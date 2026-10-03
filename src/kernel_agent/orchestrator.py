@@ -1,0 +1,423 @@
+"""End-to-end optimisation pipeline.
+
+    analyze → (harness) → plan → capture → kernels → transforms → integrate → report
+
+Deterministic steps (profiling, capture, evaluation, integration) run in GPU
+worker subprocesses; creative steps (harness writing, planning, kernel writing,
+model transforms) are Claude agents.  Each phase is recorded in ``run.json`` so
+an interrupted run can be resumed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from kernel_agent import hub, toolchain
+from kernel_agent.agent import prompts
+from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
+from kernel_agent.agent.tools import best_for_target, build_server, tool_names
+from kernel_agent.config import OptimizeConfig
+from kernel_agent.integrate.export import export_optimized
+from kernel_agent.report import write_report
+from kernel_agent.worker import call_worker
+from kernel_agent.workloads.base import WorkloadSpec
+from kernel_agent.workspace import RunDir, read_json, read_jsonl, write_json
+
+PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"]
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+class Orchestrator:
+    def __init__(self, run: RunDir, cfg: OptimizeConfig) -> None:
+        self.run = run
+        self.cfg = cfg
+        self.tc = toolchain.setup()
+        self.server = build_server(run)
+        self.env = agent_env(self.tc.env)
+        self.python = sys.executable
+        self.agent_results: list[AgentResult] = []
+
+    # ------------------------------------------------------------ creation
+
+    @classmethod
+    def create(cls, cfg: OptimizeConfig) -> Orchestrator:
+        tc = toolchain.setup()
+        if tc.gpu is None:
+            raise SystemExit("no CUDA GPU detected; kernel-agent needs one")
+        log(f"resolving {cfg.model_ref}")
+        card = hub.resolve(cfg.model_ref, token=cfg.hf_token, modality=cfg.modality)
+        log(
+            f"{card.repo_id}: modality={card.modality.value} arch={card.architectures} "
+            f"params={card.params} size={card.size_gb} GB"
+        )
+        run = RunDir.create(cfg.runs_dir, card.repo_id)
+        spec = WorkloadSpec(
+            repo_id=card.repo_id,
+            revision=card.revision,
+            modality=card.modality.value,
+            dtype=cfg.dtype,
+            trust_remote_code=cfg.trust_remote_code,
+            harness=str(Path(cfg.harness).resolve()) if cfg.harness else None,
+            options=cfg.workload_options,
+        )
+        write_json(
+            run.run_json,
+            {
+                "card": card.to_dict(),
+                "workload": spec.to_dict(),
+                "config": cfg.to_dict(),
+                "phases": {},
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+        write_json(run.toolchain_json, tc.to_dict())
+        log(f"run directory: {run.root}")
+        return cls(run, cfg)
+
+    @classmethod
+    def resume(cls, root: Path, overrides: dict[str, Any] | None = None) -> Orchestrator:
+        run = RunDir(root.resolve())
+        data = run.load()
+        cfg = OptimizeConfig.from_dict({**data["config"], **(overrides or {})})
+        return cls(run, cfg)
+
+    # ------------------------------------------------------------ helpers
+
+    def _phase_done(self, name: str) -> bool:
+        return bool(self.run.load().get("phases", {}).get(name, {}).get("done"))
+
+    def _mark(self, name: str, **info: Any) -> None:
+        data = self.run.load()
+        data.setdefault("phases", {})[name] = {
+            "done": True,
+            "at": time.strftime("%H:%M:%S"),
+            **info,
+        }
+        write_json(self.run.run_json, data)
+
+    def _available_backends(self) -> list[str]:
+        avail = [b for b in self.cfg.backends if self.tc.backends.get(b)]
+        if not avail:
+            raise SystemExit(f"none of the requested backends {self.cfg.backends} is available")
+        return avail
+
+    async def _agent(self, name: str, **kwargs: Any) -> AgentResult:
+        result = await run_agent(
+            name,
+            cfg=self.cfg,
+            mcp_server=self.server,
+            env=self.env,
+            log_dir=self.run.root / "logs",
+            **kwargs,
+        )
+        self.agent_results.append(result)
+        costs = read_json(self.run.root / "costs.json", {})
+        costs[name] = {
+            "usd": round(result.cost_usd, 4),
+            "turns": result.turns,
+            "minutes": round(result.seconds / 60, 1),
+            "tools": result.tool_calls,
+        }
+        write_json(self.run.root / "costs.json", costs)
+        return result
+
+    # ------------------------------------------------------------ phases
+
+    async def analyze(self) -> None:
+        log("analyze: loading model, measuring baseline, profiling")
+        result = call_worker(self.run, "analyze", "--iters", "3")
+        if "error" in result and self.cfg.allow_harness_agent:
+            log("analyze: built-in workload failed; asking Claude to write a harness")
+            await self.write_harness(result["error"])
+            result = call_worker(self.run, "analyze", "--iters", "3")
+        if "error" in result:
+            raise SystemExit(f"analyze failed:\n{result['error']}")
+        log(
+            f"analyze: baseline {result['median_ms']:.1f} ms, deterministic="
+            f"{result['deterministic']}, peak {result['peak_mem_gb']:.2f} GB"
+        )
+        if not result["deterministic"]:
+            log("WARNING: workload output is not deterministic; quality checks may be noisy")
+        self._mark("analyze", baseline_ms=result["median_ms"])
+
+    async def write_harness(self, error: str) -> None:
+        card = self.run.load()["card"]
+        await self._agent(
+            "harness",
+            prompt="Write and validate harness.py for this model.",
+            system_append=prompts.harness_prompt(card, error, self.python, self.tc.summary()),
+            cwd=self.run.root,
+            mcp_tools=tool_names("check_harness"),
+            add_dirs=[prompts.WORKLOADS_DIR],
+        )
+        if not self.run.harness.exists():
+            raise SystemExit("harness agent did not produce harness.py")
+        data = self.run.load()
+        data["workload"]["harness"] = str(self.run.harness)
+        write_json(self.run.run_json, data)
+
+    async def plan(self) -> None:
+        data = self.run.load()
+        baseline = read_json(self.run.baseline_json, {})
+        summary = (self.run.profile_dir / "summary.md").read_text()
+        backends = self._available_backends()
+        log(
+            f"plan: asking the planner ({self.cfg.claude_model}) for up to "
+            f"{self.cfg.max_targets} targets"
+        )
+        result = await self._agent(
+            "planner",
+            prompt="Produce the optimisation plan for this run.",
+            system_append=prompts.planner_prompt(
+                data["card"],
+                baseline,
+                summary,
+                backends,
+                self.cfg.max_targets,
+                self.python,
+                self.tc.summary(),
+            ),
+            cwd=self.run.root,
+            mcp_tools=[],
+            output_format={"type": "json_schema", "schema": prompts.PLAN_SCHEMA},
+        )
+        plan = result.structured
+        if not isinstance(plan, dict):
+            plan = _extract_json(result.text)
+        if not isinstance(plan, dict) or "targets" not in plan:
+            raise SystemExit(f"planner returned no usable plan:\n{result.text[:2000]}")
+        profile = read_json(self.run.profile_dir / "profile.json", {})
+        known = {c["cls"] for c in profile.get("classes", [])}
+        targets = []
+        for t in plan["targets"][: self.cfg.max_targets]:
+            if t["module_class"] not in known:
+                log(f"plan: dropping {t['id']}: class {t['module_class']} not in profile")
+                continue
+            t["backends"] = [b for b in t.get("backends", []) if b in backends] or backends[:2]
+            targets.append(t)
+        plan["targets"] = targets
+        write_json(self.run.plan_json, plan)
+        for t in targets:
+            log(
+                f"plan: target {t['id']} = {t['module_class']} via {t['backends']}: "
+                f"{t['approach'][:120]}"
+            )
+        for t in plan.get("transforms", []):
+            log(f"plan: transform {t['id']}: {t['idea'][:120]}")
+        self._mark("plan", targets=[t["id"] for t in targets])
+
+    async def capture(self) -> None:
+        plan = read_json(self.run.plan_json, {})
+        kept = []
+        for t in plan.get("targets", []):
+            target_dir = self.run.target(t["id"])
+            (target_dir / "candidates").mkdir(parents=True, exist_ok=True)
+            spec = {**t}
+            write_json(target_dir / "spec.json", spec)
+            log(f"capture: {t['id']} ({t['module_class']})")
+            info = call_worker(self.run, "capture", "--target", t["id"])
+            if "error" in info:
+                log(f"capture: {t['id']} failed, dropping target:\n{info['error'][-800:]}")
+                (target_dir / "spec.json").rename(target_dir / "spec.failed.json")
+                continue
+            log(f"capture: {t['id']} cases={[(c['signature'], c['count']) for c in info['cases']]}")
+            kept.append(t["id"])
+        self._mark("capture", targets=kept)
+
+    async def kernels(self) -> None:
+        profile = read_json(self.run.profile_dir / "profile.json", {})
+        stats = {c["cls"]: c for c in profile.get("classes", [])}
+        ids = self.run.target_ids()
+        done = set(self.run.load().get("phases", {}).get("kernels", {}).get("finished", []))
+        pending = [t for t in ids if t not in done]
+        sem = asyncio.Semaphore(max(1, self.cfg.parallel))
+
+        async def one(target_id: str) -> None:
+            async with sem:
+                target_dir = self.run.target(target_id)
+                spec = read_json(target_dir / "spec.json")
+                system = prompts.engineer_prompt(
+                    spec,
+                    spec.get("capture", {}),
+                    spec["backends"],
+                    self.python,
+                    self.tc.summary(),
+                    self.cfg.evaluations_per_target,
+                    stats.get(spec["module_class"]),
+                )
+                (target_dir / "NOTES.md").touch()
+                await self._agent(
+                    f"kernel-{target_id}",
+                    prompt=(
+                        f"Optimise target `{target_id}`. Start by reading reference_source.py "
+                        "and spec.json, then write and evaluate candidates."
+                    ),
+                    system_append=system,
+                    cwd=target_dir,
+                    mcp_tools=tool_names("evaluate_candidate", "best_result"),
+                    add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+                )
+                best = best_for_target(self.run, target_id)
+                log(
+                    f"kernels: {target_id} best = "
+                    + (f"{best['speedup']}x ({best['snapshot']})" if best else "none correct")
+                )
+                data = self.run.load()
+                fin = (
+                    data.setdefault("phases", {})
+                    .setdefault("kernels", {})
+                    .setdefault("finished", [])
+                )
+                fin.append(target_id)
+                write_json(self.run.run_json, data)
+
+        await asyncio.gather(*(one(t) for t in pending))
+        self._mark("kernels", finished=ids)
+
+    async def transforms(self) -> None:
+        if not self.cfg.do_transforms:
+            self._mark("transforms", skipped=True)
+            return
+        data = self.run.load()
+        plan = read_json(self.run.plan_json, {})
+        baseline = read_json(self.run.baseline_json, {})
+        summary = (self.run.profile_dir / "summary.md").read_text()
+        self.run.transforms_dir.mkdir(parents=True, exist_ok=True)
+        await self._agent(
+            "systems",
+            prompt="Design, write and evaluate model-level transforms.",
+            system_append=prompts.systems_prompt(
+                data["card"],
+                baseline,
+                summary,
+                plan.get("transforms", []),
+                self.python,
+                self.tc.summary(),
+                self.cfg.transform_evaluations,
+            ),
+            cwd=self.run.transforms_dir,
+            mcp_tools=tool_names("evaluate_e2e", "run_info"),
+            add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
+        )
+        self._mark("transforms")
+
+    async def integrate(self) -> None:
+        baseline = read_json(self.run.baseline_json, {})
+        base_ms = float(baseline["median_ms"])
+        candidates: list[tuple[str, str, float]] = []  # (kind, arg, est_gain)
+        for target_id in self.run.target_ids():
+            best = best_for_target(self.run, target_id)
+            if best and best["speedup"] >= self.cfg.min_speedup:
+                path = self.run.target(target_id) / best["snapshot"]
+                candidates.append(
+                    ("kernel", f"{target_id}={path}", best.get("est_saved_ms_per_run", 0))
+                )
+        best_tf: dict[str, dict[str, Any]] = {}
+        for rec in read_jsonl(self.run.transforms_dir / "results.jsonl"):
+            if rec.get("passed") and not rec.get("kernels") and len(rec.get("transforms", [])) == 1:
+                name = rec["transforms"][0]
+                stem = re.sub(r"^\d+_|_[0-9a-f]{8}$", "", Path(name).stem)
+                if rec["speedup"] > 1.0 and (
+                    stem not in best_tf or rec["speedup"] > best_tf[stem]["speedup"]
+                ):
+                    best_tf[stem] = rec
+        for rec in best_tf.values():
+            path = self.run.transforms_dir / rec["transforms"][0]
+            candidates.append(("transform", str(path), base_ms - rec["median_ms"]))
+        candidates.sort(key=lambda c: -c[2])
+        log(f"integrate: {len(candidates)} candidate optimisations")
+
+        def e2e(items: list[tuple[str, str, float]]) -> dict[str, Any]:
+            cli = ["--warmup", "2", "--iters", "5"]
+            for kind, arg, _ in items:
+                cli += ["--kernel" if kind == "kernel" else "--transform", arg]
+            return call_worker(self.run, "e2e", *cli)
+
+        history: list[dict[str, Any]] = []
+        accepted: list[tuple[str, str, float]] = []
+        final: dict[str, Any] | None = None
+        if candidates:
+            r = e2e(candidates)
+            history.append({"items": [c[1] for c in candidates], **_short(r)})
+            if r.get("passed"):
+                accepted, final = candidates, r
+                log(f"integrate: all {len(candidates)} together pass, {r['speedup']}x")
+            else:
+                log(
+                    "integrate: combined run failed "
+                    f"({r.get('reason') or r.get('status')}); greedy search"
+                )
+                current_ms = base_ms
+                for item in candidates:
+                    r = e2e([*accepted, item])
+                    history.append({"items": [c[1] for c in [*accepted, item]], **_short(r)})
+                    if r.get("passed") and r["median_ms"] < current_ms * 0.995:
+                        accepted.append(item)
+                        current_ms = r["median_ms"]
+                        final = r
+                        log(f"integrate: + {item[1]} -> {r['median_ms']:.1f} ms")
+                    else:
+                        log(f"integrate: - {item[1]} ({r.get('reason') or r.get('status')})")
+        result = {
+            "baseline_ms": base_ms,
+            "accepted": [{"kind": k, "item": a} for k, a, _ in accepted],
+            "final": final,
+            "history": history,
+        }
+        write_json(self.run.root / "integration.json", result)
+        export_optimized(self.run, accepted)
+        if final:
+            log(
+                f"integrate: final {final['median_ms']:.1f} ms vs {base_ms:.1f} ms "
+                f"= {final['speedup']}x"
+            )
+        else:
+            log("integrate: no optimisation survived end-to-end validation")
+        self._mark("integrate", speedup=final["speedup"] if final else 1.0)
+
+    async def report(self) -> None:
+        path = write_report(self.run)
+        self._mark("report")
+        log(f"report: {path}")
+
+    async def run_all(self, until: str | None = None) -> RunDir:
+        for phase in PHASES:
+            if self._phase_done(phase):
+                continue
+            await getattr(self, phase)()
+            if phase == until:
+                break
+        return self.run
+
+
+def _short(r: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: r.get(k)
+        for k in ("status", "passed", "reason", "median_ms", "speedup", "metrics", "patches")
+    }
+
+
+def _extract_json(text: str) -> Any:
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S) or re.search(
+        r"(\{.*\})", text, re.S
+    )
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+async def optimize(cfg: OptimizeConfig, until: str | None = None) -> RunDir:
+    orch = Orchestrator.create(cfg)
+    return await orch.run_all(until=until)

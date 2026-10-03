@@ -1,0 +1,67 @@
+[project]
+name = "kernel-agent"
+version = "0.1.0"
+description = "Claude-powered agent that profiles Hugging Face models (LLM, STT, TTS, diffusion) and rewrites their hot paths as custom GPU kernels (Triton, CUDA, CuTe DSL, TileLang)."
+readme = "README.md"
+authors = [{ name = "kadirnar", email = "kadir.nar@hotmail.com" }]
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "huggingface-hub>=0.30",
+    "numpy>=1.26",
+    "torch>=2.6",
+]
+
+[project.optional-dependencies]
+models = [
+    "accelerate>=1.0",
+    "diffusers>=0.33",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+    "transformers>=4.50",
+]
+cuda = ["cuda-python>=12.6", "ninja>=1.11", "nvidia-cuda-nvcc>=13.0; sys_platform == 'linux'", "nvidia-cuda-cccl>=13.0; sys_platform == 'linux'", "nvidia-cuda-crt>=13.0; sys_platform == 'linux'", "nvidia-nvvm>=13.0; sys_platform == 'linux'"]
+cute = ["nvidia-cutlass-dsl>=4.0"]
+tilelang = ["tilelang>=0.1.5", "nvidia-cuda-nvcc>=13.0; sys_platform == 'linux'", "nvidia-cuda-cccl>=13.0; sys_platform == 'linux'", "nvidia-cuda-crt>=13.0; sys_platform == 'linux'", "nvidia-nvvm>=13.0; sys_platform == 'linux'"]
+all = ["kernel-agent[models,cuda,cute,tilelang]"]
+
+[project.scripts]
+kernel-agent = "kernel_agent.cli:main"
+
+[dependency-groups]
+dev = ["mypy>=1.15", "pytest>=8.3", "ruff>=0.11"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003", "RUF012"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+exclude = ["src/kernel_agent/agent/examples/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a CUDA device",
+    "network: needs Hugging Face Hub access",
+]
