@@ -299,7 +299,15 @@ def systems_prompt(
     python: str,
     toolchain: str,
     evaluations: int,
+    kernels: list[tuple[str, str, float]] | None = None,
 ) -> str:
+    winners = (
+        "\n".join(
+            f"* `{tid}={path}` (module speedup {speedup:.2f}x)"
+            for tid, path, speedup in kernels or []
+        )
+        or "* (none)"
+    )
     ideas = "\n".join(f"* `{t['id']}`: {t['idea']} — {t['why']}" for t in transforms) or "* (none)"
     return f"""You are a systems/inference engineer. Speed up the end-to-end run of
 `{card["repo_id"]}` ({card["modality"]}) with model-level algorithm changes.
@@ -314,6 +322,14 @@ Baseline: {baseline.get("median_ms", 0):.1f} ms per run ({baseline.get("workload
 # Planner's ideas
 {ideas}
 
+# Kernels already written for this model
+{winners}
+The final integration measures every kernel and transform alone and then
+combines them greedily, so the best results are transforms that also work
+*on top of* these kernels: keep calling the (possibly replaced) sub-modules
+instead of re-implementing their math, and check compatibility with
+`evaluate_e2e(transforms=[...], kernels=[<entries above>])`.
+
 # Transform contract
 Write files `transforms/<id>.py` in the current directory:
 ```python
@@ -326,7 +342,9 @@ def apply(workload) -> None:
 Valid ideas: static KV cache + `torch.compile(mode="reduce-overhead")` / CUDA
 graphs for decode, compiling the denoiser, SDPA backend selection, merging
 QKV / gate-up projections, channels_last, precomputing constant tensors,
-removing `.item()` syncs. Outputs must stay within the workload's quality
+removing `.item()` syncs. Never add code that targets the benchmark instead
+of inference (clock burn-in loops, caching outputs across runs, skipping work
+when inputs repeat). Outputs must stay within the workload's quality
 check (the tool reports it). Warm-up/compile time is excluded from timing
 (1 warm-up run), but the transform must not change the inputs or the work.
 

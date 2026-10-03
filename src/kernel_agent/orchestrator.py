@@ -303,6 +303,7 @@ class Orchestrator:
                 self.python,
                 self.tc.summary(),
                 self.cfg.transform_evaluations,
+                kernels=self._kernel_winners(),
             ),
             cwd=self.run.transforms_dir,
             mcp_tools=tool_names("evaluate_e2e", "run_info"),
@@ -310,71 +311,85 @@ class Orchestrator:
         )
         self._mark("transforms")
 
-    async def integrate(self) -> None:
-        baseline = read_json(self.run.baseline_json, {})
-        base_ms = float(baseline["median_ms"])
-        candidates: list[tuple[str, str, float]] = []  # (kind, arg, est_gain)
+    def _kernel_winners(self) -> list[tuple[str, str, float]]:
+        """(target_id, snapshot path, module speedup) of every kernel worth integrating."""
+        winners = []
         for target_id in self.run.target_ids():
             best = best_for_target(self.run, target_id)
             if best and best["speedup"] >= self.cfg.min_speedup:
                 path = self.run.target(target_id) / best["snapshot"]
-                candidates.append(
-                    ("kernel", f"{target_id}={path}", best.get("est_saved_ms_per_run", 0))
-                )
+                winners.append((target_id, str(path), float(best["speedup"])))
+        return winners
+
+    async def integrate(self) -> None:
+        """Measure every candidate alone, then grow the best combination greedily.
+
+        Ordering by *measured* end-to-end gain (not module-level estimates)
+        matters: a model-level transform can beat every kernel on its own and
+        be incompatible with them, so the best single item seeds the search.
+        """
+        baseline = read_json(self.run.baseline_json, {})
+        base_ms = float(baseline["median_ms"])
+        items: list[tuple[str, str]] = [
+            ("kernel", f"{tid}={path}") for tid, path, _ in self._kernel_winners()
+        ]
         best_tf: dict[str, dict[str, Any]] = {}
         for rec in read_jsonl(self.run.transforms_dir / "results.jsonl"):
             if rec.get("passed") and not rec.get("kernels") and len(rec.get("transforms", [])) == 1:
-                name = rec["transforms"][0]
-                stem = re.sub(r"^\d+_|_[0-9a-f]{8}$", "", Path(name).stem)
+                stem = re.sub(r"^\d+_|_[0-9a-f]{8}$", "", Path(rec["transforms"][0]).stem)
                 if rec["speedup"] > 1.0 and (
                     stem not in best_tf or rec["speedup"] > best_tf[stem]["speedup"]
                 ):
                     best_tf[stem] = rec
-        for rec in best_tf.values():
-            path = self.run.transforms_dir / rec["transforms"][0]
-            candidates.append(("transform", str(path), base_ms - rec["median_ms"]))
-        candidates.sort(key=lambda c: -c[2])
-        log(f"integrate: {len(candidates)} candidate optimisations")
-
-        def e2e(items: list[tuple[str, str, float]]) -> dict[str, Any]:
-            cli = ["--warmup", "2", "--iters", "5"]
-            for kind, arg, _ in items:
-                cli += ["--kernel" if kind == "kernel" else "--transform", arg]
-            return call_worker(self.run, "e2e", *cli)
+        items += [
+            ("transform", str(self.run.transforms_dir / rec["transforms"][0]))
+            for rec in best_tf.values()
+        ]
+        log(f"integrate: {len(items)} candidate optimisations")
 
         history: list[dict[str, Any]] = []
-        accepted: list[tuple[str, str, float]] = []
-        final: dict[str, Any] | None = None
-        if candidates:
-            r = e2e(candidates)
-            history.append({"items": [c[1] for c in candidates], **_short(r)})
-            if r.get("passed"):
-                accepted, final = candidates, r
-                log(f"integrate: all {len(candidates)} together pass, {r['speedup']}x")
+
+        def e2e(combo: list[tuple[str, str]]) -> dict[str, Any]:
+            cli = ["--warmup", "2", "--iters", "5"]
+            for kind, arg in combo:
+                cli += ["--kernel" if kind == "kernel" else "--transform", arg]
+            r = call_worker(self.run, "e2e", *cli)
+            history.append({"items": [a for _, a in combo], **_short(r)})
+            return r
+
+        singles: list[tuple[tuple[str, str], dict[str, Any]]] = []
+        for item in items:
+            r = e2e([item])
+            if r.get("passed") and r["median_ms"] < base_ms:
+                singles.append((item, r))
+                log(f"integrate: alone {Path(item[1]).name}: {r['median_ms']:.1f} ms")
             else:
-                log(
-                    "integrate: combined run failed "
-                    f"({r.get('reason') or r.get('status')}); greedy search"
-                )
-                current_ms = base_ms
-                for item in candidates:
-                    r = e2e([*accepted, item])
-                    history.append({"items": [c[1] for c in [*accepted, item]], **_short(r)})
-                    if r.get("passed") and r["median_ms"] < current_ms * 0.995:
-                        accepted.append(item)
-                        current_ms = r["median_ms"]
-                        final = r
-                        log(f"integrate: + {item[1]} -> {r['median_ms']:.1f} ms")
-                    else:
-                        log(f"integrate: - {item[1]} ({r.get('reason') or r.get('status')})")
+                log(f"integrate: drop {Path(item[1]).name} ({r.get('reason') or r.get('status')})")
+        singles.sort(key=lambda s: s[1]["median_ms"])
+
+        accepted: list[tuple[str, str]] = []
+        final: dict[str, Any] | None = None
+        if singles:
+            accepted, final = [singles[0][0]], singles[0][1]
+            for item, _ in singles[1:]:
+                r = e2e([*accepted, item])
+                if r.get("passed") and r["median_ms"] < final["median_ms"] * 0.99:
+                    accepted.append(item)
+                    final = r
+                    log(f"integrate: + {Path(item[1]).name} -> {r['median_ms']:.1f} ms")
+                else:
+                    reason = r.get("reason") or r.get("status")
+                    if r.get("passed"):
+                        reason = f"no gain ({r['median_ms']:.1f} ms)"
+                    log(f"integrate: - {Path(item[1]).name} ({reason})")
         result = {
             "baseline_ms": base_ms,
-            "accepted": [{"kind": k, "item": a} for k, a, _ in accepted],
+            "accepted": [{"kind": k, "item": a} for k, a in accepted],
             "final": final,
             "history": history,
         }
         write_json(self.run.root / "integration.json", result)
-        export_optimized(self.run, accepted)
+        export_optimized(self.run, [(k, a, 0.0) for k, a in accepted])
         if final:
             log(
                 f"integrate: final {final['median_ms']:.1f} ms vs {base_ms:.1f} ms "

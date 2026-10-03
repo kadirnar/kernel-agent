@@ -113,6 +113,11 @@ def synchronize() -> None:
 def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3) -> dict[str, Any]:
     """Wall-clock latency of ``workload.run`` (GPU-synchronised), in milliseconds."""
     output = None
+    if torch.cuda.is_available():
+        # Same clock warm-up for baseline and optimised runs (fair comparison).
+        from kernel_agent.kernels.bench import warm_gpu
+
+        warm_gpu(500.0)
     with torch.inference_mode():
         for _ in range(warmup):
             output = workload.run(inputs)
