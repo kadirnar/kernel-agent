@@ -1,0 +1,194 @@
+# kernel-agent
+
+Give it a Hugging Face URL; it profiles the model on your GPU, finds the slow
+parts, and has Claude write custom GPU kernels for them in **CUDA C++,
+CuTe DSL, Triton or TileLang**. It also tries model-level algorithm changes
+(static caches, CUDA graphs, merged projections). Each candidate is checked
+for correctness against real captured inputs, benchmarked, and kept only if
+the whole model still produces the same output and runs faster.
+
+Works on **LLM**, **STT**, **TTS** and **diffusion** models. When no built-in
+workload can run a model (custom TTS stacks, for example), Claude writes a
+benchmark harness for it first.
+
+```bash
+uv sync --extra all
+uv run kernel-agent doctor --smoke      # check GPU, compilers, all 5 backends
+uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
+```
+
+## How it works
+
+```
+HF URL ─► resolve (modality, arch, size)
+        ─► analyze   load model, baseline latency, determinism check,
+                     module-level + kernel-level profile           [GPU worker]
+        ─► (harness) Claude writes harness.py if the built-in workload fails
+        ─► plan      Claude reads the profile + source, picks target modules,
+                     an approach and backends for each, and model transforms
+        ─► capture   each target module is saved with real inputs/outputs
+                     (prefill + decode shapes, KV-cache side effects)  [GPU worker]
+        ─► kernels   one Claude "kernel engineer" per target writes candidates,
+                     calls evaluate_candidate (correctness + interleaved
+                     benchmark + optional per-kernel profile) and iterates
+        ─► transforms  Claude "systems engineer" writes model-level transforms,
+                     validated end to end with evaluate_e2e
+        ─► integrate all winners are applied together, validated against the
+                     baseline output; greedy fallback if the combination fails
+        ─► report    report.md + optimized/ (kernels + apply.py)
+```
+
+All GPU work runs in subprocesses under a GPU lock, so a crashing kernel or an
+illegal memory access can't kill the run, and parallel agents
+(`--parallel N`) never benchmark at the same time.
+
+### What "correct" means
+
+* **Module level** (`evaluate_candidate`): every captured case must match the
+  reference outputs **and** the in-place side effects (for example KV-cache
+  appends) within dtype-aware tolerances (bf16 2e-2, fp16 1e-2, fp32 1e-4;
+  at most 0.1 % of elements outside). If `build()` hands back the reference
+  module unchanged, the candidate is rejected.
+* **Model level** (`e2e`): the workload's own comparison. For LLM/STT that is
+  identical greedy tokens for the first N tokens plus first-step logits cosine
+  ≥ 0.99. For TTS it is spectral cosine. For diffusion it is PSNR ≥ 25 dB on
+  the same seed.
+
+### What "faster" means
+
+Reference and candidate are timed in alternating rounds with CUDA events
+after a GPU warm-up, and the median round is reported. Mutable inputs (caches)
+are deep-copied outside the timed region. A module's speedup is weighted by how
+often each captured shape runs per inference. The end-to-end speedup is
+wall-clock latency of the whole workload.
+
+## Backends
+
+| backend | how | host overhead (tiny op, measured) |
+|---|---|---|
+| `cuda` | CUDA C++ via `torch.utils.cpp_extension.load_inline` (nvcc) | ~19 µs |
+| `cute` | CuTe DSL (`nvidia-cutlass-dsl`), TVM-FFI calling convention | ~25 µs |
+| `nvrtc` | CUDA C++ compiled at runtime with NVRTC (`cuda.core`) | ~28 µs |
+| `tilelang` | TileLang (`tilelang.language`) | ~32 µs |
+| `triton` | Triton | ~43 µs |
+
+There are verified example kernels for every backend in
+`src/kernel_agent/agent/examples/`, and backend guides plus an optimisation
+playbook in `src/kernel_agent/agent/knowledge/`. Both are fed to the agents.
+
+**No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
+(`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a
+`CUDA_HOME` shim with the unversioned `libcudart.so` the linker needs.
+A host GCC that is too new and nvcc/CUDA-header version skew are handled
+through `NVCC_APPEND_FLAGS` (`kernel_agent/toolchain.py`).
+
+## CLI
+
+```bash
+kernel-agent optimize <hf-url> [options]
+  --modality {llm,stt,tts,diffusion}   override auto-detection
+  --dtype bfloat16|float16|float32
+  -o KEY=VALUE                         workload options, e.g.
+                                       LLM: prompt_len, new_tokens, batch_size, min_prefix
+                                       STT: audio=/path.wav, audio_seconds, new_tokens
+                                       TTS: text, seed, min_spec_cosine
+                                       diffusion: steps, height, width, prompt, cpu_offload, min_psnr
+  --backends cuda,triton,cute,tilelang,nvrtc
+  --max-targets 4 --evaluations 12     targets and evaluation budget per target
+  --parallel 2                         kernel agents at the same time
+  --no-transforms                      kernels only
+  --claude-model claude-opus-5-5 --effort high --budget 10 (USD per agent)
+  --harness my_harness.py              your own workload
+  --until analyze|plan|capture|kernels|transforms|integrate
+
+kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
+kernel-agent resume <run_dir> [--redo kernels]
+kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline]
+kernel-agent report <run_dir>
+kernel-agent doctor [--smoke]
+kernel-agent install-claude-code <project-dir>
+```
+
+Python API:
+
+```python
+import asyncio
+from kernel_agent import OptimizeConfig, optimize
+
+run = asyncio.run(
+    optimize(
+        OptimizeConfig(
+            model_ref="https://huggingface.co/openai/whisper-large-v3-turbo",
+            backends=["cuda", "triton"],
+            max_targets=3,
+        )
+    )
+)
+print(run.report.read_text())
+```
+
+## Run directory
+
+```
+runs/<org>--<name>/<timestamp>/
+  run.json  toolchain.json  baseline.json  baseline_output.pt
+  profile/summary.md          profile handed to the planner
+  plan.json                   targets + transforms
+  targets/<id>/capture.pt     module + real inputs/outputs
+  targets/<id>/reference_source.py
+  targets/<id>/candidates/    files the agent writes
+  targets/<id>/history/       snapshot of every evaluated version
+  targets/<id>/results.jsonl  every evaluation
+  transforms/                 model-level transforms + results.jsonl
+  integration.json  report.md  costs.json  logs/
+  optimized/                  apply.py + manifest.json + kernels/
+```
+
+To use the result in your own code:
+
+```python
+import sys
+
+sys.path.insert(0, "runs/.../optimized")
+from apply import apply_kernels
+
+apply_kernels(model)  # replaces every matching module instance
+```
+
+## Candidate contract
+
+```python
+def build(reference: torch.nn.Module) -> torch.nn.Module:
+    """Return a drop-in replacement for `reference`: same forward signature,
+    same outputs, same in-place side effects, sharing its weights. Return
+    `reference` for instances the kernel does not support."""
+```
+
+## Harness contract (custom models)
+
+`harness.py` defines `create(spec) -> Workload`. Implement `load`, `roots`,
+`make_inputs`, `run` and `compare` (`kernel_agent/workloads/base.py`).
+
+## Using it interactively from Claude Code
+
+`kernel-agent install-claude-code <project>` copies a `/optimize-model`
+slash command and a `kernel-engineer` subagent into `<project>/.claude/`. You
+can then drive the same tools (`kernel-agent analyze/eval/...`) from an
+interactive Claude Code session instead of the autonomous pipeline.
+
+## Authentication and safety
+
+The agents run through the Claude Agent SDK and use your Claude Code login
+or `ANTHROPIC_API_KEY`. By default they run with `bypassPermissions` inside
+the run directory, because they need to compile and run code without prompts.
+Use `--permission-mode acceptEdits` for a stricter setup. Agents never
+install or change torch/CUDA packages.
+
+## Development
+
+```bash
+uv sync --extra all --group dev
+uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest -q
+```
+
+GPU tests are marked `gpu` and skipped when no CUDA device is present.

@@ -17,7 +17,9 @@ def test_rundir_layout(tmp_path):
 
 
 def test_options_parsing():
-    opts = _options(["prompt_len=1024", "min_cosine=0.995", "audio=/x.wav", "cpu_offload=true", "g=none"])
+    opts = _options(
+        ["prompt_len=1024", "min_cosine=0.995", "audio=/x.wav", "cpu_offload=true", "g=none"]
+    )
     assert opts == {
         "prompt_len": 1024,
         "min_cosine": 0.995,

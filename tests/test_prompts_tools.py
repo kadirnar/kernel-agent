@@ -55,5 +55,7 @@ def test_snapshot_and_best(tmp_path):
     append_jsonl(tdir / "results.jsonl", {"correct": False, "speedup": 9.0, "snapshot": "b"})
     append_jsonl(tdir / "results.jsonl", {"correct": True, "speedup": 2.0, "snapshot": "c"})
     assert best_for_target(run, "rms")["snapshot"] == "c"
-    out = compact({"status": "ok", "cases": [{"signature": "s", "ok": True, "speedup": 2.0}], "junk": 1})
+    out = compact(
+        {"status": "ok", "cases": [{"signature": "s", "ok": True, "speedup": 2.0}], "junk": 1}
+    )
     assert "junk" not in out and out["cases"][0]["speedup"] == 2.0

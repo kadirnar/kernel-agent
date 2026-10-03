@@ -132,6 +132,19 @@ def cmd_eval(ns: argparse.Namespace) -> int:
     return 0 if result.get("correct") else 1
 
 
+def cmd_install_claude_code(ns: argparse.Namespace) -> int:
+    import shutil
+
+    src = Path(__file__).parent / "claude_code"
+    dst = Path(ns.project) / ".claude"
+    for kind in ("commands", "agents"):
+        (dst / kind).mkdir(parents=True, exist_ok=True)
+        for file in (src / kind).glob("*.md"):
+            shutil.copy2(file, dst / kind / file.name)
+            print(f"installed {dst / kind / file.name}")
+    return 0
+
+
 def cmd_report(ns: argparse.Namespace) -> int:
     from kernel_agent.report import write_report
     from kernel_agent.workspace import RunDir
@@ -217,6 +230,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--profile", action="store_true")
     p.add_argument("--compile-baseline", action="store_true", help="also time torch.compile")
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser(
+        "install-claude-code", help="add /optimize-model + kernel-engineer subagent to a project"
+    )
+    p.add_argument("project", nargs="?", default=".")
+    p.set_defaults(func=cmd_install_claude_code)
 
     p = sub.add_parser("report", help="(re)write report.md for a run")
     p.add_argument("run_dir")

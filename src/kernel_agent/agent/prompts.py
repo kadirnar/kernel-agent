@@ -186,6 +186,10 @@ model. Specialist agents will then write custom kernels for each target you pick
    over leaf `Linear` layers (cuBLAS GEMMs are hard to beat unless fused).
    Avoid containers that wrap the whole model. Use `module_class` exactly as
    in the profile table; set `qualname` only to restrict to one instance.
+   Targets may nest (a norm inside a decoder layer). Prefer non-overlapping
+   targets; if you do pick a block and one of its children, say in the block's
+   `approach` whether its replacement keeps calling that child module (so the
+   child's kernel still applies) or absorbs it.
 3. For each target give `approach` (the concrete fusion/algorithm idea, which
    kernels it removes, expected speedup) and an ordered list of `backends` from:
    {", ".join(backends)}. Put the backend most suited to the op first
