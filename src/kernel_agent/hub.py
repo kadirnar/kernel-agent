@@ -117,7 +117,9 @@ def resolve(ref: str, *, token: str | None = None, modality: str | None = None) 
     info = api.model_info(repo_id, revision=revision, files_metadata=True)
     siblings = info.siblings or []
     files = [s.rfilename for s in siblings]
-    size = sum((s.size or 0) for s in siblings if s.rfilename.endswith((".safetensors", ".bin")))
+    # Repos often ship the same weights twice (.safetensors + .bin); count one format.
+    weight_ext = ".safetensors" if any(f.endswith(".safetensors") for f in files) else ".bin"
+    size = sum((s.size or 0) for s in siblings if s.rfilename.endswith(weight_ext))
 
     def _json(name: str) -> dict[str, Any]:
         if name not in files:
