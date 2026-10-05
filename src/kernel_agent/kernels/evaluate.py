@@ -8,6 +8,9 @@ Candidate contract (``candidates/<name>.py``)::
         (e.g. KV-cache updates).  Reuse ``reference``'s parameters/buffers.
         Return ``reference`` itself for instances the kernel does not support.'''
 
+``build`` may take keyword arguments with defaults (block sizes, ``num_warps``, ...):
+the evaluator calls ``build(reference)``; :mod:`kernels.sweep` tries configs of them.
+
 Each captured case is replayed through the entrypoint it was recorded from:
 ``candidate(*args, **kwargs)`` for ``forward`` cases and
 ``candidate.<method>(*args, **kwargs)`` otherwise (e.g. ``forward_step`` of a
@@ -301,6 +304,8 @@ def evaluate(
     compile_check: bool = False,
     quick: bool = False,
     save_outputs: Path | None = None,
+    config: dict[str, Any] | None = None,
+    session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build, check and time one candidate.  ``device`` defaults to CUDA when
     available; on CPU only correctness is checked (timing needs CUDA events).
@@ -309,6 +314,10 @@ def evaluate(
     ``quick``: correctness on the smallest and the largest case only, never timed.
     ``save_outputs``: write the candidate's outputs of the correctness stage there
     (:func:`kernels.integrity.flat_outputs`), for :func:`run_evaluation` to check.
+    ``config``: keyword arguments of ``build(reference, **config)``. ``session``: what
+    the configs of one sweep share (:mod:`kernels.sweep`): the loaded ``capture``, the
+    candidate ``module`` and a deepcopy ``memo`` (weights shared, not copied per
+    config); a passing quick check leaves its built ``candidate`` there.
     Global state the candidate changed is restored on return."""
     guards: list[Any] = []
     try:
@@ -324,6 +333,8 @@ def evaluate(
             compile_check=compile_check,
             quick=quick,
             save_outputs=save_outputs,
+            config=config or {},
+            session=session if session is not None else {},
         )
     finally:
         for guard in guards:
@@ -343,6 +354,8 @@ def _evaluate(
     compile_check: bool,
     quick: bool,
     save_outputs: Path | None,
+    config: dict[str, Any],
+    session: dict[str, Any],
 ) -> dict[str, Any]:
     import torch
 
@@ -367,7 +380,9 @@ def _evaluate(
     }
     t0 = time.perf_counter()
     try:
-        capture = load_capture(capture_path, device=device, sha256=capture_sha256)
+        capture = session.get("capture") or load_capture(
+            capture_path, device=device, sha256=capture_sha256
+        )
     except TamperError as exc:
         result.update(status="tampered", error=str(exc))
         return result
@@ -387,9 +402,10 @@ def _evaluate(
     # 1. import + build
     t_build = time.perf_counter()
     try:
-        module = load_candidate_module(candidate_path)
-        given = copy.deepcopy(reference)
-        candidate = module.build(given)
+        module = session.get("module") or load_candidate_module(candidate_path)
+        session["module"] = module
+        given = copy.deepcopy(reference, dict(session.get("memo") or {}))
+        candidate = module.build(given, **config)
         if candidate is None:
             raise TypeError("build() returned None")
         candidate = candidate.eval() if hasattr(candidate, "eval") else candidate
@@ -511,6 +527,7 @@ def _evaluate(
         timing = "skipped: quick check" if quick else "skipped: no CUDA device"
         result.update(status="ok", correct=True, timing=timing)
         result["eval_seconds"] = round(time.perf_counter() - t0, 1)
+        session["candidate"] = candidate  # a sweep times it next to its other configs
         return result
 
     # 3. performance (reference vs candidate, same inputs, same entrypoint)

@@ -537,7 +537,9 @@ All limits are off by default (`kernel_agent/budget.py`).
 * `--eval-timeout` (default 300 s) limits one `evaluate_candidate` subprocess.
   Results include `compile_s` (import, build and the first call, which is where
   JIT backends compile). A timeout result says whether it ran out of time while
-  compiling or while checking and benchmarking.
+  compiling or while checking and benchmarking. A `sweep_candidate` call gets 3 ×
+  `--eval-timeout` for its configs plus one `--eval-timeout` for the full
+  evaluation of the best one, and counts as one evaluation (see "Parameter sweeps").
 * Agents get their remaining time and USD in the system prompt. Every
   `evaluate_candidate` / `evaluate_e2e` result has
   `budget: {evals_used, evals_budget, minutes_left, non_improving}` and an
@@ -811,6 +813,57 @@ captured from the unmodified model.
   worker; `kernel-agent watch` shows the worker in the ledger, the events and
   the tooltips, and quick checks and duplicates as neutral rows.
 
+### Parameter sweeps
+
+InferenceBench found a plain hyperparameter sweep (11.5×) ahead of agents (8.1×)
+that spent their budget measuring one config per evaluation, and KernelFoundry
+tunes template parameters apart from the LLM (docs/RESEARCH.md). A candidate
+exposes its tuning parameters as keyword arguments of `build` with defaults
+(`build(reference)` still works), and `sweep_candidate(target_id, candidate,
+configs=[{"BLOCK": 512, "num_warps": 4}, ...], max_configs=32, hypothesis,
+idea_id)` tries them all while it holds one GPU of the pool
+(`kernel_agent/kernels/sweep.py`):
+
+1. **Check.** One subprocess loads the capture and the candidate once and runs
+   every config through the quick tier of the evaluator (`build(reference,
+   **config)`, the smallest and the largest case, aliasing, fallback detection,
+   perturbed re-verification, the integrity snapshot). A failing config is
+   rejected with its error. The configs share the reference's weights (one copy,
+   not one per config): a config that modifies them is an `integrity_violation`
+   and the weights are restored for the next one.
+2. **Time.** The passing configs, in the same subprocess, against the
+   reference with the evaluator's timing (60 ms rounds, rotating input sets,
+   median of 3 rounds), interleaved: every round times the reference and then
+   each config (in an order rotated per round) on every timed case. One timed
+   call per config runs on redrawn inputs and is checked against the reference.
+   The table is sorted by weighted speedup (calls per run × time) with the
+   speedup and `pct_of_sol` of every case.
+3. **Evaluate.** The best config is bound into the candidate's source
+   (`_KA_SWEEP_CONFIG`, the defaults of `build`) and that file goes through the
+   full evaluator in a fresh process, with every stage and anti-gaming guard
+   (including the checks outside the candidate's process), still under the
+   same lock acquisition. It is snapshotted and recorded like an
+   `evaluate_candidate` result: one record in `results.jsonl` with `config`
+   and the whole `sweep` table, one ledger row whose hypothesis ends with
+   `[sweep: BLOCK=1024, num_warps=4; best of 5/6 configs]`. Integration and
+   export use the bound snapshot, so they build what was measured. When no
+   config passes, the first failure is recorded instead (nothing more runs).
+
+A sweep counts as **one** evaluation for the budget and the advice, however
+many configs it times. Its configs get 3 × `--eval-timeout` (configs not
+checked by then are `skipped`, timing stops after the last whole round that
+fits) and the full evaluation the usual `--eval-timeout`. A config that kills
+its process or breaks the CUDA context (an illegal memory access) is reported
+as `crash` and the subprocess starts again without it (at most 3 processes).
+At most 64 configs per sweep; a dict of lists (`{"BLOCK": [512, 1024],
+"num_warps": [4, 8]}`) sweeps every combination. `kernel-agent eval capture.pt
+candidate.py --sweep configs.json` does the same interactively: the table on
+stderr, the JSON (with the full evaluation) on stdout.
+
+The prompts and `program.md` tell kernel engineers to tune block sizes,
+`num_warps`, `num_stages` and vector widths with one sweep per idea instead of
+one evaluation per value.
+
 ### GPUs and the GPU lock
 
 Every evaluation, worker command (`analyze`, `capture`, `e2e`) and peak
@@ -1001,6 +1054,7 @@ kernel-agent resume <run_dir> [--redo kernels] [--program FILE]
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]
                                        [--quick] [--timeout 300]
+                                       [--sweep configs.json [--max-configs 32]]
                                        (a full capture, e.g. <run_dir>/.truth/captures/<id>.pt)
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
@@ -1235,6 +1289,11 @@ def build(reference: torch.nn.Module) -> torch.nn.Module:
     same outputs, same in-place side effects, sharing its weights. Return
     `reference` for instances the kernel does not support."""
 ```
+
+Tuning parameters go in as keyword arguments with defaults, e.g.
+`def build(reference, BLOCK=1024, num_warps=4)`: the evaluator calls
+`build(reference)`, `sweep_candidate` tries configs of them (see "Parameter
+sweeps").
 
 If the model also calls the module through another entrypoint (the capture's
 cases say `"method": "forward_step"`), the replacement must implement that

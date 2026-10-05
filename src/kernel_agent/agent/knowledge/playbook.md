@@ -114,7 +114,13 @@ workload's tolerance is rejected.
 4. Cover every captured case (prefill AND decode shapes). Specialise per shape
    inside `forward` if needed (e.g. GEMV path for M ≤ 16, tensor-core path for
    larger M). Fall back to the reference math for shapes you do not handle.
-5. Keep the best version; record what you learned in `NOTES.md`.
+5. Tune with one sweep per idea: make block sizes, `num_warps`, `num_stages`
+   and vector widths keyword arguments of `build(reference, BLOCK=..., ...)`
+   and call `sweep_candidate` with the plausible grid (powers of two around
+   the row/tile size, 1-8 warps, 2-4 stages). It checks and times every config
+   in one GPU session and counts as one evaluation; a plain sweep beat agents
+   that measured one config per evaluation (InferenceBench: 11.5x vs 8.1x).
+6. Keep the best version; record what you learned in `NOTES.md`.
 
 ## 5. Host overhead matters for tiny kernels
 

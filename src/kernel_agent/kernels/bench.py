@@ -255,6 +255,17 @@ def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> d
     return {"iteration": kept["iteration"], "failures": [c for c in checks if not c.get("ok")]}
 
 
+def median_round(rounds: list[dict[str, Any]]) -> dict[str, Any]:
+    """The median of timing rounds (:func:`time_call` results), with ``spread``: the
+    range of the round medians relative to it."""
+    ordered = sorted(rounds, key=lambda r: r["median_ms"])
+    best = dict(ordered[len(ordered) // 2])
+    best["spread"] = (ordered[-1]["median_ms"] - ordered[0]["median_ms"]) / max(
+        best["median_ms"], 1e-9
+    )
+    return best
+
+
 def compare_timing(
     reference: Callable[..., Any],
     candidate: Callable[..., Any],
@@ -288,16 +299,7 @@ def compare_timing(
             )
         )
     kept = new_rounds[-1].pop("kept", None)
-
-    def pick(rs: list[dict[str, Any]]) -> dict[str, Any]:
-        ordered = sorted(rs, key=lambda r: r["median_ms"])
-        best = dict(ordered[len(ordered) // 2])
-        best["spread"] = (ordered[-1]["median_ms"] - ordered[0]["median_ms"]) / max(
-            best["median_ms"], 1e-9
-        )
-        return best
-
-    ref_t, new_t = pick(ref_rounds), pick(new_rounds)
+    ref_t, new_t = median_round(ref_rounds), median_round(new_rounds)
     if kept is not None:
         new_t["timed_output"] = check_timed_output(reference, kept)
     return ref_t, new_t

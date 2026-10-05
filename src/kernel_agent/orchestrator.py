@@ -427,7 +427,9 @@ class Orchestrator:
                         ),
                         system_append=system,
                         cwd=target_dir,
-                        mcp_tools=tool_names("evaluate_candidate", "best_result"),
+                        mcp_tools=tool_names(
+                            "evaluate_candidate", "sweep_candidate", "best_result"
+                        ),
                         add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
                     )
             if team:  # every worker session takes its own --parallel slot
@@ -534,7 +536,7 @@ class Orchestrator:
             prompt=prompt,
             system_append=system + digest,
             cwd=cwd,
-            mcp_tools=tool_names("evaluate_candidate", "best_result"),
+            mcp_tools=tool_names("evaluate_candidate", "sweep_candidate", "best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
             mcp_server=build_server(self.run, self.budget, self.truth, binding),
         )
@@ -1029,7 +1031,7 @@ class Orchestrator:
             ),
             system_append=system + digest,
             cwd=target_dir,
-            mcp_tools=tool_names("evaluate_candidate", "best_result"),
+            mcp_tools=tool_names("evaluate_candidate", "sweep_candidate", "best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
         )
 

@@ -181,6 +181,25 @@ def cmd_improve(ns: argparse.Namespace) -> int:
 def cmd_eval(ns: argparse.Namespace) -> int:
     from kernel_agent.kernels.evaluate import run_evaluation
 
+    if ns.sweep:  # many configs of build(reference, **config), the best fully evaluated
+        from kernel_agent.kernels import sweep
+
+        try:
+            configs, notes = sweep.configs_from(Path(ns.sweep).read_text(), ns.max_configs)
+        except (OSError, ValueError) as exc:
+            print(f"--sweep {ns.sweep}: {exc}", file=sys.stderr)
+            return 2
+        data = sweep.run_sweep(
+            Path(ns.capture),
+            Path(ns.candidate),
+            configs,
+            timeout=ns.timeout,
+            compile_check=ns.compile_check,
+        )
+        data["sweep"]["notes"] = notes
+        print(sweep.format_table(data), file=sys.stderr)
+        print(json.dumps(data, indent=2, default=str))
+        return 0 if data["evaluation"].get("correct") else 1
     result = run_evaluation(
         Path(ns.capture),
         Path(ns.candidate),
@@ -434,6 +453,13 @@ def main(argv: list[str] | None = None) -> int:
         "--quick", action="store_true", help="correctness on the smallest + largest case, untimed"
     )
     p.add_argument("--timeout", type=float, default=300.0, help="seconds before giving up")
+    p.add_argument(
+        "--sweep",
+        metavar="CONFIGS_JSON",
+        help="sweep build() keyword arguments: a JSON list of configs (or a dict of lists); "
+        "the best one is fully evaluated",
+    )
+    p.add_argument("--max-configs", type=int, default=None, help="--sweep: at most this many")
     p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser(
