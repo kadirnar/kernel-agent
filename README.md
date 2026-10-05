@@ -634,6 +634,18 @@ All limits are off by default (`kernel_agent/budget.py`).
   `--max-hours` (`--budget-reserve`) is kept for them. Each agent's own USD cap
   (`--budget`) is lowered to what is left of `--max-usd`. Time counts from the
   start of the current `optimize`/`resume` process; USD counts the whole run.
+  On a Claude subscription (`--auth subscription`, see "Authentication and
+  safety") the USD is Claude Code's notional estimate, so `--max-usd` is a
+  notional cap there; the limits that bind are time and sessions.
+* `--max-sessions N` stops starting agents once this process has started N
+  agent sessions (every kind: planner, kernel, worker, systems, research,
+  refactor, librarian), checked where `--max-hours` is. A session resumed after
+  a usage limit counts once.
+* A session that stops at a Claude usage or rate limit is not a failure: the
+  run waits until the limit resets and resumes the same session (see
+  "Authentication and safety"). The wait counts against `--max-hours` but not
+  against `--agent-minutes`. A limit that resets only after the time budget ends
+  stops new agents like a spent budget (`usage_limit_stop`).
 * `--agent-minutes` stops an agent session after that many minutes. The Claude
   Code subprocess is terminated. Its session id, turns and tool calls are still
   written to `costs.json`. Its USD cost is not, because Claude Code reports cost
@@ -654,7 +666,8 @@ All limits are off by default (`kernel_agent/budget.py`).
   `stop` ("within X % of speed of light"), unless it is flagged
   `suspicious_faster_than_sol` or `sol_unreliable` (see "Speed of light").
 * Timeouts and budget stops are recorded under `run.json` → `phases.<phase>`
-  (`timed_out`, `budget_skipped`), in `events.jsonl` and in `report.md`.
+  (`timed_out`, `budget_skipped`, `usage_limit`, `usage_limit_stop`), in
+  `events.jsonl` and in `report.md`.
 
 ### program.md: steering the agents
 
@@ -775,10 +788,13 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   capture first. With a run directory it continues that run, including one made
   by `optimize`. Ctrl-C leaves the run consistent: run the same command again
   and it continues. A slice that was running is recorded as `interrupted`
-  together with the evaluations it made. `--max-hours` and `--max-usd` are the
-  budget of this invocation: hours from now, and USD on top of what the run has
-  spent already. Without them the loop runs until every target has stopped.
-  `--agent-minutes` caps each slice.
+  together with the evaluations it made. `--max-hours`, `--max-usd` and
+  `--max-sessions` are the budget of this invocation: hours from now, USD on
+  top of what the run has spent already, and agent sessions from now. Without
+  them the loop runs until every target has stopped. `--agent-minutes` caps
+  each slice. A slice that hits a Claude usage limit waits for the reset and
+  continues (see "Authentication and safety"); `--auth` on a run directory
+  replaces the run's mode unless it is `auto`.
 * **Scheduler.** Every kernel target is an arm, and so is the systems agent
   (model-level transforms). The expected gain of an arm, in ms per model run,
   is `remaining_ms × headroom × 0.7^k`:
@@ -1214,6 +1230,8 @@ kernel-agent optimize <hf-url> [options]
   --no-transforms                      kernels only
   --claude-model claude-opus-5-5 --effort high --budget 10 (USD per agent)
   --max-hours 3 --max-usd 40           budget for the whole run (see "Budgets")
+  --max-sessions 30                    agent sessions this invocation may start
+  --auth subscription|api|auto         how agents authenticate (see "Authentication and safety")
   --agent-minutes 45                   time limit per agent session
   --eval-timeout 300                   seconds per evaluate_candidate
   --budget-reserve 0.15                share of --max-hours kept for integrate + report
@@ -1232,7 +1250,7 @@ kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
 kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4] [--rounds R]
   --integrate-every 4 --patience 5 --sol-stop 0.9 --target-hours 2 --speedup-goal 2
   --max-slices N --dry-run [--seed 0]  continuous loop (see "kernel-agent improve")
-kernel-agent resume <run_dir> [--redo kernels] [--program FILE]
+kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]
                                        [--quick] [--timeout 300]
@@ -1306,7 +1324,8 @@ runs/<org>--<name>/<timestamp>/
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md)
   improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
-  costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256
+  costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256,
+                              auth, api_key_source, billing (+ usage_limit_waits)
   optimized/                  apply.py + manifest.json + kernels/ (+ rewrites/ of region targets)
 ```
 
@@ -1579,11 +1598,56 @@ interactive Claude Code session instead of the autonomous pipeline.
 
 ## Authentication and safety
 
-The agents run through the Claude Agent SDK and use your Claude Code login
-or `ANTHROPIC_API_KEY`. By default they run with `bypassPermissions` inside
-the run directory, because they need to compile and run code without prompts.
-Use `--permission-mode acceptEdits` for a stricter setup. Agents never
-install or change torch/CUDA packages.
+The agents run through the Claude Agent SDK, which starts Claude Code. Claude
+Code uses `ANTHROPIC_API_KEY` (API billing) when it is set, and otherwise your
+Claude Code login. `--auth` makes the choice explicit
+(`kernel_agent/agent/auth.py`):
+
+* `--auth subscription`: every session runs on your Claude Code login (a
+  Claude subscription). `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the
+  `CLAUDE_CODE_USE_*` cloud-provider switches (Bedrock, Vertex, ...) are blanked
+  in the agent environment, so a key exported in your shell cannot switch the
+  run to API billing. Before the run starts, kernel-agent checks that a login
+  exists: `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`),
+  `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) or, on macOS, the keychain
+  item. It only checks that one of these is present and never reads it. Without
+  a login it stops with what to do: run `claude` and `/login`. A session whose
+  init message reports an `apiKeySource` other than `none` is stopped before its
+  first request, and so is the run. USD figures are Claude Code's estimate of
+  what the session would have cost on the API. `report.md`, `status` and the
+  dashboard label them "notional (subscription)".
+* `--auth api`: one of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or a
+  `CLAUDE_CODE_USE_*` provider must be set. A session that would fall back to
+  the Claude Code login is stopped.
+* `--auth auto` (default): whatever Claude Code finds, as before.
+
+Every session's mode, `apiKeySource` and billing (`subscription` or `api`) are
+written to `costs.json`. `run.json` → `config.auth` holds the mode the run was
+created with. `resume --auth` and `improve <run_dir> --auth` switch an existing
+run to another mode.
+
+**Usage limits.** A subscription has usage limits (5-hour and weekly windows).
+When a session hits one, Claude Code sends a `rate_limit_event` with status
+`rejected` and the reset time, an assistant message with `error: rate_limit`
+("You've hit your session limit · resets 3pm") and an error result (HTTP
+429). The SDK then raises. kernel-agent treats this as a pause instead of a
+failure. It records a `usage_limit` event, sleeps until the reset time plus
+one minute, and resumes the same Claude Code session ("The usage limit has
+reset. Continue the task ..."). The session keeps its evaluation count, and
+`costs.json` adds up the USD and turns of both runs. Without a reset time (a
+server-side 429), it backs off for 1, 2, 4, ... minutes, capped at 30. This
+works in every `--auth` mode. `optimize` continues the same phase, and
+`improve` continues the same slice: the loop does not count a limit as a failed
+session. If the reset comes after the end of `--max-hours`, or the session is
+still limited after 8 waits, the run stops starting agents
+(`usage_limit_stop`), and integrate and report run on what exists.
+`--max-sessions` and `--max-hours` are the budgets that matter on a
+subscription (see "Budgets").
+
+By default the agents run with `bypassPermissions` inside the run directory,
+because they need to compile and run code without prompts. Use
+`--permission-mode acceptEdits` for a stricter setup. Agents never install or
+change torch/CUDA packages.
 
 ## Development
 

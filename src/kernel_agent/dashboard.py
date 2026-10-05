@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import charts, ledger
+from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
 _warned = False
@@ -110,7 +111,11 @@ def write_dashboard(run: RunDir) -> Path:
             str(s["evaluations"]),
             f"{s['keeps']} kept · {s['failures']} failed",
         ),
-        ("agent cost", f"${s['cost_usd']:.2f}", f"{len(s['costs'])} agents"),
+        (
+            "agent cost",
+            f"${s['cost_usd']:.2f}",
+            f"{len(s['costs'])} agents" + (f" · {n}" if (n := auth.usd_note(s["costs"])) else ""),
+        ),
     ]
     tile_html = "".join(
         f'<div class="tile"><div class="label">{_e(label)}</div>'

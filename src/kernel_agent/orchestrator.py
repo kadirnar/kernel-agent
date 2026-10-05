@@ -35,7 +35,7 @@ from kernel_agent import (
     truth,
     workers,
 )
-from kernel_agent.agent import prompts
+from kernel_agent.agent import auth, prompts
 from kernel_agent.agent.runner import READ_TOOLS, AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import (
     best_for_target,
@@ -45,7 +45,7 @@ from kernel_agent.agent.tools import (
     record_candidate,
     tool_names,
 )
-from kernel_agent.budget import MIN_AGENT_USD, SOL_STOP_PCT, Budget
+from kernel_agent.budget import MIN_AGENT_SECONDS, MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.export import export_optimized
@@ -72,12 +72,15 @@ class Orchestrator:
         self.budget = Budget.from_config(run, cfg)
         self.truth = truth.of(run)  # digests of the evaluator's ground truth (truth.py)
         self.server = build_server(run, self.budget, self.truth)
-        self.env = agent_env(self.tc.env)
+        self.env = agent_env(self.tc.env, cfg.auth)  # --auth subscription: no API key vars
         self.python = sys.executable
         self.agent_results: list[AgentResult] = []
         self.phase = PHASES[0]
         # Replaced by `improve --dry-run` (simulated agent / GPU worker); None = the real ones.
         self.agent_runner: Callable[..., Awaitable[AgentResult]] | None = None
+        # Wall clock and sleep of the waits for a usage limit to reset (fakes in tests).
+        self.clock: Callable[[], float] = time.time
+        self.sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
         self.worker: Callable[..., dict[str, Any]] | None = None
         # The integration's re-check of a kernel (kernels/recheck.py); None = the real one,
         # which a simulated run (dryrun.py: no captures) skips.
@@ -99,6 +102,7 @@ class Orchestrator:
             raise SystemExit("no CUDA GPU detected; kernel-agent needs one")
         if cfg.program and not Path(cfg.program).expanduser().is_file():
             raise SystemExit(f"program file not found: {cfg.program}")
+        log(auth.preflight(cfg.auth))  # --auth: a login / API key exists (presence only)
         log(f"resolving {cfg.model_ref}")
         card = hub.resolve(cfg.model_ref, token=cfg.hf_token, modality=cfg.modality)
         log(
@@ -140,6 +144,8 @@ class Orchestrator:
         run = RunDir(root.resolve())
         data = run.load()
         cfg = OptimizeConfig.from_dict({**data["config"], **(overrides or {})})
+        if "dry_run" not in data:  # simulated runs have no agents
+            log(auth.preflight(cfg.auth))
         program.install(run, (overrides or {}).get("program"))  # keeps the run's edited copy
         return cls(run, cfg)
 
@@ -172,7 +178,9 @@ class Orchestrator:
     ) -> AgentResult:
         """Run an agent session; ``label`` keys its ``costs.json`` entry (default: ``name``),
         ``config`` overrides fields of the run's config for this session (e.g. the model),
-        ``mcp_server`` (in ``kwargs``) replaces the run's tools (a worker's, ``workers.py``)."""
+        ``mcp_server`` (in ``kwargs``) replaces the run's tools (a worker's, ``workers.py``).
+        A session stopped at a usage limit is resumed once the limit resets
+        (:meth:`_wait_for_limit`)."""
         server = kwargs.pop("mcp_server", None) or self.server
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
@@ -182,28 +190,43 @@ class Orchestrator:
         cfg = self.budget.agent_config(dataclasses.replace(self.cfg, **(config or {})))
         kwargs["system_append"] += self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
         kwargs["system_append"] += prog.prompt_note(name)
-        timer = asyncio.timeout(timeout)
-        try:
-            async with timer:
-                result = await (self.agent_runner or run_agent)(
-                    name,
-                    cfg=cfg,
-                    mcp_server=server,
-                    env=self.env,
-                    log_dir=self.run.root / "logs",
-                    result=result,
-                    **kwargs,
+        waits = 0
+        while True:
+            timer = asyncio.timeout(timeout)
+            try:
+                async with timer:
+                    result = await (self.agent_runner or run_agent)(
+                        name,
+                        cfg=cfg,
+                        mcp_server=server,
+                        env=self.env,
+                        log_dir=self.run.root / "logs",
+                        result=result,
+                        **kwargs,
+                    )
+            except TimeoutError:
+                if not timer.expired():
+                    raise
+                result.timed_out = True
+                log(f"agent {name}: stopped at its {(timeout or 0) / 60:.1f} min limit")
+                self.budget.note(
+                    self.phase, "timed_out", {"agent": name, "session_id": result.session_id}
                 )
-        except TimeoutError:
-            if not timer.expired():
+            except auth.AuthError as exc:  # --auth: the session would bill the wrong account
+                refused = {"agent": name, "api_key_source": result.api_key_source}
+                self.budget.note(self.phase, "auth_refused", {**refused, "reason": str(exc)})
                 raise
-            result.timed_out = True
-            log(f"agent {name}: stopped at its {(timeout or 0) / 60:.1f} min limit")
-            self.budget.note(
-                self.phase, "timed_out", {"agent": name, "session_id": result.session_id}
-            )
-        finally:
-            self.budget.end_agent(name)
+            finally:
+                self.budget.end_agent(name)
+            if result.usage_limit is None or result.timed_out:
+                break
+            if not await self._wait_for_limit(name, result, waits):
+                break
+            waits += 1
+            timeout = self.budget.start_agent(name, worked_s=result.seconds)
+            cfg = self.budget.agent_config(dataclasses.replace(self.cfg, **(config or {})))
+            if result.session_id:  # continue it (else the same prompt in a new session)
+                kwargs.update(prompt=auth.RESUME_PROMPT, resume=result.session_id)
         self.agent_results.append(result)
         ledger.event(
             self.run,
@@ -222,10 +245,41 @@ class Orchestrator:
             "tools": result.tool_calls,
             "session_id": result.session_id,
             "program_sha256": prog.sha256,
+            "auth": cfg.auth,
+            "api_key_source": result.api_key_source,
+            "billing": auth.billing(result.api_key_source, self.env),
             **({"timed_out": True} if result.timed_out else {}),
+            **({"usage_limit_waits": waits} if waits else {}),
+            **({"usage_limit": result.usage_limit.to_dict()} if result.usage_limit else {}),
         }
         write_json(self.run.root / "costs.json", costs)
         return result
+
+    async def _wait_for_limit(self, name: str, result: AgentResult, waits: int) -> bool:
+        """Sleep until the usage limit ``result`` stopped at resets (``auth.wait_seconds``)
+        and return True: the session is resumed. False when it resets only after the time
+        budget ends, or after ``auth.MAX_LIMIT_WAITS`` waits: the budget is then ``blocked``,
+        so no further agent starts and integrate + report run on what exists."""
+        limit = result.usage_limit
+        assert limit is not None
+        wait = auth.wait_seconds(limit, waits, self.clock())
+        left = self.budget.agent_seconds_left()
+        resume_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.clock() + wait))
+        item = {"agent": name, "session_id": result.session_id, **limit.to_dict()}
+        item.update(wait_min=round(wait / 60, 1), resume_at=resume_at)
+        if waits >= auth.MAX_LIMIT_WAITS:
+            why = f"still limited after {waits} waits"
+        elif left is not None and wait > left - MIN_AGENT_SECONDS:
+            why = f"it resets at {resume_at}, after the time budget ends"
+        else:
+            log(f"agent {name}: usage limit ({limit.message[:120]}); resuming at {resume_at}")
+            self.budget.note(self.phase, "usage_limit", item)
+            await self.sleep(wait)
+            return True
+        self.budget.blocked = f"usage limit: {why}"
+        log(f"agent {name}: {self.budget.blocked}; no further agent starts")
+        self.budget.note(self.phase, "usage_limit_stop", {**item, "reason": self.budget.blocked})
+        return False
 
     # ------------------------------------------------------------ phases
 

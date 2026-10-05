@@ -50,10 +50,14 @@ class OptimizeConfig:
     budget_usd_per_agent: float | None = None
     permission_mode: str = "bypassPermissions"
     allow_web: bool = True
+    #: How sessions authenticate (kernel_agent/agent/auth.py): "subscription" (the Claude
+    #: Code login only), "api" (an API key / cloud provider only) or "auto" (either).
+    auth: str = "auto"
 
     # Run budgets (kernel_agent/budget.py); None = unlimited.
     max_hours: float | None = None
-    max_usd: float | None = None
+    max_usd: float | None = None  # notional with --auth subscription
+    max_sessions: int | None = None  # agent sessions started by this process
     agent_minutes: float | None = None
     budget_reserve: float = 0.15  # share of max_hours kept for integrate + report
     eval_timeout_s: float = 300.0  # per evaluate_candidate subprocess

@@ -980,8 +980,10 @@ async def improve(
 ) -> RunDir:
     """``kernel-agent improve``: continue the run at ``ref`` or start one for a model.
 
-    ``cfg.max_hours`` / ``cfg.max_usd`` are the budget of this invocation: hours
-    from now, and USD on top of what the run has already spent.
+    ``cfg.max_hours`` / ``cfg.max_usd`` / ``cfg.max_sessions`` are the budget of this
+    invocation: hours from now, USD on top of what the run has already spent, and
+    agent sessions started from now. A usage limit is waited out inside the slice
+    (``Orchestrator._wait_for_limit``), so the loop survives it.
     """
     from kernel_agent import dryrun
     from kernel_agent.orchestrator import Orchestrator
@@ -997,6 +999,8 @@ async def improve(
         overrides: dict[str, Any] = {
             "max_hours": cfg.max_hours,
             "max_usd": cfg.max_usd,
+            "max_sessions": cfg.max_sessions,
+            **({"auth": cfg.auth} if cfg.auth != "auto" else {}),  # else the run's
             **{
                 k: getattr(cfg, k)
                 for k in ("agent_minutes", "program", "budget_usd_per_agent")

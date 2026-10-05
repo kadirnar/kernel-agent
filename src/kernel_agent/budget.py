@@ -4,7 +4,9 @@
   agent starts, :meth:`Budget.exhausted` checks the elapsed time and the sum of
   ``costs.json``; once the budget is spent the remaining agents are skipped, but
   integrate + report always run on whatever exists (``reserve`` of the time
-  budget is kept for them).
+  budget is kept for them). ``max_sessions`` limits the agent sessions this
+  process starts the same way, and a usage limit that resets only after the time
+  budget ends (``blocked``, :mod:`kernel_agent.agent.auth`) stops new agents too.
 * ``agent_minutes`` limits one agent session: the orchestrator wraps
   ``run_agent`` in ``asyncio.timeout`` (see :meth:`Budget.start_agent`), and
   each agent's ``max_budget_usd`` is lowered to the USD that is left.
@@ -165,11 +167,14 @@ class Budget:
     eval_timeout_s: float = 300.0
     kernel_evals: int | None = None
     transform_evals: int | None = None
+    max_sessions: int | None = None
     started: float = field(default_factory=time.monotonic)
     deadlines: dict[str, float] = field(default_factory=dict)
     evals: dict[str, int] = field(default_factory=dict)
     # agent -> evaluations in its results file when its plateau count restarted (a research plan)
     restarted: dict[str, int] = field(default_factory=dict)
+    sessions: int = 0  # agent sessions started by this process (a resumed one counts once)
+    blocked: str | None = None  # why no agent can run any more (a usage limit, auth.py)
 
     @classmethod
     def from_config(cls, run: RunDir, cfg: OptimizeConfig) -> Budget:
@@ -177,6 +182,7 @@ class Budget:
             run,
             max_hours=cfg.max_hours,
             max_usd=cfg.max_usd,
+            max_sessions=cfg.max_sessions,
             agent_minutes=cfg.agent_minutes,
             reserve=cfg.budget_reserve,
             eval_timeout_s=cfg.eval_timeout_s,
@@ -204,6 +210,10 @@ class Budget:
 
     def exhausted(self) -> str | None:
         """Why no further kernel/transform agent may start, or None."""
+        if self.blocked:
+            return self.blocked
+        if self.max_sessions is not None and self.sessions >= self.max_sessions:
+            return f"session budget spent ({self.sessions} of {self.max_sessions} agent sessions)"
         left = self.agent_seconds_left()
         if self.max_hours is not None and left is not None and left < MIN_AGENT_SECONDS:
             return (
@@ -221,16 +231,22 @@ class Budget:
 
     # -------------------------------------------------------- agent level
 
-    def start_agent(self, name: str) -> float | None:
-        """Register an agent session; returns its timeout in seconds (None = no limit)."""
+    def start_agent(self, name: str, worked_s: float | None = None) -> float | None:
+        """Register an agent session; returns its timeout in seconds (None = no limit).
+
+        ``worked_s``: the session is resumed after a usage limit and has run that long:
+        it is not a new session, that time counts against ``agent_minutes`` and its
+        evaluations so far still count."""
         limits = []
         if self.agent_minutes is not None:
-            limits.append(self.agent_minutes * 60)
+            limits.append(max(self.agent_minutes * 60 - (worked_s or 0.0), 0.0))
         left = self.agent_seconds_left()
         if left is not None:
             limits.append(max(left, MIN_AGENT_SECONDS))
         timeout = min(limits) if limits else None
-        self.evals[name] = 0
+        if worked_s is None:
+            self.sessions += 1
+            self.evals[name] = 0
         if timeout is None:
             self.deadlines.pop(name, None)
         else:

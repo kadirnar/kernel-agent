@@ -88,8 +88,10 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         budget_usd_per_agent=ns.budget,
         permission_mode=ns.permission_mode,
         allow_web=not ns.no_web,
+        auth=ns.auth,
         max_hours=ns.max_hours,
         max_usd=ns.max_usd,
+        max_sessions=ns.max_sessions,
         agent_minutes=ns.agent_minutes,
         budget_reserve=ns.budget_reserve,
         eval_timeout_s=ns.eval_timeout,
@@ -138,6 +140,8 @@ def cmd_resume(ns: argparse.Namespace) -> int:
         overrides["claude_model"] = ns.claude_model
     if ns.program:
         overrides["program"] = ns.program
+    if ns.auth:
+        overrides["auth"] = ns.auth
     orch = Orchestrator.resume(Path(ns.run_dir), overrides)
     if ns.redo:
         data = orch.run.load()
@@ -295,6 +299,17 @@ def cmd_watch(ns: argparse.Namespace) -> int:
     return 0
 
 
+def _add_auth_arg(p: argparse.ArgumentParser, default: str | None = "auto") -> None:
+    p.add_argument(
+        "--auth",
+        choices=["auto", "subscription", "api"],
+        default=default,
+        help="subscription: agents run on your Claude Code login only (API key variables "
+        "ignored, the login checked before the run); api: an API key or cloud provider "
+        "only; auto: whatever Claude Code finds (default)",
+    )
+
+
 def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="Hugging Face URL or repo id (org/name[@revision])")
     p.add_argument(
@@ -345,8 +360,16 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         choices=["bypassPermissions", "acceptEdits", "default"],
     )
     p.add_argument("--no-web", action="store_true", help="disable WebFetch/WebSearch for agents")
+    _add_auth_arg(p)
     p.add_argument("--max-hours", type=float, help="wall-clock budget for the whole run")
-    p.add_argument("--max-usd", type=float, help="USD budget for all agents together")
+    p.add_argument(
+        "--max-usd",
+        type=float,
+        help="USD budget for all agents together (notional with --auth subscription)",
+    )
+    p.add_argument(
+        "--max-sessions", type=int, help="agent sessions this invocation may start (all agents)"
+    )
     p.add_argument("--agent-minutes", type=float, help="time limit per agent session")
     p.add_argument(
         "--budget-reserve",
@@ -428,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--until", choices=["plan", "capture", "kernels", "transforms", "integrate"])
     p.add_argument("--claude-model")
     p.add_argument("--program", metavar="FILE", help="replace the run's program.md with FILE")
+    _add_auth_arg(p, default=None)  # None: the run's
     p.set_defaults(func=cmd_resume)
 
     p = sub.add_parser(

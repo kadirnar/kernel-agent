@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import abtest, ledger, library, projection, strong_baseline
+from kernel_agent.agent import auth
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
@@ -241,9 +242,10 @@ def write_report(run: RunDir) -> Path:
     lines += library.report_lines(run)  # prior winners reused, entries stored, lessons
     if costs:
         total = sum(c.get("usd", 0) for c in costs.values())
+        notional = auth.usd_note(costs)  # sessions on the Claude subscription: an estimate
         lines += [
             "",
-            f"## Agent usage (total ${total:.2f})",
+            f"## Agent usage (total ${total:.2f}{', ' + notional if notional else ''})",
             "",
             "| agent | $ | turns | min | tools |",
             "|---|---|---|---|---|",
@@ -258,7 +260,7 @@ def write_report(run: RunDir) -> Path:
     stops = [
         f"* {phase}: {key.replace('_', ' ')} `{item.get('agent')}` {item.get('reason') or ''}"
         for phase, info in data.get("phases", {}).items()
-        for key in ("timed_out", "budget_skipped")
+        for key in ("timed_out", "budget_skipped", "usage_limit_stop")
         for item in info.get(key, [])
     ]
     if stops:
