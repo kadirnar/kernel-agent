@@ -9,11 +9,17 @@ TTS heads fed back into an LM) are *chaotic*: any numerically-correct kernel
 change makes the free-running trajectory diverge.  Such workloads implement
 teacher forcing: the candidate replays the baseline trajectory and only its
 per-step predictions are compared, so errors cannot compound.
+
+What a run optimises is the workload's *metric* (``-o metric=``,
+:mod:`kernel_agent.objective`): the end-to-end latency by default, the time to the
+first audio chunk of a streaming run for ``metric=ttfa``. :func:`measure` returns its
+value as ``median_ms``.
 """
 
 from __future__ import annotations
 
 import contextlib
+import itertools
 import statistics
 import time
 from abc import ABC, abstractmethod
@@ -24,6 +30,7 @@ from typing import Any, ClassVar
 import torch
 from torch import nn
 
+from kernel_agent import objective
 from kernel_agent.hub import Modality
 
 DTYPES = {
@@ -91,10 +98,16 @@ class Workload(ABC):
     #: Per-output RMS tolerance of the free-running sanity check (default ±25 %),
     #: keyed like the output dict, e.g. ``{"audio": 0.6}``.
     sanity_rms_tolerance: ClassVar[dict[str, float]] = {}
+    #: Metrics :func:`measure` can time for this workload (``-o metric=``,
+    #: :mod:`kernel_agent.objective`). A streaming workload that calls :meth:`mark_chunk`
+    #: for every output chunk can add ``"ttfa"``.
+    metrics: ClassVar[tuple[str, ...]] = (objective.LATENCY,)
 
     def __init__(self, spec: WorkloadSpec) -> None:
         self.spec = spec
         self.options = {**self.defaults, **spec.options}
+        #: ``(time.perf_counter(), audio ms)`` of every chunk since the last timed run.
+        self.chunk_marks: list[tuple[float, float | None]] = []
 
     @property
     def device(self) -> torch.device:
@@ -203,6 +216,65 @@ class Workload(ABC):
             near_tie=float(self.options.get("stop_near_tie", STOP_NEAR_TIE)),
         )
 
+    @property
+    def metric(self) -> str:
+        """What :func:`measure` times (``-o metric=``, default ``latency``)."""
+        return str(self.options.get("metric") or objective.DEFAULT).lower()
+
+    def check_metric(self) -> None:
+        """Raise ``ValueError`` when this workload cannot time ``self.metric``."""
+        objective.check(self.metric, type(self).metrics, type(self).__name__)
+
+    @contextlib.contextmanager
+    def metric_window(self) -> Iterator[None]:
+        """Context in which :meth:`run` may stop once the metric's value is known (a
+        streaming workload: after the first chunk for ``metric=ttfa``). ``analyze``
+        profiles inside it, so the profile shows where the *metric's* time goes. The
+        default is the whole run."""
+        yield
+
+    def mark_chunk(self, audio_ms: float | None = None) -> None:
+        """Streaming workloads: an output chunk is available now (call it when the chunk
+        reaches the caller, e.g. on the host). GPU-synchronised. ``audio_ms``: the
+        duration of the chunk's audio, for the real-time factor."""
+        synchronize()
+        self.chunk_marks.append((time.perf_counter(), audio_ms))
+
+    def metric_value(self, start: float, end: float) -> tuple[float, dict[str, Any]]:
+        """``(value in ms, per-run details)`` of the metric for one run of :meth:`run`
+        that started at ``start`` and ended at ``end`` (``time.perf_counter()``, both
+        GPU-synchronised), with :attr:`chunk_marks` as marked during the run.
+
+        ``ttfa``: the first mark minus ``start``; the details hold the median latency of
+        the next ``steady_chunks`` chunks (``chunk_ms``), its real-time factor (``rtf``)
+        and the full run (``run_ms``). The extension point for new metrics (issue #74:
+        ``throughput``)."""
+        total = (end - start) * 1000
+        metric = self.metric
+        if metric == objective.LATENCY:
+            return total, {}
+        if metric != objective.TTFA:
+            raise NotImplementedError(f"metric={metric} is not implemented yet (issue #74)")
+        marks = self.chunk_marks
+        if not marks:
+            raise RuntimeError(
+                "metric=ttfa: the run produced no audio chunk (Workload.mark_chunk was never "
+                "called): the streaming path was bypassed"
+            )
+        k = int(self.options.get("steady_chunks", objective.STEADY_CHUNKS))
+        steady = marks[: k + 1]
+        gaps = [(b[0] - a[0]) * 1000 for a, b in itertools.pairwise(steady)]
+        chunk_ms = statistics.median(gaps) if gaps else None
+        audio = [a for _, a in steady[1:] if a]
+        rtf = chunk_ms / statistics.median(audio) if chunk_ms is not None and audio else None
+        return (marks[0][0] - start) * 1000, {
+            "run_ms": total,
+            "chunks": len(marks),
+            "steady_chunks": len(gaps),
+            "chunk_ms": chunk_ms,
+            "rtf": rtf,
+        }
+
     @contextlib.contextmanager
     def with_options(self, overrides: dict[str, Any] | None) -> Iterator[None]:
         """Apply option ``overrides`` (in place, so references to ``self.options``
@@ -228,8 +300,26 @@ def synchronize() -> None:
         torch.cuda.synchronize()
 
 
+def timed_run(workload: Workload, inputs: Any) -> tuple[Any, float, dict[str, Any]]:
+    """One GPU-synchronised run of ``workload.run``: ``(output, value of the workload's
+    metric in ms, its per-run details)`` (:meth:`Workload.metric_value`). The clock starts
+    before ``workload.run`` is called, so whatever a transform does around it counts."""
+    workload.chunk_marks.clear()
+    with torch.inference_mode():
+        synchronize()
+        start = time.perf_counter()
+        output = workload.run(inputs)
+        synchronize()
+        end = time.perf_counter()
+    ms, detail = workload.metric_value(start, end)
+    return output, ms, detail
+
+
 def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3) -> dict[str, Any]:
-    """Wall-clock latency of ``workload.run`` (GPU-synchronised), in milliseconds."""
+    """The workload's metric over ``iters`` GPU-synchronised runs after ``warmup`` untimed
+    ones, in milliseconds: the wall-clock latency of ``workload.run`` by default, the time
+    to first audio for ``metric=ttfa`` (:mod:`kernel_agent.objective`). ``median_ms`` is
+    the optimiser's objective; other metrics add ``metric_detail`` (medians over the runs)."""
     output = None
     if torch.cuda.is_available():
         # Same clock warm-up for baseline and optimised runs (fair comparison).
@@ -240,21 +330,24 @@ def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3)
         for _ in range(warmup):
             output = workload.run(inputs)
         synchronize()
-        times = []
-        for _ in range(iters):
-            start = time.perf_counter()
-            output = workload.run(inputs)
-            synchronize()
-            times.append((time.perf_counter() - start) * 1000)
-    return {
+    times, details = [], []
+    for _ in range(iters):
+        output, ms, detail = timed_run(workload, inputs)
+        times.append(ms)
+        details.append(detail)
+    result = {
         "median_ms": statistics.median(times),
         "min_ms": min(times),
         "times_ms": times,
+        "metric": workload.metric,
         "peak_mem_gb": torch.cuda.max_memory_allocated() / 1024**3
         if torch.cuda.is_available()
         else 0.0,
         "output": output,
     }
+    if workload.metric != objective.LATENCY:
+        result["metric_detail"] = objective.aggregate(details)
+    return result
 
 
 def cosine(a: torch.Tensor, b: torch.Tensor) -> float:

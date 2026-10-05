@@ -26,7 +26,7 @@ from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, projection
+from kernel_agent import ledger, objective, projection
 from kernel_agent.ledger import DISCARD, E2E, FAILURES, KEEP
 from kernel_agent.workspace import RunDir, read_json
 
@@ -704,7 +704,7 @@ def _draw_run(
 
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
     ax.set_xlabel("wall-clock time since the run started (min)")
-    ax.set_ylabel("end-to-end latency per run (ms, lower is better)")
+    ax.set_ylabel(f"{objective.of(baseline).label} (ms, lower is better)")
     data = run.load() if run.run_json.exists() else {}
     repo = (data.get("card") or {}).get("repo_id", run.root.name)
     final_ms = best[1]["new_ms"] if best else None
@@ -785,7 +785,8 @@ def target_shares(run: RunDir) -> list[tuple[str, str, float]]:
 
 def amdahl(run: RunDir, rows: list[dict[str, Any]] | None = None) -> Path | None:
     """``amdahl.png``: baseline time by target, before vs. after the best kernels."""
-    base_ms = _num((read_json(run.baseline_json, {}) or {}).get("median_ms"))
+    baseline = read_json(run.baseline_json, {}) or {}
+    base_ms = _num(baseline.get("median_ms"))
     shares = target_shares(run)
     if base_ms is None or not shares or not available():
         return None
@@ -797,7 +798,7 @@ def amdahl(run: RunDir, rows: list[dict[str, Any]] | None = None) -> Path | None
     return _render(
         run.root / "amdahl.png",
         (10.0, height),
-        lambda fig, ax: _draw_amdahl(ax, base_ms, shares, best, measured),
+        lambda fig, ax: _draw_amdahl(ax, base_ms, shares, best, measured, objective.of(baseline)),
     )
 
 
@@ -807,6 +808,7 @@ def _draw_amdahl(
     shares: list[tuple[str, str, float]],
     best: dict[str, float],
     measured: float | None,
+    metric: objective.Metric = objective.METRICS[objective.LATENCY],
 ) -> None:
     from matplotlib.patches import Patch
 
@@ -890,7 +892,7 @@ def _draw_amdahl(
     ax.tick_params(axis="y", length=0)
     ax.grid(axis="y", visible=False)
     ax.spines["left"].set_visible(False)
-    ax.set_xlabel("time per run (ms)")
+    ax.set_xlabel(f"time {metric.per} (ms)")
     covered = sum(s for _, _, s in shares)
     _header(
         ax,
@@ -988,14 +990,20 @@ def integration(run: RunDir) -> Path | None:
     if len(steps) < 3 or not available():
         return None
     singles = [h for h in data.get("history") or [] if len(h.get("items") or []) == 1]
+    metric = objective.of(read_json(run.baseline_json, {}))
     return _render(
         run.root / "integration.png",
         (max(7.0, 1.3 * len(steps) + 2.0), 5.4),
-        lambda fig, ax: _draw_integration(ax, steps, singles),
+        lambda fig, ax: _draw_integration(ax, steps, singles, metric),
     )
 
 
-def _draw_integration(ax: Any, steps: list[dict[str, Any]], singles: list[dict[str, Any]]) -> None:
+def _draw_integration(
+    ax: Any,
+    steps: list[dict[str, Any]],
+    singles: list[dict[str, Any]],
+    metric: objective.Metric = objective.METRICS[objective.LATENCY],
+) -> None:
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     from matplotlib.ticker import FuncFormatter
@@ -1097,7 +1105,7 @@ def _draw_integration(ax: Any, steps: list[dict[str, Any]], singles: list[dict[s
     ax.tick_params(axis="x", length=0)
     ax.grid(axis="x", visible=False)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
-    ax.set_ylabel("end-to-end latency per run (ms)")
+    ax.set_ylabel(f"{metric.label} (ms)")
     kept = sum(s["kind"] == "keep" for s in steps)
     dropped = [ledger.item_label(h["items"][0]) for h in singles if not h.get("passed")]
     rule = next((s["rule"] for s in steps if s.get("rule")), None)

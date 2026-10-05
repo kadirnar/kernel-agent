@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from kernel_agent import objective
 from kernel_agent.strong_baseline import headroom_note
 
 AGENT_DIR = Path(__file__).parent
@@ -536,7 +537,8 @@ Kernel engineers are separately replacing individual modules; you work on
 everything around them: decoding loop, caches, graph capture, layouts,
 redundant work, host synchronisation.
 
-Baseline: {baseline.get("median_ms", 0):.1f} ms per run ({baseline.get("workload")}).
+Baseline: {baseline.get("median_ms", 0):.1f} ms {objective.of(baseline).per} \
+({baseline.get("workload")}).
 {headroom_note(baseline)}
 {profile_summary}
 

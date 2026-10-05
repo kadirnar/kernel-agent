@@ -646,8 +646,13 @@ td.nowrap { white-space: nowrap; }
     if (run.running && run.start_ts) return nowTs() - run.start_ts;
     return run.elapsed_s;
   }
+  // what every ms measures (-o metric=, objective.py); older servers send none
+  function metricOf(sm) {
+    return sm.metric || { name: "latency", title: "End-to-end latency", short: "latency", per: "per run" };
+  }
   function renderTiles() {
     const sm = S.summary, run = sm.run, base = sm.baseline.eager_ms, comp = sm.baseline.compiled_ms;
+    const mt = metricOf(sm), tag = mt.name === "latency" ? "" : ` · ${mt.short}`;
     const m = sm.measured, proj = sm.projected_ms, c = sm.counts, total = sm.costs.total_usd;
     const nAgents = Object.keys(sm.costs.agents).length;
     const keptKernel = sm.targets.some((t) => t.keeps > 0);
@@ -657,9 +662,9 @@ td.nowrap { white-space: nowrap; }
     else if (run.phase === "report") state = "finished";
     else if (run.phase) state = `stopped after ${run.phase}`;
     const tiles = [
-      ["Baseline (eager)", fmt.ms(base),
+      [`Baseline (eager)${tag}`, fmt.ms(base),
         comp ? `torch.compile ${fmt.ms(comp)} (${fmt.x(base / comp)})` : run.workload || "not measured yet"],
-      ["Best end-to-end", m ? fmt.ms(m.ms) : "—",
+      [`Best end-to-end${tag}`, m ? fmt.ms(m.ms) : "—",
         m ? `${fmt.x(m.speedup)} vs eager${comp ? ` · ${fmt.x(comp / m.ms)} vs compiled` : ""} · ${m.label}`
           : "no passing end-to-end run yet"],
       ["Projected from kernels", keptKernel ? fmt.ms(proj) : "—",
@@ -699,7 +704,8 @@ td.nowrap { white-space: nowrap; }
 
   // ------------------------------------------------------------ end-to-end chart
   function drawE2E() {
-    const host = $("chart-e2e"), sm = S.summary, base = sm.baseline.eager_ms;
+    const host = $("chart-e2e"), sm = S.summary, base = sm.baseline.eager_ms, mt = metricOf(sm);
+    $("h-e2e").textContent = mt.title;
     $("legend-e2e").replaceChildren();
     if (base == null || sm.run.start_ts == null) {
       return empty(host, "Starts once the baseline is measured (analyze phase).");
@@ -725,7 +731,7 @@ td.nowrap { white-space: nowrap; }
     lo = Math.max(lo - 0.15 * span, 0);
     hi += 0.1 * span;
     const narrow = host.clientWidth < 560;
-    const f = frame(host, "e2e", "End-to-end latency over wall-clock time; arrow keys walk the points",
+    const f = frame(host, "e2e", `${mt.title} over wall-clock time; arrow keys walk the points`,
       { height: narrow ? 270 : 330, left: 54, top: 24, bottom: 34, right: 18 });
     const xs = linear(0, tMax, f.x0, f.x1), ys = linear(lo, hi, f.y0, f.y1);
 
@@ -934,7 +940,7 @@ td.nowrap { white-space: nowrap; }
     const f = frame(host, "integration", "Integration waterfall; arrow keys walk the steps",
       { height: steps.length * rowH + 34, left: labelW, top: 6, bottom: 28, right: narrow ? 64 : 92 });
     const xs = linear(0, base * 1.02, f.x0, f.x1);
-    axes(f, xs, () => 0, ticks(0, base, narrow ? 3 : 5), [], (v) => num(v, 0), null, "ms per run");
+    axes(f, xs, () => 0, ticks(0, base, narrow ? 3 : 5), [], (v) => num(v, 0), null, `ms ${metricOf(S.summary).per}`);
     const defs = svg("defs", {}, svg("pattern", { id: "hatch", width: 5, height: 5, patternUnits: "userSpaceOnUse",
       patternTransform: "rotate(45)" }, svg("line", { x1: 0, y1: 0, x2: 0, y2: 5, class: "hatch" })));
     const g = svg("g", {});

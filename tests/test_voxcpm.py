@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from kernel_agent.workloads import create_workload, stopping
-from kernel_agent.workloads.base import WorkloadSpec
+from kernel_agent.workloads.base import WorkloadSpec, measure, timed_run
 from kernel_agent.workloads.voxcpm import NATURAL_TEXT, VoxCPMWorkload
 
 
@@ -48,10 +48,8 @@ class FakeVoxCPM(nn.Module):
         self.bypass = False
         self.ignore_stop = False
 
-    def generate(self, target_text, min_len, max_len, **kwargs):
-        self.calls.append({"text": target_text, "min_len": min_len, "max_len": max_len, **kwargs})
+    def _patches(self, min_len, max_len):
         x = torch.zeros(1, 4)
-        feats = []
         for i in range(max_len):
             if self.bypass:
                 pred = torch.tanh(x).unsqueeze(-1).expand(-1, -1, 2)
@@ -59,13 +57,40 @@ class FakeVoxCPM(nn.Module):
                 pred = self.feat_decoder(
                     mu=self.lm(x) * 3, patch_size=2, cond=None, n_timesteps=10, cfg_value=2.0
                 )
-            feats.append(pred)
+            yield pred
             # as VoxCPM: the stop head on the state that produced this patch, every patch
             logits = self.stop_head(torch.cat([x, torch.full((1, 1), float(i))], -1))
             if i > min_len and int(logits.argmax(-1)[0]) == 1 and not self.ignore_stop:
                 break
             x = pred.mean(-1)
+
+    def generate(self, target_text, min_len, max_len, **kwargs):
+        self.calls.append({"text": target_text, "min_len": min_len, "max_len": max_len, **kwargs})
+        feats = list(self._patches(min_len, max_len))
         return torch.cat(feats, -1).flatten().repeat(64).unsqueeze(0)  # "wav" [1, T]
+
+    # metric=ttfa: VoxCPM's streaming path, one audio chunk per patch
+    stream_all_at_once = False  # an `_inference` that ignores streaming=True
+    vae_broken = False  # a decoder that `streaming_decode()` cannot drive
+    loop_broken = False  # an `_inference` whose streaming branch crashes
+
+    def decode_chunk(self, pred):
+        if self.vae_broken:
+            raise RuntimeError("Expected 3-D tensors, but got 4-D for tensor number 1")
+        return pred.flatten().repeat(64).unsqueeze(0)  # [1, 512] per patch
+
+    def generate_streaming(self, target_text, min_len, max_len, **kwargs):
+        self.calls.append(
+            {"text": target_text, "min_len": min_len, "max_len": max_len, **kwargs, "stream": 1}
+        )
+        patches = self._patches(min_len, max_len)
+        if self.stream_all_at_once:
+            yield self.decode_chunk(torch.cat(list(patches), -1))
+            return
+        for i, pred in enumerate(patches):
+            if self.loop_broken and i == 3:
+                raise IndexError("streaming branch lost")
+            yield self.decode_chunk(pred)
 
 
 @pytest.fixture
@@ -168,6 +193,76 @@ def test_natural_length_run_lets_the_stop_head_decide(fake):
     cmp = fake.compare_natural_length(ref, never)
     assert never["steps"] == 100 and not cmp.passed and "never fires" in cmp.reason
     assert fake.run(fake.make_inputs())["latents"].shape[0] == 20  # ... passes the main run
+
+
+# ---------------------------------------------------------------- metric=ttfa (streaming)
+
+
+@pytest.fixture
+def streaming(fake, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)  # CPU timing
+    fake.options["metric"] = "ttfa"
+    return fake
+
+
+def test_ttfa_run_streams_and_marks_every_chunk(streaming):
+    inputs = streaming.make_inputs()
+    out, ms, detail = timed_run(streaming, inputs)
+    call = streaming.model.calls[-1]
+    assert call["stream"] == 1 and call["min_len"] == call["max_len"] == 20
+    assert call["retry_badcase"] is False and call["retry_badcase_ratio_threshold"] >= 20
+    assert out["latents"].shape == (20, 1, 4, 2) and out["audio"].numel() == 20 * 512
+    assert detail["chunks"] == 20 and detail["steady_chunks"] == 8
+    assert 0 < ms <= detail["run_ms"]
+    assert detail["rtf"] == pytest.approx(detail["chunk_ms"] / 32.0)  # 512 samples at 16 kHz
+    assert "forward" not in vars(streaming.model.feat_decoder)  # every hook removed
+
+    # quality: the full streamed output, teacher forced like the non-streaming run
+    forced = streaming.run_teacher_forced(inputs, out)
+    cmp = streaming.compare_teacher_forced(out, forced)
+    assert cmp.passed and cmp.metrics["min_step_cosine"] == 1.0
+
+    timing = measure(streaming, inputs, warmup=0, iters=2)
+    assert timing["metric"] == "ttfa" and timing["median_ms"] < timing["metric_detail"]["run_ms"]
+    assert timing["metric_detail"]["chunks"] == 20
+
+
+def test_ttfa_metric_window_stops_after_the_first_chunk(streaming):
+    with streaming.metric_window():
+        out = streaming.run(streaming.make_inputs())
+    assert out["latents"].shape[0] == 1 and out["audio"].numel() == 512
+    assert streaming.run(streaming.make_inputs())["latents"].shape[0] == 20  # the full run again
+
+
+def test_ttfa_natural_length_run_streams(streaming):
+    ref = streaming.natural_length_run()
+    assert ref["steps"] == 13 and streaming.model.calls[-1]["stream"] == 1
+    assert streaming.compare_natural_length(ref, streaming.natural_length_run(ref)).passed
+
+
+def test_ttfa_rejects_a_broken_streaming_path(streaming):
+    inputs = streaming.make_inputs()
+    model = streaming.model
+    model.stream_all_at_once = True  # an `_inference` that ignores streaming=True
+    with pytest.raises(RuntimeError, match=r"1 audio chunk\(s\) for 20 generated patches"):
+        streaming.run(inputs)
+    model.stream_all_at_once, model.vae_broken = False, True  # e.g. a channels-last decoder
+    with pytest.raises(RuntimeError, match=r"AudioVAE decode failed \(RuntimeError: .*4-D"):
+        streaming.run(inputs)
+    model.vae_broken, model.loop_broken = False, True
+    with pytest.raises(RuntimeError, match=r"`_inference\(streaming=True\)`\) failed \(IndexError"):
+        streaming.run(inputs)
+    assert "forward" not in vars(model.feat_decoder)
+    model.loop_broken = False
+    assert streaming.run(inputs)["latents"].shape[0] == 20
+
+    def oom(**kwargs):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+        yield
+
+    model.generate_streaming = oom  # the GPU, not the streaming path: not reworded
+    with pytest.raises(torch.OutOfMemoryError, match=r"^CUDA out of memory$"):
+        streaming.run(inputs)
 
 
 # ---------------------------------------------------------------- GPU calibration
@@ -287,8 +382,10 @@ def test_voxcpm2_teacher_forcing_calibration(tmp_path):
         assert not bad["passed"] and bad["reason"].startswith("teacher-forced"), bad
 
 
-#: Verbatim copies of two decode-loop transforms by the systems agent of a live VoxCPM2
-#: run (runs/openbmb--VoxCPM2/20261005-042829/transforms/); both keep the stop semantics.
+#: Verbatim copies of transforms by the systems agent of a live VoxCPM2 run
+#: (runs/openbmb--VoxCPM2/20261005-042829/transforms/): two decode loops, which keep the stop
+#: semantics and the streaming branch, and vae_channels_last (a channels-last AudioVAE
+#: decoder, which `audio_vae.streaming_decode()` cannot drive).
 STOP_TRANSFORMS = Path(__file__).with_name("voxcpm_transforms")
 #: async_stop_loop's stop check, and two broken versions of it.
 STOP_CHECK = (
@@ -362,3 +459,78 @@ def test_voxcpm2_natural_length_checks_the_stop_condition(tmp_path):
         assert not wl.compare_natural_length(ref, out).passed
     _, cmp = verdict()  # late_stop was undone
     assert cmp.passed, cmp
+
+
+#: A transform whose `_inference` ignores `streaming=True`: every patch comes at the end.
+IGNORE_STREAMING = """
+import types
+
+
+def apply(workload):
+    model = workload.model
+    original = type(model)._inference
+
+    def _inference(self, *args, streaming=False, **kwargs):
+        yield from original(self, *args, streaming=False, **kwargs)
+
+    model._inference = types.MethodType(_inference, model)
+"""
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _voxcpm2_cached(), reason="needs voxcpm + openbmb/VoxCPM2 in the HF cache")
+def test_voxcpm2_time_to_first_audio(tmp_path):
+    from kernel_agent.integrate.patcher import PatchReport, apply_transforms
+    from kernel_agent.integrate.undo import Undo
+    from kernel_agent.workloads.base import compare_audio
+    from kernel_agent.workloads.quality import assess
+
+    patches = 16
+    options = {"metric": "ttfa", "patches": patches}
+    wl = create_workload(WorkloadSpec("openbmb/VoxCPM2", "tts", family="voxcpm", options=options))
+    wl.load()
+    inputs = wl.make_inputs()
+    timing = measure(wl, inputs, warmup=1, iters=3)
+    ref, detail = timing.pop("output"), timing["metric_detail"]
+    assert timing["metric"] == "ttfa" and detail["chunks"] == patches == ref["latents"].shape[0]
+    assert ref["audio"].numel() == patches * 7680  # 160 ms of 48 kHz audio per patch
+    # the first chunk comes after one patch (+ the prefill), not after all of them
+    assert timing["median_ms"] < detail["run_ms"] / 5, timing
+    assert detail["steady_chunks"] == 8 and 0 < detail["rtf"] < 1.5, detail  # eager: 0.6
+
+    # the streamed audio is the non-streaming audio: the same trajectory, a stateful decoder
+    with wl.with_options({"metric": "latency"}), torch.inference_mode():
+        full = wl.run(inputs)
+    assert torch.equal(full["latents"], ref["latents"])
+    cmp = compare_audio(full["audio"], ref["audio"], min_spec_cosine=0.999)
+    assert cmp.passed and float(cmp.metrics["waveform_cosine"]) > 0.9999, cmp
+
+    # quality of the streamed output: the unmodified model replays itself exactly
+    verdict = assess(wl, inputs, ref, ref, chaotic=True)
+    assert verdict["passed"] and verdict["metrics"]["teacher_forced"]["min_step_cosine"] == 1.0
+
+    def streamed(transform: Path) -> dict[str, Any]:
+        handles: list[Undo] = []
+        try:
+            apply_transforms(wl, [transform], PatchReport(), handles=handles)
+            with torch.inference_mode():
+                out = wl.run(inputs)
+            return assess(wl, inputs, ref, out, chaotic=True)
+        finally:
+            for handle in reversed(handles):
+                handle.undo()
+
+    # the live run's decode loops implement the streaming branch
+    for name in ("async_stop_loop.py", "skip_dead_work.py"):
+        verdict = streamed(STOP_TRANSFORMS / name)
+        assert verdict["passed"], (name, verdict)
+    (tmp_path / "ignore_streaming.py").write_text(IGNORE_STREAMING)
+    with pytest.raises(RuntimeError, match=rf"1 audio chunk\(s\) for {patches} generated patches"):
+        streamed(tmp_path / "ignore_streaming.py")
+    assert streamed(STOP_TRANSFORMS / "skip_dead_work.py")["passed"]  # undone: works again
+
+    # its channels-last AudioVAE decoder breaks `streaming_decode()`: rejected with the reason
+    # (last: the transform removes the weight norm in place)
+    apply_transforms(wl, [STOP_TRANSFORMS / "vae_channels_last.py"], PatchReport())
+    with pytest.raises(RuntimeError, match="the streaming AudioVAE decode failed"):
+        wl.run(inputs)

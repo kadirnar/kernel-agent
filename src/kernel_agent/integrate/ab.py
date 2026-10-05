@@ -17,18 +17,15 @@ transform again when it defines its own ``undo()``.
 from __future__ import annotations
 
 import statistics
-import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from kernel_agent.integrate.patcher import KernelPatch, PatchReport, apply_kernels, apply_transforms
 from kernel_agent.integrate.undo import Undo
-from kernel_agent.workloads.base import synchronize
+from kernel_agent.workloads import base
 from kernel_agent.workloads.holdout import outputs_equal
 
 
@@ -127,13 +124,10 @@ class Session:
 
 
 def timed_run(workload: Any, inputs: Any) -> tuple[Any, float]:
-    """One synchronised end-to-end run: (output, ms)."""
-    with torch.inference_mode():
-        synchronize()
-        start = time.perf_counter()
-        output = workload.run(inputs)
-        synchronize()
-    return output, (time.perf_counter() - start) * 1000
+    """One synchronised end-to-end run: (output, value of the workload's metric in ms;
+    the latency by default, see ``objective.py``)."""
+    output, ms, _ = base.timed_run(workload, inputs)
+    return output, ms
 
 
 @dataclass

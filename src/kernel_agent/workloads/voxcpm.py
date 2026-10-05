@@ -28,6 +28,16 @@ original.  A transform that captures the whole step (LM + decoder) in one CUDA
 graph, or calls ``generate`` more than once per run, cannot be teacher-forced
 and is rejected with a clear reason.  The model runs in its checkpoint dtype
 (``config.json``, bfloat16 for VoxCPM2); ``--dtype`` is ignored.
+
+``-o metric=ttfa`` (:mod:`kernel_agent.objective`) optimises the time to first audio:
+``run`` goes through VoxCPM's streaming path, ``generate_streaming``
+(``_inference(streaming=True)`` yields every patch latent as it is generated, the
+stateful ``audio_vae.streaming_decode()`` decodes it to one audio chunk), and marks
+every chunk on arrival. The output is the concatenated chunks plus the latents, so
+teacher forcing, the held-out input and the natural-length run judge the full streamed
+output exactly as they judge the non-streaming one. A transform that breaks the
+streaming path (an ``_inference`` without its streaming branch, an AudioVAE decoder
+that ``streaming_decode()`` cannot drive) is rejected with a clear reason.
 """
 
 from __future__ import annotations
@@ -35,12 +45,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import traceback
 from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
 from torch import nn
 
+from kernel_agent import objective
 from kernel_agent.hub import Modality
 from kernel_agent.workloads.base import Comparison, Workload, compare_audio, compare_steps
 
@@ -96,6 +108,9 @@ class VoxCPMWorkload(Workload):
     # A diverged (but correct) free run is another plausible sample: its audio
     # loudness varies more than its latents (different seeds: x0.52 .. x1.54).
     sanity_rms_tolerance = {"audio": 0.6}
+    # `-o metric=ttfa`: the streaming path (`_stream`), time to the first audio chunk.
+    metrics = (objective.LATENCY, objective.TTFA)
+    _first_chunk_only = False  # inside `metric_window()` (metric=ttfa)
 
     def load(self) -> None:
         from huggingface_hub import snapshot_download
@@ -204,7 +219,8 @@ class VoxCPMWorkload(Workload):
         # `min_patches` (natural_length_run only): the stop head may end the run early.
         min_len = self.options.get("min_patches")
         torch.manual_seed(int(self.options["seed"]))
-        wav: torch.Tensor = self.model.generate(
+        generate = self._stream if self.metric == objective.TTFA else self.model.generate
+        wav: torch.Tensor = generate(
             target_text=text,
             min_len=n if min_len is None else int(min_len),
             max_len=n,
@@ -215,6 +231,55 @@ class VoxCPMWorkload(Workload):
             retry_badcase_ratio_threshold=float(n),
         )
         return wav
+
+    @contextlib.contextmanager
+    def metric_window(self) -> Iterator[None]:
+        """``metric=ttfa``: :meth:`run` stops after the first audio chunk."""
+        if self.metric != objective.TTFA:
+            yield
+            return
+        self._first_chunk_only = True
+        try:
+            yield
+        finally:
+            self._first_chunk_only = False
+
+    def _stream(self, **kwargs: Any) -> torch.Tensor:
+        """``metric=ttfa``: ``model.generate_streaming(**kwargs)``, every chunk marked on
+        arrival (:meth:`mark_chunk`; VoxCPM hands it over on the host). Returns the chunks
+        concatenated. The streaming path must yield one chunk per generated patch."""
+        chunks: list[torch.Tensor] = []
+        patches = 0
+
+        def count(pred: torch.Tensor) -> torch.Tensor:
+            nonlocal patches
+            patches += 1
+            return pred
+
+        with self._decoder_hook(count):
+            stream = self.model.generate_streaming(**kwargs)
+            try:
+                for chunk in stream:
+                    chunks.append(chunk)
+                    self.mark_chunk(audio_ms=1000.0 * chunk.shape[-1] / self.sampling_rate)
+                    if self._first_chunk_only:
+                        break
+            except torch.OutOfMemoryError:
+                raise  # the GPU, not the streaming path
+            except Exception as exc:
+                raise RuntimeError(_streaming_failure(exc)) from exc
+            finally:
+                stream.close()
+        if not chunks:
+            raise RuntimeError("metric=ttfa: the streaming path yielded no audio chunk")
+        if patches and len(chunks) != patches and not self._first_chunk_only:
+            raise RuntimeError(
+                f"metric=ttfa: the streaming path yielded {len(chunks)} audio chunk(s) for "
+                f"{patches} generated patches: `_inference(streaming=True)` must yield every "
+                "patch latent as soon as it is generated (an `_inference` replacement that "
+                "ignores `streaming=True` hands over all patches at the end of the run)"
+            )
+        return torch.cat(chunks, dim=-1)
 
     def run(self, inputs: str) -> dict[str, Any]:
         latents: list[torch.Tensor] = []
@@ -284,3 +349,26 @@ class VoxCPMWorkload(Workload):
         if not decoded.passed:
             reasons.append(f"audio decoded from the reference latents: {decoded.reason}")
         return Comparison(steps.passed and decoded.passed, metrics, "; ".join(reasons))
+
+
+def _streaming_failure(exc: BaseException) -> str:
+    """A clear reason for a failure of VoxCPM's streaming path (``metric=ttfa``)."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    message = " ".join(str(exc).split())
+    what = f"{type(exc).__name__}: {message}"[:500]
+    if any(f.name == "decode_chunk" or "audiovae" in f.filename for f in frames):
+        return (
+            f"metric=ttfa: the streaming AudioVAE decode failed ({what}). "
+            "`audio_vae.streaming_decode()` decodes one patch at a time and carries the "
+            "causal-convolution state between chunks by replacing the `forward` of every "
+            "CausalConv1d / CausalTransposeConv1d in `audio_vae.decoder` with one that takes "
+            "[B, C, T] tensors: a transform that changes the decoder's tensor layout or the "
+            "forwards of those modules (a channels-last 4-D decoder, say) must keep that path "
+            "working"
+        )
+    return (
+        f"metric=ttfa: VoxCPM's streaming path (`generate_streaming` -> "
+        f"`_inference(streaming=True)`) failed ({what}); a transform that replaces "
+        "`_inference` must keep its streaming branch working (yield every patch latent as "
+        "soon as it is generated)"
+    )

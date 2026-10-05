@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from kernel_agent import charts, ledger, projection
+from kernel_agent import charts, ledger, objective, projection
 from kernel_agent.ledger import E2E, FAILURES, KEEP
 from kernel_agent.workspace import TRUTH_DIR, RunDir
 
@@ -466,6 +466,8 @@ class Watcher:
                     "compiled_ms": charts._compiled_ms(baseline),
                     "times_ms": baseline.get("times_ms"),
                 },
+                # what every ms measures (-o metric=, objective.py): headings, axes
+                "metric": objective.as_dict(objective.of(baseline)),
                 "projected_ms": proj.projected_ms if base_ms else None,
                 "projection": {
                     **proj.as_dict(),

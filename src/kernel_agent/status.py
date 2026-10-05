@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from typing import Any
 
-from kernel_agent import ledger, strong_baseline
+from kernel_agent import ledger, objective, strong_baseline
 from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
@@ -50,6 +50,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
     lines = [
         f"{s['repo_id']} ({s['modality'] or '?'})  ·  phase: {phase}{elapsed}",
         f"run: {s['root']}",
+        *([line[:width]] if (line := objective.describe(s["baseline"])) else []),  # metric=ttfa
         "",
     ]
 
