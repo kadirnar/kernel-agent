@@ -86,8 +86,9 @@ version is saved as `logs/program-<sha12>.md`.
 * Fix compile errors and wrong results with a short local script (import,
   `build()`, one call on the captured inputs) before you spend an evaluation.
   Fix rounds are not experiments.
-* Judge a direction by its ceiling (memory-bandwidth or launch-overhead
-  floor), not by its first attempt. When the advice is `consider_stopping`,
+* Judge a direction by its ceiling (every result has `sol_ms`, `pct_of_sol`
+  and `bound`: the memory-bandwidth, compute or launch-overhead floor),
+  not by its first attempt. When the advice is `consider_stopping`,
   re-read `NOTES.md` and switch to a fundamentally different idea (fusion
   boundary, algorithm, backend), or finish. Do not tune parameters below the
   noise.

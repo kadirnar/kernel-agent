@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent.gpulock import gpu_lock
+from kernel_agent.kernels.roofline import annotate, ensure_peaks
 
 COMPILE_MARKER = "@@KA_COMPILE_S@@"  # on stderr, so a timed-out run still reports it
 
@@ -257,6 +258,8 @@ def evaluate(
         ref_ms_weighted=round(ref_total, 4),
         new_ms_weighted=round(new_total, 4),
     )
+    # speed of light per case (after timing, never inside it): sol_ms, pct_of_sol, bound
+    annotate(result, reference, cases, l2_flush=l2_flush)
     if profile:
         try:
             first = cases[0]
@@ -313,6 +316,7 @@ def run_evaluation(
     if compile_baseline:
         cmd.append("--compile-baseline")
     with gpu_lock():
+        ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:

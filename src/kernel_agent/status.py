@@ -13,6 +13,10 @@ def _ms(value: float | None, nd: int = 1) -> str:
     return "—" if value is None else f"{value:,.{nd}f} ms"
 
 
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:.0f} %"
+
+
 def _x(value: float | None) -> str:
     return "—" if value is None else f"{value:.2f}x"
 
@@ -74,6 +78,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
             str(t["keeps"]),
             str(t["failures"]),
             _x(t["best_speedup"]),
+            _pct(t.get("best_pct_of_sol")),
             _ms(t["est_saved_ms"]),
             t["last_hypothesis"] or "",
         ]
@@ -94,6 +99,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
                         default=None,
                     )
                 ),
+                "—",
                 _ms(best["est_saved_ms"]) if best else "—",
                 e2e[-1]["hypothesis"] or "",
             ]
@@ -106,10 +112,11 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
             "kept",
             "failed",
             "best",
+            "% SOL",
             "est. saved",
             "last hypothesis",
         ]
-        lines += _table(headers, rows, {2, 3, 4, 5, 6}, width)
+        lines += _table(headers, rows, {2, 3, 4, 5, 6, 7}, width)
     else:
         lines.append("no evaluations yet")
 

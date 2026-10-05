@@ -87,6 +87,9 @@ class Orchestrator:
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         )
+        from kernel_agent.kernels.roofline import ensure_peaks
+
+        ensure_peaks(verbose=True)  # roofline peaks for toolchain.json + prompts (cached)
         write_json(run.toolchain_json, tc.to_dict())
         program.install(run, cfg.program)
         log(f"run directory: {run.root}")

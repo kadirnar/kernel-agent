@@ -10,10 +10,17 @@ Classify every hot spot before choosing a technique:
 | **Memory bound** | Elementwise / norm / softmax / GEMV (M=1..16) / attention decode; arithmetic intensity < ~50 FLOP/byte | Read every byte once: fusion, vectorised 128-bit loads, keep intermediates in registers/SMEM, lower precision weights, split-K / split-KV for parallelism |
 | **Compute bound** | Large GEMM / conv / prefill attention; tensor-core kernels dominate | Tensor cores with the right MMA, tiling + pipelining (cp.async / TMA), epilogue fusion (bias, activation, residual, quantisation), FlashAttention-style tiling |
 
-Roofline numbers: achieved bandwidth = bytes moved / time; compare with the GPU
-peak (consumer Blackwell RTX 50xx ≈ 0.9 TB/s on a 5070 Ti, Hopper ≈ 3.3 TB/s).
-If a memory-bound kernel already reaches > 80 % of peak bandwidth, stop
-optimising it and fuse it with its neighbours instead.
+Roofline numbers: the evaluator does this for you. Peak copy bandwidth (DRAM
+and L2), dense matmul TFLOP/s per dtype and the launch floor are measured on
+this GPU (see "measured peaks" in the toolchain section), and every timed
+result reports per case `flops`, `min_bytes` (what the reference must read and
+write at least once), `sol_ms` = max(FLOPs / peak, bytes / bandwidth),
+`pct_of_sol` and `bound`. Achieved bandwidth = `min_bytes` / `new_ms`. A
+`memory` case at ≥ 80 % of SOL is done: fuse it with its neighbours instead.
+For a `launch` case the work is smaller than one launch from Python: only
+fewer launches and less host work per call help. Cases that fit in L2
+(`l2_resident`) are compared with the L2 bandwidth, because the benchmark runs
+them with a warm cache.
 
 ## 2. Hot paths by model family
 

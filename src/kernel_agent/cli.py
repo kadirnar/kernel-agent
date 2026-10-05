@@ -40,6 +40,10 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
     from kernel_agent import toolchain
 
     tc = toolchain.setup()
+    if tc.gpu is not None and not ns.no_peaks:
+        from kernel_agent.kernels.roofline import ensure_peaks
+
+        ensure_peaks(remeasure=ns.remeasure_peaks, verbose=True)  # cached per GPU + torch
     print(tc.summary())
     if ns.smoke:
         from kernel_agent.selftest import smoke_backends
@@ -252,6 +256,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("doctor", help="show GPU / compiler / backend status")
     p.add_argument("--smoke", action="store_true", help="compile and run a kernel per backend")
+    p.add_argument(
+        "--remeasure-peaks", action="store_true", help="measure the roofline peaks again"
+    )
+    p.add_argument("--no-peaks", action="store_true", help="do not measure missing peaks")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("optimize", help="full pipeline: profile, plan, write kernels, integrate")

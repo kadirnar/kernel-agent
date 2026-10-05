@@ -10,6 +10,8 @@
   each agent's ``max_budget_usd`` is lowered to the USD that is left.
 * The evaluation tools append :meth:`Budget.feedback` to every result: the
   budget left and an ``advice`` (``continue`` / ``consider_stopping`` / ``stop``).
+  A kernel evaluation within ``100 - SOL_STOP_PCT`` % of its speed of light
+  (weighted ``pct_of_sol``, :mod:`kernel_agent.kernels.roofline`) also means ``stop``.
 
 Time is measured from the start of this process (``optimize`` or ``resume``);
 USD is the sum of ``costs.json``, so it covers the whole run.
@@ -32,6 +34,7 @@ MIN_GAIN = 0.01  # an improvement beats the best by more than max(1 %, 2 x timin
 MIN_AGENT_SECONDS = 120.0  # do not start a kernel/transform agent with less time left
 MIN_AGENT_USD = 0.25  # ... or with less money left
 WRAP_UP_SECONDS = 120.0  # advice is "stop" when an agent has less time than this left
+SOL_STOP_PCT = 90.0  # advice is "stop" once a kernel reaches this % of its speed of light
 
 EVAL_TOOLS = ("evaluate_candidate", "evaluate_e2e")
 
@@ -215,6 +218,7 @@ class Budget:
                 "minutes_left) and `advice`: `continue`; `consider_stopping` after "
                 f"{PLATEAU} evaluations in a row that did not beat the best result (try a "
                 "fundamentally different idea or finish); `stop` when the budget is spent "
+                f"or the candidate reaches {SOL_STOP_PCT:.0f} % of its speed of light "
                 "(write your summary and end the session now)."
             )
         return "\n\n# Budget\n" + "\n".join(lines) if lines else ""
@@ -228,11 +232,15 @@ class Budget:
         evals_budget: int | None,
         *,
         ok_key: str = "correct",
+        pct_of_sol: float | None = None,
     ) -> dict[str, Any]:
         """``budget`` + ``advice`` for an evaluation tool result.
 
         Call once per evaluation, after it was appended to ``results``;
         ``evals_used`` counts the evaluations of the current agent session.
+        ``pct_of_sol`` is the evaluation's weighted share of its speed of light
+        (:func:`kernel_agent.kernels.roofline.sol_signal`); at ``SOL_STOP_PCT`` or
+        more further work cannot pay off, so the advice is ``stop``.
         """
         used = self.evals[agent] = self.evals.get(agent, 0) + 1
         minutes = self.minutes_left(agent)
@@ -244,6 +252,12 @@ class Budget:
             advice, why = "stop", f"time is up ({max(minutes, 0):.1f} min left)"
         elif usd is not None and usd < MIN_AGENT_USD:
             advice, why = "stop", "run USD budget spent"
+        elif pct_of_sol is not None and pct_of_sol >= SOL_STOP_PCT:
+            advice = "stop"
+            why = (
+                f"within {max(100 - pct_of_sol, 0):.0f} % of speed of light "
+                f"({pct_of_sol:.0f} % of SOL)"
+            )
         elif streak >= PLATEAU:
             advice, why = "consider_stopping", f"{streak} evaluations without a new best"
         else:

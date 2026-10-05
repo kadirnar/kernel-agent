@@ -16,6 +16,7 @@ from kernel_agent import ledger
 from kernel_agent.budget import Budget
 from kernel_agent.dashboard import refresh
 from kernel_agent.kernels.evaluate import run_evaluation
+from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.worker import call_worker
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
 
@@ -60,6 +61,15 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "kernels_reference",
             "eval_seconds",
             "compile_s",
+            # speed of light (kernels/roofline.py)
+            "pct_of_sol",
+            "sol_ms_weighted",
+            "bound",
+            "launch_floor_ms",
+            "suspicious_faster_than_sol",
+            "sol_unreliable",
+            "sol_note",
+            "sol_error",
         )
         if k in result
     }
@@ -78,6 +88,14 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
                 "speedup",
                 "timing_spread",
                 "torch_compile_ms",
+                "flops",
+                "min_bytes",
+                "sol_ms",
+                "pct_of_sol",
+                "bound",
+                "l2_resident",
+                "suspicious_faster_than_sol",
+                "sol_unreliable",
             )
             if c.get(k) is not None
         }
@@ -254,7 +272,10 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
             {"snapshot": best["snapshot"], "speedup": best["speedup"]} if best else None
         )
         out |= budget.feedback(
-            f"kernel-{args['target_id']}", target_dir / "results.jsonl", budget.kernel_evals
+            f"kernel-{args['target_id']}",
+            target_dir / "results.jsonl",
+            budget.kernel_evals,
+            pct_of_sol=sol_signal(result),
         )
         return _text(out)
 
