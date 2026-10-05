@@ -21,7 +21,7 @@ from kernel_agent import abtest, charts, dryrun, ledger, orchestrator, truth
 from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.report import write_report
-from kernel_agent.workspace import read_json
+from kernel_agent.workspace import read_json, write_json
 
 BASE = dryrun.BASELINE_MS
 
@@ -290,7 +290,7 @@ def test_combination_with_an_unverified_file_is_no_seed(tmp_path):
 # ------------------------------------------------------------------ paired A/B (issue #11)
 
 #: True latency factor of each item (product over a set).
-FACTOR = {"attn": 0.6, "gain3": 0.97, "noise": 0.996, "inplace": 0.96, "mlp": 0.95}
+FACTOR = {"attn": 0.6, "gain3": 0.97, "noise": 0.996, "inplace": 0.96, "mlp": 0.95, "layer": 0.92}
 
 
 def noisy_worker(calls: list[tuple[str, list[str]]], drift: dict[frozenset[str], float]):
@@ -418,6 +418,37 @@ def test_paired_ab_rejects_what_the_old_rule_accepted_as_noise(tmp_path):
     asyncio.run(orch.integrate(reuse=True))
     assert calls == []
     assert read_json(run.root / "integration.json")["accepted"] == data["accepted"]
+
+
+def test_projection_counts_nested_kernels_once(tmp_path):
+    """Issue #67: the attention lies inside the decoder layer, and the layer's kernel replaces
+    the attention kernel. The projection of the set with both summed their savings (0.45 +
+    0.30 of the baseline); it counts the better of the layer and what lies inside it."""
+    orch = make(tmp_path)
+    run = orch.run
+    profile = read_json(run.profile_dir / "profile.json")
+    groups = {"Qwen3DecoderLayer": "model.layers.*", "Qwen3Attention": "model.layers.*.self_attn"}
+    for c in profile["classes"]:  # the module tree: an attention in each of the 28 layers
+        if c["cls"] in groups:
+            c["groups"] = {groups[c["cls"]]: 28}
+    write_json(run.profile_dir / "profile.json", profile)
+    dryrun._write_target(run, {"id": "layer", "module_class": "Qwen3DecoderLayer"})
+    kernel(run, "attn", 2.1, saved_ms=0.45 * BASE)
+    kernel(run, "layer", 1.4, saved_ms=0.30 * BASE)
+    orch.worker = noisy_worker([], {})
+    asyncio.run(orch.integrate())
+
+    data = read_json(run.root / "integration.json")
+    assert [label(a["item"]) for a in data["accepted"]] == ["attn", "layer"]
+    first, second = data["projection"]
+    assert first["projected_ms"] == pytest.approx(0.55 * BASE)
+    attn, layer = second["items"]
+    assert second["est_saved_ms"] == pytest.approx({attn: 0.45 * BASE, layer: 0.30 * BASE})
+    assert second["counted_ms"] == pytest.approx({attn: 0.45 * BASE, layer: 0.0})
+    assert second["projected_ms"] == pytest.approx(0.55 * BASE)  # not 0.25 x the baseline
+    assert second["measured_ms"] == data["final"]["median_ms"]
+    report = write_report(run).read_text()
+    assert "| `attn` + `layer` (not counted, nested: layer) |" in report
 
 
 def test_paired_singles_keep_a_kernel_a_busy_process_hid(tmp_path):

@@ -8,7 +8,9 @@
   :mod:`kernel_agent.projection`) as a step line, measured end-to-end runs
   (transforms, integration) as diamonds, baseline lines.
 * ``amdahl.png``: the baseline time split by target class share (from the
-  profile), before and after the best per-target speedups, plus "other".
+  profile), before and after the best per-target speedups, plus "other". Nested
+  targets count once: the set the projection counts is drawn, the targets inside
+  or around it are hatched (:func:`amdahl_slices`).
 * ``integration.png``: waterfall of the greedy end-to-end integration.
 
 Colours are the same everywhere: one green for kept, neutral grey for
@@ -23,6 +25,7 @@ import math
 import textwrap
 import threading
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -313,6 +316,23 @@ def _ink_on(color: str) -> str:
     r, g, b = (int(color[i : i + 2], 16) / 255 for i in (1, 3, 5))
     lum = 0.2126 * r**2.2 + 0.7152 * g**2.2 + 0.0722 * b**2.2
     return INK if lum > 0.36 else "#ffffff"
+
+
+def _tint(color: str, amount: float = 0.35) -> str:
+    """A lighter shade of ``color``: ``amount`` of it mixed into the surface."""
+    rgb = [[int(c[i : i + 2], 16) for i in (1, 3, 5)] for c in (color, SURFACE)]
+    mixed = (round(a * amount + b * (1 - amount)) for a, b in zip(*rgb, strict=True))
+    return "#" + "".join(f"{v:02x}" for v in mixed)
+
+
+def _hatched(color: str) -> dict[str, Any]:
+    """Patch style of a mark that is not counted: a lighter shade, hatched in ``color``."""
+    import matplotlib
+
+    style: dict[str, Any] = {"facecolor": _tint(color), "edgecolor": color, "hatch": "////"}
+    if matplotlib.__version_info__ >= (3, 10):  # before, the hatch takes the edge colour
+        style["hatchcolor"] = color
+    return {**style, "lw": 0.8}
 
 
 def _num(value: Any) -> float | None:
@@ -761,7 +781,8 @@ def target_shares(run: RunDir) -> list[tuple[str, str, float]]:
     """``(target_id, module_class, share of the profiled time)`` per target.
 
     Shares come from the module profile (inclusive time of the class over the
-    roots' total). Nested targets can overlap; then they are scaled to sum to 1.
+    roots' total). Nested targets overlap: their shares can add up to more than 1
+    (:func:`amdahl_slices` counts each part of the time once).
     """
     profile = read_json(run.profile_dir / "profile.json", {}) or {}
     classes = profile.get("classes") or []
@@ -777,9 +798,76 @@ def target_shares(run: RunDir) -> list[tuple[str, str, float]]:
         ms = sum(c.get("inclusive_ms", 0.0) for c in classes if c.get("cls") == cls)
         if total > 0 and ms > 0:
             out.append((target_id, str(cls), ms / total))
-    scale = sum(s for _, _, s in out)
-    if scale > 1.0:
-        out = [(t, c, s / scale) for t, c, s in out]
+    return out
+
+
+@dataclass(frozen=True)
+class Slice:
+    """A target of ``amdahl.png``: its baseline time, the part of it drawn, its speedup."""
+
+    target: str
+    cls: str
+    full_ms: float  # its share of the profiled time × the baseline
+    speedup: float  # best module speedup (1.0: nothing kept)
+    part: float = 1.0  # share of its time drawn (0: nested, not drawn)
+    nested_in: tuple[str, ...] = ()  # drawn targets that hold some of its instances
+    holds: tuple[str, ...] = ()  # drawn targets inside it
+
+    @property
+    def ms(self) -> float:
+        """Baseline ms drawn."""
+        return self.full_ms * self.part
+
+    @property
+    def after_ms(self) -> float:
+        """The drawn ms at its best module speedup (Amdahl's law)."""
+        return self.ms / max(self.speedup, 1e-9)
+
+
+def amdahl_slices(
+    run: RunDir, base_ms: float, rows: list[dict[str, Any]] | None = None
+) -> list[Slice]:
+    """The targets of ``amdahl.png`` (:func:`target_shares` order), each part of the time
+    drawn once.
+
+    Targets nest (a decoder layer holds its attention), so the bars draw the set the
+    projection counts (:mod:`kernel_agent.projection`, as ``progress.png``): each target
+    with the part of its time it counts. A target without a saving is drawn in full when
+    it neither holds nor lies in a drawn target. The rest are not drawn (``part`` 0);
+    ``nested_in`` / ``holds`` name the drawn targets they overlap. The drawn time never
+    exceeds the baseline: it is scaled down otherwise (a target's share is its whole
+    class's, whatever its ``phase`` or ``qualname`` scope)."""
+    shares = target_shares(run)
+    rows = ledger.rows(run) if rows is None else rows
+    tree = projection.tree(run)
+    steps = projection.series(tree, base_ms, rows)
+    proj = steps[-1][1] if steps else projection.project(tree, {}, base_ms)
+    holders = tree.holders()  # target → the targets that hold some of its instances
+
+    def overlaps(a: str, b: str) -> bool:
+        return a in holders.get(b, set()) or b in holders.get(a, set())
+
+    part = {t: proj.part(t) for t, _, _ in shares if proj.part(t) > 0}
+    for t, _, _ in sorted(shares, key=lambda s: len(holders.get(s[0], ()))):  # outer first
+        if t not in part and not any(overlaps(t, d) for d in part):
+            part[t] = 1.0
+    drawn = sum(share * part[t] for t, _, share in shares if t in part)
+    scale = 1.0 / drawn if drawn > 1.0 else 1.0
+    out = []
+    for t, cls, share in shares:
+        best = ledger.best_kept([r for r in rows if r["target"] == t])
+        inside = holders.get(t, set())
+        out.append(
+            Slice(
+                t,
+                cls,
+                base_ms * share * scale,
+                best,
+                part.get(t, 0.0),
+                nested_in=tuple(d for d, _, _ in shares if d in part and d in inside),
+                holds=tuple(d for d, _, _ in shares if d in part and t in holders.get(d, set())),
+            )
+        )
     return out
 
 
@@ -787,41 +875,44 @@ def amdahl(run: RunDir, rows: list[dict[str, Any]] | None = None) -> Path | None
     """``amdahl.png``: baseline time by target, before vs. after the best kernels."""
     baseline = read_json(run.baseline_json, {}) or {}
     base_ms = _num(baseline.get("median_ms"))
-    shares = target_shares(run)
-    if base_ms is None or not shares or not available():
+    if base_ms is None or not available():
         return None
-    rows = ledger.rows(run) if rows is None else rows
-    best = {t: ledger.best_kept([r for r in rows if r["target"] == t]) for t, _, _ in shares}
+    slices = amdahl_slices(run, base_ms, rows)
+    if not slices:
+        return None
     final = (read_json(run.root / "integration.json", {}) or {}).get("final") or {}
     measured = _num(final.get("median_ms")) if final.get("passed", True) else None
     height = 3.9 if measured else 3.3
     return _render(
         run.root / "amdahl.png",
         (10.0, height),
-        lambda fig, ax: _draw_amdahl(ax, base_ms, shares, best, measured, objective.of(baseline)),
+        lambda fig, ax: _draw_amdahl(ax, base_ms, slices, measured, objective.of(baseline)),
     )
 
 
 def _draw_amdahl(
     ax: Any,
     base_ms: float,
-    shares: list[tuple[str, str, float]],
-    best: dict[str, float],
+    slices: list[Slice],
     measured: float | None,
     metric: objective.Metric = objective.METRICS[objective.LATENCY],
 ) -> None:
     from matplotlib.patches import Patch
 
-    colors = {t: TARGET_COLORS[i % len(TARGET_COLORS)] for i, (t, _, _) in enumerate(shares)}
-    other = base_ms * max(1.0 - sum(s for _, _, s in shares), 0.0)
-    before = [(t, base_ms * s) for t, _, s in shares]
-    after = [(t, base_ms * s / max(best[t], 1e-9)) for t, _, s in shares]
+    colors = {s.target: TARGET_COLORS[i % len(TARGET_COLORS)] for i, s in enumerate(slices)}
+    drawn = [s for s in slices if s.ms > 0]
+    nested = [s for s in slices if s.ms <= 0]
+    best = {s.target: s.speedup for s in slices}
+    other = max(base_ms - sum(s.ms for s in drawn), 0.0)
+    before = [(s.target, s.ms) for s in drawn]
+    after = [(s.target, s.after_ms) for s in drawn]
     after_total = sum(ms for _, ms in after) + other
     bars = [("baseline", before, base_ms), ("best kernels\n(Amdahl estimate)", after, after_total)]
     if measured:
         bars.append(("measured\n(integrated)", [], measured))
     h = 0.5
     labels = []
+    starts: dict[str, float] = {}  # where each drawn target starts in the baseline bar
     ax.set_xlim(0, base_ms * 1.2)  # limits first: label fitting measures in data units
     ax.set_ylim(-0.6, len(bars) - 0.4)
     ax.xaxis.set_major_formatter(_thousands())
@@ -832,6 +923,8 @@ def _draw_amdahl(
         if name == "baseline" or segments:
             for t, ms in [*segments, ("other", other)]:
                 color = colors.get(t, OTHER_COLOR)
+                if name == "baseline":
+                    starts[t] = left
                 ax.barh(y, ms, left=left, height=h, color=color, edgecolor=SURFACE, lw=2, zorder=3)
                 options = [f"{t}\n{ms:,.0f} ms", f"{ms:,.0f}"]
                 if t != "other" and name != "baseline":
@@ -888,25 +981,59 @@ def _draw_amdahl(
             fontweight="bold" if name != "baseline" else "normal",
         )
 
+    # a nested target that is not drawn: a hatched strip under the drawn target holding it
+    y, filled = len(bars) - 1, {s.target: 0.0 for s in drawn}
+    ms_of = {s.target: s.ms for s in drawn}
+    for s in nested:
+        holder = next((t for t in s.nested_in if t in starts), None)
+        if holder is None:
+            continue
+        width = min(s.full_ms, ms_of[holder] - filled[holder])
+        if width > 0:
+            ax.barh(
+                y - h / 2 - 0.11,
+                width,
+                left=starts[holder] + filled[holder],
+                height=0.13,
+                zorder=3,
+                **_hatched(colors[s.target]),
+            )
+            filled[holder] += width
+
     ax.set_yticks([y for y, _ in labels], [n for _, n in labels])
     ax.tick_params(axis="y", length=0)
     ax.grid(axis="y", visible=False)
     ax.spines["left"].set_visible(False)
     ax.set_xlabel(f"time {metric.per} (ms)")
-    covered = sum(s for _, _, s in shares)
+    covered = sum(s.ms for s in drawn) / base_ms
+    subtitle = (
+        f"targets cover {covered:.0%} of the profiled time; each target's share ÷ its best "
+        "module speedup, the rest unchanged (Amdahl's law)"
+    )
+    if nested:  # counted once, as in the projection
+        names = ", ".join(s.target for s in nested)
+        subtitle += "\n" + _short(f"nested targets count once; not drawn (hatched): {names}", 125)
     _header(
         ax,
         f"Where the time goes: {base_ms:,.1f} → {after_total:,.1f} ms with the best kernels "
         f"({base_ms / after_total:.2f}×)",
-        f"targets cover {covered:.0%} of the profiled time; each target's share ÷ its best "
-        "module speedup, the rest unchanged (Amdahl's law)",
+        subtitle,
     )
-    handles = [Patch(color=colors[t], label=f"{t} ({cls})") for t, cls, _ in shares]
+    handles, notes = [], False
+    for s in slices:
+        label, color = f"{s.target} ({s.cls})", colors[s.target]
+        if s.part < 0.995:  # nested: the drawn targets it overlaps
+            names = ", ".join(s.nested_in or s.holds)
+            where = f"nested in {names}" if s.nested_in else f"holds {names}" if names else "nested"
+            label += "\n" + _short(where if s.part <= 0 else f"{s.part:.0%} drawn; {where}", 50)
+            notes = True
+        style = {"color": color} if s.part > 0 else _hatched(color)
+        handles.append(Patch(label=label, **style))
     handles += [
         Patch(color=OTHER_COLOR, label="other"),
         Patch(color=KEEP_COLOR, alpha=0.25, label="saved"),
     ]
-    _legend(ax, handles, ncol=min(len(handles), 4))
+    _legend(ax, handles, ncol=min(len(handles), 3 if notes else 4))
 
 
 # ------------------------------------------------------------------ integration

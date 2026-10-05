@@ -27,6 +27,7 @@ from kernel_agent import (
     library,
     objective,
     program,
+    projection,
     region,
     research,
     scheduler,
@@ -723,7 +724,7 @@ class Orchestrator:
         (``abtest.SEPARATE_ITERS`` runs each, A measured again).
         ``integration.json`` keeps each step's ``ab`` record (a swap's with
         ``kind: swap``, ``old`` and ``new``) and the ``projection`` (baseline −
-        Σ est. saved ms) of every accepted set.
+        Σ est. saved ms, nested kernels counted once) of every accepted set.
 
         ``reuse`` (re-integrations of the improve loop) takes the measurements
         of the same snapshot files (the same A and B for an A/B) from the
@@ -1218,21 +1219,32 @@ class Orchestrator:
     ) -> list[dict[str, Any]]:
         """Projected (baseline − Σ est. saved ms of its items) vs measured latency of every
         accepted set: a kernel's saving is its module-level estimate, a transform's its
-        measured gain alone (paired against the unmodified model)."""
+        measured gain alone (paired against the unmodified model). Nested kernels count
+        once (:mod:`kernel_agent.projection`: a decoder layer's kernel replaces the attention
+        kernel inside it); ``counted_ms`` is the part of each item's saving that counts."""
         alone = _alone(base_ms, history)
+        tree = projection.tree(self.run)
         out = []
         for combo, r in sets:
             saved: dict[str, float | None] = {}
             for item in combo:
                 est = self._saving(item, alone)
                 saved[item[1]] = None if est is None else round(est, 3)
-            known = [v for v in saved.values() if v is not None]
+            # kernels by target (the module tree's names); transforms are in no tree: in full
+            key = {a: a.partition("=")[0] if k == "kernel" else a for k, a in combo}
+            proj = projection.project(tree, {key[a]: v for a, v in saved.items()}, base_ms)
+            slower = sum(v for v in saved.values() if v is not None and v < 0)
             out.append(
                 {
                     "items": [a for _, a in combo],
-                    "projected_ms": round(base_ms - sum(known), 3),
+                    "projected_ms": round(base_ms - proj.saved_ms - slower, 3),
                     "measured_ms": r.get("median_ms"),
                     "est_saved_ms": saved,
+                    "counted_ms": {
+                        a: round(proj.counted.get(key[a], 0.0), 3)
+                        for a, v in saved.items()
+                        if v is not None and v > 0
+                    },
                 }
             )
         return out

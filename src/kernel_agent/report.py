@@ -46,20 +46,26 @@ def _projection_lines(projection: list[dict[str, Any]]) -> list[str]:
         return []
     lines = [
         "",
-        "Projected (baseline − Σ est. saved ms: a kernel's module-level estimate, a "
-        "transform's gain alone) vs measured end-to-end latency of every accepted set:",
+        "Projected (baseline − Σ est. saved ms: a kernel's module-level estimate, nested "
+        "kernels counted once, a transform's gain alone) vs measured end-to-end latency of "
+        "every accepted set:",
         "",
         "| accepted set | projected ms | measured ms | measured / projected |",
         "|---|---|---|---|",
     ]
     for p in projection:
         names = " + ".join(f"`{ledger.item_label(i)}`" for i in p.get("items", []))
-        unknown = [
-            ledger.item_label(i) for i, v in (p.get("est_saved_ms") or {}).items() if v is None
+        saved = p.get("est_saved_ms") or {}
+        unknown = [ledger.item_label(i) for i, v in saved.items() if v is None]
+        nested = [  # the kernels inside (or around) a kernel that counts instead
+            ledger.item_label(i) + (f" ({ms / saved[i]:.0%} counted)" if ms > 0 else "")
+            for i, ms in (p.get("counted_ms") or {}).items()
+            if saved.get(i) and ms < 0.995 * saved[i]
         ]
         projected, measured = p.get("projected_ms"), p.get("measured_ms")
         ratio = measured / projected if measured and projected else None
         note = f" (no estimate: {', '.join(unknown)})" if unknown else ""
+        note += f" (not counted, nested: {', '.join(nested)})" if nested else ""
         lines.append(
             f"| {names}{note} | {_fmt(projected, 1)} | {_fmt(measured, 1)} | {_fmt(ratio, 2)} |"
         )

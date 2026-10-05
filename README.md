@@ -447,7 +447,11 @@ Every step in `integration.json` → `history` carries its `ab` record: `mode`
 the GPU telemetry. `projection` lists, for every accepted set, the projected
 latency (baseline − Σ est. saved ms: a kernel's module-level estimate, a
 transform's measured gain alone) next to the measured one; `report.md` shows
-both. A re-integration reuses an A/B only for the same A and B files.
+both. Nested kernels count once, as in the run's projection (see Charts): a
+decoder layer's kernel and the attention kernel inside it add up to the better
+of the two, not both. `counted_ms` holds the part of each item's saving that
+counts, and `report.md` names the kernels not counted. A re-integration reuses
+an A/B only for the same A and B files.
 
 ### Anti-gaming guards
 
@@ -1798,7 +1802,14 @@ step line is the running best, and the dashed line is the reference module.
 
 `amdahl.png`: the baseline time split by each target's share of the module
 profile, then the same bar with every target at its best module speedup
-(Amdahl's law), then the measured integrated result.
+(Amdahl's law), then the measured integrated result. Nested targets are drawn
+once, so the bar never exceeds 100 %. The bars hold the set the projection
+counts, each target with the part of its time it counts. A target without a
+kept kernel is drawn in full when it neither holds nor lies in a drawn target.
+The other targets are hatched in a lighter shade: a target nested in a drawn
+one is a strip under that target's segment, and its legend entry reads
+`nested in X` (or `holds X, Y` for a parent whose children are drawn
+instead).
 
 ![time split](docs/images/example-amdahl.png)
 
