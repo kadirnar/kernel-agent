@@ -5,6 +5,8 @@ loop with an evaluator that cannot be gamed, and use it to make
 `openbmb/VoxCPM2` fast. Background and sources: [RESEARCH.md](RESEARCH.md).
 Every item is a GitHub issue; this file is the overview.
 
+**Status (Oct 2026):** M1–M4 are done except #10 (Nsight Compute: `ncu` is not installed on the development machine). The VoxCPM2 result is in [VOXCPM2.md](VOXCPM2.md): 7.40× vs eager, 5.20× vs VoxCPM's own `torch.compile`. Follow-ups found on that run: #58, #59, #60. #21's adversarial red-team agent was descoped; its defensive parts (independent re-check, KernelBench suite) shipped.
+
 ## Principles
 
 1. **Trust before search.** More search on a weak evaluator only finds more
