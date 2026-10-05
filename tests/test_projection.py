@@ -238,6 +238,34 @@ def test_scope_and_regions():
     assert {g.target: g.pattern for g in tree.groups} == {"x": "model.layers.*.x", "y": ""}
 
 
+def test_series_uses_the_results_that_stand():
+    """A re-evaluation (#58) replaces its snapshot's earlier row in the projection."""
+    tree = tree_of({"attn": spec("Attn")}, [ATTN])
+
+    def row(exp, status, snapshot, speedup, saved, target="attn", correct=True):
+        return {
+            "exp": exp,
+            "target": target,
+            "status": status,
+            "snapshot": snapshot,
+            "speedup": speedup,
+            "est_saved_ms": saved,
+            "correct": correct,
+        }
+
+    rows = [
+        row(1, "keep", "a.py", 9.8, 100.0),
+        row(2, "keep", "b.py", 46.9, 300.0),  # a stale record
+        row(3, "keep", "e2e_1", 2.0, None, target="e2e"),
+        row(4, "re-evaluated", "b.py", 18.3, 250.0),
+        row(5, "discard", "c.py", 5.0, 50.0),
+    ]
+    steps = [(r["exp"], p.projected_ms) for r, p in projection.series(tree, 1000.0, rows)]
+    assert steps == [(1, 900.0), (2, 700.0), (4, 750.0)]
+    rows.append(row(6, "re-evaluated", "b.py", None, None, correct=False))  # it failed
+    assert projection.series(tree, 1000.0, rows)[-1][1].projected_ms == 900.0
+
+
 def test_profiler_groups_build_the_tree():
     import torch
     from torch import nn

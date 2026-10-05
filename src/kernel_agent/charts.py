@@ -557,8 +557,8 @@ def _draw_run(
     )
     end = max(end, 1.0)
 
-    # projected: baseline − Σ est. saved of each target's latest kept candidate, nested
-    # targets counted once (projection.py)
+    # projected: baseline − Σ est. saved of each target's best kept candidate (or its
+    # re-evaluation), nested targets counted once (projection.py)
     tree = projection.tree(run)
     last = projection.project(tree, {}, base_ms)
     px, py = [0.0], [base_ms]

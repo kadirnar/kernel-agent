@@ -513,7 +513,8 @@ class Watcher:
             spec = (files.get("specs") or {}).get(target_id) or {}
             trows = ledger.measured(r for r in rows if r["target"] == target_id)
             kept = [r for r in trows if r["status"] == KEEP]
-            best = max(kept, key=lambda r: r["speedup"] or 0.0, default=None)
+            stand = ledger.standing(r for r in rows if r["target"] == target_id)  # as summary()
+            best = max(stand, key=lambda r: r["speedup"] or 0.0, default=None)
             out.append(
                 {
                     "id": target_id,

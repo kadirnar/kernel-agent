@@ -173,13 +173,19 @@ def project(tree: Tree, saved: Mapping[str, float | None], baseline_ms: float) -
 def series(
     tree: Tree, baseline_ms: float, rows: Iterable[dict[str, Any]]
 ) -> list[tuple[dict[str, Any], Projection]]:
-    """The projection after every kept kernel row (each target at its latest kept result)."""
-    saved: dict[str, float] = {}
+    """The projection after every kept or re-evaluated kernel row, each target at its best
+    result that stands (:func:`ledger.standing`, as in :func:`ledger.summary`)."""
+    mine: dict[str, list[dict[str, Any]]] = {}
+    saved: dict[str, float | None] = {}
     out = []
     for row in rows:
-        kept = row["target"] != ledger.E2E and row["status"] == ledger.KEEP
-        if kept and row.get("est_saved_ms") is not None:
-            saved[row["target"]] = row["est_saved_ms"]
+        if row["target"] == ledger.E2E:
+            continue
+        mine.setdefault(row["target"], []).append(row)
+        if row["status"] in (ledger.KEEP, ledger.REEVALUATED):
+            stand = ledger.standing(mine[row["target"]])
+            best = max(stand, key=lambda r: r["speedup"] or 0.0, default=None)
+            saved[row["target"]] = best.get("est_saved_ms") if best else None
             out.append((row, project(tree, saved, baseline_ms)))
     return out
 

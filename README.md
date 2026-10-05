@@ -1362,7 +1362,8 @@ value for that column.
   streak uses them (see "Parallel workers, duplicates and quick checks").
   Neither are `re-evaluated` rows, the integration's re-evaluations of stale
   records (see "Independent re-check of winners"). They do replace the
-  snapshot's earlier row as the target's best in `status` and the report.
+  snapshot's earlier row as the target's best in `status`, the report, the
+  live dashboard and the projection.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
   there is no custom kernel).

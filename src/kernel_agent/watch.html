@@ -706,13 +706,14 @@ td.nowrap { white-space: nowrap; }
     }
     const tEnd = timeExtent(), tMax = tEnd * 1.03;
     const proj = [{ t: 0, ms: base, row: null }], measured = [], failed = [];
-    // the projection after each kept kernel, nested targets counted once (projection.py)
+    // the projection after each kept (or re-evaluated) kernel, nested targets counted once
+    // (projection.py)
     const steps = (sm.projection && sm.projection.steps) || {};
     for (const r of S.rows) {
       const t = minutesOf(r.ts);
       if (t == null) continue;
       if (r.target !== "e2e") {
-        if (r.status === "keep" && steps[r.exp] != null) proj.push({ t, ms: steps[r.exp], row: r });
+        if (steps[r.exp] != null) proj.push({ t, ms: steps[r.exp], row: r });
       } else if ((r.status === "keep" || r.status === "discard") && r.new_ms) measured.push({ t, row: r });
       else if (FAILURES.includes(r.status)) failed.push({ t, row: r });
     }
@@ -783,7 +784,8 @@ td.nowrap { white-space: nowrap; }
     for (const p of proj.slice(1)) {
       const r = p.row;
       points.push({ x: xs(p.t), y: ys(p.ms), r: 6, open: openFor(r), tip: () => tipContent(
-        `projected ${fmt.ms(p.ms)}`, `${fmt.x(base / p.ms)} vs eager · after #${r.exp} kept`,
+        `projected ${fmt.ms(p.ms)}`,
+        `${fmt.x(base / p.ms)} vs eager · after #${r.exp} ${r.status === "keep" ? "kept" : r.status}`,
         [`${r.target} ${fmt.x(r.speedup)} · ${r.backend} · ${fmt.ms(r.est_saved_ms)} saved`, r.time], r.hypothesis) });
     }
     for (const m of [...measured, ...failed]) {
