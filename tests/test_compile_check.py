@@ -68,6 +68,25 @@ def test_graph_breaks_are_reported():
     assert "test_compile_check.py" in result["break_reasons"][0]
 
 
+@torch._dynamo.disable
+def _untraceable(x: torch.Tensor) -> torch.Tensor:
+    return x * 2 + 1
+
+
+class Untraceable(nn.Module):
+    """The whole entrypoint is one call Dynamo skips (like a load_inline function)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _untraceable(x)
+
+
+def test_entrypoints_that_run_eagerly_are_reported():
+    result = check(Untraceable, _cases())
+    assert result["passed"] and result["graph_breaks"] >= 0  # never the -1 of explain()
+    assert result["eager_entrypoints"] == ["forward"] and not result["fullgraph_ok"]
+    assert result["break_reasons"][0].startswith("forward: no graph captured")
+
+
 def test_custom_op_compiles_without_breaks():
     result = check(Opaque, _cases())
     assert result["passed"] and result["graph_breaks"] == 0 and result["fullgraph_ok"]

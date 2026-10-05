@@ -346,9 +346,17 @@ def _last_error(text: str) -> str:
     """The exception line of a traceback tail (or its last line)."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     errors = [
-        line for line in lines if re.match(r"^[\w.]*(Error|Exception|Unsupported|Exit)\w*:", line)
+        i
+        for i, line in enumerate(lines)
+        if re.match(r"^[\w.]*(Error|Exception|Unsupported|Exit)\w*:", line)
     ]
-    return ((errors or lines or [""])[-1])[:300]
+    if not errors:
+        return (lines or [""])[-1][:300]
+    i = errors[-1]
+    line = lines[i]
+    if i + 1 < len(lines) and lines[i + 1].startswith("Explanation:"):  # Dynamo says which call
+        line += " — " + lines[i + 1].removeprefix("Explanation:").strip()
+    return line[:300]
 
 
 def combination(result: dict[str, Any], compiled: float) -> dict[str, Any]:

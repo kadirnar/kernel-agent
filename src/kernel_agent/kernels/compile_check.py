@@ -9,7 +9,11 @@ fresh ``build()`` of the candidate:
 * ``torch._dynamo.explain`` per captured entrypoint: graphs and **graph
   breaks** with their reasons.  Launchers Dynamo cannot trace (pybind
   ``load_inline`` modules, NVRTC / ``cuda.core`` handles, CuTe ``cute.compile``
-  functions) break the graph; under ``fullgraph=True`` that is an error.
+  functions) break the graph, or Dynamo skips the whole entrypoint
+  (``eager_entrypoints``); under ``fullgraph=True`` either is an error.  Measured
+  on the bundled RMSNorm examples: Triton (plain and custom op) 0 breaks, CuTe 2
+  breaks, load_inline CUDA runs eagerly, NVRTC fails to trace (``cuda.core``
+  stream from ``torch.cuda.current_stream()``).
 * ``torch.compile(entrypoint, fullgraph=False)`` (Inductor on CUDA, tracing
   only via ``aot_eager`` on CPU) on every captured case, outputs and in-place
   side effects checked like the eager check.
@@ -84,8 +88,15 @@ def check(
             args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
             with torch.inference_mode():
                 explanation = dynamo.explain(fn)(*args, **kwargs)
-            result["graphs"] += int(explanation.graph_count)
-            result["graph_breaks"] += int(explanation.graph_break_count)
+            graphs = int(explanation.graph_count)
+            result["graphs"] += graphs
+            result["graph_breaks"] += max(int(explanation.graph_break_count), 0)
+            if graphs == 0:  # Dynamo skipped the frame: everything runs eagerly
+                result["eager_entrypoints"] = [*result.get("eager_entrypoints", []), method]
+                reasons.append(
+                    f"{method}: no graph captured, Dynamo runs it eagerly (an untraceable "
+                    "call such as a pybind / load_inline function; wrap it in a custom op)"
+                )
             reasons += [r for r in _reasons(explanation) if r not in reasons]
             compiled[method] = torch.compile(fn, backend=backend, fullgraph=False)
         result["break_reasons"] = reasons[:MAX_REASONS]
@@ -107,6 +118,10 @@ def check(
         result["error"] = text if len(text) <= 3000 else "...\n" + text[-3000:]
     finally:
         dynamo.reset()  # drop the compiled graphs before anything else runs
-    result["fullgraph_ok"] = "error" not in result and result["graph_breaks"] == 0
+    result["fullgraph_ok"] = (
+        "error" not in result
+        and result["graph_breaks"] == 0
+        and not result.get("eager_entrypoints")
+    )
     result["seconds"] = round(time.perf_counter() - t0, 1)
     return result
