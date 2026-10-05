@@ -256,6 +256,15 @@ def setup(apply_env: bool = True) -> Toolchain:
             env["TORCH_CUDA_ARCH_LIST"] = f"{gpu.capability[0]}.{gpu.capability[1]}"
 
     has_ninja = _module_available("ninja") or shutil.which("ninja") is not None
+    if apply_env and shutil.which("ninja") is None and _module_available("ninja"):
+        # load_inline runs the `ninja` executable from PATH; the pip wheel puts it
+        # next to the venv's python, which is not on PATH unless the venv is active.
+        import ninja
+
+        bin_dir = str(getattr(ninja, "BIN_DIR", ""))
+        if bin_dir and Path(bin_dir, "ninja").exists():
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+            notes.append(f"added {bin_dir} to PATH for ninja")
     backends = {
         "triton": _module_available("triton") and gpu is not None,
         "cuda": nvcc_ver is not None and has_ninja and gpu is not None,

@@ -35,7 +35,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from kernel_agent.gpulock import gpu_lock
+from kernel_agent.gpulock import child_env, gpu_lock
 from kernel_agent.kernels.roofline import annotate, ensure_peaks
 
 COMPILE_MARKER = "@@KA_COMPILE_S@@"  # on stderr, so a timed-out run still reports it
@@ -318,7 +318,9 @@ def run_evaluation(
     with gpu_lock():
         ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, env=child_env()
+            )
         except subprocess.TimeoutExpired as exc:
             return _timeout_result(timeout, exc.stderr)
     marker = "@@KA_RESULT@@"

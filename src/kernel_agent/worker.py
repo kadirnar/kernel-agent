@@ -17,7 +17,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from kernel_agent.gpulock import gpu_lock
+from kernel_agent.gpulock import child_env, gpu_lock
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 MARKER = "@@KA_WORKER@@"
@@ -252,7 +252,9 @@ def call_worker(run: RunDir, command: str, *args: str, timeout: float = 3600.0) 
     log.parent.mkdir(parents=True, exist_ok=True)
     with gpu_lock():
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, env=child_env()
+            )
         except subprocess.TimeoutExpired:
             return {"status": "timeout", "error": f"worker {command} exceeded {timeout:.0f}s"}
     with log.open("a") as fh:
