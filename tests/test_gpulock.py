@@ -57,3 +57,13 @@ def test_child_process_flag_skips_locking(monkeypatch, lock_dir):
         fcntl.flock(fh, fcntl.LOCK_EX)  # held by the "parent"
         with gpulock.gpu_lock():  # the child must not wait for it
             pass
+
+
+@pytest.mark.gpu
+def test_gpu_tests_hold_the_lock():
+    # conftest wraps every `gpu` test in gpu_lock() on the real lock file (taken before
+    # this module's lock_dir fixture redirects CACHE_DIR): nobody else can take it now.
+    from kernel_agent.toolchain import CACHE_DIR
+
+    with open(CACHE_DIR / "gpu.lock", "w") as fh, pytest.raises(BlockingIOError):
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
