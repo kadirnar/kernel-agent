@@ -17,6 +17,7 @@ from kernel_agent import budget, charts, cli, dryrun, ledger, library, orchestra
 from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import record_candidate, snapshot
 from kernel_agent.config import OptimizeConfig
+from kernel_agent.improve import ImproveConfig, Improver
 from kernel_agent.kernels import evaluate
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -257,6 +258,23 @@ def test_prior_at_speed_of_light_needs_no_agent(tmp_path, monkeypatch):
     orch.agent_runner = agent
     asyncio.run(orch.kernels())
     assert "kernel-rmsnorm" not in started and "kernel-mlp" in started
+
+
+def test_improve_seeds_before_the_first_slice(tmp_path, monkeypatch):
+    stored_run(tmp_path, monkeypatch)
+    calls = fake_evaluator(monkeypatch, outcome=1.4)
+    orch = make(tmp_path, monkeypatch, "b", repo="org/other-model")
+    capture(orch, "rmsnorm")
+    world = dryrun.World(orch)  # simulated agents + worker; the library stays on
+    improver = Improver(orch, ImproveConfig(max_slices=1), require_capture=False, live_charts=False)
+    with world.installed():
+        orch.tc = FakeToolchain("sm_120")
+        asyncio.run(improver.improve())
+    first = ledger.rows(orch.run)[0]
+    assert first["target"] == "rmsnorm" and first["status"] == ledger.KEEP
+    assert first["hypothesis"].startswith(budget.PRIOR_HYPOTHESIS) and len(calls) == 1
+    assert all(library.seeded(orch.run, t) is not None for t in orch.run.target_ids())
+    assert improver.state["slices"][0]["exp_before"] >= 1  # the prior is no slice's evaluation
 
 
 def test_matching_rules():
