@@ -298,7 +298,8 @@ def summary_section(baseline: dict[str, Any]) -> str:
             "trajectory and its per-step predictions are compared with the baseline's "
             f"({_fmt(tf.get('metrics'))}; self-check on the unmodified model {check}). "
             "The free-running output only has to pass a sanity check (finite, same "
-            f"shape, RMS energy within ±{MAX_RMS_CHANGE:.0%})"
+            f"shape, RMS energy within ±{MAX_RMS_CHANGE:.0%} unless the workload sets a "
+            "per-output tolerance)"
             + (" and is otherwise informational." if baseline.get("chaotic") else "."),
             "* teacher forcing hooks into the step loop from Python, so a transform that "
             "captures a whole step (or the whole loop) in one CUDA graph, or changes how "

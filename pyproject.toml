@@ -25,6 +25,9 @@ cuda = ["cuda-python>=12.6", "ninja>=1.11", "nvidia-cuda-nvcc>=13.0; sys_platfor
 cute = ["nvidia-cutlass-dsl>=4.0"]
 tilelang = ["tilelang>=0.1.5", "nvidia-cuda-nvcc>=13.0; sys_platform == 'linux'", "nvidia-cuda-cccl>=13.0; sys_platform == 'linux'", "nvidia-cuda-crt>=13.0; sys_platform == 'linux'", "nvidia-nvvm>=13.0; sys_platform == 'linux'"]
 viz = ["matplotlib>=3.8"]
+# Built-in VoxCPM workload. Not in `all`: voxcpm pulls torchaudio, whose build must
+# match the installed torch (see README).
+voxcpm = ["voxcpm>=2.0.3", "einops", "librosa", "pydantic", "soundfile"]
 all = ["kernel-agent[models,cuda,cute,tilelang,viz]"]
 
 [project.scripts]

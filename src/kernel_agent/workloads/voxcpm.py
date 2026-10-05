@@ -52,10 +52,11 @@ class VoxCPMWorkload(Workload):
         "at run time: candidates must call the current `model.feat_decoder` from Python "
         "once per patch and draw its noise with `torch.randn` as the original does."
     )
-    # Thresholds calibrated on VoxCPM2 (60 patches, bf16): correct changes (bundled
-    # Triton RMSNorm, fp32 RMSNorm, MATH-backend SDPA, every nn.Linear x (1 ± 2^-8))
-    # reach mean step cosine >= 0.9959 and min >= 0.868; broken RMSNorm (eps=1e-2,
-    # no weight) and attention (scale x1.25, one KV head dropped) reach mean <= 0.948.
+    # Thresholds calibrated on VoxCPM2 (60 patches, bf16, two texts): correct changes
+    # (bundled Triton RMSNorm, fp32 RMSNorm, MATH-backend SDPA, every nn.Linear x
+    # (1 ± 2^-8)) reach mean step cosine >= 0.9959, min >= 0.868 and RMS ratio within
+    # ±0.2 %; broken RMSNorm (eps=1e-2, no weight) and attention (scale x1.25, one KV
+    # head dropped) reach mean <= 0.974.
     defaults = {
         "text": TEXT,
         "patches": 60,
