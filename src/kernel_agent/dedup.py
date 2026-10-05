@@ -31,7 +31,14 @@ from kernel_agent.workspace import RunDir
 
 #: Evaluator statuses that the same source reproduces (failures included: a build error
 #: does not go away by evaluating the same file again).
-REPEATABLE = ("ok", "incorrect", "build_error", "runtime_error")
+REPEATABLE = (
+    "ok",
+    "incorrect",
+    "incorrect_timed_output",
+    "incorrect_perturbed",
+    "build_error",
+    "runtime_error",
+)
 QUICK = "quick"
 FULL = "full"
 

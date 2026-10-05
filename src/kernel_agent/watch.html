@@ -347,7 +347,8 @@ td.nowrap { white-space: nowrap; }
   // inserted as text nodes or attributes, never parsed as HTML.
   const NS = "http://www.w3.org/2000/svg";
   const PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"];
-  const FAILURES = ["incorrect", "build_error", "runtime_error", "crash", "timeout"];
+  const FAILURES = ["incorrect", "incorrect_timed_output", "incorrect_perturbed", "build_error",
+    "runtime_error", "crash", "timeout"];
   // not benchmark evaluations (ledger.UNMEASURED): quick checks and duplicates
   const UNMEASURED = ["quick_ok", "quick_fail", "duplicate"];
   const MAX_EVENTS = 600, MAX_LOGS = 400;
@@ -788,8 +789,8 @@ td.nowrap { white-space: nowrap; }
     for (const m of [...measured, ...failed]) {
       const r = m.row, ok = r.status === "keep" || r.status === "discard";
       points.push({ x: xs(m.t), y: ok ? ys(r.new_ms) : f.y1 + 6, r: 9, open: openFor(r), tip: () => tipContent(
-        ok ? `${fmt.ms(r.new_ms)} · ${fmt.x(r.speedup)}` : r.status.replace("_", " "),
-        `#${r.exp} · ${r.status.replace("_", " ")} · ${r.backend}`,
+        ok ? `${fmt.ms(r.new_ms)} · ${fmt.x(r.speedup)}` : r.status.replaceAll("_", " "),
+        `#${r.exp} · ${r.status.replaceAll("_", " ")} · ${r.backend}`,
         [r.snapshot, r.time], r.hypothesis) });
     }
     hover(f, points);
@@ -861,8 +862,8 @@ td.nowrap { white-space: nowrap; }
       const x = xs(i + 1), good = r.status === "keep" || r.status === "discard";
       const y = good && r.speedup != null ? ys(r.speedup) : floor;
       return { x, y, r: good ? 8 : 7, row: null, open: openFor(r), data: r, tip: () => tipContent(
-        good ? fmt.x(r.speedup) : r.status.replace("_", " "),
-        `#${r.exp} · ${r.status.replace("_", " ")} · ${r.backend}${r.worker ? ` · worker ${r.worker}` : ""}`,
+        good ? fmt.x(r.speedup) : r.status.replaceAll("_", " "),
+        `#${r.exp} · ${r.status.replaceAll("_", " ")} · ${r.backend}${r.worker ? ` · worker ${r.worker}` : ""}`,
         [good && r.new_ms != null ? `${fmt.ms(r.new_ms, 4)} vs ${fmt.ms(r.ref_ms, 4)} per run` : null,
           `${r.snapshot}${r.parent ? ` (parent ${r.parent})` : ""}`, r.time], r.hypothesis) };
     });
@@ -990,12 +991,12 @@ td.nowrap { white-space: nowrap; }
         const r = byExp.get(e.exp);
         const extra = r && r.speedup != null && kindOf(r.status) !== "fail" ? ` · ${fmt.x(r.speedup)}` : "";
         const where = e.worker ? `${data("target")}/w${data("worker")}` : data("target");
-        return [`${where} #${data("exp")}: ${data("status").replace("_", " ")}${extra}`, r ? r.hypothesis : ""];
+        return [`${where} #${data("exp")}: ${data("status").replaceAll("_", " ")}${extra}`, r ? r.hypothesis : ""];
       }
       default: {
         const rest = Object.entries(e).filter(([k]) => !["ts", "time", "event"].includes(k))
           .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" ");
-        return [String(e.event || "event").replace("_", " "), rest];
+        return [String(e.event || "event").replaceAll("_", " "), rest];
       }
     }
   }
@@ -1031,7 +1032,7 @@ td.nowrap { white-space: nowrap; }
     const targets = [...sm.targets.map((t) => t.id), ...(sm.counts.e2e ? ["e2e"] : [])];
     options($("f-target"), [["", "all targets"], ...targets.map((t) => [t, t])], ui.target);
     options($("f-status"), [["", "all"], ["keep", "keep"], ["discard", "discard"], ["failed", "any failure"],
-      ...FAILURES.map((s) => [s, s.replace("_", " ")]), ...UNMEASURED.map((s) => [s, s.replace("_", " ")])],
+      ...FAILURES.map((s) => [s, s.replaceAll("_", " ")]), ...UNMEASURED.map((s) => [s, s.replaceAll("_", " ")])],
       ui.status);
     const q = ui.query.trim().toLowerCase();
     const rows = S.rows.filter((r) => (!ui.target || r.target === ui.target)
@@ -1048,7 +1049,7 @@ td.nowrap { white-space: nowrap; }
         h("td", { class: "nowrap" }, String(r.time || "").slice(11) || String(r.time || "")),
         h("td", { class: "nowrap" }, h("span", { class: "name" }, sw, h("code", {}, who(r)))),
         h("td", {}, r.backend || ""),
-        h("td", {}, h("span", { class: `pill ${k}` }, h("i", {}), r.status.replace("_", " "))),
+        h("td", {}, h("span", { class: `pill ${k}` }, h("i", {}), r.status.replaceAll("_", " "))),
         h("td", { class: "num" }, fmt.x(r.speedup)),
         h("td", { class: "num" }, r.target === "e2e" ? fmt.ms(r.new_ms) : fmt.ms(r.new_ms, 3)),
         h("td", { class: "num" }, fmt.ms(r.est_saved_ms)),

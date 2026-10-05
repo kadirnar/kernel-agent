@@ -114,6 +114,9 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "new_ms_weighted",
             "error",
             "failed_case",
+            # which correctness stage failed (kernels/evaluate.py)
+            "stage",
+            "failed_check",
             "kernels_candidate",
             "kernels_reference",
             "eval_seconds",
