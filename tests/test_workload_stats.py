@@ -18,7 +18,7 @@ from test_methods import LAYERS, MAX_LEN, PREFIX, STEPS, ToyWorkload, _candidate
 from test_voxcpm import _voxcpm2_cached
 from torch import nn
 
-from kernel_agent import orchestrator, worker
+from kernel_agent import orchestrator, truth, worker
 from kernel_agent.agent import prompts
 from kernel_agent.hub import Modality
 from kernel_agent.integrate.export import export_optimized
@@ -470,6 +470,7 @@ def test_plan_schema_and_scope():
 
 def test_worker_plumbs_phase_and_regex(mixed, tmp_path, monkeypatch):
     run = RunDir.create(tmp_path, "toy/mixed")
+    write_json(run.run_json, {"truth": truth.new_section()})  # sealed: capture in .truth/
     spec = {
         "id": "dit_attn",
         "module_class": "Mixed",
@@ -484,7 +485,11 @@ def test_worker_plumbs_phase_and_regex(mixed, tmp_path, monkeypatch):
     assert info["qualname"] == "model.dit" and info["phase"] == "prefill"
     saved = read_json(run.target("dit_attn") / "spec.json")
     assert saved["phase"] == "prefill" and saved["capture"]["method_instances"] == {"forward": 1}
+    # the profile is for the agent: in its directory, not next to the sealed capture
+    assert run.capture_file("dit_attn").parent == run.truth_dir / "captures"
     assert (run.target("dit_attn") / "workload_profile.md").exists()
+    assert not (run.truth_dir / "captures" / "workload_profile.md").exists()
+    assert load_capture(run.target("dit_attn") / "capture_inputs.pt")["phase"] == "prefill"
     assert (run.target("dit_attn") / "reference_source.py").exists()
     patch = worker._kernel_patches(run, [f"dit_attn={tmp_path / 'k.py'}"])[0]
     assert (patch.phase, patch.qualname_regex, patch.methods) == ("prefill", r"\.dit$", ["forward"])
