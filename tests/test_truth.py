@@ -251,6 +251,7 @@ def test_tools_refuse_truth_paths_and_tampered_evaluations(tmp_path, monkeypatch
     assert seen[0][0] == capture and seen[0][2] == keeper.expect(capture)
     assert seen[0][1].parent == run.history_dir("t")
 
+    cand.write_text("def build(r): return r\n")  # a new kernel (the same one: a duplicate)
     changed = call(
         "evaluate_candidate", target_id="t", candidate="candidates/v1.py", hypothesis="h"
     )

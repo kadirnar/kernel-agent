@@ -22,6 +22,9 @@ Expected gain (Amdahl), in ms per run of the whole model::
   for systems the GPU-idle share of the profile or :attr:`Policy.systems_estimate`).
 * ``stale``: consecutive slices of this arm that found no new best.
 
+A kernel arm's rows are its benchmark evaluations (``ledger.measured``: quick
+checks and duplicates count for nothing) of all its workers (``workers.py``).
+
 UCB on the observed gain per evaluation (as in KernelBand): ``rate`` is the ms
 per run an arm's kept results saved, divided by its evaluations. Each arm's
 index is ``rate / best rate + explore × sqrt(2 ln(N + 2) / (n + 1))`` (``n``
@@ -363,7 +366,7 @@ def build_arms(
             _ref_ms(target_id, spec, profiles),
             module_class=spec.get("module_class"),
             estimate=estimate,
-            rows=[r for r in rows if r["target"] == target_id],
+            rows=ledger.measured(r for r in rows if r["target"] == target_id),
         )
         plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
         _kernel_history(arm, arm.rows, max(plans, default=None))

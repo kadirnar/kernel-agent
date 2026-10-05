@@ -36,7 +36,8 @@ HF URL ─► resolve (modality, arch, family, size)
                      forward_step, correctness-only cases from extra
                      settings), plus statistics of every call
                      (workload_profile.md)                          [GPU worker]
-        ─► kernels   one Claude "kernel engineer" per target writes candidates,
+        ─► kernels   one Claude "kernel engineer" per target (or k isolated
+                     workers, --seeds-per-target) writes candidates,
                      calls evaluate_candidate (correctness + interleaved
                      benchmark + optional per-kernel profile) and iterates
         ─► transforms  Claude "systems engineer" writes model-level transforms,
@@ -561,6 +562,52 @@ Limits: the evaluation budget of a slice is advice to the agent. The hard caps
 are `--agent-minutes` and the run budgets. Targets found by a re-plan are
 captured from the unmodified model.
 
+### Parallel workers, duplicates and quick checks
+
+* **Workers** (`kernel_agent/workers.py`). `--seeds-per-target K` gives every
+  target K isolated workers; `auto` gives 2 to targets with at least 20 % of the
+  profiled time and 1 to the rest (default: 1, one session as before). Each
+  worker is its own agent session (`kernel-<id>-w<k>`) in
+  `targets/<id>/workers/<k>/` with its own `candidates/` and `NOTES.md`; the
+  target's shared files (`spec.json`, `reference_source.py`, `history/`,
+  `results.jsonl`, ...) are links there. Worker 1 starts from the planner's
+  approach, worker k from the planner's `alternatives[k-2]` (`approach` +
+  `backends`, an optional field of the plan) or else from the next backend
+  (KernelFalcon's seeded workers, GEAK's workspace per agent). All workers of a
+  target share its verified evaluation store and the GPU lock, so
+  `best_for_target`, `best_result` and `best_so_far` are the best across workers
+  and the integration takes it. Ledger rows, records and evaluation events carry
+  the `worker`. The target's evaluation budget stays the same and is split across
+  its workers (`--evaluations 12`, 2 workers: 6 each; an improve slice of 4: 2
+  each), because serial refinement beats parallel sampling at a fixed budget
+  (Kevin). Worker sessions run concurrently up to `--parallel`, in the `kernels`
+  phase and in a slice of `improve`; a resumed `kernels` phase skips finished
+  worker sessions. `--reseed-workers` adds round 2: after the first worker
+  sessions of a target, the next ones start from its two best snapshots (with
+  half of the budget; in `improve`, every slice after the target's first).
+* **Duplicates** (`kernel_agent/dedup.py`). Before it takes the GPU lock,
+  `evaluate_candidate` hashes the candidate's source normalised by
+  `ast.unparse(ast.parse(...))` (comments, blank lines and formatting do not
+  count) and looks it up in the target's verified records. A match is not
+  evaluated again: the result is the earlier one, labelled `duplicate of
+  history/NNN_...py (exp N)`, the ledger gets a `duplicate` row, and no budget,
+  streak or idea counts it. A full evaluation reuses only full results; results
+  that may not repeat (`timeout`, `crash`, tampered) and calls that ask for more
+  than the record has (`profile=true`, `compile_check=true`) run again. Two
+  workers submitting the same source at the same time evaluate it once.
+* **Quick checks.** `evaluate_candidate(mode="quick")` (and `kernel-agent eval
+  --quick`) checks correctness on the smallest and the largest captured case
+  only, untimed. The result says it is not a benchmark, has no speedup and is
+  not counted against the evaluation budget; it is recorded in
+  `.truth/targets/<id>/quick.jsonl` and in the ledger as `quick_ok` /
+  `quick_fail`, which the charts, the scheduler, the streaks and the idea
+  aggregates ignore. A full evaluation of a quick-checked source still runs; a
+  quick check of an evaluated source returns the full result as a duplicate.
+* **Views.** `status` shows `<target>/w<k>` in the latest rows and the number of
+  workers per target; a target's `progress.png` has one marker shape per
+  worker; `kernel-agent watch` shows the worker in the ledger, the events and
+  the tooltips, and quick checks and duplicates as neutral rows.
+
 ### Kernel library and lessons (memory across runs)
 
 Runs used to forget everything. Now the kernels that won are kept per GPU
@@ -686,6 +733,8 @@ kernel-agent optimize <hf-url> [options]
   --backends cuda,triton,cute,tilelang,nvrtc
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
+  --seeds-per-target 2|auto            isolated workers per target, budget split across them
+  --reseed-workers                     round 2 of the workers from the two best snapshots
   --no-transforms                      kernels only
   --claude-model claude-opus-5-5 --effort high --budget 10 (USD per agent)
   --max-hours 3 --max-usd 40           budget for the whole run (see "Budgets")
@@ -707,7 +756,7 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE]
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]
-                                       [--timeout 300]
+                                       [--quick] [--timeout 300]
                                        (a full capture, e.g. <run_dir>/.truth/captures/<id>.pt)
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
@@ -750,11 +799,13 @@ runs/<org>--<name>/<timestamp>/
     captures/<id>.pt            module + real inputs/outputs + post-call state
     targets/<id>/history/       snapshot of every evaluated version
     targets/<id>/results.jsonl  every evaluation (full record + snapshot sha256)
+    targets/<id>/quick.jsonl    every quick check (mode="quick", not a benchmark)
     transforms/                 history/ + results.jsonl of the transforms
   targets/<id>/capture_inputs.pt  module + real inputs (no outputs), for the agent
   targets/<id>/workload_profile.md  statistics of every call of the target (+ .json)
   targets/<id>/reference_source.py
   targets/<id>/candidates/    files the agent writes
+  targets/<id>/workers/<k>/   --seeds-per-target: a worker's candidates/ + NOTES.md (+ links)
   targets/<id>/plan.md        improve: the research plan of a plateaued target
   targets/<id>/history/ results.jsonl   the agent's copies (never read back)
   targets/<id>/progress.png   speedup per evaluation (see "Charts")
@@ -787,11 +838,12 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  idea  hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  worker  idea  hypothesis
 ```
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
-"Speed of light"). `idea` is the `idea_id` of a kernel candidate. A ledger
+"Speed of light"). `worker` is the target's worker that evaluated a kernel
+candidate (empty without workers). `idea` is the `idea_id` of a kernel candidate. A ledger
 written before a column existed keeps its own layout, and its rows have no
 value for that column.
 
@@ -819,7 +871,9 @@ value for that column.
   Kernels start from the reference module (1.0×), `e2e` rows from the baseline.
   A correct result that is not better is `discard`. Failures are `incorrect`,
   `build_error`, `runtime_error`, `crash` or `timeout`. The keep rule is the
-  same one the budget advice uses.
+  same one the budget advice uses. `quick_ok` / `quick_fail` (quick checks) and
+  `duplicate` rows are not benchmark evaluations: no chart, count, budget or
+  streak uses them (see "Parallel workers, duplicates and quick checks").
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
   there is no custom kernel).

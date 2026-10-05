@@ -90,7 +90,8 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
     rows = [
         [
             t["id"],
-            str(t["module_class"] or ""),
+            str(t["module_class"] or "")
+            + (f" ({len(t['workers'])} workers)" if len(t.get("workers") or []) > 1 else ""),
             str(t["evals"]),
             str(t["keeps"]),
             str(t["failures"]),
@@ -146,7 +147,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
                 [
                     str(r["exp"]),
                     str(r["time"])[11:] or str(r["time"]),
-                    r["target"],
+                    r["target"] + (f"/w{r['worker']}" if r.get("worker") else ""),
                     r["backend"],
                     r["status"],
                     _x(r["speedup"]),

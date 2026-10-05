@@ -90,6 +90,26 @@ def _kernel_table(fn: Any, args: Any, kwargs: Any, top: int = 15) -> list[dict[s
     return rows[:top]
 
 
+def _numel(value: Any) -> int:
+    """Tensor elements in a (nested) structure of arguments."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return int(value.numel())
+    if isinstance(value, dict):
+        return sum(_numel(v) for v in value.values())
+    if isinstance(value, list | tuple):
+        return sum(_numel(v) for v in value)
+    return 0
+
+
+def quick_cases(cases: list[dict[str, Any]]) -> list[int]:
+    """Indices of the smallest and the largest case by input elements (``--quick``)."""
+    sizes = [_numel((c.get("args"), c.get("kwargs"))) for c in cases]
+    order = sorted(range(len(cases)), key=lambda i: (sizes[i], i))
+    return sorted({order[0], order[-1]}) if order else []
+
+
 def evaluate(
     capture_path: Path,
     candidate_path: Path,
@@ -100,11 +120,13 @@ def evaluate(
     device: str | None = None,
     capture_sha256: str | None = None,
     compile_check: bool = False,
+    quick: bool = False,
 ) -> dict[str, Any]:
     """Build, check and time one candidate.  ``device`` defaults to CUDA when
     available; on CPU only correctness is checked (timing needs CUDA events).
     ``capture_sha256``: refuse (status ``tampered``) a capture without this digest.
-    ``compile_check`` adds ``result["compile_check"]`` (``compile_check.py``)."""
+    ``compile_check`` adds ``result["compile_check"]`` (``compile_check.py``).
+    ``quick``: correctness on the smallest and the largest case only, never timed."""
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -176,6 +198,10 @@ def evaluate(
         )
         return result
 
+    if quick:  # evaluate_candidate(mode="quick"): two cases, untimed (not a benchmark)
+        result["quick"] = {"cases": quick_cases(cases), "of": len(cases)}
+        cases = [cases[i] for i in result["quick"]["cases"]]
+
     # 2. correctness on every captured case (outputs + in-place side effects)
     case_reports: list[dict[str, Any]] = []
     all_ok = True
@@ -223,8 +249,9 @@ def evaluate(
         from kernel_agent.kernels.compile_check import check
 
         result["compile_check"] = check(lambda: module.build(copy.deepcopy(reference)), cases)
-    if not device.startswith("cuda"):
-        result.update(status="ok", timing="skipped: no CUDA device")
+    if quick or not device.startswith("cuda"):
+        timing = "skipped: quick check" if quick else "skipped: no CUDA device"
+        result.update(status="ok", timing=timing)
         result["eval_seconds"] = round(time.perf_counter() - t0, 1)
         return result
 
@@ -321,9 +348,10 @@ def run_evaluation(
     timeout: float = 300.0,
     capture_sha256: str | None = None,
     compile_check: bool = False,
+    quick: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``: see
-    :func:`evaluate`; the subprocess checks the bytes it loads)."""
+    """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``, ``quick``:
+    see :func:`evaluate`; the subprocess checks the bytes it loads)."""
     cmd = [
         sys.executable,
         "-m",
@@ -343,6 +371,8 @@ def run_evaluation(
         cmd += ["--capture-sha256", capture_sha256]
     if compile_check:
         cmd.append("--compile-check")
+    if quick:
+        cmd.append("--quick")
     with gpu_lock():
         ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
         try:
@@ -374,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile-baseline", action="store_true")
     parser.add_argument("--capture-sha256", help="refuse a capture without this digest")
     parser.add_argument("--compile-check", action="store_true", help="torch.compile compat")
+    parser.add_argument("--quick", action="store_true", help="smallest + largest case, untimed")
     parser.add_argument("--json", default=None, help="write result JSON ('-' = stdout marker)")
     ns = parser.parse_args(argv)
     try:
@@ -385,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
             compile_baseline=ns.compile_baseline,
             capture_sha256=ns.capture_sha256,
             compile_check=ns.compile_check,
+            quick=ns.quick,
         )
     except Exception:
         result = {"status": "harness_error", "correct": False, "error": _short_tb()}

@@ -8,12 +8,13 @@ import json
 import re
 import shutil
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from kernel_agent import ledger, truth
+from kernel_agent import dedup, ledger, truth, workers
 from kernel_agent.budget import Budget
 from kernel_agent.dashboard import refresh
 from kernel_agent.kernels.evaluate import run_evaluation
@@ -23,6 +24,13 @@ from kernel_agent.worker import call_worker
 from kernel_agent.workspace import RunDir, append_jsonl, read_json
 
 SERVER_NAME = "ka"
+QUICK_NOTE = (
+    "quick check: correctness only, on the smallest and the largest captured case. NOT a "
+    "benchmark: no timing, no speedup, never a new best, not counted against your evaluation "
+    'budget. Evaluate with mode="full" to measure it.'
+)
+# (run, target, source key) of evaluations in flight: the same source waits for the first one
+_inflight: dict[tuple[str, str, str], asyncio.Event] = {}
 
 
 def _text(data: Any) -> dict[str, Any]:
@@ -67,12 +75,19 @@ def snapshot(run: RunDir, src: Path, target_id: str | None = None) -> Path:
 
 
 def _append(
-    run: RunDir, target_id: str | None, record: dict[str, Any], keeper: Truth | None
+    run: RunDir,
+    target_id: str | None,
+    record: dict[str, Any],
+    keeper: Truth | None,
+    *,
+    quick: bool = False,
 ) -> None:
-    """Append an evaluation record (``.truth/`` + the agent's copy, or the old place)."""
-    (keeper or truth.of(run)).append(run.results_file(target_id), record)
+    """Append an evaluation record (``.truth/`` + the agent's copy, or the old place);
+    ``quick``: to the quick checks' file of the target (``dedup.quick_file``)."""
+    path = dedup.quick_file(run, target_id) if quick and target_id else run.results_file(target_id)
+    (keeper or truth.of(run)).append(path, record)
     if run.sealed():
-        append_jsonl(_agent_dir(run, target_id) / "results.jsonl", record)
+        append_jsonl(_agent_dir(run, target_id) / path.name, record)
 
 
 def _in_truth(run: RunDir, path: Path) -> dict[str, Any] | None:
@@ -165,15 +180,21 @@ def record_candidate(
     keeper: Truth | None = None,
     idea: str = "",
     expected_speedup: float | None = None,
+    worker: int | None = None,
+    mode: str = dedup.FULL,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
 
     The record carries the sha256 of the snapshot it measured (``snapshot_sha256``,
     computed from ``snap`` when not given); winners are picked only from records
     whose snapshot still has it. ``keeper``: this process's :class:`Truth` of the run.
-    ``idea`` / ``expected_speedup``: the agent's ``idea_id`` and the speedup it expected.
+    ``idea`` / ``expected_speedup``: the agent's ``idea_id`` and the speedup it expected;
+    ``worker``: the target's worker that evaluated it (``workers.py``). A ``quick``
+    ``mode`` check goes to ``quick.jsonl`` instead, as a ``quick_ok`` / ``quick_fail`` row.
     """
     target_dir = run.target(target_id)
+    quick = mode == dedup.QUICK
+    source = snap.read_text()
     row = ledger.record_kernel(
         run,
         target_id,
@@ -181,10 +202,12 @@ def record_candidate(
         snapshot=snap.name,
         hypothesis=hypothesis,
         parent=parent,
-        source=snap.read_text(),
+        source=source,
         eval_s=eval_s,
         when=when,
         idea=idea,
+        worker=worker,
+        status=(ledger.QUICK_OK if result.get("correct") else ledger.QUICK_FAIL) if quick else None,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -201,10 +224,13 @@ def record_candidate(
         "parent": parent,
         "idea": idea or None,
         "expected_speedup": expected_speedup,
+        "source_key": dedup.source_key(source),
+        **({"worker": worker} if worker else {}),
+        **({"mode": dedup.QUICK} if quick else {}),
     }
     if isinstance(record.get("error"), str):
         record["error"] = record["error"][-1500:]
-    _append(run, target_id, record, keeper)
+    _append(run, target_id, record, keeper, quick=quick)
     return record, row
 
 
@@ -288,44 +314,110 @@ def record_e2e_result(
     return record, row
 
 
-def best_for_target(
+def ranked_for_target(
     run: RunDir, target_id: str, keeper: Truth | None = None
-) -> dict[str, Any] | None:
-    """The fastest correct record of a target whose snapshot is still the evaluated file.
+) -> Iterator[dict[str, Any]]:
+    """The correct records of a target, fastest first, whose snapshot is still the
+    evaluated file (checked lazily, as the caller asks for the next one).
 
     Only records kernel-agent wrote count (lines appended by anyone else are
-    ignored); a target whose records were modified has no winner."""
+    ignored); a target whose records were modified has none. Every worker of a
+    target records here (``workers.py``), so this ranks across workers."""
     keeper = keeper or truth.of(run)
     try:
         records = keeper.records(run.results_file(target_id))
     except TamperError:
-        return None
+        return
     ranked = [r for r in records if r.get("correct") and r.get("speedup") is not None]
     ranked.sort(key=lambda r: -float(r["speedup"]))  # stable: the first of equals wins
     history = run.history_dir(target_id)
     for rec in ranked:
         name = Path(str(rec.get("snapshot", ""))).name
         if keeper.snapshot_ok(history / name, rec.get("snapshot_sha256")):
-            return rec
-    return None
+            yield rec
 
 
-def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None = None) -> Any:
-    """Tools bound to one run directory (its budget: eval timeout + advice; its truth)."""
+def best_for_target(
+    run: RunDir, target_id: str, keeper: Truth | None = None
+) -> dict[str, Any] | None:
+    """The fastest correct record of a target (of all its workers) whose snapshot is still
+    the evaluated file (:func:`ranked_for_target`)."""
+    return next(ranked_for_target(run, target_id, keeper), None)
+
+
+def _uncounted(budget: Budget, agent: str, evals_budget: int | None) -> dict[str, Any]:
+    """``budget`` of a quick check or a duplicate: shown, not counted."""
+    used = budget.evals.get(agent, 0)
+    return {"budget": {"evals_used": used, "evals_budget": evals_budget, "counted": False}}
+
+
+def build_server(
+    run: RunDir,
+    budget: Budget | None = None,
+    keeper: Truth | None = None,
+    worker: workers.Binding | None = None,
+) -> Any:
+    """Tools bound to one run directory (its budget: eval timeout + advice; its truth) and,
+    for a worker session, to that worker (its directory, agent name and evaluation budget)."""
     budget = budget or Budget(run)
     keeper = keeper or truth.of(run)
+
+    def _best_so_far(target_id: str) -> dict[str, Any]:
+        best = best_for_target(run, target_id, keeper)
+        return {
+            "best_so_far": {"snapshot": best["snapshot"], "speedup": best["speedup"]}
+            if best
+            else None
+        }
+
+    async def _duplicate(
+        cached: dict[str, Any],
+        args: dict[str, Any],
+        hypothesis: str,
+        source: str,
+        idea: str,
+        mine: workers.Binding | None,
+    ) -> dict[str, Any]:
+        """The earlier result of a candidate evaluated before (``dedup.py``) + its ledger row."""
+        target_id = args["target_id"]
+        row = ledger.record_kernel(
+            run,
+            target_id,
+            {"correct": cached.get("correct")},
+            snapshot=Path(str(cached.get("snapshot"))).name,
+            hypothesis=hypothesis,
+            parent=args.get("parent"),
+            source=source,
+            idea=idea,
+            worker=mine.worker if mine else None,
+            status=ledger.DUPLICATE,
+        )
+        await asyncio.to_thread(refresh, run, target_id)
+        out = compact(cached)
+        out["duplicate"] = (
+            f"{dedup.label(cached)}: the same source up to comments and formatting, so it was "
+            "not evaluated again and this is that result. No evaluation, budget or streak was "
+            "used; change the kernel to measure something new."
+        )
+        out["duplicate_of"] = cached.get("snapshot")
+        if cached.get("mode") == dedup.QUICK:
+            out["mode"], out["not_a_benchmark"] = dedup.QUICK, QUICK_NOTE
+        out["ledger"] = {"exp": row["exp"], "status": row["status"]}
+        return out | _best_so_far(target_id)
 
     @tool(
         "evaluate_candidate",
         "Compile a kernel candidate, verify it on every captured case of the target and "
-        "benchmark it against the reference module. Records the result and snapshots the file.",
+        "benchmark it against the reference module. Records the result and snapshots the file. "
+        "mode=quick only checks correctness on two cases (no timing, free); a candidate that "
+        "was evaluated before (same code up to comments/formatting) returns that result.",
         {
             "type": "object",
             "properties": {
                 "target_id": {"type": "string"},
                 "candidate": {
                     "type": "string",
-                    "description": "path to the candidate .py (relative to the target dir)",
+                    "description": "path to the candidate .py (relative to your working dir)",
                 },
                 "hypothesis": {
                     "type": "string",
@@ -356,6 +448,14 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
                     "compiled outputs (does it survive the model's torch.compile?)",
                     "default": False,
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": [dedup.FULL, dedup.QUICK],
+                    "description": "quick: correctness on the smallest and the largest "
+                    "captured case only, no timing (not a benchmark, not counted against "
+                    "the evaluation budget); full (default): every case, timed",
+                    "default": dedup.FULL,
+                },
             },
             "required": ["target_id", "candidate", "hypothesis"],
         },
@@ -366,6 +466,9 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
         capture = run.capture_file(target_id)
         if not capture.exists():
             return _text({"status": "error", "error": f"unknown target {target_id}"})
+        mine = worker if worker is not None and worker.target_id == target_id else None
+        if mine is not None:  # a worker session: its own directory, name and budget
+            target_dir = workers.directory(run, target_id, mine.worker)
         src = _resolve(target_dir, args["candidate"])
         if (refused := _in_truth(run, src)) is not None:
             return _text(refused)
@@ -380,64 +483,98 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
                     "it should be faster",
                 }
             )
+        mode = str(args.get("mode") or dedup.FULL).strip().lower()
+        if mode not in (dedup.FULL, dedup.QUICK):
+            return _text({"status": "error", "error": f'mode is "full" or "quick", not {mode!r}'})
+        quick = mode == dedup.QUICK
         idea = ledger.idea_slug(args.get("idea_id"))
         expected = _expected(args.get("expected_speedup"))
+        agent = mine.agent if mine else f"kernel-{target_id}"
+        evals_budget = budget.kernel_evals
+        if mine is not None and mine.evaluations is not None:
+            evals_budget = mine.evaluations
         try:
             capture_sha256 = keeper.expect(capture)
         except TamperError as exc:
             return _text({"status": "error", "error": str(exc)})
-        snap = snapshot(run, src, target_id)
-        snap_sha256 = sha256_file(snap)
-        start = time.perf_counter()
-        result = await asyncio.to_thread(
-            run_evaluation,
-            capture,
-            snap,
-            profile=bool(args.get("profile")),
-            timeout=budget.eval_timeout_s,
-            capture_sha256=capture_sha256,
-            **({"compile_check": True} if args.get("compile_check") else {}),
-        )
-        if result.get("status") == "tampered":  # the evaluator refused the capture
-            keeper.alarm(capture, str(result.get("error")))
-        elif sha256_file(snap) != snap_sha256:
-            keeper.alarm(snap, "snapshot changed during its evaluation")
-            result = {
-                "status": "tampered",
-                "correct": False,
-                "error": f"{snap.name} changed while it was evaluated; result discarded",
-            }
-        _, row = record_candidate(
-            run,
-            target_id,
-            src,
-            snap,
-            result,
-            hypothesis=hypothesis,
-            parent=args.get("parent"),
-            eval_s=round(time.perf_counter() - start, 1),
-            snapshot_sha256=snap_sha256,
-            keeper=keeper,
-            idea=idea,
-            expected_speedup=expected,
-        )
+        source = src.read_text(errors="replace")
+        slot = (str(run.root), target_id, dedup.source_key(source))
+        while (busy := _inflight.get(slot)) is not None:  # another worker evaluates this source
+            await busy.wait()
+        if quick or not args.get("profile"):  # profile tables are never stored: run it again
+            cached = dedup.find(
+                run,
+                target_id,
+                slot[2],
+                keeper,
+                mode=mode,
+                compile_check=bool(args.get("compile_check")),
+            )
+            if cached is not None:
+                return _text(
+                    await _duplicate(cached, args, hypothesis, source, idea, mine)
+                    | _uncounted(budget, agent, evals_budget)
+                )
+        _inflight[slot] = done = asyncio.Event()
+        try:
+            snap = snapshot(run, src, target_id)
+            snap_sha256 = sha256_file(snap)
+            start = time.perf_counter()
+            result = await asyncio.to_thread(
+                run_evaluation,
+                capture,
+                snap,
+                profile=bool(args.get("profile")) and not quick,
+                timeout=budget.eval_timeout_s,
+                capture_sha256=capture_sha256,
+                **({"compile_check": True} if args.get("compile_check") else {}),
+                **({"quick": True} if quick else {}),
+            )
+            if result.get("status") == "tampered":  # the evaluator refused the capture
+                keeper.alarm(capture, str(result.get("error")))
+            elif sha256_file(snap) != snap_sha256:
+                keeper.alarm(snap, "snapshot changed during its evaluation")
+                result = {
+                    "status": "tampered",
+                    "correct": False,
+                    "error": f"{snap.name} changed while it was evaluated; result discarded",
+                }
+            _, row = record_candidate(
+                run,
+                target_id,
+                src,
+                snap,
+                result,
+                hypothesis=hypothesis,
+                parent=args.get("parent"),
+                eval_s=round(time.perf_counter() - start, 1),
+                snapshot_sha256=snap_sha256,
+                keeper=keeper,
+                idea=idea,
+                expected_speedup=expected,
+                worker=mine.worker if mine else None,
+                mode=mode,
+            )
+        finally:
+            _inflight.pop(slot, None)
+            done.set()
         await asyncio.to_thread(refresh, run, target_id)
         out = compact(result)
         out["ledger"] = {"exp": row["exp"], "status": row["status"]}
+        if quick:
+            out["mode"], out["not_a_benchmark"] = dedup.QUICK, QUICK_NOTE
+            return _text(out | _best_so_far(target_id) | _uncounted(budget, agent, evals_budget))
         if idea or expected is not None:
             try:
                 records = keeper.records(run.results_file(target_id))
             except TamperError:
                 records = []
             out["idea"] = idea_feedback(records, idea, expected, row)
-        best = best_for_target(run, target_id, keeper)
-        out["best_so_far"] = (
-            {"snapshot": best["snapshot"], "speedup": best["speedup"]} if best else None
-        )
+        out |= _best_so_far(target_id)
         out |= budget.feedback(
-            f"kernel-{target_id}",
+            agent,
             run.results_file(target_id),
-            budget.kernel_evals,
+            evals_budget,
             pct_of_sol=sol_signal(result),
         )
         return _text(out)
@@ -466,6 +603,7 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
                         "speedup": r.get("speedup"),
                         "idea": r.get("idea"),
                         "hypothesis": r.get("hypothesis"),
+                        **({"worker": r["worker"]} if r.get("worker") else {}),
                     }
                     for r in records[-15:]
                 ],

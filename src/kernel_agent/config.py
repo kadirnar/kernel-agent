@@ -26,6 +26,10 @@ class OptimizeConfig:
     transform_evaluations: int = 6
     min_speedup: float = 1.03
     parallel: int = 1
+    #: Isolated workers per target (workers.py): a count, "auto" (2 for targets with >= 20 %
+    #: of the profile) or None (1); the target's evaluation budget is split across them.
+    seeds_per_target: int | str | None = None
+    reseed_workers: bool = False  # a second round of worker sessions from the 2 best snapshots
     do_transforms: bool = True
     allow_harness_agent: bool = True
     #: analyze: also time a generic torch.compile when the workload has no

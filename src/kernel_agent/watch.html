@@ -175,6 +175,7 @@ svg .focus-ring { fill: none; stroke: var(--ink); stroke-width: 1.5; pointer-eve
 .pill.keep i { background: var(--keep); box-shadow: 0 0 0 1px var(--ink); }
 .pill.discard i { background: var(--discard); }
 .pill.fail i { background: var(--fail); border-radius: 2px; transform: rotate(45deg) scale(0.85); }
+.pill.note i { background: transparent; box-shadow: inset 0 0 0 1.5px var(--discard); }
 
 /* feeds */
 .feed { margin: 6px 0 0; padding: 0; list-style: none; max-height: 340px; overflow: auto;
@@ -347,6 +348,8 @@ td.nowrap { white-space: nowrap; }
   const NS = "http://www.w3.org/2000/svg";
   const PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"];
   const FAILURES = ["incorrect", "build_error", "runtime_error", "crash", "timeout"];
+  // not benchmark evaluations (ledger.UNMEASURED): quick checks and duplicates
+  const UNMEASURED = ["quick_ok", "quick_fail", "duplicate"];
   const MAX_EVENTS = 600, MAX_LOGS = 400;
   const S = { summary: null, rows: [], events: [], logs: [] };
   const ui = { target: "", status: "", query: "", limit: 100, files: null, file: null, filter: "",
@@ -387,7 +390,9 @@ td.nowrap { white-space: nowrap; }
       : `${(b / 1048576).toFixed(1)} MB`),
     clock: (t) => (t ? String(t).slice(-8) : ""),
   };
-  const kindOf = (status) => (status === "keep" ? "keep" : status === "discard" ? "discard" : "fail");
+  const kindOf = (status) => (status === "keep" ? "keep" : status === "discard" ? "discard"
+    : UNMEASURED.includes(status) ? "note" : "fail");
+  const who = (r) => (r.worker ? `${r.target}/w${r.worker}` : r.target);
   const nowTs = () => Date.now() / 1000 + clockOffset;
   const sum = (xs) => xs.reduce((a, b) => a + b, 0);
   const targetColor = (i) => (i == null ? "var(--other)" : `var(--t${i % 6})`);
@@ -826,7 +831,7 @@ td.nowrap { white-space: nowrap; }
   }
 
   function drawTarget(t, host) {
-    const rows = S.rows.filter((r) => r.target === t.id);
+    const rows = S.rows.filter((r) => r.target === t.id && !UNMEASURED.includes(r.status));
     if (!rows.length) return empty(host, "waiting for the first evaluation");
     const ok = rows.filter((r) => r.status === "keep" || r.status === "discard");
     const speeds = ok.map((r) => r.speedup).filter((v) => v != null);
@@ -857,7 +862,7 @@ td.nowrap { white-space: nowrap; }
       const y = good && r.speedup != null ? ys(r.speedup) : floor;
       return { x, y, r: good ? 8 : 7, row: null, open: openFor(r), data: r, tip: () => tipContent(
         good ? fmt.x(r.speedup) : r.status.replace("_", " "),
-        `#${r.exp} · ${r.status.replace("_", " ")} · ${r.backend}`,
+        `#${r.exp} · ${r.status.replace("_", " ")} · ${r.backend}${r.worker ? ` · worker ${r.worker}` : ""}`,
         [good && r.new_ms != null ? `${fmt.ms(r.new_ms, 4)} vs ${fmt.ms(r.ref_ms, 4)} per run` : null,
           `${r.snapshot}${r.parent ? ` (parent ${r.parent})` : ""}`, r.time], r.hypothesis) };
     });
@@ -984,7 +989,8 @@ td.nowrap { white-space: nowrap; }
       case "evaluation": {
         const r = byExp.get(e.exp);
         const extra = r && r.speedup != null && kindOf(r.status) !== "fail" ? ` · ${fmt.x(r.speedup)}` : "";
-        return [`${data("target")} #${data("exp")}: ${data("status").replace("_", " ")}${extra}`, r ? r.hypothesis : ""];
+        const where = e.worker ? `${data("target")}/w${data("worker")}` : data("target");
+        return [`${where} #${data("exp")}: ${data("status").replace("_", " ")}${extra}`, r ? r.hypothesis : ""];
       }
       default: {
         const rest = Object.entries(e).filter(([k]) => !["ts", "time", "event"].includes(k))
@@ -1025,7 +1031,8 @@ td.nowrap { white-space: nowrap; }
     const targets = [...sm.targets.map((t) => t.id), ...(sm.counts.e2e ? ["e2e"] : [])];
     options($("f-target"), [["", "all targets"], ...targets.map((t) => [t, t])], ui.target);
     options($("f-status"), [["", "all"], ["keep", "keep"], ["discard", "discard"], ["failed", "any failure"],
-      ...FAILURES.map((s) => [s, s.replace("_", " ")])], ui.status);
+      ...FAILURES.map((s) => [s, s.replace("_", " ")]), ...UNMEASURED.map((s) => [s, s.replace("_", " ")])],
+      ui.status);
     const q = ui.query.trim().toLowerCase();
     const rows = S.rows.filter((r) => (!ui.target || r.target === ui.target)
       && (!ui.status || r.status === ui.status || (ui.status === "failed" && FAILURES.includes(r.status)))
@@ -1039,7 +1046,7 @@ td.nowrap { white-space: nowrap; }
       return h("tr", {},
         h("td", { class: "num" }, String(r.exp ?? "")),
         h("td", { class: "nowrap" }, String(r.time || "").slice(11) || String(r.time || "")),
-        h("td", { class: "nowrap" }, h("span", { class: "name" }, sw, h("code", {}, r.target))),
+        h("td", { class: "nowrap" }, h("span", { class: "name" }, sw, h("code", {}, who(r)))),
         h("td", {}, r.backend || ""),
         h("td", {}, h("span", { class: `pill ${k}` }, h("i", {}), r.status.replace("_", " "))),
         h("td", { class: "num" }, fmt.x(r.speedup)),
