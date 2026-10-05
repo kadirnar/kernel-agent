@@ -368,6 +368,40 @@ def test_evaluation_and_worker_run_on_the_locked_gpu(lock_dir, foreign, monkeypa
     assert all(e[gpulock.ENV] == "1" for e in envs)
 
 
+def test_parallel_evaluations_run_one_per_gpu(monkeypatch, tmp_path):
+    """--parallel N with N GPUs: N evaluations at once, never two on one GPU."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from kernel_agent.kernels import evaluate
+
+    fake_gpus(monkeypatch, 2)
+    busy = {"0": 0, "1": 0}
+    peak = {"0": 0, "1": 0, "all": 0}
+    guard = threading.Lock()
+
+    def run(cmd, *, env, **kwargs):
+        gpu = env["CUDA_VISIBLE_DEVICES"]
+        with guard:
+            busy[gpu] += 1
+            peak[gpu] = max(peak[gpu], busy[gpu])
+            peak["all"] = max(peak["all"], sum(busy.values()))
+        time.sleep(0.2)
+        with guard:
+            busy[gpu] -= 1
+        return subprocess.CompletedProcess(cmd, 0, "@@KA_RESULT@@" + json.dumps({}), "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(evaluate, "ensure_peaks", lambda: None)
+    with ThreadPoolExecutor(4) as agents:  # the agents' tool calls run in worker threads
+        results = list(
+            agents.map(
+                lambda _: evaluate.run_evaluation(tmp_path / "c.pt", tmp_path / "k.py"), range(4)
+            )
+        )
+    assert peak == {"0": 1, "1": 1, "all": 2}
+    assert sorted(r["gpu_index"] for r in results) == [0, 0, 1, 1]
+
+
 def test_one_gpu_results_say_gpu_0_and_children_see_the_usual_environment(monkeypatch, tmp_path):
     from kernel_agent.kernels import evaluate
 
