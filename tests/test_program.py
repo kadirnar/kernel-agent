@@ -10,7 +10,7 @@ from kernel_agent.agent.runner import AgentResult
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.hub import Modality, ModelCard
 from kernel_agent.program import Program, parse, role_of
-from kernel_agent.workspace import RunDir, read_json, write_json
+from kernel_agent.workspace import RunDir, read_json, read_jsonl, write_json
 
 CARD = {"repo_id": "org/m", "modality": "llm", "architectures": ["X"], "params": 1}
 
@@ -220,6 +220,11 @@ def test_agents_see_mid_run_edits(tmp_path, monkeypatch):
     assert costs["kernel-t2"]["program_sha256"] == sha("## kernel\nrule two\n")
     rec = run.load()["program"]
     assert rec["source"] == str(custom.resolve()) and len(rec["versions"]) == 2
+    starts = [e for e in read_jsonl(run.events) if e["event"] == "agent_start"]
+    assert [(e["agent"], e["program_sha256"]) for e in starts] == [
+        ("kernel-t1", costs["kernel-t1"]["program_sha256"]),
+        ("kernel-t2", costs["kernel-t2"]["program_sha256"]),
+    ]
 
 
 def test_create_copies_program(tmp_path, monkeypatch):
