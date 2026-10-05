@@ -422,4 +422,27 @@ def summarize(profile: dict[str, Any], baseline_ms: float, top: int = 30) -> str
     ]
     for o in kv["aten_ops"][:20]:
         lines.append(f"| `{o['name']}` | {o['calls']} | {o['device_ms']:.3f} |")
+    lines += _roofline_note()
     return "\n".join(lines) + "\n"
+
+
+def _roofline_note() -> list[str]:
+    """Measured peaks + how to read headroom from them (empty when not measured)."""
+    from kernel_agent import toolchain
+
+    peaks = toolchain.setup().peaks
+    if not peaks:
+        return []
+    gbps = float(peaks["dram_gbps"])
+    return [
+        "",
+        "## Roofline (peaks measured on this GPU)",
+        "",
+        f"{toolchain.format_peaks(peaks)}. A module call takes at least max(FLOPs / peak, "
+        "bytes it must read and write / bandwidth), and at least the launch floor if it "
+        "launches anything. Weights are read once per call, so a class with P bf16 "
+        f"parameters needs ≥ 2·P bytes / {gbps:.0f} GB/s per call (≈ {2e3 / gbps:.1f} us per "
+        "million parameters): when *inclusive ms / calls* is far above that, there is "
+        "headroom. Kernel "
+        "engineers get `sol_ms` / `pct_of_sol` per captured case.",
+    ]

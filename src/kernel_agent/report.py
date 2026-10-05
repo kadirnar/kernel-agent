@@ -100,10 +100,15 @@ def write_report(run: RunDir) -> Path:
         )
         if best:
             for case in best.get("cases", []):
+                sol = (
+                    f", {case['pct_of_sol']} % of SOL, {case.get('bound')}"
+                    if case.get("pct_of_sol") is not None
+                    else ""
+                )
                 lines.append(
                     f"|  ↳ `{case.get('signature', '')[:60]}` ×{case.get('calls_per_run')} | | | | "
                     f"{_fmt(case.get('speedup'))} ({_fmt(case.get('ref_ms'), 4)} → "
-                    f"{_fmt(case.get('new_ms'), 4)} ms) | | |"
+                    f"{_fmt(case.get('new_ms'), 4)} ms{sol}) | | |"
                 )
     lines.append("")
     for target_id in run.target_ids():

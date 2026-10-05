@@ -25,6 +25,12 @@ kernel-agent eval capture.pt candidates/<file>.py --profile
 A candidate counts only with `"correct": true`. Never call the reference
 forward and never return captured outputs.
 
+Each timed result reports per case `sol_ms` (speed of light from FLOPs, bytes
+and peaks measured on this GPU), `pct_of_sol` and `bound`
+(memory/compute/launch), plus the weighted `pct_of_sol` of the target. Stop
+once it reaches about 90 %. `suspicious_faster_than_sol` means the result beat
+the hardware, so check that the kernel really does all the work.
+
 Before you write code, read the backend guides and the verified examples:
 
 ```bash

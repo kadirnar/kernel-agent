@@ -351,8 +351,15 @@ their structure.
   `profile=true` adds per-kernel GPU time tables for candidate and reference.
 * `best_result(target_id="{target["id"]}")`: best correct result so far.
 You have a budget of about {evaluations} evaluations. Stop early once further
-gains are unlikely (e.g. you are within ~10 % of the memory-bandwidth or launch
-overhead floor). The orchestrator always keeps the best correct snapshot.
+gains are unlikely. Every timed result reports the speed of light per case:
+`sol_ms` = max(FLOPs / peak FLOP/s, `min_bytes` / peak bandwidth) with peaks
+measured on this GPU, `pct_of_sol` = 100 × sol_ms / new_ms, and `bound`
+(`memory`, `compute`, or `launch` when even a perfect kernel is dominated by one
+launch: then compare `new_ms` with `launch_floor_ms` and fuse more work per
+launch). The result-level `pct_of_sol` weights the cases by calls per run; at
+≥ 90 % the advice is `stop`. `suspicious_faster_than_sol` means the measurement
+beat the hardware: make sure the kernel does all the work the reference does.
+The orchestrator always keeps the best correct snapshot.
 
 {COMMON_RULES}
 

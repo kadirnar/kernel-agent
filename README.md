@@ -112,6 +112,52 @@ overlapping views (a full deep copy would store the whole cache for every
 case, before and after the call). Side effects are therefore checked on the
 memory the arguments cover, not on the rest of the buffer they were sliced from.
 
+### Speed of light
+
+Every timed `evaluate_candidate` result says how close each case is to the
+hardware limit (`kernel_agent/kernels/roofline.py`).
+
+* **Peaks** are measured on the GPU once per GPU model and torch version, in a
+  subprocess under the GPU lock (never inside a timed evaluation), and cached
+  in `~/.cache/kernel-agent/peaks-<gpu>-torch<version>.json`. They are copy
+  bandwidth from DRAM (512 MiB buffers) and from L2 (counting bytes read plus
+  bytes written), dense matmul TFLOP/s for bf16, fp16 and fp32 (best of a few
+  large shapes, TF32 off), and the launch floor (a module call that launches
+  one tiny kernel, timed like a candidate). `kernel-agent doctor` measures and
+  prints them (`--remeasure-peaks` measures again). `toolchain.json` and the
+  agents' prompts include them. On the RTX 5070 Ti: copy DRAM 767 GB/s, L2
+  2970 GB/s, matmul bf16/fp16/fp32 99 / 94 / 34 TFLOP/s, launch floor ~16 µs.
+* **Work** is counted on the reference call. FLOPs come from
+  `torch.utils.flop_counter.FlopCounterMode`, split by the dtype of each op's
+  inputs. Attention (SDPA) FLOPs count only the query/key pairs that the mask
+  or `is_causal` allows. `min_bytes` counts every byte range of the inputs,
+  parameters and buffers that the reference reads, each one once. Unused
+  weights, intermediates and metadata-only uses do not count. Gather ops
+  (embedding, index) count only the rows they read, and SDPA counts only the
+  key/value positions that some query attends to. Outputs and new state (for
+  example a concatenated cache) count once. Inputs updated in place count only
+  the elements that changed, so a decode step over a static KV cache costs the
+  slot it writes plus the valid positions, not the whole cache.
+* Per case: `flops`, `min_bytes`, `sol_ms = max(Σ flops / peak, min_bytes /
+  bandwidth)`, `pct_of_sol = 100 × sol_ms / new_ms` and `bound`. `bound` is
+  `compute`, `memory`, or `launch` when `sol_ms` is below the launch floor
+  (one launch from Python costs more than the work). Cases whose bytes fit in
+  L2 are compared with the L2 bandwidth (`l2_resident`), because the benchmark
+  reuses the same inputs and runs them with a warm cache. The result also has
+  the weighted `pct_of_sol` (cases weighted by calls per run), `sol_ms_weighted`,
+  the dominant `bound` and `launch_floor_ms`.
+* `new_ms < 0.9 × sol_ms` is faster than the hardware allows. That case and the
+  result get `suspicious_faster_than_sol`, which is a warning and not a
+  rejection. If the reference itself beats 0.9 × `sol_ms`, the estimate is wrong
+  and the case gets `sol_unreliable` instead.
+* Limitations: the bytes are what the reference touches. Masked work that
+  happens outside SDPA (for example a `repeat_kv` copy of a whole static cache)
+  counts in full, so a kernel that skips it can legitimately beat the estimate.
+  Such a result is flagged, never rejected. Strided views count their whole
+  span. Element-wise math counts as free. The launch floor is measured for a
+  torch op, and backend launch paths add their own overhead on top of it
+  (CUDA C++ ~19 µs, Triton ~43 µs, see Backends).
+
 ### Budgets
 
 All limits are off by default (`kernel_agent/budget.py`).
@@ -136,7 +182,10 @@ All limits are off by default (`kernel_agent/budget.py`).
   `budget: {evals_used, evals_budget, minutes_left, non_improving}` and an
   `advice`. The advice is `continue`, or `consider_stopping` after 4 evaluations
   in a row that did not beat the best result by more than max(1 %, 2 × timing
-  spread), or `stop` when the evaluation, time or USD budget is spent.
+  spread), or `stop` when the evaluation, time or USD budget is spent. A
+  correct kernel result whose weighted `pct_of_sol` is at least 90 % also gets
+  `stop` ("within X % of speed of light"), unless it is flagged
+  `suspicious_faster_than_sol` or `sol_unreliable` (see "Speed of light").
 * Timeouts and budget stops are recorded under `run.json` → `phases.<phase>`
   (`timed_out`, `budget_skipped`), in `events.jsonl` and in `report.md`.
 
@@ -273,7 +322,7 @@ kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
-kernel-agent doctor [--smoke]
+kernel-agent doctor [--smoke] [--remeasure-peaks]
 kernel-agent install-claude-code <project-dir>
 ```
 
@@ -336,8 +385,12 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  eval_s  hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  hypothesis
 ```
+
+`pct_of_sol` is the weighted share of the speed of light for kernel rows (see
+"Speed of light"). A ledger written before that column existed keeps its own
+layout.
 
 * `evaluate_candidate` requires a `hypothesis` (one sentence: what changed and
   why it should be faster) and accepts an optional `parent` snapshot.
@@ -358,7 +411,8 @@ est_saved_ms  spread  eval_s  hypothesis
 `kernel-agent status <run_dir> [--watch SECONDS]` prints the current phase, the
 baseline, the projected and measured end-to-end latency, the total cost from
 `costs.json`, a table per target (evaluations, keeps, failures, best speedup,
-estimated ms saved, last hypothesis) and the last 10 ledger rows.
+its % of speed of light, estimated ms saved, last hypothesis) and the last 10
+ledger rows.
 
 `dashboard.html` in the run directory is self-contained: charts inlined as
 PNG, the target table, the latest evaluations and the agent costs. It supports

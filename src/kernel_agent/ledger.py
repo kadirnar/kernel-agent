@@ -43,6 +43,7 @@ COLUMNS = (
     "new_ms",
     "est_saved_ms",
     "spread",
+    "pct_of_sol",
     "eval_s",
     "hypothesis",
 )
@@ -53,7 +54,7 @@ STATUSES = (KEEP, DISCARD, *FAILURES)
 E2E = "e2e"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-_FLOATS = {"speedup", "ref_ms", "new_ms", "est_saved_ms", "spread", "eval_s"}
+_FLOATS = {"speedup", "ref_ms", "new_ms", "est_saved_ms", "spread", "pct_of_sol", "eval_s"}
 # Statuses of the evaluator / e2e worker that are not ledger statuses.
 _STATUS_MAP = {"patch_error": "build_error", "harness_error": "crash", "error": "crash"}
 _BACKENDS = (
@@ -202,14 +203,16 @@ def append(run: RunDir, row: dict[str, Any]) -> dict[str, Any]:
         path = run.ledger
         exists = path.exists() and path.stat().st_size > 0
         count = 0
+        columns: tuple[str, ...] = COLUMNS
         if exists:
             with path.open() as fh:
-                count = sum(1 for line in fh if line.strip()) - 1
+                columns = tuple(fh.readline().rstrip("\n").split("\t"))  # older runs: fewer
+                count = sum(1 for line in fh if line.strip())
         row = {**row, "exp": count + 1}
         with path.open("a") as fh:
             if not exists:
-                fh.write("\t".join(COLUMNS) + "\n")
-            fh.write("\t".join(_cell(row.get(c)) for c in COLUMNS) + "\n")
+                fh.write("\t".join(columns) + "\n")
+            fh.write("\t".join(_cell(row.get(c)) for c in columns) + "\n")
     return row
 
 
@@ -243,6 +246,7 @@ def record_kernel(
                 "new_ms": _num(result.get("new_ms_weighted")),
                 "est_saved_ms": _num(result.get("est_saved_ms_per_run")),
                 "spread": kernel_spread(result),
+                "pct_of_sol": _num(result.get("pct_of_sol")),
                 "eval_s": eval_s if eval_s is not None else _num(result.get("eval_seconds")),
                 "hypothesis": hypothesis,
             },
@@ -332,6 +336,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
                 "new_ms": _num(rec.get("new_ms_weighted")),
                 "est_saved_ms": _num(rec.get("est_saved_ms_per_run")),
                 "spread": kernel_spread(rec),
+                "pct_of_sol": _num(rec.get("pct_of_sol")),
                 "eval_s": _num(rec.get("eval_seconds")),
                 "hypothesis": rec.get("hypothesis") or "",
             }
@@ -434,6 +439,7 @@ def summary(run: RunDir) -> dict[str, Any]:
                 "keeps": len(kept),
                 "failures": sum(r["status"] in FAILURES for r in trows),
                 "best_speedup": best["speedup"] if best else None,
+                "best_pct_of_sol": best.get("pct_of_sol") if best else None,
                 "best_snapshot": best["snapshot"] if best else None,
                 "best_backend": best["backend"] if best else None,
                 "est_saved_ms": best["est_saved_ms"] if best else None,

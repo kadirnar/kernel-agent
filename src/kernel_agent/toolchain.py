@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -53,6 +54,7 @@ class Toolchain:
     backends: dict[str, bool] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    peaks: dict[str, Any] | None = None  # measured roofline peaks (kernels/roofline.py)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -77,6 +79,10 @@ class Toolchain:
         lines.append(f"backends available: {', '.join(enabled) or 'none'}")
         if disabled:
             lines.append(f"backends unavailable: {', '.join(disabled)}")
+        if self.peaks:
+            lines.append(f"measured peaks: {format_peaks(self.peaks)}")
+        elif self.gpu:
+            lines.append("measured peaks: not yet (`kernel-agent doctor` measures them)")
         lines.extend(f"note: {n}" for n in self.notes)
         return "\n".join(lines)
 
@@ -97,6 +103,36 @@ def gpu_info() -> GPUInfo | None:
         sm_count=props.multi_processor_count,
         l2_cache_mb=l2 / 1024**2,
     )
+
+
+def peaks_path(gpu: str, torch_version: str) -> Path:
+    """Cache file of the measured roofline peaks of one GPU model + torch version."""
+    name = re.sub(r"[^A-Za-z0-9.]+", "-", f"{gpu}-torch{torch_version}").strip("-").lower()
+    return CACHE_DIR / f"peaks-{name}.json"
+
+
+def load_peaks(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("dram_gbps") else None
+
+
+def format_peaks(peaks: dict[str, Any]) -> str:
+    """One line: copy bandwidths (read + write bytes), matmul TFLOP/s, launch floor."""
+    parts = [f"copy DRAM {peaks['dram_gbps']:.0f} GB/s"]
+    if peaks.get("l2_gbps"):
+        parts.append(f"L2 {peaks['l2_gbps']:.0f} GB/s")
+    short = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
+    tflops = peaks.get("tflops") or {}
+    if tflops:
+        names = "/".join(short.get(k, k) for k in tflops)
+        values = " / ".join(f"{v:.0f}" for v in tflops.values())
+        parts.append(f"matmul {names} {values} TFLOP/s")
+    if peaks.get("launch_floor_us"):
+        parts.append(f"launch floor {peaks['launch_floor_us']:.1f} us")
+    return ", ".join(parts)
 
 
 def _pip_cuda_root() -> Path | None:
@@ -242,6 +278,7 @@ def setup(apply_env: bool = True) -> Toolchain:
         backends=backends,
         notes=notes,
         env=env,
+        peaks=load_peaks(peaks_path(gpu.name, torch.__version__)) if gpu else None,
     )
 
 
