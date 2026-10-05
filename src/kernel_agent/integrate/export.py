@@ -15,11 +15,18 @@ APPLY_TEMPLATE = '''"""Optimised kernels for {repo_id}, produced by kernel-agent
 Usage::
 
     import sys; sys.path.insert(0, "{root}")
-    from apply import apply_kernels
+    from apply import apply_kernels, apply_transforms
     apply_kernels(model)            # model: the nn.Module(s) loaded as in the benchmark
+    apply_transforms(model)         # model-level transforms, in the integrated order
 
-Model-level transforms (``transforms/*.py``) take the kernel-agent workload
-object; port them by hand if you use your own inference code.
+Model-level transforms (``transforms/*.py``) receive the kernel-agent workload
+object. Most only use ``workload.model``; ``apply_transforms(model)`` passes a
+stand-in holding ``model`` (pass ``workload=`` for transforms that need more).
+
+Kernels compiled at load time (CUDA C++ via ``load_inline``, TileLang) need the
+compiler environment kernel-agent found (nvcc from pip wheels, ninja on PATH,
+nvcc flags for new host compilers): with kernel-agent importable this module
+sets it up; otherwise put a CUDA toolkit and ninja on PATH yourself.
 """
 
 from __future__ import annotations
@@ -34,6 +41,17 @@ from torch import nn
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = json.loads((HERE / "manifest.json").read_text())
+
+
+def _toolchain() -> None:
+    try:
+        from kernel_agent import toolchain
+    except ImportError:
+        return
+    toolchain.setup()
+
+
+_toolchain()
 
 
 def _load(path: Path, name: str | None = None):
@@ -119,6 +137,18 @@ def apply_kernels(*roots: nn.Module) -> dict[str, int]:
                 n += 1
         counts[entry["target"]] = n
     return counts
+
+
+def apply_transforms(model: nn.Module, workload=None) -> list[str]:
+    """Apply the model-level transforms in the order the integration accepted them."""
+    from types import SimpleNamespace
+
+    target = workload if workload is not None else SimpleNamespace(model=model)
+    done = []
+    for entry in MANIFEST.get("transforms", []):
+        _load(HERE / entry["file"]).apply(target)
+        done.append(entry["file"])
+    return done
 '''
 
 
