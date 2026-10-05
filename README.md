@@ -132,7 +132,7 @@ kernels and returns a one-line description:
 | workload | reference optimisations |
 |---|---|
 | VoxCPM | `model.optimize()`: `torch.compile(mode="reduce-overhead", fullgraph=True)` of both LMs' `forward_step`, the LocEnc and the LocDiT estimator |
-| LLM | static KV cache (`cache_implementation="static"`); transformers then compiles the decode step (`reduce-overhead`). Only for architectures that declare compile support |
+| LLM | static KV cache (`cache_implementation="static"`); transformers then compiles the decode step (`reduce-overhead`). Only for architectures that declare compile support. SmolLM2-135M, 512 + 64 tokens: 985 → 187 ms, identical tokens |
 | diffusion | `torch.compile` of the denoiser (`pipe.transformer` / `pipe.unet`; not with `cpu_offload`) |
 | STT, TTS, harnesses | none by default (implement the hook, or pass `--compile-baseline`) |
 
@@ -389,6 +389,14 @@ bf16 rounding step per layer cannot be told apart from correct rounding
 changes: an attention softmax scale off by 5 % reaches mean cosine 0.994 and
 passes; the module-level check has to catch errors of that size. The model
 runs in its checkpoint dtype (bf16), and `--dtype` is ignored.
+
+Compiled baseline (`model.optimize()`, see "Strong baseline"), RTX 5070 Ti,
+60 patches: eager 5,499 ms, compiled 3,798 ms (1.45×; 2 warm-up runs take
+15.5 s), teacher-forced against the eager output with mean step cosine 0.9984
+(min 0.958). On top of it the bundled Triton RMSNorm on all 124
+`MiniCPMRMSNorm` instances survives `fullgraph=True` and passes (3,789 ms, no
+gain: Inductor already fuses the norm); the `load_inline` CUDA RMSNorm breaks
+it (Dynamo cannot trace the pybind function) until it is wrapped in a custom op.
 
 ### kernel-agent improve: the continuous loop
 
