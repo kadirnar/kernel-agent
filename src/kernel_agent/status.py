@@ -78,6 +78,9 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         else:
             header[-1] += "  |  " + part
     lines += header
+    if s["projection"] and s["projection"].used:  # projection.py: nested targets counted once
+        text = f"projected from {s['projection'].describe()}"
+        lines.append(text if len(text) <= width else text[: width - 1] + "…")
     if s["reference"]:
         lines.append(
             "compiled baseline + accepted kernels: "

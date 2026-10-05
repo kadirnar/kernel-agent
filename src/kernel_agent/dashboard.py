@@ -87,6 +87,7 @@ def write_dashboard(run: RunDir) -> Path:
     phase = ledger.phase_label(s)
 
     comp = s["compiled_ms"]  # strong baseline (strong_baseline.py)
+    proj = s["projection"]  # projection.py: nested targets counted once
     compiled = f"torch.compile {_ms(comp)} ({base / comp:.2f}×)" if comp and base else ""
     vs_comp = f" · {comp / measured:.2f}× vs. compiled" if comp and measured else ""
     tiles = [
@@ -101,7 +102,8 @@ def write_dashboard(run: RunDir) -> Path:
         (
             "projected from kernels",
             _ms(s["projected_ms"]),
-            f"{base / s['projected_ms']:.2f}×" if base and s["projected_ms"] else "",
+            (f"{base / s['projected_ms']:.2f}×" if base and s["projected_ms"] else "")
+            + (f" · from {_e(proj.describe())}" if proj and proj.used else ""),
         ),
         (
             "evaluations",

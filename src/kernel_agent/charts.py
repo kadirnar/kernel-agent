@@ -4,8 +4,9 @@
   (green, annotated with their hypothesis), discarded ones (grey), failures (red ×
   on the floor), the running best and the 1.0× reference.
 * ``progress.png``: end-to-end latency over wall-clock time. The projection from
-  the best kernels (baseline − Σ est. saved ms) as a step line, measured
-  end-to-end runs (transforms, integration) as diamonds, baseline lines.
+  the best kernels (baseline − Σ est. saved ms, nested targets counted once:
+  :mod:`kernel_agent.projection`) as a step line, measured end-to-end runs
+  (transforms, integration) as diamonds, baseline lines.
 * ``amdahl.png``: the baseline time split by target class share (from the
   profile), before and after the best per-target speedups, plus "other".
 * ``integration.png``: waterfall of the greedy end-to-end integration.
@@ -21,11 +22,11 @@ import importlib.util
 import math
 import textwrap
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger
+from kernel_agent import ledger, projection
 from kernel_agent.ledger import DISCARD, E2E, FAILURES, KEEP
 from kernel_agent.workspace import RunDir, read_json
 
@@ -128,11 +129,12 @@ def _render(path: Path, size: tuple[float, float], draw: Callable[[Any, Any], No
 
 
 def _header(ax: Any, title: str, subtitle: str = "", raise_pt: float = 0.0) -> None:
+    """Title and subtitle above the axes (a subtitle of several lines raises the title)."""
     ax.annotate(
         title,
         xy=(0, 1),
         xycoords="axes fraction",
-        xytext=(0, (26 if subtitle else 10) + raise_pt),
+        xytext=(0, (26 + 12 * subtitle.count("\n") if subtitle else 10) + raise_pt),
         textcoords="offset points",
         fontsize=12.5,
         fontweight="bold",
@@ -265,6 +267,40 @@ def _place_labels(
 def _label_box(ax: Any, annotation: Any) -> list[tuple[float, float]]:
     bbox = annotation.get_window_extent(ax.figure.canvas.get_renderer())
     return [(bbox.x0, bbox.y0), (bbox.x1, bbox.y0), (bbox.x1, bbox.y1), (bbox.x0, bbox.y1)]
+
+
+def _place_text(
+    ax: Any,
+    xy: tuple[float, float],
+    text: str,
+    options: list[tuple[float, float, str, str]],
+    taken: list[list[tuple[float, float]]],
+    avoid: Sequence[list[tuple[float, float]]] = (),
+    **style: Any,
+) -> Any:
+    """Annotate ``xy`` with ``text`` at the first of ``options`` (``(dx, dy, ha, va)``,
+    offsets in points) that stays inside the axes and overlaps no label in ``taken``
+    nor a mark in ``avoid``; else the first that overlaps no label; else the first.
+    The label's box is added to ``taken``."""
+    inside = ax.get_window_extent(ax.figure.canvas.get_renderer())
+    tried = []
+    for dx, dy, ha, va in options:
+        note = ax.annotate(
+            text, xy=xy, xytext=(dx, dy), textcoords="offset points", ha=ha, va=va, **style
+        )
+        box = _label_box(ax, note)
+        (x0, y0), (x1, y1) = box[0], box[2]
+        fits = inside.x0 <= x0 and x1 <= inside.x1 and inside.y0 <= y0 and y1 <= inside.y1
+        free = not any(_overlap(box, other) for other in taken)
+        tried.append((note, box, fits and free and not any(_overlap(box, o) for o in avoid), free))
+        note.set_visible(False)
+    note, box, _, _ = next((t for t in tried if t[2]), next((t for t in tried if t[3]), tried[0]))
+    for other, _, _, _ in tried:
+        if other is not note:
+            other.remove()
+    note.set_visible(True)
+    taken.append(box)
+    return note
 
 
 def _short(text: str, limit: int) -> str:
@@ -521,14 +557,14 @@ def _draw_run(
     )
     end = max(end, 1.0)
 
-    # projected: baseline − Σ est. saved of each target's latest kept candidate
-    saved: dict[str, float] = {}
+    # projected: baseline − Σ est. saved of each target's best kept candidate (or its
+    # re-evaluation), nested targets counted once (projection.py)
+    tree = projection.tree(run)
+    last = projection.project(tree, {}, base_ms)
     px, py = [0.0], [base_ms]
-    for t, r in timed:
-        if r["target"] != E2E and r["status"] == KEEP and r["est_saved_ms"] is not None:
-            saved[r["target"]] = r["est_saved_ms"]
-            px.append(t)
-            py.append(max(base_ms - sum(saved.values()), 0.0))
+    for r, last in projection.series(tree, base_ms, rows):
+        px.append(minutes(ledger.epoch(r["time"])))
+        py.append(last.projected_ms)
     e2e = [(t, r) for t, r in timed if r["target"] == E2E]
     measured = [(t, r) for t, r in e2e if r["status"] in (KEEP, DISCARD) and r["new_ms"]]
     failed = [(t, r) for t, r in e2e if r["status"] in FAILURES]
@@ -562,7 +598,7 @@ def _draw_run(
             )
 
     ax.axhline(base_ms, color=INK_2, lw=1.0, ls=(0, (5, 4)), zorder=1)
-    ax.annotate(
+    reference = ax.annotate(
         f"baseline {base_ms:,.1f} ms",
         xy=(0, base_ms),
         xycoords=("axes fraction", "data"),
@@ -573,9 +609,10 @@ def _draw_run(
         fontsize=8.5,
         color=INK_2,
     )
+    taken = [_label_box(ax, reference)]  # labels placed so far (display px)
     if compiled:
         ax.axhline(compiled, color=COMPILE_COLOR, lw=1.2, ls=(0, (1.5, 2.5)), zorder=1)
-        ax.annotate(
+        compiled_label = ax.annotate(
             f"torch.compile baseline {compiled:,.1f} ms",
             xy=(0, compiled),
             xycoords=("axes fraction", "data"),
@@ -586,22 +623,13 @@ def _draw_run(
             fontsize=8.5,
             color=INK_2,
         )
+        taken.append(_label_box(ax, compiled_label))
 
     px.append(end)
     py.append(py[-1])
     ax.step(px, py, where="post", color=PROJECTED_COLOR, lw=2.0, zorder=3)
     if len(px) > 2:
         ax.scatter(px[1:-1], py[1:-1], s=16, color=PROJECTED_COLOR, zorder=3, lw=0)
-    ax.annotate(
-        f"projected {py[-1]:,.1f} ms",
-        xy=(px[-1], py[-1]),
-        xytext=(-2, 5),
-        textcoords="offset points",
-        ha="right",
-        va="bottom",
-        fontsize=9,
-        color=INK,
-    )
 
     for status, color, size in ((DISCARD, DISCARD_COLOR, 40), (KEEP, KEEP_COLOR, 70)):
         pts = [(t, r) for t, r in measured if r["status"] == status]
@@ -636,16 +664,39 @@ def _draw_run(
         best = next(
             ((t, r) for t, r in reversed(measured) if r["new_ms"] == final["median_ms"]), best
         )
+    # The two end labels (the projection's and the highlighted measurement) must not
+    # overlap each other, the baseline labels, the projected line or the markers.
+    (x0, y0), (x1, _) = ax.transData.transform([(px[-2], py[-1]), (px[-1], py[-1])])
+    avoid = [_box(x0, y0 - 2, x1 - x0, 4, 0.0, "left")]  # the last step of the projection
+    half = 4.5 * ax.figure.dpi / 72  # of a diamond
+    for t, r in measured:
+        cx, cy = ax.transData.transform((t, r["new_ms"]))
+        avoid.append(_box(cx - half, cy - half, 2 * half, 2 * half, 0.0, "left"))
+    _place_text(
+        ax,
+        (px[-1], py[-1]),
+        f"projected {py[-1]:,.1f} ms",
+        [(-2, 5, "right", "bottom"), (-2, -5, "right", "top")],
+        taken,
+        avoid,
+        fontsize=9,
+        color=INK,
+    )
     if best is not None:
         t, r = best
-        ax.annotate(
+        _place_text(
+            ax,
+            (t, r["new_ms"]),
             f"measured {r['new_ms']:,.1f} ms ({base_ms / r['new_ms']:.2f}×)\n"
             f"{_short(r['snapshot'] or r['hypothesis'], 44)}",
-            xy=(t, r["new_ms"]),
-            xytext=(-10, -10),
-            textcoords="offset points",
-            ha="right",
-            va="top",
+            [
+                (-10, -10, "right", "top"),
+                (-10, 10, "right", "bottom"),
+                (10, -10, "left", "top"),
+                (10, 10, "left", "bottom"),
+            ],
+            taken,
+            avoid,
             fontsize=8.5,
             color=INK,
             zorder=6,
@@ -663,13 +714,13 @@ def _draw_run(
         else f"baseline {base_ms:,.1f} ms"
     )
     n_kernel = sum(r["target"] != E2E for r in rows)
-    _header(
-        ax,
-        f"{repo}: {headline}",
+    subtitle = (
         f"{n_kernel} kernel evaluations, {len(e2e)} end-to-end runs  ·  "
-        f"projected from the best kernels: {py[-1]:,.1f} ms ({base_ms / max(py[-1], 1e-9):.2f}×)",
-        raise_pt=14 if spans else 0,
+        f"projected from the best kernels: {py[-1]:,.1f} ms ({base_ms / max(py[-1], 1e-9):.2f}×)"
     )
+    if last.used:  # which targets the projection counts
+        subtitle += "\n" + _short(f"projected from {last.describe()}", 120)
+    _header(ax, f"{repo}: {headline}", subtitle, raise_pt=14 if spans else 0)
     handles = [
         Line2D([], [], color=PROJECTED_COLOR, lw=2, label="projected (kernels)"),
         Line2D(

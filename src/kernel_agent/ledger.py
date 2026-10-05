@@ -606,7 +606,10 @@ def summary(run: RunDir) -> dict[str, Any]:
                 "workers": sorted({str(r["worker"]) for r in trows if r.get("worker")}, key=int),
             }
         )
-    saved = sum(t["est_saved_ms"] or 0.0 for t in targets)
+    from kernel_agent import projection  # it imports this module
+
+    # nested targets counted once (a decoder layer's kernel replaces its attention's)
+    proj = projection.of_run(run, {t["id"]: t["est_saved_ms"] for t in targets}, base_ms)
     kept_e2e = [r for r in ledger_rows if r["target"] == E2E and r["status"] == KEEP]
     best_e2e = kept_e2e[-1] if kept_e2e else None  # running best end-to-end measurement
     integration = read_json(run.root / "integration.json", {}) or {}
@@ -639,7 +642,8 @@ def summary(run: RunDir) -> dict[str, Any]:
         "compiled_ms": _num(baseline.get("compiled_ms")),
         "baseline": baseline,
         "workload": baseline.get("workload"),
-        "projected_ms": round(max(base_ms - saved, 0.0), 3) if base_ms else None,
+        "projected_ms": proj.projected_ms if proj and base_ms else None,
+        "projection": proj,
         "best_e2e": best_e2e,
         "final": final or None,
         "reference": integration.get("reference") or None,

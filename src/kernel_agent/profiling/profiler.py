@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import collections
 import inspect
-import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -34,6 +33,7 @@ from kernel_agent.profiling.methods import (
     instrument,
     workload_entrypoints,
 )
+from kernel_agent.projection import fold
 from kernel_agent.workloads.base import Workload, synchronize
 
 
@@ -97,6 +97,10 @@ class ClassStat:
     #: Per phase (:mod:`kernel_agent.phases`): calls, inclusive_ms, instances,
     #: top_signature and ``groups`` (qualname pattern -> instances).
     phases: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Where the instances are: qualname with layer indices folded -> instances
+    #: (``model.base_lm.layers.*.self_attn``: 28); the module tree of
+    #: :mod:`kernel_agent.projection`.
+    groups: dict[str, int] = field(default_factory=dict)
 
 
 class ModuleTimer:
@@ -290,6 +294,7 @@ class ModuleTimer:
                             g["phases"].items(), key=lambda kv: -kv[1]["inclusive"]
                         )
                     },
+                    groups=dict(_folded(g["qualnames"]).most_common()),
                 )
             )
         stats.sort(key=lambda s: -s.inclusive_ms)
@@ -299,17 +304,19 @@ class ModuleTimer:
 def _phase_stat(p: dict[str, Any]) -> dict[str, Any]:
     """One phase of a class: totals, the top signature and where its instances live
     (qualnames with layer indices folded: ``model.base_lm.layers.*.self_attn``)."""
-    groups: collections.Counter[str] = collections.Counter(
-        re.sub(r"\.\d+(?=\.|$)", ".*", q) for q in p["qualnames"]
-    )
     top = p["sigs"].most_common(1)
     return {
         "calls": p["calls"],
         "inclusive_ms": round(p["inclusive"], 4),
         "instances": len(p["qualnames"]),
         "top_signature": top[0][0] if top else "",
-        "groups": dict(groups.most_common(6)),
+        "groups": dict(_folded(p["qualnames"]).most_common(6)),
     }
+
+
+def _folded(qualnames: set[str]) -> collections.Counter[str]:
+    """Instances per qualname with layer indices folded (``model.layers.*.mlp``)."""
+    return collections.Counter(fold(q) for q in qualnames)
 
 
 def _device_time(evt: Any, self_only: bool) -> float:

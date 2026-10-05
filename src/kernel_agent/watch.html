@@ -395,7 +395,6 @@ td.nowrap { white-space: nowrap; }
     : UNMEASURED.includes(status) ? "note" : "fail");
   const who = (r) => (r.worker ? `${r.target}/w${r.worker}` : r.target);
   const nowTs = () => Date.now() / 1000 + clockOffset;
-  const sum = (xs) => xs.reduce((a, b) => a + b, 0);
   const targetColor = (i) => (i == null ? "var(--other)" : `var(--t${i % 6})`);
 
   const measureCtx = document.createElement("canvas").getContext("2d");
@@ -664,7 +663,10 @@ td.nowrap { white-space: nowrap; }
         m ? `${fmt.x(m.speedup)} vs eager${comp ? ` · ${fmt.x(comp / m.ms)} vs compiled` : ""} · ${m.label}`
           : "no passing end-to-end run yet"],
       ["Projected from kernels", keptKernel ? fmt.ms(proj) : "—",
-        keptKernel && proj && base ? `${fmt.x(base / proj)} if the best kernels add up` : "no kept kernel yet"],
+        keptKernel && proj && base
+          ? `${fmt.x(base / proj)} if the best kernels add up` +
+            (sm.projection && sm.projection.label ? ` · from ${sm.projection.label}` : "")
+          : "no kept kernel yet"],
       ["Evaluations", String(c.evaluations), `${c.keeps} kept · ${c.failures} failed · ${c.e2e} end-to-end`],
       ["Elapsed", fmt.dur(elapsedNow()), state, "elapsed"],
       ["Agent cost", fmt.usd(total),
@@ -704,15 +706,14 @@ td.nowrap { white-space: nowrap; }
     }
     const tEnd = timeExtent(), tMax = tEnd * 1.03;
     const proj = [{ t: 0, ms: base, row: null }], measured = [], failed = [];
-    const saved = new Map();
+    // the projection after each kept (or re-evaluated) kernel, nested targets counted once
+    // (projection.py)
+    const steps = (sm.projection && sm.projection.steps) || {};
     for (const r of S.rows) {
       const t = minutesOf(r.ts);
       if (t == null) continue;
       if (r.target !== "e2e") {
-        if (r.status === "keep" && r.est_saved_ms != null) {
-          saved.set(r.target, r.est_saved_ms);
-          proj.push({ t, ms: Math.max(base - sum([...saved.values()]), 0), row: r });
-        }
+        if (steps[r.exp] != null) proj.push({ t, ms: steps[r.exp], row: r });
       } else if ((r.status === "keep" || r.status === "discard") && r.new_ms) measured.push({ t, row: r });
       else if (FAILURES.includes(r.status)) failed.push({ t, row: r });
     }
@@ -783,7 +784,8 @@ td.nowrap { white-space: nowrap; }
     for (const p of proj.slice(1)) {
       const r = p.row;
       points.push({ x: xs(p.t), y: ys(p.ms), r: 6, open: openFor(r), tip: () => tipContent(
-        `projected ${fmt.ms(p.ms)}`, `${fmt.x(base / p.ms)} vs eager · after #${r.exp} kept`,
+        `projected ${fmt.ms(p.ms)}`,
+        `${fmt.x(base / p.ms)} vs eager · after #${r.exp} ${r.status === "keep" ? "kept" : r.status}`,
         [`${r.target} ${fmt.x(r.speedup)} · ${r.backend} · ${fmt.ms(r.est_saved_ms)} saved`, r.time], r.hypothesis) });
     }
     for (const m of [...measured, ...failed]) {

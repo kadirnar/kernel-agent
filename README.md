@@ -1362,7 +1362,8 @@ value for that column.
   streak uses them (see "Parallel workers, duplicates and quick checks").
   Neither are `re-evaluated` rows, the integration's re-evaluations of stale
   records (see "Independent re-check of winners"). They do replace the
-  snapshot's earlier row as the target's best in `status` and the report.
+  snapshot's earlier row as the target's best in `status`, the report, the
+  live dashboard and the projection.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
   there is no custom kernel).
@@ -1372,7 +1373,8 @@ value for that column.
   files.
 
 `kernel-agent status <run_dir> [--watch SECONDS]` prints the current phase, the
-baseline, the projected and measured end-to-end latency, the total cost from
+baseline, the projected (nested targets counted once, see Charts) and measured
+end-to-end latency, the total cost from
 `costs.json`, a table per target (evaluations, keeps, failures, best speedup,
 its % of speed of light, estimated ms saved, last hypothesis) and the last 10
 ledger rows.
@@ -1395,6 +1397,30 @@ is the projection from the best kernels (baseline − Σ est. saved ms of each
 target's best kept candidate). Diamonds are measured end-to-end runs
 (transforms and integration steps). Dashed lines mark the baseline and, when it
 is known, the `torch.compile` baseline. The shaded bands are the pipeline phases.
+The end labels of the projection and of the highlighted measurement are placed
+so that they overlap neither each other nor the other labels.
+
+Nested targets are counted once (`kernel_agent/projection.py`). A decoder
+layer's kernel replaces the attention, MLP and norm kernels inside it, so
+adding all of them would count the attention twice. The module tree comes
+from the profile: `profile.json` lists, per class, its instances by qualname
+with layer indices folded (`classes[].groups`, e.g.
+`model.base_lm.layers.*.self_attn: 28`). Older profiles only have one example
+qualname per class plus each target's captured instance; there the
+instances are split evenly over the known qualnames. Each target's saving is
+spread evenly over its instances. Per parent instance the projection takes
+the better of the parent's kernel alone and the sum of what its children
+count. A parent that holds only some of a child's instances replaces only
+that share of the child. On VoxCPM2 the LocEnc holds 12 of the 60 decoder
+layers. The second subtitle line, `kernel-agent status`, the dashboard tile
+and `report.md` name the set that was counted, for example `projected from
+attn_fused + rmsnorm_fused + mlp_fused; not counted (nested):
+decoder_layer_fused, locenc_fused`. A target counted only in part shows its
+share, as in `decoder_layer_fused (80%)`. Approximations: the even split
+over instances (the evaluator scales the captured instance's gain by the
+instances calling each entrypoint), and a phase-specific parent is taken
+to replace all of its children's saving. Two targets on the same instances
+with different `phase` add up.
 
 ![run progress](docs/images/example-progress.png)
 
