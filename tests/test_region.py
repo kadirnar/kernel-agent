@@ -215,7 +215,15 @@ def _orchestrator(tmp_path, capsys, rewrite: str | None):
     spec = WorkloadSpec(
         repo_id="toy/decoder", modality="llm", device="cpu", dtype="float32", harness=str(TOY)
     )
-    cfg = OptimizeConfig(model_ref="toy/decoder", runs_dir=tmp_path, use_library=False)
+    # This tests the pipeline wiring; whether the fused kernel wins a paired A/B on a
+    # CPU toy is timing noise under load, so any quality-passing item is accepted.
+    cfg = OptimizeConfig(
+        model_ref="toy/decoder",
+        runs_dir=tmp_path,
+        use_library=False,
+        ab_min_win_rate=0.0,
+        ab_min_gain=-1.0,
+    )
     run = sealed_run(tmp_path, workload=spec.to_dict(), config=cfg.to_dict())
     orch = orchestrator.Orchestrator(run, cfg)
     orch.worker = _call_worker(capsys)

@@ -59,3 +59,8 @@ def _gpu_lock_for_gpu_tests(request):
                 os.environ.pop(ENV, None)
             else:
                 os.environ[ENV] = old
+            # Hand cached GPU memory back before the lock is released: other
+            # processes (agents, optimisation runs) allocate as soon as they get it.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
