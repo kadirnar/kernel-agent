@@ -81,12 +81,29 @@ class STTWorkload(Workload):
     def roots(self) -> dict[str, nn.Module]:
         return {"model": self.model}
 
+    def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
+        """The same audio length, rotated by 37 % and with faint noise (seed = ``variant``)."""
+        return {"audio_shift": 0.37, "audio_noise_seed": variant}
+
+    def variants(self) -> list[dict[str, Any]]:
+        """Batch 2, and a shorter clip (other shapes for CTC models), a few tokens each."""
+        return [
+            {"batch_size": 2, "new_tokens": 4},
+            {"audio_seconds": 7.0, "new_tokens": 4},
+        ]
+
     def make_inputs(self) -> dict[str, torch.Tensor]:
         path = self.options.get("audio")
         if path:
             audio = load_wav(str(path), self.sampling_rate)
         else:
             audio = synthetic_speechlike(float(self.options["audio_seconds"]), self.sampling_rate)
+        if self.options.get("audio_shift"):  # held-out input: other content, same length
+            audio = np.roll(audio, int(audio.size * float(self.options["audio_shift"])))
+        if self.options.get("audio_noise_seed") is not None:
+            rng = np.random.default_rng(int(self.options["audio_noise_seed"]))
+            rms = float(np.sqrt(np.mean(audio**2))) or 1.0
+            audio = (audio + 0.01 * rms * rng.standard_normal(audio.size)).astype(np.float32)
         batch = [audio] * int(self.options["batch_size"])
         feats = self.processor(batch, sampling_rate=self.sampling_rate, return_tensors="pt")
         return {

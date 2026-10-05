@@ -5,6 +5,7 @@ run directory is within their reach. Everything the evaluator trusts therefore
 lives outside the agents' working directories, in ``<run>/.truth/``::
 
     .truth/baseline_output.pt         reference output of the baseline run
+    .truth/baseline_output_holdout.pt ... of the held-out input (workloads/holdout.py)
     .truth/captures/<id>.pt           module + inputs + reference outputs + post-call state
     .truth/targets/<id>/results.jsonl evaluation records (each with its snapshot's sha256)
     .truth/targets/<id>/history/      the evaluated snapshots
@@ -205,13 +206,17 @@ class Truth:
             self._persist()
         return digest
 
+    def _baseline_files(self) -> tuple[Path, ...]:
+        run = self.run
+        return (run.baseline_json, run.baseline_output(), run.baseline_output_holdout())
+
     def seal_baseline(self, median_ms: float) -> None:
-        """``baseline.json`` + the baseline output, and the latency every speedup divides."""
+        """``baseline.json`` + the baseline outputs, and the latency every speedup divides."""
         if not self.enabled:
             return
         with self._lock:
             self.recorded_baseline_ms = float(median_ms)
-            for path in (self.run.baseline_json, self.run.baseline_output()):
+            for path in self._baseline_files():
                 if path.exists():
                     self.seal(path)
             self._persist()
@@ -337,7 +342,7 @@ class Truth:
         args = []
         if self.recorded_baseline_ms:
             args += ["--baseline-ms", repr(self.recorded_baseline_ms)]
-        for path in (self.run.baseline_json, self.run.baseline_output()):
+        for path in self._baseline_files():
             entry = self.files.get(self.rel(path))
             if entry is not None:
                 args += ["--verify", f"{self.rel(path)}={entry['sha256']}"]

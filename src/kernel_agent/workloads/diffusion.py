@@ -11,6 +11,8 @@ from kernel_agent.hub import Modality
 from kernel_agent.workloads.base import Comparison, Workload, cosine, psnr
 
 PROMPT = "a photograph of a red fox sitting in fresh snow, golden hour, highly detailed"
+#: Held-out e2e input (``holdout_options``): another prompt, other seeds.
+HOLDOUT_PROMPT = "an oil painting of a lighthouse on a rocky coast at dusk, stormy sea"
 
 
 class DiffusionWorkload(Workload):
@@ -54,6 +56,17 @@ class DiffusionWorkload(Workload):
             return None  # offloaded weights move between devices: nothing robust to compile
         denoiser.compile()
         return f"torch.compile of the denoiser (pipe.{name}.compile(), default mode)"
+
+    def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
+        """Another prompt; variants ``>= 2`` change only the seed (same shapes)."""
+        return {"prompt": HOLDOUT_PROMPT, "seed": int(self.options["seed"]) + variant}
+
+    def variants(self) -> list[dict[str, Any]]:
+        """Three quarters of the resolution (a multiple of 64), two steps."""
+        height, width = (
+            max(64, int(self.options[k]) * 3 // 4 // 64 * 64) for k in ("height", "width")
+        )
+        return [{"height": height, "width": width, "steps": 2}]
 
     def make_inputs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {

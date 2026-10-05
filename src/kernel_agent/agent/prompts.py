@@ -112,6 +112,10 @@ where the returned object subclasses `kernel_agent.workloads.base.Workload`
   `chaotic = True`, `supports_teacher_forcing = True`, `run_teacher_forced` and
   `compare_teacher_forced` (see `voxcpm.py`), until `"teacher_forcing"` passes.
 * One `run()` should take roughly 0.2-10 s on the GPU.
+* Read prompts / texts / seeds from `self.options` and implement
+  `holdout_options(variant)` (option overrides for a held-out input with other
+  content and the same shapes; see `llm.py`, `voxcpm.py`) and, optionally,
+  `variants()` (extra settings such as other lengths, checked for correctness).
 * If the inference loop calls module methods other than `forward` directly
   (e.g. `layer.step_decode(...)`) and their names do not match
   `forward*|step|decode*|prefill*|generate_step`, list them in the class
@@ -484,6 +488,10 @@ of inference (clock burn-in loops, caching outputs across runs, skipping work
 when inputs repeat). Outputs must stay within the workload's quality
 check (the tool reports it). Warm-up/compile time is excluded from timing
 (1 warm-up run), but the transform must not change the inputs or the work.
+Quality is also checked, untimed, on a held-out input (other prompt / text /
+seed; `metrics.holdout`), so nothing may bake in the main input, and a fresh
+input timed after warm-up must not be more than 3x slower than the repeated
+runs (memoisation fails the evaluation).
 
 # Tools
 * `evaluate_e2e(transforms=["transforms/<id>.py"], kernels=[], hypothesis="...")` loads

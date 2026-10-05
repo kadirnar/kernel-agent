@@ -59,7 +59,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     from kernel_agent import strong_baseline
     from kernel_agent.profiling.profiler import profile_workload, summarize
-    from kernel_agent.workloads import quality
+    from kernel_agent.workloads import holdout, quality
     from kernel_agent.workloads.base import measure
 
     if (ns.kernel or ns.transform) and not ns.out_dir:
@@ -104,6 +104,9 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         first = read_json(run.baseline_json, {}) or {}
         baseline["run_eager_ms"] = first.get("median_ms")
         baseline.update({k: first[k] for k in ("compiled_ms", "compiled_detail") if k in first})
+    else:  # the held-out input: e2e judges candidates on it too (workloads/holdout.py)
+        target = truth.replace(out.baseline_output_holdout())
+        baseline["holdout"] = holdout.save_baseline(workload, output, target)
     write_json(out.baseline_json, baseline)
     # Strong baseline (strong_baseline.py): the full analyze of a run measures the
     # workload's reference optimisations (or, with --compile-baseline, a generic
@@ -185,6 +188,7 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         qualname_regex=spec.get("qualname_regex"),
         phase=spec.get("phase"),
         profile_dir=target_dir,  # workload_profile.md is for the agent
+        variants=workload.variants(),  # extra settings: correctness-only cases
     )
     if run.sealed():  # the agent's copy: module + inputs, no reference outputs
         truth.write_inputs_capture(capture, target_dir / "capture_inputs.pt")
@@ -223,15 +227,17 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     import torch
 
     from kernel_agent.integrate.patcher import PatchReport, apply_kernels, apply_transforms
+    from kernel_agent.workloads import holdout
     from kernel_agent.workloads.base import measure
     from kernel_agent.workloads.quality import assess, is_chaotic
 
-    # The baseline output and baseline.json, checked against the digests the
+    # The baseline outputs and baseline.json, checked against the digests the
     # orchestrator holds (--verify) before anything runs; read once, used later.
     expected = dict(item.partition("=")[::2] for item in ns.verify or [])
     try:
         reference_bytes = _truth_bytes(run, run.baseline_output(), expected)
         baseline_bytes = _truth_bytes(run, run.baseline_json, expected, required=False)
+        holdout_bytes = _truth_bytes(run, run.baseline_output_holdout(), expected, required=False)
     except truth.TamperError as exc:
         return {"status": "tampered", "passed": False, "error": str(exc)}
     workload = _workload(run)
@@ -259,10 +265,9 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     # the orchestrator's baseline latency (--baseline-ms), not what baseline.json says now
     base_ms = ns.baseline_ms or float(baseline.get("median_ms", 0.0)) or float("nan")
     # Timing is free-running; quality is teacher-forced when the workload supports it.
+    chaotic = is_chaotic(workload, baseline)
     try:
-        verdict = assess(
-            workload, inputs, reference, output, chaotic=is_chaotic(workload, baseline)
-        )
+        verdict = assess(workload, inputs, reference, output, chaotic=chaotic)
     except Exception as exc:
         return {
             "status": "runtime_error",
@@ -272,11 +277,22 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             "patches": report.__dict__,
             "error": traceback.format_exc()[-4000:],
         }
+    # Held-out input (untimed) + memoisation probe; failures are verdicts, not errors.
+    held = holdout.check(
+        workload,
+        torch.load(io.BytesIO(holdout_bytes), weights_only=False) if holdout_bytes else None,
+        reference,
+        main_output=output,
+        main_ms=timing["median_ms"],
+        baseline=baseline,
+        chaotic=chaotic,
+    )
+    reasons = [verdict["reason"], held["reason"] and f"held-out input: {held['reason']}"]
     return {
         "status": "ok",
-        "passed": verdict["passed"],
-        "reason": verdict["reason"],
-        "metrics": verdict["metrics"],
+        "passed": verdict["passed"] and held["passed"],
+        "reason": "; ".join(r for r in reasons if r),
+        "metrics": {**verdict["metrics"], "holdout": held},
         "median_ms": round(timing["median_ms"], 3),
         "times_ms": [round(t, 3) for t in timing["times_ms"]],
         "baseline_ms": round(base_ms, 3),

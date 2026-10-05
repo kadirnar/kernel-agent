@@ -79,7 +79,13 @@ def write_report(run: RunDir) -> Path:
         )
         lines.append(row("compiled baseline", compiled, quality))
     if final:
-        metrics = ", ".join(f"{k}={v}" for k, v in _flat_metrics(final.get("metrics")).items())
+        found = dict(final.get("metrics") or {})
+        held = found.pop("holdout", None)  # workloads/holdout.py: one phrase, not every metric
+        metrics = ", ".join(f"{k}={v}" for k, v in _flat_metrics(found).items())
+        if isinstance(held, dict):
+            from kernel_agent.workloads.holdout import summary_text
+
+            metrics += f"; {summary_text(held)}"
         lines.append(
             row("optimised", final.get("median_ms"), metrics, f"**{final.get('speedup')}x**")
         )

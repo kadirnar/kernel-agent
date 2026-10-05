@@ -19,6 +19,12 @@ TEXT = (
     "Kernel level optimisation makes speech synthesis fast enough for real time "
     "conversation, even on a single consumer graphics card."
 )
+#: Held-out e2e input (``holdout_options``) and a short extra capture setting (``variants``).
+HOLDOUT_TEXT = (
+    "Every sentence a listener hears must be synthesised from scratch, never replayed "
+    "from an earlier run, whatever words it happens to contain."
+)
+SHORT_TEXT = "Short sentences matter too."
 
 
 class TTSWorkload(Workload):
@@ -39,6 +45,13 @@ class TTSWorkload(Workload):
 
     def roots(self) -> dict[str, nn.Module]:
         return {"model": self.pipe.model}
+
+    def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
+        """Another sentence; variants ``>= 2`` change only the seed."""
+        return {"text": HOLDOUT_TEXT, "seed": int(self.options["seed"]) + variant}
+
+    def variants(self) -> list[dict[str, Any]]:
+        return [{"text": SHORT_TEXT}]
 
     def make_inputs(self) -> str:
         return str(self.options["text"])

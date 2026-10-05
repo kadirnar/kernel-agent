@@ -39,6 +39,12 @@ from kernel_agent.hub import Modality
 from kernel_agent.workloads.base import Comparison, Workload, compare_audio, compare_steps
 
 TEXT = "Kernel level optimisation makes speech synthesis fast enough for real time conversation."
+#: Held-out e2e input (``holdout_options``): another sentence and seed, the same patches.
+HOLDOUT_TEXT = (
+    "A held out sentence proves that every patch is computed, never replayed from memory."
+)
+#: Extra capture setting (``variants``): another LM prefill length, few patches.
+SHORT_TEXT = "Short sentences matter too."
 
 
 class VoxCPMWorkload(Workload):
@@ -107,6 +113,14 @@ class VoxCPMWorkload(Workload):
             "VoxCPM `model.optimize()`: torch.compile(mode='reduce-overhead', fullgraph=True) "
             "of base_lm/residual_lm.forward_step, feat_encoder and feat_decoder.estimator"
         )
+
+    def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
+        """Another sentence and seed, the same number of patches; variants ``>= 2``
+        change only the seed (the shapes of variant 1)."""
+        return {"text": HOLDOUT_TEXT, "seed": int(self.options["seed"]) + variant}
+
+    def variants(self) -> list[dict[str, Any]]:
+        return [{"text": SHORT_TEXT, "patches": min(int(self.options["patches"]), 8)}]
 
     def make_inputs(self) -> str:
         return str(self.options["text"])
