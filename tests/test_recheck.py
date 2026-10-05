@@ -346,7 +346,7 @@ def worker(calls: list[str]):
     return run_worker
 
 
-def test_integration_refuses_a_kernel_that_fails_the_recheck(tmp_path, simulated):
+def test_integration_refuses_a_kernel_that_fails_the_recheck(tmp_path, simulated, monkeypatch):
     orch = make(tmp_path)
     run = orch.run
     attn, mlp = kernel(run, "attn", 2.0), kernel(run, "mlp", 1.5)
@@ -391,6 +391,21 @@ def test_integration_refuses_a_kernel_that_fails_the_recheck(tmp_path, simulated
     again = read_json(run.root / "integration.json")
     assert [r["passed"] for r in again["recheck"]] == [False, True]
     assert [a["item"] for a in again["accepted"]] == [mlp]
+
+    # A re-check made by an older evaluator schema is measured again, not reused (#81).
+    load = orch.truth.load_json
+
+    def from_older_evaluator(path):
+        data = load(path)
+        if Path(path).name == "integration.json":
+            for r in data.get("recheck") or []:
+                r["evaluator_schema"] = EVALUATOR_SCHEMA - 1
+        return data
+
+    monkeypatch.setattr(orch.truth, "load_json", from_older_evaluator)
+    rechecked.clear()
+    asyncio.run(orch.integrate(reuse=True))
+    assert [t for t, _ in rechecked] == ["attn", "mlp"]
 
 
 def test_no_recheck_and_simulated_runs(tmp_path, simulated):

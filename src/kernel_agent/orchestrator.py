@@ -895,7 +895,13 @@ class Orchestrator:
         decides. A re-evaluation or a speed cap (:meth:`_recheck_one`) can rank another
         snapshot of the target first: that one is re-checked too and, when it passes,
         integrated instead (its sha256 goes to ``digests``)."""
-        known = {(r.get("item"), r.get("sha256")): r for r in previous.get("recheck") or []}
+        # Reuse a re-check only when it was made by the current evaluator: a schema bump
+        # (e.g. timing at full clocks, #81) invalidates every earlier measurement.
+        known = {
+            (r.get("item"), r.get("sha256")): r
+            for r in previous.get("recheck") or []
+            if r.get("evaluator_schema") == evaluate.EVALUATOR_SCHEMA
+        }
         records: list[dict[str, Any]] = []
         refused: set[str] = set()
         checked: dict[str, dict[str, Any]] = {}
@@ -911,7 +917,14 @@ class Orchestrator:
             result = dict(hit) if hit is not None else self._recheck_one(target_id, snap, rec)
             checked[arg] = result
             records.append(
-                {**result, "item": arg, "target": target_id, "snapshot": snap.name, "sha256": sha}
+                {
+                    **result,
+                    "item": arg,
+                    "target": target_id,
+                    "snapshot": snap.name,
+                    "sha256": sha,
+                    "evaluator_schema": evaluate.EVALUATOR_SCHEMA,
+                }
             )
             warn = "WARNING " if result.get("status") == recheck.SPEED_DISAGREES else ""
             log(f"integrate: {warn}recheck {target_id} ({snap.name}): {recheck.describe(result)}")
