@@ -34,6 +34,8 @@ DTYPES = {
     "float32": torch.float32,
     "fp32": torch.float32,
 }
+#: :func:`compare_stop`: a baseline stop logit margin this close to zero is a near-tie.
+STOP_NEAR_TIE = 0.5
 
 
 @dataclass
@@ -172,6 +174,34 @@ class Workload(ABC):
         checked by the evaluator, not timed, not weighted. Keep them short (few
         decode steps); only calls with shapes the main run lacks are kept."""
         return []
+
+    def natural_length_run(self, reference: Any = None) -> dict[str, Any] | None:
+        """Optional hook for autoregressive models that decide their own output length
+        (a stop head, an end-of-sequence token): one untimed run in which that decision
+        is live. ``None`` (the default): the workload has no stop condition.
+
+        A fixed-length workload (VoxCPM forces ``min_len = max_len``) never lets the stop
+        condition decide, so a transform that skipped or delayed it would pass every other
+        check (:mod:`kernel_agent.workloads.stopping`). ``analyze`` calls this free running
+        (``reference=None``) and stores the result in ``.truth/``; ``e2e`` calls it with
+        ``reference`` set to that result and replays it teacher forced where the workload
+        supports it, so every stop decision sees the baseline history.
+
+        Returns a dict with ``steps`` (generated steps), ``min_steps`` / ``max_steps``
+        (the limits of the run) and, optionally, ``stop_margins`` (baseline: stop minus
+        continue logit of every step), ``output_length`` (e.g. audio samples) and whatever
+        the teacher-forced replay needs (CPU tensors). Keep it short (tens of steps)."""
+        return None
+
+    def compare_natural_length(self, reference: Any, candidate: Any) -> Comparison:
+        """Results of :meth:`natural_length_run`: the candidate must stop at the same step
+        (:func:`compare_stop`; options ``stop_tolerance`` and ``stop_near_tie``)."""
+        return compare_stop(
+            reference,
+            candidate,
+            tolerance=int(self.options.get("stop_tolerance", 0)),
+            near_tie=float(self.options.get("stop_near_tie", STOP_NEAR_TIE)),
+        )
 
     @contextlib.contextmanager
     def with_options(self, overrides: dict[str, Any] | None) -> Iterator[None]:
@@ -381,3 +411,57 @@ def compare_steps(
     if abs(rms_ratio - 1.0) > max_rms_change:
         return Comparison(False, metrics, f"RMS x{rms_ratio:.4f} (allowed ±{max_rms_change:.0%})")
     return Comparison(True, metrics)
+
+
+def compare_stop(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    tolerance: int = 0,
+    near_tie: float = STOP_NEAR_TIE,
+) -> Comparison:
+    """Natural-length comparison (:meth:`Workload.natural_length_run`): the candidate
+    must stop after as many steps as the baseline.
+
+    Replayed teacher forced, every stop decision is an argmax over a hidden state on
+    the baseline trajectory, so the check is exact by default. ``tolerance`` > 0 accepts
+    a candidate that stops up to that many steps away when the baseline's stop margin
+    (stop minus continue logit, ``reference["stop_margins"]``) at the first step where
+    the two decisions differ is within ``near_tie`` of zero, a near-tie that rounding can
+    flip. Without recorded margins the check stays exact. The margins are reported."""
+    ref_steps, new_steps = int(reference["steps"]), int(candidate["steps"])
+    margins = reference.get("stop_margins")
+    if margins is not None and len(margins) != ref_steps:
+        margins = None
+    metrics: dict[str, float | int | str] = {"steps": new_steps, "reference_steps": ref_steps}
+    if margins:
+        metrics["reference_stop_margin"] = round(float(margins[-1]), 4)
+    if new_steps == ref_steps:
+        ref_len, new_len = reference.get("output_length"), candidate.get("output_length")
+        if ref_len is None or new_len is None or int(ref_len) == int(new_len):
+            return Comparison(True, metrics)
+        metrics.update(output_length=int(new_len), reference_output_length=int(ref_len))
+        return Comparison(
+            False, metrics, f"output length {new_len} != {ref_len} after the same {new_steps} steps"
+        )
+    max_steps = reference.get("max_steps")
+    if new_steps > ref_steps and max_steps is not None and new_steps >= int(max_steps):
+        what = f"never fires (ran to max_steps={max_steps})"
+    elif new_steps > ref_steps:
+        what = f"fires {new_steps - ref_steps} step(s) late"
+    else:
+        what = f"fires {ref_steps - new_steps} step(s) early"
+    reason = f"the stop condition {what}: {new_steps} steps, the baseline {ref_steps}"
+    if not margins:
+        return Comparison(False, metrics, reason)
+    # The first step whose decisions differ: the baseline stops at its last step while
+    # the candidate goes on, or the candidate stops at an earlier one.
+    step = min(ref_steps, new_steps) - 1
+    margin = float(margins[step])
+    metrics.update(differing_step=step, differing_step_margin=round(margin, 4))
+    reason += f" (baseline stop margin {margin:+.3f} at step {step})"
+    consulted = step > int(reference.get("min_steps", 0))  # before that the stop is ignored
+    if abs(new_steps - ref_steps) <= tolerance and abs(margin) <= near_tie and consulted:
+        metrics["tolerated"] = f"{reason}: a near-tie (|margin| <= {near_tie:g})"
+        return Comparison(True, metrics)
+    return Comparison(False, metrics, reason)

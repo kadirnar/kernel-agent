@@ -6,6 +6,7 @@ lives outside the agents' working directories, in ``<run>/.truth/``::
 
     .truth/baseline_output.pt         reference output of the baseline run
     .truth/baseline_output_holdout.pt ... of the held-out input (workloads/holdout.py)
+    .truth/baseline_output_natural.pt ... of the natural-length run (workloads/stopping.py)
     .truth/captures/<id>.pt           module + inputs + reference outputs + post-call state
     .truth/targets/<id>/results.jsonl evaluation records (each with its snapshot's sha256)
     .truth/targets/<id>/history/      the evaluated snapshots
@@ -208,7 +209,12 @@ class Truth:
 
     def _baseline_files(self) -> tuple[Path, ...]:
         run = self.run
-        return (run.baseline_json, run.baseline_output(), run.baseline_output_holdout())
+        return (
+            run.baseline_json,
+            run.baseline_output(),
+            run.baseline_output_holdout(),
+            run.baseline_output_natural(),
+        )
 
     def seal_baseline(self, median_ms: float) -> None:
         """``baseline.json`` + the baseline outputs, and the latency every speedup divides."""

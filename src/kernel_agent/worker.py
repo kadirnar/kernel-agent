@@ -61,7 +61,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     from kernel_agent import strong_baseline
     from kernel_agent.profiling.profiler import profile_workload, summarize
-    from kernel_agent.workloads import holdout, quality
+    from kernel_agent.workloads import holdout, quality, stopping
     from kernel_agent.workloads.base import measure
 
     if (ns.kernel or ns.transform) and not ns.out_dir:
@@ -109,6 +109,9 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     else:  # the held-out input: e2e judges candidates on it too (workloads/holdout.py)
         target = truth.replace(out.baseline_output_holdout())
         baseline["holdout"] = holdout.save_baseline(workload, output, target)
+        # ... and the stop condition on a natural-length run (workloads/stopping.py)
+        target = truth.replace(out.baseline_output_natural())
+        baseline["natural_length"] = stopping.save_baseline(workload, target)
     write_json(out.baseline_json, baseline)
     # Strong baseline (strong_baseline.py): the full analyze of a run measures the
     # workload's reference optimisations (or, with --compile-baseline, a generic
@@ -287,14 +290,16 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _truth_files(run: RunDir, ns: argparse.Namespace) -> tuple[bytes, bytes, bytes]:
-    """The baseline output, baseline.json and the held-out baseline output, checked against
-    the digests the orchestrator holds (``--verify``) before anything runs; read once."""
+def _truth_files(run: RunDir, ns: argparse.Namespace) -> tuple[bytes, bytes, bytes, bytes]:
+    """The baseline output, baseline.json, the held-out baseline output and the
+    natural-length baseline, checked against the digests the orchestrator holds
+    (``--verify``) before anything runs; read once."""
     expected = dict(item.partition("=")[::2] for item in ns.verify or [])
     return (
         _truth_bytes(run, run.baseline_output(), expected),
         _truth_bytes(run, run.baseline_json, expected, required=False),
         _truth_bytes(run, run.baseline_output_holdout(), expected, required=False),
+        _truth_bytes(run, run.baseline_output_natural(), expected, required=False),
     )
 
 
@@ -304,16 +309,16 @@ def _judge(
     inputs: Any,
     output: Any,
     median_ms: float,
-    truth_files: tuple[bytes, bytes, bytes],
+    truth_files: tuple[bytes, bytes, bytes, bytes],
 ) -> tuple[float, dict[str, Any]]:
     """(baseline ms, quality verdict) of a timed candidate output: ``status`` ok with
     ``passed`` / ``reason`` / ``metrics``, or ``runtime_error`` when a check crashed."""
     import torch
 
-    from kernel_agent.workloads import holdout
+    from kernel_agent.workloads import holdout, stopping
     from kernel_agent.workloads.quality import assess, is_chaotic
 
-    reference_bytes, baseline_bytes, holdout_bytes = truth_files
+    reference_bytes, baseline_bytes, holdout_bytes, natural_bytes = truth_files
     reference = torch.load(io.BytesIO(reference_bytes), weights_only=False)
     baseline = json.loads(baseline_bytes or b"{}")
     # the orchestrator's baseline latency (--baseline-ms), not what baseline.json says now
@@ -340,11 +345,21 @@ def _judge(
         chaotic=chaotic,
     )
     reasons = [verdict["reason"], held["reason"] and f"held-out input: {held['reason']}"]
+    metrics = {**verdict["metrics"], "holdout": held}
+    # Stop condition (untimed natural-length run); None: the workload has none.
+    natural = stopping.check(
+        workload,
+        torch.load(io.BytesIO(natural_bytes), weights_only=False) if natural_bytes else None,
+        baseline,
+    )
+    if natural is not None:
+        metrics["natural_length"] = natural
+        reasons.append(natural["reason"] and f"natural length: {natural['reason']}")
     return base_ms, {
         "status": "ok",
-        "passed": verdict["passed"] and held["passed"],
+        "passed": verdict["passed"] and held["passed"] and (natural or {}).get("passed", True),
         "reason": "; ".join(r for r in reasons if r),
-        "metrics": {**verdict["metrics"], "holdout": held},
+        "metrics": metrics,
     }
 
 

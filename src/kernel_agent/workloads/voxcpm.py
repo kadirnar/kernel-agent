@@ -16,6 +16,12 @@ the loop, so every step sees the baseline history and the baseline noise.  The
 audio of that run is decoded from the reference latents, which validates the
 (deterministic, non-chaotic) AudioVAE decoder as well.
 
+The fixed length (``min_len = max_len``) keeps runs comparable but never lets the
+stop head decide, so a natural-length run (``natural_length_run``,
+:mod:`kernel_agent.workloads.stopping`) checks the stop condition: ``natural_text``
+with VoxCPM's own ``min_len`` (2), recorded at analyze time; every candidate replays
+it teacher forced and must stop at the same patch.
+
 Limitations: the candidate must keep calling ``model.feat_decoder`` from
 Python once per patch, with the noise drawn from the global RNG as in the
 original.  A transform that captures the whole step (LM + decoder) in one CUDA
@@ -45,6 +51,11 @@ HOLDOUT_TEXT = (
 )
 #: Extra capture setting (``variants``): another LM prefill length, few patches.
 SHORT_TEXT = "Short sentences matter too."
+#: Natural-length run (``natural_length_run``): VoxCPM2 stops it after about 30 patches
+#: (seed 0), with a clear stop logit margin at the stop and before it.
+NATURAL_TEXT = "When the sentence is finished, the speaker stops talking and waits for the reply."
+#: ``min_len`` of the natural-length run: VoxCPM's own default.
+NATURAL_MIN_PATCHES = 2
 
 
 class VoxCPMWorkload(Workload):
@@ -75,6 +86,12 @@ class VoxCPMWorkload(Workload):
         # Audio decoded from the teacher-forced (reference) latents; also reported,
         # informationally, for the free-running audio.
         "min_spec_cosine": 0.97,
+        # Natural-length run (stop condition): the candidate stops at the baseline's patch;
+        # `stop_tolerance=1` accepts ±1 patch at a near-tie of the baseline's stop logits.
+        "natural_text": NATURAL_TEXT,
+        "natural_max_patches": 100,
+        "stop_tolerance": 0,
+        "stop_near_tie": 0.5,
     }
     # A diverged (but correct) free run is another plausible sample: its audio
     # loudness varies more than its latents (different seeds: x0.52 .. x1.54).
@@ -122,6 +139,44 @@ class VoxCPMWorkload(Workload):
     def variants(self) -> list[dict[str, Any]]:
         return [{"text": SHORT_TEXT, "patches": min(int(self.options["patches"]), 8)}]
 
+    def natural_length_run(self, reference: Any = None) -> dict[str, Any]:
+        """``natural_text`` with the stop head live (``min_len`` 2, ``max_len``
+        ``natural_max_patches``), teacher forced on ``reference`` when given.  The stop
+        logit margins come from a hook on ``model.stop_head``: the unmodified loop calls
+        it once per patch (a candidate may call it differently; only its patch count
+        counts)."""
+        max_patches = int(self.options["natural_max_patches"])
+        options = {
+            "text": self.options["natural_text"],
+            "patches": max_patches,
+            "min_patches": NATURAL_MIN_PATCHES,
+        }
+        logits: list[torch.Tensor] = []
+        hook = self.model.stop_head.register_forward_hook(
+            lambda module, args, output: logits.append(output.detach().float().reshape(-1, 2)[0])
+        )
+        try:
+            with self.with_options(options):
+                inputs = self.make_inputs()
+                if reference is None:
+                    out = self.run(inputs)
+                else:
+                    out = self.run_teacher_forced(inputs, reference)
+        finally:
+            hook.remove()
+        steps = int(out["latents"].shape[0])
+        result: dict[str, Any] = {
+            "steps": steps,
+            "min_steps": NATURAL_MIN_PATCHES,
+            "max_steps": max_patches,
+            "output_length": int(out["audio"].numel()),
+            "latents": out["latents"],
+            "audio": out["audio"],
+        }
+        if reference is None and len(logits) == steps:
+            result["stop_margins"] = [float(x[1] - x[0]) for x in torch.stack(logits).cpu()]
+        return result
+
     def make_inputs(self) -> str:
         return str(self.options["text"])
 
@@ -146,10 +201,12 @@ class VoxCPMWorkload(Workload):
 
     def _generate(self, text: str) -> torch.Tensor:
         n = int(self.options["patches"])
+        # `min_patches` (natural_length_run only): the stop head may end the run early.
+        min_len = self.options.get("min_patches")
         torch.manual_seed(int(self.options["seed"]))
         wav: torch.Tensor = self.model.generate(
             target_text=text,
-            min_len=n,
+            min_len=n if min_len is None else int(min_len),
             max_len=n,
             inference_timesteps=int(self.options["timesteps"]),
             cfg_value=float(self.options["cfg"]),

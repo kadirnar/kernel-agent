@@ -24,7 +24,8 @@ uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
 HF URL ─► resolve (modality, arch, family, size)
         ─► analyze   load model, baseline latency, determinism check,
                      sensitivity probe, teacher-forcing self-check,
-                     held-out input baseline, module-level + kernel-level
+                     held-out input + natural-length (stop) baselines,
+                     module-level + kernel-level
                      profile, compiled baseline (the model's own
                      torch.compile path)                           [GPU worker]
         ─► (harness) Claude writes harness.py if the built-in workload fails
@@ -145,6 +146,21 @@ same time.
   held-out output although their baseline outputs differ. A first run at new
   shapes (compilation, CUDA-graph capture) is not penalised: the held-out run
   warms those shapes up before the probe. Details are in `metrics.holdout`.
+* **Stop condition** (`workloads/stopping.py`): fixed-length workloads (VoxCPM
+  forces `min_len = max_len`) never let the stop head decide, so a transform
+  that skipped, delayed or reordered the stop decision would pass all of the
+  above. Workloads with a stop condition implement
+  `Workload.natural_length_run()`: `analyze` runs it once on the baseline,
+  untimed, with the stop live (VoxCPM: `natural_text`, `min_len` 2,
+  `max_len` `natural_max_patches`), and stores the steps, the step at which
+  the stop fired and the stop logit margin there (`baseline.json` →
+  `natural_length`, `.truth/baseline_output_natural.pt`). `e2e` replays it on
+  every candidate, untimed and teacher forced, so each stop decision sees the
+  baseline history, and the candidate must stop at the same step: exactly by
+  default. `-o stop_tolerance=1` accepts ±1 step when the baseline's margin at
+  the step where the decisions differ is a near-tie (`|margin| <=
+  stop_near_tie`, default 0.5). Details are in `metrics.natural_length`;
+  workloads without a stop condition are unaffected.
 
 ### What "faster" means
 
@@ -309,8 +325,8 @@ writes them: in the orchestrator's memory (the authority) and in `run.json` →
   (`status: tampered`). A snapshot that changes during its evaluation voids
   the result.
 * `e2e` gets the baseline latency from the orchestrator (`--baseline-ms`) and
-  verifies `baseline.json` and the baseline outputs, main and held-out
-  (`--verify`).
+  verifies `baseline.json` and the baseline outputs, main, held-out and
+  natural-length (`--verify`).
 * Each record stores its snapshot's sha256. Winners (`best_for_target`), the
   integration and the export use only records kernel-agent wrote (lines
   appended by anyone else are ignored) whose snapshot still has that digest.
@@ -633,6 +649,17 @@ bf16 rounding step per layer cannot be told apart from correct rounding
 changes: an attention softmax scale off by 5 % reaches mean cosine 0.994 and
 passes; the module-level check has to catch errors of that size. The model
 runs in its checkpoint dtype (bf16), and `--dtype` is ignored.
+
+Stop condition: the natural-length run (`natural_text`, seed 0) stops after
+31 patches on VoxCPM2 (stop at step 30 with a stop-minus-continue logit
+margin of +1.99; the closest earlier step is at −5.42; 2.8 s, untimed). Replayed
+teacher forced, the bundled Triton RMSNorm, `model.optimize()` and every
+`nn.Linear` output × (1 ± 2^-8) move the margin at the stop step by at most
+0.04 and stop at patch 31. The live run's `async_stop_loop` and
+`skip_dead_work` transforms pass. A loop that never consults the stop head
+runs to `natural_max_patches` (100) and one that acts on the flag one step
+late stops after 32 patches; both pass teacher forcing and the held-out input
+and are rejected here.
 
 Compiled baseline (`model.optimize()`, see "Strong baseline"), RTX 5070 Ti,
 60 patches: eager 5,499 ms, compiled 3,798 ms (1.45×; 2 warm-up runs take
@@ -1024,7 +1051,9 @@ kernel-agent optimize <hf-url> [options]
                                        diffusion: steps, height, width, prompt, cpu_offload, min_psnr
                                        any: entrypoints=Cls.method,... (extra non-forward methods)
                                        VoxCPM: text, patches, timesteps, cfg, seed, compile,
-                                               min_step_cosine, min_mean_step_cosine, min_spec_cosine
+                                               min_step_cosine, min_mean_step_cosine, min_spec_cosine,
+                                               natural_text, natural_max_patches,
+                                               stop_tolerance, stop_near_tie
   --backends cuda,triton,cute,tilelang,nvrtc
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
@@ -1094,6 +1123,7 @@ runs/<org>--<name>/<timestamp>/
   .truth/                     what the evaluator trusts (read-only, sha256 in run.json):
     baseline_output.pt          output of the baseline run
     baseline_output_holdout.pt  ... of the held-out input
+    baseline_output_natural.pt  ... of the natural-length run (stop condition)
     captures/<id>.pt            module + real inputs/outputs + post-call state
     captures/<id>.parent.pt     region target: the capture of its parent class
     targets/<id>/history/       snapshot of every evaluated version (region: + rewrite.py)
@@ -1341,6 +1371,15 @@ They apply to `self.options` around `make_inputs`, `run` and teacher forcing,
 so read prompts, texts and seeds from `self.options`. `variants()` returns
 option overrides of extra settings (other lengths, batch sizes) whose new
 shapes `capture` records as correctness-only cases.
+
+Autoregressive models whose workload fixes the output length but that have a
+stop condition (a stop head, an EOS token) implement
+`natural_length_run(reference=None)`: one short run with the stop live,
+returning `steps`, `min_steps`, `max_steps`, optionally `stop_margins` (stop
+minus continue logit per step, from the baseline run) and `output_length`,
+and teacher forced on `reference` when it is given (see "Stop condition"
+above and `workloads/voxcpm.py`). `compare_natural_length` defaults to
+`compare_stop` in `base.py`.
 
 ## Using it interactively from Claude Code
 

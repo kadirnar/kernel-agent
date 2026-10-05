@@ -107,11 +107,16 @@ def write_report(run: RunDir) -> Path:
     if final:
         found = dict(final.get("metrics") or {})
         held = found.pop("holdout", None)  # workloads/holdout.py: one phrase, not every metric
+        natural = found.pop("natural_length", None)  # workloads/stopping.py: one phrase too
         metrics = ", ".join(f"{k}={v}" for k, v in _flat_metrics(found).items())
         if isinstance(held, dict):
             from kernel_agent.workloads.holdout import summary_text
 
             metrics += f"; {summary_text(held)}"
+        if isinstance(natural, dict):
+            from kernel_agent.workloads import stopping
+
+            metrics += f"; {stopping.summary_text(natural)}"
         lines.append(
             row("optimised", final.get("median_ms"), metrics, f"**{final.get('speedup')}x**")
         )
