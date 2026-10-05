@@ -278,13 +278,14 @@ def compare_steps(
     *,
     min_step_cosine: float,
     min_mean_step_cosine: float,
+    max_rms_change: float = 0.1,
 ) -> Comparison:
     """Teacher-forced comparison of per-step predictions (dim 0 = step).
 
     ``new_steps[i]`` was predicted from the *reference* history, so a kernel's
     error shows up once per step instead of compounding along the trajectory.
-    The mean cosine catches small systematic errors; the minimum catches a
-    single bad step."""
+    The mean cosine catches small systematic errors, the minimum a single bad
+    step, and the RMS ratio magnitude errors that cosines cannot see."""
     if ref_steps.shape[0] == 0:
         return Comparison(False, {"steps": 0}, "the reference recorded no steps")
     if ref_steps.shape[0] != new_steps.shape[0]:
@@ -305,6 +306,8 @@ def compare_steps(
     rel_err = (new - ref).norm(dim=1) / ref.norm(dim=1).clamp_min(1e-12)
     worst = min(range(len(cosines)), key=cosines.__getitem__)
     mean_cos = sum(cosines) / len(cosines)
+    ref_rms = float(ref.pow(2).mean().sqrt())
+    rms_ratio = float(new.pow(2).mean().sqrt()) / ref_rms if ref_rms > 0 else 1.0
     metrics: dict[str, float | int | str] = {
         "steps": len(cosines),
         "min_step_cosine": round(cosines[worst], 6),
@@ -312,6 +315,7 @@ def compare_steps(
         "worst_step": worst,
         "mean_rel_error": round(float(rel_err.mean()), 6),
         "max_rel_error": round(float(rel_err.max()), 6),
+        "rms_ratio": round(rms_ratio, 6),
     }
     if not bool(torch.isfinite(new).all()):
         return Comparison(False, metrics, "non-finite teacher-forced predictions")
@@ -323,4 +327,6 @@ def compare_steps(
         return Comparison(
             False, metrics, f"step {worst} cosine {cosines[worst]:.5f} < {min_step_cosine}"
         )
+    if abs(rms_ratio - 1.0) > max_rms_change:
+        return Comparison(False, metrics, f"RMS x{rms_ratio:.4f} (allowed ±{max_rms_change:.0%})")
     return Comparison(True, metrics)
