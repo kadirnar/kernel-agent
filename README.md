@@ -176,14 +176,17 @@ workload in `kernel_agent/workloads/voxcpm.py`, so no harness agent is needed:
 
 ```bash
 uv sync --extra all --extra voxcpm
-uv run kernel-agent analyze openbmb/VoxCPM2 --no-harness-agent
+uv pip install --no-deps "voxcpm>=2.0.3"
+uv pip install --no-deps torchaudio --index-url https://download.pytorch.org/whl/cu130
+uv run --no-sync kernel-agent analyze openbmb/VoxCPM2 --no-harness-agent
 ```
 
-`voxcpm` depends on `torchaudio`, and the `torchaudio` build must match your
-torch (same version and CUDA variant). If the resolver would pick a different
-torch or a mismatched `torchaudio`, install `voxcpm` with `pip install --no-deps`
-and add `einops librosa pydantic soundfile` plus the matching `torchaudio`
-yourself. Never let it replace torch.
+`voxcpm` is installed with `--no-deps` because its own requirements pin
+`datasets<4`, gradio and funasr, and pull a `torchaudio` build that may not
+match your torch. It imports `torchaudio` at import time, so install a
+`torchaudio` from the same index as your torch (same CUDA variant), also with
+`--no-deps`. Never let either replace torch. A later `uv sync` removes both
+again; use `uv run --no-sync` afterwards.
 
 The workload generates exactly `patches` latent patches (default 60, 9.6 s
 of 48 kHz audio) with `retry_badcase=False`, and records every patch the
