@@ -36,6 +36,7 @@ import asyncio
 import dataclasses
 import random
 import re
+import statistics
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -624,9 +625,15 @@ class World:
         parser.add_argument("--transform", action="append", default=[])
         parser.add_argument("--out-dir", type=Path)
         parser.add_argument("--target")
+        parser.add_argument("--b-kernel", action="append", default=[])
+        parser.add_argument("--b-transform", action="append", default=[])
+        parser.add_argument("--rounds", type=int, default=8)
         ns, _ = parser.parse_known_args(list(args))
         if command == "e2e":
             return self._e2e(ns.kernel, ns.transform)
+        if command == "e2e_ab":
+            a, b = (ns.kernel, ns.transform), (ns.b_kernel, ns.b_transform)
+            return self._e2e_ab(a, b, ns.rounds)
         if command == "analyze" and ns.out_dir:
             return self._reprofile(ns.out_dir, ns.kernel, ns.transform)
         if command == "capture":
@@ -677,6 +684,26 @@ class World:
         rng = _rng(self.seed, "e2e", key, len(ledger.rows(self.run)))
         self.clock.advance(rng.uniform(65, 95))
         result = _e2e_result(ms * rng.uniform(0.997, 1.003))
+        if reason:
+            result.update(passed=False, reason=reason, metrics={"token_match": 0.32})
+        return result
+
+    def _e2e_ab(
+        self, a: tuple[list[str], list[str]], b: tuple[list[str], list[str]], rounds: int
+    ) -> dict[str, Any]:
+        """A paired A/B (``worker e2e_ab``): both states share each round's GPU drift."""
+        a_ms = self._model(*a)[0]
+        b_ms, _, _, reason = self._model(*b)
+        key = "+".join(sorted(ledger.item_label(i) for i in [*b[0], *b[1]]))
+        rng = _rng(self.seed, "e2e_ab", key, len(ledger.rows(self.run)))
+        self.clock.advance(rng.uniform(150, 210))
+        times: tuple[list[float], list[float]] = ([], [])
+        for _ in range(rounds):
+            drift = rng.uniform(0.99, 1.01)
+            times[0].append(round(a_ms * drift * rng.uniform(0.998, 1.002), 3))
+            times[1].append(round(b_ms * drift * rng.uniform(0.998, 1.002), 3))
+        result = _e2e_result(statistics.median(times[1]))
+        result.update(times_ms=times[1], ab={"mode": "paired", "a_ms": times[0], "b_ms": times[1]})
         if reason:
             result.update(passed=False, reason=reason, metrics={"token_match": 0.32})
         return result

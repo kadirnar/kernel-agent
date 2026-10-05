@@ -35,6 +35,11 @@ class OptimizeConfig:
     #: analyze: also time a generic torch.compile when the workload has no
     #: reference_optimizations() hook (strong_baseline.py).
     compile_baseline: bool = False
+    #: Integration (abtest.py): timed rounds of each paired A/B, and the acceptance rule:
+    #: B wins >= ab_min_win_rate of them and the 95 % CI of its gain starts above ab_min_gain.
+    ab_rounds: int = 8
+    ab_min_win_rate: float = 0.8
+    ab_min_gain: float = 0.01
 
     claude_model: str = DEFAULT_MODEL
     effort: str | None = "high"

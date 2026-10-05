@@ -557,6 +557,12 @@ Quality is also checked, untimed, on a held-out input (other prompt / text /
 seed; `metrics.holdout`), so nothing may bake in the main input, and a fresh
 input timed after warm-up must not be more than 3x slower than the repeated
 runs (memoisation fails the evaluation).
+The integration switches one loaded model between the accepted set and the
+accepted set plus your transform (a paired A/B), undoing `apply` by restoring
+every attribute, module, `.data` binding and torch flag it changed. Change
+weights by rebinding (`param.data = new`), not in place (`param.mul_()`), or
+the transform falls back to slower separate-process measurements; a transform
+that cannot be undone that way sets `undo = False` or defines `undo(workload)`.
 
 # Tools
 * `evaluate_e2e(transforms=["transforms/<id>.py"], kernels=[], hypothesis="...")` loads

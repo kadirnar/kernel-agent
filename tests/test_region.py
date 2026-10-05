@@ -201,7 +201,10 @@ def _call_worker(capsys):
         worker.main([command, "--run-dir", str(run.root), *args])
         out = capsys.readouterr().out
         line = [x for x in out.splitlines() if x.startswith(worker.MARKER)][-1]
-        return json.loads(line[len(worker.MARKER) :])
+        result = json.loads(line[len(worker.MARKER) :])
+        if command == "e2e_ab" and result.get("ab"):  # CPU timings are noise: B is 2x faster
+            result["ab"]["b_ms"] = [t / 2 for t in result["ab"]["b_ms"]]
+        return result
 
     return call
 

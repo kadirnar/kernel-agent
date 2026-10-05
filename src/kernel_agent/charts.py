@@ -865,7 +865,9 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
     The best single item seeds the combination, or the systems agent's best
     measured combination (``composite``) when it was faster; every later history
     entry adds one item to the accepted set and is either accepted (new level),
-    rejected for no gain, or failed (quality check / error).
+    rejected for no gain, or failed (quality check / error). A step judged by a
+    paired A/B (``ab``) starts at A's median of that session, so its bar is the
+    paired difference; its ``rule`` is the acceptance rule.
     """
     base = _num(data.get("baseline_ms"))
     history = data.get("history") or []
@@ -888,17 +890,21 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
         if len(items) < 2 or (items == together and h is seed):
             continue
         item, ms = items[-1], _num(h.get("median_ms"))
+        ab = h.get("ab") or {}
+        start = _num(ab.get("a_median_ms"))
+        start = level if start is None else start
         if items == together:  # measured, but slower than the best single item
             kind = "nogain" if h.get("passed") and ms is not None else "fail"
             reason = None if kind == "nogain" else h.get("reason") or h.get("status")
-            steps.append(_together(_step(kind, item, level, ms, reason), composite))
+            step = _together(_step(kind, item, level, ms, reason), composite)
         elif item in accepted and h.get("passed") and ms is not None:
-            steps.append(_step("keep", item, level, ms))
+            step = _step("keep", item, start, ms)
             level = ms
         elif h.get("passed") and ms is not None:
-            steps.append(_step("nogain", item, level, ms))
+            step = _step("nogain", item, start, ms)
         else:
-            steps.append(_step("fail", item, level, ms, h.get("reason") or h.get("status")))
+            step = _step("fail", item, level, ms, h.get("reason") or h.get("status"))
+        steps.append({**step, "rule": ab.get("rule")} if ab.get("rule") else step)
     steps.append({"kind": "total", "label": "final", "ms": level})
     return steps
 
@@ -1043,9 +1049,16 @@ def _draw_integration(ax: Any, steps: list[dict[str, Any]], singles: list[dict[s
     ax.set_ylabel("end-to-end latency per run (ms)")
     kept = sum(s["kind"] == "keep" for s in steps)
     dropped = [ledger.item_label(h["items"][0]) for h in singles if not h.get("passed")]
+    rule = next((s["rule"] for s in steps if s.get("rule")), None)
+    test = "gain > 1 %"
+    if rule:  # abtest.py
+        test = (
+            f"win a paired A/B: ≥ {rule['min_win_rate']:.0%} of the rounds, 95 % CI of the "
+            f"gain > {rule['min_gain']:.0%}"
+        )
     subtitle = (
         f"{len(singles)} items measured alone, {kept} combined greedily (each must pass the "
-        "quality check and gain > 1 %)"
+        f"quality check and {test})"
     )
     if dropped:
         subtitle += f"  ·  failed alone: {_short(', '.join(dropped), 60)}"

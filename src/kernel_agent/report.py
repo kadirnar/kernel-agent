@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, library, strong_baseline
+from kernel_agent import abtest, ledger, library, strong_baseline
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
@@ -36,6 +36,32 @@ def _flat_metrics(metrics: Any, prefix: str = "") -> dict[str, Any]:
         else:
             flat[f"{prefix}{key}"] = value
     return flat
+
+
+def _projection_lines(projection: list[dict[str, Any]]) -> list[str]:
+    """Projected (baseline − Σ est. saved ms) vs measured latency of each accepted set."""
+    if not projection:
+        return []
+    lines = [
+        "",
+        "Projected (baseline − Σ est. saved ms: a kernel's module-level estimate, a "
+        "transform's gain alone) vs measured end-to-end latency of every accepted set:",
+        "",
+        "| accepted set | projected ms | measured ms | measured / projected |",
+        "|---|---|---|---|",
+    ]
+    for p in projection:
+        names = " + ".join(f"`{ledger.item_label(i)}`" for i in p.get("items", []))
+        unknown = [
+            ledger.item_label(i) for i, v in (p.get("est_saved_ms") or {}).items() if v is None
+        ]
+        projected, measured = p.get("projected_ms"), p.get("measured_ms")
+        ratio = measured / projected if measured and projected else None
+        note = f" (no estimate: {', '.join(unknown)})" if unknown else ""
+        lines.append(
+            f"| {names}{note} | {_fmt(projected, 1)} | {_fmt(measured, 1)} | {_fmt(ratio, 2)} |"
+        )
+    return lines
 
 
 def write_report(run: RunDir) -> Path:
@@ -170,10 +196,21 @@ def write_report(run: RunDir) -> Path:
         for item in integration.get("accepted", []):
             lines.append(f"* accepted {item['kind']}: `{item['item']}`")
         for h in integration.get("history", []):
+            ab = h.get("ab") or {}
+            verdict = ""
+            if ab.get("rounds"):  # abtest.py: paired (or separate-process) A/B against A
+                verdict = f" {abtest.describe(ab)}"
+                if ab.get("a_items") or len(h["items"]) > 1:  # a step of the greedy search
+                    verdict += ": " + (
+                        "accepted" if ab.get("accepted") else f"rejected ({ab.get('why')})"
+                    )
+                else:  # an item alone, against the unmodified model
+                    verdict += " vs the unmodified model"
             lines.append(
                 f"* tried {len(h['items'])} item(s): passed={h.get('passed')} "
-                f"speedup={h.get('speedup')} {h.get('reason') or ''}"
+                f"speedup={h.get('speedup')} {h.get('reason') or ''}{verdict}"
             )
+        lines += _projection_lines(integration.get("projection") or [])
         if reference:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))
