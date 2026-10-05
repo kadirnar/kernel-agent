@@ -159,6 +159,73 @@ def test_build_arms_from_ledger(tmp_path):
     assert SYSTEMS not in {a.id for a in no_systems}
 
 
+def test_systems_arm_credits_transforms_on_top_of_kernels(tmp_path):
+    """Issue #40, the VoxCPM2 run: transforms on top of the integrated kernels beat the
+    integration (ledger rows 14, 17-19); that is the systems agent's gain, the kernels' is not."""
+    orch, _ = make(tmp_path)
+    run = orch.run
+
+    def transforms(*stems):
+        snaps = []
+        for stem in stems:
+            src = run.transforms_dir / f"{stem}.py"
+            src.write_text(f"def apply(workload): pass  # {stem}\n")
+            snaps.append(snapshot(run, src))
+        return snaps
+
+    def kernel(target, speedup):
+        src = run.target(target) / "candidates" / "v.py"
+        src.write_text(f"import torch  # {speedup}\n")
+        snap = snapshot(run, src, target)
+        record_candidate(run, target, src, snap, _kernel(speedup), hypothesis="h")
+        return f"{target}={run.target(target) / 'history' / snap.name}"  # as _kernel_winners
+
+    def e2e(speedup, snaps, kernels=()):
+        result = dryrun._e2e_result(BASE / speedup)
+        record_e2e_result(run, result, snaps, list(kernels), hypothesis="h")
+
+    def integrate(speedup, *items):
+        result = dryrun._e2e_result(BASE / speedup)
+        ledger.record_e2e(run, result, backend="integrate", snapshot="+".join(items), hypothesis="")
+
+    def systems(policy=None):
+        return next(a for a in build_arms(run, policy or Policy(), []) if a.id == SYSTEMS)
+
+    stack = ("graph_cfm_solver", "compile_dit", "graph_lm_step")
+    e2e(2.0843, transforms("graph_cfm_solver"))
+    e2e(1.2366, transforms("graph_lm_step"))
+    e2e(5.0473, transforms(*stack))  # the best transform-only run
+    kernel("attn", 9.84)
+    attn = kernel("attn", 46.89)
+    integrate(1.6786, "attn")
+    integrate(4.6775, "graph_cfm_solver", "compile_dit", "attn")
+    integrate(5.4441, "graph_cfm_solver", "compile_dit", "attn", "graph_lm_step")  # row 14
+    assert systems().best == pytest.approx(5.0473, rel=1e-3)
+    for speedup in (5.9027, 6.1677, 6.3778):  # rows 17-19: each beats the previous
+        e2e(speedup, transforms(*stack), [attn])
+    arm = systems(Policy(patience=3))
+    assert arm.best == pytest.approx(6.3778, rel=1e-3) and arm.best_snapshot.endswith("+attn")
+    assert arm.streak == 0 and arm.stop is None and arm.evals == 6
+    alone = BASE * (1 - 1 / 5.0473)
+    on_kernels = BASE * (1 / 5.4441 - 1 / 6.3778)  # over the integration with the same kernels
+    assert arm.gain_ms == pytest.approx(alone + on_kernels, rel=1e-3)
+    assert arm.remaining_ms == pytest.approx(BASE / 6.3778, rel=1e-3)
+
+    # a faster kernel (or one more kernel) is not the systems agent's gain: no run with
+    # those kernels to beat yet, the first run sets the bar
+    faster = kernel("attn", 60.0)
+    e2e(6.9, transforms(*stack), [faster])
+    e2e(7.5, transforms(*stack), [attn, kernel("mlp", 1.4)])
+    arm = systems()
+    assert arm.best == pytest.approx(6.3778, rel=1e-3) and arm.streak == 2
+    e2e(7.1, transforms(*stack), [faster])  # beats 6.9 with the same kernels
+    e2e(5.2, transforms(*stack))  # transform-only: beats 5.0473, as before
+    arm = systems()
+    assert arm.best == pytest.approx(7.1, rel=1e-3) and arm.streak == 0
+    more = BASE * (1 / 6.9 - 1 / 7.1) + BASE * (1 / 5.0473 - 1 / 5.2)
+    assert arm.gain_ms == pytest.approx(alone + on_kernels + more, rel=1e-3)
+
+
 # ------------------------------------------------------------------ digests
 
 

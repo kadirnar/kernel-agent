@@ -460,7 +460,10 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   is `remaining_ms × headroom × 0.7^k`:
   * `remaining_ms`: the target's share of the profiled time × the baseline ms
     ÷ its best module speedup. For the systems agent it is the end-to-end time
-    with its best transform.
+    of its best run. A transform-only run is a new best when it beats the best
+    transform-only run; transforms on top of kernels when they beat the best
+    run measured with the same kernels (the integration, or the agent's previous
+    best with them), so the kernels' own gain is never the systems agent's.
   * `headroom`: `1 − pct_of_sol` of the best result when the evaluator reports
     a speed-of-light estimate. Otherwise `1 − 1/further`, where `further =
     max(2 ÷ best, 1.1)` is the speedup still assumed possible. For the systems
