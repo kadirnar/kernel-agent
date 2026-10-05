@@ -899,9 +899,12 @@ def _draw_amdahl(
 ) -> None:
     from matplotlib.patches import Patch
 
-    colors = {s.target: TARGET_COLORS[i % len(TARGET_COLORS)] for i, s in enumerate(slices)}
     drawn = [s for s in slices if s.ms > 0]
     nested = [s for s in slices if s.ms <= 0]
+    # drawn targets take the first colours, so two segments of the bars never share one
+    colors = {
+        s.target: TARGET_COLORS[i % len(TARGET_COLORS)] for i, s in enumerate(drawn + nested)
+    }
     best = {s.target: s.speedup for s in slices}
     other = max(base_ms - sum(s.ms for s in drawn), 0.0)
     before = [(s.target, s.ms) for s in drawn]
