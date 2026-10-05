@@ -52,9 +52,10 @@ HF URL ─► resolve (modality, arch, family, size)
         ─► report    report.md + optimized/ (kernels + apply.py)
 ```
 
-All GPU work runs in subprocesses under a GPU lock, so a crashing kernel or an
-illegal memory access can't kill the run, and parallel agents
-(`--parallel N`) never benchmark at the same time.
+All GPU work runs in subprocesses under a GPU lock (one per GPU, see "GPUs and
+the GPU lock"), so a crashing kernel or an illegal memory access can't kill the
+run, and parallel agents (`--parallel N`) never benchmark on the same GPU at the
+same time.
 
 ### What "correct" means
 
@@ -648,6 +649,43 @@ captured from the unmodified model.
   workers per target; a target's `progress.png` has one marker shape per
   worker; `kernel-agent watch` shows the worker in the ledger, the events and
   the tooltips, and quick checks and duplicates as neutral rows.
+
+### GPUs and the GPU lock
+
+Every evaluation, worker command (`analyze`, `capture`, `e2e`) and peak
+measurement holds the lock of one GPU while its subprocess runs
+(`kernel_agent/gpulock.py`).
+
+* **Pool.** The GPUs `nvidia-smi --query-gpu=index,name,uuid` lists (the
+  orchestrator never initialises CUDA to find them), restricted to an inherited
+  `CUDA_VISIBLE_DEVICES` (indices or `GPU-` UUIDs, in its order).
+  `KERNEL_AGENT_GPUS=0,2` replaces both. Indices are `nvidia-smi`'s (PCI bus
+  order). `kernel-agent doctor` prints the pool and its lock files.
+* **Locks.** GPU `i` locks `~/.cache/kernel-agent/gpu<i>.lock` (an `flock`
+  across processes, plus a thread lock for the agents of one process). GPU 0
+  keeps `gpu.lock`, the lock file from before the pool, so an older
+  kernel-agent (or a `flock ~/.cache/kernel-agent/gpu.lock ...` wrapper) and a
+  new one still exclude each other on a single GPU. The lock takes the first
+  free GPU, else waits for the GPU with the fewest waiters; a nested lock in
+  the same thread keeps its GPU. Without `nvidia-smi`, or with no GPU visible,
+  the pool is GPU 0 alone (`gpu.lock`), as before.
+* **Child processes.** A subprocess started under the lock gets
+  `KERNEL_AGENT_LOCK_HELD=1` (it does not wait for its parent) and, when more
+  than one GPU is visible, `CUDA_VISIBLE_DEVICES=<i>` with
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so it sees the locked GPU alone. With a
+  single visible GPU its environment is the same as before.
+* **Results** carry `gpu_index`, in the targets' and the transforms'
+  `results.jsonl`. A candidate and its reference always run on the same GPU
+  (one subprocess). With N GPUs, `--parallel N` agents evaluate at the same
+  time, one GPU each.
+* **Mixed GPU models.** Roofline peaks are cached per GPU model, measured on
+  the GPU the lock hands out and named after the orchestrator's first visible
+  GPU. The e2e speedups divide by the baseline that `analyze` measured once,
+  on one GPU. Both assume identical GPUs: on a mixed machine, restrict the pool
+  to one model (`KERNEL_AGENT_GPUS` or `CUDA_VISIBLE_DEVICES`); `doctor` says
+  when the pool mixes models.
+* `gpu` tests hold the lock of the GPU the test process uses. With several
+  GPUs, the test session runs on the first GPU of the pool.
 
 ### Kernel library and lessons (memory across runs)
 

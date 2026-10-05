@@ -44,6 +44,7 @@ import collections
 import copy
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -238,7 +239,9 @@ def ensure_peaks(
     """Cached peaks, measuring them first (subprocess, under the GPU lock) when missing.
 
     Never raises; returns None without a GPU or when the measurement fails (it is
-    retried once per process at most)."""
+    retried once per process at most). The peaks are measured on the GPU of the pool
+    this thread locks and filed under this process's GPU model: a pool of identical
+    GPUs shares one file (mixed models: restrict the pool, ``KERNEL_AGENT_GPUS``)."""
     global _MEASURE_FAILED
     try:
         found = _peaks_file()
@@ -677,13 +680,14 @@ def sol_signal(result: dict[str, Any]) -> float | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from kernel_agent.gpulock import gpu_lock
+    from kernel_agent.gpulock import gpu_lock, pinned
     from kernel_agent.workspace import write_json
 
     parser = argparse.ArgumentParser(description="Measure and cache the GPU roofline peaks.")
     parser.add_argument("--out", default=None, help="JSON file (default: the peaks cache)")
     ns = parser.parse_args(argv)
-    with gpu_lock():
+    with gpu_lock() as gpu:
+        os.environ.update(pinned(gpu))  # before CUDA starts: measure the GPU we locked
         peaks = measure_peaks()
     tc = toolchain.setup()
     assert tc.gpu is not None

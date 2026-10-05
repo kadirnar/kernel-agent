@@ -4,6 +4,18 @@ import pytest
 import torch
 
 
+def pytest_configure(config):
+    """With several GPUs in kernel-agent's lock pool, this process and its children use
+    the first one, the GPU `gpu` tests lock (set before CUDA starts)."""
+    from kernel_agent import gpulock
+
+    pool = gpulock.pool()
+    if pool.pin:
+        first = pool.gpus[0].index
+        os.environ.update(gpulock.pinned(first), **{gpulock.GPUS_ENV: str(first)})
+        gpulock.pool.cache_clear()
+
+
 def pytest_collection_modifyitems(config, items):
     if torch.cuda.is_available():
         return
@@ -27,8 +39,9 @@ def _private_library(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def _gpu_lock_for_gpu_tests(request):
-    """`gpu` tests hold kernel-agent's GPU lock, so a plain `pytest` never benchmarks
-    on top of a running optimisation (or another test session)."""
+    """`gpu` tests hold kernel-agent's GPU lock (of the GPU this process uses, see
+    `pytest_configure`), so a plain `pytest` never benchmarks on top of a running
+    optimisation (or another test session)."""
     if request.node.get_closest_marker("gpu") is None:
         yield
         return
