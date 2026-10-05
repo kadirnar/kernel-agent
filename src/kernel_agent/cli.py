@@ -131,6 +131,30 @@ def cmd_resume(ns: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_improve(ns: argparse.Namespace) -> int:
+    from kernel_agent.improve import ImproveConfig, improve
+    from kernel_agent.scheduler import Policy
+
+    icfg = ImproveConfig(
+        slice=ns.slice,
+        rounds=ns.rounds,
+        integrate_every=ns.integrate_every,
+        max_slices=ns.max_slices,
+        policy=Policy(
+            patience=ns.patience,
+            sol_stop=ns.sol_stop or None,
+            target_hours=ns.target_hours or None,
+            speedup_goal=ns.speedup_goal or None,
+        ),
+    )
+    try:
+        run = asyncio.run(improve(ns.model, _config(ns), icfg, dry_run=ns.dry_run, seed=ns.seed))
+    except KeyboardInterrupt:
+        return 130
+    print(f"\nreport: {run.report}\nrun directory: {run.root}")
+    return 0
+
+
 def cmd_eval(ns: argparse.Namespace) -> int:
     from kernel_agent.kernels.evaluate import run_evaluation
 
@@ -293,6 +317,34 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--claude-model")
     p.add_argument("--program", metavar="FILE", help="replace the run's program.md with FILE")
     p.set_defaults(func=cmd_resume)
+
+    p = sub.add_parser(
+        "improve",
+        help="continuous loop: slices for the targets that pay most, until budget or plateau",
+        description="MODEL is a run directory to continue or a Hugging Face URL / repo id to "
+        "start (analyze, plan and capture first). --max-hours / --max-usd are the budget of "
+        "this invocation; without them it runs until every target has stopped.",
+    )
+    _add_run_args(p)
+    p.add_argument("--slice", type=int, default=4, help="evaluations per slice (one session)")
+    p.add_argument("--rounds", type=int, default=1, help="re-profile + re-plan rounds (1 = none)")
+    p.add_argument(
+        "--integrate-every", type=int, default=4, help="re-integrate after this many kept results"
+    )
+    p.add_argument(
+        "--patience", type=int, default=5, help="stop a target after this many evals w/o a gain"
+    )
+    p.add_argument("--sol-stop", type=float, default=0.9, help="stop at this share of SOL (0: off)")
+    p.add_argument("--target-hours", type=float, default=2.0, help="time cap per target (0: off)")
+    p.add_argument(
+        "--speedup-goal", type=float, default=2.0, help="stop a target at this speedup (0: off)"
+    )
+    p.add_argument("--max-slices", type=int, help="stop after this many slices")
+    p.add_argument(
+        "--dry-run", action="store_true", help="simulated agents and GPU (no Claude, no GPU)"
+    )
+    p.add_argument("--seed", type=int, default=0, help="--dry-run: seed of the simulation")
+    p.set_defaults(func=cmd_improve)
 
     p = sub.add_parser("eval", help="evaluate a candidate against a capture file")
     p.add_argument("capture")

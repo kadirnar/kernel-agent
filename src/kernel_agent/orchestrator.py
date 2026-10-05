@@ -15,6 +15,7 @@ import json
 import re
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,9 @@ class Orchestrator:
         self.python = sys.executable
         self.agent_results: list[AgentResult] = []
         self.phase = PHASES[0]
+        # Replaced by `improve --dry-run` (simulated agent / GPU worker); None = the real ones.
+        self.agent_runner: Callable[..., Awaitable[AgentResult]] | None = None
+        self.worker: Callable[..., dict[str, Any]] | None = None
 
     # ------------------------------------------------------------ creation
 
@@ -120,9 +124,14 @@ class Orchestrator:
             raise SystemExit(f"none of the requested backends {self.cfg.backends} is available")
         return avail
 
-    async def _agent(self, name: str, **kwargs: Any) -> AgentResult:
+    def _worker(self, command: str, *args: str) -> dict[str, Any]:
+        return (self.worker or call_worker)(self.run, command, *args)
+
+    async def _agent(self, name: str, label: str | None = None, **kwargs: Any) -> AgentResult:
+        """Run an agent session; ``label`` keys its ``costs.json`` entry (default: ``name``)."""
+        tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
-        ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256)
+        ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)
         result = AgentResult(name=name)
         timeout = self.budget.start_agent(name)
         cfg = self.budget.agent_config(self.cfg)
@@ -131,7 +140,7 @@ class Orchestrator:
         timer = asyncio.timeout(timeout)
         try:
             async with timer:
-                result = await run_agent(
+                result = await (self.agent_runner or run_agent)(
                     name,
                     cfg=cfg,
                     mcp_server=self.server,
@@ -158,9 +167,10 @@ class Orchestrator:
             usd=round(result.cost_usd, 4),
             minutes=round(result.seconds / 60, 1),
             error=result.is_error,
+            **tag,
         )
         costs = read_json(self.run.root / "costs.json", {})
-        costs[name] = {
+        costs[label or name] = {
             "usd": round(result.cost_usd, 4),
             "turns": result.turns,
             "minutes": round(result.seconds / 60, 1),
@@ -261,21 +271,25 @@ class Orchestrator:
 
     async def capture(self) -> None:
         plan = read_json(self.run.plan_json, {})
+        self._mark("capture", targets=self._capture(plan.get("targets", [])))
+
+    def _capture(self, targets: list[dict[str, Any]]) -> list[str]:
+        """Create ``targets/<id>/spec.json`` and capture each target; returns the captured ids."""
         kept = []
-        for t in plan.get("targets", []):
+        for t in targets:
             target_dir = self.run.target(t["id"])
             (target_dir / "candidates").mkdir(parents=True, exist_ok=True)
             spec = {**t}
             write_json(target_dir / "spec.json", spec)
             log(f"capture: {t['id']} ({t['module_class']})")
-            info = call_worker(self.run, "capture", "--target", t["id"])
+            info = self._worker("capture", "--target", t["id"])
             if "error" in info:
                 log(f"capture: {t['id']} failed, dropping target:\n{info['error'][-800:]}")
                 (target_dir / "spec.json").rename(target_dir / "spec.failed.json")
                 continue
             log(f"capture: {t['id']} cases={[(c['signature'], c['count']) for c in info['cases']]}")
             kept.append(t["id"])
-        self._mark("capture", targets=kept)
+        return kept
 
     async def kernels(self) -> None:
         profile = read_json(self.run.profile_dir / "profile.json", {})
@@ -375,12 +389,15 @@ class Orchestrator:
                 winners.append((target_id, str(path), float(best["speedup"])))
         return winners
 
-    async def integrate(self) -> None:
+    async def integrate(self, reuse: bool = False) -> None:
         """Measure every candidate alone, then grow the best combination greedily.
 
         Ordering by *measured* end-to-end gain (not module-level estimates)
         matters: a model-level transform can beat every kernel on its own and
         be incompatible with them, so the best single item seeds the search.
+        ``reuse`` (re-integrations of the improve loop) takes combinations of the
+        same snapshot files that the previous integration measured from
+        ``integration.json`` instead of measuring them again.
         """
         baseline = read_json(self.run.baseline_json, {})
         base_ms = float(baseline["median_ms"])
@@ -402,13 +419,18 @@ class Orchestrator:
         log(f"integrate: {len(items)} candidate optimisations")
 
         history: list[dict[str, Any]] = []
+        previous = read_json(self.run.root / "integration.json", {}) if reuse else {}
+        measured = {tuple(h["items"]): h for h in (previous or {}).get("history", [])}
 
         def e2e(combo: list[tuple[str, str]]) -> dict[str, Any]:
+            if (known := measured.get(tuple(a for _, a in combo))) is not None:
+                history.append(known)
+                return known
             cli = ["--warmup", "2", "--iters", "5"]
             for kind, arg in combo:
                 cli += ["--kernel" if kind == "kernel" else "--transform", arg]
             start = time.perf_counter()
-            r = call_worker(self.run, "e2e", *cli)
+            r = self._worker("e2e", *cli)
             history.append({"items": [a for _, a in combo], **_short(r)})
             names = [ledger.item_label(a) for _, a in combo]
             ledger.record_e2e(
@@ -464,6 +486,129 @@ class Orchestrator:
         else:
             log("integrate: no optimisation survived end-to-end validation")
         self._mark("integrate", speedup=final["speedup"] if final else 1.0)
+
+    # ------------------------------------------------------------ improve loop (improve.py)
+
+    async def kernel_slice(
+        self, target_id: str, *, evaluations: int, digest: str, label: str
+    ) -> AgentResult:
+        """A fresh kernel-engineer session for ``target_id`` seeded with ``digest``."""
+        profile = read_json(self.run.profile_dir / "profile.json", {})
+        stats = {c["cls"]: c for c in profile.get("classes", [])}
+        target_dir = self.run.target(target_id)
+        spec = read_json(target_dir / "spec.json")
+        (target_dir / "NOTES.md").touch()
+        self.budget.kernel_evals = evaluations  # evaluation advice says `stop` after these
+        system = prompts.engineer_prompt(
+            spec,
+            spec.get("capture", {}),
+            spec["backends"],
+            self.python,
+            self.tc.summary(),
+            evaluations,
+            stats.get(spec["module_class"]),
+        )
+        return await self._agent(
+            f"kernel-{target_id}",
+            label,
+            prompt=(
+                f"Continue optimising target `{target_id}`. Read the `# Improve slice` section "
+                "first: it says where the previous sessions left off."
+            ),
+            system_append=system + digest,
+            cwd=target_dir,
+            mcp_tools=tool_names("evaluate_candidate", "best_result"),
+            add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+        )
+
+    async def systems_slice(self, *, evaluations: int, digest: str, label: str) -> AgentResult:
+        """A fresh systems-engineer session seeded with ``digest``."""
+        plan = read_json(self.run.plan_json, {})
+        self.run.transforms_dir.mkdir(parents=True, exist_ok=True)
+        self.budget.transform_evals = evaluations
+        system = prompts.systems_prompt(
+            self.run.load()["card"],
+            read_json(self.run.baseline_json, {}),
+            (self.run.profile_dir / "summary.md").read_text(),
+            plan.get("transforms", []),
+            self.python,
+            self.tc.summary(),
+            evaluations,
+            kernels=self._kernel_winners(),
+        )
+        return await self._agent(
+            "systems",
+            label,
+            prompt=(
+                "Continue designing and evaluating model-level transforms. Read the "
+                "`# Improve slice` section first: it says where the previous sessions left off."
+            ),
+            system_append=system + digest,
+            cwd=self.run.transforms_dir,
+            mcp_tools=tool_names("evaluate_e2e", "run_info"),
+            add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
+        )
+
+    def reprofile(self, out_dir: Path, accepted: list[dict[str, Any]]) -> dict[str, Any]:
+        """Baseline + profile of the model with ``accepted`` integration items applied.
+
+        Written to ``out_dir`` (``baseline.json``, ``profile/``); the run's own
+        baseline stays the reference for every comparison.
+        """
+        cli = ["--iters", "3", "--out-dir", str(out_dir)]
+        for item in accepted:
+            cli += ["--kernel" if item["kind"] == "kernel" else "--transform", item["item"]]
+        return self._worker("analyze", *cli)
+
+    async def replan(self, round_dir: Path, context: str, label: str) -> list[dict[str, Any]]:
+        """Planner session on the re-profile in ``round_dir``; returns the new targets.
+
+        The plan is written to ``round_dir/plan.json``. Targets whose id or module
+        class already exists, or whose class is not in the re-profile, are dropped.
+        """
+        baseline = read_json(round_dir / "baseline.json", {})
+        backends = self._available_backends()
+        result = await self._agent(
+            "planner",
+            label,
+            prompt="Re-plan this run: pick new targets in the optimised model.",
+            system_append=prompts.planner_prompt(
+                self.run.load()["card"],
+                baseline,
+                (round_dir / "profile" / "summary.md").read_text(),
+                backends,
+                self.cfg.max_targets,
+                self.python,
+                self.tc.summary(),
+            )
+            + context,
+            cwd=round_dir,
+            mcp_tools=[],
+            output_format={"type": "json_schema", "schema": prompts.PLAN_SCHEMA},
+        )
+        plan = result.structured
+        if not isinstance(plan, dict):
+            plan = _extract_json(result.text)
+        if not isinstance(plan, dict):
+            log(f"replan: planner returned no usable plan:\n{result.text[:1000]}")
+            return []
+        profile = read_json(round_dir / "profile" / "profile.json", {})
+        known = {c["cls"] for c in profile.get("classes", [])}
+        taken = {
+            read_json(self.run.target(t) / "spec.json", {}).get("module_class")
+            for t in self.run.target_ids()
+        }
+        new = []
+        for t in plan.get("targets", [])[: self.cfg.max_targets]:
+            cls = t.get("module_class")
+            if cls not in known or cls in taken or self.run.target(t["id"]).exists():
+                log(f"replan: dropping {t['id']} ({cls}): not in the profile or already a target")
+                continue
+            t["backends"] = [b for b in t.get("backends", []) if b in backends] or backends[:2]
+            new.append(t)
+        plan["targets"] = new
+        write_json(round_dir / "plan.json", plan)
+        return new
 
     async def report(self) -> None:
         path = write_report(self.run)

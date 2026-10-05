@@ -7,6 +7,7 @@ from typing import Any
 
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
+from kernel_agent.improve import report_lines
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 
@@ -138,6 +139,7 @@ def write_report(run: RunDir) -> Path:
                 f"* tried {len(h['items'])} item(s): passed={h.get('passed')} "
                 f"speedup={h.get('speedup')} {h.get('reason') or ''}"
             )
+    lines += report_lines(run)  # `kernel-agent improve` slices, re-integrations, rounds
     if costs:
         total = sum(c.get("usd", 0) for c in costs.values())
         lines += [

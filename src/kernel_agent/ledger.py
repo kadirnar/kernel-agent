@@ -23,6 +23,7 @@ import re
 import statistics
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,8 @@ _BACKENDS = (
     ("triton", re.compile(r"^\s*(?:import|from)\s+triton\b", re.M)),
 )
 _lock = threading.RLock()
+# Time of rows and events without an explicit ``when``; `improve --dry-run` simulates it.
+clock: Callable[[], float] = time.time
 
 
 # ------------------------------------------------------------------ classification
@@ -169,7 +172,7 @@ def _parse(key: str, cell: str) -> Any:
 
 
 def stamp(when: float | None = None) -> str:
-    return time.strftime(TIME_FORMAT, time.localtime(time.time() if when is None else when))
+    return time.strftime(TIME_FORMAT, time.localtime(clock() if when is None else when))
 
 
 def epoch(text: str | None) -> float | None:
@@ -372,7 +375,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
 
 def event(run: RunDir, kind: str, *, when: float | None = None, **data: Any) -> None:
     """Append to ``events.jsonl`` (phase changes, agent start/stop, evaluations)."""
-    ts = time.time() if when is None else when
+    ts = clock() if when is None else when
     append_jsonl(run.events, {"ts": round(ts, 3), "time": stamp(ts), "event": kind, **data})
 
 
