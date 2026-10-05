@@ -15,6 +15,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
     query,
@@ -37,6 +38,7 @@ class AgentResult:
     is_error: bool = False
     session_id: str | None = None
     tool_calls: dict[str, int] = field(default_factory=dict)
+    timed_out: bool = False
 
 
 def _log(msg: str) -> None:
@@ -78,7 +80,14 @@ async def run_agent(
     add_dirs: list[Path] | None = None,
     output_format: dict[str, Any] | None = None,
     extra_tools: list[str] | None = None,
+    result: AgentResult | None = None,
 ) -> AgentResult:
+    """Run one agent session to completion.
+
+    ``result`` is filled in place while messages arrive, so a caller that
+    cancels the session (e.g. a timeout) still has its session id, turns and
+    tool calls so far. Cancelling terminates the Claude Code subprocess.
+    """
     tools = BASE_TOOLS + (WEB_TOOLS if cfg.allow_web else []) + list(extra_tools or [])
     options = ClaudeAgentOptions(
         system_prompt={"type": "preset", "preset": "claude_code", "append": system_append},
@@ -97,44 +106,62 @@ async def run_agent(
     if cfg.effort:
         options.effort = cfg.effort  # type: ignore[assignment]
 
-    result = AgentResult(name=name)
+    result = result or AgentResult(name=name)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"agent-{name}.jsonl"
     start = time.perf_counter()
     _log(f"agent {name}: started (cwd={cwd})")
-    with log_path.open("a") as log:
-        async for message in query(prompt=prompt, options=options):
-            payload: Any
-            try:
-                payload = (
-                    dataclasses.asdict(message)
-                    if dataclasses.is_dataclass(message)
-                    else repr(message)
+    turns: set[str] = set()
+    finished = False
+    stream = query(prompt=prompt, options=options)
+    try:
+        with log_path.open("a") as log:
+            async for message in stream:
+                payload: Any
+                try:
+                    payload = (
+                        dataclasses.asdict(message)
+                        if dataclasses.is_dataclass(message)
+                        else repr(message)
+                    )
+                except Exception:
+                    payload = repr(message)
+                log.write(
+                    json.dumps({"type": type(message).__name__, "data": payload}, default=str)
+                    + "\n"
                 )
-            except Exception:
-                payload = repr(message)
-            log.write(
-                json.dumps({"type": type(message).__name__, "data": payload}, default=str) + "\n"
-            )
-            log.flush()
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, ToolUseBlock):
-                        short = block.name.removeprefix("mcp__ka__")
-                        result.tool_calls[short] = result.tool_calls.get(short, 0) + 1
-                        _log(f"agent {name}: {short} {_brief(block.input)}")
-                    elif isinstance(block, TextBlock) and cfg.verbose:
-                        _log(f"agent {name}: {block.text[:300]}")
-            elif isinstance(message, ResultMessage):
-                result.text = message.result or ""
-                result.structured = message.structured_output
-                result.cost_usd = message.total_cost_usd or 0.0
-                result.turns = message.num_turns
-                result.is_error = message.is_error
-                result.session_id = message.session_id
-    result.seconds = time.perf_counter() - start
-    _log(
-        f"agent {name}: done in {result.seconds / 60:.1f} min, {result.turns} turns, "
-        f"${result.cost_usd:.2f}{' (error)' if result.is_error else ''}"
-    )
+                log.flush()
+                if isinstance(message, AssistantMessage):
+                    result.session_id = result.session_id or message.session_id
+                    if message.parent_tool_use_id is None:
+                        turns.add(message.message_id or f"#{len(turns)}")
+                        result.turns = len(turns)
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock):
+                            short = block.name.removeprefix("mcp__ka__")
+                            result.tool_calls[short] = result.tool_calls.get(short, 0) + 1
+                            _log(f"agent {name}: {short} {_brief(block.input)}")
+                        elif isinstance(block, TextBlock) and cfg.verbose:
+                            _log(f"agent {name}: {block.text[:300]}")
+                elif isinstance(message, SystemMessage) and message.subtype == "init":
+                    result.session_id = message.data.get("session_id") or result.session_id
+                elif isinstance(message, ResultMessage):
+                    result.text = message.result or ""
+                    result.structured = message.structured_output
+                    result.cost_usd = message.total_cost_usd or 0.0
+                    result.turns = message.num_turns
+                    result.is_error = message.is_error
+                    result.session_id = message.session_id
+        finished = True
+    finally:
+        # `async for` does not close the generator when the loop is left by an
+        # exception (e.g. a timeout cancelling this task); closing it runs the
+        # SDK's cleanup, which ends the Claude Code subprocess.
+        await stream.aclose()  # type: ignore[attr-defined]
+        result.seconds = time.perf_counter() - start
+        _log(
+            f"agent {name}: {'done' if finished else 'stopped'} in {result.seconds / 60:.1f} "
+            f"min, {result.turns} turns, ${result.cost_usd:.2f}"
+            f"{' (error)' if result.is_error else ''}"
+        )
     return result

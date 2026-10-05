@@ -12,6 +12,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from kernel_agent.budget import Budget
 from kernel_agent.kernels.evaluate import run_evaluation
 from kernel_agent.worker import call_worker
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
@@ -56,6 +57,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "kernels_candidate",
             "kernels_reference",
             "eval_seconds",
+            "compile_s",
         )
         if k in result
     }
@@ -97,8 +99,9 @@ def best_for_target(run: RunDir, target_id: str) -> dict[str, Any] | None:
     return best
 
 
-def build_server(run: RunDir) -> Any:
-    """Tools bound to one run directory."""
+def build_server(run: RunDir, budget: Budget | None = None) -> Any:
+    """Tools bound to one run directory (and its budget: eval timeout + advice)."""
+    budget = budget or Budget(run)
 
     @tool(
         "evaluate_candidate",
@@ -130,7 +133,11 @@ def build_server(run: RunDir) -> Any:
             return _text({"status": "error", "error": f"{src} does not exist"})
         snap = _snapshot(src, target_dir / "history")
         result = await asyncio.to_thread(
-            run_evaluation, target_dir / "capture.pt", snap, profile=bool(args.get("profile"))
+            run_evaluation,
+            target_dir / "capture.pt",
+            snap,
+            profile=bool(args.get("profile")),
+            timeout=budget.eval_timeout_s,
         )
         record = {
             "time": time.strftime("%H:%M:%S"),
@@ -151,6 +158,9 @@ def build_server(run: RunDir) -> Any:
         best = best_for_target(run, args["target_id"])
         out["best_so_far"] = (
             {"snapshot": best["snapshot"], "speedup": best["speedup"]} if best else None
+        )
+        out |= budget.feedback(
+            f"kernel-{args['target_id']}", target_dir / "results.jsonl", budget.kernel_evals
         )
         return _text(out)
 
@@ -220,6 +230,9 @@ def build_server(run: RunDir) -> Any:
         append_jsonl(run.transforms_dir / "results.jsonl", record)
         if isinstance(result.get("error"), str):
             result["error"] = result["error"][-3000:]
+        result |= budget.feedback(
+            "systems", run.transforms_dir / "results.jsonl", budget.transform_evals, ok_key="passed"
+        )
         return _text(result)
 
     @tool(

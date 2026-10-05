@@ -22,6 +22,7 @@ from kernel_agent import hub, toolchain
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import best_for_target, build_server, tool_names
+from kernel_agent.budget import Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.integrate.export import export_optimized
 from kernel_agent.report import write_report
@@ -41,10 +42,12 @@ class Orchestrator:
         self.run = run
         self.cfg = cfg
         self.tc = toolchain.setup()
-        self.server = build_server(run)
+        self.budget = Budget.from_config(run, cfg)
+        self.server = build_server(run, self.budget)
         self.env = agent_env(self.tc.env)
         self.python = sys.executable
         self.agent_results: list[AgentResult] = []
+        self.phase = PHASES[0]
 
     # ------------------------------------------------------------ creation
 
@@ -97,11 +100,8 @@ class Orchestrator:
 
     def _mark(self, name: str, **info: Any) -> None:
         data = self.run.load()
-        data.setdefault("phases", {})[name] = {
-            "done": True,
-            "at": time.strftime("%H:%M:%S"),
-            **info,
-        }
+        phase = data.setdefault("phases", {}).setdefault(name, {})  # keep budget notes
+        phase.update(done=True, at=time.strftime("%H:%M:%S"), **info)
         write_json(self.run.run_json, data)
 
     def _available_backends(self) -> list[str]:
@@ -111,14 +111,32 @@ class Orchestrator:
         return avail
 
     async def _agent(self, name: str, **kwargs: Any) -> AgentResult:
-        result = await run_agent(
-            name,
-            cfg=self.cfg,
-            mcp_server=self.server,
-            env=self.env,
-            log_dir=self.run.root / "logs",
-            **kwargs,
-        )
+        result = AgentResult(name=name)
+        timeout = self.budget.start_agent(name)
+        cfg = self.budget.agent_config(self.cfg)
+        kwargs["system_append"] += self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
+        timer = asyncio.timeout(timeout)
+        try:
+            async with timer:
+                result = await run_agent(
+                    name,
+                    cfg=cfg,
+                    mcp_server=self.server,
+                    env=self.env,
+                    log_dir=self.run.root / "logs",
+                    result=result,
+                    **kwargs,
+                )
+        except TimeoutError:
+            if not timer.expired():
+                raise
+            result.timed_out = True
+            log(f"agent {name}: stopped at its {(timeout or 0) / 60:.1f} min limit")
+            self.budget.note(
+                self.phase, "timed_out", {"agent": name, "session_id": result.session_id}
+            )
+        finally:
+            self.budget.end_agent(name)
         self.agent_results.append(result)
         costs = read_json(self.run.root / "costs.json", {})
         costs[name] = {
@@ -126,6 +144,8 @@ class Orchestrator:
             "turns": result.turns,
             "minutes": round(result.seconds / 60, 1),
             "tools": result.tool_calls,
+            "session_id": result.session_id,
+            **({"timed_out": True} if result.timed_out else {}),
         }
         write_json(self.run.root / "costs.json", costs)
         return result
@@ -243,6 +263,11 @@ class Orchestrator:
 
         async def one(target_id: str) -> None:
             async with sem:
+                if reason := self.budget.exhausted():
+                    log(f"kernels: skipping {target_id}: {reason}")
+                    skip = {"agent": f"kernel-{target_id}", "reason": reason}
+                    self.budget.note("kernels", "budget_skipped", skip)
+                    return
                 target_dir = self.run.target(target_id)
                 spec = read_json(target_dir / "spec.json")
                 system = prompts.engineer_prompt(
@@ -281,10 +306,15 @@ class Orchestrator:
                 write_json(self.run.run_json, data)
 
         await asyncio.gather(*(one(t) for t in pending))
-        self._mark("kernels", finished=ids)
+        self._mark("kernels")  # `finished` lists the targets whose agent ran
 
     async def transforms(self) -> None:
         if not self.cfg.do_transforms:
+            self._mark("transforms", skipped=True)
+            return
+        if reason := self.budget.exhausted():
+            log(f"transforms: skipped: {reason}")
+            self.budget.note("transforms", "budget_skipped", {"agent": "systems", "reason": reason})
             self._mark("transforms", skipped=True)
             return
         data = self.run.load()
@@ -408,6 +438,7 @@ class Orchestrator:
         for phase in PHASES:
             if self._phase_done(phase):
                 continue
+            self.phase = phase
             await getattr(self, phase)()
             if phase == until:
                 break

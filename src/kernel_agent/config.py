@@ -35,6 +35,14 @@ class OptimizeConfig:
     budget_usd_per_agent: float | None = None
     permission_mode: str = "bypassPermissions"
     allow_web: bool = True
+
+    # Run budgets (kernel_agent/budget.py); None = unlimited.
+    max_hours: float | None = None
+    max_usd: float | None = None
+    agent_minutes: float | None = None
+    budget_reserve: float = 0.15  # share of max_hours kept for integrate + report
+    eval_timeout_s: float = 300.0  # per evaluate_candidate subprocess
+
     hf_token: str | None = None
     verbose: bool = False
 
