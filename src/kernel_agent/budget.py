@@ -65,6 +65,49 @@ def improves(rec: dict[str, Any], best: float, *, ok_key: str = "correct") -> bo
     return float(speedup) > best * (1 + max(MIN_GAIN, 2 * _spread(rec)))
 
 
+def _snapshot_name(row: dict[str, Any]) -> str:
+    return Path(str(row.get("snapshot") or "")).name
+
+
+@dataclass
+class Standing:
+    """The results of one target that stand, collected in evaluation order: those that set
+    a new best (``keep``) and the integration's re-evaluations of earlier snapshots
+    (:mod:`kernel_agent.kernels.recheck`), each of which replaces its snapshot's earlier
+    results. :attr:`best` is the speedup the next evaluation has to beat
+    (:func:`improves`), so a stale record that a re-evaluation replaced never sets it.
+
+    The one definition of the bar for ledger rows (:func:`kernel_agent.ledger.standing`,
+    :func:`kernel_agent.ledger.best_kept`, the scheduler's arms) and ``results.jsonl``
+    records (:func:`non_improving_streak`, the evaluation advice).
+    """
+
+    start: float = 1.0  # the speedup to beat before any result (1.0 = the reference)
+    rows: list[dict[str, Any]] = field(default_factory=list)
+
+    def keep(self, row: dict[str, Any]) -> None:
+        """A result that set a new best."""
+        self.rows.append(row)
+
+    def replace(self, row: dict[str, Any]) -> None:
+        """A re-evaluation: it stands (when correct) instead of its snapshot's earlier results."""
+        name = _snapshot_name(row)
+        self.rows = [r for r in self.rows if _snapshot_name(r) != name]
+        if row.get("correct"):
+            self.rows.append(row)
+
+    @property
+    def top(self) -> dict[str, Any] | None:
+        """The fastest standing result faster than ``start`` (None: there is none)."""
+        faster = [r for r in self.rows if float(r.get("speedup") or 0.0) > self.start]
+        return max(faster, key=lambda r: float(r["speedup"]), default=None)
+
+    @property
+    def best(self) -> float:
+        top = self.top
+        return float(top["speedup"]) if top else self.start
+
+
 def non_improving_streak(
     records: Iterable[dict[str, Any]], *, ok_key: str = "correct", start: float = 1.0
 ) -> int:
@@ -73,14 +116,17 @@ def non_improving_streak(
     ``start`` is the speedup to beat before any record (1.0 = the reference).
     Failed, incorrect and not-faster evaluations all extend the streak, except
     the library's prior winners (``PRIOR_HYPOTHESIS``). The integration's
-    re-evaluations of earlier snapshots (``reevaluates``) are not the agent's.
+    re-evaluations of earlier snapshots (``reevaluates``) are not the agent's: they
+    extend nothing, but replace the snapshot's earlier record in the best so far
+    (:class:`Standing`, like the ledger's keep bar).
     """
-    best, streak = start, 0
+    stand, streak = Standing(start), 0
     for rec in records:
         if rec.get("reevaluates"):
-            continue
-        if improves(rec, best, ok_key=ok_key):
-            best, streak = float(rec["speedup"]), 0
+            stand.replace(rec)
+        elif improves(rec, stand.best, ok_key=ok_key):
+            stand.keep(rec)
+            streak = 0
         elif not str(rec.get("hypothesis") or "").startswith(PRIOR_HYPOTHESIS):
             streak += 1
     return streak
@@ -122,7 +168,7 @@ class Budget:
     started: float = field(default_factory=time.monotonic)
     deadlines: dict[str, float] = field(default_factory=dict)
     evals: dict[str, int] = field(default_factory=dict)
-    # agent -> records in its results file when its plateau count restarted (a research plan)
+    # agent -> evaluations in its results file when its plateau count restarted (a research plan)
     restarted: dict[str, int] = field(default_factory=dict)
 
     @classmethod
@@ -249,16 +295,18 @@ class Budget:
 
         Call once per evaluation, after it was appended to ``results``;
         ``evals_used`` counts the evaluations of the current agent session; the
-        non-improving streak starts again after ``restarted[agent]`` records.
+        non-improving streak starts again after ``restarted[agent]`` evaluations.
         ``pct_of_sol`` is the evaluation's weighted share of its speed of light
         (:func:`kernel_agent.kernels.roofline.sol_signal`); at ``SOL_STOP_PCT`` or
         more further work cannot pay off, so the advice is ``stop``.
         """
         used = self.evals[agent] = self.evals.get(agent, 0) + 1
         minutes = self.minutes_left(agent)
-        streak = results_streak(results, ok_key=ok_key)
-        if (since := self.restarted.get(agent)) is not None:
-            streak = min(streak, max(len(read_jsonl(results)) - since, 0))
+        records = read_jsonl(results)
+        streak = non_improving_streak(records, ok_key=ok_key)
+        if (since := self.restarted.get(agent)) is not None:  # re-evaluations are not the agent's
+            done = sum(not rec.get("reevaluates") for rec in records)
+            streak = min(streak, max(done - since, 0))
         usd = self.usd_left()
         if evals_budget is not None and used >= evals_budget:
             advice, why = "stop", f"evaluation budget used ({used} of {evals_budget})"
