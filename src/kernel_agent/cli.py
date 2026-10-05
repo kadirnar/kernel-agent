@@ -98,6 +98,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         ab_rounds=ns.ab_rounds,
         ab_min_win_rate=ns.ab_min_win_rate,
         ab_min_gain=ns.ab_min_gain,
+        recheck=not ns.no_recheck,
         use_library=not ns.no_library,
         librarian=not ns.no_librarian,
         librarian_model=ns.librarian_model,
@@ -211,6 +212,26 @@ def cmd_eval(ns: argparse.Namespace) -> int:
     )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("correct") else 1
+
+
+def cmd_recheck(ns: argparse.Namespace) -> int:
+    from kernel_agent.kernels.recheck import describe, run_recheck
+
+    capture, candidate = Path(ns.capture), Path(ns.candidate)
+    verdict: dict[str, Any] | None = None
+    if ns.speedup is not None:
+        verdict = {"correct": True, "speedup": ns.speedup}
+    elif not ns.no_evaluate:  # the verdict to compare with: the evaluator's
+        from kernel_agent.kernels.evaluate import run_evaluation
+
+        verdict = run_evaluation(capture, candidate, timeout=ns.timeout)
+        print(f"evaluator: {verdict.get('status')}, speedup {verdict.get('speedup')}", flush=True)
+    result = run_recheck(
+        capture, candidate, seeds=ns.seeds, seed=ns.seed, verdict=verdict, timeout=ns.timeout
+    )
+    print(json.dumps(result, indent=2, default=str))
+    print(f"recheck: {describe(result)}")
+    return 0 if result.get("passed") else 1
 
 
 def cmd_install_claude_code(ns: argparse.Namespace) -> int:
@@ -364,6 +385,11 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         help="integration: the 95%% CI of an item's A/B gain must start above this",
     )
     p.add_argument("--librarian-model", help="model of the librarian (default: --claude-model)")
+    p.add_argument(
+        "--no-recheck",
+        action="store_true",
+        help="integration: do not re-check kernels on fresh inputs in separate processes",
+    )
     p.add_argument("--verbose", "-v", action="store_true")
 
 
@@ -463,6 +489,23 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser(
+        "recheck",
+        help="re-check a winner on fresh inputs, reference and candidate in separate processes",
+    )
+    p.add_argument("capture")
+    p.add_argument("candidate")
+    p.add_argument("--seeds", type=int, default=3, help="fresh input draws per captured case")
+    p.add_argument("--seed", type=int, help="first input seed (default: random)")
+    p.add_argument(
+        "--speedup",
+        type=float,
+        help="the evaluator's speedup to compare with (default: run the evaluator first)",
+    )
+    p.add_argument("--no-evaluate", action="store_true", help="no evaluator verdict to compare")
+    p.add_argument("--timeout", type=float, default=600.0, help="seconds per subprocess")
+    p.set_defaults(func=cmd_recheck)
+
+    p = sub.add_parser(
         "install-claude-code", help="add /optimize-model + kernel-engineer subagent to a project"
     )
     p.add_argument("project", nargs="?", default=".")
@@ -493,6 +536,10 @@ def main(argv: list[str] | None = None) -> int:
     from kernel_agent import library
 
     library.add_parser(sub).set_defaults(func=library.main)
+
+    from kernel_agent import suite
+
+    suite.add_parser(sub).set_defaults(func=suite.main)  # bench-suite (KernelBench)
 
     ns = parser.parse_args(argv)
     return int(ns.func(ns))

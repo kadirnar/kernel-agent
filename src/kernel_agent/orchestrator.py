@@ -42,6 +42,7 @@ from kernel_agent.budget import MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.export import export_optimized
+from kernel_agent.kernels import recheck
 from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
@@ -71,6 +72,10 @@ class Orchestrator:
         # Replaced by `improve --dry-run` (simulated agent / GPU worker); None = the real ones.
         self.agent_runner: Callable[..., Awaitable[AgentResult]] | None = None
         self.worker: Callable[..., dict[str, Any]] | None = None
+        # The integration's re-check of a kernel (kernels/recheck.py); None = the real one,
+        # which a simulated run (dryrun.py: no captures) skips.
+        self.rechecker: Callable[..., dict[str, Any]] | None = None
+        self.simulated = "dry_run" in run.load()
 
     # ------------------------------------------------------------ creation
 
@@ -647,6 +652,9 @@ class Orchestrator:
         paired = {_ab_key(h): h for h in known if h.get("ab")}
         # items whose state cannot be undone in-process (snapshot paths: content-addressed)
         irreversible = set((previous or {}).get("irreversible") or [])
+        rechecks: list[dict[str, Any]] = []
+        if self.cfg.recheck:  # fresh inputs, separate processes; failing kernels are refused
+            items, composite, rechecks = self._recheck_kernels(items, composite, previous or {})
 
         def ab(
             a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = ""
@@ -746,6 +754,8 @@ class Orchestrator:
             result["composite"] = seed
         if irreversible:
             result["irreversible"] = sorted(irreversible)
+        if rechecks:
+            result["recheck"] = rechecks
         baseline = self.truth.load_json(self.run.baseline_json)  # its compiled_ms
         reference = self._with_reference(baseline, accepted, previous or {})
         if reference is not None:
@@ -766,6 +776,96 @@ class Orchestrator:
         else:
             log("integrate: no optimisation survived end-to-end validation")
         self._mark("integrate", speedup=final["speedup"] if final else 1.0)
+
+    def _recheck_kernels(
+        self,
+        items: list[tuple[str, str]],
+        composite: tuple[list[tuple[str, str]], dict[str, Any]] | None,
+        previous: dict[str, Any],
+    ) -> tuple[
+        list[tuple[str, str]],
+        tuple[list[tuple[str, str]], dict[str, Any]] | None,
+        list[dict[str, Any]],
+    ]:
+        """The independent re-check (``kernels/recheck.py``) of every kernel the integration
+        considers (each target's best and the kernels of the measured combination): fresh
+        inputs of the captured shapes against a freshly computed reference, reference and
+        kernel timed in processes of their own. A kernel that fails it is refused (a log
+        line and a ``recheck_failed`` event with the reason), and so is a combination with
+        it. A re-integration reuses the result of the same snapshot (``previous``)."""
+        kernels = [a for k, a in items if k == "kernel"]
+        for kind, arg in composite[0] if composite else []:
+            if kind == "kernel" and arg not in kernels:
+                kernels.append(arg)
+        known = {(r.get("item"), r.get("sha256")): r for r in previous.get("recheck") or []}
+        records: list[dict[str, Any]] = []
+        refused: set[str] = set()
+        for arg in kernels:
+            target_id, _, path = arg.partition("=")
+            snap = Path(path)
+            rec = self._kernel_record(target_id, snap.name)
+            sha = (rec or {}).get("snapshot_sha256")
+            hit = known.get((arg, sha)) if sha else None
+            result = dict(hit) if hit is not None else self._recheck_one(target_id, snap, rec)
+            records.append(
+                {**result, "item": arg, "target": target_id, "snapshot": snap.name, "sha256": sha}
+            )
+            log(f"integrate: recheck {target_id} ({snap.name}): {recheck.describe(result)}")
+            if not result.get("passed"):
+                refused.add(arg)
+                ledger.event(
+                    self.run,
+                    "recheck_failed",
+                    target=target_id,
+                    snapshot=snap.name,
+                    status=result.get("status"),
+                    reason=str(result.get("reason"))[:500],
+                )
+        if refused:
+            items = [(k, a) for k, a in items if not (k == "kernel" and a in refused)]
+            if composite is not None and refused.intersection(a for _, a in composite[0]):
+                exp = composite[1].get("exp")
+                log(f"integrate: no seed from exp {exp}: one of its kernels failed the recheck")
+                composite = None
+        return items, composite, records
+
+    def _recheck_one(
+        self, target_id: str, snap: Path, rec: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """:func:`kernels.recheck.run_recheck` of one kernel snapshot on its target's capture,
+        against the verified evaluation record ``rec``. In a run with ``.truth/`` a missing or
+        changed capture fails it; a run from before that layout without one skips it."""
+        if self.rechecker is None and self.simulated:
+            return {"status": "skipped", "passed": True, "reason": "simulated run (no captures)"}
+        capture = self.run.capture_file(target_id)
+        try:
+            capture_sha256 = self.truth.verify(capture)
+        except truth.TamperError as exc:
+            return {"status": "tampered", "passed": False, "reason": str(exc)}
+        if capture_sha256 is None and not capture.exists():
+            return {"status": "skipped", "passed": True, "reason": f"no capture file {capture}"}
+        verdict = {"correct": rec.get("correct"), "speedup": rec.get("speedup")} if rec else None
+        try:
+            return (self.rechecker or recheck.run_recheck)(
+                capture,
+                snap,
+                verdict=verdict,
+                capture_sha256=capture_sha256,
+                timeout=2 * self.budget.eval_timeout_s,
+            )
+        except Exception as exc:  # the re-check itself broke: the kernel is not confirmed
+            return {"status": "error", "passed": False, "reason": repr(exc)[:500]}
+
+    def _kernel_record(self, target_id: str, snapshot: str) -> dict[str, Any] | None:
+        """The verified correct evaluation record of a kernel snapshot (None: there is none)."""
+        try:
+            records = self.truth.records(self.run.results_file(target_id))
+        except truth.TamperError:
+            return None
+        for rec in records:
+            if rec.get("correct") and Path(str(rec.get("snapshot", ""))).name == snapshot:
+                return rec
+        return None
 
     def _integration_call(
         self, command: str, combo: list[tuple[str, str]], cli: list[str], note: str
