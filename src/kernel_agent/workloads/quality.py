@@ -204,9 +204,10 @@ def teacher_forcing_selfcheck(workload: Workload, inputs: Any, reference: Any) -
 
 
 def probe(workload: Workload, inputs: Any, reference: Any) -> dict[str, Any]:
-    """Quality probes for ``baseline.json`` (``sensitivity`` and, for
-    teacher-forced workloads, ``teacher_forcing``).  Failures are recorded, not
-    raised: they inform the user and the agents but must not abort ``analyze``."""
+    """Quality probes for ``baseline.json`` (``sensitivity``, for teacher-forced
+    workloads ``teacher_forcing``, and the workload's own ``self_check``, e.g. a batched
+    loop against batch 1).  Failures are recorded, not raised: they inform the user and
+    the agents but must not abort ``analyze``."""
     result: dict[str, Any] = {}
     try:
         result["sensitivity"] = sensitivity_probe(workload, inputs, reference)
@@ -222,6 +223,13 @@ def probe(workload: Workload, inputs: Any, reference: Any) -> dict[str, Any]:
             result["teacher_forcing"] = {"passed": False, "error": traceback.format_exc()[-2000:]}
         if workload.teacher_forcing_note:
             result["teacher_forcing"]["note"] = workload.teacher_forcing_note
+    try:
+        with torch.inference_mode():
+            check = workload.self_check(inputs, reference)
+    except Exception:
+        check = {"passed": False, "error": traceback.format_exc()[-2000:]}
+    if check is not None:
+        result["self_check"] = check
     result["chaotic"] = is_chaotic(workload, result)
     return result
 
@@ -253,6 +261,13 @@ def probe_messages(baseline: dict[str, Any]) -> list[str]:
                 f"WARNING: teacher-forcing self-check FAILED ({detail}); every candidate will "
                 "fail end-to-end validation"
             )
+    if (check := baseline.get("self_check")) is not None:
+        what = check.get("check") or "the workload's own run"
+        if check.get("passed"):
+            messages.append(f"analyze: self-check ok ({what})")
+        else:
+            detail = check.get("reason") or str(check.get("error", ""))[-500:]
+            messages.append(f"WARNING: self-check FAILED ({what}): {detail}")
     return (
         messages
         + holdout.messages(baseline)
@@ -315,6 +330,10 @@ def summary_section(baseline: dict[str, Any]) -> str:
             lines.append(f"* {tf['note']}")
         if tf.get("error"):
             lines.append(f"* teacher-forcing self-check error: `{tf['error'][-300:]}`")
+    if (own := baseline.get("self_check")) is not None:
+        state = "passes" if own.get("passed") else f"**FAILS** ({own.get('reason')})"
+        what = own.get("check") or "the workload's own run"
+        lines.append(f"* workload self-check ({what}): {state}.")
     lines += holdout.summary_lines(baseline) + stopping.summary_lines(baseline)
     lines += perceptual.summary_lines(baseline)
     return "\n".join(lines) + "\n"

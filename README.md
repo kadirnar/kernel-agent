@@ -267,9 +267,15 @@ wall-clock latency of the whole workload, unless the run optimises another
 metric.
 
 `-o metric=` chooses what a run optimises (`kernel_agent/objective.py`):
-`latency` (the default) or `ttfa`, the time to first audio of a streaming TTS
+`latency` (the default), `ttfa`, the time to first audio of a streaming TTS
 run (VoxCPM, and harnesses that declare it): from the call of `workload.run`
-to the first audio chunk, GPU-synchronised. `measure()` returns the metric as
+to the first audio chunk, GPU-synchronised, or `throughput`, seconds of audio
+generated per wall second by a batch of different requests (VoxCPM with
+`-o batch_size=N`, see "Throughput" in the VoxCPM section). A rate is higher-is-better,
+so the value of `throughput` is its reciprocal, the wall time per second of
+generated audio (ms): "lower is better" holds for every metric, and every
+speedup `base_ms / new_ms` is exactly the throughput ratio; `metric_detail`
+holds the throughput itself and the per-request latency. `measure()` returns the metric as
 `median_ms`, so the baseline, every end-to-end evaluation, the paired A/B
 rounds of the integration, the memoisation probe and every speedup use it.
 `baseline.json` records `metric` and, for `ttfa`, `metric_detail`: the median
@@ -281,7 +287,8 @@ the metric times (for `ttfa`, up to the first chunk), `profile/summary.md` gets
 an *Objective* section for the agents, and reports, charts, `status` and
 `watch` name the metric ("time to first audio" instead of "latency per run").
 A workload that cannot time the requested metric is refused before the run
-starts. `throughput` is reserved for #74.
+starts. For `throughput` the profile covers the whole batched run (its value is
+a rate).
 
 ### Integration: paired A/B with undo handles
 
@@ -904,6 +911,85 @@ them 4-D tensors. The whole package is therefore rejected with that reason. An
 `_inference` that ignores `streaming=True` (all chunks at the end) is rejected
 as well.
 
+Throughput (`-o batch_size=N`, implies `-o metric=throughput`;
+`kernel_agent/workloads/voxcpm_batch.py`): VoxCPM's own inference is batch 1,
+so the workload runs a faithful batched version of `_generate` / `_inference`
+for N *different* texts (request 0 says `text`, the others built-in sentences),
+zero-shot or in a reference voice. The prompts are right-padded and prefilled
+once through the model's own `forward`s (causal attention keeps real positions
+off the padding, the masks zero the padded embeddings); each LM has a static
+KV cache with batch N sized to the longest prompt plus the patches; every
+request decodes at its own position (`workload.lm_step`: VoxCPM's
+`forward_step` with a position per request for RoPE, cache slot and mask,
+calling the layers' own norms, projections and MLPs); the LocDiT runs CFG at
+batch 2N, the LocEnc and the stop head at batch N, the AudioVAE decodes up to
+`vae_batch` (16) requests per call. Request b draws its LocDiT noise from its
+own generator seeded `seed + b`, exactly the noise VoxCPM's batch-1 `generate`
+draws after `torch.manual_seed(seed + b)` (the batched run serves the
+`torch.randn((batch, ...))` call of `feat_decoder.forward` row by row). Stop
+flags are per request: in the fixed-length benchmark every request generates
+`patches` patches; with the stop head live (natural-length run, perceptual
+samples) each request stops on its own.
+
+* **Batching is exact.** At N = 1 the batched loop is bit-identical to VoxCPM's
+  `generate` (teacher-forced cosine 1.0 on every step; on the CPU test model
+  even free running, every request of a batch of 4). At N = 4/16, teacher forced
+  per request against VoxCPM's batch-1 `generate` of the same text and seed,
+  mean step cosine ≥ 0.996: bf16 GEMMs of other shapes, nothing else.
+  `analyze` checks this for every request (`baseline.json` `self_check`).
+* **Quality per request.** Teacher forcing, the held-out input and the
+  natural-length run judge every request (one wrong request fails the batch;
+  the reason names it). Some trajectories have an ill-conditioned LocDiT step
+  that any bf16-level change flips (request 2 of the default batch, step 43:
+  cosine 0.33 under every `nn.Linear` × (1 ± 2^-8), 0.19 batched vs batch 1), so
+  each request's worst step is excused when it is an outlier
+  (`-o outlier_steps=1`, reported as `excused_steps`). Calibrated on batches of
+  4/8/16: with it, correct changes keep mean ≥ 0.994 and min ≥ 0.75 per
+  request; broken RMSNorm (eps 1e-2) and request 0's noise for every request
+  reach mean ≤ 0.84 on every request, a decode step at request 0's position
+  (a step written for batch 1) ≤ 0.93 with 5–12 steps below 0.7 on each
+  request with another prompt length (one at 0.985, still below 0.99). With `--quality near-lossless` each perceptual sample runs as a
+  batch (its text is request 0) and request 0's audio is scored.
+
+RTX 5070 Ti, eager, 60 patches per request (9.6 s of audio), medians of 3:
+
+| | wall per batch | ms per audio second (the metric) | throughput (audio s / s) | peak memory |
+|---|---|---|---|---|
+| VoxCPM `generate`, batch 1 | 5,414 ms | 564.0 | 1.77 | 5.5 GB |
+| batched loop, N = 1 | 5,033 ms | 524.3 | 1.91 | 5.5 GB |
+| N = 4 | 5,244 ms | 136.6 | 7.32 | 6.5 GB |
+| N = 8 (default) | 5,322 ms | 69.3 | 14.4 | 7.8 GB |
+| N = 16 | 5,659 ms | 36.8 | 27.1 | 10.5 GB |
+| N = 32 | 6,247 ms | 20.3 | 49.2 | 10.6 GB |
+| N = 64 | 10,057 ms | 16.4 | 61.1 | 10.9 GB |
+| N = 128 | 18,588 ms | 15.1 | 66.1 | 11.3 GB |
+| N = 256 | 39,606 ms | 16.1 | 62.1 | 12.1 GB |
+
+Eager VoxCPM2 is launch-bound at batch 1, so throughput scales almost linearly
+up to N = 16 (14.2×) and saturates around 66 s of audio per second at
+N ≈ 128, where the GPU is busy. The AudioVAE decode is the memory limit: all
+requests in one call ran out of memory at N = 32; in calls of 16 requests
+N = 256 peaks at 12.1 GB. The compiled baseline (`model.optimize()`, whose
+LocEnc and LocDiT estimator compile for batch N, plus `lm_step` compiled the
+same way) reaches 29.2 s/s at N = 4 (4.1× eager) and 52.6 at N = 16 (47.4 with
+`model.optimize()` alone: its compiled `forward_step`s are not called by the
+batched loop).
+
+The live run's optimised package (written for batch 1) applied to the batched
+loop passes every per-request check and reaches 22.9 s/s at N = 4 and 57.8 at
+N = 16 (2.2–3.1× the batched eager), against 13.1 s/s for the package at batch
+1 (731–737 ms per run). Its decode kernels do not compute anything wrong at
+N > 1: `decoder_layer_fused.forward_step` falls back to the reference for a
+batch > 1; `attn_fused.forward_step` handles a batch at one shared position
+(cosine 0.99999 to the reference at N = 16); with a position per request both,
+like VoxCPM's own `forward_step`, raise a shape error. The batched loop calls
+neither (nor `model._inference`, nor `MiniCPMModel.forward_step`, so the
+package's decode-loop transforms and its fused decoder layer do not apply);
+its CUDA-graph transforms key their graphs by input shape, and the module
+kernels (`mlp_fused` at M = N, `attn_fused` prefill) handle the batch or fall
+back. New candidates for the batched decode step (`lm_step`) are the next
+round's work.
+
 ### kernel-agent improve: the continuous loop
 
 ```bash
@@ -1352,12 +1438,14 @@ kernel-agent optimize <hf-url> [options]
                                        TTS: text, seed, min_spec_cosine
                                        diffusion: steps, height, width, prompt, cpu_offload, min_psnr
                                        any: entrypoints=Cls.method,... (extra non-forward methods)
-                                       any: metric=latency|ttfa (what the run optimises; ttfa:
-                                            VoxCPM / streaming harnesses), steady_chunks=8
+                                       any: metric=latency|ttfa|throughput (what the run optimises;
+                                            ttfa: VoxCPM / streaming harnesses, throughput: VoxCPM
+                                            batches / batch harnesses), steady_chunks=8
                                        VoxCPM: text, patches, timesteps, cfg, seed, compile,
                                                min_step_cosine, min_mean_step_cosine, min_spec_cosine,
                                                natural_text, natural_max_patches,
                                                stop_tolerance, stop_near_tie,
+                                               throughput: batch_size (8), vae_batch (16), outlier_steps (1),
                                                near-lossless: max_error_increase, max_mos_drop,
                                                min_speaker_similarity(_worst), perceptual_max_patches
   --quality exact|near-lossless        near-lossless: numerics-changing optimisations pass a
@@ -1734,8 +1822,14 @@ Streaming TTS harnesses can support `-o metric=ttfa`: list it in
 `metrics = ("latency", "ttfa")`, call `self.mark_chunk(audio_ms=...)` in `run`
 whenever an audio chunk reaches the caller, and optionally implement
 `metric_window()` (a context in which `run` stops after the first chunk) so the
-profile covers the time-to-first-audio window. `Workload.metric_value` is the
-extension point for further metrics.
+profile covers the time-to-first-audio window. Batch harnesses can support
+`-o metric=throughput`: list it in `metrics`, call `self.mark_chunk(audio_ms=...)`
+when each request's output is ready (its latency; the audio seconds default to
+the sum of the marks), or override `output_seconds()` when the options fix the
+output length, as the VoxCPM batch does. `Workload.metric_value` is the
+extension point for further metrics; `Workload.self_check(inputs, reference)`
+(optional) records an `analyze`-time check that the workload's own run is
+faithful to the model (`baseline.json` `self_check`).
 
 To opt in to the perceptual gate of `--quality near-lossless` (see "Quality
 modes"), implement `perceptual_samples()` (option overrides of a few short

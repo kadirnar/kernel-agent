@@ -127,9 +127,9 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
             profile = profile_workload(workload, inputs)
         write_json(out.profile_dir / "profile.json", profile)
-        metric = objective.of(baseline)
+        window_ms, what, per = objective.profile_window(baseline)  # metric=throughput: a run
         summary = (
-            summarize(profile, timing["median_ms"], metric=metric.title.lower(), per=metric.per)
+            summarize(profile, window_ms, metric=what, per=per)
             + objective.summary_section(baseline)
             + quality.summary_section(baseline)
         )

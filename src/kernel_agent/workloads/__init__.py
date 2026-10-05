@@ -48,6 +48,11 @@ def _create(spec: WorkloadSpec) -> Workload:
 
         return load_harness(spec.harness, spec)
     if spec.family == "voxcpm":
+        options = spec.options
+        if "batch_size" in options or str(options.get("metric")).lower() == objective.THROUGHPUT:
+            from kernel_agent.workloads.voxcpm_batch import VoxCPMBatchWorkload
+
+            return VoxCPMBatchWorkload(spec)  # a batch of requests (metric=throughput)
         from kernel_agent.workloads.voxcpm import VoxCPMWorkload
 
         return VoxCPMWorkload(spec)
