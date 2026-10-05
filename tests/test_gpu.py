@@ -1,5 +1,6 @@
 """GPU tests: evaluator, side-effect checking, patcher, profiler, capture."""
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -163,3 +164,21 @@ def test_patcher_replaces_all_instances(tiny):
     assert report.replaced == {"rms": 4} and not report.errors
     assert not any(isinstance(m, RMSNorm) for m in tiny.model.modules())
     assert tiny.compare(ref, tiny.run(inputs)).passed
+
+
+@pytest.mark.gpu
+def test_gpu_test_threads_do_not_wait_for_the_test():
+    """Tools evaluate in worker threads (asyncio.to_thread); under the conftest GPU lock
+    they must not wait for the test's own thread."""
+    from kernel_agent import gpulock
+
+    got = []
+
+    def worker():
+        with gpulock.gpu_lock():
+            got.append(True)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(10)
+    assert got == [True]
