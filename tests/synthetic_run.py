@@ -5,13 +5,15 @@ It goes through the same recording code as a real run (``record_candidate``,
 order, so results.jsonl, results.tsv and events.jsonl look like the real thing.
 The story: Qwen3-0.6B decoding 128 tokens; four kernel targets written by two
 parallel kernel agents, then model-level transforms, then the greedy
-integration (baseline 1532 ms, final 889 ms).
+integration (baseline 1532 ms, final 889 ms). ``logs/agent-<name>.jsonl`` has
+a few messages per agent in the runner's format (tool calls, text, the result).
 
 ``python tests/synthetic_run.py OUT_DIR`` writes one and renders its charts.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from collections.abc import Callable
@@ -474,7 +476,34 @@ def make_run(base: Path, *, integrate: bool = True) -> RunDir:
             for name, (usd, turns, minutes) in COSTS.items()
         },
     )
+    _agent_logs(run)
     return run
+
+
+def _agent_logs(run: RunDir) -> None:
+    """``logs/agent-<name>.jsonl`` as ``agent.runner`` writes them (a short excerpt)."""
+
+    def message(kind: str, **data: Any) -> str:
+        return json.dumps({"type": kind, "data": data}) + "\n"
+
+    def tool(name: str, **args: Any) -> str:
+        block = {"id": f"toolu_{name.lower()}", "name": name, "input": args}
+        return message("AssistantMessage", content=[block], parent_tool_use_id=None)
+
+    (run.root / "logs").mkdir(exist_ok=True)
+    for agent, (usd, turns, _) in COSTS.items():
+        lines = [message("SystemMessage", subtype="init", data={"session_id": f"s-{agent}"})]
+        lines.append(tool("Read", file_path=str(run.profile_dir / "summary.md")))
+        for _, name, hypothesis, _ in SCRIPTS.get(agent.removeprefix("kernel-"), [])[-4:]:
+            lines.append(message("AssistantMessage", content=[{"text": f"Next: {hypothesis}."}]))
+            lines.append(tool("Write", file_path=f"candidates/{name}.py", content="..."))
+            lines.append(tool("mcp__ka__evaluate_candidate", candidate=f"candidates/{name}.py"))
+            lines.append(message("UserMessage", content=[{"tool_use_id": "x", "content": "{}"}]))
+        if agent == "systems":
+            lines.append(tool("mcp__ka__evaluate_e2e", transforms=["transforms/static_cache.py"]))
+        result = {"is_error": False, "num_turns": turns, "total_cost_usd": usd, "result": "done"}
+        lines.append(message("ResultMessage", subtype="success", **result))
+        (run.root / "logs" / f"agent-{agent}.jsonl").write_text("".join(lines))
 
 
 def _integrate(run: RunDir, at: Callable[[float], float]) -> None:

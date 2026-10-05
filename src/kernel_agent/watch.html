@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>kernel-agent watch</title>
+<link rel="icon" href="data:,">
+<style>
+/* Colours match charts.py: green = kept, grey = discarded, red = failed, blue = projected. */
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --band: #f1f0ec; --border: rgba(11, 11, 11, 0.1);
+  --code: #f0efec; --hover: rgba(11, 11, 11, 0.045); --shadow: 0 6px 24px rgba(11, 11, 11, 0.14);
+  --keep: #1baf7a; --discard: #b4b2ab; --fail: #d03b3b; --projected: #2a78d6;
+  --compile: #eb6834; --total: #52514e; --cost: #52514e; --other: #d9d8d1;
+  --t0: #2a78d6; --t1: #eb6834; --t2: #4a3aa7; --t3: #eda100; --t4: #e87ba4; --t5: #008300;
+  --good: #0ca30c; --warn: #fab219; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --band: #222221; --border: rgba(255, 255, 255, 0.1);
+    --code: #2c2c2a; --hover: rgba(255, 255, 255, 0.05); --shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+    --keep: #199e70; --discard: #6e6d67; --fail: #d03b3b; --projected: #3987e5;
+    --compile: #d95926; --total: #a3a29a; --cost: #c3c2b7; --other: #4a4a46;
+    --t0: #3987e5; --t1: #d95926; --t2: #9085e9; --t3: #c98500; --t4: #d55181; --t5: #008300;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --band: #222221; --border: rgba(255, 255, 255, 0.1);
+  --code: #2c2c2a; --hover: rgba(255, 255, 255, 0.05); --shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+  --keep: #199e70; --discard: #6e6d67; --fail: #d03b3b; --projected: #3987e5;
+  --compile: #d95926; --total: #a3a29a; --cost: #c3c2b7; --other: #4a4a46;
+  --t0: #3987e5; --t1: #d95926; --t2: #9085e9; --t3: #c98500; --t4: #d55181; --t5: #008300;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+code, pre, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+code { background: var(--code); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+button, input, select { font: inherit; color: inherit; }
+.wrap { max-width: 1360px; margin: 0 auto; padding: 20px 16px 48px; }
+.skip { position: absolute; left: -9999px; }
+.skip:focus { left: 16px; top: 8px; background: var(--surface); padding: 6px 10px; z-index: 10; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+:focus-visible { outline: 2px solid var(--projected); outline-offset: 2px; }
+.feed, .scroll, .files .list, .viewer pre { scrollbar-color: var(--axis) transparent;
+  scrollbar-width: thin; }
+
+/* header */
+.top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px 24px;
+  flex-wrap: wrap; }
+.top h1 { font-size: 22px; line-height: 1.25; margin: 0; overflow-wrap: anywhere; }
+.meta { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 4px 0 0; color: var(--ink-2); }
+.root { margin: 2px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.live { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; font-size: 13px;
+  font-weight: 600; white-space: nowrap; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface); }
+.live i { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.live[data-state="live"] i { background: var(--good); animation: pulse 2s ease-in-out infinite; }
+.live[data-state="retry"] i { background: var(--warn); }
+.live[data-state="failed"] i { background: var(--critical); }
+@keyframes pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .live i { animation: none !important; } }
+.status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 14px; }
+.steps { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.steps li { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; font-size: 12.5px;
+  color: var(--muted); border: 1px solid var(--border); border-radius: 999px; }
+.steps li.done { color: var(--ink-2); background: var(--surface); }
+.steps li.running { color: var(--ink); font-weight: 600; border-color: var(--projected);
+  background: var(--surface); }
+.steps li.failed { color: var(--ink); font-weight: 600; border-color: var(--critical); }
+.steps li svg { flex: none; }
+.agents { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; color: var(--ink-2);
+  font-size: 12.5px; }
+.agents .chip { display: inline-flex; gap: 6px; align-items: baseline; padding: 2px 9px;
+  border-radius: 999px; background: var(--code); color: var(--ink); }
+.agents .chip span { color: var(--muted); font-variant-numeric: tabular-nums; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px;
+  margin-top: 16px; }
+.tile { min-width: 0; padding: 11px 14px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; }
+.tile .label { color: var(--ink-2); font-size: 12px; }
+.tile .value { margin-top: 2px; font-size: 23px; font-weight: 600; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.tile .sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+/* sections and cards */
+section { margin-top: 22px; }
+h2 { margin: 0; font-size: 15px; }
+h3 { margin: 0; font-size: 14px; }
+.card { min-width: 0; padding: 14px 16px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 10px; }
+.head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline;
+  gap: 4px 16px; }
+.caption { margin: 2px 0 8px; color: var(--ink-2); font-size: 12.5px; }
+.note { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+.empty { padding: 26px 8px; color: var(--muted); text-align: center; font-size: 13px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 6px; color: var(--ink-2);
+  font-size: 12px; }
+.legend .key { display: inline-flex; align-items: center; gap: 6px; }
+.multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: 12px; margin-top: 10px; }
+.multiples > .empty { grid-column: 1 / -1; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr));
+  gap: 12px; }
+.two > section { margin-top: 22px; }
+.target .best { font-size: 20px; font-weight: 600; white-space: nowrap; }
+.target .best span { color: var(--muted); font-size: 12px; font-weight: 400; margin-right: 6px; }
+.target .stats { margin: 1px 0 4px; color: var(--ink-2); font-size: 12px; }
+.nowrap { white-space: nowrap; }
+.target .last { margin: 4px 0 0; color: var(--muted); font-size: 12px; display: -webkit-box;
+  -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.name { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+.name small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.target .head { flex-wrap: nowrap; }
+.target .head .name { flex: 1 1 auto; }
+.target .head .name small { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.swatch { flex: none; display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+
+/* charts */
+.chart { position: relative; min-height: 40px; }
+svg.plot { display: block; overflow: visible; touch-action: pan-y; }
+svg.plot:focus { outline: none; }
+svg.plot:focus-visible { outline: 2px solid var(--projected); outline-offset: 3px; border-radius: 4px; }
+svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink-2); }
+svg .tick { fill: var(--muted); font-variant-numeric: tabular-nums; }
+svg .strong { fill: var(--ink); font-weight: 600; }
+svg .halo { paint-order: stroke; stroke: var(--surface); stroke-width: 3px; stroke-linejoin: round; }
+svg .phase-label { fill: var(--muted); }
+svg .grid { stroke: var(--grid); stroke-width: 1; }
+svg .axis { stroke: var(--axis); stroke-width: 1; }
+svg .band { fill: var(--band); }
+svg .ref { stroke: var(--ink-2); stroke-width: 1; stroke-dasharray: 5 4; fill: none; }
+svg .now { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 3; }
+svg .compile { stroke: var(--compile); stroke-width: 1.6; stroke-dasharray: 1.5 3;
+  stroke-linecap: round; fill: none; }
+svg .projected { stroke: var(--projected); stroke-width: 2; fill: none; stroke-linejoin: round; }
+svg .projected-dot { fill: var(--projected); stroke: var(--surface); stroke-width: 1.5; }
+svg .best-line { stroke: var(--keep); stroke-width: 2; fill: none; stroke-linejoin: round; }
+svg .keep { fill: var(--keep); stroke: var(--surface); stroke-width: 2; }
+svg .discard { fill: var(--discard); stroke: var(--surface); stroke-width: 2; }
+svg .fail { stroke: var(--fail); stroke-width: 2; fill: none; stroke-linecap: round; }
+svg .cost-line { stroke: var(--cost); stroke-width: 2; fill: none; stroke-linejoin: round; }
+svg .cost-dot { fill: var(--cost); stroke: var(--surface); stroke-width: 2; }
+svg .budget { stroke: var(--critical); stroke-width: 1; stroke-dasharray: 5 4; }
+svg .total { fill: var(--total); }
+svg .gain { fill: var(--keep); }
+svg .nogain { stroke: var(--discard); stroke-width: 1; }
+svg .hatch { stroke: var(--discard); stroke-width: 1.2; }
+svg .connector { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 2; }
+svg .row-hover { fill: var(--hover); }
+svg .focus-ring { fill: none; stroke: var(--ink); stroke-width: 1.5; pointer-events: none; }
+.tooltip { position: fixed; z-index: 20; max-width: min(360px, calc(100vw - 16px));
+  padding: 8px 10px; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); font-size: 12.5px; }
+.tooltip[hidden] { display: none; }
+.tooltip .value { font-size: 14px; font-weight: 600; }
+.tooltip .label { color: var(--ink-2); }
+.tooltip .line { color: var(--ink-2); margin-top: 3px; overflow-wrap: anywhere; }
+.tooltip .hyp { color: var(--ink); margin-top: 4px; overflow-wrap: anywhere; }
+
+/* status pills */
+.pill { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.pill i { display: inline-block; flex: none; width: 9px; height: 9px; border-radius: 50%; }
+.pill.keep { font-weight: 600; }
+.pill.keep i { background: var(--keep); box-shadow: 0 0 0 1px var(--ink); }
+.pill.discard i { background: var(--discard); }
+.pill.fail i { background: var(--fail); border-radius: 2px; transform: rotate(45deg) scale(0.85); }
+
+/* feeds */
+.feed { margin: 6px 0 0; padding: 0; list-style: none; max-height: 340px; overflow: auto;
+  font-size: 12.5px; }
+.feed li { display: grid; grid-template-columns: 62px 1fr; gap: 8px; padding: 4px 2px;
+  border-bottom: 1px solid var(--border); }
+.feed li:last-child { border-bottom: 0; }
+.feed time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.feed .what { min-width: 0; overflow-wrap: anywhere; }
+.feed .kind { color: var(--muted); }
+.feed .agent { display: inline-block; padding: 0 6px; margin-right: 6px; border-radius: 4px;
+  background: var(--code); color: var(--ink); font-size: 11.5px; }
+.feed .tool { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11.5px; }
+
+/* ledger */
+.filters { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: end; margin: 8px 0 10px; }
+.filters label { display: grid; gap: 2px; color: var(--ink-2); font-size: 12px; }
+.filters select, .filters input { min-width: 0; padding: 5px 8px; background: var(--surface);
+  border: 1px solid var(--axis); border-radius: 6px; font-size: 13px; }
+.filters input { width: min(260px, 70vw); }
+.filters .count { color: var(--muted); font-size: 12px; margin-left: auto; }
+.scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 6px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+th { color: var(--ink-2); font-weight: 600; white-space: nowrap; position: sticky; top: 0;
+  background: var(--surface); }
+tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: var(--hover); }
+td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+td.hyp { min-width: 260px; }
+td.nowrap { white-space: nowrap; }
+.linkish { padding: 1px 8px; background: transparent; border: 1px solid var(--axis); border-radius: 6px;
+  cursor: pointer; font-size: 12px; }
+.linkish:hover { background: var(--hover); }
+.more { margin-top: 8px; }
+
+/* files */
+.files { display: grid; grid-template-columns: minmax(220px, 330px) minmax(0, 1fr); gap: 12px;
+  margin-top: 8px; }
+.files .list { max-height: 560px; overflow: auto; padding: 6px 8px; }
+.files details { margin: 2px 0; }
+.files summary { cursor: pointer; padding: 3px 2px; color: var(--ink-2); font-size: 12.5px;
+  overflow-wrap: anywhere; }
+.files summary span { color: var(--muted); }
+.files ul { margin: 0 0 4px; padding: 0 0 0 12px; list-style: none; }
+.files li button { display: flex; justify-content: space-between; gap: 8px; width: 100%;
+  padding: 2px 6px; text-align: left; background: transparent; border: 0; border-radius: 4px;
+  cursor: pointer; font-size: 12.5px; }
+.files li button:hover { background: var(--hover); }
+.files li button[aria-current="true"] { background: var(--code); font-weight: 600; }
+.files li button span { overflow-wrap: anywhere; min-width: 0; }
+.files li button small { color: var(--muted); white-space: nowrap; }
+.viewer { min-width: 0; display: flex; flex-direction: column; }
+.viewer .head { padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.viewer pre { margin: 8px 0 0; max-height: 520px; overflow: auto; font-size: 12px; line-height: 1.5;
+  tab-size: 4; white-space: pre; }
+@media (max-width: 720px) {
+  .files { grid-template-columns: 1fr; }
+  .files .list { max-height: 300px; }
+  .tile .value { font-size: 20px; }
+  .top h1 { font-size: 19px; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#ledger">Skip to the ledger</a>
+<div class="wrap">
+<header class="top">
+  <div>
+    <h1 id="repo">kernel-agent</h1>
+    <p class="meta" id="meta"></p>
+    <p class="root mono" id="root"></p>
+  </div>
+  <div class="live" id="live" data-state="connecting" role="status"><i></i><span id="live-text">connecting</span></div>
+</header>
+<div class="status">
+  <ol class="steps" id="steps" aria-label="pipeline phases"></ol>
+  <div class="agents" id="agents"></div>
+</div>
+<div class="tiles" id="tiles"></div>
+
+<main>
+<section aria-labelledby="h-e2e">
+  <div class="card">
+    <div class="head"><h2 id="h-e2e">End-to-end latency</h2><span class="note" id="e2e-note"></span></div>
+    <p class="caption">Projected from the best kernels (baseline − Σ est. saved ms) and measured
+      end-to-end runs (transforms, integration) over wall-clock time. Lower is better.</p>
+    <div class="chart" id="chart-e2e"></div>
+    <div class="legend" id="legend-e2e"></div>
+  </div>
+</section>
+
+<section aria-labelledby="h-targets">
+  <div class="head"><h2 id="h-targets">Targets</h2><span class="note">module speedup per evaluation;
+    hover, or focus a chart and use the arrow keys</span></div>
+  <div class="legend" id="legend-targets"></div>
+  <div class="multiples" id="multiples"></div>
+</section>
+
+<div class="two">
+  <section aria-labelledby="h-cost" class="card">
+    <div class="head"><h2 id="h-cost">Agent cost</h2><span class="note" id="cost-note"></span></div>
+    <p class="caption">Cumulative USD of finished agent sessions (costs.json).</p>
+    <div class="chart" id="chart-cost"></div>
+  </section>
+  <section aria-labelledby="h-int" class="card">
+    <div class="head"><h2 id="h-int">Integration</h2><span class="note" id="int-note"></span></div>
+    <p class="caption">Greedy integration: best single item first, then each item on top.</p>
+    <div class="chart" id="chart-int"></div>
+    <div class="legend" id="legend-int"></div>
+  </section>
+</div>
+
+<div class="two">
+  <section aria-labelledby="h-events" class="card">
+    <div class="head"><h2 id="h-events">Latest events</h2><span class="note">events.jsonl</span></div>
+    <ol class="feed" id="events"></ol>
+  </section>
+  <section aria-labelledby="h-activity" class="card">
+    <div class="head"><h2 id="h-activity">Agent activity</h2><span class="note">logs/agent-*.jsonl</span></div>
+    <ol class="feed" id="activity"></ol>
+  </section>
+</div>
+
+<section id="ledger" aria-labelledby="h-ledger">
+  <div class="head"><h2 id="h-ledger">Ledger</h2><span class="note">results.tsv, newest first</span></div>
+  <div class="filters">
+    <label>Target <select id="f-target"></select></label>
+    <label>Status <select id="f-status"></select></label>
+    <label>Search <input id="f-query" type="search" placeholder="hypothesis, snapshot, backend"></label>
+    <span class="count" id="f-count" aria-live="polite"></span>
+  </div>
+  <div class="scroll">
+    <table>
+      <thead><tr>
+        <th class="num">#</th><th>time</th><th>target</th><th>backend</th><th>status</th>
+        <th class="num">speedup</th><th class="num">new</th><th class="num">saved</th>
+        <th>hypothesis</th><th>file</th>
+      </tr></thead>
+      <tbody id="ledger-body"></tbody>
+    </table>
+  </div>
+  <div class="more" id="ledger-more"></div>
+</section>
+
+<section id="files" aria-labelledby="h-files">
+  <div class="head"><h2 id="h-files">Files</h2><span class="note">read-only, text files of the run directory</span></div>
+  <div class="files">
+    <div class="card list">
+      <div class="filters"><label>Filter <input id="file-filter" type="search" placeholder="candidates, NOTES.md, program.md"></label></div>
+      <div id="file-list"><div class="empty">loading…</div></div>
+    </div>
+    <div class="card viewer">
+      <div class="head"><h3 id="file-name">No file selected</h3><span class="note" id="file-info"></span></div>
+      <pre id="file-body" tabindex="0"></pre>
+    </div>
+  </div>
+</section>
+</main>
+</div>
+<div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+<div class="sr-only" id="announce" aria-live="polite"></div>
+<script id="initial-state" type="application/json">__STATE__</script>
+<script nonce="__NONCE__">
+"use strict";
+(() => {
+  // Everything that comes from the run (hypotheses, agent text, file contents) is
+  // inserted as text nodes or attributes, never parsed as HTML.
+  const NS = "http://www.w3.org/2000/svg";
+  const PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"];
+  const FAILURES = ["incorrect", "build_error", "runtime_error", "crash", "timeout"];
+  const MAX_EVENTS = 600, MAX_LOGS = 400;
+  const S = { summary: null, rows: [], events: [], logs: [] };
+  const ui = { target: "", status: "", query: "", limit: 100, files: null, file: null, filter: "",
+               conn: "connecting", filesStale: false };
+  let clockOffset = 0;
+  const $ = (id) => document.getElementById(id);
+
+  const theme = new URLSearchParams(location.search).get("theme");
+  if (theme === "dark" || theme === "light") document.documentElement.dataset.theme = theme;
+
+  // ------------------------------------------------------------ DOM helpers
+  function put(el, attrs, kids) {
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v == null || v === false) continue;
+      if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v === true ? "" : String(v));
+    }
+    for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid);
+    return el;
+  }
+  const h = (tag, attrs, ...kids) => put(document.createElement(tag), attrs, kids);
+  const svg = (tag, attrs, ...kids) => put(document.createElementNS(NS, tag), attrs, kids);
+
+  // ------------------------------------------------------------ formatting
+  const num = (v, nd = 1) =>
+    v.toLocaleString("en-US", { minimumFractionDigits: nd, maximumFractionDigits: nd });
+  const fmt = {
+    ms: (v, nd = 1) => (v == null ? "—" : `${num(v, nd)} ms`),
+    x: (v) => (v == null ? "—" : `${v.toFixed(2)}×`),
+    usd: (v) => (v == null ? "—" : `$${num(v, 2)}`),
+    dur(s) {
+      if (s == null) return "—";
+      if (s < 60) return `${Math.max(0, Math.round(s))} s`;
+      const m = Math.floor(s / 60);
+      return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min`;
+    },
+    size: (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB`
+      : `${(b / 1048576).toFixed(1)} MB`),
+    clock: (t) => (t ? String(t).slice(-8) : ""),
+  };
+  const kindOf = (status) => (status === "keep" ? "keep" : status === "discard" ? "discard" : "fail");
+  const nowTs = () => Date.now() / 1000 + clockOffset;
+  const sum = (xs) => xs.reduce((a, b) => a + b, 0);
+  const targetColor = (i) => (i == null ? "var(--other)" : `var(--t${i % 6})`);
+
+  const measureCtx = document.createElement("canvas").getContext("2d");
+  function textWidth(text, size = 11) {
+    measureCtx.font = `${size}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+    return measureCtx.measureText(text).width;
+  }
+
+  // ------------------------------------------------------------ chart helpers
+  function linear(d0, d1, r0, r1) {
+    const k = (r1 - r0) / (d1 - d0 || 1);
+    return (v) => r0 + (v - d0) * k;
+  }
+  function ticks(lo, hi, count) {
+    const raw = (hi - lo) / Math.max(count, 1);
+    if (!(raw > 0)) return [lo];
+    const mag = 10 ** Math.floor(Math.log10(raw));
+    const n = raw / mag;
+    const step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+    const out = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(+v.toFixed(10));
+    return out;
+  }
+  function empty(host, text) {
+    host.replaceChildren(h("div", { class: "empty" }, text));
+  }
+  function frame(host, key, label, { height, left = 52, right = 16, top = 14, bottom = 30 }) {
+    const width = Math.max(Math.floor(host.clientWidth), 260);
+    const root = svg("svg", {
+      class: "plot", width, height, viewBox: `0 0 ${width} ${height}`, tabindex: 0,
+      role: "group", "aria-label": label, "data-key": key,
+    });
+    host.replaceChildren(root);
+    return { root, width, height, x0: left, x1: width - right, y0: height - bottom, y1: top };
+  }
+  function axes(f, xs, ys, xt, yt, xfmt, yfmt, xlabel) {
+    const g = svg("g", { "aria-hidden": "true" });
+    for (const v of yt) {
+      const y = ys(v);
+      g.append(svg("line", { class: "grid", x1: f.x0, x2: f.x1, y1: y, y2: y }),
+        svg("text", { class: "tick", x: f.x0 - 6, y: y + 3.5, "text-anchor": "end" }, yfmt(v)));
+    }
+    g.append(svg("line", { class: "axis", x1: f.x0, x2: f.x1, y1: f.y0, y2: f.y0 }));
+    for (const v of xt) {
+      g.append(svg("text", { class: "tick", x: xs(v), y: f.y0 + 15, "text-anchor": "middle" }, xfmt(v)));
+    }
+    if (xlabel) {
+      g.append(svg("text", { class: "tick", x: f.x1, y: f.height - 2, "text-anchor": "end" }, xlabel));
+    }
+    f.root.append(g);
+    return g;
+  }
+  const dot = (x, y, r, cls) => svg("circle", { cx: x, cy: y, r, class: cls });
+  const diamond = (x, y, r, cls) =>
+    svg("path", { d: `M${x},${y - r}L${x + r},${y}L${x},${y + r}L${x - r},${y}Z`, class: cls });
+  const cross = (x, y, r, cls = "fail") =>
+    svg("path", { d: `M${x - r},${y - r}L${x + r},${y + r}M${x - r},${y + r}L${x + r},${y - r}`, class: cls });
+  function label(x, y, text, anchor = "start", cls = "") {
+    return svg("text", { x, y, "text-anchor": anchor, class: `halo ${cls}` }, text);
+  }
+
+  function key(kind, text) {
+    const icon = svg("svg", { width: 18, height: 12, viewBox: "0 0 18 12", "aria-hidden": "true" });
+    const marks = {
+      projected: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "projected" }),
+      best: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "best-line" }),
+      ref: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "ref" }),
+      compile: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "compile" }),
+      keep: () => dot(9, 6, 5, "keep"),
+      discard: () => dot(9, 6, 4.5, "discard"),
+      dkeep: () => diamond(9, 6, 5.5, "keep"),
+      ddiscard: () => diamond(9, 6, 5, "discard"),
+      fail: () => cross(9, 6, 3.5),
+      total: () => svg("rect", { x: 2, y: 2, width: 14, height: 8, rx: 2, class: "total" }),
+      gain: () => svg("rect", { x: 2, y: 2, width: 14, height: 8, rx: 2, class: "gain" }),
+      nogain: () => svg("rect", { x: 2.5, y: 2.5, width: 13, height: 7, fill: "none", class: "nogain" }),
+    };
+    icon.append(marks[kind]());
+    return h("span", { class: "key" }, icon, text);
+  }
+
+  // One tooltip for every chart. Pointer: nearest mark within reach. Keyboard: focus the
+  // chart, then arrow keys / Home / End walk the marks, Enter opens the snapshot, Esc hides.
+  const tip = $("tooltip"), announce = $("announce");
+  function tipContent(value, what, lines, hypothesis) {
+    return [
+      h("div", { class: "value" }, value),
+      h("div", { class: "label" }, what),
+      ...lines.filter(Boolean).map((l) => h("div", { class: "line" }, l)),
+      hypothesis ? h("div", { class: "hyp" }, hypothesis) : null,
+    ].filter(Boolean);
+  }
+  addEventListener("scroll", () => { tip.hidden = true; }, { passive: true });
+  function placeTip(x, y) {
+    const pad = 14, w = tip.offsetWidth, ht = tip.offsetHeight;
+    let left = x + pad, top = y + pad;
+    if (left + w > innerWidth - 8) left = Math.max(8, x - w - pad);
+    if (top + ht > innerHeight - 8) top = Math.max(8, y - ht - pad);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+  }
+  function hover(f, points, { axis = "xy", reach = 26 } = {}) {
+    const ring = svg("circle", { class: "focus-ring", r: 8, visibility: "hidden" });
+    const band = svg("rect", { class: "row-hover", x: 0, width: f.width, visibility: "hidden" });
+    f.root.prepend(band);
+    f.root.append(ring);
+    const order = points.map((_, i) => i).sort((a, b) => points[a].x - points[b].x || points[a].y - points[b].y);
+    let current = -1;
+    function show(i, cx, cy, fromKeyboard) {
+      current = i;
+      const p = points[i];
+      if (p.row) {
+        band.setAttribute("y", p.row[0]);
+        band.setAttribute("height", p.row[1] - p.row[0]);
+        band.setAttribute("visibility", "visible");
+      } else {
+        ring.setAttribute("cx", p.x);
+        ring.setAttribute("cy", p.y);
+        ring.setAttribute("r", p.r || 8);
+        ring.setAttribute("visibility", "visible");
+      }
+      tip.replaceChildren(...p.tip());
+      tip.hidden = false;
+      if (cx == null) {
+        const box = f.root.getBoundingClientRect();
+        cx = box.left + p.x;
+        cy = box.top + p.y;
+      }
+      placeTip(cx, cy);
+      if (fromKeyboard) announce.textContent = tip.textContent;
+    }
+    function hide() {
+      current = -1;
+      ring.setAttribute("visibility", "hidden");
+      band.setAttribute("visibility", "hidden");
+      tip.hidden = true;
+    }
+    function nearest(ev) {
+      const box = f.root.getBoundingClientRect();
+      const mx = ev.clientX - box.left, my = ev.clientY - box.top;
+      let best = -1, bestD = Infinity;
+      points.forEach((p, i) => {
+        const d = axis === "y" ? (p.row && my >= p.row[0] && my < p.row[1] ? 0 : Infinity)
+          : Math.hypot(p.x - mx, p.y - my);
+        if (d < bestD) { bestD = d; best = i; }
+      });
+      return bestD <= reach ? best : -1;
+    }
+    const move = (ev) => {
+      const i = nearest(ev);
+      if (i < 0) hide(); else show(i, ev.clientX, ev.clientY, false);
+    };
+    f.root.addEventListener("pointermove", move);
+    f.root.addEventListener("pointerdown", move);
+    f.root.addEventListener("pointerleave", hide);
+    f.root.addEventListener("blur", hide);
+    f.root.addEventListener("click", (ev) => {
+      const i = nearest(ev);
+      if (ev.pointerType === "mouse" && i >= 0 && points[i].open) points[i].open();
+    });
+    f.root.addEventListener("keydown", (ev) => {
+      if (!points.length) return;
+      let pos = order.indexOf(current);
+      switch (ev.key) {
+        case "ArrowRight": case "ArrowDown": pos = pos < 0 ? 0 : Math.min(pos + 1, order.length - 1); break;
+        case "ArrowLeft": case "ArrowUp": pos = pos < 0 ? order.length - 1 : Math.max(pos - 1, 0); break;
+        case "Home": pos = 0; break;
+        case "End": pos = order.length - 1; break;
+        case "Escape": hide(); return;
+        case "Enter":
+          if (current >= 0 && points[current].open) { ev.preventDefault(); points[current].open(); }
+          return;
+        default: return;
+      }
+      ev.preventDefault();
+      show(order[pos], null, null, true);
+    });
+  }
+
+  // ------------------------------------------------------------ time axis shared by charts
+  function minutesOf(ts) {
+    const start = S.summary.run.start_ts;
+    return ts == null || start == null ? null : Math.max(ts - start, 0) / 60;
+  }
+  function timeExtent() {
+    const sm = S.summary;
+    let end = 1;
+    const bump = (m) => { if (m != null && m > end) end = m; };
+    S.rows.forEach((r) => bump(minutesOf(r.ts)));
+    sm.phases.forEach((p) => bump(minutesOf(p.end ?? p.start)));
+    sm.costs.burn.forEach((b) => bump(minutesOf(b.ts)));
+    if (sm.run.running) bump(minutesOf(nowTs()));
+    return end;
+  }
+  function timeAxis(tMax, count) {
+    const hours = tMax > 180, unit = hours ? 60 : 1;
+    return {
+      ticks: ticks(0, tMax / unit, count).map((v) => v * unit).filter((v) => v <= tMax),
+      fmt: (v) => `${+(v / unit).toFixed(1)}`,
+      label: `${hours ? "hours" : "minutes"} since the run started`,
+    };
+  }
+
+  // ------------------------------------------------------------ header
+  function renderHeader() {
+    const sm = S.summary, run = sm.run;
+    document.title = `${run.repo_id} · kernel-agent watch`;
+    $("repo").textContent = run.repo_id;
+    const meta = [
+      run.workload && run.modality && run.workload.startsWith(run.modality) ? null : run.modality,
+      run.gpu ? `${run.gpu}${run.arch ? ` (${run.arch})` : ""}` : null,
+      run.workload,
+      run.claude_model ? `agents: ${run.claude_model}${run.parallel > 1 ? ` × ${run.parallel} parallel` : ""}` : null,
+    ].filter(Boolean);
+    $("meta").replaceChildren(...meta.map((m) => h("span", {}, m)));
+    $("root").textContent = run.path || run.root;
+    $("root").title = run.root;
+
+    const spans = new Map();
+    sm.phases.forEach((p) => spans.set(p.phase, p));
+    const names = [...PHASES, ...sm.phases.map((p) => p.phase).filter((p) => !PHASES.includes(p))];
+    $("steps").replaceChildren(...names.map((name) => {
+      const span = spans.get(name);
+      let state = "pending";
+      if (run.phase_failed === name) state = "failed";
+      else if (span && span.end == null && run.running) state = "running";
+      else if (span && span.end != null) state = "done";
+      const icon = svg("svg", { width: 10, height: 10, viewBox: "0 0 10 10", "aria-hidden": "true" });
+      if (state === "done") icon.append(svg("path", { d: "M1.5,5.2L4,7.6L8.6,2.6", class: "best-line" }));
+      else if (state === "failed") icon.append(cross(5, 5, 3));
+      else if (state === "running") icon.append(dot(5, 5, 3.5, "projected-dot"));
+      else icon.append(svg("circle", { cx: 5, cy: 5, r: 3, class: "ref" }));
+      const dur = span && span.end != null ? ` · ${fmt.dur(span.end - span.start)}` : "";
+      return h("li", { class: state, title: `${name}: ${state}${dur}` }, icon, name,
+        h("span", { class: "sr-only" }, ` (${state})`));
+    }));
+
+    const agents = run.active_agents || [];
+    $("agents").replaceChildren(...(agents.length
+      ? [h("span", {}, "active:"), ...agents.map((a) => h("span", { class: "chip" }, a.agent,
+          h("span", { "data-since": a.since ?? "" }, a.since ? fmt.dur(nowTs() - a.since) : "")))]
+      : []));
+    renderTiles();
+    renderLive();
+  }
+
+  function elapsedNow() {
+    const run = S.summary.run;
+    if (run.running && run.start_ts) return nowTs() - run.start_ts;
+    return run.elapsed_s;
+  }
+  function renderTiles() {
+    const sm = S.summary, run = sm.run, base = sm.baseline.eager_ms, comp = sm.baseline.compiled_ms;
+    const m = sm.measured, proj = sm.projected_ms, c = sm.counts, total = sm.costs.total_usd;
+    const nAgents = Object.keys(sm.costs.agents).length;
+    const keptKernel = sm.targets.some((t) => t.keeps > 0);
+    let state = "not running";
+    if (run.running) state = run.idle_s > 900 ? `running · no new data for ${fmt.dur(run.idle_s)}` : `running · ${run.phase}`;
+    else if (run.phase_failed) state = `stopped: ${run.phase_failed} failed`;
+    else if (run.phase === "report") state = "finished";
+    else if (run.phase) state = `stopped after ${run.phase}`;
+    const tiles = [
+      ["Baseline (eager)", fmt.ms(base),
+        comp ? `torch.compile ${fmt.ms(comp)} (${fmt.x(base / comp)})` : run.workload || "not measured yet"],
+      ["Best end-to-end", m ? fmt.ms(m.ms) : "—",
+        m ? `${fmt.x(m.speedup)} vs eager · ${m.label}` : "no passing end-to-end run yet"],
+      ["Projected from kernels", keptKernel ? fmt.ms(proj) : "—",
+        keptKernel && proj && base ? `${fmt.x(base / proj)} if the best kernels add up` : "no kept kernel yet"],
+      ["Evaluations", String(c.evaluations), `${c.keeps} kept · ${c.failures} failed · ${c.e2e} end-to-end`],
+      ["Elapsed", fmt.dur(elapsedNow()), state, "elapsed"],
+      ["Agent cost", fmt.usd(total),
+        run.max_usd ? `of ${fmt.usd(run.max_usd)} budget · ${nAgents} sessions` : `${nAgents} agent sessions`],
+    ];
+    $("tiles").replaceChildren(...tiles.map(([labelText, value, sub, id]) => h("div", { class: "tile" },
+      h("div", { class: "label" }, labelText),
+      h("div", { class: "value", id: id ? `tile-${id}` : null, title: value }, value),
+      h("div", { class: "sub" }, sub))));
+  }
+  function renderLive() {
+    const run = S.summary.run, el = $("live");
+    let state = "idle", text = run.phase === "report" ? "run finished" : "run not running";
+    if (run.running) { state = "live"; text = "live"; }
+    else if (run.phase_failed) { state = "failed"; text = "run stopped (failed)"; }
+    if (ui.conn === "retry") { state = "retry"; text = "reconnecting…"; }
+    else if (ui.conn === "connecting" && run.running) { state = "connecting"; text = "connecting…"; }
+    el.dataset.state = state;
+    $("live-text").textContent = text;
+  }
+  function tick() {
+    if (!S.summary) return;
+    const el = $("tile-elapsed");
+    if (el && S.summary.run.running) el.textContent = fmt.dur(elapsedNow());
+    document.querySelectorAll("[data-since]").forEach((node) => {
+      const since = parseFloat(node.dataset.since);
+      if (since) node.textContent = fmt.dur(nowTs() - since);
+    });
+  }
+
+  // ------------------------------------------------------------ end-to-end chart
+  function drawE2E() {
+    const host = $("chart-e2e"), sm = S.summary, base = sm.baseline.eager_ms;
+    $("legend-e2e").replaceChildren();
+    if (base == null || sm.run.start_ts == null) {
+      return empty(host, "Starts once the baseline is measured (analyze phase).");
+    }
+    const tEnd = timeExtent(), tMax = tEnd * 1.03;
+    const proj = [{ t: 0, ms: base, row: null }], measured = [], failed = [];
+    const saved = new Map();
+    for (const r of S.rows) {
+      const t = minutesOf(r.ts);
+      if (t == null) continue;
+      if (r.target !== "e2e") {
+        if (r.status === "keep" && r.est_saved_ms != null) {
+          saved.set(r.target, r.est_saved_ms);
+          proj.push({ t, ms: Math.max(base - sum([...saved.values()]), 0), row: r });
+        }
+      } else if ((r.status === "keep" || r.status === "discard") && r.new_ms) measured.push({ t, row: r });
+      else if (FAILURES.includes(r.status)) failed.push({ t, row: r });
+    }
+    const comp = sm.baseline.compiled_ms;
+    const values = [base, ...proj.map((p) => p.ms), ...measured.map((m) => m.row.new_ms)];
+    if (comp) values.push(comp);
+    let lo = Math.min(...values), hi = Math.max(...values);
+    const span = Math.max(hi - lo, 0.05 * hi);
+    lo = Math.max(lo - 0.15 * span, 0);
+    hi += 0.1 * span;
+    const narrow = host.clientWidth < 560;
+    const f = frame(host, "e2e", "End-to-end latency over wall-clock time; arrow keys walk the points",
+      { height: narrow ? 270 : 330, left: 54, top: 24, bottom: 34, right: 18 });
+    const xs = linear(0, tMax, f.x0, f.x1), ys = linear(lo, hi, f.y0, f.y1);
+
+    // phase bands (every other one shaded), labelled when the label fits
+    let shaded = false;
+    const bands = svg("g", { "aria-hidden": "true" });
+    for (const p of sm.phases) {
+      const a = xs(minutesOf(p.start)), b = xs(p.end == null ? tEnd : minutesOf(p.end));
+      if (b - a < textWidth(p.phase) + 6) continue;
+      if (shaded) bands.append(svg("rect", { class: "band", x: a, y: f.y1, width: b - a, height: f.y0 - f.y1 }));
+      shaded = !shaded;
+      bands.append(label((a + b) / 2, f.y1 - 7, p.phase, "middle", "phase-label"));
+    }
+    f.root.append(bands);
+    const ta = timeAxis(tMax, narrow ? 4 : 8);
+    axes(f, xs, ys, ta.ticks, ticks(lo, hi, 5), ta.fmt, (v) => num(v, 0), ta.label);
+
+    const g = svg("g", {});
+    g.append(svg("line", { class: "ref", x1: f.x0, x2: f.x1, y1: ys(base), y2: ys(base) }),
+      label(f.x0 + 4, ys(base) - 5, `baseline ${fmt.ms(base)}`));
+    if (comp) {
+      g.append(svg("line", { class: "compile", x1: f.x0, x2: f.x1, y1: ys(comp), y2: ys(comp) }),
+        label(f.x0 + 4, ys(comp) - 5, `torch.compile ${fmt.ms(comp)}`));
+    }
+    if (sm.run.running) {
+      const x = xs(minutesOf(nowTs()));
+      const left = x - f.x0 > 30;
+      g.append(svg("line", { class: "now", x1: x, x2: x, y1: f.y1, y2: f.y0 }),
+        label(left ? x - 3 : x + 3, f.y0 - 5, "now", left ? "end" : "start", "tick"));
+    }
+    const lineEnd = sm.run.running ? minutesOf(nowTs()) : tEnd;
+    let d = `M${xs(0)},${ys(base)}`;
+    for (const p of proj.slice(1)) d += `H${xs(p.t)}V${ys(p.ms)}`;
+    const last = proj[proj.length - 1];
+    d += `H${xs(Math.max(lineEnd, last.t))}`;
+    g.append(svg("path", { class: "projected", d }));
+    proj.slice(1).forEach((p) => g.append(dot(xs(p.t), ys(p.ms), 3, "projected-dot")));
+    if (proj.length > 1) {
+      g.append(label(xs(Math.max(lineEnd, last.t)), ys(last.ms) - 6, `projected ${fmt.ms(last.ms)}`, "end", "strong"));
+    }
+    measured.filter((m) => m.row.status === "discard").forEach((m) => g.append(diamond(xs(m.t), ys(m.row.new_ms), 5.5, "discard")));
+    measured.filter((m) => m.row.status === "keep").forEach((m) => g.append(diamond(xs(m.t), ys(m.row.new_ms), 6.5, "keep")));
+    failed.forEach((m) => g.append(cross(xs(m.t), f.y1 + 6, 3.5)));
+    f.root.append(g);
+
+    // label the integrated result (else the running best measurement)
+    const best = sm.measured && [...measured].reverse().find((m) => m.row.new_ms === sm.measured.ms);
+    if (best) {
+      const text = `${fmt.ms(best.row.new_ms)} (${fmt.x(base / best.row.new_ms)})`;
+      const x = xs(best.t), y = ys(best.row.new_ms);
+      const right = x + 10 + textWidth(text, 12) < f.x1;
+      g.append(label(right ? x + 10 : x - 10, y + 16, text, right ? "start" : "end", "strong"));
+    }
+
+    const points = [];
+    for (const p of proj.slice(1)) {
+      const r = p.row;
+      points.push({ x: xs(p.t), y: ys(p.ms), r: 6, open: openFor(r), tip: () => tipContent(
+        `projected ${fmt.ms(p.ms)}`, `${fmt.x(base / p.ms)} vs eager · after #${r.exp} kept`,
+        [`${r.target} ${fmt.x(r.speedup)} · ${r.backend} · ${fmt.ms(r.est_saved_ms)} saved`, r.time], r.hypothesis) });
+    }
+    for (const m of [...measured, ...failed]) {
+      const r = m.row, ok = r.status === "keep" || r.status === "discard";
+      points.push({ x: xs(m.t), y: ok ? ys(r.new_ms) : f.y1 + 6, r: 9, open: openFor(r), tip: () => tipContent(
+        ok ? `${fmt.ms(r.new_ms)} · ${fmt.x(r.speedup)}` : r.status.replace("_", " "),
+        `#${r.exp} · ${r.status.replace("_", " ")} · ${r.backend}`,
+        [r.snapshot, r.time], r.hypothesis) });
+    }
+    hover(f, points);
+    $("e2e-note").textContent = `${S.rows.length - sm.counts.e2e} kernel evaluations · ${sm.counts.e2e} end-to-end runs`;
+    const keys = [key("projected", "projected (kernels)"), key("dkeep", "measured, new best"),
+      key("ddiscard", "measured, no gain"), key("fail", "failed"), key("ref", "baseline")];
+    if (comp) keys.push(key("compile", "torch.compile"));
+    $("legend-e2e").replaceChildren(...keys);
+  }
+
+  // ------------------------------------------------------------ per-target small multiples
+  function drawTargets() {
+    const host = $("multiples"), sm = S.summary;
+    $("legend-targets").replaceChildren(key("keep", "kept"), key("discard", "discarded"),
+      key("fail", "failed (on the floor)"), key("best", "running best"), key("ref", "reference 1.0×"));
+    if (!sm.targets.length) return empty(host, "No kernel targets yet: the planner picks them after the profile.");
+    const charts = [];
+    host.replaceChildren(...sm.targets.map((t) => {
+      const chart = h("div", { class: "chart" });
+      charts.push([t, chart]);
+      const share = t.share != null ? `${(t.share * 100).toFixed(0)} % of the profile` : null;
+      return h("article", { class: "card target" },
+        h("div", { class: "head" },
+          h("h3", { class: "name" }, h("span", { class: "swatch", "data-color": t.color ?? "" }),
+            h("code", {}, t.id), h("small", { title: t.module_class || "" }, t.module_class || "")),
+          h("div", { class: "best" }, h("span", {}, "best"), fmt.x(t.best_speedup))),
+        h("p", { class: "stats" }, ...[
+          `${t.evals} eval${t.evals === 1 ? "" : "s"}`, `${t.keeps} kept`, `${t.failures} failed`,
+          t.best_backend, t.est_saved_ms != null ? `−${fmt.ms(t.est_saved_ms)} per run` : null, share,
+        ].filter(Boolean).flatMap((text, i) => [i ? " · " : null, h("span", { class: "nowrap" }, text)])),
+        chart,
+        t.last_hypothesis ? h("p", { class: "last", title: t.last_hypothesis }, `latest: ${t.last_hypothesis}`) : null);
+    }));
+    host.querySelectorAll(".swatch").forEach((el) => {
+      const i = el.dataset.color;
+      el.style.background = targetColor(i === "" ? null : Number(i));
+    });
+    for (const [t, chart] of charts) drawTarget(t, chart);
+  }
+
+  function drawTarget(t, host) {
+    const rows = S.rows.filter((r) => r.target === t.id);
+    if (!rows.length) return empty(host, "waiting for the first evaluation");
+    const ok = rows.filter((r) => r.status === "keep" || r.status === "discard");
+    const speeds = ok.map((r) => r.speedup).filter((v) => v != null);
+    let lo = Math.min(0.9, ...speeds), hi = Math.max(1.2, ...speeds);
+    const pad = (hi - lo) * 0.08;
+    lo = Math.max(0, lo - pad * 2.2);
+    hi += pad;
+    const n = Math.max(rows.length, 6);
+    const f = frame(host, `t:${t.id}`, `${t.id}: speedup per evaluation; arrow keys walk the evaluations`,
+      { height: 168, left: 42, top: 8, bottom: 24, right: 10 });
+    const xs = linear(0.5, n + 0.5, f.x0 + 2, f.x1), ys = linear(lo, hi, f.y0, f.y1);
+    axes(f, xs, ys, ticks(1, n, 5).filter((v) => Number.isInteger(v) && v >= 1), ticks(lo, hi, 3),
+      (v) => `${v}`, (v) => `${+v.toFixed(2)}×`, null);
+    const g = svg("g", {});
+    g.append(svg("line", { class: "ref", x1: f.x0, x2: f.x1, y1: ys(1), y2: ys(1) }));
+    let best = 1, d = `M${xs(0.5)},${ys(1)}`;
+    rows.forEach((r, i) => {
+      if (r.status === "keep" && r.speedup != null) {
+        d += `H${xs(i + 1)}V${ys(r.speedup)}`;
+        best = r.speedup;
+      }
+    });
+    d += `H${xs(rows.length + 0.5)}`;
+    g.append(svg("path", { class: "best-line", d }));
+    const floor = f.y0 - 7;
+    const points = rows.map((r, i) => {
+      const x = xs(i + 1), good = r.status === "keep" || r.status === "discard";
+      const y = good && r.speedup != null ? ys(r.speedup) : floor;
+      return { x, y, r: good ? 8 : 7, row: null, open: openFor(r), data: r, tip: () => tipContent(
+        good ? fmt.x(r.speedup) : r.status.replace("_", " "),
+        `#${r.exp} · ${r.status.replace("_", " ")} · ${r.backend}`,
+        [good && r.new_ms != null ? `${fmt.ms(r.new_ms, 4)} vs ${fmt.ms(r.ref_ms, 4)} per run` : null,
+          `${r.snapshot}${r.parent ? ` (parent ${r.parent})` : ""}`, r.time], r.hypothesis) };
+    });
+    points.filter((p) => p.data.status === "discard").forEach((p) => g.append(dot(p.x, p.y, 3.8, "discard")));
+    points.filter((p) => kindOf(p.data.status) === "fail").forEach((p) => g.append(cross(p.x, p.y, 3.2)));
+    points.filter((p) => p.data.status === "keep").forEach((p) => g.append(dot(p.x, p.y, 4.6, "keep")));
+    if (best > 1) {
+      const x = xs(rows.length + 0.5);
+      g.append(label(Math.min(x, f.x1), ys(best) - 6, fmt.x(best), "end", "strong"));
+    }
+    f.root.append(g);
+    hover(f, points);
+  }
+
+  // ------------------------------------------------------------ cost burn
+  function drawCost() {
+    const host = $("chart-cost"), sm = S.summary, burn = sm.costs.burn;
+    const total = sm.costs.total_usd || 0, budget = sm.run.max_usd;
+    $("cost-note").textContent = budget ? `budget ${fmt.usd(budget)}` : "";
+    if (!burn.length && !total) return empty(host, "Appears when the first agent session finishes.");
+    if (sm.run.start_ts == null) return empty(host, `${fmt.usd(total)} spent`);
+    const tEnd = timeExtent(), tMax = tEnd * 1.03;
+    const lastUsd = burn.length ? burn[burn.length - 1].usd : 0;
+    const top = Math.max(total, lastUsd, budget || 0) * 1.15 || 1;
+    const f = frame(host, "cost", "Cumulative agent cost over wall-clock time; arrow keys walk the sessions",
+      { height: 230, left: 50, top: 12, bottom: 34, right: 16 });
+    const xs = linear(0, tMax, f.x0, f.x1), ys = linear(0, top, f.y0, f.y1);
+    const ta = timeAxis(tMax, 5);
+    axes(f, xs, ys, ta.ticks, ticks(0, top, 4), ta.fmt, (v) => `$${num(v, v < 10 && v % 1 ? 1 : 0)}`,
+      ta.label);
+    const g = svg("g", {});
+    if (budget) {
+      g.append(svg("line", { class: "budget", x1: f.x0, x2: f.x1, y1: ys(budget), y2: ys(budget) }),
+        label(f.x0 + 4, ys(budget) - 5, `budget ${fmt.usd(budget)}`));
+    }
+    const end = sm.run.running ? minutesOf(nowTs()) : tEnd;
+    let d = `M${xs(0)},${ys(0)}`;
+    for (const b of burn) d += `H${xs(minutesOf(b.ts))}V${ys(b.usd)}`;
+    if (total > lastUsd + 0.005) d += `V${ys(total)}`;  // sessions without an event
+    d += `H${xs(Math.max(end, burn.length ? minutesOf(burn[burn.length - 1].ts) : 0))}`;
+    g.append(svg("path", { class: "cost-line", d }));
+    const points = burn.map((b) => {
+      const x = xs(minutesOf(b.ts)), y = ys(b.usd);
+      g.append(dot(x, y, 4, "cost-dot"));
+      return { x, y, r: 7, tip: () => tipContent(fmt.usd(b.usd), `total after ${b.agent} finished`,
+        [`${b.agent}: +${fmt.usd(b.add)}`, `${num(minutesOf(b.ts), 0)} min into the run`]) };
+    });
+    g.append(label(xs(Math.max(end, 0)), ys(Math.max(total, lastUsd)) - 7, fmt.usd(Math.max(total, lastUsd)), "end", "strong"));
+    f.root.append(g);
+    hover(f, points);
+  }
+
+  // ------------------------------------------------------------ integration waterfall (horizontal)
+  function drawIntegration() {
+    const host = $("chart-int"), integ = S.summary.integration;
+    $("legend-int").replaceChildren();
+    $("int-note").textContent = "";
+    if (!integ || integ.steps.length < 2) {
+      return empty(host, "Appears when the integrate phase measures combinations.");
+    }
+    const steps = integ.steps, base = steps[0].ms, final = steps[steps.length - 1].ms;
+    $("int-note").textContent = `${fmt.ms(base)} → ${fmt.ms(final)} (${fmt.x(base / final)})`;
+    const narrow = host.clientWidth < 520, rowH = 30;
+    const names = steps.map((s) => (s.kind === "total" ? s.label : `+ ${s.label}`));
+    const labelW = Math.min(Math.max(...names.map((n) => textWidth(n, 11.5))) + 16, narrow ? 120 : 170);
+    const f = frame(host, "integration", "Integration waterfall; arrow keys walk the steps",
+      { height: steps.length * rowH + 34, left: labelW, top: 6, bottom: 28, right: narrow ? 64 : 92 });
+    const xs = linear(0, base * 1.02, f.x0, f.x1);
+    axes(f, xs, () => 0, ticks(0, base, narrow ? 3 : 5), [], (v) => num(v, 0), null, "ms per run");
+    const defs = svg("defs", {}, svg("pattern", { id: "hatch", width: 5, height: 5, patternUnits: "userSpaceOnUse",
+      patternTransform: "rotate(45)" }, svg("line", { x1: 0, y1: 0, x2: 0, y2: 5, class: "hatch" })));
+    const g = svg("g", {});
+    f.root.append(defs, g);
+    let level = base;
+    const points = [];
+    steps.forEach((s, i) => {
+      const top = f.y1 + i * rowH, mid = top + rowH / 2, barH = 14;
+      const name = names[i];
+      const shown = textWidth(name, 11.5) > labelW - 12 ? `${name.slice(0, Math.max(4, Math.floor((labelW - 24) / 6.4)))}…` : name;
+      g.append(svg("text", { x: f.x0 - 8, y: mid + 4, "text-anchor": "end", class: s.kind === "total" ? "strong" : "" }, shown));
+      let note = "", noteX = 0, value = "";
+      if (s.kind === "total") {
+        g.append(svg("rect", { class: "total", x: f.x0, y: mid - barH / 2, width: Math.max(xs(s.ms) - f.x0, 1), height: barH, rx: 3 }));
+        note = fmt.ms(s.ms); noteX = xs(s.ms) + 6; value = fmt.ms(s.ms);
+      } else if (s.kind === "keep") {
+        g.append(svg("rect", { class: "gain", x: xs(s.ms), y: mid - barH / 2, width: Math.max(xs(s.from) - xs(s.ms), 2), height: barH, rx: 3 }));
+        note = `−${num(s.from - s.ms)} ms`; noteX = xs(s.from) + 6; value = `${fmt.ms(s.ms)} (−${num(s.from - s.ms)} ms)`;
+        level = s.ms;
+      } else if (s.kind === "nogain") {
+        const a = Math.min(s.from, s.ms), b = Math.max(s.from, s.ms);
+        g.append(svg("rect", { class: "nogain", fill: "url(#hatch)", x: xs(a), y: mid - barH / 2, width: Math.max(xs(b) - xs(a), 3), height: barH }));
+        const delta = s.ms - s.from;
+        note = `no gain`; noteX = xs(b) + 6; value = `${fmt.ms(s.ms)} (${delta >= 0 ? "+" : "−"}${num(Math.abs(delta))} ms)`;
+      } else {
+        g.append(cross(xs(level), mid, 4.5));
+        note = "failed"; noteX = xs(level) + 9; value = "failed";
+      }
+      g.append(svg("text", { x: noteX, y: mid + 4, class: s.kind === "keep" ? "strong" : "tick" }, note));
+      if (i < steps.length - 1) {
+        g.append(svg("line", { class: "connector", x1: xs(level), x2: xs(level), y1: mid + barH / 2, y2: top + rowH + (rowH - barH) / 2 }));
+      }
+      points.push({ x: f.x0, y: mid, row: [top, top + rowH], tip: () => tipContent(value,
+        s.kind === "total" ? s.label : `${s.label} (${s.source})`,
+        [{ keep: "accepted", nogain: "rejected: gain under 1 %", fail: "failed", total: "" }[s.kind],
+          s.kind !== "total" && s.from != null ? `from ${fmt.ms(s.from)}` : null], s.reason || "") });
+    });
+    hover(f, points, { axis: "y", reach: 0 });
+    $("legend-int").replaceChildren(key("total", "end-to-end total"), key("gain", "accepted (ms saved)"),
+      key("nogain", "rejected, no gain"), key("fail", "failed"));
+  }
+
+  // ------------------------------------------------------------ feeds
+  function eventText(e, byExp) {
+    const data = (k) => (e[k] == null ? "" : String(e[k]));
+    switch (e.event) {
+      case "phase_start": return [`phase ${data("phase")} started`];
+      case "phase_done": return [`phase ${data("phase")} done`];
+      case "phase_failed": return [`phase ${data("phase")} failed`, data("error")];
+      case "agent_start": return [`${data("agent")} started`];
+      case "agent_done": {
+        const bits = [e.usd != null ? fmt.usd(e.usd) : "", e.minutes != null ? `${e.minutes} min` : "", e.error ? "error" : ""];
+        return [`${data("agent")} finished`, bits.filter(Boolean).join(" · ")];
+      }
+      case "evaluation": {
+        const r = byExp.get(e.exp);
+        const extra = r && r.speedup != null && kindOf(r.status) !== "fail" ? ` · ${fmt.x(r.speedup)}` : "";
+        return [`${data("target")} #${data("exp")}: ${data("status").replace("_", " ")}${extra}`, r ? r.hypothesis : ""];
+      }
+      default: {
+        const rest = Object.entries(e).filter(([k]) => !["ts", "time", "event"].includes(k))
+          .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" ");
+        return [String(e.event || "event").replace("_", " "), rest];
+      }
+    }
+  }
+  function renderFeeds() {
+    const byExp = new Map(S.rows.map((r) => [r.exp, r]));
+    const events = S.events.slice(-150).reverse();
+    $("events").replaceChildren(...(events.length ? events.map((e) => {
+      const [main, detail] = eventText(e, byExp);
+      const status = e.event === "evaluation" ? h("span", { class: `pill ${kindOf(e.status)}` }, h("i", {})) : null;
+      return h("li", {}, h("time", {}, fmt.clock(e.time)),
+        h("div", { class: "what" }, status, status ? " " : null, main,
+          detail ? h("div", { class: "kind" }, detail) : null));
+    }) : [h("li", {}, h("span", {}), h("span", { class: "kind" }, "no events yet"))]));
+    const logs = S.logs.slice(-150).reverse();
+    $("activity").replaceChildren(...(logs.length ? logs.map((l) => h("li", {},
+      h("time", {}, l.ts ? new Date(l.ts * 1000).toTimeString().slice(0, 8) : ""),
+      h("div", { class: "what" }, h("span", { class: "agent" }, l.agent),
+        h("span", { class: l.kind === "tool" ? "tool" : l.kind === "result" ? "kind" : "" }, l.text))))
+      : [h("li", {}, h("span", {}), h("span", { class: "kind" }, "no agent logs yet"))]));
+  }
+
+  // ------------------------------------------------------------ ledger
+  function options(select, items, value) {
+    const sig = JSON.stringify(items);
+    if (select.dataset.sig !== sig) {
+      select.replaceChildren(...items.map(([v, text]) => h("option", { value: v }, text)));
+      select.dataset.sig = sig;
+    }
+    select.value = items.some(([v]) => v === value) ? value : "";
+  }
+  function renderLedger() {
+    const sm = S.summary;
+    const targets = [...sm.targets.map((t) => t.id), ...(sm.counts.e2e ? ["e2e"] : [])];
+    options($("f-target"), [["", "all targets"], ...targets.map((t) => [t, t])], ui.target);
+    options($("f-status"), [["", "all"], ["keep", "keep"], ["discard", "discard"], ["failed", "any failure"],
+      ...FAILURES.map((s) => [s, s.replace("_", " ")])], ui.status);
+    const q = ui.query.trim().toLowerCase();
+    const rows = S.rows.filter((r) => (!ui.target || r.target === ui.target)
+      && (!ui.status || r.status === ui.status || (ui.status === "failed" && FAILURES.includes(r.status)))
+      && (!q || `${r.hypothesis} ${r.snapshot} ${r.backend} ${r.target}`.toLowerCase().includes(q)));
+    const shown = rows.slice(-ui.limit).reverse();
+    const colors = new Map(sm.targets.map((t) => [t.id, t.color]));
+    $("ledger-body").replaceChildren(...shown.map((r) => {
+      const sw = h("span", { class: "swatch" });
+      sw.style.background = r.target === "e2e" ? "var(--total)" : targetColor(colors.get(r.target));
+      const k = kindOf(r.status);
+      return h("tr", {},
+        h("td", { class: "num" }, String(r.exp ?? "")),
+        h("td", { class: "nowrap" }, String(r.time || "").slice(11) || String(r.time || "")),
+        h("td", { class: "nowrap" }, h("span", { class: "name" }, sw, h("code", {}, r.target))),
+        h("td", {}, r.backend || ""),
+        h("td", {}, h("span", { class: `pill ${k}` }, h("i", {}), r.status.replace("_", " "))),
+        h("td", { class: "num" }, fmt.x(r.speedup)),
+        h("td", { class: "num" }, r.target === "e2e" ? fmt.ms(r.new_ms) : fmt.ms(r.new_ms, 3)),
+        h("td", { class: "num" }, fmt.ms(r.est_saved_ms)),
+        h("td", { class: "hyp" }, r.hypothesis || r.snapshot || ""),
+        h("td", {}, r.file ? h("button", { class: "linkish", type: "button", title: r.file,
+          onclick: () => openFile(r.file, true) }, "view") : ""));
+    }));
+    if (!shown.length) {
+      $("ledger-body").replaceChildren(h("tr", {}, h("td", { colspan: 10, class: "empty" },
+        S.rows.length ? "no evaluation matches the filters" : "no evaluations yet")));
+    }
+    $("f-count").textContent = `showing ${shown.length} of ${rows.length}` + (rows.length !== S.rows.length ? ` (${S.rows.length} in total)` : "");
+    $("ledger-more").replaceChildren(rows.length > shown.length
+      ? h("button", { class: "linkish", type: "button", onclick: () => { ui.limit = Infinity; renderLedger(); } },
+        `show all ${rows.length}`) : "");
+  }
+  $("f-target").addEventListener("change", (e) => { ui.target = e.target.value; renderLedger(); });
+  $("f-status").addEventListener("change", (e) => { ui.status = e.target.value; renderLedger(); });
+  $("f-query").addEventListener("input", (e) => { ui.query = e.target.value; renderLedger(); });
+
+  // ------------------------------------------------------------ files
+  const openFor = (r) => (r && r.file ? () => openFile(r.file, true) : null);
+  async function loadFiles() {
+    try {
+      const res = await fetch("api/files", { cache: "no-store" });
+      if (!res.ok) throw new Error(res.statusText);
+      ui.files = await res.json();
+      ui.filesStale = false;
+    } catch (err) {
+      ui.files = ui.files || [];
+    }
+    renderFiles();
+  }
+  function renderFiles() {
+    const host = $("file-list");
+    if (!ui.files) return;
+    const q = ui.filter.trim().toLowerCase();
+    const files = ui.files.filter((f) => !q || f.path.toLowerCase().includes(q));
+    if (!files.length) return host.replaceChildren(h("div", { class: "empty" }, q ? "no match" : "no text files yet"));
+    const groups = new Map();
+    for (const f of files) {
+      const cut = f.path.lastIndexOf("/");
+      const dir = cut < 0 ? "" : f.path.slice(0, cut);
+      if (!groups.has(dir)) groups.set(dir, []);
+      groups.get(dir).push(f);
+    }
+    host.replaceChildren(...[...groups].map(([dir, list]) => {
+      const open = !!q || dir === "" || dir.endsWith("candidates") || list.some((f) => f.path === ui.file) ||
+        list.some((f) => f.path.endsWith("NOTES.md"));
+      const recent = [...list].sort((a, b) => b.mtime - a.mtime || a.path.localeCompare(b.path));
+      return h("details", { open },
+        h("summary", {}, dir || "run directory", h("span", {}, ` · ${list.length}`)),
+        h("ul", {}, ...(dir.endsWith("history") ? recent : list).map((f) => h("li", {},
+          h("button", { type: "button", "aria-current": f.path === ui.file ? "true" : null,
+            onclick: () => openFile(f.path, false) },
+            h("span", {}, f.path.slice(dir ? dir.length + 1 : 0)), h("small", {}, fmt.size(f.size)))))));
+    }));
+  }
+  $("file-filter").addEventListener("input", (e) => { ui.filter = e.target.value; renderFiles(); });
+  async function openFile(path, scroll) {
+    ui.file = path;
+    $("file-name").textContent = path;
+    $("file-info").textContent = "loading…";
+    renderFiles();
+    if (scroll) $("files").scrollIntoView({ behavior: "smooth", block: "start" });
+    try {
+      const res = await fetch(`file?path=${encodeURIComponent(path)}`, { cache: "no-store" });
+      const text = await res.text();
+      if (ui.file !== path) return;
+      if (!res.ok) {
+        $("file-info").textContent = `${res.status}: ${text}`;
+        $("file-body").textContent = "";
+        return;
+      }
+      const size = Number(res.headers.get("X-File-Size") || text.length);
+      const cut = res.headers.get("X-Truncated") === "1";
+      $("file-info").textContent = cut ? `${fmt.size(size)} · showing the first 512 KB` : fmt.size(size);
+      $("file-body").textContent = text;
+    } catch (err) {
+      $("file-info").textContent = "could not load the file";
+    }
+  }
+
+  // ------------------------------------------------------------ render loop + stream
+  let pending = false;
+  function render() {
+    pending = false;
+    if (!S.summary) return;
+    const focused = document.activeElement && document.activeElement.dataset
+      ? document.activeElement.dataset.key : null;
+    tip.hidden = true;
+    renderHeader();
+    for (const draw of [drawE2E, drawTargets, drawCost, drawIntegration]) {
+      try { draw(); } catch (err) { console.error(err); }
+    }
+    renderFeeds();
+    renderLedger();
+    if (focused) {
+      const again = [...document.querySelectorAll("svg[data-key]")].find((el) => el.dataset.key === focused);
+      if (again) again.focus({ preventScroll: true });
+    }
+  }
+  function schedule() {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(render);
+  }
+  function receive(summary) {
+    S.summary = summary;
+    clockOffset = summary.now - Date.now() / 1000;
+  }
+  function connect() {
+    const es = new EventSource("events");
+    es.addEventListener("open", () => { ui.conn = "open"; if (S.summary) renderLive(); });
+    es.addEventListener("error", () => { ui.conn = "retry"; if (S.summary) renderLive(); });
+    es.addEventListener("state", (ev) => {
+      const data = JSON.parse(ev.data);
+      S.rows = data.rows; S.events = data.events; S.logs = data.logs;
+      receive(data.summary);
+      ui.conn = "open";
+      schedule();
+    });
+    es.addEventListener("delta", (ev) => {
+      const data = JSON.parse(ev.data);
+      if (data.rows) { S.rows.push(...data.rows); ui.filesStale = true; }
+      if (data.events) S.events = S.events.concat(data.events).slice(-MAX_EVENTS);
+      if (data.logs) S.logs = S.logs.concat(data.logs).slice(-MAX_LOGS);
+      receive(data.summary);
+      schedule();
+    });
+  }
+
+  const initial = JSON.parse($("initial-state").textContent);
+  S.rows = initial.rows; S.events = initial.events; S.logs = initial.logs;
+  receive(initial.summary);
+  render();
+  let lastWidth = document.body.clientWidth;
+  new ResizeObserver(() => {
+    if (document.body.clientWidth !== lastWidth) { lastWidth = document.body.clientWidth; schedule(); }
+  }).observe(document.body);
+  setInterval(tick, 1000);
+  setInterval(() => { if (S.summary && S.summary.run.running) schedule(); }, 30000);
+  setInterval(() => { if (ui.filesStale) loadFiles(); }, 10000);
+  loadFiles().then(() => {
+    if (!ui.file && ui.files && ui.files.some((f) => f.path === "program.md")) openFile("program.md", false);
+  });
+  if (window.EventSource) setTimeout(connect, 0);
+})();
+</script>
+</body>
+</html>
