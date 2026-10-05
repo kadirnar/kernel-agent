@@ -443,7 +443,10 @@ def build(reference: torch.nn.Module) -> torch.nn.Module:
     # Return `reference` for instances you do not support.
 ```
 `build` is called on every instance of the class in the model, so handle the
-instances' configuration generically (read sizes from the module).
+instances' configuration generically (read sizes from the module). Expose tuning
+parameters (block sizes, `num_warps`, `num_stages`, vector widths) as keyword
+arguments with defaults, `def build(reference, BLOCK=1024, num_warps=4)`, and
+tune them with `sweep_candidate`.
 {entrypoints}
 # Backends (in priority order)
 {backend_list}
@@ -471,6 +474,18 @@ their structure.
   candidate before you spend a full evaluation on it. A candidate whose code
   was evaluated before (comments and formatting aside) is not run again: the
   result says `duplicate` and returns the earlier one.
+* `sweep_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py",
+  configs=[{{"BLOCK": 512, "num_warps": 4}}, {{"BLOCK": 1024, "num_warps": 8}}],
+  hypothesis="...", idea_id="<slug>")`: tunes the keyword arguments of
+  `build(reference, **config)` in one GPU session. Every config (at most
+  `max_configs`, default 32; a dict of lists sweeps every combination) is built
+  and checked like `mode="quick"`, failing configs are listed with their error,
+  the passing ones are timed interleaved against the reference, and the fastest
+  is fully evaluated and recorded like `evaluate_candidate` (its snapshot has the
+  config bound into `build()`). The result has the table sorted by weighted
+  speedup (`speedup_per_case`, `pct_of_sol`). A sweep counts as ONE evaluation:
+  tune block sizes, `num_warps`, `num_stages` and vector widths with one sweep per
+  idea, never with one evaluation per value.
 * `best_result(target_id="{target["id"]}")`: best correct result so far, and per
   idea: tries, best speedup, bugs (failed attempts) vs slow (correct, not faster).
 You have a budget of about {evaluations} evaluations. Stop early once further

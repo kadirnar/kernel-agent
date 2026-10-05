@@ -17,6 +17,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from kernel_agent import dedup, ledger, region, truth, workers
 from kernel_agent.budget import Budget
 from kernel_agent.dashboard import refresh
+from kernel_agent.kernels import sweep as sweep_mod
 from kernel_agent.kernels.evaluate import run_evaluation
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.truth import TamperError, Truth, sha256_file
@@ -590,6 +591,154 @@ def build_server(
         return _text(out)
 
     @tool(
+        "sweep_candidate",
+        "Tune the keyword arguments of a candidate's build(reference, **config) (block "
+        "sizes, num_warps, num_stages, vector widths) in one GPU session: every config is "
+        "built and checked on two cases (failing ones are listed with their error), the "
+        "passing ones are timed interleaved against the reference, and the fastest is fully "
+        "evaluated and recorded like evaluate_candidate (with its config bound into the "
+        "snapshot). Returns the table sorted by weighted speedup. Counts as ONE evaluation.",
+        {
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "string"},
+                "candidate": {
+                    "type": "string",
+                    "description": "path to the candidate .py (relative to your working dir) "
+                    "whose build(reference, **config) takes the swept keyword arguments",
+                },
+                "configs": {
+                    "type": ["array", "object"],
+                    "description": 'build() keyword arguments per config, e.g. [{"BLOCK": '
+                    '512, "num_warps": 4}, {"BLOCK": 1024, "num_warps": 8}], or a dict of '
+                    'lists for every combination ({"BLOCK": [512, 1024], "num_warps": [4, 8]})',
+                },
+                "max_configs": {
+                    "type": "integer",
+                    "description": f"sweep at most this many configs (default "
+                    f"{sweep_mod.DEFAULT_MAX_CONFIGS}, at most {sweep_mod.MAX_CONFIGS})",
+                    "default": sweep_mod.DEFAULT_MAX_CONFIGS,
+                },
+                "hypothesis": {
+                    "type": "string",
+                    "description": "one sentence: which parameters you sweep and why they matter",
+                },
+                "idea_id": {"type": "string", "description": "the idea these configs tune"},
+                "expected_speedup": {"type": "number"},
+                "parent": {"type": "string"},
+                "compile_check": {"type": "boolean", "default": False},
+            },
+            "required": ["target_id", "candidate", "configs", "hypothesis"],
+        },
+    )
+    async def sweep_candidate(args: dict[str, Any]) -> dict[str, Any]:
+        target_id = args["target_id"]
+        target_dir = run.target(target_id)
+        capture = run.capture_file(target_id)
+        if not capture.exists():
+            return _text({"status": "error", "error": f"unknown target {target_id}"})
+        mine = worker if worker is not None and worker.target_id == target_id else None
+        if mine is not None:
+            target_dir = workers.directory(run, target_id, mine.worker)
+        src = _resolve(target_dir, args["candidate"])
+        if (refused := _in_truth(run, src)) is not None:
+            return _text(refused)
+        if not src.exists():
+            return _text({"status": "error", "error": f"{src} does not exist"})
+        hypothesis = str(args.get("hypothesis") or "").strip()
+        if not hypothesis:
+            return _text({"status": "error", "error": "hypothesis is required"})
+        try:
+            configs, notes = sweep_mod.configs_from(args.get("configs"), args.get("max_configs"))
+        except ValueError as exc:
+            return _text({"status": "error", "error": str(exc)})
+        idea = ledger.idea_slug(args.get("idea_id"))
+        expected = _expected(args.get("expected_speedup"))
+        agent = mine.agent if mine else f"kernel-{target_id}"
+        evals_budget = budget.kernel_evals
+        if mine is not None and mine.evaluations is not None:
+            evals_budget = mine.evaluations
+        try:
+            capture_sha256 = keeper.expect(capture)
+        except TamperError as exc:
+            return _text({"status": "error", "error": str(exc)})
+        snaps: list[tuple[Path, str]] = []
+
+        def prepare(bound: Path) -> Path:  # the best config, bound into the source
+            snap = snapshot(run, bound, target_id)
+            snaps.append((snap, sha256_file(snap)))
+            return snap
+
+        start = time.perf_counter()
+        data = await asyncio.to_thread(
+            sweep_mod.run_sweep,
+            capture,
+            src,
+            configs,
+            timeout=budget.eval_timeout_s,
+            capture_sha256=capture_sha256,
+            compile_check=bool(args.get("compile_check")),
+            prepare=prepare,
+        )
+        snap, snap_sha256 = snaps[0]
+        result = data["evaluation"]
+        if result.get("status") == "tampered":
+            keeper.alarm(capture, str(result.get("error")))
+        elif sha256_file(snap) != snap_sha256:
+            keeper.alarm(snap, "snapshot changed during its evaluation")
+            result = {
+                "status": "tampered",
+                "correct": False,
+                "error": f"{snap.name} changed while it was evaluated; result discarded",
+            }
+        info = data["sweep"]
+        config = data["config"]
+        result = {**result, "config": config, "sweep": {**info, "notes": notes}}
+        tag = f"{sweep_mod.label(config)}; best of {info['passed']}/{info['configs']} configs"
+        _, row = record_candidate(
+            run,
+            target_id,
+            src,
+            snap,
+            result,
+            hypothesis=f"{hypothesis} [sweep: {tag}]",
+            parent=args.get("parent"),
+            eval_s=round(time.perf_counter() - start, 1),
+            snapshot_sha256=snap_sha256,
+            keeper=keeper,
+            idea=idea,
+            expected_speedup=expected,
+            worker=mine.worker if mine else None,
+        )
+        await asyncio.to_thread(refresh, run, target_id)
+        out = compact(result)
+        out["config"], out["snapshot"] = config, f"history/{snap.name}"
+        out["sweep"] = {
+            k: info[k] for k in ("configs", "passed", "failed", "skipped", "seconds") if k in info
+        }
+        for key in ("rounds", "cases", "timing", "note", "sol_note"):
+            if info.get(key):
+                out["sweep"][key] = info[key]
+        if notes:
+            out["sweep"]["notes"] = notes
+        out["sweep"]["table"] = [sweep_mod.compact_row(r) for r in info["table"]]
+        out["ledger"] = {"exp": row["exp"], "status": row["status"]}
+        if idea or expected is not None:
+            try:
+                records = keeper.records(run.results_file(target_id))
+            except TamperError:
+                records = []
+            out["idea"] = idea_feedback(records, idea, expected, row)
+        out |= _best_so_far(target_id)
+        out |= budget.feedback(  # a sweep is one evaluation, however many configs it timed
+            agent,
+            run.results_file(target_id),
+            evals_budget,
+            pct_of_sol=sol_signal(result),
+        )
+        return _text(out)
+
+    @tool(
         "best_result",
         "Best correct evaluation so far for a target, the number of evaluations, the last "
         "15 and per idea (idea_id): tries, best speedup, bugs (failed) vs slow (correct, "
@@ -737,6 +886,7 @@ def build_server(
         version="0.1.0",
         tools=[
             evaluate_candidate,
+            sweep_candidate,
             best_result,
             evaluate_e2e,
             check_harness,

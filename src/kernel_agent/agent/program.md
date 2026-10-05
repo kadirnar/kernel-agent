@@ -36,9 +36,9 @@ version is saved as `logs/program-<sha12>.md`.
 * Test one hypothesis per evaluation. Change one thing, write down what you
   expect and why, evaluate, then record what happened. When several changes
   go into one evaluation you cannot tell which one helped or hurt.
-* Only `evaluate_candidate` / `evaluate_e2e` results count. Timing scripts
-  you write yourself are for debugging: the GPU is shared and they are not
-  locked, so never report their numbers as results.
+* Only `evaluate_candidate` / `sweep_candidate` / `evaluate_e2e` results
+  count. Timing scripts you write yourself are for debugging: the GPU is
+  shared and they are not locked, so never report their numbers as results.
 
 ### Simplicity
 * At equal speed, simpler wins. A gain within the noise that adds complex
@@ -109,6 +109,11 @@ version is saved as `logs/program-<sha12>.md`.
   re-read `NOTES.md` and switch to a fundamentally different idea (fusion
   boundary, algorithm, backend), or finish. Do not tune parameters below the
   noise.
+* Tune parameters (block sizes, `num_warps`, `num_stages`, vector widths, tile
+  shapes) with `sweep_candidate`, not with one evaluation per value: make them
+  keyword arguments of `build()` and sweep the plausible grid in one call (it
+  counts as one evaluation). One sweep per idea, once the kernel is correct; a
+  sweep tunes an idea, it is not a new one (same `idea_id`).
 * Per-call host work is real latency at decode shapes. Do allocation,
   weight packing and shape logic once in `build()` or cache them per shape.
 

@@ -30,6 +30,17 @@ kernel-agent eval <run_dir>/.truth/captures/<target_id>.pt candidates/<file>.py 
 A candidate counts only with `"correct": true`. Never call the reference
 forward and never return captured outputs.
 
+Tune block sizes, `num_warps`, `num_stages` and vector widths with one sweep,
+not one evaluation per value: make them keyword arguments of
+`build(reference, BLOCK=1024, num_warps=4)` and pass the configs as JSON
+(`[{"BLOCK": 512, "num_warps": 4}, ...]`, or `{"BLOCK": [512, 1024]}` for every
+combination). Every config is checked and timed against the reference in one
+run, and the fastest is fully evaluated:
+
+```bash
+kernel-agent eval <run_dir>/.truth/captures/<target_id>.pt candidates/<file>.py --sweep configs.json
+```
+
 Each timed result reports per case `sol_ms` (speed of light from FLOPs, bytes
 and peaks measured on this GPU), `pct_of_sol` and `bound`
 (memory/compute/launch), plus the weighted `pct_of_sol` of the target. Stop

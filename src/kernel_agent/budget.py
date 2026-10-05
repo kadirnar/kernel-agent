@@ -12,6 +12,8 @@
   budget left and an ``advice`` (``continue`` / ``consider_stopping`` / ``stop``).
   A kernel evaluation within ``100 - SOL_STOP_PCT`` % of its speed of light
   (weighted ``pct_of_sol``, :mod:`kernel_agent.kernels.roofline`) also means ``stop``.
+  A ``sweep_candidate`` call is one evaluation (one :meth:`Budget.feedback`), however
+  many configs it times (:mod:`kernel_agent.kernels.sweep`).
 
 Time is measured from the start of this process (``optimize`` or ``resume``);
 USD is the sum of ``costs.json``, so it covers the whole run.
@@ -36,7 +38,7 @@ MIN_AGENT_USD = 0.25  # ... or with less money left
 WRAP_UP_SECONDS = 120.0  # advice is "stop" when an agent has less time than this left
 SOL_STOP_PCT = 90.0  # advice is "stop" once a kernel reaches this % of its speed of light
 
-EVAL_TOOLS = ("evaluate_candidate", "evaluate_e2e")
+EVAL_TOOLS = ("evaluate_candidate", "sweep_candidate", "evaluate_e2e")
 #: Hypothesis of the library's prior winners (library.py), evaluated before a target's agent
 #: starts: they may set the best result, but are not the agent's attempts without a gain.
 PRIOR_HYPOTHESIS = "prior winner from "

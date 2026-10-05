@@ -45,7 +45,17 @@ def _gpu_lock_for_gpu_tests(request):
     if request.node.get_closest_marker("gpu") is None:
         yield
         return
-    from kernel_agent.gpulock import gpu_lock
+    from kernel_agent.gpulock import ENV, gpu_lock
 
     with gpu_lock():
-        yield
+        # The test process holds the GPU for all its threads: evaluation tools run in
+        # worker threads (asyncio.to_thread), which would otherwise wait for this one.
+        old = os.environ.get(ENV)
+        os.environ[ENV] = "1"
+        try:
+            yield
+        finally:
+            if old is None:
+                os.environ.pop(ENV, None)
+            else:
+                os.environ[ENV] = old
