@@ -41,9 +41,11 @@ HF URL ─► resolve (modality, arch, family, size)
                      benchmark + optional per-kernel profile) and iterates
         ─► transforms  Claude "systems engineer" writes model-level transforms,
                      validated end to end with evaluate_e2e
-        ─► integrate all winners are applied together, validated against the
-                     baseline output; greedy fallback if the combination fails;
-                     then the accepted kernels under the compiled baseline
+        ─► integrate every winner measured alone, then combined greedily from
+                     the fastest single item (or from the systems agent's
+                     fastest measured combination, when it is faster again),
+                     validated against the baseline output; then the accepted
+                     kernels under the compiled baseline
         ─► report    report.md + optimized/ (kernels + apply.py)
 ```
 
@@ -868,6 +870,17 @@ profile, then the same bar with every target at its best module speedup
 `integration.png`: the greedy integration as a waterfall. It starts at the
 baseline, then the best single item, then each item added on top: accepted
 (green, ms saved), rejected for no gain (hatched) or failed (red ×).
+
+The candidates are every kernel winner and every transform of a passing
+`evaluate_e2e` record that beat the baseline, alone or combined with other
+transforms and kernels (the systems agent evaluates on top of the kernel
+winners); of each transform idea (file stem, without the `NNN_` / `_<sha>`
+of history snapshots) the version of the fastest such record. The fastest
+passing combination the systems agent measured is measured again as a whole
+(`integration.json` → `composite`: its `items`, `exp` and whether it
+`seeded`); when it beats the best single item it seeds the search instead
+(`exp N combination` in the waterfall), and items that are already part of it,
+or another version of one, are not added again.
 
 ![integration waterfall](docs/images/example-integration.png)
 

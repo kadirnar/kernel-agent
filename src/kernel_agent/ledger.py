@@ -141,7 +141,20 @@ def item_label(item: str) -> str:
     target, sep, _ = item.partition("=")
     if sep and "/" not in target:
         return target
-    return re.sub(r"^\d+_|_[0-9a-f]{8}$", "", Path(item).stem)
+    return snapshot_stem(item)
+
+
+_SNAPSHOT_AFFIX = re.compile(r"^\d{3,}_|_[0-9a-f]{8}$")
+
+
+def snapshot_stem(path: str | Path) -> str:
+    """The file stem a snapshot was taken of, without every ``NNN_`` sequence prefix and
+    ``_<sha1:8>`` suffix: a snapshot of a snapshot such as
+    ``history/014_001_graph_cfm_solver_300928ff_300928ff.py`` → ``graph_cfm_solver``."""
+    stem = Path(path).stem
+    while (shorter := _SNAPSHOT_AFFIX.sub("", stem)) not in (stem, ""):
+        stem = shorter
+    return stem
 
 
 # ------------------------------------------------------------------ ideas
