@@ -62,6 +62,35 @@ are deep-copied outside the timed region. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
 wall-clock latency of the whole workload.
 
+### Budgets
+
+All limits are off by default (`kernel_agent/budget.py`).
+
+* `--max-hours` / `--max-usd` cover the whole run. Before each kernel or
+  transform agent starts, the elapsed time and the sum of `costs.json` are
+  checked. Once the budget is spent, the remaining agents are skipped, but
+  integrate and report always run on whatever results exist. 15 % of
+  `--max-hours` (`--budget-reserve`) is kept for them. Each agent's own USD cap
+  (`--budget`) is lowered to what is left of `--max-usd`. Time counts from the
+  start of the current `optimize`/`resume` process; USD counts the whole run.
+* `--agent-minutes` stops an agent session after that many minutes. The Claude
+  Code subprocess is terminated. Its session id, turns and tool calls are still
+  written to `costs.json`. Its USD cost is not, because Claude Code reports cost
+  only when a session ends.
+* `--eval-timeout` (default 300 s) limits one `evaluate_candidate` subprocess.
+  Results include `compile_s` (import, build and the first call, which is where
+  JIT backends compile). A timeout result says whether it ran out of time while
+  compiling or while checking and benchmarking.
+* Agents get their remaining time and USD in the system prompt. Every
+  `evaluate_candidate` / `evaluate_e2e` result has
+  `budget: {evals_used, evals_budget, minutes_left, non_improving}` and an
+  `advice`. The advice is `continue`, or `consider_stopping` after 4 evaluations
+  in a row that did not beat the best result by more than max(1 %, 2 × timing
+  spread), or `stop` when the evaluation, time or USD budget is spent.
+* Timeouts and budget stops are recorded under `run.json` → `phases.<phase>`
+  (`timed_out`, `budget_skipped`), in `events.jsonl` if it exists, and in
+  `report.md`.
+
 ## Backends
 
 | backend | how | host overhead (tiny op, measured) |
@@ -98,12 +127,16 @@ kernel-agent optimize <hf-url> [options]
   --parallel 2                         kernel agents at the same time
   --no-transforms                      kernels only
   --claude-model claude-opus-5-5 --effort high --budget 10 (USD per agent)
+  --max-hours 3 --max-usd 40           budget for the whole run (see "Budgets")
+  --agent-minutes 45                   time limit per agent session
+  --eval-timeout 300                   seconds per evaluate_candidate
+  --budget-reserve 0.15                share of --max-hours kept for integrate + report
   --harness my_harness.py              your own workload
   --until analyze|plan|capture|kernels|transforms|integrate
 
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
 kernel-agent resume <run_dir> [--redo kernels]
-kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline]
+kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
 kernel-agent report <run_dir>
 kernel-agent doctor [--smoke]
 kernel-agent install-claude-code <project-dir>
@@ -140,7 +173,8 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/history/       snapshot of every evaluated version
   targets/<id>/results.jsonl  every evaluation
   transforms/                 model-level transforms + results.jsonl
-  integration.json  report.md  costs.json  logs/
+  integration.json  report.md  logs/
+  costs.json                  per agent: $, turns, minutes, tools, session_id
   optimized/                  apply.py + manifest.json + kernels/
 ```
 

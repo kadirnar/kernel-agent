@@ -110,9 +110,19 @@ def write_report(run: RunDir) -> Path:
         ]
         for name, c in costs.items():
             tools = ", ".join(f"{k}×{v}" for k, v in c.get("tools", {}).items())
+            if c.get("timed_out"):
+                name += " (timed out; $ not reported)"
             lines.append(
                 f"| {name} | {c.get('usd')} | {c.get('turns')} | {c.get('minutes')} | {tools} |"
             )
+    stops = [
+        f"* {phase}: {key.replace('_', ' ')} `{item.get('agent')}` {item.get('reason') or ''}"
+        for phase, info in data.get("phases", {}).items()
+        for key in ("timed_out", "budget_skipped")
+        for item in info.get(key, [])
+    ]
+    if stops:
+        lines += ["", "## Budget stops", "", *stops]
     lines += [
         "",
         "## Use the optimised model",

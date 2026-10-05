@@ -30,6 +30,8 @@ from typing import Any
 
 from kernel_agent.gpulock import gpu_lock
 
+COMPILE_MARKER = "@@KA_COMPILE_S@@"  # on stderr, so a timed-out run still reports it
+
 
 def load_candidate_module(path: Path) -> Any:
     path = path.resolve()
@@ -108,6 +110,7 @@ def evaluate(
     cases = capture["cases"]
 
     # 1. import + build
+    t_build = time.perf_counter()
     try:
         module = load_candidate_module(candidate_path)
         given = copy.deepcopy(reference)
@@ -138,6 +141,10 @@ def evaluate(
         except Exception:
             result.update(status="runtime_error", error=_short_tb(), failed_case=i)
             return result
+        if i == 0:
+            # import + build + first call: where load_inline / JIT backends compile
+            result["compile_s"] = round(time.perf_counter() - t_build, 1)
+            print(f"{COMPILE_MARKER}{result['compile_s']}", file=sys.stderr, flush=True)
         checks = compare_structures(case["output"], out, "output")
         checks += compare_structures(case["post_args"], args, "args")
         checks += compare_structures(case["post_kwargs"], kwargs, "kwargs")
@@ -216,6 +223,24 @@ def evaluate(
     return result
 
 
+def _timeout_result(timeout: float, stderr: str | bytes | None) -> dict[str, Any]:
+    """Timeout result; says whether compiling or checking/benchmarking ran out of time."""
+    text = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr or ""
+    compile_s = None
+    for line in text.splitlines():
+        if line.startswith(COMPILE_MARKER):
+            compile_s = float(line[len(COMPILE_MARKER) :])
+    result: dict[str, Any] = {"status": "timeout", "correct": False, "compile_s": compile_s}
+    if compile_s is None:
+        result["error"] = f"exceeded {timeout:.0f}s before the first call finished (compiling?)"
+    else:
+        result["error"] = (
+            f"exceeded {timeout:.0f}s; compile + first call took {compile_s:.0f}s, "
+            "the rest went to correctness checks and benchmarking"
+        )
+    return result
+
+
 def run_evaluation(
     capture_path: Path,
     candidate_path: Path,
@@ -223,7 +248,7 @@ def run_evaluation(
     profile: bool = False,
     l2_flush: bool = False,
     compile_baseline: bool = False,
-    timeout: float = 900.0,
+    timeout: float = 300.0,
 ) -> dict[str, Any]:
     """Evaluate in a fresh subprocess under the GPU lock."""
     cmd = [
@@ -244,8 +269,8 @@ def run_evaluation(
     with gpu_lock():
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return {"status": "timeout", "correct": False, "error": f"exceeded {timeout:.0f}s"}
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(timeout, exc.stderr)
     marker = "@@KA_RESULT@@"
     for line in proc.stdout.splitlines()[::-1]:
         if line.startswith(marker):

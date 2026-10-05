@@ -69,6 +69,11 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         budget_usd_per_agent=ns.budget,
         permission_mode=ns.permission_mode,
         allow_web=not ns.no_web,
+        max_hours=ns.max_hours,
+        max_usd=ns.max_usd,
+        agent_minutes=ns.agent_minutes,
+        budget_reserve=ns.budget_reserve,
+        eval_timeout_s=ns.eval_timeout,
         hf_token=os.environ.get("HF_TOKEN"),
         verbose=ns.verbose,
     )
@@ -127,6 +132,7 @@ def cmd_eval(ns: argparse.Namespace) -> int:
         Path(ns.candidate),
         profile=ns.profile,
         compile_baseline=ns.compile_baseline,
+        timeout=ns.timeout,
     )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("correct") else 1
@@ -189,6 +195,18 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         choices=["bypassPermissions", "acceptEdits", "default"],
     )
     p.add_argument("--no-web", action="store_true", help="disable WebFetch/WebSearch for agents")
+    p.add_argument("--max-hours", type=float, help="wall-clock budget for the whole run")
+    p.add_argument("--max-usd", type=float, help="USD budget for all agents together")
+    p.add_argument("--agent-minutes", type=float, help="time limit per agent session")
+    p.add_argument(
+        "--budget-reserve",
+        type=float,
+        default=0.15,
+        help="share of --max-hours kept for integrate + report",
+    )
+    p.add_argument(
+        "--eval-timeout", type=float, default=300.0, help="seconds per evaluate_candidate"
+    )
     p.add_argument("--verbose", "-v", action="store_true")
 
 
@@ -229,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("candidate")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--compile-baseline", action="store_true", help="also time torch.compile")
+    p.add_argument("--timeout", type=float, default=300.0, help="seconds before giving up")
     p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser(
