@@ -48,6 +48,12 @@ class OptimizeConfig:
 
     program: str | None = None  # program.md for the agents (kernel_agent/program.py)
 
+    # Cross-run kernel library + lessons (kernel_agent/library.py).
+    use_library: bool = True  # reuse prior winners and lessons, store this run's winners
+    librarian: bool = True  # distil lessons after the report (a cheap agent)
+    librarian_model: str | None = None  # None: claude_model
+    librarian_effort: str | None = "low"
+
     hf_token: str | None = None
     verbose: bool = False
 

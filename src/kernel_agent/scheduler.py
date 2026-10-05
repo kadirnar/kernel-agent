@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger
-from kernel_agent.budget import SOL_STOP_PCT, improves
+from kernel_agent.budget import PRIOR_HYPOTHESIS, SOL_STOP_PCT, improves
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
@@ -217,13 +217,14 @@ def _improves(row: dict[str, Any], best: float) -> bool:
 
 
 def _kernel_history(arm: Arm, rows: list[dict[str, Any]]) -> None:
-    """Best, gain and streak of a kernel target from its ledger rows (``keep`` = new best)."""
+    """Best, gain and streak of a kernel target from its ledger rows (``keep`` = new best;
+    the library's prior winners do not extend the streak)."""
     for row in rows:
         if row["status"] == ledger.KEEP and row["speedup"]:
             new = float(row["speedup"])
             arm.gain_ms += arm.ref_ms * (1.0 / arm.best - 1.0 / new)
             arm.best, arm.best_snapshot, arm.streak = new, row["snapshot"], 0
-        else:
+        elif not str(row["hypothesis"] or "").startswith(PRIOR_HYPOTHESIS):
             arm.streak += 1
 
 
