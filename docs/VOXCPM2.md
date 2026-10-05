@@ -1,4 +1,4 @@
-# VoxCPM2 on an RTX 5070 Ti: 7.4× faster with kernel-agent
+# VoxCPM2 on an RTX 5070 Ti: 7.3–7.4× faster with kernel-agent
 
 The motivating case for the roadmap ([ROADMAP.md](ROADMAP.md), tracking issue
 [#24](https://github.com/kadirnar/kernel-agent/issues/24)): make
@@ -15,7 +15,7 @@ audio, 10 flow-matching steps, CFG 2.0, seed 0):
 | eager PyTorch (`optimize=False`) | 5,407 ms | 1.00× | 0.70× |
 | VoxCPM `optimize()` (`torch.compile`, reduce-overhead) | 3,798 ms | 1.42× | 1.00× |
 | kernel-agent, round 1 (integrated) | 891 ms | 6.07× | 4.26× |
-| **kernel-agent, final (paired A/B integration)** | **731 ms** | **7.40×** | **5.20×** |
+| **kernel-agent, final (paired A/B integration)** | **731–737 ms** | **7.34–7.40×** | **5.15–5.20×** |
 
 Real use through VoxCPM2's own `generate()` at natural length
 (`examples/voxcpm2_optimized.py`, three English sentences, the exported
@@ -24,7 +24,7 @@ Real use through VoxCPM2's own `generate()` at natural length
 | | total time | real-time factor | Whisper-large-v3 WER |
 |---|---|---|---|
 | eager | 8.44 s | 0.57 | 0.08 / 0.00 / 0.00 |
-| optimised | 1.13 s | 0.077 | 0.08 / 0.00 / 0.00 |
+| optimised | 1.13–1.15 s | 0.077–0.080 | 0.08 / 0.00 / 0.00 |
 
 (The 0.08 is Whisper spelling "optimisation" as "optimization".) Audio lengths
 match (4.6–5.0 s per sentence).
@@ -34,8 +34,15 @@ Cost: 19 agent sessions, **$31.67** of Claude usage, 4 h 41 min wall clock
 
 ## What made it fast
 
-The final integration (paired in-process A/B, each step ≥ 80 % of 8 rounds
-won and a bootstrap 95 % CI of the gain > 1 %) accepted four items:
+The range comes from two independent final integrations with the current
+code: the first accepted four items (below, 730.8 ms); the second, after the
+stale kernel records had been re-evaluated (#58), seeded from the best measured
+combination of 14 items plus the hoisted CFM solver (736.9 ms). Both use the
+same fused decoder-layer kernel for most of the gain; they differ by < 1 %.
+Real use was measured with each exported package (7.49× and 7.35×).
+
+The first final integration (paired in-process A/B, each step ≥ 80 % of 8
+rounds won and a bootstrap 95 % CI of the gain > 1 %) accepted four items:
 
 | item | kind | what it does | gain when added |
 |---|---|---|---|
