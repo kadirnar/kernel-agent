@@ -36,6 +36,7 @@ REPEATABLE = (
     "incorrect",
     "incorrect_timed_output",
     "incorrect_perturbed",
+    "fallback",  # not integrity_violation: its timing checks can depend on the moment
     "build_error",
     "runtime_error",
 )

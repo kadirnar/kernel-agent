@@ -196,10 +196,19 @@ def compare_side_effects(
     writing one position of an 8192-long KV cache (0.01 % of its elements), or
     forgetting to, would vanish inside the allowance.  Other tensors (e.g. caches
     that grow by concatenation) are compared whole."""
-    pre_flat = flatten(pre, prefix)
-    new_flat = flatten(new_post, prefix)
+    return compare_side_effects_flat(
+        flatten(pre, prefix), flatten(ref_post, prefix), flatten(new_post, prefix)
+    )
+
+
+def compare_side_effects_flat(
+    pre_flat: dict[str, torch.Tensor],
+    ref_flat: dict[str, torch.Tensor],
+    new_flat: dict[str, torch.Tensor],
+) -> list[dict[str, Any]]:
+    """:func:`compare_side_effects` on already flattened ``{name: tensor}`` states."""
     results: list[dict[str, Any]] = []
-    for name, ref in flatten(ref_post, prefix).items():
+    for name, ref in ref_flat.items():
         new = new_flat.get(name)
         if new is None:
             results.append({"name": name, "ok": False, "error": "missing in candidate arguments"})
