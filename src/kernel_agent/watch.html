@@ -349,8 +349,8 @@ td.nowrap { white-space: nowrap; }
   const PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"];
   const FAILURES = ["incorrect", "incorrect_timed_output", "incorrect_perturbed",
     "integrity_violation", "fallback", "build_error", "runtime_error", "crash", "timeout"];
-  // not benchmark evaluations (ledger.UNMEASURED): quick checks and duplicates
-  const UNMEASURED = ["quick_ok", "quick_fail", "duplicate"];
+  // not the agents' benchmark evaluations (ledger.UNMEASURED): quick checks, duplicates, re-evaluations
+  const UNMEASURED = ["quick_ok", "quick_fail", "duplicate", "re-evaluated"];
   const MAX_EVENTS = 600, MAX_LOGS = 400;
   const S = { summary: null, rows: [], events: [], logs: [] };
   const ui = { target: "", status: "", query: "", limit: 100, files: null, file: null, filter: "",

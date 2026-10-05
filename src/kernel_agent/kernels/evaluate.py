@@ -50,6 +50,9 @@ unless noted:
   tagged with a nonce the candidate cannot read from its environment.
 
 A failed stage is named in ``stage``, with details in ``failed_check``.
+:func:`run_evaluation` stamps every result with ``evaluator_version``
+(:func:`evaluator_version`), so a record measured by an older evaluator is
+recognisable (:func:`stale`).
 
 Run as a subprocess (so compiler crashes and illegal memory accesses cannot
 take down the orchestrator)::
@@ -62,6 +65,7 @@ from __future__ import annotations
 import argparse
 import collections
 import copy
+import functools
 import hashlib
 import importlib.util
 import json
@@ -92,6 +96,62 @@ HIDDEN_WORK_MS = 0.1
 HIDDEN_WORK_SHARE = 0.5
 #: Candidate calls in the profiled activity pass over the main case.
 ACTIVITY_CALLS = 3
+#: Measurement semantics of this evaluator: bump it when a change makes earlier results
+#: incomparable (what is timed and how, how cases are weighted, what counts as correct).
+#: Records without ``evaluator_version`` predate it and count as schema 0.
+EVALUATOR_SCHEMA = 1
+
+
+_run = subprocess.run  # bound at import: tests replace subprocess.run for the evaluator
+
+
+@functools.cache
+def _git_sha() -> str | None:
+    """The commit of the kernel-agent checkout this module runs from (None: an installed
+    package, not a git checkout of kernel-agent, or no git)."""
+    here = Path(__file__).resolve()
+    try:
+        proc = _run(
+            ["git", "rev-parse", "--show-toplevel", "HEAD"],
+            cwd=here.parent,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = proc.stdout.splitlines()
+    if proc.returncode != 0 or len(lines) != 2:
+        return None
+    top, sha = Path(lines[0]), lines[1]
+    ours = (top / "src" / "kernel_agent" / "kernels" / here.name).resolve() == here
+    return sha if ours else None  # not the checkout of some other repository around it
+
+
+def evaluator_version() -> dict[str, Any]:
+    """``{"schema": EVALUATOR_SCHEMA, "git": <commit>}`` (``git`` when available)."""
+    sha = _git_sha()
+    return {"schema": EVALUATOR_SCHEMA, **({"git": sha} if sha else {})}
+
+
+def record_schema(record: dict[str, Any]) -> int:
+    """The evaluator schema a record was measured with (0: before it was recorded)."""
+    version = record.get("evaluator_version")
+    try:
+        return int(version.get("schema") or 0) if isinstance(version, dict) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def stale(record: dict[str, Any]) -> str | None:
+    """Why ``record`` was measured by an older evaluator than this one (None: it was not);
+    only the schema counts, not the commit."""
+    schema = record_schema(record)
+    if schema >= EVALUATOR_SCHEMA:
+        return None
+    if schema == 0:
+        return f"measured before evaluator_version was recorded (now schema {EVALUATOR_SCHEMA})"
+    return f"measured by evaluator schema {schema} (now {EVALUATOR_SCHEMA})"
 
 
 def load_candidate_module(path: Path) -> Any:
@@ -709,7 +769,9 @@ def run_evaluation(
     see :func:`evaluate`; the subprocess checks the bytes it loads), then check its
     result outside the candidate's process (:func:`_check_reference_timing`,
     :func:`_check_outputs`). The result says on which GPU of the pool it ran
-    (``gpu_index``, :mod:`kernel_agent.gpulock`)."""
+    (``gpu_index``, :mod:`kernel_agent.gpulock`) and which evaluator measured it
+    (``evaluator_version``, set here: the candidate's process cannot choose it)."""
+    version = {"evaluator_version": evaluator_version()}
     workdir = Path(tempfile.mkdtemp(prefix="ka-eval-"))
     outputs = workdir / "outputs.pt"
     nonce = secrets.token_hex(16)  # on stdin, read before the candidate is imported
@@ -750,7 +812,7 @@ def run_evaluation(
                     env=child_env(),
                 )
             except subprocess.TimeoutExpired as exc:
-                return _timeout_result(timeout, exc.stderr) | {"gpu_index": gpu}
+                return _timeout_result(timeout, exc.stderr) | {"gpu_index": gpu} | version
             data = _parse_result(proc.stdout, nonce)
             if data is None:
                 tail = (proc.stderr or proc.stdout)[-4000:]
@@ -760,8 +822,9 @@ def run_evaluation(
                     "returncode": proc.returncode,
                     "error": tail,
                     "gpu_index": gpu,
+                    **version,
                 }
-            data["gpu_index"] = gpu
+            data.update(gpu_index=gpu, **version)
             _check_reference_timing(
                 data, capture_path, capture_sha256, l2_flush=l2_flush, gpu=gpu
             )  # in a subprocess pinned to the same GPU (child_env)

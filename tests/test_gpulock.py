@@ -364,7 +364,8 @@ def test_evaluation_and_worker_run_on_the_locked_gpu(lock_dir, foreign, monkeypa
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(evaluate, "ensure_peaks", lambda: None)
     result = evaluate.run_evaluation(tmp_path / "c.pt", tmp_path / "k.py")
-    assert result == {"status": "ok", "gpu_index": 1}
+    version = evaluate.evaluator_version()  # stamped outside the candidate's process
+    assert result == {"status": "ok", "gpu_index": 1, "evaluator_version": version}
     assert worker.call_worker(RunDir(tmp_path), "e2e") == {"status": "ok", "gpu_index": 1}
     assert [e["CUDA_VISIBLE_DEVICES"] for e in envs] == ["1", "1"]
     assert all(e[gpulock.ENV] == "1" for e in envs)

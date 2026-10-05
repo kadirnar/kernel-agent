@@ -189,6 +189,7 @@ def record_candidate(
     expected_speedup: float | None = None,
     worker: int | None = None,
     mode: str = dedup.FULL,
+    reevaluates: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
 
@@ -198,10 +199,13 @@ def record_candidate(
     ``idea`` / ``expected_speedup``: the agent's ``idea_id`` and the speedup it expected;
     ``worker``: the target's worker that evaluated it (``workers.py``). A ``quick``
     ``mode`` check goes to ``quick.jsonl`` instead, as a ``quick_ok`` / ``quick_fail`` row.
+    ``reevaluates``: the earlier record of the same snapshot this evaluation replaces
+    (its ``exp``, ``speedup``, why; a ``re-evaluated`` row, :func:`current_records`).
     """
     target_dir = run.target(target_id)
     quick = mode == dedup.QUICK
     source = snap.read_text()
+    status = (ledger.QUICK_OK if result.get("correct") else ledger.QUICK_FAIL) if quick else None
     row = ledger.record_kernel(
         run,
         target_id,
@@ -214,7 +218,7 @@ def record_candidate(
         when=when,
         idea=idea,
         worker=worker,
-        status=(ledger.QUICK_OK if result.get("correct") else ledger.QUICK_FAIL) if quick else None,
+        status=ledger.REEVALUATED if reevaluates else status,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -234,6 +238,7 @@ def record_candidate(
         "source_key": dedup.source_key(source),
         **({"worker": worker} if worker else {}),
         **({"mode": dedup.QUICK} if quick else {}),
+        **({"reevaluates": reevaluates} if reevaluates else {}),
     }
     if isinstance(record.get("error"), str):
         record["error"] = record["error"][-1500:]
@@ -321,6 +326,17 @@ def record_e2e_result(
     return record, row
 
 
+def current_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``records`` without those a later re-evaluation of the same snapshot replaced
+    (``reevaluates``): the current evaluator's verdict on a snapshot counts."""
+
+    def name(rec: dict[str, Any]) -> str:
+        return Path(str(rec.get("snapshot", ""))).name
+
+    last = {name(r): i for i, r in enumerate(records) if r.get("reevaluates")}
+    return [r for i, r in enumerate(records) if last.get(name(r), i) <= i]
+
+
 def ranked_for_target(
     run: RunDir, target_id: str, keeper: Truth | None = None
 ) -> Iterator[dict[str, Any]]:
@@ -329,10 +345,11 @@ def ranked_for_target(
 
     Only records kernel-agent wrote count (lines appended by anyone else are
     ignored); a target whose records were modified has none. Every worker of a
-    target records here (``workers.py``), so this ranks across workers."""
+    target records here (``workers.py``), so this ranks across workers. A re-evaluated
+    snapshot ranks by its re-evaluation (:func:`current_records`)."""
     keeper = keeper or truth.of(run)
     try:
-        records = keeper.records(run.results_file(target_id))
+        records = current_records(keeper.records(run.results_file(target_id)))
     except TamperError:
         return
     ranked = [r for r in records if r.get("correct") and r.get("speedup") is not None]

@@ -26,10 +26,9 @@ from scratch, with nothing shared with the evaluation:
    evaluator's verdict.
 
 The re-check fails (``passed`` False) when the candidate is wrong on any fresh input
-(``incorrect``), fails to build or run, changes watched state, or is slower than the
-evaluator's speedup by more than the timing noise (``slower``: outside
-:data:`SPEEDUP_TOLERANCE`, or twice the measured spread of the rounds). ``agrees``
-says whether correctness and speedup match the evaluator's verdict.
+(``incorrect``), fails to build or run, changes watched state, or when its speedup and
+the evaluator's disagree (``disagrees``, :func:`speedups_agree`: faster or slower).
+``agrees`` says whether correctness and speedup match the evaluator's verdict.
 
 Subprocesses::
 
@@ -57,9 +56,14 @@ from typing import Any
 from kernel_agent.gpulock import child_env, gpu_lock
 
 RESULT_MARKER = "@@KA_RECHECK@@"
-#: A speedup within this relative distance of the evaluator's agrees with it; a slower
-#: one fails the re-check (twice the measured spread of the timing rounds if larger).
+#: Two speedups of a kernel agree when each is within a factor ``1 + tolerance`` of the
+#: other (:func:`speedups_agree`); the tolerance is twice the larger timing spread of the
+#: two measurements, at least SPEEDUP_TOLERANCE and at most SPEEDUP_TOLERANCE_MAX (noisy
+#: rounds cannot make 3x and 5x agree).
 SPEEDUP_TOLERANCE = 0.25
+SPEEDUP_TOLERANCE_MAX = 0.5
+#: ``status`` of a re-check whose speedup disagrees with the evaluator's (set by :func:`judge`).
+DISAGREES = "disagrees"
 ROUNDS = 3
 INPUTS, EXPECTED, CANDIDATE = "inputs.pt", "expected.pt", "candidate.pt"
 _dumps = json.dumps  # bound before any candidate is imported
@@ -360,12 +364,43 @@ def compare_entries(
     return failures
 
 
+def spread(result: dict[str, Any] | None) -> float | None:
+    """The timing spread of a measurement: the largest of its ``timing_spread`` and its
+    cases' (an evaluator result or record); None when it reports none."""
+    result = result or {}
+    found = [result.get("timing_spread")]
+    found += [c.get("timing_spread") for c in result.get("cases") or [] if isinstance(c, dict)]
+    return max((float(v) for v in found if isinstance(v, int | float)), default=None)
+
+
+def speedup_tolerance(*spreads: float | None, floor: float = SPEEDUP_TOLERANCE) -> float:
+    """The agreement tolerance of speedups measured with these timing spreads: twice the
+    larger spread, within [``floor``, :data:`SPEEDUP_TOLERANCE_MAX`]."""
+    noise = 2 * max((float(s) for s in spreads if s is not None), default=0.0)
+    return min(max(floor, noise), max(floor, SPEEDUP_TOLERANCE_MAX))
+
+
+def speedups_agree(a: float, b: float, tolerance: float) -> bool:
+    """Whether speedups ``a`` and ``b`` are within a factor ``1 + tolerance`` of each other:
+    ``|log a - log b| <= log(1 + tolerance)``, the same band whichever is larger."""
+    return abs(math.log(float(a)) - math.log(float(b))) <= math.log1p(tolerance)
+
+
 def judge(
-    result: dict[str, Any], verdict: dict[str, Any] | None, tolerance: float
+    result: dict[str, Any], verdict: dict[str, Any] | None, tolerance: float = SPEEDUP_TOLERANCE
 ) -> dict[str, Any]:
-    """Agreement with the evaluator's ``verdict`` (``correct``, ``speedup``), the
-    re-check's own ``passed`` and, when it failed, ``reason``."""
+    """Agreement with the evaluator's ``verdict`` (``correct``, ``speedup``, its timing
+    spread: :func:`spread`), the re-check's own ``passed`` and, when it failed, ``reason``.
+
+    The speedups must agree (:func:`speedups_agree` within :func:`speedup_tolerance`,
+    ``tolerance`` its floor), whichever is larger. A result judged before is judged again
+    from its measurement (against another verdict: a re-evaluation)."""
     verdict = verdict or {}
+    if result.get("status") == DISAGREES:  # judged before: the measurement itself was fine
+        result["status"] = "ok"
+        result.pop("reason", None)
+    for key in ("speedup_ratio", "tolerance"):
+        result.pop(key, None)
     claimed, measured = verdict.get("speedup"), result.get("speedup")
     result["evaluator"] = {"correct": verdict.get("correct"), "speedup": claimed}
     if "status" in verdict:
@@ -373,20 +408,18 @@ def judge(
     agrees: dict[str, Any] = {}
     if verdict.get("correct") is not None and result.get("correct") is not None:
         agrees["correct"] = bool(verdict["correct"]) == bool(result["correct"])
-    slower = False
     if isinstance(claimed, int | float) and claimed > 0 and measured:
-        tol = max(tolerance, 2 * float(result.get("timing_spread") or 0.0))
-        ratio = float(measured) / float(claimed)
-        result["speedup_ratio"] = round(ratio, 3)
+        tol = speedup_tolerance(result.get("timing_spread"), spread(verdict), floor=tolerance)
+        result["speedup_ratio"] = round(float(measured) / float(claimed), 3)
         result["tolerance"] = round(tol, 3)
-        agrees["speedup"] = abs(math.log(ratio)) <= math.log1p(tol)
-        slower = ratio < 1 / (1 + tol)
+        agrees["speedup"] = speedups_agree(measured, claimed, tol)
     result["agrees"] = agrees
-    if result.get("status") == "ok" and slower:
-        result["status"] = "slower"
+    if result.get("status") == "ok" and agrees.get("speedup") is False:
+        tol = result["tolerance"]
+        result["status"] = DISAGREES
         result["reason"] = (
             f"{measured}x in separate processes vs {claimed}x claimed by the evaluator "
-            f"(more than the ±{result['tolerance']:.0%} timing noise below it)"
+            f"(ratio {result['speedup_ratio']}, outside {1 / (1 + tol):.2f}-{1 + tol:.2f})"
         )
     result["passed"] = result.get("status") == "ok"
     return result
@@ -539,10 +572,19 @@ def _summarise(
 
 
 def describe(result: dict[str, Any]) -> str:
-    """One line on a re-check: its verdict against the evaluator's."""
+    """One line on a re-check: its verdict against the evaluator's, after the
+    re-evaluation of a stale or disagreeing record when there was one (``reevaluated``)."""
     status = result.get("status")
     if status == "skipped":
         return f"skipped: {result.get('reason')}"
+    prefix = ""
+    if again := result.get("reevaluated"):
+        new_speed, new_status = again.get("new_speedup"), again.get("new_status")
+        now = f"{new_speed}x" if again.get("new_correct") else new_status
+        prefix = (
+            f"re-evaluated ({again.get('why')}): {again.get('old_speedup')}x recorded, "
+            f"{now} by the current evaluator; "
+        )
     seeds = result.get("seeds")
     cases = len(result.get("cases") or [])
     parts = []
@@ -558,7 +600,7 @@ def describe(result: dict[str, Any]) -> str:
     text = "; ".join(parts) or str(status)
     if not result.get("passed"):
         text = f"FAILED ({status}): {result.get('reason') or ''}".strip()
-    return text
+    return prefix + text
 
 
 # ------------------------------------------------------------------ entry point

@@ -331,10 +331,13 @@ repeats the evaluator's verdict from scratch, sharing nothing with the evaluatio
    weighted by calls per run, as the evaluator does.
 
 The result says whether it `agrees` with the evaluator on correctness and on the
-speedup, within ±25 % or twice the measured spread of the rounds. It fails
-(`passed: false`) when the candidate is wrong on any fresh input (`incorrect`),
-does not build or run, changes watched state, or is slower than the evaluator's
-speedup by more than that noise (`slower`). A kernel that keeps outputs keyed by
+speedup. Two speedups agree when each is within a factor 1 + t of the other,
+whichever is larger (|log a − log b| ≤ log(1 + t)); t is twice the larger timing
+spread of the two measurements (the re-check's rounds, the evaluator's cases), at
+least 25 % and at most 50 %, so noisy rounds cannot make 2.9× and 5.5× agree. It
+fails (`passed: false`) when the candidate is wrong on any fresh input
+(`incorrect`), does not build or run, changes watched state, or when the speedups
+disagree in either direction (`disagrees`). A kernel that keeps outputs keyed by
 the captured shapes passes every captured case and fails here. Without
 `--speedup X` the command runs the evaluator first to get its verdict. On the
 bundled Triton RMSNorm (the RMSNorm smoke capture, RTX 5070 Ti) it is correct on
@@ -350,6 +353,24 @@ not seed the search. The results go to `integration.json` → `recheck` (status,
 `report.md`. A re-integration reuses the result for the same snapshot.
 `--no-recheck` turns this off. A simulated run (`improve --dry-run`) has no
 captures and records `skipped`.
+
+A stored speedup can be stale. Every evaluation records `evaluator_version`
+(`schema`, bumped when the evaluator's measurement semantics change, and the
+`git` commit when kernel-agent runs from a checkout). A record from an older
+schema, or from before the field existed, is re-evaluated before the re-check.
+So is a record whose speedup the re-check disagrees with while the kernel is
+correct on the fresh inputs. The re-evaluation runs the current evaluator on the
+verified snapshot and appends its record to the target's `results.jsonl`
+(`reevaluates`: the old `exp`, speedup, version and why), with a `re-evaluated`
+ledger row. From then on it stands in for the old record: in the target's
+ranking, the projection, `status` and the report. The re-check is then judged
+against it. The kernel is refused only when the re-evaluation fails
+(`reevaluation_failed`) or the re-check disagrees with it too. If another
+snapshot of the target now ranks first, that one is re-checked and integrated
+instead. `integration.json` → `recheck` → `reevaluated` keeps the old and the new
+speedup. In the VoxCPM2 run, the attention kernel's 46.89× came from the evaluator
+before the hardening of #6/#7. Re-evaluated, it measures 18.25×, the re-check
+agrees (17.84×), and the kernel is integrated instead of being refused.
 
 ### Ground truth the agents cannot quietly change
 
@@ -1323,6 +1344,9 @@ value for that column.
   budget advice uses. `quick_ok` / `quick_fail` (quick checks) and
   `duplicate` rows are not benchmark evaluations: no chart, count, budget or
   streak uses them (see "Parallel workers, duplicates and quick checks").
+  Neither are `re-evaluated` rows, the integration's re-evaluations of stale
+  records (see "Independent re-check of winners"). They do replace the
+  snapshot's earlier row as the target's best in `status` and the report.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
   there is no custom kernel).

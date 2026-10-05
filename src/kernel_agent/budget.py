@@ -72,10 +72,13 @@ def non_improving_streak(
 
     ``start`` is the speedup to beat before any record (1.0 = the reference).
     Failed, incorrect and not-faster evaluations all extend the streak, except
-    the library's prior winners (``PRIOR_HYPOTHESIS``).
+    the library's prior winners (``PRIOR_HYPOTHESIS``). The integration's
+    re-evaluations of earlier snapshots (``reevaluates``) are not the agent's.
     """
     best, streak = start, 0
     for rec in records:
+        if rec.get("reevaluates"):
+            continue
         if improves(rec, best, ok_key=ok_key):
             best, streak = float(rec["speedup"]), 0
         elif not str(rec.get("hypothesis") or "").startswith(PRIOR_HYPOTHESIS):
