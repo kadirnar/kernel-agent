@@ -9,3 +9,4 @@ runs/
 *.so
 .env
 dist/
+.claude/worktrees/

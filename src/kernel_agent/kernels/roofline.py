@@ -249,7 +249,7 @@ def ensure_peaks(
             peaks = current_peaks()
             if peaks is not None or _MEASURE_FAILED:
                 return peaks
-        from kernel_agent.gpulock import gpu_lock
+        from kernel_agent.gpulock import child_env, gpu_lock
 
         with gpu_lock():
             peaks = None if remeasure else toolchain.load_peaks(path)  # another process won
@@ -257,7 +257,9 @@ def ensure_peaks(
                 if verbose:
                     print(f"measuring GPU peaks for the roofline -> {path}", file=sys.stderr)
                 cmd = [sys.executable, "-m", "kernel_agent.kernels.roofline", "--out", str(path)]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout, env=child_env()
+                )
                 if proc.returncode != 0 and verbose:
                     print(proc.stderr[-2000:], file=sys.stderr)
                 peaks = toolchain.load_peaks(path)
