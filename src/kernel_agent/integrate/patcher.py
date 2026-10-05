@@ -12,6 +12,8 @@ from typing import Any
 from torch import nn
 
 from kernel_agent.kernels.evaluate import load_candidate_module
+from kernel_agent.phases import PHASES, route
+from kernel_agent.profiling.methods import entrypoints_of
 
 
 @dataclass
@@ -23,6 +25,9 @@ class KernelPatch:
     #: Entrypoints the model calls on this class (``spec["capture"]["method_instances"]``,
     #: e.g. ``["forward", "forward_step"]``); replacements must provide them.
     methods: list[str] = field(default_factory=list)
+    #: ``prefill`` / ``decode``: only that phase's calls of ``methods`` go to the
+    #: replacement; the instance stays in the model (:func:`kernel_agent.phases.route`).
+    phase: str | None = None
 
 
 class PatchError(RuntimeError):
@@ -51,6 +56,10 @@ def apply_kernels(
 ) -> PatchReport:
     """Replace every instance of each patch's module class with ``build(instance)``.
 
+    A patch with a ``phase`` keeps the instance and routes only that phase's
+    calls to the replacement, so a second patch for the other phase of the
+    same class still applies.
+
     Raises :class:`PatchError` when a replacement lacks one of the patch's
     entrypoints that the original instance has (e.g. ``forward_step``): the
     model would call it and either crash or silently bypass the kernel."""
@@ -58,6 +67,7 @@ def apply_kernels(
     for patch in patches:
         module = load_candidate_module(patch.candidate)
         pattern = re.compile(patch.qualname_regex) if patch.qualname_regex else None
+        phase = patch.phase if patch.phase in PHASES else None
         replaced = skipped = 0
         for root_name, root in roots.items():
             targets = [
@@ -90,7 +100,11 @@ def apply_kernels(
                         f"{type(new).__name__} without {', '.join(missing)}(), which the model "
                         f"calls on {patch.module_class}"
                     )
-                _set_child(root, name, new)
+                if phase is None:
+                    _set_child(root, name, new)
+                else:
+                    methods = patch.methods or ["forward", *entrypoints_of(type(instance))]
+                    route(instance, new, phase, methods)
                 replaced += 1
         report.replaced[patch.target_id] = replaced
         report.skipped[patch.target_id] = skipped

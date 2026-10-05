@@ -124,6 +124,7 @@ def _kernel_patches(run: RunDir, kernels: list[str]) -> list[Any]:
                 candidate=Path(path),
                 qualname_regex=spec.get("qualname_regex"),
                 methods=list(spec.get("capture", {}).get("method_instances", [])),
+                phase=spec.get("phase"),
             )
         )
     return patches
@@ -155,6 +156,9 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         capture,
         qualname=spec.get("qualname"),
         max_cases=int(ns.max_cases),
+        qualname_regex=spec.get("qualname_regex"),
+        phase=spec.get("phase"),
+        profile_dir=target_dir,  # workload_profile.md is for the agent
     )
     if run.sealed():  # the agent's copy: module + inputs, no reference outputs
         truth.write_inputs_capture(capture, target_dir / "capture_inputs.pt")
@@ -170,7 +174,8 @@ def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> 
 
     from kernel_agent.profiling.capture import find_instance
 
-    _, module = find_instance(workload.roots(), spec["module_class"], spec.get("qualname"))
+    qualname = spec.get("capture", {}).get("qualname") or spec.get("qualname")  # captured one
+    _, module = find_instance(workload.roots(), spec["module_class"], qualname)
     cls = type(module)
     try:
         file = inspect.getsourcefile(cls)

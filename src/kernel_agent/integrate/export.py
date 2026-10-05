@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from kernel_agent import phases
 from kernel_agent.truth import TamperError, alarm, read_verified
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -44,14 +46,22 @@ def _load(path: Path):
 
 
 def apply_kernels(*roots: nn.Module) -> dict[str, int]:
-    """Replace every matching module instance in ``roots``; returns counts."""
+    """Replace every matching module instance in ``roots``; returns counts.
+
+    An entry with a ``phase`` keeps the instance and sends only that phase's
+    calls to the kernel (``phases.py``), as the integration did."""
     counts: dict[str, int] = {{}}
     for entry in MANIFEST["kernels"]:
         module = _load(HERE / entry["file"])
+        regex = entry.get("qualname_regex")
         n = 0
         for root in roots:
             for name, child in list(root.named_modules()):
                 if not name or type(child).__name__ != entry["module_class"]:
+                    continue
+                # qualnames in the run start with the workload's root name, e.g. "model."
+                names = [name, *(f"{{r}}.{{name}}" for r in MANIFEST.get("roots", []))]
+                if regex and not any(re.search(regex, q) for q in names):
                     continue
                 new = module.build(child)
                 if new is None or new is child:
@@ -66,6 +76,11 @@ def apply_kernels(*roots: nn.Module) -> dict[str, int]:
                     raise RuntimeError(
                         f"{{entry['target']}}: the replacement for {{name}} lacks {{missing}}"
                     )
+                if entry.get("phase"):
+                    phases = _load(HERE / "phases.py")
+                    phases.route(child, new, entry["phase"], entry.get("routed") or ["forward"])
+                    n += 1
+                    continue
                 parent_name, _, attr = name.rpartition(".")
                 parent = root.get_submodule(parent_name) if parent_name else root
                 if isinstance(parent, (nn.ModuleList, nn.Sequential)) and attr.isdigit():
@@ -103,7 +118,7 @@ def export_optimized(
     (out / "kernels").mkdir(parents=True)
     (out / "transforms").mkdir()
     card = run.load()["card"]
-    manifest: dict[str, list[dict[str, Any]]] = {"kernels": [], "transforms": []}
+    manifest: dict[str, list[Any]] = {"kernels": [], "transforms": []}
     for kind, arg, _ in accepted:
         if kind == "kernel":
             target_id, _, path = arg.partition("=")
@@ -111,12 +126,16 @@ def export_optimized(
             dst = out / "kernels" / f"{target_id}.py"
             _copy(run, Path(path), dst, digests)
             methods = spec.get("capture", {}).get("method_instances", {})
+            scope = {k: spec[k] for k in ("phase", "qualname_regex") if spec.get(k)}
+            if "phase" in scope:
+                scope["routed"] = list(methods)  # entrypoints whose phase calls go to the kernel
             manifest["kernels"].append(
                 {
                     "target": target_id,
                     "module_class": spec["module_class"],
                     "file": f"kernels/{dst.name}",
                     "methods": [m for m in methods if m != "forward"],
+                    **scope,
                 }
             )
         else:
@@ -124,6 +143,10 @@ def export_optimized(
             dst = out / "transforms" / src.name
             _copy(run, src, dst, digests)
             manifest["transforms"].append({"file": f"transforms/{dst.name}"})
+    # Root names prefix the qualnames that `qualname_regex` was written against.
+    profile = read_json(run.profile_dir / "profile.json", {}) or {}
+    manifest["roots"] = sorted({c["root"] for c in profile.get("classes", []) if c.get("root")})
+    shutil.copy2(Path(phases.__file__), out / "phases.py")  # phase routing for apply.py
     write_json(out / "manifest.json", manifest)
     (out / "apply.py").write_text(APPLY_TEMPLATE.format(repo_id=card["repo_id"], root=out))
     return out

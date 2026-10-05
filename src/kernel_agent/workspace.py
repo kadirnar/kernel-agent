@@ -13,8 +13,8 @@ runs/<org>--<name>/<timestamp>/
                         captures/<id>.pt, targets/<id>/{results.jsonl,history/},
                         transforms/{results.jsonl,history/}
   targets/<id>/         spec.json, capture_inputs.pt (no outputs), reference_source.py,
-                        candidates/*.py, NOTES.md, progress.png, copies of history/ and
-                        results.jsonl for the agent
+                        workload_profile.md, candidates/*.py, NOTES.md, progress.png,
+                        copies of history/ and results.jsonl for the agent
   transforms/           *.py model-level transforms (+ copies of history/, results.jsonl)
   results.tsv           experiment ledger: one row per evaluation (kernel, transform, integration)
   events.jsonl          phase changes, agent start/stop, evaluations

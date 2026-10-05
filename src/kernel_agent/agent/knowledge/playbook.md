@@ -48,6 +48,37 @@ them with a warm cache.
 * Fuse conv1d + GELU, LayerNorm (+ residual), attention; static KV cache for the
   decoder with cross-attention K/V computed once.
 
+**Diffusion-autoregressive TTS (VoxCPM2 measurements)**
+RTX 5070 Ti, bf16, 60 patches (9.6 s of audio), 10 flow-matching steps, CFG
+2.0 (docs/RESEARCH.md §5). Per audio patch: AR LM decode (MiniCPM base +
+residual LM, batch 1, one position, through `forward_step`), the LocDiT
+flow-matching sampler (Euler; the guided steps run cond + uncond as batch 2,
+`[2, 11, 1024]` per DiT attention call), the LocEnc that feeds the patch back,
+and once per run the AudioVAE vocoder.
+* 5.46 s eager, 3.80 s with VoxCPM's own `torch.compile(reduce-overhead)`;
+  GPU busy 47 %, 507k kernel launches per run (5 µs average): launch bound
+  before anything else.
+* Decode attention is the top kernel: `fmha_cutlassF` 1151 ms, 45 % of GPU
+  time. `MiniCPMAttention.forward_step` attends over all 8192 slots of the
+  static KV cache with a mask while ~70 hold data. Attend over the valid
+  length only (`position_id + 1` slots: slice the cache or use a split-KV
+  decode kernel that stops there). `workload_profile.md` gives the valid range.
+* DiT layers run tiny `[2, 11, 1024]` problems hundreds of times per patch
+  batch: fuse the whole layer (norm, QKV, RoPE, attention, o-proj, MLP) into
+  a few launches and keep cond + uncond in one batch-2 call.
+  `MiniCPMAttention` serves both the LM (`forward_step`) and the DiT
+  (`forward`): split it into a `decode` and a `prefill` target.
+* CUDA graphs per step remove most launches, but teacher forcing (the only
+  valid quality check: one-ulp changes diverge the free run after ~18 steps,
+  spectral cosine 0.69 for a verified RMSNorm) wraps `model.feat_decoder`
+  from Python once per patch and needs its noise from `torch.randn`. Graph
+  the LM step and the DiT estimator separately, never the whole step (LM +
+  decoder): such a transform cannot be validated and is rejected.
+* Host syncs per patch: the loop reads the stop flag with `.cpu().item()` on
+  every patch (even before `min_len`) and builds positions with
+  `torch.tensor([kv_cache.step()], device=...)` twice per patch. Keep
+  positions on the device and drop the sync where the loop does not need it.
+
 **TTS vocoders / codecs (HiFi-GAN, Vocos, DAC, SNAC, Mimi)**
 * Conv1d / ConvTranspose1d with small channel counts, Snake / LeakyReLU
   activations, residual stacks: fuse activation + conv, use channels-last 1D

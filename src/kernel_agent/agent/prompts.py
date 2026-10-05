@@ -135,6 +135,8 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "id": {"type": "string", "pattern": "^[a-z0-9_]{2,40}$"},
                     "module_class": {"type": "string"},
                     "qualname": {"type": ["string", "null"]},
+                    "qualname_regex": {"type": ["string", "null"]},
+                    "phase": {"type": "string", "enum": ["all", "prefill", "decode"]},
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
@@ -203,6 +205,19 @@ model. Specialist agents will then write custom kernels for each target you pick
    `forward_step` in a custom decode loop) are valid targets; their
    replacement implements those methods too, so say which one the approach
    speeds up.
+   **Phase-specific targets.** `phase` is `prefill` (calls on several
+   positions at once: prompt prefill, encoder and DiT/denoiser blocks),
+   `decode` (one position per call: `*step*` entrypoints such as
+   `forward_step`, `[batch, 1, ...]` inputs) or `all` (default). A phase
+   target captures only that phase's calls, and integration sends only those
+   calls to its kernel; the other calls keep the reference, so one target per
+   phase on the same class combine. Split a class when the *Phase split* table
+   shows both phases with a large share and different bottlenecks, e.g.
+   VoxCPM's `MiniCPMAttention`: `forward` on `[2, 11, 1024]` in the LocDiT
+   (fuse the whole layer) vs `forward_step` decoding over an 8192-slot static
+   KV cache (attend over the valid length only). `qualname_regex` (searched
+   in the full qualname, e.g. `feat_decoder\\.`) restricts a target to some
+   instances, e.g. when one class serves an LM and a DiT of different sizes.
 3. For each target give `approach` (the concrete fusion/algorithm idea, which
    kernels it removes, expected speedup) and an ordered list of `backends` from:
    {", ".join(backends)}. Put the backend most suited to the op first
@@ -273,6 +288,37 @@ def build(reference):
 """
 
 
+def _scope_lines(target: dict[str, Any]) -> str:
+    """Phase / instance restrictions of a target (empty for whole-class targets)."""
+    lines = ""
+    phase = target.get("phase")
+    if phase in ("prefill", "decode"):
+        lines += (
+            f"* phase: `{phase}` only. The cases are the {phase} calls; integration sends "
+            f"only {phase} calls of the captured entrypoints to your replacement, every other "
+            "call keeps the reference implementation.\n"
+        )
+    if target.get("qualname_regex"):
+        lines += f"* instances: only those whose qualname matches `{target['qualname_regex']}`\n"
+    return lines
+
+
+def _workload_block(capture_info: dict[str, Any], top: int = 6) -> str:
+    """Top facts of ``workload_profile.md`` (every call of the target during the capture run)."""
+    facts = (capture_info.get("workload") or {}).get("facts") or []
+    if not facts:
+        return ""
+    listed = "\n".join(f"* {fact}" for fact in facts[:top])
+    return f"""
+# Workload
+How the model calls this module: every call of the target's instances during
+the capture run, not only the captured cases (full tables in
+`workload_profile.md`). Specialise on these properties only behind a run-time
+check with a fallback.
+{listed}
+"""
+
+
 def engineer_prompt(
     target: dict[str, Any],
     capture_info: dict[str, Any],
@@ -306,17 +352,18 @@ custom kernels while keeping its results identical within numerical tolerance.
 # Target `{target["id"]}`
 * module class: `{target["module_class"]}` (instance captured: `{capture_info.get("qualname")}`)
 {stats}
-* why it matters: {target.get("why", "")}
+{_scope_lines(target)}* why it matters: {target.get("why", "")}
 * suggested approach: {target.get("approach", "")}
 * captured cases (real shapes from the model run):
 {cases}
-
+{_workload_block(capture_info)}
 Files in your working directory:
 * `capture_inputs.pt` — the module (with weights) + the captured inputs, for local
   debugging (`torch.load(path, weights_only=False)`). The reference outputs stay with
   the evaluator: `evaluate_candidate` is the correctness check.
 * `history/`, `results.jsonl` — copies of your evaluated snapshots and their records.
 * `reference_source.py` — source code of the module class (and its file path).
+* `workload_profile.md` — statistics of every call of the module during the run.
 * `spec.json` — target metadata.
 * `candidates/` — put your candidates here, one file per idea, e.g.
   `candidates/{backends[0]}_v1.py`.

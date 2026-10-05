@@ -30,7 +30,8 @@ HF URL ─► resolve (modality, arch, family, size)
                      an approach and backends for each, and model transforms
         ─► capture   each target module is saved with real inputs/outputs
                      (prefill + decode shapes, KV-cache side effects, every
-                     entrypoint such as forward_step)               [GPU worker]
+                     entrypoint such as forward_step), plus statistics of
+                     every call (workload_profile.md)               [GPU worker]
         ─► kernels   one Claude "kernel engineer" per target writes candidates,
                      calls evaluate_candidate (correctness + interleaved
                      benchmark + optional per-kernel profile) and iterates
@@ -143,6 +144,41 @@ memory the views span, with the same shapes, strides and aliasing between
 overlapping views (a full deep copy would store the whole cache for every
 case, before and after the call). Side effects are therefore checked on the
 memory the arguments cover, not on the rest of the buffer they were sliced from.
+
+### Workload statistics and phase-specific targets
+
+A capture keeps a few cases, but the kernel engineer also needs to know how
+the model calls the module the rest of the time. During the capture run every
+call of the target's instances is summarised in
+`targets/<id>/workload_profile.md` (+ `.json`), and its top facts go into the
+engineer's prompt:
+
+* calls and share per entrypoint and primary-input signature, with the phase;
+* masks: `None`, all ones, causal, prefix (a decode step that may only read
+  the first *L* slots) or other;
+* contiguity / strides and dtypes of tensor arguments, zero biases (argument
+  or parameter), values of flags such as `is_causal`;
+* integer ranges (`position_id`, `cache_position`: min / max / distinct);
+* KV-cache arguments: cache slots and the valid length per call (from the
+  position, else from the mask). VoxCPM2's decode attention, for example,
+  reads a static cache of 8192 slots of which only the first `position_id + 1`
+  hold data.
+
+Values are reduced on the GPU without a sync per call and read back once at
+the end of the run.
+
+A call is `decode` when it goes through a `*step*` entrypoint or its first
+tensor argument is `[batch, 1, ...]`, otherwise `prefill`. The profile summary
+has a *Phase split* table for classes called in both phases (with the
+qualname patterns of their instances). The planner can then split such a class
+into one target per phase (`"phase": "prefill" | "decode"` in the plan; `all`
+is the default), and restrict a target to some instances with
+`"qualname_regex"` (searched in the full qualname, e.g. `feat_decoder\.`).
+A phase target captures only that phase's calls (from the instance with the
+most of them, unless `qualname` is set). Integration keeps the instance and
+sends only that phase's calls of the captured entrypoints to the kernel. The
+other calls keep the reference, so a `prefill` and a `decode` target on the
+same class combine. `optimized/apply.py` applies them the same way.
 
 ### Speed of light
 
@@ -487,6 +523,7 @@ runs/<org>--<name>/<timestamp>/
     targets/<id>/results.jsonl  every evaluation (full record + snapshot sha256)
     transforms/                 history/ + results.jsonl of the transforms
   targets/<id>/capture_inputs.pt  module + real inputs (no outputs), for the agent
+  targets/<id>/workload_profile.md  statistics of every call of the target (+ .json)
   targets/<id>/reference_source.py
   targets/<id>/candidates/    files the agent writes
   targets/<id>/history/ results.jsonl   the agent's copies (never read back)
