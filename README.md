@@ -1192,7 +1192,14 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   (`worker analyze --out-dir D --kernel ... --transform ...`). The planner then
   proposes new targets, with the earlier rounds and the existing targets as
   context, and the loop continues with them. A target whose module was replaced
-  in the re-profile keeps the share it had in the first profile.
+  in the re-profile keeps the share it had in the first profile. The module
+  view of an optimised model times a `torch.compile`d module as one call (its
+  submodules are not hooked: hooks would make Dynamo recompile it), skips calls
+  made while a CUDA graph is captured, counts unmatched hooks and unpairable
+  events instead of failing, and lets compiled code whose guards the hooks
+  break run eagerly rather than recompile. `profile/summary.md` lists these
+  regions and the module calls that replay CUDA graphs (`module_gaps` in
+  `profile.json`); their kernels are in the kernel view.
 * **Files.** `improve.json` holds the slices (arm, scores, evaluations,
   outcome), the research sessions, the re-integrations, the rounds and why the
   loop stopped. `improve.png` is drawn from it, and `report.md` gets an
