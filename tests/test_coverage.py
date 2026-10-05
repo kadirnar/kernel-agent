@@ -234,8 +234,40 @@ def test_memoising_run_fails_the_probe():
     result = _held_out_verdict(wl, memoise)
     assert result["quality"]["passed"]  # computed correctly the first time
     assert not result["passed"] and result["memoisation"]["flagged"]
-    assert result["reason"].startswith("memoisation: a first run on a fresh input")
+    assert result["reason"].startswith("memoisation: first runs on two fresh inputs")
+    assert result["memoisation"]["confirm_ms"] > 50
     assert result["memoisation"]["fresh_over_repeat"] > holdout.MEMO_RATIO
+
+
+def test_one_slow_fresh_run_is_noise_not_memoisation():
+    """A busy GPU slows one run: the probe confirms on a second fresh input."""
+
+    def hiccup(wl: Workload) -> None:
+        run, calls = wl.run, [0]
+
+        def busy(inputs: torch.Tensor) -> Any:
+            calls[0] += 1
+            if calls[0] == 6:  # 4 timed main runs, the held-out run, then the probe
+                time.sleep(0.2)
+            return run(inputs)
+
+        wl.run = busy
+
+    wl = ShapeToy(WorkloadSpec(repo_id="toy/shape", modality="llm", device="cpu"))
+    wl.load()
+    result = _held_out_verdict(wl, hiccup)
+    memo = result["memoisation"]
+    assert result["passed"] and not memo["flagged"], result
+    assert memo["fresh_ms"] > 200 and memo["confirm_ms"] < 100
+
+
+def test_summary_text():
+    ok = {"passed": True, "reason": "", "memoisation": {"fresh_over_repeat": 1.04}}
+    assert holdout.summary_text(ok) == "held-out input passed (fresh input 1.04x the repeated runs)"
+    bad = {"passed": False, "reason": "memoisation: ..."}
+    assert holdout.summary_text(bad) == "held-out input FAILED: memoisation: ..."
+    skipped = {"passed": True, "reason": "", "skipped": "none declared"}
+    assert holdout.summary_text(skipped) == "held-out input skipped (none declared)"
 
 
 def test_outputs_equal():
@@ -282,7 +314,7 @@ def test_worker_stores_verifies_and_checks_the_held_out_input(tmp_path, cpu, cap
     assert memo["status"] == "ok" and not memo["passed"], memo
     assert memo["metrics"]["teacher_forced"]["passed"]  # today's checks all pass ...
     assert memo["metrics"]["holdout"]["quality"]["passed"]
-    assert memo["reason"].startswith("held-out input: memoisation: a first run on a fresh")
+    assert memo["reason"].startswith("held-out input: memoisation: first runs on two fresh")
 
     # Replays the first output it computed: the held-out output is the main output.
     replay = e2e("memo_none", MEMO.format(key=NO_KEY))
@@ -525,6 +557,7 @@ def test_voxcpm2_held_out_input_and_memoisation_probe():
         )
 
     plain = verdict()
+    print("plain:", {k: plain["memoisation"][k] for k in ("fresh_ms", "main_median_ms")})
     assert plain["passed"], plain
     assert not plain["memoisation"]["flagged"] and plain["memoisation"]["fresh_over_repeat"] < 1.5
 

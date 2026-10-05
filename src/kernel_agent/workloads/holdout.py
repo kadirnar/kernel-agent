@@ -22,7 +22,8 @@ check.  The held-out input closes that gap:
   variant ``>= 2``, random per evaluation, never seen by any process: the
   shapes of input 1, other content) is timed.  Real inference takes about as
   long as the repeated main-input runs; a memoised one is computed for the
-  first time.  The candidate fails when that run takes more than
+  first time.  The candidate fails when that run, and a second fresh one that
+  confirms it (one slow run can be a busy GPU), take more than
   :data:`MEMO_RATIO` x the median timed main run (and at least
   :data:`MEMO_MIN_GAP_MS` longer), or when its output equals the held-out
   output although the baseline's differ.
@@ -132,29 +133,44 @@ def memo_probe(
     probe_distinct: bool | None,
     variant: int | None = None,
 ) -> dict[str, Any]:
-    """Time one run on a fresh input (held-out ``variant``, random by default)."""
-    variant = variant if variant is not None else 2 + secrets.randbelow(2**30)
-    options = workload.holdout_options(variant)
-    if not options:
+    """Time one run on a fresh input (held-out ``variant``, random by default).  A slow
+    run is confirmed on a second fresh input before it counts: a busy GPU slows one
+    run, memoisation every fresh one."""
+    first = variant if variant is not None else 2 + secrets.randbelow(2**30)
+    second = first + 1 if variant is not None else 2 + secrets.randbelow(2**30)
+    if not workload.holdout_options(first):
         return {"flagged": False, "skipped": "the workload declares no fresh held-out input"}
-    _, output, ms = run_variant(workload, options)
-    ratio = ms / main_ms if main_ms > 0 else math.inf
-    slow = ratio > MEMO_RATIO and ms - main_ms >= MEMO_MIN_GAP_MS
-    same = bool(probe_distinct) and outputs_equal(output, holdout_output)
+
+    def slow(ms: float) -> bool:
+        return ms > MEMO_RATIO * main_ms and ms - main_ms >= MEMO_MIN_GAP_MS
+
+    times: list[float] = []
+    same = False
+    for v in (first, second):
+        _, output, ms = run_variant(workload, workload.holdout_options(v) or {})
+        times.append(ms)
+        same = same or (bool(probe_distinct) and outputs_equal(output, holdout_output))
+        if same or not slow(ms):
+            break
+    memoised = all(slow(ms) for ms in times) and len(times) == 2
+    ratio = min(times) / main_ms if main_ms > 0 else math.inf
     info: dict[str, Any] = {
-        "flagged": slow or same,
-        "variant": variant,
-        "fresh_ms": round(ms, 3),
+        "flagged": memoised or same,
+        "variant": first,
+        "fresh_ms": round(times[0], 3),
         "main_median_ms": round(main_ms, 3),
-        "fresh_over_repeat": round(ratio, 3),
+        "fresh_over_repeat": round(times[0] / main_ms if main_ms > 0 else math.inf, 3),
         "threshold": MEMO_RATIO,
         "equals_holdout_output": same,
     }
-    if slow:
+    if len(times) == 2:
+        info["confirm_ms"] = round(times[1], 3)
+    if memoised:
         info["reason"] = (
-            f"memoisation: a first run on a fresh input of already warmed-up shapes took "
-            f"{ms:.1f} ms, {ratio:.1f}x the median of the repeated main-input runs "
-            f"({main_ms:.1f} ms; limit {MEMO_RATIO:g}x): outputs are reused across runs"
+            f"memoisation: first runs on two fresh inputs of already warmed-up shapes took "
+            f"{times[0]:.1f} and {times[1]:.1f} ms, at least {ratio:.1f}x the median of the "
+            f"repeated main-input runs ({main_ms:.1f} ms; limit {MEMO_RATIO:g}x): outputs "
+            "are reused across runs"
         )
     elif same:
         info["reason"] = (
@@ -269,6 +285,17 @@ def summary_lines(baseline: dict[str, Any]) -> list[str]:
         f"* memoisation probe: one run on a fresh input is timed after warm-up; more than "
         f"{MEMO_RATIO:g}x the repeated main-input runs, or replayed outputs, fail the candidate.",
     ]
+
+
+def summary_text(result: dict[str, Any]) -> str:
+    """One phrase for reports: the ``metrics.holdout`` of an ``e2e`` run."""
+    if result.get("skipped"):
+        return f"held-out input skipped ({result['skipped']})"
+    if not result.get("passed"):
+        return f"held-out input FAILED: {result.get('reason')}"
+    ratio = (result.get("memoisation") or {}).get("fresh_over_repeat")
+    probe = f" (fresh input {ratio:.2f}x the repeated runs)" if ratio is not None else ""
+    return f"held-out input passed{probe}"
 
 
 def _fmt(options: Any) -> str:

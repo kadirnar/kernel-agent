@@ -24,15 +24,18 @@ uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
 HF URL ─► resolve (modality, arch, family, size)
         ─► analyze   load model, baseline latency, determinism check,
                      sensitivity probe, teacher-forcing self-check,
-                     module-level + kernel-level profile, compiled
-                     baseline (the model's own torch.compile path)  [GPU worker]
+                     held-out input baseline, module-level + kernel-level
+                     profile, compiled baseline (the model's own
+                     torch.compile path)                           [GPU worker]
         ─► (harness) Claude writes harness.py if the built-in workload fails
         ─► plan      Claude reads the profile + source, picks target modules,
                      an approach and backends for each, and model transforms
         ─► capture   each target module is saved with real inputs/outputs
-                     (prefill + decode shapes, KV-cache side effects, every
-                     entrypoint such as forward_step), plus statistics of
-                     every call (workload_profile.md)               [GPU worker]
+                     (prefill + decode shapes, first/middle/last decode step,
+                     KV-cache side effects, every entrypoint such as
+                     forward_step, correctness-only cases from extra
+                     settings), plus statistics of every call
+                     (workload_profile.md)                          [GPU worker]
         ─► kernels   one Claude "kernel engineer" per target writes candidates,
                      calls evaluate_candidate (correctness + interleaved
                      benchmark + optional per-kernel profile) and iterates
@@ -57,6 +60,18 @@ illegal memory access can't kill the run, and parallel agents
   elements the reference or the candidate changed, so writing one position of
   an 8192-long cache (or forgetting to) is not lost in the 0.1 %. If `build()`
   hands back the reference module unchanged, the candidate is rejected.
+* **More than one KV length and one setting**: decode steps share their
+  primary input while the KV cache grows, so `capture` runs the workload once
+  to count them and keeps the **first, middle and last** decode step of every
+  decode signature as cases (`"bucket"`, signature `... @ decode step 31/60`).
+  A kernel that only works for the first step's KV length fails the later
+  buckets, and each bucket weighs a third of the calls in the timing.
+  `Workload.variants()` declares extra settings (LLM: prompt length 37 and
+  301 at batch 2; VoxCPM: a short text with 8 patches; diffusion: ¾ of the
+  resolution); calls whose primary input the main run lacks become
+  **correctness-only** cases (`count` 0, `[correctness only: ...]` in the
+  signature): checked like the others, never timed. A kernel that only
+  handles the captured length fails them.
 * **Model level** (`e2e`): the workload's own comparison. For LLM/STT that is
   identical greedy tokens for the first N tokens plus first-step logits cosine
   ≥ 0.99. For TTS it is spectral cosine. For diffusion it is PSNR ≥ 25 dB on
@@ -81,6 +96,24 @@ illegal memory access can't kill the run, and parallel agents
   says that end-to-end validation will reject (almost) every kernel.
   Teacher-forced workloads also replay their own trajectory once, which must be
   exact (`baseline.json` → `teacher_forcing`).
+* **Held-out input** (`workloads/holdout.py`): every e2e run times the same
+  main input, so a transform that memoised outputs across runs would pass all
+  of the above. `analyze` therefore also stores the baseline output of a
+  held-out input (`Workload.holdout_options(1)`: LLM another prompt of the
+  same length, STT rotated audio, TTS / VoxCPM another text and seed with the
+  same patches, diffusion another prompt and seed), and `e2e` judges every
+  candidate on it too with the same check (teacher forced where supported),
+  untimed. It fails when the held-out check fails, or when the candidate's
+  held-out output equals its main output although the baseline's differ.
+  **Memoisation probe**: after the timed runs, one run on a *fresh* input
+  (`holdout_options(k)`, random `k >= 2`: the held-out input's shapes, another
+  seed or rotation, never seen by any process) is timed. Real inference takes
+  about as long as the repeated main runs; the candidate fails when it takes
+  more than 3× their median (and ≥ 10 ms more) on a second fresh input as
+  well (one slow run can be a busy GPU), or when its output equals the
+  held-out output although their baseline outputs differ. A first run at new
+  shapes (compilation, CUDA-graph capture) is not penalised: the held-out run
+  warms those shapes up before the probe. Details are in `metrics.holdout`.
 
 ### What "faster" means
 
@@ -109,7 +142,8 @@ writes them: in the orchestrator's memory (the authority) and in `run.json` →
   (`status: tampered`). A snapshot that changes during its evaluation voids
   the result.
 * `e2e` gets the baseline latency from the orchestrator (`--baseline-ms`) and
-  verifies `baseline.json` and the baseline output (`--verify`).
+  verifies `baseline.json` and the baseline outputs, main and held-out
+  (`--verify`).
 * Each record stores its snapshot's sha256. Winners (`best_for_target`), the
   integration and the export use only records kernel-agent wrote (lines
   appended by anyone else are ignored) whose snapshot still has that digest.
@@ -186,7 +220,8 @@ instance:
 * the profile shows a *methods* column (`forward_step×720 (638.4 ms) ·
   forward×2448 (1208.7 ms)`) and signatures like `forward_step: a0[1, 2048]`;
 * capture records cases from every entrypoint (`"method": "forward_step"`),
-  keeping at least one case per entrypoint (`--max-cases`, default 4);
+  keeping at least one case per entrypoint (`--max-cases`, default 4; the
+  middle / last decode-step cases of a signature come on top);
 * the evaluator replays each case through its method (`candidate.forward_step(...)`)
   for correctness and timing; a candidate without a captured method is a
   `build_error`, and integration refuses a replacement that lacks one.
@@ -583,6 +618,7 @@ runs/<org>--<name>/<timestamp>/
   plan.json                   targets + transforms
   .truth/                     what the evaluator trusts (read-only, sha256 in run.json):
     baseline_output.pt          output of the baseline run
+    baseline_output_holdout.pt  ... of the held-out input
     captures/<id>.pt            module + real inputs/outputs + post-call state
     targets/<id>/history/       snapshot of every evaluated version
     targets/<id>/results.jsonl  every evaluation (full record + snapshot sha256)
@@ -775,6 +811,15 @@ baseline output of `run()`, so `run()` must record the per-step trajectory.
 Optionally implement `reference_optimizations()` (apply the model's own fast
 path in place, return a one-line description, or `None`) so that `analyze`
 measures a compiled baseline (see "Strong baseline").
+
+`holdout_options(variant)` returns option overrides for the held-out input
+(variant 1: other content, the same shapes where possible) and the
+memoisation probe's fresh inputs (variants >= 2: the shapes of variant 1,
+other content); the default changes the `seed` option when there is one.
+They apply to `self.options` around `make_inputs`, `run` and teacher forcing,
+so read prompts, texts and seeds from `self.options`. `variants()` returns
+option overrides of extra settings (other lengths, batch sizes) whose new
+shapes `capture` records as correctness-only cases.
 
 ## Using it interactively from Claude Code
 
