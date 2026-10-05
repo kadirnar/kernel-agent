@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import hub, ledger, toolchain
+from kernel_agent import hub, ledger, program, toolchain
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import best_for_target, build_server, tool_names
@@ -57,6 +57,8 @@ class Orchestrator:
         tc = toolchain.setup()
         if tc.gpu is None:
             raise SystemExit("no CUDA GPU detected; kernel-agent needs one")
+        if cfg.program and not Path(cfg.program).expanduser().is_file():
+            raise SystemExit(f"program file not found: {cfg.program}")
         log(f"resolving {cfg.model_ref}")
         card = hub.resolve(cfg.model_ref, token=cfg.hf_token, modality=cfg.modality)
         log(
@@ -84,6 +86,7 @@ class Orchestrator:
             },
         )
         write_json(run.toolchain_json, tc.to_dict())
+        program.install(run, cfg.program)
         log(f"run directory: {run.root}")
         return cls(run, cfg)
 
@@ -92,6 +95,7 @@ class Orchestrator:
         run = RunDir(root.resolve())
         data = run.load()
         cfg = OptimizeConfig.from_dict({**data["config"], **(overrides or {})})
+        program.install(run, (overrides or {}).get("program"))  # keeps the run's edited copy
         return cls(run, cfg)
 
     # ------------------------------------------------------------ helpers
@@ -117,6 +121,8 @@ class Orchestrator:
         timeout = self.budget.start_agent(name)
         cfg = self.budget.agent_config(self.cfg)
         kwargs["system_append"] += self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
+        prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
+        kwargs["system_append"] += prog.prompt_note(name)
         timer = asyncio.timeout(timeout)
         try:
             async with timer:
@@ -155,6 +161,7 @@ class Orchestrator:
             "minutes": round(result.seconds / 60, 1),
             "tools": result.tool_calls,
             "session_id": result.session_id,
+            "program_sha256": prog.sha256,
             **({"timed_out": True} if result.timed_out else {}),
         }
         write_json(self.run.root / "costs.json", costs)

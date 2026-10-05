@@ -90,6 +90,33 @@ All limits are off by default (`kernel_agent/budget.py`).
 * Timeouts and budget stops are recorded under `run.json` → `phases.<phase>`
   (`timed_out`, `budget_skipped`), in `events.jsonl` and in `report.md`.
 
+### program.md: steering the agents
+
+You can steer the agents by editing a Markdown file instead of the code, as
+in karpathy/autoresearch (`kernel_agent/program.py`). Each `## <section>` is
+appended to the system prompt of the matching agents. `## all` goes to every
+agent. `## planner`, `## kernel` (each `kernel-<target>` agent), `## systems`
+and `## harness` go to that role only. A heading can name several roles
+(`## kernel, systems`). Unknown sections are ignored with a warning. Text
+above the first `##` heading and `<!-- comments -->` are not sent to agents.
+
+* `kernel-agent program init [path]` writes the default program for editing.
+  It covers measurement hygiene (absolute latencies, deltas below
+  max(1 %, 2 × timing spread) are noise), one hypothesis per evaluation, the
+  simplicity criterion, "abandoned after N attempts" instead of "X doesn't
+  work", optimising inference rather than the benchmark, and a few rules per
+  role.
+* `--program FILE` on `optimize` / `analyze` copies FILE to `<run>/program.md`.
+  Without the flag, the default is copied. `resume --program FILE` replaces
+  the run's copy. A plain `resume` keeps it, including your edits.
+* The run's `program.md` is read again before every agent session. Edits made
+  during a run apply to the next agent that starts, while running agents keep
+  the version they started with.
+* Provenance: `costs.json` stores `program_sha256` for each agent.
+  `run.json` → `program` stores the source and every version in use (sha256,
+  the first agent that used it, time). Each version is saved as
+  `logs/program-<sha12>.md`.
+
 ## Backends
 
 | backend | how | host overhead (tiny op, measured) |
@@ -131,10 +158,12 @@ kernel-agent optimize <hf-url> [options]
   --eval-timeout 300                   seconds per evaluate_candidate
   --budget-reserve 0.15                share of --max-hours kept for integrate + report
   --harness my_harness.py              your own workload
+  --program my_program.md              instructions for the agents (see "program.md")
   --until analyze|plan|capture|kernels|transforms|integrate
 
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
-kernel-agent resume <run_dir> [--redo kernels]
+kernel-agent resume <run_dir> [--redo kernels] [--program FILE]
+kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
@@ -165,6 +194,7 @@ print(run.report.read_text())
 ```
 runs/<org>--<name>/<timestamp>/
   run.json  toolchain.json  baseline.json  baseline_output.pt
+  program.md                  agent instructions; edit it mid-run to steer the agents
   profile/summary.md          profile handed to the planner
   plan.json                   targets + transforms
   targets/<id>/capture.pt     module + real inputs/outputs
@@ -177,8 +207,8 @@ runs/<org>--<name>/<timestamp>/
   results.tsv                 experiment ledger: one row per evaluation
   events.jsonl                phase changes, agent start/stop, evaluations
   progress.png  amdahl.png  integration.png  dashboard.html
-  integration.json  report.md  logs/
-  costs.json                  per agent: $, turns, minutes, tools, session_id
+  integration.json  report.md  logs/  (incl. logs/program-<sha12>.md)
+  costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256
   optimized/                  apply.py + manifest.json + kernels/
 ```
 
