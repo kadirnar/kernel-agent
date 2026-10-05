@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, strong_baseline
+from kernel_agent import ledger, library, strong_baseline
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
@@ -172,6 +172,7 @@ def write_report(run: RunDir) -> Path:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))
     lines += report_lines(run)  # `kernel-agent improve` slices, re-integrations, rounds
+    lines += library.report_lines(run)  # prior winners reused, entries stored, lessons
     if costs:
         total = sum(c.get("usd", 0) for c in costs.values())
         lines += [

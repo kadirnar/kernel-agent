@@ -11,6 +11,7 @@ an interrupted run can be resumed.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import re
 import sys
@@ -19,11 +20,11 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import hub, ledger, program, strong_baseline, toolchain, truth
+from kernel_agent import hub, ledger, library, program, strong_baseline, toolchain, truth
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import best_for_target, build_server, tool_names
-from kernel_agent.budget import Budget
+from kernel_agent.budget import MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.export import export_optimized
@@ -130,14 +131,21 @@ class Orchestrator:
     def _worker(self, command: str, *args: str) -> dict[str, Any]:
         return (self.worker or call_worker)(self.run, command, *args)
 
-    async def _agent(self, name: str, label: str | None = None, **kwargs: Any) -> AgentResult:
-        """Run an agent session; ``label`` keys its ``costs.json`` entry (default: ``name``)."""
+    async def _agent(
+        self,
+        name: str,
+        label: str | None = None,
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AgentResult:
+        """Run an agent session; ``label`` keys its ``costs.json`` entry (default: ``name``),
+        ``config`` overrides fields of the run's config for this session (e.g. the model)."""
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
         ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)
         result = AgentResult(name=name)
         timeout = self.budget.start_agent(name)
-        cfg = self.budget.agent_config(self.cfg)
+        cfg = self.budget.agent_config(dataclasses.replace(self.cfg, **(config or {})))
         kwargs["system_append"] += self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
         kwargs["system_append"] += prog.prompt_note(name)
         timer = asyncio.timeout(timeout)
@@ -317,6 +325,10 @@ class Orchestrator:
                     skip = {"agent": f"kernel-{target_id}", "reason": reason}
                     self.budget.note("kernels", "budget_skipped", skip)
                     return
+                await self.seed_library([target_id])  # prior winners first, no LLM cost
+                if reason := self._prior_suffices(target_id):
+                    log(f"kernels: {target_id}: no agent session needed: {reason}")
+                    return
                 target_dir = self.run.target(target_id)
                 spec = read_json(target_dir / "spec.json")
                 system = prompts.engineer_prompt(
@@ -327,7 +339,7 @@ class Orchestrator:
                     self.tc.summary(),
                     self.cfg.evaluations_per_target,
                     stats.get(spec["module_class"]),
-                )
+                ) + self._library_note(target_id, spec)
                 (target_dir / "NOTES.md").touch()
                 await self._agent(
                     f"kernel-{target_id}",
@@ -492,6 +504,7 @@ class Orchestrator:
         write_json(integration, result)
         self.truth.seal(integration)
         export_optimized(self.run, [(k, a, 0.0) for k, a in accepted], digests=digests)
+        self._library_store([a for k, a in accepted if k == "kernel"], final)
         if final:
             _, vs_compiled = strong_baseline.speedups(baseline, final["median_ms"])
             log(
@@ -575,6 +588,7 @@ class Orchestrator:
         """A fresh kernel-engineer session for ``target_id`` seeded with ``digest``."""
         profile = read_json(self.run.profile_dir / "profile.json", {})
         stats = {c["cls"]: c for c in profile.get("classes", [])}
+        await self.seed_library([target_id])  # no-op once the target was seeded
         target_dir = self.run.target(target_id)
         spec = read_json(target_dir / "spec.json")
         (target_dir / "NOTES.md").touch()
@@ -587,7 +601,7 @@ class Orchestrator:
             self.tc.summary(),
             evaluations,
             stats.get(spec["module_class"]),
-        )
+        ) + self._library_note(target_id, spec)
         return await self._agent(
             f"kernel-{target_id}",
             label,
@@ -699,6 +713,106 @@ class Orchestrator:
         path = write_report(self.run)
         self._mark("report")
         log(f"report: {path}")
+        await self.librarian()
+
+    # ------------------------------------------------------------ kernel library (library.py)
+
+    def _library_arch(self) -> str | None:
+        """GPU architecture whose library entries this run reads and writes (None: off)."""
+        gpu = getattr(self.tc, "gpu", None)
+        return gpu.arch if self.cfg.use_library and gpu is not None else None
+
+    async def seed_library(self, target_ids: list[str]) -> None:
+        """Evaluate matching library entries on targets not seeded yet (zero LLM cost)."""
+        if (arch := self._library_arch()) is None:
+            return
+        for target_id in target_ids:
+            if library.seeded(self.run, target_id) is not None:
+                continue
+            tried = await asyncio.to_thread(
+                library.seed_target,
+                self.run,
+                target_id,
+                arch=arch,
+                keeper=self.truth,
+                timeout=self.budget.eval_timeout_s,
+            )
+            library.remember_seed(self.run, target_id, tried)
+
+    def _prior_suffices(self, target_id: str) -> str | None:
+        """Why a target needs no agent: a prior winner already reaches the speed-of-light stop."""
+        from kernel_agent.kernels.roofline import sol_signal
+
+        if not library.seeded(self.run, target_id):
+            return None
+        best = best_for_target(self.run, target_id, self.truth)
+        pct = sol_signal(best) if best else None
+        if best is None or pct is None or pct < SOL_STOP_PCT:
+            return None
+        return f"prior winner {best['snapshot']} reaches {pct:.0f} % of its speed of light"
+
+    def _library_note(self, target_id: str, spec: dict[str, Any]) -> str:
+        """Engineer-prompt section: priors evaluated on the target + lessons ("" when off)."""
+        if self._library_arch() is None:
+            return ""
+        return library.prompt_note(self.run, target_id, spec)
+
+    def _library_store(self, accepted: list[str], final: dict[str, Any] | None) -> None:
+        """Store the verified module winners and accepted kernels (never fails the run)."""
+        if (arch := self._library_arch()) is None:
+            return
+        try:
+            stored = library.store_run(
+                self.run,
+                self.truth,
+                arch=arch,
+                gpu=getattr(self.tc.gpu, "name", None),
+                torch_version=getattr(self.tc, "torch_version", None),
+                accepted=accepted,
+                final=final,
+                min_speedup=self.cfg.min_speedup,
+            )
+        except Exception as exc:
+            log(f"library: storing this run's kernels failed: {exc!r}")
+            return
+        if stored:
+            library.remember_store(self.run, stored)
+            ledger.event(self.run, "library_store", entries=[s["entry"] for s in stored])
+            log(f"library: stored {', '.join(s['entry'] for s in stored)} in {library.root()}")
+
+    async def librarian(self) -> None:
+        """Distil the run's notes + ledger into the library's lessons (a cheap agent)."""
+        arch = self._library_arch()
+        if arch is None or not self.cfg.librarian or not library.librarian_due(self.run):
+            return
+        usd = self.budget.usd_left()
+        if usd is not None and usd < MIN_AGENT_USD:
+            log("librarian: skipped: the USD budget is spent")
+            return
+        names = library.lesson_names(self.run)
+        try:
+            result = await self._agent(
+                "librarian",
+                config={
+                    "claude_model": self.cfg.librarian_model or self.cfg.claude_model,
+                    "effort": self.cfg.librarian_effort,
+                    "max_turns_per_agent": 8,
+                },
+                prompt="Distil this run into the library's lessons files.",
+                system_append=library.librarian_prompt(self.run, names, arch=arch),
+                cwd=self.run.root,
+                mcp_tools=[],
+                output_format={"type": "json_schema", "schema": library.LESSONS_SCHEMA},
+            )
+        except Exception as exc:  # lessons are a bonus: never fail a finished run
+            log(f"librarian: failed: {exc!r}")
+            return
+        answer = result.structured
+        written = library.write_lessons(
+            answer if isinstance(answer, dict) else _extract_json(result.text), names
+        )
+        library.remember_librarian(self.run, written)
+        log(f"librarian: lessons {', '.join(p.name for p in written) or 'unchanged'}")
 
     async def run_all(self, until: str | None = None) -> RunDir:
         for phase in PHASES:

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 
@@ -9,3 +11,15 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "gpu" in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _private_library(tmp_path_factory):
+    """Tests never read or write the user's cross-run kernel library (library.py)."""
+    old = os.environ.get("KERNEL_AGENT_LIBRARY")
+    os.environ["KERNEL_AGENT_LIBRARY"] = str(tmp_path_factory.mktemp("library"))
+    yield
+    if old is None:
+        os.environ.pop("KERNEL_AGENT_LIBRARY", None)
+    else:
+        os.environ["KERNEL_AGENT_LIBRARY"] = old

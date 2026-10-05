@@ -354,6 +354,7 @@ class Improver:
                 return reason
             if self.icfg.max_slices is not None and done >= self.icfg.max_slices:
                 return f"--max-slices {self.icfg.max_slices} reached"
+            await self.orch.seed_library(self.targets())  # library priors before any slice
             arms = self.arms()
             arm = pick(arms)
             if arm is None:
@@ -782,6 +783,7 @@ async def improve(
                 for k in ("agent_minutes", "program", "budget_usd_per_agent")
                 if getattr(cfg, k) is not None
             },
+            **{k: False for k in ("use_library", "librarian") if not getattr(cfg, k)},
         }
         orch = Orchestrator.resume(path, overrides)
     elif dry_run:

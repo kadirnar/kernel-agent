@@ -524,6 +524,88 @@ Limits: the evaluation budget of a slice is advice to the agent. The hard caps
 are `--agent-minutes` and the run budgets. Targets found by a re-plan are
 captured from the unmodified model.
 
+### Kernel library and lessons (memory across runs)
+
+Runs used to forget everything. Now the kernels that won are kept per GPU
+architecture, and short lessons are distilled from the agents' notes, so the
+next run starts from them (AccelOpt, KernelBlaster and AdaExplore: slow→fast
+examples and validity rules; FlashInfer-Bench: a stored definition, solution
+and evaluation per kernel). The code is in `kernel_agent/library.py`.
+
+```
+~/.cache/kernel-agent/library/          ($KERNEL_AGENT_LIBRARY overrides it)
+  <sm_arch>/<module_class>/<entry-id>/  kernel.py  spec.json  result.json  NOTES.md  entry.json
+  lessons/<backend>.md  lessons/<module_family>.md
+```
+
+* **Store.** After every integration (`optimize` and each re-integration of
+  `improve`), kernel-agent stores two kinds of kernels. The first is the
+  verified best kernel of every target with at least `min_speedup` (1.03×),
+  flagged `module_winner`. The second is every kernel the integration accepted
+  end to end, flagged `accepted` (with the measured e2e speedup). `entry.json`
+  holds the model repo, torch version, GPU, dates and the module speedup and %
+  of SOL. It also holds a signature summary (entrypoints, dtypes, shapes of the
+  captured cases) and the sha256 of each of the other files. The entry id is
+  `<signature hash>-<code hash>`, so storing the same kernel again for the same
+  shapes updates the entry. `runs` lists every run that stored it, and `origin`
+  points to the entry it was first reused from.
+* **Reuse.** Library entries are evaluated before a target's first agent
+  session: at the start of the `optimize` kernels phase, and in `improve`
+  before the scheduler picks a slice. This costs no LLM calls. An entry
+  matches when it has the same module class and GPU architecture, implements
+  the target's entrypoints (`forward_step`, ...) and was verified on the
+  target's dtypes. Shapes may differ, because kernels read their sizes from the
+  module. Up to 3 matches are tried, closest shapes first. Each one is copied
+  to `candidates/prior_<entry-id>.py` and evaluated through the normal
+  truth-verified path (`capture_sha256`, snapshot, `results.jsonl`). Its ledger
+  row has the hypothesis `prior winner from <repo> (library entry <id>, 1.50x
+  there)`. A prior can set the target's best, but it does not count as an
+  attempt without a gain: neither the `consider_stopping` advice nor
+  `--patience` counts it. When a prior already reaches 90 % of its speed of
+  light, `optimize` skips the target's agent, and `improve` stops the arm.
+* **Prompt.** The engineer prompt lists the evaluated priors slow → fast, with
+  their numbers in the run that stored them and on this target. It then gives
+  the lessons for the target's module family and backends, at most 1,500
+  characters of whole rules:
+
+  ```
+  # Prior kernels from the library
+  1. `candidates/prior_02205747-95d63ec4.py` (triton, from `Qwen/Qwen3-0.6B`): 1.50x at
+     60 % of SOL there; here 1.40x at 55 % of SOL, `history/001_prior_..._3c9a.py`.
+     Approach: one program per row, fp32 accumulation
+  ```
+* **Librarian.** After the report, a cheap agent distils the run's `NOTES.md`
+  files and ledger rows (status, speedup, % of SOL, hypothesis) into short
+  rules, such as "do X when Y" or "Z fails because W (abandoned after N
+  attempts)". It merges them into `lessons/<backend>.md` and
+  `lessons/<module_family>.md` (`norm`, `attention`, `mlp`, `rope`, ...),
+  dropping duplicates and contradicted rules. It runs through the same code as
+  the other agents (budgets, `program.md` `## all`, events, `costs.json` →
+  `librarian`). It uses `--librarian-model` (default `--claude-model`) at
+  effort `low` and answers with structured output only. kernel-agent writes the
+  files itself: only names of this run's backends and module families, at most
+  20 rules each. The librarian runs again only when the ledger has new rows.
+* **Safety.** Entries are code that will run. An entry is reused only when
+  every file still has its recorded sha256. Otherwise a `LIBRARY: ... refused`
+  line and a `library_rejected` event are emitted. Entries of another GPU
+  architecture are never read: only `<this sm_arch>/` is searched, and each
+  entry's own `sm_arch` must match. A reused kernel passes the same correctness
+  checks as any candidate before it counts. The digests are tamper evidence,
+  not a signature, because the library is as reachable from an agent's Bash
+  tool as a run directory is.
+* `--no-library` turns off reading and writing the library, and
+  `--no-librarian` skips the lessons agent. Without a GPU (`improve --dry-run`),
+  the library is off. `run.json` → `library` records the priors tried, the
+  entries stored and the librarian's files, and `report.md` has a "Kernel
+  library" section.
+
+```bash
+kernel-agent library list [--arch sm_120] [--module-class LlamaRMSNorm]
+kernel-agent library show <id or prefix>       # metadata, integrity, cases, runs, notes
+kernel-agent library prune [--older-than DAYS] [--dry-run]   # broken (and old) entries
+kernel-agent library path
+```
+
 ## Backends
 
 | backend | how | host overhead (tiny op, measured) |
@@ -572,6 +654,8 @@ kernel-agent optimize <hf-url> [options]
   --until analyze|plan|capture|kernels|transforms|integrate
   --compile-baseline                   also measure a generic torch.compile baseline for
                                        workloads without reference_optimizations()
+  --no-library --no-librarian          cross-run kernel library / lessons agent off
+  --librarian-model MODEL              (see "Kernel library and lessons")
 
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
 kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4] [--rounds R]
@@ -585,6 +669,7 @@ kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--co
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
+kernel-agent library list|show <id>|prune [--older-than DAYS]|path   cross-run kernel library
 kernel-agent doctor [--smoke] [--remeasure-peaks]
 kernel-agent install-claude-code <project-dir>
 ```

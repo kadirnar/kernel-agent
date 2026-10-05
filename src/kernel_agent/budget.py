@@ -37,6 +37,9 @@ WRAP_UP_SECONDS = 120.0  # advice is "stop" when an agent has less time than thi
 SOL_STOP_PCT = 90.0  # advice is "stop" once a kernel reaches this % of its speed of light
 
 EVAL_TOOLS = ("evaluate_candidate", "evaluate_e2e")
+#: Hypothesis of the library's prior winners (library.py), evaluated before a target's agent
+#: starts: they may set the best result, but are not the agent's attempts without a gain.
+PRIOR_HYPOTHESIS = "prior winner from "
 
 
 # ------------------------------------------------------------ advice signals
@@ -66,13 +69,14 @@ def non_improving_streak(
     """Evaluations since the last one that improved on the best result so far.
 
     ``start`` is the speedup to beat before any record (1.0 = the reference).
-    Failed, incorrect and not-faster evaluations all extend the streak.
+    Failed, incorrect and not-faster evaluations all extend the streak, except
+    the library's prior winners (``PRIOR_HYPOTHESIS``).
     """
     best, streak = start, 0
     for rec in records:
         if improves(rec, best, ok_key=ok_key):
             best, streak = float(rec["speedup"]), 0
-        else:
+        elif not str(rec.get("hypothesis") or "").startswith(PRIOR_HYPOTHESIS):
             streak += 1
     return streak
 

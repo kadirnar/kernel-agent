@@ -80,6 +80,9 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         eval_timeout_s=ns.eval_timeout,
         program=ns.program,
         compile_baseline=ns.compile_baseline,
+        use_library=not ns.no_library,
+        librarian=not ns.no_librarian,
+        librarian_model=ns.librarian_model,
         hf_token=os.environ.get("HF_TOKEN"),
         verbose=ns.verbose,
     )
@@ -286,6 +289,13 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         help="analyze: time a generic torch.compile when the workload has no "
         "reference_optimizations() hook",
     )
+    p.add_argument(
+        "--no-library",
+        action="store_true",
+        help="do not reuse or store kernels and lessons of the cross-run library",
+    )
+    p.add_argument("--no-librarian", action="store_true", help="skip the lessons agent")
+    p.add_argument("--librarian-model", help="model of the librarian (default: --claude-model)")
     p.add_argument("--verbose", "-v", action="store_true")
 
 
@@ -394,6 +404,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=8765, help="0 picks a free port")
     p.add_argument("--host", default="127.0.0.1", help="interface to bind (default: localhost)")
     p.set_defaults(func=cmd_watch)
+
+    from kernel_agent import library
+
+    library.add_parser(sub).set_defaults(func=library.main)
 
     ns = parser.parse_args(argv)
     return int(ns.func(ns))
