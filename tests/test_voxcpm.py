@@ -1,15 +1,18 @@
-"""Built-in VoxCPM workload: family routing and teacher-forcing mechanics on a
-fake model (CPU), threshold calibration on the real VoxCPM2 (GPU)."""
+"""Built-in VoxCPM workload: family routing, teacher-forcing and natural-length
+mechanics on a fake model (CPU), threshold calibration and the stop-condition check
+on the real VoxCPM2 (GPU)."""
 
 import importlib.util
+from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
 from torch import nn
 
-from kernel_agent.workloads import create_workload
+from kernel_agent.workloads import create_workload, stopping
 from kernel_agent.workloads.base import WorkloadSpec
-from kernel_agent.workloads.voxcpm import VoxCPMWorkload
+from kernel_agent.workloads.voxcpm import NATURAL_TEXT, VoxCPMWorkload
 
 
 class FakeDecoder(nn.Module):
@@ -24,6 +27,14 @@ class FakeDecoder(nn.Module):
         return self.scale * mean + 0.1 * torch.randn(mean.shape)
 
 
+class FakeStopHead(nn.Module):
+    """``[continue, stop]`` logits from a clock feature (the last one): stop at patch 12."""
+
+    def forward(self, h):
+        stop = 2.0 * (h[:, -1] - 11.5) + 0.1 * torch.tanh(h[:, 0])
+        return torch.stack([torch.zeros_like(stop), stop], -1)
+
+
 class FakeVoxCPM(nn.Module):
     sample_rate = 16000
 
@@ -32,14 +43,16 @@ class FakeVoxCPM(nn.Module):
         torch.manual_seed(0)
         self.lm = nn.Linear(4, 4)
         self.feat_decoder = FakeDecoder()
+        self.stop_head = FakeStopHead()
         self.calls: list[dict] = []
         self.bypass = False
+        self.ignore_stop = False
 
     def generate(self, target_text, min_len, max_len, **kwargs):
-        self.calls.append({"min_len": min_len, "max_len": max_len, **kwargs})
+        self.calls.append({"text": target_text, "min_len": min_len, "max_len": max_len, **kwargs})
         x = torch.zeros(1, 4)
         feats = []
-        for _ in range(max_len):
+        for i in range(max_len):
             if self.bypass:
                 pred = torch.tanh(x).unsqueeze(-1).expand(-1, -1, 2)
             else:
@@ -47,6 +60,10 @@ class FakeVoxCPM(nn.Module):
                     mu=self.lm(x) * 3, patch_size=2, cond=None, n_timesteps=10, cfg_value=2.0
                 )
             feats.append(pred)
+            # as VoxCPM: the stop head on the state that produced this patch, every patch
+            logits = self.stop_head(torch.cat([x, torch.full((1, 1), float(i))], -1))
+            if i > min_len and int(logits.argmax(-1)[0]) == 1 and not self.ignore_stop:
+                break
             x = pred.mean(-1)
         return torch.cat(feats, -1).flatten().repeat(64).unsqueeze(0)  # "wav" [1, T]
 
@@ -124,6 +141,33 @@ def test_teacher_forcing_respects_transforms_that_wrap_run(fake):
     fake.run = wrapped  # what a model-level transform may do
     fake.run_teacher_forced(inputs, ref)
     assert seen == [inputs]
+
+
+def test_natural_length_run_lets_the_stop_head_decide(fake):
+    before = dict(fake.options)
+    ref = fake.natural_length_run()
+    call = fake.model.calls[-1]
+    assert call["text"] == NATURAL_TEXT and call["retry_badcase"] is False
+    assert call["min_len"] == 2 and call["max_len"] == 100
+    assert call["retry_badcase_ratio_threshold"] >= 100  # generate() never caps max_len
+    assert fake.options == before and "min_patches" not in fake.options
+    assert ref["steps"] == 13 == ref["latents"].shape[0] and ref["max_steps"] == 100
+    margins = ref["stop_margins"]
+    assert len(margins) == 13 and margins[-1] > 0 > max(margins[3:-1])
+    assert ref["output_length"] == ref["audio"].numel() > 0
+    summary = stopping.stop_summary(ref)
+    assert summary["stopped"] and summary["stop_step"] == 12
+
+    forced = fake.natural_length_run(ref)  # teacher forced: the same patches, the same stop
+    assert "stop_margins" not in forced
+    assert fake.compare_natural_length(ref, forced).passed
+    assert fake.run(fake.make_inputs())["latents"].shape[0] == 20  # the main run: fixed
+
+    fake.model.ignore_stop = True  # a transform that never consults the stop head
+    never = fake.natural_length_run(ref)
+    cmp = fake.compare_natural_length(ref, never)
+    assert never["steps"] == 100 and not cmp.passed and "never fires" in cmp.reason
+    assert fake.run(fake.make_inputs())["latents"].shape[0] == 20  # ... passes the main run
 
 
 # ---------------------------------------------------------------- GPU calibration
@@ -241,3 +285,80 @@ def test_voxcpm2_teacher_forcing_calibration(tmp_path):
     ):
         bad = verdict(cls_name, candidate)
         assert not bad["passed"] and bad["reason"].startswith("teacher-forced"), bad
+
+
+#: Verbatim copies of two decode-loop transforms by the systems agent of a live VoxCPM2
+#: run (runs/openbmb--VoxCPM2/20261005-042829/transforms/); both keep the stop semantics.
+STOP_TRANSFORMS = Path(__file__).with_name("voxcpm_transforms")
+#: async_stop_loop's stop check, and two broken versions of it.
+STOP_CHECK = (
+    "        stop_flag = stop_host.item()\n        if i > min_len and stop_flag == 1:\n"
+    "            break\n"
+)
+NEVER_STOP = "        stop_host.item()  # computed, never consulted\n"
+LATE_STOP = (  # the flag of step i is only acted on at step i + 1: one patch too many
+    "        if i > min_len + 1 and prev_flag == 1:\n            break\n"
+    "        prev_flag = stop_host.item()\n"
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _voxcpm2_cached(), reason="needs voxcpm + openbmb/VoxCPM2 in the HF cache")
+def test_voxcpm2_natural_length_checks_the_stop_condition(tmp_path):
+    from kernel_agent.integrate.patcher import PatchReport, apply_transforms
+    from kernel_agent.integrate.undo import Undo
+    from kernel_agent.workloads.quality import perturb_linears
+
+    wl = create_workload(WorkloadSpec(repo_id="openbmb/VoxCPM2", modality="tts", family="voxcpm"))
+    wl.load()
+    with torch.inference_mode():
+        ref = wl.natural_length_run()
+    info = stopping.stop_summary(ref)
+    assert info["stopped"] and 25 <= info["steps"] <= 60, info
+    near_tie = float(wl.options["stop_near_tie"])  # a clear decision at the stop and before it
+    assert info["stop_margin"] > 2 * near_tie and info["closest_margin"] > 2 * near_tie, info
+
+    async_src = (STOP_TRANSFORMS / "async_stop_loop.py").read_text()
+    assert async_src.count(STOP_CHECK) == 1
+    loop = "    for i in tqdm(range(max_len)):\n"
+    variants = {
+        "never_stop": async_src.replace(STOP_CHECK, NEVER_STOP),
+        "late_stop": async_src.replace(STOP_CHECK, LATE_STOP).replace(
+            loop, "    prev_flag = 0\n" + loop
+        ),
+    }
+    for name, source in variants.items():
+        (tmp_path / f"{name}.py").write_text(source)
+
+    def verdict(transform: Path | None = None) -> Any:
+        handles: list[Undo] = []
+        try:
+            if transform is not None:
+                apply_transforms(wl, [transform], PatchReport(), handles=handles)
+            with torch.inference_mode():
+                out = wl.natural_length_run(ref)
+            return out, wl.compare_natural_length(ref, out)
+        finally:
+            for handle in reversed(handles):
+                handle.undo()
+
+    for transform in (
+        STOP_TRANSFORMS / "async_stop_loop.py",
+        STOP_TRANSFORMS / "skip_dead_work.py",
+    ):
+        _, cmp = verdict(transform)
+        assert cmp.passed, (transform.name, cmp)
+    with perturb_linears(wl.roots()):  # a benign numerical change keeps the stop step
+        _, cmp = verdict()
+    assert cmp.passed, cmp
+
+    out, cmp = verdict(tmp_path / "never_stop.py")
+    assert not cmp.passed and out["steps"] == wl.options["natural_max_patches"], cmp
+    assert "never fires" in cmp.reason
+    out, cmp = verdict(tmp_path / "late_stop.py")
+    assert not cmp.passed and out["steps"] == info["steps"] + 1, cmp
+    assert "fires 1 step(s) late" in cmp.reason and cmp.metrics["differing_step_margin"] > near_tie
+    with wl.with_options({"stop_tolerance": 1}):  # ±1 only at a near-tie: still rejected
+        assert not wl.compare_natural_length(ref, out).passed
+    _, cmp = verdict()  # late_stop was undone
+    assert cmp.passed, cmp
