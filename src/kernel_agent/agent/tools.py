@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -12,13 +13,14 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from kernel_agent import ledger
+from kernel_agent import ledger, truth
 from kernel_agent.budget import Budget
 from kernel_agent.dashboard import refresh
 from kernel_agent.kernels.evaluate import run_evaluation
 from kernel_agent.kernels.roofline import sol_signal
+from kernel_agent.truth import TamperError, Truth, sha256_file
 from kernel_agent.worker import call_worker
-from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
+from kernel_agent.workspace import RunDir, append_jsonl, read_json
 
 SERVER_NAME = "ka"
 
@@ -37,11 +39,51 @@ def _resolve(base: Path, path: str) -> Path:
 
 def _snapshot(src: Path, history: Path) -> Path:
     history.mkdir(parents=True, exist_ok=True)
-    seq = len(list(history.glob("*.py"))) + 1
+    # after the highest number, not the count: a deleted snapshot must not cause a clash
+    numbers = [int(m[1]) for p in history.glob("*.py") if (m := re.match(r"(\d+)_", p.name))]
+    seq = 1 + max(numbers, default=0)
     digest = hashlib.sha1(src.read_bytes()).hexdigest()[:8]
     dst = history / f"{seq:03d}_{src.stem}_{digest}.py"
     shutil.copy2(src, dst)
     return dst
+
+
+def _agent_dir(run: RunDir, target_id: str | None) -> Path:
+    """The agent's working directory of a target (``None``: the transforms)."""
+    return run.target(target_id) if target_id else run.transforms_dir
+
+
+def snapshot(run: RunDir, src: Path, target_id: str | None = None) -> Path:
+    """Snapshot ``src`` into the history of a target (``None``: of the transforms).
+
+    The snapshot is what gets evaluated and integrated; in a run with ``.truth/``
+    it is read-only there and the agent gets a copy in its own ``history/``."""
+    snap = _snapshot(src, run.history_dir(target_id))
+    if run.sealed():
+        truth.read_only(snap)
+        copy = truth.replace(_agent_dir(run, target_id) / "history" / snap.name)
+        shutil.copyfile(snap, copy)
+    return snap
+
+
+def _append(
+    run: RunDir, target_id: str | None, record: dict[str, Any], keeper: Truth | None
+) -> None:
+    """Append an evaluation record (``.truth/`` + the agent's copy, or the old place)."""
+    (keeper or truth.of(run)).append(run.results_file(target_id), record)
+    if run.sealed():
+        append_jsonl(_agent_dir(run, target_id) / "results.jsonl", record)
+
+
+def _in_truth(run: RunDir, path: Path) -> dict[str, Any] | None:
+    """Error result for a path inside ``.truth/`` (agents work on their own copies)."""
+    if not path.resolve().is_relative_to(run.truth_dir.resolve()):
+        return None
+    return {
+        "status": "error",
+        "error": f"{path} is inside {truth.TRUTH_DIR}/, the evaluator's ground truth; use the "
+        "files in your working directory (candidates/, history/)",
+    }
 
 
 def compact(result: dict[str, Any]) -> dict[str, Any]:
@@ -118,8 +160,15 @@ def record_candidate(
     parent: str | None = None,
     eval_s: float | None = None,
     when: float | None = None,
+    snapshot_sha256: str | None = None,
+    keeper: Truth | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Append a kernel evaluation to ``results.jsonl`` and the run ledger."""
+    """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
+
+    The record carries the sha256 of the snapshot it measured (``snapshot_sha256``,
+    computed from ``snap`` when not given); winners are picked only from records
+    whose snapshot still has it. ``keeper``: this process's :class:`Truth` of the run.
+    """
     target_dir = run.target(target_id)
     row = ledger.record_kernel(
         run,
@@ -137,7 +186,8 @@ def record_candidate(
         "candidate": str(src.relative_to(target_dir))
         if src.is_relative_to(target_dir)
         else str(src),
-        "snapshot": str(snap.relative_to(target_dir)),
+        "snapshot": f"history/{snap.name}",
+        "snapshot_sha256": snapshot_sha256 or sha256_file(snap),
         **{k: v for k, v in result.items() if k not in ("kernels_candidate", "kernels_reference")},
         "exp": row["exp"],
         "ledger_status": row["status"],
@@ -147,7 +197,7 @@ def record_candidate(
     }
     if isinstance(record.get("error"), str):
         record["error"] = record["error"][-1500:]
-    append_jsonl(target_dir / "results.jsonl", record)
+    _append(run, target_id, record, keeper)
     return record, row
 
 
@@ -160,8 +210,10 @@ def record_e2e_result(
     hypothesis: str = "",
     eval_s: float | None = None,
     when: float | None = None,
+    keeper: Truth | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Append an ``evaluate_e2e`` measurement to ``transforms/results.jsonl`` and the ledger."""
+    """Append an ``evaluate_e2e`` measurement to the transforms' ``results.jsonl`` and the
+    ledger; ``transforms_sha256`` holds the digests of the snapshots it measured."""
     row = ledger.record_e2e(
         run,
         result,
@@ -173,32 +225,44 @@ def record_e2e_result(
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
-        "transforms": [str(s.relative_to(run.transforms_dir)) for s in snaps],
+        "transforms": [f"history/{s.name}" for s in snaps],
+        "transforms_sha256": [sha256_file(s) for s in snaps],
         "kernels": kernels,
         **result,
         "exp": row["exp"],
         "ledger_status": row["status"],
         "hypothesis": hypothesis,
     }
-    append_jsonl(run.transforms_dir / "results.jsonl", record)
+    _append(run, None, record, keeper)
     return record, row
 
 
-def best_for_target(run: RunDir, target_id: str) -> dict[str, Any] | None:
-    best = None
-    for rec in read_jsonl(run.target(target_id) / "results.jsonl"):
-        if (
-            rec.get("correct")
-            and rec.get("speedup") is not None
-            and (best is None or rec["speedup"] > best["speedup"])
-        ):
-            best = rec
-    return best
+def best_for_target(
+    run: RunDir, target_id: str, keeper: Truth | None = None
+) -> dict[str, Any] | None:
+    """The fastest correct record of a target whose snapshot is still the evaluated file.
+
+    Only records kernel-agent wrote count (lines appended by anyone else are
+    ignored); a target whose records were modified has no winner."""
+    keeper = keeper or truth.of(run)
+    try:
+        records = keeper.records(run.results_file(target_id))
+    except TamperError:
+        return None
+    ranked = [r for r in records if r.get("correct") and r.get("speedup") is not None]
+    ranked.sort(key=lambda r: -float(r["speedup"]))  # stable: the first of equals wins
+    history = run.history_dir(target_id)
+    for rec in ranked:
+        name = Path(str(rec.get("snapshot", ""))).name
+        if keeper.snapshot_ok(history / name, rec.get("snapshot_sha256")):
+            return rec
+    return None
 
 
-def build_server(run: RunDir, budget: Budget | None = None) -> Any:
-    """Tools bound to one run directory (and its budget: eval timeout + advice)."""
+def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None = None) -> Any:
+    """Tools bound to one run directory (its budget: eval timeout + advice; its truth)."""
     budget = budget or Budget(run)
+    keeper = keeper or truth.of(run)
 
     @tool(
         "evaluate_candidate",
@@ -230,10 +294,14 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
         },
     )
     async def evaluate_candidate(args: dict[str, Any]) -> dict[str, Any]:
-        target_dir = run.target(args["target_id"])
-        if not (target_dir / "capture.pt").exists():
-            return _text({"status": "error", "error": f"unknown target {args['target_id']}"})
+        target_id = args["target_id"]
+        target_dir = run.target(target_id)
+        capture = run.capture_file(target_id)
+        if not capture.exists():
+            return _text({"status": "error", "error": f"unknown target {target_id}"})
         src = _resolve(target_dir, args["candidate"])
+        if (refused := _in_truth(run, src)) is not None:
+            return _text(refused)
         if not src.exists():
             return _text({"status": "error", "error": f"{src} does not exist"})
         hypothesis = str(args.get("hypothesis") or "").strip()
@@ -245,35 +313,52 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
                     "it should be faster",
                 }
             )
-        snap = _snapshot(src, target_dir / "history")
+        try:
+            capture_sha256 = keeper.expect(capture)
+        except TamperError as exc:
+            return _text({"status": "error", "error": str(exc)})
+        snap = snapshot(run, src, target_id)
+        snap_sha256 = sha256_file(snap)
         start = time.perf_counter()
         result = await asyncio.to_thread(
             run_evaluation,
-            target_dir / "capture.pt",
+            capture,
             snap,
             profile=bool(args.get("profile")),
             timeout=budget.eval_timeout_s,
+            capture_sha256=capture_sha256,
         )
+        if result.get("status") == "tampered":  # the evaluator refused the capture
+            keeper.alarm(capture, str(result.get("error")))
+        elif sha256_file(snap) != snap_sha256:
+            keeper.alarm(snap, "snapshot changed during its evaluation")
+            result = {
+                "status": "tampered",
+                "correct": False,
+                "error": f"{snap.name} changed while it was evaluated; result discarded",
+            }
         _, row = record_candidate(
             run,
-            args["target_id"],
+            target_id,
             src,
             snap,
             result,
             hypothesis=hypothesis,
             parent=args.get("parent"),
             eval_s=round(time.perf_counter() - start, 1),
+            snapshot_sha256=snap_sha256,
+            keeper=keeper,
         )
-        await asyncio.to_thread(refresh, run, args["target_id"])
+        await asyncio.to_thread(refresh, run, target_id)
         out = compact(result)
         out["ledger"] = {"exp": row["exp"], "status": row["status"]}
-        best = best_for_target(run, args["target_id"])
+        best = best_for_target(run, target_id, keeper)
         out["best_so_far"] = (
             {"snapshot": best["snapshot"], "speedup": best["speedup"]} if best else None
         )
         out |= budget.feedback(
-            f"kernel-{args['target_id']}",
-            target_dir / "results.jsonl",
+            f"kernel-{target_id}",
+            run.results_file(target_id),
             budget.kernel_evals,
             pct_of_sol=sol_signal(result),
         )
@@ -285,8 +370,11 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
         {"target_id": str},
     )
     async def best_result(args: dict[str, Any]) -> dict[str, Any]:
-        records = read_jsonl(run.target(args["target_id"]) / "results.jsonl")
-        best = best_for_target(run, args["target_id"])
+        try:
+            records = keeper.records(run.results_file(args["target_id"]))
+        except TamperError as exc:
+            return _text({"status": "error", "error": str(exc)})
+        best = best_for_target(run, args["target_id"], keeper)
         return _text(
             {
                 "evaluations": len(records),
@@ -332,16 +420,21 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
         snaps = []
         for t in args.get("transforms") or []:
             src = _resolve(run.transforms_dir, t)
+            if (refused := _in_truth(run, src)) is not None:
+                return _text(refused)
             if not src.exists():
                 return _text({"status": "error", "error": f"{src} does not exist"})
-            snap = _snapshot(src, run.transforms_dir / "history")
+            snap = snapshot(run, src)
             snaps.append(snap)
             cli += ["--transform", str(snap)]
         for k in args.get("kernels") or []:
             target_id, _, path = k.partition("=")
-            cli += ["--kernel", f"{target_id}={_resolve(run.target(target_id), path)}"]
+            kernel = _resolve(run.target(target_id), path)
+            if (refused := _in_truth(run, kernel)) is not None:
+                return _text(refused)
+            cli += ["--kernel", f"{target_id}={kernel}"]
         start = time.perf_counter()
-        result = await asyncio.to_thread(call_worker, run, "e2e", *cli)
+        result = await asyncio.to_thread(call_worker, run, "e2e", *cli, *keeper.worker_args())
         _, row = record_e2e_result(
             run,
             result,
@@ -349,13 +442,14 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
             args.get("kernels") or [],
             hypothesis=str(args.get("hypothesis") or ""),
             eval_s=round(time.perf_counter() - start, 1),
+            keeper=keeper,
         )
         await asyncio.to_thread(refresh, run)
         result["ledger"] = {"exp": row["exp"], "status": row["status"]}
         if isinstance(result.get("error"), str):
             result["error"] = result["error"][-3000:]
         result |= budget.feedback(
-            "systems", run.transforms_dir / "results.jsonl", budget.transform_evals, ok_key="passed"
+            "systems", run.results_file(), budget.transform_evals, ok_key="passed"
         )
         return _text(result)
 
@@ -388,7 +482,7 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
             "workload": baseline.get("workload"),
             "plan": read_json(run.plan_json),
             "targets": {
-                t: (best_for_target(run, t) or {}).get("speedup") for t in run.target_ids()
+                t: (best_for_target(run, t, keeper) or {}).get("speedup") for t in run.target_ids()
             },
         }
         return _text(info)

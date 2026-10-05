@@ -37,9 +37,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import ledger, program
+from kernel_agent import ledger, program, truth
 from kernel_agent.agent.runner import AgentResult
-from kernel_agent.agent.tools import _snapshot, record_candidate, record_e2e_result
+from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.budget import Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.kernels.roofline import sol_signal
@@ -352,6 +352,7 @@ def create_run(cfg: OptimizeConfig, seed: int = 0) -> RunDir:
             "phases": {p: {"done": True} for p in ("analyze", "plan", "capture")},
             "created": ledger.stamp(t0),
             "dry_run": {"seed": seed},
+            "truth": truth.new_section(),
         },
     )
     write_json(run.toolchain_json, {"gpu": {"name": "simulated", "arch": "sm_120"}})
@@ -364,6 +365,7 @@ def create_run(cfg: OptimizeConfig, seed: int = 0) -> RunDir:
             "deterministic": True,
         },
     )
+    truth.of(run).seal_baseline(BASELINE_MS)
     write_json(run.profile_dir / "profile.json", profile)
     (run.profile_dir / "summary.md").write_text(_summary(profile, BASELINE_MS))
     write_json(run.plan_json, plan)
@@ -487,7 +489,7 @@ class World:
             src.write_text(
                 f'{header}\n"""{hypothesis}"""\n\n\ndef build(reference):\n    return reference\n'
             )
-            snap = _snapshot(src, target_dir / "history")
+            snap = snapshot(self.run, src, target_id)
             result = kernel_result(outcome, ref_ms, instances, sim)
             _, row = record_candidate(
                 self.run,
@@ -504,7 +506,7 @@ class World:
             _note(target_dir / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
             if self.hook:
                 self.hook(f"kernel-{target_id}", used)
-            results = target_dir / "results.jsonl"
+            results = self.run.results_file(target_id)
             evals = self.orch.budget.kernel_evals
             if self._advice(f"kernel-{target_id}", results, evals, rng, sol_signal(result)):
                 return used
@@ -537,7 +539,7 @@ class World:
             self.clock.advance(rng.uniform(240, 420))
             src = self.run.transforms_dir / f"{stem}.py"
             src.write_text(f'"""{hypothesis}"""\n\n\ndef apply(workload):\n    pass\n')
-            snap = _snapshot(src, self.run.transforms_dir / "history")
+            snap = snapshot(self.run, src)
             if isinstance(outcome, str):
                 result: dict[str, Any] = {
                     "status": outcome,
@@ -559,7 +561,7 @@ class World:
             _note(self.run.transforms_dir / "NOTES.md", row, SYSTEM_TWEAKS[k % 3 :][:2])
             if self.hook:
                 self.hook("systems", used)
-            results = self.run.transforms_dir / "results.jsonl"
+            results = self.run.results_file()
             if self._advice("systems", results, self.orch.budget.transform_evals, rng):
                 return used
 
@@ -613,7 +615,7 @@ class World:
             rec = snapshot_record(self.run, target_id, path) or {}
             speedups[target_id] = float(rec.get("speedup") or 1.0)
         families: dict[str, float] = {}
-        records = read_jsonl(self.run.transforms_dir / "results.jsonl")
+        records = read_jsonl(self.run.results_file())
         for path in transforms:
             name = Path(path).name
             rec = next((r for r in records if Path(r["transforms"][0]).name == name), {})

@@ -247,7 +247,7 @@ def snapshot_record(run: RunDir, target_id: str, snapshot: str | None) -> dict[s
     if not snapshot:
         return None
     name = Path(snapshot).name
-    for rec in reversed(read_jsonl(run.target(target_id) / "results.jsonl")):
+    for rec in reversed(read_jsonl(run.results_file(target_id))):
         if Path(str(rec.get("snapshot", ""))).name == name:
             return rec
     return None

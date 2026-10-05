@@ -87,6 +87,38 @@ are deep-copied outside the timed region. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
 wall-clock latency of the whole workload.
 
+### Ground truth the agents cannot quietly change
+
+Agents have a Bash tool, so file permissions alone cannot protect what the
+evaluator trusts. Everything it trusts lives in `<run>/.truth/`, outside the
+agents' working directories: the full captures (with reference outputs and
+post-call state), the baseline output, every evaluation record and every
+evaluated snapshot. The agent's `targets/<id>/` holds `capture_inputs.pt`
+(module + inputs, no outputs) for local debugging, plus copies of its
+snapshots (`history/`) and records (`results.jsonl`) that nothing reads back.
+
+Truth files are `chmod a-w`, and their sha256 is recorded when kernel-agent
+writes them: in the orchestrator's memory (the authority) and in `run.json` →
+`truth` for a resumed run. They are checked before use:
+
+* `evaluate_candidate` passes the capture's digest to the evaluator
+  subprocess, which hashes the bytes it loads; a changed capture is refused
+  (`status: tampered`). A snapshot that changes during its evaluation voids
+  the result.
+* `e2e` gets the baseline latency from the orchestrator (`--baseline-ms`) and
+  verifies `baseline.json` and the baseline output (`--verify`).
+* Each record stores its snapshot's sha256. Winners (`best_for_target`), the
+  integration and the export use only records kernel-agent wrote (lines
+  appended by anyone else are ignored) whose snapshot still has that digest.
+  The integration's reuse cache comes only from an unmodified
+  `integration.json`.
+
+A mismatch is refused with a `TAMPER` line on stderr and a `tamper` event in
+`events.jsonl`. Runs created before `.truth/` existed are read from their old
+paths without these checks. The evaluator runs candidate code in the same
+user account, so a candidate could still read `.truth/` at run time; process
+isolation is a separate step.
+
 ### Entrypoints other than `forward`
 
 Custom decode loops often call module methods directly, e.g. VoxCPM's
@@ -414,6 +446,7 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE]
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
+                                       (a full capture, e.g. <run_dir>/.truth/captures/<id>.pt)
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
@@ -443,17 +476,22 @@ print(run.report.read_text())
 
 ```
 runs/<org>--<name>/<timestamp>/
-  run.json  toolchain.json  baseline.json  baseline_output.pt
+  run.json  toolchain.json  baseline.json
   program.md                  agent instructions; edit it mid-run to steer the agents
   profile/summary.md          profile handed to the planner
   plan.json                   targets + transforms
-  targets/<id>/capture.pt     module + real inputs/outputs
+  .truth/                     what the evaluator trusts (read-only, sha256 in run.json):
+    baseline_output.pt          output of the baseline run
+    captures/<id>.pt            module + real inputs/outputs + post-call state
+    targets/<id>/history/       snapshot of every evaluated version
+    targets/<id>/results.jsonl  every evaluation (full record + snapshot sha256)
+    transforms/                 history/ + results.jsonl of the transforms
+  targets/<id>/capture_inputs.pt  module + real inputs (no outputs), for the agent
   targets/<id>/reference_source.py
   targets/<id>/candidates/    files the agent writes
-  targets/<id>/history/       snapshot of every evaluated version
-  targets/<id>/results.jsonl  every evaluation (full record)
+  targets/<id>/history/ results.jsonl   the agent's copies (never read back)
   targets/<id>/progress.png   speedup per evaluation (see "Charts")
-  transforms/                 model-level transforms + results.jsonl
+  transforms/                 model-level transforms (+ the agent's copies)
   results.tsv                 experiment ledger: one row per evaluation
   events.jsonl                phase changes, agent start/stop, evaluations
   progress.png  amdahl.png  integration.png  dashboard.html
@@ -501,9 +539,10 @@ layout.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
   there is no custom kernel).
-* `results.jsonl` still has the full records (cases, errors) plus `exp`,
-  `ledger_status` and `hypothesis`. For runs that predate the ledger, the
-  rows are rebuilt from the `results.jsonl` files.
+* `results.jsonl` (in `.truth/`) still has the full records (cases, errors)
+  plus `exp`, `ledger_status`, `hypothesis` and the snapshot's sha256. For
+  runs that predate the ledger, the rows are rebuilt from the `results.jsonl`
+  files.
 
 `kernel-agent status <run_dir> [--watch SECONDS]` prints the current phase, the
 baseline, the projected and measured end-to-end latency, the total cost from

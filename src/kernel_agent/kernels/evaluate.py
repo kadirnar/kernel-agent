@@ -37,6 +37,7 @@ from typing import Any
 
 from kernel_agent.gpulock import child_env, gpu_lock
 from kernel_agent.kernels.roofline import annotate, ensure_peaks
+from kernel_agent.truth import TamperError
 
 COMPILE_MARKER = "@@KA_COMPILE_S@@"  # on stderr, so a timed-out run still reports it
 
@@ -97,9 +98,11 @@ def evaluate(
     l2_flush: bool = False,
     compile_baseline: bool = False,
     device: str | None = None,
+    capture_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Build, check and time one candidate.  ``device`` defaults to CUDA when
-    available; on CPU only correctness is checked (timing needs CUDA events)."""
+    available; on CPU only correctness is checked (timing needs CUDA events).
+    ``capture_sha256``: refuse (status ``tampered``) a capture without this digest."""
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,7 +123,17 @@ def evaluate(
         "correct": False,
     }
     t0 = time.perf_counter()
-    capture = load_capture(capture_path, device=device)
+    try:
+        capture = load_capture(capture_path, device=device, sha256=capture_sha256)
+    except TamperError as exc:
+        result.update(status="tampered", error=str(exc))
+        return result
+    if capture.get("inputs_only"):
+        result["error"] = (
+            f"{capture_path} is an inputs-only capture (no reference outputs); use the "
+            "evaluate_candidate tool, or the full capture in the run's .truth/captures/"
+        )
+        return result
     reference = capture["module"].eval()
     cases = capture["cases"]
     for case in cases:
@@ -298,8 +311,10 @@ def run_evaluation(
     l2_flush: bool = False,
     compile_baseline: bool = False,
     timeout: float = 300.0,
+    capture_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Evaluate in a fresh subprocess under the GPU lock."""
+    """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``: see
+    :func:`evaluate`; the subprocess checks the bytes it loads)."""
     cmd = [
         sys.executable,
         "-m",
@@ -315,6 +330,8 @@ def run_evaluation(
         cmd.append("--l2-flush")
     if compile_baseline:
         cmd.append("--compile-baseline")
+    if capture_sha256:
+        cmd += ["--capture-sha256", capture_sha256]
     with gpu_lock():
         ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
         try:
@@ -344,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", action="store_true", help="add per-kernel tables")
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--compile-baseline", action="store_true")
+    parser.add_argument("--capture-sha256", help="refuse a capture without this digest")
     parser.add_argument("--json", default=None, help="write result JSON ('-' = stdout marker)")
     ns = parser.parse_args(argv)
     try:
@@ -353,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             profile=ns.profile,
             l2_flush=ns.l2_flush,
             compile_baseline=ns.compile_baseline,
+            capture_sha256=ns.capture_sha256,
         )
     except Exception:
         result = {"status": "harness_error", "correct": False, "error": _short_tb()}

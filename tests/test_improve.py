@@ -11,7 +11,7 @@ import struct
 import pytest
 
 from kernel_agent import charts, cli, dryrun, improve, ledger, orchestrator, scheduler
-from kernel_agent.agent.tools import record_candidate, record_e2e_result
+from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.improve import ImproveConfig, Improver, kernel_digest, open_ideas
 from kernel_agent.scheduler import KERNEL, SYSTEMS, Arm, Policy, build_arms, pick, rank, stop_reason
@@ -123,7 +123,7 @@ def test_build_arms_from_ledger(tmp_path):
     def evaluate(target, outcome, pct=None):
         src = run.target(target) / "candidates" / "v.py"
         src.write_text("import torch\n")
-        snap = dryrun._snapshot(src, run.target(target) / "history")
+        snap = snapshot(run, src, target)
         record_candidate(run, target, src, snap, _kernel(outcome, pct=pct), hypothesis="h")
 
     for outcome in (1.2, "incorrect", 1.5, 1.49, "build_error"):
@@ -132,7 +132,7 @@ def test_build_arms_from_ledger(tmp_path):
     evaluate("mlp", 1.7, pct=93.0)
     transform = run.transforms_dir / "static_cache.py"
     transform.write_text("def apply(workload): pass\n")
-    snap = dryrun._snapshot(transform, run.transforms_dir / "history")
+    snap = snapshot(run, transform)
     record_e2e_result(run, dryrun._e2e_result(BASE / 1.25), [snap], [], hypothesis="cache")
     integration = dryrun._e2e_result(BASE / 1.9)
     ledger.record_e2e(run, integration, backend="integrate", snapshot="x", hypothesis="all")
@@ -172,7 +172,7 @@ def test_open_ideas_and_digest_are_bounded(tmp_path):
     for i in range(40):
         src = run.target("attn") / "candidates" / f"v{i}.py"
         src.write_text("import triton\n")
-        snap = dryrun._snapshot(src, run.target("attn") / "history")
+        snap = snapshot(run, src, "attn")
         record_candidate(run, "attn", src, snap, _kernel(1.0 + 0.03 * i), hypothesis=f"idea {i}")
     (run.target("attn") / "NOTES.md").write_text("x" * 50_000 + "\n## Open ideas\n- tile 64\n")
     arm = next(a for a in build_arms(run, Policy(), []) if a.id == "attn")

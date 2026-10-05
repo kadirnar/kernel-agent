@@ -12,7 +12,7 @@ experiment:
 * ``discard`` correct, but not better
 * ``incorrect``, ``build_error``, ``runtime_error``, ``crash``, ``timeout``: failures
 
-``targets/<id>/results.jsonl`` keeps the full records; the TSV is the readable
+``results.jsonl`` (``RunDir.results_file``) keeps the full records; the TSV is the readable
 summary that the charts, ``kernel-agent status`` and ``dashboard.html`` read.
 """
 
@@ -324,8 +324,8 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
 
     for target_id in run.target_ids():
         kept: list[dict[str, Any]] = []
-        for rec in read_jsonl(run.target(target_id) / "results.jsonl"):
-            snap = run.target(target_id) / str(rec.get("snapshot", ""))
+        for rec in read_jsonl(run.results_file(target_id)):
+            snap = run.history_dir(target_id) / Path(str(rec.get("snapshot", ""))).name
             row = {
                 "time": when(rec),
                 "target": target_id,
@@ -346,7 +346,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
             kept.append(row)
             out.append(row)
     kept = []
-    for rec in read_jsonl(run.transforms_dir / "results.jsonl"):
+    for rec in read_jsonl(run.results_file()):
         base, new = _num(rec.get("baseline_ms")), _num(rec.get("median_ms"))
         row = {
             "time": when(rec),

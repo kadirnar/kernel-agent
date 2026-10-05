@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import hub, ledger, program, toolchain
+from kernel_agent import hub, ledger, program, toolchain, truth
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import best_for_target, build_server, tool_names
@@ -31,7 +31,7 @@ from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
 from kernel_agent.workloads.base import WorkloadSpec
 from kernel_agent.workloads.quality import probe_messages
-from kernel_agent.workspace import RunDir, read_json, read_jsonl, write_json
+from kernel_agent.workspace import RunDir, read_json, write_json
 
 PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"]
 
@@ -46,7 +46,8 @@ class Orchestrator:
         self.cfg = cfg
         self.tc = toolchain.setup()
         self.budget = Budget.from_config(run, cfg)
-        self.server = build_server(run, self.budget)
+        self.truth = truth.of(run)  # digests of the evaluator's ground truth (truth.py)
+        self.server = build_server(run, self.budget, self.truth)
         self.env = agent_env(self.tc.env)
         self.python = sys.executable
         self.agent_results: list[AgentResult] = []
@@ -89,6 +90,7 @@ class Orchestrator:
                 "config": cfg.to_dict(),
                 "phases": {},
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "truth": truth.new_section(),  # ground truth in .truth/, hashed
             },
         )
         from kernel_agent.kernels.roofline import ensure_peaks
@@ -201,6 +203,7 @@ class Orchestrator:
             log("WARNING: workload output is not deterministic; quality checks may be noisy")
         for message in probe_messages(result):  # sensitivity probe / teacher forcing
             log(message)
+        self.truth.seal_baseline(result["median_ms"])  # baseline.json + baseline_output.pt
         self._mark("analyze", baseline_ms=result["median_ms"])
 
     async def write_harness(self, error: str) -> None:
@@ -287,6 +290,8 @@ class Orchestrator:
                 log(f"capture: {t['id']} failed, dropping target:\n{info['error'][-800:]}")
                 (target_dir / "spec.json").rename(target_dir / "spec.failed.json")
                 continue
+            if (capture := self.run.capture_file(t["id"])).exists():
+                self.truth.seal(capture)
             log(f"capture: {t['id']} cases={[(c['signature'], c['count']) for c in info['cases']]}")
             kept.append(t["id"])
         return kept
@@ -329,7 +334,7 @@ class Orchestrator:
                     mcp_tools=tool_names("evaluate_candidate", "best_result"),
                     add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
                 )
-                best = best_for_target(self.run, target_id)
+                best = best_for_target(self.run, target_id, self.truth)
                 log(
                     f"kernels: {target_id} best = "
                     + (f"{best['speedup']}x ({best['snapshot']})" if best else "none correct")
@@ -379,14 +384,22 @@ class Orchestrator:
         )
         self._mark("transforms")
 
-    def _kernel_winners(self) -> list[tuple[str, str, float]]:
-        """(target_id, snapshot path, module speedup) of every kernel worth integrating."""
-        winners = []
+    def _kernel_bests(self) -> list[tuple[str, dict[str, Any]]]:
+        """(target_id, verified best record) of every kernel worth integrating."""
+        bests = []
         for target_id in self.run.target_ids():
-            best = best_for_target(self.run, target_id)
+            best = best_for_target(self.run, target_id, self.truth)
             if best and best["speedup"] >= self.cfg.min_speedup:
-                path = self.run.target(target_id) / best["snapshot"]
-                winners.append((target_id, str(path), float(best["speedup"])))
+                bests.append((target_id, best))
+        return bests
+
+    def _kernel_winners(self) -> list[tuple[str, str, float]]:
+        """(target_id, snapshot path, module speedup) of every kernel worth integrating,
+        for prompts: the snapshot copies in the targets' own ``history/``."""
+        winners = []
+        for target_id, best in self._kernel_bests():
+            path = self.run.target(target_id) / "history" / Path(best["snapshot"]).name
+            winners.append((target_id, str(path), float(best["speedup"])))
         return winners
 
     async def integrate(self, reuse: bool = False) -> None:
@@ -398,28 +411,18 @@ class Orchestrator:
         ``reuse`` (re-integrations of the improve loop) takes combinations of the
         same snapshot files that the previous integration measured from
         ``integration.json`` instead of measuring them again.
+
+        Everything comes from the verified truth (``truth.py``): the baseline
+        latency the orchestrator recorded, records and snapshots whose digests
+        match, and a reuse cache only from an unmodified ``integration.json``.
         """
-        baseline = read_json(self.run.baseline_json, {})
-        base_ms = float(baseline["median_ms"])
-        items: list[tuple[str, str]] = [
-            ("kernel", f"{tid}={path}") for tid, path, _ in self._kernel_winners()
-        ]
-        best_tf: dict[str, dict[str, Any]] = {}
-        for rec in read_jsonl(self.run.transforms_dir / "results.jsonl"):
-            if rec.get("passed") and not rec.get("kernels") and len(rec.get("transforms", [])) == 1:
-                stem = re.sub(r"^\d+_|_[0-9a-f]{8}$", "", Path(rec["transforms"][0]).stem)
-                if rec["speedup"] > 1.0 and (
-                    stem not in best_tf or rec["speedup"] > best_tf[stem]["speedup"]
-                ):
-                    best_tf[stem] = rec
-        items += [
-            ("transform", str(self.run.transforms_dir / rec["transforms"][0]))
-            for rec in best_tf.values()
-        ]
+        base_ms = self.truth.baseline_ms()
+        items, digests = self._integration_items()
         log(f"integrate: {len(items)} candidate optimisations")
 
         history: list[dict[str, Any]] = []
-        previous = read_json(self.run.root / "integration.json", {}) if reuse else {}
+        integration = self.run.root / "integration.json"
+        previous = self.truth.load_json(integration) if reuse else {}
         measured = {tuple(h["items"]): h for h in (previous or {}).get("history", [])}
 
         def e2e(combo: list[tuple[str, str]]) -> dict[str, Any]:
@@ -430,7 +433,7 @@ class Orchestrator:
             for kind, arg in combo:
                 cli += ["--kernel" if kind == "kernel" else "--transform", arg]
             start = time.perf_counter()
-            r = self._worker("e2e", *cli)
+            r = self._worker("e2e", *cli, *self.truth.worker_args())
             history.append({"items": [a for _, a in combo], **_short(r)})
             names = [ledger.item_label(a) for _, a in combo]
             ledger.record_e2e(
@@ -476,8 +479,9 @@ class Orchestrator:
             "final": final,
             "history": history,
         }
-        write_json(self.run.root / "integration.json", result)
-        export_optimized(self.run, [(k, a, 0.0) for k, a in accepted])
+        write_json(integration, result)
+        self.truth.seal(integration)
+        export_optimized(self.run, [(k, a, 0.0) for k, a in accepted], digests=digests)
         if final:
             log(
                 f"integrate: final {final['median_ms']:.1f} ms vs {base_ms:.1f} ms "
@@ -486,6 +490,37 @@ class Orchestrator:
         else:
             log("integrate: no optimisation survived end-to-end validation")
         self._mark("integrate", speedup=final["speedup"] if final else 1.0)
+
+    def _integration_items(self) -> tuple[list[tuple[str, str]], dict[str, str | None]]:
+        """Kernel winners + the best transform per idea, and their snapshots' sha256.
+
+        Only records kernel-agent wrote and snapshots that are still the evaluated
+        files count; anything else is ignored (and reported as tampering)."""
+        items: list[tuple[str, str]] = []
+        digests: dict[str, str | None] = {}
+        for target_id, best in self._kernel_bests():
+            kernel = str(self.run.history_dir(target_id) / Path(best["snapshot"]).name)
+            items.append(("kernel", f"{target_id}={kernel}"))
+            digests[kernel] = best.get("snapshot_sha256")
+        try:
+            records = self.truth.records(self.run.results_file())
+        except truth.TamperError:
+            records = []
+        history = self.run.history_dir()
+        best_tf: dict[str, tuple[dict[str, Any], str, str | None]] = {}
+        for rec in records:
+            if rec.get("passed") and not rec.get("kernels") and len(rec.get("transforms", [])) == 1:
+                snap = history / Path(rec["transforms"][0]).name
+                digest = (rec.get("transforms_sha256") or [None])[0]
+                if rec["speedup"] <= 1.0 or not self.truth.snapshot_ok(snap, digest):
+                    continue
+                stem = re.sub(r"^\d+_|_[0-9a-f]{8}$", "", snap.stem)
+                if stem not in best_tf or rec["speedup"] > best_tf[stem][0]["speedup"]:
+                    best_tf[stem] = (rec, str(snap), digest)
+        for _, transform, digest in best_tf.values():
+            items.append(("transform", transform))
+            digests[transform] = digest
+        return items, digests
 
     # ------------------------------------------------------------ improve loop (improve.py)
 

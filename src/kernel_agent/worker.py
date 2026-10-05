@@ -4,11 +4,13 @@ orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
     python -m kernel_agent.worker analyze --run-dir R [--out-dir D --kernel ID=PATH ...]
     python -m kernel_agent.worker capture --run-dir R --target ID
     python -m kernel_agent.worker e2e     --run-dir R [--kernel ID=PATH ...] [--transform PATH ...]
+                                          [--baseline-ms MS] [--verify REL=SHA256 ...]
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import subprocess
 import sys
@@ -17,6 +19,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from kernel_agent import truth
 from kernel_agent.gpulock import child_env, gpu_lock
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -69,7 +72,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     inputs = workload.make_inputs()
     timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     output = timing.pop("output")
-    torch.save(output, out.root / "baseline_output.pt")
+    torch.save(output, truth.replace(out.baseline_output()))  # .truth/ of a sealed run
 
     # Determinism check: a second run must pass the workload's own comparison.
     with torch.inference_mode():
@@ -144,14 +147,17 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     inputs = workload.make_inputs()
     with __import__("torch").inference_mode():
         workload.run(inputs)  # warm-up so lazily-initialised state exists
+    capture = truth.replace(run.capture_file(ns.target))  # .truth/captures/ of a sealed run
     info = capture_module(
         workload,
         inputs,
         spec["module_class"],
-        target_dir / "capture.pt",
+        capture,
         qualname=spec.get("qualname"),
         max_cases=int(ns.max_cases),
     )
+    if run.sealed():  # the agent's copy: module + inputs, no reference outputs
+        truth.write_inputs_capture(capture, target_dir / "capture_inputs.pt")
     spec["capture"] = info
     write_json(target_dir / "spec.json", spec)
     _write_reference_source(workload, spec, target_dir / "reference_source.py")
@@ -189,6 +195,14 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     from kernel_agent.workloads.base import measure
     from kernel_agent.workloads.quality import assess, is_chaotic
 
+    # The baseline output and baseline.json, checked against the digests the
+    # orchestrator holds (--verify) before anything runs; read once, used later.
+    expected = dict(item.partition("=")[::2] for item in ns.verify or [])
+    try:
+        reference_bytes = _truth_bytes(run, run.baseline_output(), expected)
+        baseline_bytes = _truth_bytes(run, run.baseline_json, expected, required=False)
+    except truth.TamperError as exc:
+        return {"status": "tampered", "passed": False, "error": str(exc)}
     workload = _workload(run)
     patches = _kernel_patches(run, ns.kernel or [])
     report = PatchReport()
@@ -209,9 +223,10 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             "error": traceback.format_exc()[-4000:],
         }
     output = timing.pop("output")
-    reference = torch.load(run.root / "baseline_output.pt", weights_only=False)
-    baseline = read_json(run.baseline_json, {})
-    base_ms = float(baseline.get("median_ms", 0.0)) or float("nan")
+    reference = torch.load(io.BytesIO(reference_bytes), weights_only=False)
+    baseline = json.loads(baseline_bytes or b"{}")
+    # the orchestrator's baseline latency (--baseline-ms), not what baseline.json says now
+    base_ms = ns.baseline_ms or float(baseline.get("median_ms", 0.0)) or float("nan")
     # Timing is free-running; quality is teacher-forced when the workload supports it.
     try:
         verdict = assess(
@@ -240,6 +255,22 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _truth_bytes(
+    run: RunDir, path: Path, expected: dict[str, str], *, required: bool = True
+) -> bytes:
+    """A run file checked against its ``--verify`` digest (unchecked and missing: b""
+    unless ``required``)."""
+    rel = path.relative_to(run.root).as_posix()
+    sha256 = expected.get(rel)
+    if sha256 is None:
+        return path.read_bytes() if required or path.exists() else b""
+    try:
+        return truth.read_verified(path, sha256)
+    except (truth.TamperError, OSError) as exc:
+        truth.alarm(run, rel, str(exc) if isinstance(exc, truth.TamperError) else "missing")
+        raise truth.TamperError(f"{rel}: {exc}") from None
+
+
 COMMANDS = {"analyze": cmd_analyze, "capture": cmd_capture, "e2e": cmd_e2e}
 
 
@@ -255,6 +286,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--no-profile", action="store_true")
     parser.add_argument("--out-dir", type=Path, help="analyze: write baseline + profile here")
+    parser.add_argument("--baseline-ms", type=float, help="e2e: the speedup denominator")
+    parser.add_argument(
+        "--verify", action="append", help="e2e: REL=SHA256, refuse a run file without it"
+    )
     ns = parser.parse_args(argv)
     run = RunDir(ns.run_dir.resolve())
     try:

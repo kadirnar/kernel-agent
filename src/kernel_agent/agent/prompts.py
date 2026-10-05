@@ -312,7 +312,10 @@ custom kernels while keeping its results identical within numerical tolerance.
 {cases}
 
 Files in your working directory:
-* `capture.pt` — the module (with weights) + inputs + reference outputs. Read-only.
+* `capture_inputs.pt` — the module (with weights) + the captured inputs, for local
+  debugging (`torch.load(path, weights_only=False)`). The reference outputs stay with
+  the evaluator: `evaluate_candidate` is the correctness check.
+* `history/`, `results.jsonl` — copies of your evaluated snapshots and their records.
 * `reference_source.py` — source code of the module class (and its file path).
 * `spec.json` — target metadata.
 * `candidates/` — put your candidates here, one file per idea, e.g.

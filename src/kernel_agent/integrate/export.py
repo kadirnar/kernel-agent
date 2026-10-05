@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from kernel_agent.truth import TamperError, alarm, read_verified
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 APPLY_TEMPLATE = '''"""Optimised kernels for {repo_id}, produced by kernel-agent.
@@ -77,7 +78,25 @@ def apply_kernels(*roots: nn.Module) -> dict[str, int]:
 '''
 
 
-def export_optimized(run: RunDir, accepted: list[tuple[str, str, float]]) -> Path:
+def _copy(run: RunDir, src: Path, dst: Path, digests: dict[str, str | None] | None) -> None:
+    """Copy ``src`` after checking it against its recorded sha256 (when ``digests`` has one)."""
+    sha256 = (digests or {}).get(str(src))
+    try:
+        dst.write_bytes(read_verified(src, sha256))
+    except TamperError as exc:
+        rel = src.relative_to(run.root).as_posix() if src.is_relative_to(run.root) else str(src)
+        alarm(run, rel, str(exc))
+        raise
+
+
+def export_optimized(
+    run: RunDir,
+    accepted: list[tuple[str, str, float]],
+    *,
+    digests: dict[str, str | None] | None = None,
+) -> Path:
+    """``optimized/``: the accepted snapshots + ``apply.py``. ``digests`` (snapshot path →
+    sha256 of the evaluated file) makes a snapshot changed since then refuse the export."""
     out = run.optimized_dir
     if out.exists():
         shutil.rmtree(out)
@@ -90,7 +109,7 @@ def export_optimized(run: RunDir, accepted: list[tuple[str, str, float]]) -> Pat
             target_id, _, path = arg.partition("=")
             spec = read_json(run.target(target_id) / "spec.json")
             dst = out / "kernels" / f"{target_id}.py"
-            shutil.copy2(path, dst)
+            _copy(run, Path(path), dst, digests)
             methods = spec.get("capture", {}).get("method_instances", {})
             manifest["kernels"].append(
                 {
@@ -103,7 +122,7 @@ def export_optimized(run: RunDir, accepted: list[tuple[str, str, float]]) -> Pat
         else:
             src = Path(arg)
             dst = out / "transforms" / src.name
-            shutil.copy2(src, dst)
+            _copy(run, src, dst, digests)
             manifest["transforms"].append({"file": f"transforms/{dst.name}"})
     write_json(out / "manifest.json", manifest)
     (out / "apply.py").write_text(APPLY_TEMPLATE.format(repo_id=card["repo_id"], root=out))

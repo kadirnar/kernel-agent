@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import io
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -283,15 +284,27 @@ def capture_module(
     }
 
 
-def load_capture(path: Path, device: str | None = None) -> dict[str, Any]:
+def load_capture(
+    path: Path, device: str | None = None, *, sha256: str | None = None
+) -> dict[str, Any]:
+    """Load a capture file; with ``sha256`` it is read once and refused (``TamperError``)
+    unless it has that digest (``kernel_agent.truth``)."""
+    from kernel_agent.truth import read_verified
+
+    data = read_verified(path, sha256) if sha256 is not None else None
+
+    def load() -> dict[str, Any]:
+        source = path if data is None else io.BytesIO(data)
+        return torch.load(source, map_location=device, weights_only=False)
+
     try:
-        return torch.load(path, map_location=device, weights_only=False)
+        return load()
     except ModuleNotFoundError:
         # Classes from ``trust_remote_code`` repos live in the HF modules cache.
         from transformers.dynamic_module_utils import init_hf_modules
 
         init_hf_modules()
-        return torch.load(path, map_location=device, weights_only=False)
+        return load()
 
 
 def capture_calls(

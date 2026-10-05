@@ -137,7 +137,7 @@ def test_evaluate_candidate_carries_budget(tmp_path, monkeypatch):
     (tdir / "candidates" / "v1.py").write_text("def build(r): ...\n")
     timeouts = []
 
-    def fake_eval(capture, snap, *, profile, timeout):
+    def fake_eval(capture, snap, *, profile, timeout, **_):
         timeouts.append(timeout)
         return {"status": "ok", "correct": True, "speedup": 1.0, "compile_s": 3.0}
 
