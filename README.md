@@ -112,7 +112,8 @@ above the first `##` heading and `<!-- comments -->` are not sent to agents.
 * The run's `program.md` is read again before every agent session. Edits made
   during a run apply to the next agent that starts, while running agents keep
   the version they started with.
-* Provenance: `costs.json` stores `program_sha256` for each agent.
+* Provenance: `costs.json` and the `agent_start` events in `events.jsonl`
+  store `program_sha256` for each agent.
   `run.json` → `program` stores the source and every version in use (sha256,
   the first agent that used it, time). Each version is saved as
   `logs/program-<sha12>.md`.

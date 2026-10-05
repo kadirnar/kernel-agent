@@ -116,12 +116,12 @@ class Orchestrator:
         return avail
 
     async def _agent(self, name: str, **kwargs: Any) -> AgentResult:
-        ledger.event(self.run, "agent_start", agent=name)
+        prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
+        ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256)
         result = AgentResult(name=name)
         timeout = self.budget.start_agent(name)
         cfg = self.budget.agent_config(self.cfg)
         kwargs["system_append"] += self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
-        prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
         kwargs["system_append"] += prog.prompt_note(name)
         timer = asyncio.timeout(timeout)
         try:
