@@ -174,7 +174,25 @@ after a GPU warm-up, and the median round is reported. Mutable inputs (caches)
 are deep-copied outside the timed region; other inputs rotate between three
 copies made before timing. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
-wall-clock latency of the whole workload.
+wall-clock latency of the whole workload, unless the run optimises another
+metric.
+
+`-o metric=` chooses what a run optimises (`kernel_agent/objective.py`):
+`latency` (the default) or `ttfa`, the time to first audio of a streaming TTS
+run (VoxCPM, and harnesses that declare it): from the call of `workload.run`
+to the first audio chunk, GPU-synchronised. `measure()` returns the metric as
+`median_ms`, so the baseline, every end-to-end evaluation, the paired A/B
+rounds of the integration, the memoisation probe and every speedup use it.
+`baseline.json` records `metric` and, for `ttfa`, `metric_detail`: the median
+latency of the next `steady_chunks` (8) chunks, their real-time factor (chunk
+latency / chunk audio; below 1 the stream keeps up with playback) and the full
+streamed run, reported but not optimised. Quality is judged on the full
+streamed output with the usual checks. The `analyze` profile covers the window
+the metric times (for `ttfa`, up to the first chunk), `profile/summary.md` gets
+an *Objective* section for the agents, and reports, charts, `status` and
+`watch` name the metric ("time to first audio" instead of "latency per run").
+A workload that cannot time the requested metric is refused before the run
+starts. `throughput` is reserved for #74.
 
 ### Integration: paired A/B with undo handles
 
@@ -770,6 +788,33 @@ Compiled baseline (`model.optimize()`, see "Strong baseline"), RTX 5070 Ti,
 gain: Inductor already fuses the norm); the `load_inline` CUDA RMSNorm breaks
 it (Dynamo cannot trace the pybind function) until it is wrapped in a custom op.
 
+Time to first audio (`-o metric=ttfa`): `run` goes through VoxCPM's streaming
+path, `generate_streaming`. `_inference(streaming=True)` yields every patch
+latent as it is generated and the stateful `audio_vae.streaming_decode()` turns
+it into one 160 ms chunk, handed over on the host. Every chunk is marked on
+arrival; the output (the chunks concatenated, plus the latents) goes through
+teacher forcing, the held-out input and the natural-length run like the
+non-streaming one, and equals the non-streaming audio (waveform cosine 1.0000).
+`analyze` profiles the run up to the first chunk: the prefill, one LocDiT solve
+and one chunk of AudioVAE decode. RTX 5070 Ti, 60 patches, medians of 3–5 runs:
+
+| | time to first audio | steady state per chunk (RTF) | full streamed run |
+|---|---|---|---|
+| eager | 97.7 ms | 96.6 ms (0.60) | 5,835 ms |
+| `model.optimize()` (compiled baseline) | 41.1 ms (2.38×) | 67.1 ms (0.42) | 4,061 ms |
+| the live run's optimised package without `vae_channels_last` | 16.6 ms (5.89×, 2.48× vs compiled) | 14.4 ms (0.090) | 869 ms |
+
+The package passes every check in streaming mode (teacher-forced mean step
+cosine 0.9983, held-out input, memoisation probe 1.06×, natural length 31
+patches). Its decode-loop transforms (`async_stop_loop`, `skip_dead_work`)
+keep `_inference`'s streaming branch. Its `vae_channels_last` transform does
+not work with the streaming decoder: `streaming_decode()` carries the causal
+state by replacing the `forward` of every `CausalConv1d` /
+`CausalTransposeConv1d` with a 3-D one, and the channels-last decoder feeds
+them 4-D tensors. The whole package is therefore rejected with that reason. An
+`_inference` that ignores `streaming=True` (all chunks at the end) is rejected
+as well.
+
 ### kernel-agent improve: the continuous loop
 
 ```bash
@@ -1218,6 +1263,8 @@ kernel-agent optimize <hf-url> [options]
                                        TTS: text, seed, min_spec_cosine
                                        diffusion: steps, height, width, prompt, cpu_offload, min_psnr
                                        any: entrypoints=Cls.method,... (extra non-forward methods)
+                                       any: metric=latency|ttfa (what the run optimises; ttfa:
+                                            VoxCPM / streaming harnesses), steady_chunks=8
                                        VoxCPM: text, patches, timesteps, cfg, seed, compile,
                                                min_step_cosine, min_mean_step_cosine, min_spec_cosine,
                                                natural_text, natural_max_patches,
@@ -1588,6 +1635,13 @@ minus continue logit per step, from the baseline run) and `output_length`,
 and teacher forced on `reference` when it is given (see "Stop condition"
 above and `workloads/voxcpm.py`). `compare_natural_length` defaults to
 `compare_stop` in `base.py`.
+
+Streaming TTS harnesses can support `-o metric=ttfa`: list it in
+`metrics = ("latency", "ttfa")`, call `self.mark_chunk(audio_ms=...)` in `run`
+whenever an audio chunk reaches the caller, and optionally implement
+`metric_window()` (a context in which `run` stops after the first chunk) so the
+profile covers the time-to-first-audio window. `Workload.metric_value` is the
+extension point for further metrics.
 
 ## Using it interactively from Claude Code
 

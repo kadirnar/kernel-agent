@@ -57,7 +57,7 @@ def _worker(capsys, *argv):
 
 def _no_profiler(monkeypatch):
     monkeypatch.setattr(profiler, "profile_workload", lambda w, i: {"classes": []})
-    monkeypatch.setattr(profiler, "summarize", lambda p, ms: "# Profile summary\n")
+    monkeypatch.setattr(profiler, "summarize", lambda p, ms, **kw: "# Profile summary\n")
 
 
 # ------------------------------------------------------------------ the hook

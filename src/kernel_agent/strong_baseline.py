@@ -111,15 +111,19 @@ def measure(run: RunDir, *, generic: bool, warmup: int = WARMUP, iters: int = 3)
     timing = measure_runs(workload, inputs, warmup=0, iters=iters)
     output = timing.pop("output")
     median = float(timing["median_ms"])
+    # a whole run (median_ms is the time to first audio for metric=ttfa, objective.py)
+    run_ms = float((timing.get("metric_detail") or {}).get("run_ms") or median)
     detail.update(
         status="ok",
         median_ms=round(median, 3),
         min_ms=round(timing["min_ms"], 3),
         times_ms=[round(t, 3) for t in timing["times_ms"]],
+        metric=timing["metric"],
+        **({"metric_detail": d} if (d := timing.get("metric_detail")) else {}),
         peak_mem_gb=round(timing["peak_mem_gb"], 3),
         warmup_s=warm,
         # warm-up runs minus steady-state runs: compilation, autotuning, graph recording
-        compile_s=round(max(sum(warm) - len(warm) * median / 1000, 0.0), 1),
+        compile_s=round(max(sum(warm) - len(warm) * run_ms / 1000, 0.0), 1),
     )
     reference = torch.load(run.baseline_output(), weights_only=False)
     chaotic = is_chaotic(workload, read_json(run.baseline_json, {}) or {})

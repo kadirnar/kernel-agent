@@ -25,6 +25,7 @@ from kernel_agent import (
     hub,
     ledger,
     library,
+    objective,
     program,
     region,
     research,
@@ -53,6 +54,7 @@ from kernel_agent.kernels import evaluate, recheck
 from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
+from kernel_agent.workloads import validate_metric
 from kernel_agent.workloads.base import WorkloadSpec
 from kernel_agent.workloads.quality import probe_messages
 from kernel_agent.workspace import RunDir, read_json, write_json
@@ -109,7 +111,6 @@ class Orchestrator:
             f"{card.repo_id}: modality={card.modality.value} arch={card.architectures} "
             f"params={card.params} size={card.size_gb} GB"
         )
-        run = RunDir.create(cfg.runs_dir, card.repo_id)
         spec = WorkloadSpec(
             repo_id=card.repo_id,
             revision=card.revision,
@@ -120,6 +121,11 @@ class Orchestrator:
             options=cfg.workload_options,
             family=card.family,
         )
+        try:  # -o metric= (objective.py): one the workload can time, before a run starts
+            validate_metric(spec)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        run = RunDir.create(cfg.runs_dir, card.repo_id)
         write_json(
             run.run_json,
             {
@@ -296,6 +302,8 @@ class Orchestrator:
             f"analyze: baseline {result['median_ms']:.1f} ms, deterministic="
             f"{result['deterministic']}, peak {result['peak_mem_gb']:.2f} GB"
         )
+        if (metric := objective.describe(result)) is not None:  # -o metric=ttfa, say
+            log(f"analyze: {metric}")
         if not result["deterministic"]:
             log("WARNING: workload output is not deterministic; quality checks may be noisy")
         for message in probe_messages(result):  # sensitivity probe / teacher forcing

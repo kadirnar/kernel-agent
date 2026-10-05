@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import math
 import secrets
-import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -41,7 +40,7 @@ from typing import Any
 import torch
 
 from kernel_agent.kernels.compare import flatten
-from kernel_agent.workloads.base import Workload, synchronize
+from kernel_agent.workloads.base import Workload, timed_run
 
 #: A fresh-input run this many times slower than the repeated main-input runs is memoisation.
 MEMO_RATIO = 3.0
@@ -69,15 +68,12 @@ def outputs_equal(a: Any, b: Any) -> bool:
 
 
 def run_variant(workload: Workload, options: dict[str, Any]) -> tuple[Any, Any, float]:
-    """``(inputs, output, ms)`` of one run under the option overrides ``options``."""
+    """``(inputs, output, ms)`` of one run under the option overrides ``options``; ``ms``
+    is the workload's metric (the latency by default, ``objective.py``), as for the
+    timed main-input runs it is compared with."""
     with workload.with_options(options):
         inputs = workload.make_inputs()
-        with torch.inference_mode():
-            synchronize()
-            start = time.perf_counter()
-            output = workload.run(inputs)
-            synchronize()
-            ms = (time.perf_counter() - start) * 1000
+        output, ms, _ = timed_run(workload, inputs)
     return inputs, output, ms
 
 

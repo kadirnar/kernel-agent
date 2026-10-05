@@ -405,17 +405,25 @@ def _methods_cell(methods: dict[str, dict[str, Any]]) -> str:
     )
 
 
-def summarize(profile: dict[str, Any], baseline_ms: float, top: int = 30) -> str:
-    """Markdown summary handed to the planner."""
+def summarize(
+    profile: dict[str, Any],
+    baseline_ms: float,
+    top: int = 30,
+    *,
+    metric: str = "end-to-end latency",
+    per: str = "per run",
+) -> str:
+    """Markdown summary handed to the planner. ``metric`` / ``per``: what ``baseline_ms``
+    measures (``objective.py``; the profile covers the same window)."""
     kv = profile["kernel_view"]
     busy = kv["gpu_busy_ms"] / baseline_ms if baseline_ms else kv["gpu_busy_fraction"]
     total = max((c["inclusive_ms"] for c in profile["classes"]), default=0.0) or 1.0
     lines = [
         "# Profile summary",
         "",
-        f"* end-to-end latency (no hooks): **{baseline_ms:.1f} ms**",
-        f"* GPU kernel time: {kv['gpu_busy_ms']:.1f} ms per run = **{busy:.0%}** of the "
-        "end-to-end latency — "
+        f"* {metric} (no hooks): **{baseline_ms:.1f} ms**",
+        f"* GPU kernel time: {kv['gpu_busy_ms']:.1f} ms {per} = **{busy:.0%}** of the "
+        f"{metric} — "
         + (
             "LAUNCH/CPU BOUND: the GPU idles between tiny kernels. Fusing many small ops into "
             "few kernels, CUDA graphs and static caches matter more than faster math."

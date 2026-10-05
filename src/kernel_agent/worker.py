@@ -59,7 +59,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     import torch
 
-    from kernel_agent import strong_baseline
+    from kernel_agent import objective, strong_baseline
     from kernel_agent.profiling.profiler import profile_workload, summarize
     from kernel_agent.workloads import holdout, quality, stopping
     from kernel_agent.workloads.base import measure
@@ -120,9 +120,15 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     compiled = not (ns.out_dir or ns.no_profile) and (generic or strong_baseline.has_hook(workload))
 
     if not ns.no_profile:
-        profile = profile_workload(workload, inputs)
+        with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
+            profile = profile_workload(workload, inputs)
         write_json(out.profile_dir / "profile.json", profile)
-        summary = summarize(profile, timing["median_ms"]) + quality.summary_section(baseline)
+        metric = objective.of(baseline)
+        summary = (
+            summarize(profile, timing["median_ms"], metric=metric.title.lower(), per=metric.per)
+            + objective.summary_section(baseline)
+            + quality.summary_section(baseline)
+        )
         (out.profile_dir / "summary.md").write_text(
             summary + strong_baseline.summary_section(baseline)
         )
@@ -284,6 +290,8 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "times_ms": [round(t, 3) for t in timing["times_ms"]],
         "baseline_ms": round(base_ms, 3),
         "speedup": round(base_ms / timing["median_ms"], 4),
+        "metric": timing["metric"],  # what median_ms is (objective.py)
+        **({"metric_detail": d} if (d := timing.get("metric_detail")) else {}),
         "peak_mem_gb": round(timing["peak_mem_gb"], 3),
         "patches": report.__dict__,
         **({"gpu": gpu} if (gpu := monitor.summary()) else {}),
@@ -444,6 +452,7 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "times_ms": [round(t, 3) for t in rounds.b_ms],
         "baseline_ms": round(base_ms, 3),
         "speedup": round(base_ms / b_ms, 4),
+        "metric": workload.metric,  # what the rounds timed (objective.py)
         "peak_mem_gb": round(peak, 3),
         "patches": b.report.__dict__,
     }

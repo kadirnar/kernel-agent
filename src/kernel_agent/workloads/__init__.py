@@ -4,14 +4,45 @@ built-in workloads for model families whose inference code is not
 
 from __future__ import annotations
 
+from kernel_agent import objective
 from kernel_agent.hub import Modality
 from kernel_agent.workloads.base import Comparison, Workload, WorkloadSpec, measure
 
-__all__ = ["Comparison", "Workload", "WorkloadSpec", "create_workload", "measure"]
+__all__ = [
+    "Comparison",
+    "Workload",
+    "WorkloadSpec",
+    "create_workload",
+    "measure",
+    "validate_metric",
+]
 
 
 def create_workload(spec: WorkloadSpec) -> Workload:
-    """Instantiate (but do not load) the workload for ``spec``."""
+    """Instantiate (but do not load) the workload for ``spec``; ``ValueError`` when it
+    cannot time the requested metric (``-o metric=``)."""
+    workload = _create(spec)
+    workload.check_metric()
+    return workload
+
+
+def validate_metric(spec: WorkloadSpec) -> None:
+    """Fail fast, before a run starts, on a metric (``-o metric=``) that the built-in
+    workload for ``spec`` cannot time (``ValueError``). A harness is checked when
+    ``create_workload`` loads it."""
+    metric = objective.get(spec.options.get("metric"))
+    if spec.harness:
+        objective.check(metric.name, tuple(objective.METRICS), "a harness")
+        return
+    try:
+        workload = _create(spec)
+    except ValueError:  # no built-in workload: the harness agent writes one
+        objective.check(metric.name, tuple(objective.METRICS), "a harness")
+        return
+    workload.check_metric()
+
+
+def _create(spec: WorkloadSpec) -> Workload:
     if spec.harness:
         from kernel_agent.workloads.harness import load_harness
 
