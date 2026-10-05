@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import inspect
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -26,6 +27,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from kernel_agent.phases import call_phase
 from kernel_agent.profiling.methods import (
     describe,
     discover_entrypoints,
@@ -73,6 +75,7 @@ class _Call:
     end: Any = None
     children: list[int] = field(default_factory=list)
     method: str = "forward"
+    phase: str = "prefill"
 
 
 @dataclass
@@ -91,6 +94,9 @@ class ClassStat:
     signatures: list[dict[str, Any]]
     #: Per entrypoint: ``{"forward_step": {"calls": 2160, "inclusive_ms": 1151.2}, ...}``.
     methods: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Per phase (:mod:`kernel_agent.phases`): calls, inclusive_ms, instances,
+    #: top_signature and ``groups`` (qualname pattern -> instances).
+    phases: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class ModuleTimer:
@@ -162,6 +168,7 @@ class ModuleTimer:
                 parent,
                 start,
                 method=method,
+                phase=call_phase(method, args, kwargs),
             )
         )
         index = len(self.calls) - 1
@@ -206,6 +213,14 @@ class ModuleTimer:
                     "self": 0.0,
                     "sigs": collections.defaultdict(lambda: [0, 0.0]),
                     "methods": collections.defaultdict(lambda: [0, 0.0]),
+                    "phases": collections.defaultdict(
+                        lambda: {
+                            "calls": 0,
+                            "inclusive": 0.0,
+                            "qualnames": set(),
+                            "sigs": collections.Counter(),
+                        }
+                    ),
                     "example": call.qualname,
                 },
             )
@@ -222,9 +237,14 @@ class ModuleTimer:
             g["self"] += max(own, 0.0)
             meth = g["methods"][call.method]
             meth[0] += 1
+            phase = g["phases"][call.phase]
+            phase["calls"] += 1
+            phase["qualnames"].add(call.qualname)
+            phase["sigs"][call.signature] += inclusive[idx]
             if not nested:
                 g["inclusive"] += inclusive[idx]
                 meth[1] += inclusive[idx]
+                phase["inclusive"] += inclusive[idx]
             sig = g["sigs"][call.signature]
             sig[0] += 1
             sig[1] += inclusive[idx]
@@ -264,10 +284,32 @@ class ModuleTimer:
                         m: {"calls": c, "inclusive_ms": round(t, 4)}
                         for m, (c, t) in sorted(g["methods"].items(), key=lambda kv: -kv[1][1])
                     },
+                    phases={
+                        name: _phase_stat(p)
+                        for name, p in sorted(
+                            g["phases"].items(), key=lambda kv: -kv[1]["inclusive"]
+                        )
+                    },
                 )
             )
         stats.sort(key=lambda s: -s.inclusive_ms)
         return stats
+
+
+def _phase_stat(p: dict[str, Any]) -> dict[str, Any]:
+    """One phase of a class: totals, the top signature and where its instances live
+    (qualnames with layer indices folded: ``model.base_lm.layers.*.self_attn``)."""
+    groups: collections.Counter[str] = collections.Counter(
+        re.sub(r"\.\d+(?=\.|$)", ".*", q) for q in p["qualnames"]
+    )
+    top = p["sigs"].most_common(1)
+    return {
+        "calls": p["calls"],
+        "inclusive_ms": round(p["inclusive"], 4),
+        "instances": len(p["qualnames"]),
+        "top_signature": top[0][0] if top else "",
+        "groups": dict(groups.most_common(6)),
+    }
 
 
 def _device_time(evt: Any, self_only: bool) -> float:
@@ -404,6 +446,7 @@ def summarize(profile: dict[str, Any], baseline_ms: float, top: int = 30) -> str
             f"{c['self_ms']:.2f} | {c['params']:,} | "
             f"`{sig[:70]}` |"
         )
+    lines += _phase_split(profile["classes"][:top])
     lines += [
         "",
         "## Top CUDA kernels",
@@ -424,6 +467,42 @@ def summarize(profile: dict[str, Any], baseline_ms: float, top: int = 30) -> str
         lines.append(f"| `{o['name']}` | {o['calls']} | {o['device_ms']:.3f} |")
     lines += _roofline_note()
     return "\n".join(lines) + "\n"
+
+
+def _phase_split(classes: list[dict[str, Any]], min_share: float = 0.05) -> list[str]:
+    """Classes that spend at least ``min_share`` of their time in each of both phases:
+    candidates for one target per phase."""
+
+    def both(c: dict[str, Any]) -> bool:
+        times = [p["inclusive_ms"] for p in (c.get("phases") or {}).values()]
+        return len(times) > 1 and min(times) >= min_share * (sum(times) or 1.0)
+
+    split = [c for c in classes if both(c)]
+    if not split:
+        return []
+    lines = [
+        "",
+        "## Phase split",
+        "",
+        "Classes called both on several positions at once (`prefill`: prompt prefill, "
+        "encoder and DiT/denoiser blocks) and one position at a time (`decode`: `*step*` "
+        "entrypoints, `[batch, 1, ...]` inputs). Each phase can be its own target "
+        "(`phase` in the plan), restricted to some instances with `qualname_regex`.",
+        "",
+        "| class | phase | calls | inclusive ms | share of class | instances | top signature "
+        "| instances by qualname |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for c in split:
+        total = sum(p["inclusive_ms"] for p in c["phases"].values()) or 1.0
+        for name, p in c["phases"].items():
+            groups = ", ".join(f"`{q}` ({n})" for q, n in p["groups"].items())
+            lines.append(
+                f"| `{c['cls']}` | {name} | {p['calls']} | {p['inclusive_ms']:.2f} | "
+                f"{p['inclusive_ms'] / total:.0%} | {p['instances']} | "
+                f"`{p['top_signature'][:60]}` | {groups} |"
+            )
+    return lines
 
 
 def _roofline_note() -> list[str]:

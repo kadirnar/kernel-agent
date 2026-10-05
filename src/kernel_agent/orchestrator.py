@@ -27,6 +27,7 @@ from kernel_agent.budget import Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.export import export_optimized
+from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
 from kernel_agent.workloads.base import WorkloadSpec
@@ -258,6 +259,9 @@ class Orchestrator:
         for t in plan["targets"][: self.cfg.max_targets]:
             if t["module_class"] not in known:
                 log(f"plan: dropping {t['id']}: class {t['module_class']} not in profile")
+                continue
+            if problem := _scope(t):
+                log(f"plan: dropping {t['id']}: {problem}")
                 continue
             t["backends"] = [b for b in t.get("backends", []) if b in backends] or backends[:2]
             targets.append(t)
@@ -629,15 +633,20 @@ class Orchestrator:
             return []
         profile = read_json(round_dir / "profile" / "profile.json", {})
         known = {c["cls"] for c in profile.get("classes", [])}
-        taken = {
-            read_json(self.run.target(t) / "spec.json", {}).get("module_class")
-            for t in self.run.target_ids()
-        }
+        specs = [read_json(self.run.target(t) / "spec.json", {}) for t in self.run.target_ids()]
+        # (class, phase) pairs already targeted; None = all phases
+        taken = {(s.get("module_class"), s.get("phase")) for s in specs}
         new = []
         for t in plan.get("targets", [])[: self.cfg.max_targets]:
             cls = t.get("module_class")
-            if cls not in known or cls in taken or self.run.target(t["id"]).exists():
-                log(f"replan: dropping {t['id']} ({cls}): not in the profile or already a target")
+            problem = _scope(t)
+            phase = t.get("phase")
+            overlap = any(c == cls and (None in (p, phase) or p == phase) for c, p in taken)
+            if cls not in known or overlap or problem or self.run.target(t["id"]).exists():
+                log(
+                    f"replan: dropping {t['id']} ({cls}): "
+                    + (problem or "not in the profile or already a target")
+                )
                 continue
             t["backends"] = [b for b in t.get("backends", []) if b in backends] or backends[:2]
             new.append(t)
@@ -673,6 +682,24 @@ def _short(r: dict[str, Any]) -> dict[str, Any]:
         k: r.get(k)
         for k in ("status", "passed", "reason", "median_ms", "speedup", "metrics", "patches")
     }
+
+
+def _scope(target: dict[str, Any]) -> str | None:
+    """Normalise a planned target's ``phase`` / ``qualname_regex`` in place; returns why the
+    target is unusable, or None. ``phase: all`` (or none) means a whole-class target."""
+    phase = target.pop("phase", None)
+    if phase in CALL_PHASES:
+        target["phase"] = phase
+    elif phase not in (None, "", "all"):
+        return f"unknown phase {phase!r}"
+    regex = target.pop("qualname_regex", None)
+    if regex:
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            return f"bad qualname_regex {regex!r}: {exc}"
+        target["qualname_regex"] = regex
+    return None
 
 
 def _extract_json(text: str) -> Any:

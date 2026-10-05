@@ -78,6 +78,10 @@ version is saved as `logs/program-<sha12>.md`.
 * Start with the simplest correct kernel for the dominant case (largest
   `calls_per_run` × `ref_ms`), evaluate it, then optimise using evidence
   from `profile=true`.
+* Read `workload_profile.md` before the first candidate. It covers every call
+  of the module in the run, not only the captured cases: call mix per
+  entrypoint and phase, mask kinds, layouts, and how many KV-cache slots
+  hold data. Specialise on what it shows, behind a run-time check.
 * Before each optimisation, write down the bottleneck you are attacking, the
   number that shows it, and the gain you expect. Afterwards, compare the
   result with that expectation.

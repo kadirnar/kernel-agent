@@ -17,6 +17,12 @@ overlapping views.  Deep-copying such a view would copy the whole buffer for
 every case and for both the pre- and post-call state.  As a consequence,
 side effects are checked on the memory the arguments cover, not on the rest
 of a larger buffer they were sliced from.
+
+While recording, every call of the target's instances (not only the saved
+cases) feeds :class:`~kernel_agent.profiling.workload_stats.WorkloadStats`,
+written to ``workload_profile.md`` / ``.json`` (in the target directory). A
+target with a ``phase`` (:mod:`kernel_agent.phases`) records only that phase's
+calls as cases; ``qualname_regex`` restricts the instances it covers.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from __future__ import annotations
 import collections
 import copy
 import io
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -32,6 +39,7 @@ import torch
 from torch import nn
 
 from kernel_agent.kernels.compare import flatten
+from kernel_agent.phases import PHASES, call_phase
 from kernel_agent.profiling.methods import (
     entrypoint,
     entrypoints_of,
@@ -39,6 +47,7 @@ from kernel_agent.profiling.methods import (
     workload_entrypoints,
 )
 from kernel_agent.profiling.profiler import call_signature, signature_of
+from kernel_agent.profiling.workload_stats import WorkloadStats, write_profile
 from kernel_agent.workloads.base import Workload, synchronize
 
 #: A storage is copied compactly only when that saves at least this many bytes.
@@ -117,7 +126,9 @@ class _Recorder:
     """Records the calls of one module instance through all of its entrypoints.
 
     ``peers`` (other instances of the class) are only watched to count which
-    instances call which entrypoint (``callers``)."""
+    instances call which entrypoint (``callers``). With ``phase`` only calls of
+    that phase are recorded and counted. ``stats`` sees every call of the
+    module and its peers, whatever the phase."""
 
     def __init__(
         self,
@@ -125,9 +136,14 @@ class _Recorder:
         max_cases: int,
         methods: Sequence[str] = (),
         peers: Sequence[nn.Module] = (),
+        *,
+        phase: str | None = None,
+        stats: WorkloadStats | None = None,
     ) -> None:
         self.module = module
         self.max_cases = max_cases
+        self.phase = phase if phase in PHASES else None
+        self.stats = stats
         self.cases: dict[tuple[str, str], dict[str, Any]] = {}
         #: Calls per entrypoint during the run (all signatures, captured or not).
         self.calls: collections.Counter[str] = collections.Counter()
@@ -142,8 +158,16 @@ class _Recorder:
     def _pre(
         self, module: nn.Module, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
-        self.callers[method].add(id(module))
+        phase = call_phase(method, args, kwargs)
+        if self.stats is not None:
+            self.stats.observe(module, method, args, kwargs, phase)
+        wanted = self.phase is None or phase == self.phase
+        if wanted:
+            self.callers[method].add(id(module))
         if module is not self.module:
+            return
+        if not wanted:
+            self._pending.append(None)
             return
         self.calls[method] += 1
         # Group calls by entrypoint and primary input only: decode steps share
@@ -208,21 +232,62 @@ class _Recorder:
             self._ctx = None
 
 
-def find_instance(
-    roots: dict[str, nn.Module], cls: str, qualname: str | None = None
-) -> tuple[str, nn.Module]:
+def instances_of(
+    roots: dict[str, nn.Module], cls: str, qualname_regex: str | None = None
+) -> list[tuple[str, nn.Module]]:
+    """``(qualname, module)`` of every instance of ``cls`` whose qualname the regex
+    matches (``re.search``, as in the patcher), in module order."""
+    pattern = re.compile(qualname_regex) if qualname_regex else None
+    found: list[tuple[str, nn.Module]] = []
+    seen: set[int] = set()
     for root_name, root in roots.items():
         for name, module in root.named_modules():
             full = f"{root_name}.{name}" if name else root_name
-            if qualname is not None and full != qualname:
+            if type(module).__name__ != cls or id(module) in seen:
                 continue
-            if type(module).__name__ == cls:
-                return full, module
-    raise LookupError(f"no module of class {cls!r} (qualname={qualname!r})")
+            if pattern is None or pattern.search(full):
+                seen.add(id(module))
+                found.append((full, module))
+    return found
+
+
+def find_instance(
+    roots: dict[str, nn.Module],
+    cls: str,
+    qualname: str | None = None,
+    qualname_regex: str | None = None,
+) -> tuple[str, nn.Module]:
+    for full, module in instances_of(roots, cls, None if qualname else qualname_regex):
+        if qualname is None or full == qualname:
+            return full, module
+    raise LookupError(
+        f"no module of class {cls!r} (qualname={qualname!r}, qualname_regex={qualname_regex!r})"
+    )
 
 
 def count_calls(roots: dict[str, nn.Module], cls: str) -> int:
     return sum(1 for root in roots.values() for m in root.modules() if type(m).__name__ == cls)
+
+
+def _busiest(
+    workload: Workload, inputs: Any, candidates: list[tuple[str, nn.Module]], phase: str
+) -> tuple[str, nn.Module]:
+    """The candidate instance with the most ``phase`` calls in one run (the first on ties)."""
+    counts: collections.Counter[int] = collections.Counter()
+    extra = workload_entrypoints(workload)
+    methods = {t: entrypoints_of(t, extra) for t in {type(m) for _, m in candidates}}
+
+    def pre(module: nn.Module, method: str, args: Any, kwargs: Any) -> None:
+        if call_phase(method, args, kwargs) == phase:
+            counts[id(module)] += 1
+
+    with (
+        instrument([m for _, m in candidates], methods, pre, lambda *_: None),
+        torch.inference_mode(),
+    ):
+        workload.run(inputs)
+        synchronize()
+    return max(candidates, key=lambda c: counts[id(c[1])])
 
 
 def capture_module(
@@ -233,26 +298,46 @@ def capture_module(
     *,
     qualname: str | None = None,
     max_cases: int = 4,
+    qualname_regex: str | None = None,
+    phase: str | None = None,
+    profile_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Run the workload once and save one instance of ``cls`` plus its calls."""
+    """Run the workload once and save one instance of ``cls`` plus its calls.
+
+    The target's instances are those a patch replaces (``cls``, matching
+    ``qualname_regex``); every call of theirs goes into the workload profile
+    (``workload_profile.md`` in ``profile_dir``, default: next to ``path``).
+    The captured instance is ``qualname``, else the one with the most
+    ``phase`` calls when a phase is given (one extra run), else the first.
+    With ``phase`` only that phase's calls become cases."""
+    phase = phase if phase in PHASES else None
     roots = workload.roots()
-    full, module = find_instance(roots, cls, qualname)
+    candidates = instances_of(roots, cls, qualname_regex)
+    if qualname is not None:
+        full, module = find_instance(roots, cls, qualname)
+    elif phase is not None and len(candidates) > 1:
+        full, module = _busiest(workload, inputs, candidates, phase)
+    elif candidates:
+        full, module = candidates[0]
+    else:
+        raise LookupError(f"no module of class {cls!r} (qualname_regex={qualname_regex!r})")
     methods = entrypoints_of(type(module), workload_entrypoints(workload))
-    peers = [
-        m
-        for root in roots.values()
-        for m in root.modules()
-        if type(m).__name__ == cls and m is not module
-    ]
-    recorder = _Recorder(module, max_cases, methods, peers)
+    peers = [m for _, m in candidates if m is not module]
+    stats = WorkloadStats()
+    recorder = _Recorder(module, max_cases, methods, peers, phase=phase, stats=stats)
     try:
         with torch.inference_mode():
             workload.run(inputs)
             synchronize()
     finally:
         recorder.remove()
+    with torch.inference_mode():
+        meta = {"class": cls, "qualname": full, "instances": len(candidates) or 1}
+        profile = stats.finalize(module, **meta, qualname_regex=qualname_regex, phase=phase)
+    write_profile(profile, profile_dir or path.parent)
     if not recorder.cases:
-        raise RuntimeError(f"{full} ({cls}) was never called during the workload run")
+        what = f"{phase} calls" if phase else "calls"
+        raise RuntimeError(f"{full} ({cls}) had no {what} during the workload run")
     cases = sorted(recorder.cases.values(), key=lambda c: -c["count"])
     calls = dict(recorder.calls.most_common())
     # Instances that call each entrypoint (VoxCPM: forward_step only on the LM
@@ -265,10 +350,11 @@ def capture_module(
             "qualname": full,
             "class": cls,
             "module_path": f"{type(module).__module__}.{type(module).__qualname__}",
-            "instances": count_calls(roots, cls),
+            "instances": len(candidates) or count_calls(roots, cls),
             "method_instances": method_instances,
             "methods": calls,
             "cases": cases,
+            **({"phase": phase} if phase else {}),
         },
         path,
     )
@@ -281,6 +367,9 @@ def capture_module(
             {"method": c["method"], "signature": c["signature"], "count": c["count"]} for c in cases
         ],
         "bytes": path.stat().st_size,
+        **({"phase": phase} if phase else {}),
+        # every call of the target's instances; the facts go into the engineer prompt
+        "workload": {"calls": profile["calls"], "facts": profile["facts"]},
     }
 
 
