@@ -6,6 +6,7 @@ import shutil
 from typing import Any
 
 from kernel_agent import ledger, strong_baseline
+from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
 
@@ -70,7 +71,8 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         parts.append(f"measured {_ms(best['new_ms'])} ({vs(best['new_ms'])}, {best['snapshot']})")
     else:
         parts.append("measured —")
-    parts.append(f"cost ${s['cost_usd']:.2f}")
+    notional = auth.usd_note(s["costs"])
+    parts.append(f"cost ${s['cost_usd']:.2f}" + (f" {notional}" if notional else ""))
     header = [parts[0]]
     for part in parts[1:]:  # wrap between parts at the terminal width
         if len(header[-1]) + 5 + len(part) > width:

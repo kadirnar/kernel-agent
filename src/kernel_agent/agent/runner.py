@@ -9,13 +9,15 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKError,
     HookJSONOutput,
     HookMatcher,
+    Message,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -24,6 +26,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookEvent
 
+from kernel_agent.agent import auth
 from kernel_agent.config import OptimizeConfig
 
 BASE_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite"]
@@ -44,6 +47,8 @@ class AgentResult:
     session_id: str | None = None
     tool_calls: dict[str, int] = field(default_factory=dict)
     timed_out: bool = False
+    api_key_source: str | None = None  # the init message's; "none" = no API key in use
+    usage_limit: auth.UsageLimit | None = None  # the session stopped at a usage limit
 
 
 def _log(msg: str) -> None:
@@ -58,8 +63,9 @@ def _brief(block_input: Any, limit: int = 110) -> str:
     return str(block_input)[:limit]
 
 
-def agent_env(extra: dict[str, str]) -> dict[str, str]:
-    """Environment for the agent's Bash tool: same Python env + toolchain variables."""
+def agent_env(extra: dict[str, str], mode: str = auth.AUTO) -> dict[str, str]:
+    """Environment for the agent's Bash tool: same Python env + toolchain variables; with
+    ``mode`` subscription, the API key / cloud provider variables blanked (auth.py)."""
     venv_bin = str(Path(sys.executable).parent)
     env = {
         "PATH": f"{venv_bin}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -68,7 +74,7 @@ def agent_env(extra: dict[str, str]) -> dict[str, str]:
     }
     if "VIRTUAL_ENV" not in os.environ and (Path(venv_bin).parent / "pyvenv.cfg").exists():
         env["VIRTUAL_ENV"] = str(Path(venv_bin).parent)
-    return env
+    return auth.scrub(env) if mode == auth.SUBSCRIPTION else env
 
 
 def write_guard(writable: list[Path], cwd: Path) -> dict[HookEvent, list[HookMatcher]]:
@@ -116,6 +122,7 @@ async def run_agent(
     result: AgentResult | None = None,
     tools: list[str] | None = None,
     writable: list[Path] | None = None,
+    resume: str | None = None,
 ) -> AgentResult:
     """Run one agent session to completion.
 
@@ -124,6 +131,11 @@ async def run_agent(
     tool calls so far. Cancelling terminates the Claude Code subprocess.
     ``tools`` replaces :data:`BASE_TOOLS` as the built-in tools the session has at
     all; with ``writable`` the file-writing tools may touch only those files.
+
+    A session that stops at a usage limit returns with ``usage_limit`` set instead of
+    raising (auth.py); ``resume`` (its session id) continues it, and the USD, turns and
+    seconds of ``result`` then add up over both runs. :class:`~kernel_agent.agent.auth.
+    AuthError` stops a session whose API key source ``cfg.auth`` does not allow.
     """
     builtin = list(BASE_TOOLS if tools is None else tools)
     builtin += (WEB_TOOLS if cfg.allow_web else []) + list(extra_tools or [])
@@ -147,8 +159,13 @@ async def run_agent(
         options.tools = builtin
     if writable is not None:
         options.hooks = write_guard(writable, cwd)
+    if resume:
+        options.resume = resume
 
     result = result or AgentResult(name=name)
+    result.is_error, result.usage_limit = False, None
+    usd, turns_before, seconds = result.cost_usd, result.turns, result.seconds  # resumed: > 0
+    watch = auth.LimitWatch()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"agent-{name}.jsonl"
     start = time.perf_counter()
@@ -158,52 +175,66 @@ async def run_agent(
     stream = query(prompt=prompt, options=options)
     try:
         with log_path.open("a") as log:
-            async for message in stream:
-                payload: Any
-                try:
-                    payload = (
-                        dataclasses.asdict(message)
-                        if dataclasses.is_dataclass(message)
-                        else repr(message)
-                    )
-                except Exception:
-                    payload = repr(message)
-                log.write(
-                    json.dumps({"type": type(message).__name__, "data": payload}, default=str)
-                    + "\n"
-                )
-                log.flush()
-                if isinstance(message, AssistantMessage):
-                    result.session_id = result.session_id or message.session_id
-                    if message.parent_tool_use_id is None:
-                        turns.add(message.message_id or f"#{len(turns)}")
-                        result.turns = len(turns)
-                    for block in message.content:
-                        if isinstance(block, ToolUseBlock):
-                            short = block.name.removeprefix("mcp__ka__")
-                            result.tool_calls[short] = result.tool_calls.get(short, 0) + 1
-                            _log(f"agent {name}: {short} {_brief(block.input)}")
-                        elif isinstance(block, TextBlock) and cfg.verbose:
-                            _log(f"agent {name}: {block.text[:300]}")
-                elif isinstance(message, SystemMessage) and message.subtype == "init":
-                    result.session_id = message.data.get("session_id") or result.session_id
-                elif isinstance(message, ResultMessage):
-                    result.text = message.result or ""
-                    result.structured = message.structured_output
-                    result.cost_usd = message.total_cost_usd or 0.0
-                    result.turns = message.num_turns
-                    result.is_error = message.is_error
-                    result.session_id = message.session_id
+            try:
+                async for message in stream:
+                    _write(log, message)
+                    watch.see(message)
+                    if isinstance(message, AssistantMessage):
+                        result.session_id = result.session_id or message.session_id
+                        if message.parent_tool_use_id is None:
+                            turns.add(message.message_id or f"#{len(turns)}")
+                            result.turns = turns_before + len(turns)
+                        for block in message.content:
+                            if isinstance(block, ToolUseBlock):
+                                short = block.name.removeprefix("mcp__ka__")
+                                result.tool_calls[short] = result.tool_calls.get(short, 0) + 1
+                                _log(f"agent {name}: {short} {_brief(block.input)}")
+                            elif isinstance(block, TextBlock) and cfg.verbose:
+                                _log(f"agent {name}: {block.text[:300]}")
+                    elif isinstance(message, SystemMessage) and message.subtype == "init":
+                        result.session_id = message.data.get("session_id") or result.session_id
+                        result.api_key_source = message.data.get("apiKeySource")
+                        if why := auth.session_problem(cfg.auth, result.api_key_source, env):
+                            raise auth.AuthError(why)  # before the session's first request
+                    elif isinstance(message, ResultMessage):
+                        result.text = message.result or ""
+                        result.structured = message.structured_output
+                        result.cost_usd = usd + (message.total_cost_usd or 0.0)
+                        result.turns = turns_before + message.num_turns
+                        result.is_error = message.is_error
+                        result.session_id = message.session_id
+            except ClaudeSDKError as exc:  # Claude Code exits 1 after an error result
+                watch.failed(exc)
+                if watch.limit() is None:
+                    raise
+                result.is_error = True
+        result.usage_limit = watch.limit()
         finished = True
     finally:
         # `async for` does not close the generator when the loop is left by an
         # exception (e.g. a timeout cancelling this task); closing it runs the
         # SDK's cleanup, which ends the Claude Code subprocess.
         await stream.aclose()  # type: ignore[attr-defined]
-        result.seconds = time.perf_counter() - start
+        result.seconds = seconds + time.perf_counter() - start
+        how = "done" if finished else "stopped"
+        if result.usage_limit:
+            how = f"stopped at a usage limit ({result.usage_limit.message[:120]})"
         _log(
-            f"agent {name}: {'done' if finished else 'stopped'} in {result.seconds / 60:.1f} "
+            f"agent {name}: {how} in {result.seconds / 60:.1f} "
             f"min, {result.turns} turns, ${result.cost_usd:.2f}"
             f"{' (error)' if result.is_error else ''}"
         )
     return result
+
+
+def _write(log: IO[str], message: Message) -> None:
+    """One message of the session as a line of its ``agent-<name>.jsonl`` log."""
+    payload: Any
+    try:
+        payload = (
+            dataclasses.asdict(message) if dataclasses.is_dataclass(message) else repr(message)
+        )
+    except Exception:
+        payload = repr(message)
+    log.write(json.dumps({"type": type(message).__name__, "data": payload}, default=str) + "\n")
+    log.flush()
