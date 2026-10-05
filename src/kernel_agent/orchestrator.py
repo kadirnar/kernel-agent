@@ -29,6 +29,7 @@ from kernel_agent.integrate.export import export_optimized
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
 from kernel_agent.workloads.base import WorkloadSpec
+from kernel_agent.workloads.quality import probe_messages
 from kernel_agent.workspace import RunDir, read_json, read_jsonl, write_json
 
 PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"]
@@ -74,6 +75,7 @@ class Orchestrator:
             trust_remote_code=cfg.trust_remote_code,
             harness=str(Path(cfg.harness).resolve()) if cfg.harness else None,
             options=cfg.workload_options,
+            family=card.family,
         )
         write_json(
             run.run_json,
@@ -184,6 +186,8 @@ class Orchestrator:
         )
         if not result["deterministic"]:
             log("WARNING: workload output is not deterministic; quality checks may be noisy")
+        for message in probe_messages(result):  # sensitivity probe / teacher forcing
+            log(message)
         self._mark("analyze", baseline_ms=result["median_ms"])
 
     async def write_harness(self, error: str) -> None:

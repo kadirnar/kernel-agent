@@ -37,6 +37,12 @@ _ARCH_HINTS: list[tuple[str, Modality]] = [
     (r"Vits|SpeechT5|Bark|Kokoro|Parler|TTS|Musicgen|Dia|Csm|Orpheus|Vocos", Modality.TTS),
 ]
 
+#: Model families with a dedicated built-in workload (``workloads.create_workload``),
+#: matched against architectures, ``model_type`` and the Hub library name.
+_FAMILIES: list[tuple[str, str]] = [
+    (r"(?i)^voxcpm", "voxcpm"),
+]
+
 _URL_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?(?:huggingface\.co|hf\.co)/"
     r"(?!datasets/|spaces/)(?P<repo>[\w.\-]+/[\w.\-]+)"
@@ -72,6 +78,7 @@ class ModelCard:
     files: list[str] = field(default_factory=list)
     config: dict[str, Any] = field(default_factory=dict)
     readme_excerpt: str = ""
+    family: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -107,6 +114,28 @@ def classify(
     return Modality.UNKNOWN
 
 
+def config_architectures(config: dict[str, Any]) -> list[str]:
+    """Architecture names from a ``config.json`` / ``model_index.json``: the usual
+    ``architectures`` list, a singular ``architecture`` string (VoxCPM) or the
+    diffusers ``_class_name``."""
+    architectures = [str(a) for a in config.get("architectures") or []]
+    if not architectures and isinstance(config.get("architecture"), str):
+        architectures = [config["architecture"]]
+    if not architectures and "_class_name" in config:
+        architectures = [str(config["_class_name"])]
+    return architectures
+
+
+def detect_family(
+    architectures: list[str], model_type: str | None = None, library: str | None = None
+) -> str | None:
+    names = [*architectures, model_type or "", library or ""]
+    for pattern, family in _FAMILIES:
+        if any(name and re.search(pattern, name) for name in names):
+            return family
+    return None
+
+
 def resolve(ref: str, *, token: str | None = None, modality: str | None = None) -> ModelCard:
     """Fetch metadata (no weights) for ``ref`` from the Hub."""
     from huggingface_hub import HfApi, hf_hub_download
@@ -133,9 +162,7 @@ def resolve(ref: str, *, token: str | None = None, modality: str | None = None) 
         return loaded if isinstance(loaded, dict) else {}
 
     config = _json("config.json") or _json("model_index.json")
-    architectures = list(config.get("architectures") or [])
-    if not architectures and "_class_name" in config:
-        architectures = [config["_class_name"]]
+    architectures = config_architectures(config)
 
     readme = ""
     if "README.md" in files:
@@ -170,4 +197,5 @@ def resolve(ref: str, *, token: str | None = None, modality: str | None = None) 
             if not isinstance(v, dict | list) or k in {"architectures", "_class_name"}
         },
         readme_excerpt=readme,
+        family=detect_family(architectures, config.get("model_type"), info.library_name),
     )

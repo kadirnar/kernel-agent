@@ -7,7 +7,8 @@ CuTe DSL, Triton or TileLang**. It also tries model-level algorithm changes
 for correctness against real captured inputs, benchmarked, and kept only if
 the whole model still produces the same output and runs faster.
 
-Works on **LLM**, **STT**, **TTS** and **diffusion** models. When no built-in
+Works on **LLM**, **STT**, **TTS** and **diffusion** models, plus a built-in
+workload for **VoxCPM2** (diffusion-autoregressive TTS). When no built-in
 workload can run a model (custom TTS stacks, for example), Claude writes a
 benchmark harness for it first.
 
@@ -20,8 +21,9 @@ uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
 ## How it works
 
 ```
-HF URL ─► resolve (modality, arch, size)
+HF URL ─► resolve (modality, arch, family, size)
         ─► analyze   load model, baseline latency, determinism check,
+                     sensitivity probe, teacher-forcing self-check,
                      module-level + kernel-level profile           [GPU worker]
         ─► (harness) Claude writes harness.py if the built-in workload fails
         ─► plan      Claude reads the profile + source, picks target modules,
@@ -55,7 +57,27 @@ illegal memory access can't kill the run, and parallel agents
 * **Model level** (`e2e`): the workload's own comparison. For LLM/STT that is
   identical greedy tokens for the first N tokens plus first-step logits cosine
   ≥ 0.99. For TTS it is spectral cosine. For diffusion it is PSNR ≥ 25 dB on
-  the same seed.
+  the same seed. Timing is always the free-running workload.
+* **Chaotic workloads** (teacher forcing): in an autoregressive model with
+  continuous, sampled outputs (VoxCPM: LM → flow-matching head with fresh noise
+  → latent fed back), any numerically-correct kernel makes the free-running
+  output diverge. The bundled Triton RMSNorm gives spectral cosine 0.69 on
+  VoxCPM2, a different seed 0.37. Such workloads implement
+  `run_teacher_forced`: the candidate replays the baseline trajectory with the
+  same per-step noise, and its own prediction for every step is compared with
+  the baseline's (per-step cosine, mean and minimum, plus an RMS ratio). The
+  free-running output only has to pass a sanity check: finite, same shapes, RMS
+  energy within ±25 % (VoxCPM: ±60 % for audio). The full free-running
+  comparison is reported as `metrics.free_running` and does not gate.
+  Teacher-forced metrics are in `metrics.teacher_forced`.
+* **Sensitivity probe**: `analyze` runs the workload once more with every
+  `nn.Linear` output multiplied by `1 ± 2^-8` (about one bf16 rounding step) and
+  records whether the free-running comparison still passes
+  (`baseline.json` → `sensitivity`, and `profile/summary.md`). If it fails, the
+  workload counts as chaotic. If it also has no teacher forcing, a loud warning
+  says that end-to-end validation will reject (almost) every kernel.
+  Teacher-forced workloads also replay their own trajectory once, which must be
+  exact (`baseline.json` → `teacher_forcing`).
 
 ### What "faster" means
 
@@ -146,6 +168,58 @@ above the first `##` heading and `<!-- comments -->` are not sent to agents.
   the first agent that used it, time). Each version is saved as
   `logs/program-<sha12>.md`.
 
+### VoxCPM2
+
+`openbmb/VoxCPM2` (and VoxCPM 1.x) is detected from the `"architecture"`
+field of its `config.json` (family `voxcpm`) and runs through the built-in
+workload in `kernel_agent/workloads/voxcpm.py`, so no harness agent is needed:
+
+```bash
+uv sync --extra all --extra voxcpm
+uv pip install --no-deps "voxcpm>=2.0.3"
+uv pip install --no-deps torchaudio --index-url https://download.pytorch.org/whl/cu130
+uv run --no-sync kernel-agent analyze openbmb/VoxCPM2 --no-harness-agent
+```
+
+`voxcpm` is installed with `--no-deps` because its own requirements pin
+`datasets<4`, gradio and funasr, and pull a `torchaudio` build that may not
+match your torch. It imports `torchaudio` at import time, so install a
+`torchaudio` from the same index as your torch (same CUDA variant), also with
+`--no-deps`. Never let either replace torch. A later `uv sync` removes both
+again; use `uv run --no-sync` afterwards.
+
+The workload generates exactly `patches` latent patches (default 60, 9.6 s
+of 48 kHz audio) with `retry_badcase=False`, and records every patch the
+LocDiT sampler (`model.feat_decoder`) produces. Teacher forcing wraps
+`forward` of the current `model.feat_decoder` instance at run time, so it
+works after kernel replacements and with transforms that wrap `workload.run`.
+The wrapper runs the sampler (same noise as the free run), records its
+prediction and returns the reference patch to the loop. The audio of that run
+is decoded from the reference latents, which also checks the AudioVAE decoder.
+The defaults `min_mean_step_cosine=0.99` and `min_step_cosine=0.7` (plus a
+±10 % RMS ratio) were calibrated at 60 patches on two texts. The table shows,
+for each change, the value of the two texts that is closest to the threshold:
+
+| change | mean step cosine | min step cosine | verdict |
+|---|---|---|---|
+| bundled `triton_rmsnorm.py` on every `MiniCPMRMSNorm` | 0.9993 | 0.976 | pass |
+| fp32 RMSNorm, MATH-backend SDPA | 0.9983 | 0.927 | pass |
+| every `nn.Linear` output × (1 ± 2^-8), 6 sign patterns | 0.9959 | 0.868 | pass |
+| RMSNorm with eps=1e-2 | 0.70 | 0.10 | fail |
+| RMSNorm without its weight | 0.26 | −0.06 | fail |
+| attention softmax scale × 1.25 | 0.973 | 0.79 | fail |
+| attention with one KV head dropped | 0.30 | −0.01 | fail |
+| Snake1d (AudioVAE) ignoring alpha | 1.0 (decoded audio: spectral cosine 0.90) | 1.0 | fail |
+
+Limitations: a candidate must still call `model.feat_decoder` from Python once
+per patch and draw its noise with `torch.randn` like the original. A transform
+that captures a whole step or the whole loop in one CUDA graph cannot be
+teacher-forced and is rejected with a clear reason. Errors as small as one
+bf16 rounding step per layer cannot be told apart from correct rounding
+changes: an attention softmax scale off by 5 % reaches mean cosine 0.994 and
+passes; the module-level check has to catch errors of that size. The model
+runs in its checkpoint dtype (bf16), and `--dtype` is ignored.
+
 ## Backends
 
 | backend | how | host overhead (tiny op, measured) |
@@ -178,6 +252,8 @@ kernel-agent optimize <hf-url> [options]
                                        TTS: text, seed, min_spec_cosine
                                        diffusion: steps, height, width, prompt, cpu_offload, min_psnr
                                        any: entrypoints=Cls.method,... (extra non-forward methods)
+                                       VoxCPM: text, patches, timesteps, cfg, seed, compile,
+                                               min_step_cosine, min_mean_step_cosine, min_spec_cosine
   --backends cuda,triton,cute,tilelang,nvrtc
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
@@ -357,6 +433,13 @@ def build(reference):
 `make_inputs`, `run` and `compare` (`kernel_agent/workloads/base.py`). If the
 inference loop calls module methods whose names the entrypoint pattern misses,
 list them in the class attribute `entrypoints = {"ClassName": ["method"]}`.
+
+For chaotic autoregressive models, also set `supports_teacher_forcing = True`
+(and `chaotic = True`) and implement `run_teacher_forced(inputs, reference)`
+and `compare_teacher_forced(reference, candidate)`. `reference` is the
+baseline output of `run()`, so `run()` must record the per-step trajectory.
+`compare_steps` in `base.py` is the per-step comparison, and
+`workloads/voxcpm.py` is a complete example.
 
 ## Using it interactively from Claude Code
 

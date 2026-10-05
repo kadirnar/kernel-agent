@@ -104,6 +104,11 @@ where the returned object subclasses `kernel_agent.workloads.base.Workload`
 * `compare()` uses the helpers in base.py (`compare_tokens`, `compare_audio`,
   `psnr`, `cosine`) with tolerances that accept bf16 numerical noise but catch
   broken kernels.
+* If `check_harness` reports `"sensitivity": {{"free_running_passed": false}}`
+  (the output diverges under a one-rounding-step perturbation, typical of
+  autoregressive models that sample continuous values), add teacher forcing:
+  `chaotic = True`, `supports_teacher_forcing = True`, `run_teacher_forced` and
+  `compare_teacher_forced` (see `voxcpm.py`), until `"teacher_forcing"` passes.
 * One `run()` should take roughly 0.2-10 s on the GPU.
 * If the inference loop calls module methods other than `forward` directly
   (e.g. `layer.step_decode(...)`) and their names do not match

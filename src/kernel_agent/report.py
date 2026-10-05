@@ -21,6 +21,17 @@ def _chart(run: RunDir, path: Path, alt: str) -> list[str]:
     return [f"![{alt}]({path.relative_to(run.root).as_posix()})", ""] if path.exists() else []
 
 
+def _flat_metrics(metrics: Any, prefix: str = "") -> dict[str, Any]:
+    """One level of ``{"teacher_forced": {...}, "free_running": {...}}`` -> dotted keys."""
+    flat: dict[str, Any] = {}
+    for key, value in (metrics or {}).items():
+        if isinstance(value, dict):
+            flat.update(_flat_metrics(value, f"{prefix}{key}."))
+        else:
+            flat[f"{prefix}{key}"] = value
+    return flat
+
+
 def write_report(run: RunDir) -> Path:
     refresh(run)  # charts + dashboard.html, so the report embeds current images
     data = run.load()
@@ -48,7 +59,7 @@ def write_report(run: RunDir) -> Path:
         f"| baseline | {_fmt(baseline.get('median_ms'), 1)} | 1.00x | reference |",
     ]
     if final:
-        metrics = ", ".join(f"{k}={v}" for k, v in (final.get("metrics") or {}).items())
+        metrics = ", ".join(f"{k}={v}" for k, v in _flat_metrics(final.get("metrics")).items())
         lines.append(
             f"| optimised | {_fmt(final.get('median_ms'), 1)} | **{final.get('speedup')}x** | "
             f"{metrics} |"

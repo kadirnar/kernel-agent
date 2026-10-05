@@ -3,6 +3,12 @@
 A workload is the ground truth for an optimisation run.  It must be
 deterministic (fixed seeds, greedy decoding) so that the output of the
 optimised model can be compared against the baseline output.
+
+Autoregressive models with continuous, sampled outputs (diffusion/flow-matching
+TTS heads fed back into an LM) are *chaotic*: any numerically-correct kernel
+change makes the free-running trajectory diverge.  Such workloads implement
+teacher forcing: the candidate replays the baseline trajectory and only its
+per-step predictions are compared, so errors cannot compound.
 """
 
 from __future__ import annotations
@@ -38,6 +44,8 @@ class WorkloadSpec:
     trust_remote_code: bool = False
     harness: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
+    #: Model family with a dedicated built-in workload (``hub.detect_family``).
+    family: str | None = None
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -69,6 +77,16 @@ class Workload(ABC):
     #: the name pattern in :mod:`kernel_agent.profiling.methods` misses.  The
     #: ``entrypoints=Cls.method,...`` option adds more.
     entrypoints: ClassVar[dict[str, list[str]]] = {}
+    #: The free-running output diverges under any numerically-correct change, so
+    #: :meth:`compare` on it is informational only (quality = teacher forcing).
+    chaotic: ClassVar[bool] = False
+    #: :meth:`run_teacher_forced` and :meth:`compare_teacher_forced` are implemented.
+    supports_teacher_forcing: ClassVar[bool] = False
+    #: Where teacher forcing hooks in (shown to the agents in the profile summary).
+    teacher_forcing_note: ClassVar[str] = ""
+    #: Per-output RMS tolerance of the free-running sanity check (default ±25 %),
+    #: keyed like the output dict, e.g. ``{"audio": 0.6}``.
+    sanity_rms_tolerance: ClassVar[dict[str, float]] = {}
 
     def __init__(self, spec: WorkloadSpec) -> None:
         self.spec = spec
@@ -101,6 +119,20 @@ class Workload(ABC):
     @abstractmethod
     def compare(self, reference: Any, candidate: Any) -> Comparison:
         """Decide whether ``candidate`` output is acceptable versus the baseline."""
+
+    def run_teacher_forced(self, inputs: Any, reference: Any) -> Any:
+        """Replay the trajectory recorded in ``reference`` (the baseline output of
+        :meth:`run`): at every step feed the *reference* state back into the loop
+        and record the model's own prediction for that step.
+
+        Sampling noise must be drawn exactly as in :meth:`run` (same seed, same
+        RNG calls in the same order) so that step *i* sees the same noise."""
+        raise NotImplementedError(f"{type(self).__name__} does not support teacher forcing")
+
+    def compare_teacher_forced(self, reference: Any, candidate: Any) -> Comparison:
+        """Compare the per-step predictions of :meth:`run_teacher_forced` with the
+        steps recorded in ``reference``."""
+        raise NotImplementedError(f"{type(self).__name__} does not support teacher forcing")
 
     def describe(self) -> str:
         opts = ", ".join(f"{k}={v}" for k, v in sorted(self.options.items()))
@@ -237,4 +269,64 @@ def compare_audio(
         return Comparison(False, metrics, f"length differs by {len_diff:.1%}")
     if cos < min_spec_cosine:
         return Comparison(False, metrics, f"spectral cosine {cos:.4f} < {min_spec_cosine}")
+    return Comparison(True, metrics)
+
+
+def compare_steps(
+    ref_steps: torch.Tensor,
+    new_steps: torch.Tensor,
+    *,
+    min_step_cosine: float,
+    min_mean_step_cosine: float,
+    max_rms_change: float = 0.1,
+) -> Comparison:
+    """Teacher-forced comparison of per-step predictions (dim 0 = step).
+
+    ``new_steps[i]`` was predicted from the *reference* history, so a kernel's
+    error shows up once per step instead of compounding along the trajectory.
+    The mean cosine catches small systematic errors, the minimum a single bad
+    step, and the RMS ratio magnitude errors that cosines cannot see."""
+    if ref_steps.shape[0] == 0:
+        return Comparison(False, {"steps": 0}, "the reference recorded no steps")
+    if ref_steps.shape[0] != new_steps.shape[0]:
+        return Comparison(
+            False,
+            {"steps": int(new_steps.shape[0]), "reference_steps": int(ref_steps.shape[0])},
+            f"{new_steps.shape[0]} teacher-forced steps != {ref_steps.shape[0]} reference steps",
+        )
+    if ref_steps.shape[1:] != new_steps.shape[1:]:
+        return Comparison(
+            False,
+            {"steps": int(new_steps.shape[0])},
+            f"step shape {tuple(new_steps.shape[1:])} != {tuple(ref_steps.shape[1:])}",
+        )
+    ref = ref_steps.detach().float().flatten(1)
+    new = new_steps.detach().float().flatten(1)
+    cosines = [cosine(r, n) for r, n in zip(ref, new, strict=True)]
+    rel_err = (new - ref).norm(dim=1) / ref.norm(dim=1).clamp_min(1e-12)
+    worst = min(range(len(cosines)), key=cosines.__getitem__)
+    mean_cos = sum(cosines) / len(cosines)
+    ref_rms = float(ref.pow(2).mean().sqrt())
+    rms_ratio = float(new.pow(2).mean().sqrt()) / ref_rms if ref_rms > 0 else 1.0
+    metrics: dict[str, float | int | str] = {
+        "steps": len(cosines),
+        "min_step_cosine": round(cosines[worst], 6),
+        "mean_step_cosine": round(mean_cos, 6),
+        "worst_step": worst,
+        "mean_rel_error": round(float(rel_err.mean()), 6),
+        "max_rel_error": round(float(rel_err.max()), 6),
+        "rms_ratio": round(rms_ratio, 6),
+    }
+    if not bool(torch.isfinite(new).all()):
+        return Comparison(False, metrics, "non-finite teacher-forced predictions")
+    if mean_cos < min_mean_step_cosine:
+        return Comparison(
+            False, metrics, f"mean step cosine {mean_cos:.5f} < {min_mean_step_cosine}"
+        )
+    if cosines[worst] < min_step_cosine:
+        return Comparison(
+            False, metrics, f"step {worst} cosine {cosines[worst]:.5f} < {min_step_cosine}"
+        )
+    if abs(rms_ratio - 1.0) > max_rms_change:
+        return Comparison(False, metrics, f"RMS x{rms_ratio:.4f} (allowed ±{max_rms_change:.0%})")
     return Comparison(True, metrics)

@@ -53,6 +53,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     import torch
 
     from kernel_agent.profiling.profiler import profile_workload, summarize
+    from kernel_agent.workloads import quality
     from kernel_agent.workloads.base import measure
 
     t0 = time.perf_counter()
@@ -75,6 +76,8 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "deterministic": det.passed,
         "determinism_metrics": det.metrics,
         "determinism_reason": det.reason,
+        # Sensitivity probe (+ teacher-forcing self-check): is the output chaotic?
+        **quality.probe(workload, inputs, output),
         "output_summary": _output_summary(output),
         "roots": {
             name: {
@@ -89,7 +92,9 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     if not ns.no_profile:
         profile = profile_workload(workload, inputs)
         write_json(run.profile_dir / "profile.json", profile)
-        (run.profile_dir / "summary.md").write_text(summarize(profile, timing["median_ms"]))
+        (run.profile_dir / "summary.md").write_text(
+            summarize(profile, timing["median_ms"]) + quality.summary_section(baseline)
+        )
         baseline["profile"] = str(run.profile_dir / "summary.md")
     return baseline
 
@@ -151,6 +156,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         apply_transforms,
     )
     from kernel_agent.workloads.base import measure
+    from kernel_agent.workloads.quality import assess, is_chaotic
 
     workload = _workload(run)
     patches = []
@@ -185,14 +191,27 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         }
     output = timing.pop("output")
     reference = torch.load(run.root / "baseline_output.pt", weights_only=False)
-    cmp = workload.compare(reference, output)
     baseline = read_json(run.baseline_json, {})
     base_ms = float(baseline.get("median_ms", 0.0)) or float("nan")
+    # Timing is free-running; quality is teacher-forced when the workload supports it.
+    try:
+        verdict = assess(
+            workload, inputs, reference, output, chaotic=is_chaotic(workload, baseline)
+        )
+    except Exception as exc:
+        return {
+            "status": "runtime_error",
+            "passed": False,
+            "reason": f"quality check failed: {exc}"[:500],
+            "median_ms": round(timing["median_ms"], 3),
+            "patches": report.__dict__,
+            "error": traceback.format_exc()[-4000:],
+        }
     return {
         "status": "ok",
-        "passed": cmp.passed,
-        "reason": cmp.reason,
-        "metrics": cmp.metrics,
+        "passed": verdict["passed"],
+        "reason": verdict["reason"],
+        "metrics": verdict["metrics"],
         "median_ms": round(timing["median_ms"], 3),
         "times_ms": [round(t, 3) for t in timing["times_ms"]],
         "baseline_ms": round(base_ms, 3),
