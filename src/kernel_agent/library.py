@@ -647,8 +647,12 @@ def _x(value: Any) -> str:
     return f"{float(value):.2f}x" if isinstance(value, int | float) else "?"
 
 
+def _pct(value: float) -> str:
+    return f"{value:.0f}" if value >= 10 else f"{value:.2g}"
+
+
 def _sol(value: Any) -> str:
-    return f" at {float(value):.0f} % of SOL" if isinstance(value, int | float) else ""
+    return f" at {_pct(float(value))} % of SOL" if isinstance(value, int | float) else ""
 
 
 def priors_text(tried: list[dict[str, Any]], limit: int = MAX_PRIORS) -> list[str]:
@@ -960,7 +964,7 @@ def cmd_list(ns: argparse.Namespace) -> int:
                 str(m.get("module_class") or e.path.parent.name),
                 str(m.get("backend") or ""),
                 _x(m.get("speedup")) if m.get("speedup") else "",
-                f"{sol:.0f}" if isinstance(sol, int | float) else "",
+                _pct(float(sol)) if isinstance(sol, int | float) else "",
                 "BROKEN" if problem else flags,
                 str(m.get("repo_id") or ""),
                 str(m.get("updated") or "")[:10],

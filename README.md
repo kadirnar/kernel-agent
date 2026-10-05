@@ -570,10 +570,16 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
 
   ```
   # Prior kernels from the library
-  1. `candidates/prior_02205747-95d63ec4.py` (triton, from `Qwen/Qwen3-0.6B`): 1.50x at
-     60 % of SOL there; here 1.40x at 55 % of SOL, `history/001_prior_..._3c9a.py`.
-     Approach: one program per row, fp32 accumulation
+  1. `candidates/prior_b5dee5cf-cebbc64f.py` (triton, from `HuggingFaceTB/SmolLM2-135M-Instruct`):
+     1.67x at 0.017 % of SOL there; here 1.68x at 0.018 % of SOL,
+     `history/001_prior_b5dee5cf-cebbc64f_996c6f7d.py`. Approach: bundled Triton example:
+     one program per row, fp32 accumulation
   ```
+
+  That is from a run on SmolLM2-135M with batch 2 and a 128-token prompt. The
+  kernel came from an earlier run with batch 1 and a 256-token prompt. The
+  reused kernel was then accepted end to end (487.4 → 454.7 ms), and no agent
+  wrote a line of it.
 * **Librarian.** After the report, a cheap agent distils the run's `NOTES.md`
   files and ledger rows (status, speedup, % of SOL, hypothesis) into short
   rules, such as "do X when Y" or "Z fails because W (abandoned after N
