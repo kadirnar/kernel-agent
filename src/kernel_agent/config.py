@@ -43,6 +43,8 @@ class OptimizeConfig:
     budget_reserve: float = 0.15  # share of max_hours kept for integrate + report
     eval_timeout_s: float = 300.0  # per evaluate_candidate subprocess
 
+    program: str | None = None  # program.md for the agents (kernel_agent/program.py)
+
     hf_token: str | None = None
     verbose: bool = False
 

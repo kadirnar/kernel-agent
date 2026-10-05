@@ -74,6 +74,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         agent_minutes=ns.agent_minutes,
         budget_reserve=ns.budget_reserve,
         eval_timeout_s=ns.eval_timeout,
+        program=ns.program,
         hf_token=os.environ.get("HF_TOKEN"),
         verbose=ns.verbose,
     )
@@ -108,6 +109,8 @@ def cmd_resume(ns: argparse.Namespace) -> int:
     overrides: dict[str, Any] = {}
     if ns.claude_model:
         overrides["claude_model"] = ns.claude_model
+    if ns.program:
+        overrides["program"] = ns.program
     orch = Orchestrator.resume(Path(ns.run_dir), overrides)
     if ns.redo:
         data = orch.run.load()
@@ -148,6 +151,14 @@ def cmd_install_claude_code(ns: argparse.Namespace) -> int:
         for file in (src / kind).glob("*.md"):
             shutil.copy2(file, dst / kind / file.name)
             print(f"installed {dst / kind / file.name}")
+    return 0
+
+
+def cmd_program_init(ns: argparse.Namespace) -> int:
+    from kernel_agent import program
+
+    path = program.init(Path(ns.path), force=ns.force)
+    print(f"wrote {path}; edit it and pass `--program {path}` to optimize, analyze or resume")
     return 0
 
 
@@ -195,6 +206,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         help="workload option, e.g. -o prompt_len=1024 -o new_tokens=128 -o steps=20",
     )
     p.add_argument("--harness", help="use your own harness.py (create(spec) -> Workload)")
+    p.add_argument("--program", metavar="FILE", help="program.md with instructions for the agents")
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--runs-dir", default="runs")
     p.add_argument(
@@ -261,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--until", choices=["plan", "capture", "kernels", "transforms", "integrate"])
     p.add_argument("--claude-model")
+    p.add_argument("--program", metavar="FILE", help="replace the run's program.md with FILE")
     p.set_defaults(func=cmd_resume)
 
     p = sub.add_parser("eval", help="evaluate a candidate against a capture file")
@@ -276,6 +289,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("project", nargs="?", default=".")
     p.set_defaults(func=cmd_install_claude_code)
+
+    p = sub.add_parser("program", help="program.md: human-editable instructions for the agents")
+    program_sub = p.add_subparsers(dest="program_command", required=True)
+    p = program_sub.add_parser("init", help="write the default program.md for editing")
+    p.add_argument("path", nargs="?", default="program.md", help="file or directory")
+    p.add_argument("--force", action="store_true", help="overwrite an existing file")
+    p.set_defaults(func=cmd_program_init)
 
     p = sub.add_parser("report", help="(re)write report.md, charts and dashboard.html for a run")
     p.add_argument("run_dir")
