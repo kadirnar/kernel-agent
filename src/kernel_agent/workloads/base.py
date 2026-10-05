@@ -134,6 +134,19 @@ class Workload(ABC):
         steps recorded in ``reference``."""
         raise NotImplementedError(f"{type(self).__name__} does not support teacher forcing")
 
+    def reference_optimizations(self) -> str | None:
+        """Optional hook: apply, in place and after :meth:`load`, what a competent
+        user would do to speed this model up without custom kernels (the model's
+        own ``torch.compile`` path, a static KV cache, a compiled denoiser, ...).
+        Returns a one-line description, or ``None`` when there is nothing to apply.
+
+        ``analyze`` measures it in a fresh process as the *compiled baseline*
+        (``baseline.json`` ``compiled_ms``) and the reports show speedups vs eager
+        and vs compiled; the integration also measures it on top of the accepted
+        kernels.  The default does nothing (no compiled baseline unless
+        ``--compile-baseline`` asks for a generic ``torch.compile`` of the roots)."""
+        return None
+
     def describe(self) -> str:
         opts = ", ".join(f"{k}={v}" for k, v in sorted(self.options.items()))
         return f"{type(self).__name__}({self.spec.repo_id}, {self.spec.dtype}; {opts})"

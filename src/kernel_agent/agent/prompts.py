@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from kernel_agent.strong_baseline import headroom_note
+
 AGENT_DIR = Path(__file__).parent
 KNOWLEDGE_DIR = AGENT_DIR / "knowledge"
 EXAMPLES_DIR = AGENT_DIR / "examples"
@@ -171,6 +173,8 @@ def planner_prompt(
     toolchain: str,
 ) -> str:
     base = {k: baseline.get(k) for k in ("workload", "median_ms", "peak_mem_gb", "deterministic")}
+    if "compiled_ms" in baseline:  # the strong baseline (strong_baseline.py)
+        base["compiled_ms"] = baseline["compiled_ms"]
     return f"""You are the lead GPU performance engineer. Decide what to optimise in this
 model. Specialist agents will then write custom kernels for each target you pick.
 
@@ -181,7 +185,7 @@ model. Specialist agents will then write custom kernels for each target you pick
 ```json
 {json.dumps(base, indent=2)}
 ```
-
+{headroom_note(baseline)}
 {profile_summary}
 
 # Optimisation playbook
@@ -449,7 +453,7 @@ everything around them: decoding loop, caches, graph capture, layouts,
 redundant work, host synchronisation.
 
 Baseline: {baseline.get("median_ms", 0):.1f} ms per run ({baseline.get("workload")}).
-
+{headroom_note(baseline)}
 {profile_summary}
 
 # Planner's ideas

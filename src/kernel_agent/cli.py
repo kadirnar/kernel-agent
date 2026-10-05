@@ -79,6 +79,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         budget_reserve=ns.budget_reserve,
         eval_timeout_s=ns.eval_timeout,
         program=ns.program,
+        compile_baseline=ns.compile_baseline,
         hf_token=os.environ.get("HF_TOKEN"),
         verbose=ns.verbose,
     )
@@ -164,6 +165,7 @@ def cmd_eval(ns: argparse.Namespace) -> int:
         profile=ns.profile,
         compile_baseline=ns.compile_baseline,
         timeout=ns.timeout,
+        compile_check=ns.compile_check,
     )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("correct") else 1
@@ -278,6 +280,12 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--eval-timeout", type=float, default=300.0, help="seconds per evaluate_candidate"
     )
+    p.add_argument(
+        "--compile-baseline",
+        action="store_true",
+        help="analyze: time a generic torch.compile when the workload has no "
+        "reference_optimizations() hook",
+    )
     p.add_argument("--verbose", "-v", action="store_true")
 
 
@@ -351,6 +359,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("candidate")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--compile-baseline", action="store_true", help="also time torch.compile")
+    p.add_argument(
+        "--compile-check",
+        action="store_true",
+        help="also torch.compile the candidate: graph breaks + compiled outputs",
+    )
     p.add_argument("--timeout", type=float, default=300.0, help="seconds before giving up")
     p.set_defaults(func=cmd_eval)
 

@@ -137,7 +137,8 @@ def test_summary_and_status(run):
 
     text = render(run, width=160)
     assert "Qwen/Qwen3-0.6B (llm)" in text and "phase: report" in text
-    assert "baseline 1,532.4 ms" in text and "measured 889.0 ms (1.72x, integrated)" in text
+    assert "baseline 1,532.4 ms" in text and "compiled 1,104.6 ms (1.39x)" in text
+    assert "measured 889.0 ms (1.72x vs eager, 1.24x vs compiled, integrated)" in text
     assert "cost $20.62" in text
     for target in SCRIPTS:
         assert f"\n{target} " in text

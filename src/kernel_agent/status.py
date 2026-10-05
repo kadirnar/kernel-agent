@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from typing import Any
 
-from kernel_agent import ledger
+from kernel_agent import ledger, strong_baseline
 from kernel_agent.workspace import RunDir
 
 
@@ -52,23 +52,40 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         "",
     ]
 
+    comp = s["compiled_ms"]
+
+    def vs(ms: float) -> str:  # speedup vs eager (and vs the compiled baseline when measured)
+        return f"{_x(base / ms)} vs eager, {_x(comp / ms)} vs compiled" if comp else _x(base / ms)
+
     parts = [f"baseline {_ms(base)}"]
+    if comp:
+        parts.append(f"compiled {_ms(comp)} ({_x(base / comp) if base else '—'})")
     if base and s["projected_ms"]:
         parts.append(f"projected {_ms(s['projected_ms'])} ({_x(base / s['projected_ms'])})")
     best = s["best_e2e"]
     final = s["final"] or {}
-    if final.get("passed") and final.get("median_ms"):
-        parts.append(
-            f"measured {_ms(final['median_ms'])} ({_x(base / final['median_ms'])}, integrated)"
-        )
-    elif best and base:
-        parts.append(
-            f"measured {_ms(best['new_ms'])} ({_x(base / best['new_ms'])}, {best['snapshot']})"
-        )
+    if base and final.get("passed") and final.get("median_ms"):
+        parts.append(f"measured {_ms(final['median_ms'])} ({vs(final['median_ms'])}, integrated)")
+    elif best and base and best["new_ms"]:
+        parts.append(f"measured {_ms(best['new_ms'])} ({vs(best['new_ms'])}, {best['snapshot']})")
     else:
         parts.append("measured —")
     parts.append(f"cost ${s['cost_usd']:.2f}")
-    lines += ["  |  ".join(parts), ""]
+    header = [parts[0]]
+    for part in parts[1:]:  # wrap between parts at the terminal width
+        if len(header[-1]) + 5 + len(part) > width:
+            header.append(part)
+        else:
+            header[-1] += "  |  " + part
+    lines += header
+    if s["reference"]:
+        lines.append(
+            "compiled baseline + accepted kernels: "
+            + strong_baseline.combination_text(s["reference"])
+        )
+    elif s["compiled_ms"] is None and (line := strong_baseline.describe(s["baseline"])):
+        lines.append(line.replace("**", ""))  # the compiled baseline failed: say why
+    lines.append("")
 
     rows = [
         [

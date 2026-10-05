@@ -74,3 +74,8 @@ Notes
 * Matmul with tiny M (decode GEMV): use a split-K or row-per-program design with
   `tl.sum(a[None, :] * w, axis=1)` rather than `tl.dot`, and vector loads of the
   weight (memory bound — goal is to stream weights at full bandwidth).
+* torch.compile: the model may run under `torch.compile` (the compiled baseline,
+  e.g. VoxCPM's `model.optimize()` with `fullgraph=True`). Wrap the launcher in
+  `torch.library.custom_op` + `register_fake` (`examples/triton_rmsnorm_custom_op.py`)
+  so it is one opaque op instead of a graph break, and check it with
+  `evaluate_candidate(..., compile_check=true)`.

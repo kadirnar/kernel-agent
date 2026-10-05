@@ -24,7 +24,8 @@ uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
 HF URL ─► resolve (modality, arch, family, size)
         ─► analyze   load model, baseline latency, determinism check,
                      sensitivity probe, teacher-forcing self-check,
-                     module-level + kernel-level profile           [GPU worker]
+                     module-level + kernel-level profile, compiled
+                     baseline (the model's own torch.compile path)  [GPU worker]
         ─► (harness) Claude writes harness.py if the built-in workload fails
         ─► plan      Claude reads the profile + source, picks target modules,
                      an approach and backends for each, and model transforms
@@ -38,7 +39,8 @@ HF URL ─► resolve (modality, arch, family, size)
         ─► transforms  Claude "systems engineer" writes model-level transforms,
                      validated end to end with evaluate_e2e
         ─► integrate all winners are applied together, validated against the
-                     baseline output; greedy fallback if the combination fails
+                     baseline output; greedy fallback if the combination fails;
+                     then the accepted kernels under the compiled baseline
         ─► report    report.md + optimized/ (kernels + apply.py)
 ```
 
@@ -119,6 +121,57 @@ A mismatch is refused with a `TAMPER` line on stderr and a `tamper` event in
 paths without these checks. The evaluator runs candidate code in the same
 user account, so a candidate could still read `.truth/` at run time; process
 isolation is a separate step.
+
+### Strong baseline: eager vs compiled
+
+Speedups over eager PyTorch overstate the gain when the model already has a
+fast path that users get for free. `Workload.reference_optimizations()` is an
+optional hook that applies what a competent user would do without custom
+kernels and returns a one-line description:
+
+| workload | reference optimisations |
+|---|---|
+| VoxCPM | `model.optimize()`: `torch.compile(mode="reduce-overhead", fullgraph=True)` of both LMs' `forward_step`, the LocEnc and the LocDiT estimator |
+| LLM | static KV cache (`cache_implementation="static"`); transformers then compiles the decode step (`reduce-overhead`). Only for architectures that declare compile support |
+| diffusion | `torch.compile` of the denoiser (`pipe.transformer` / `pipe.unet`; not with `cpu_offload`) |
+| STT, TTS, harnesses | none by default (implement the hook, or pass `--compile-baseline`) |
+
+`analyze` measures the eager baseline first, releases the model and measures
+the reference optimisations in a fresh process (`python -m
+kernel_agent.strong_baseline`, log in `logs/strong-baseline.log`): 2 untimed
+warm-up runs (compilation, CUDA-graph recording), then the same timed runs as
+the eager baseline. `--compile-baseline` also measures workloads without the
+hook, with a generic `torch.compile` of their root modules. `baseline.json`
+gets `compiled_ms` (median, or `null` when it failed) and `compiled_detail`:
+what was applied, timings, `warmup_s`, `compile_s` (warm-up time beyond the
+steady-state runs), `speedup_vs_eager`, and `quality`: the compiled output
+judged against the eager output by the workload's own end-to-end check
+(teacher forced for chaotic workloads). A failure is recorded and reported,
+never fatal. Harness checks (`--no-profile`) and the re-profiles of improve
+rounds do not measure it (rounds copy the run's values).
+
+* `report.md`, `kernel-agent status`, `dashboard.html`, `kernel-agent watch`
+  and `profile/summary.md` show every result vs eager **and** vs compiled.
+* The planner and systems prompts state the real headroom: the compiled
+  latency, its speedup over eager, and that an optimisation only helps users
+  when it beats it (re-discovering `torch.compile` / CUDA graphs is no
+  progress).
+* `integrate` also measures *reference optimisations + accepted kernels*
+  (the built-in transform `integrate/builtin/reference_optimizations.py`
+  applied after the kernels) and records in `integration.json` → `reference`
+  whether the kernels compose with it: `composes` (beats the compiled baseline
+  by > 1 %), `no_gain`, `fails_quality`, or `breaks` (for example a kernel
+  launcher that is a graph break under `fullgraph=True`, with the error). The
+  greedy result (`accepted`, `final`) is unchanged.
+* `evaluate_candidate(..., compile_check=true)` / `kernel-agent eval
+  --compile-check` adds an optional stage on a fresh `build()`:
+  `torch._dynamo.explain` per entrypoint (graphs, graph breaks and where they
+  happen) and `torch.compile(fullgraph=False)` of the candidate on every
+  captured case, with outputs and side effects checked
+  (`result["compile_check"]`: `passed`, `graph_breaks`, `fullgraph_ok`,
+  `break_reasons`). `examples/triton_rmsnorm_custom_op.py` shows how to wrap
+  a kernel in `torch.library.custom_op` + `register_fake` so it is one opaque
+  op for Dynamo, Inductor and CUDA graphs instead of a graph break.
 
 ### Entrypoints other than `forward`
 
@@ -474,6 +527,8 @@ kernel-agent optimize <hf-url> [options]
   --harness my_harness.py              your own workload
   --program my_program.md              instructions for the agents (see "program.md")
   --until analyze|plan|capture|kernels|transforms|integrate
+  --compile-baseline                   also measure a generic torch.compile baseline for
+                                       workloads without reference_optimizations()
 
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
 kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4] [--rounds R]
@@ -481,7 +536,8 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
   --max-slices N --dry-run [--seed 0]  continuous loop (see "kernel-agent improve")
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE]
 kernel-agent program init [path]       write the default program.md for editing
-kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
+kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]
+                                       [--timeout 300]
                                        (a full capture, e.g. <run_dir>/.truth/captures/<id>.pt)
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
@@ -512,7 +568,8 @@ print(run.report.read_text())
 
 ```
 runs/<org>--<name>/<timestamp>/
-  run.json  toolchain.json  baseline.json
+  run.json  toolchain.json
+  baseline.json               eager baseline (+ compiled_ms / compiled_detail, see "Strong baseline")
   program.md                  agent instructions; edit it mid-run to steer the agents
   profile/summary.md          profile handed to the planner
   plan.json                   targets + transforms
@@ -689,6 +746,10 @@ def build(reference):
     return new
 ```
 
+To keep a kernel working when the model runs under `torch.compile` (the
+compiled baseline), register its launcher as a custom op
+(`examples/triton_rmsnorm_custom_op.py`) and check it with `--compile-check`.
+
 ## Harness contract (custom models)
 
 `harness.py` defines `create(spec) -> Workload`. Implement `load`, `roots`,
@@ -702,6 +763,10 @@ and `compare_teacher_forced(reference, candidate)`. `reference` is the
 baseline output of `run()`, so `run()` must record the per-step trajectory.
 `compare_steps` in `base.py` is the per-step comparison, and
 `workloads/voxcpm.py` is a complete example.
+
+Optionally implement `reference_optimizations()` (apply the model's own fast
+path in place, return a one-line description, or `None`) so that `analyze`
+measures a compiled baseline (see "Strong baseline").
 
 ## Using it interactively from Claude Code
 

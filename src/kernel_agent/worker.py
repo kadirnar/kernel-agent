@@ -53,8 +53,11 @@ def _output_summary(output: Any) -> dict[str, Any]:
 
 
 def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    import gc
+
     import torch
 
+    from kernel_agent import strong_baseline
     from kernel_agent.profiling.profiler import profile_workload, summarize
     from kernel_agent.workloads import quality
     from kernel_agent.workloads.base import measure
@@ -97,14 +100,37 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             for name, m in workload.roots().items()
         },
     }
+    if ns.out_dir:  # improve round: keep the run's eager + compiled baselines for reference
+        first = read_json(run.baseline_json, {}) or {}
+        baseline["run_eager_ms"] = first.get("median_ms")
+        baseline.update({k: first[k] for k in ("compiled_ms", "compiled_detail") if k in first})
     write_json(out.baseline_json, baseline)
+    # Strong baseline (strong_baseline.py): the full analyze of a run measures the
+    # workload's reference optimisations (or, with --compile-baseline, a generic
+    # torch.compile) in a fresh process; harness checks and re-profiles do not.
+    generic = bool((run.load().get("config") or {}).get("compile_baseline"))
+    compiled = not (ns.out_dir or ns.no_profile) and (generic or strong_baseline.has_hook(workload))
 
     if not ns.no_profile:
         profile = profile_workload(workload, inputs)
         write_json(out.profile_dir / "profile.json", profile)
+        summary = summarize(profile, timing["median_ms"]) + quality.summary_section(baseline)
         (out.profile_dir / "summary.md").write_text(
-            summarize(profile, timing["median_ms"]) + quality.summary_section(baseline)
+            summary + strong_baseline.summary_section(baseline)
         )
+        if compiled:
+            del workload, inputs, output, again  # release the eager model for the compiled copy
+            gc.collect()
+            torch.cuda.empty_cache()
+            baseline.update(
+                strong_baseline.run_measurement(
+                    out, eager_ms=timing["median_ms"], generic=generic, iters=ns.iters
+                )
+            )
+            write_json(out.baseline_json, baseline)
+            (out.profile_dir / "summary.md").write_text(
+                summary + strong_baseline.summary_section(baseline)
+            )
         baseline["profile"] = str(out.profile_dir / "summary.md")
     return baseline
 

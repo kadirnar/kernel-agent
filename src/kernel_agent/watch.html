@@ -655,7 +655,8 @@ td.nowrap { white-space: nowrap; }
       ["Baseline (eager)", fmt.ms(base),
         comp ? `torch.compile ${fmt.ms(comp)} (${fmt.x(base / comp)})` : run.workload || "not measured yet"],
       ["Best end-to-end", m ? fmt.ms(m.ms) : "—",
-        m ? `${fmt.x(m.speedup)} vs eager · ${m.label}` : "no passing end-to-end run yet"],
+        m ? `${fmt.x(m.speedup)} vs eager${comp ? ` · ${fmt.x(comp / m.ms)} vs compiled` : ""} · ${m.label}`
+          : "no passing end-to-end run yet"],
       ["Projected from kernels", keptKernel ? fmt.ms(proj) : "—",
         keptKernel && proj && base ? `${fmt.x(base / proj)} if the best kernels add up` : "no kept kernel yet"],
       ["Evaluations", String(c.evaluations), `${c.keeps} kept · ${c.failures} failed · ${c.e2e} end-to-end`],
