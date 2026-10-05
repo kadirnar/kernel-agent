@@ -660,14 +660,16 @@ measurement holds the lock of one GPU while its subprocess runs
   orchestrator never initialises CUDA to find them), restricted to an inherited
   `CUDA_VISIBLE_DEVICES` (indices or `GPU-` UUIDs, in its order).
   `KERNEL_AGENT_GPUS=0,2` replaces both. Indices are `nvidia-smi`'s (PCI bus
-  order). `kernel-agent doctor` prints the pool and its lock files.
+  order, which is CUDA's order with `CUDA_DEVICE_ORDER=PCI_BUS_ID`).
+  `kernel-agent doctor` prints the pool and its lock files.
 * **Locks.** GPU `i` locks `~/.cache/kernel-agent/gpu<i>.lock` (an `flock`
   across processes, plus a thread lock for the agents of one process). GPU 0
   keeps `gpu.lock`, the lock file from before the pool, so an older
   kernel-agent (or a `flock ~/.cache/kernel-agent/gpu.lock ...` wrapper) and a
-  new one still exclude each other on a single GPU. The lock takes the first
-  free GPU, else waits for the GPU with the fewest waiters; a nested lock in
-  the same thread keeps its GPU. Without `nvidia-smi`, or with no GPU visible,
+  new one still exclude each other on GPU 0, the only GPU of a single-GPU
+  machine. The lock takes the first free GPU, else waits for the GPU with the
+  fewest waiters (and stays with it); a nested lock in the same thread keeps
+  its GPU. Without `nvidia-smi`, or with no GPU visible,
   the pool is GPU 0 alone (`gpu.lock`), as before.
 * **Child processes.** A subprocess started under the lock gets
   `KERNEL_AGENT_LOCK_HELD=1` (it does not wait for its parent) and, when more

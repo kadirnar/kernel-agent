@@ -12,12 +12,14 @@ the locked GPU, so it runs where its parent locked.
 
 The pool is what ``nvidia-smi`` lists (the parent never initialises CUDA to find
 it), restricted to an inherited ``CUDA_VISIBLE_DEVICES`` (indices or ``GPU-`` UUIDs);
-``KERNEL_AGENT_GPUS=0,2`` replaces both. Indices are ``nvidia-smi``'s (PCI bus order;
-pinned children also get ``CUDA_DEVICE_ORDER=PCI_BUS_ID``). GPU 0 locks ``gpu.lock``,
-the one lock file of kernel-agent before the pool, so old and new processes on the
-same GPU still exclude each other; GPU ``i`` locks ``gpu{i}.lock``. Without
+``KERNEL_AGENT_GPUS=0,2`` replaces both. Indices are ``nvidia-smi``'s, i.e. PCI bus
+order (CUDA's own order too with ``CUDA_DEVICE_ORDER=PCI_BUS_ID``, which pinned
+children get, or on identical GPUs). GPU 0 locks ``gpu.lock``, the one lock file of
+kernel-agent before the pool, so old and new processes on GPU 0 (on a single-GPU
+machine: always) still exclude each other; GPU ``i`` locks ``gpu{i}.lock``. Without
 ``nvidia-smi`` (or with no GPU visible) the pool is GPU 0 alone and a child's
-environment only gains ``KERNEL_AGENT_LOCK_HELD``, as before the pool.
+environment only gains ``KERNEL_AGENT_LOCK_HELD``, as before the pool. A waiter stays
+with the GPU it chose, even if another one frees up first.
 """
 
 from __future__ import annotations
