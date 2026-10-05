@@ -99,10 +99,12 @@ def evaluate(
     compile_baseline: bool = False,
     device: str | None = None,
     capture_sha256: str | None = None,
+    compile_check: bool = False,
 ) -> dict[str, Any]:
     """Build, check and time one candidate.  ``device`` defaults to CUDA when
     available; on CPU only correctness is checked (timing needs CUDA events).
-    ``capture_sha256``: refuse (status ``tampered``) a capture without this digest."""
+    ``capture_sha256``: refuse (status ``tampered``) a capture without this digest.
+    ``compile_check`` adds ``result["compile_check"]`` (``compile_check.py``)."""
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -217,6 +219,10 @@ def evaluate(
         result.update(status="incorrect")
         return result
     result["correct"] = True
+    if compile_check:  # optional stage on a fresh build: graph breaks + compiled outputs
+        from kernel_agent.kernels.compile_check import check
+
+        result["compile_check"] = check(lambda: module.build(copy.deepcopy(reference)), cases)
     if not device.startswith("cuda"):
         result.update(status="ok", timing="skipped: no CUDA device")
         result["eval_seconds"] = round(time.perf_counter() - t0, 1)
@@ -312,6 +318,7 @@ def run_evaluation(
     compile_baseline: bool = False,
     timeout: float = 300.0,
     capture_sha256: str | None = None,
+    compile_check: bool = False,
 ) -> dict[str, Any]:
     """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``: see
     :func:`evaluate`; the subprocess checks the bytes it loads)."""
@@ -332,6 +339,8 @@ def run_evaluation(
         cmd.append("--compile-baseline")
     if capture_sha256:
         cmd += ["--capture-sha256", capture_sha256]
+    if compile_check:
+        cmd.append("--compile-check")
     with gpu_lock():
         ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
         try:
@@ -362,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--compile-baseline", action="store_true")
     parser.add_argument("--capture-sha256", help="refuse a capture without this digest")
+    parser.add_argument("--compile-check", action="store_true", help="torch.compile compat")
     parser.add_argument("--json", default=None, help="write result JSON ('-' = stdout marker)")
     ns = parser.parse_args(argv)
     try:
@@ -372,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
             l2_flush=ns.l2_flush,
             compile_baseline=ns.compile_baseline,
             capture_sha256=ns.capture_sha256,
+            compile_check=ns.compile_check,
         )
     except Exception:
         result = {"status": "harness_error", "correct": False, "error": _short_tb()}

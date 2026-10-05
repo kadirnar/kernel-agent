@@ -454,7 +454,8 @@ def summary(run: RunDir) -> dict[str, Any]:
     saved = sum(t["est_saved_ms"] or 0.0 for t in targets)
     kept_e2e = [r for r in ledger_rows if r["target"] == E2E and r["status"] == KEEP]
     best_e2e = kept_e2e[-1] if kept_e2e else None  # running best end-to-end measurement
-    final = (read_json(run.root / "integration.json", {}) or {}).get("final") or {}
+    integration = read_json(run.root / "integration.json", {}) or {}
+    final = integration.get("final") or {}
     costs = read_json(run.root / "costs.json", {}) or {}
     phases = data.get("phases", {})
     spans = phase_spans(run)
@@ -479,10 +480,14 @@ def summary(run: RunDir) -> dict[str, Any]:
         "phase_failed": failed.get("phase") if failed.get("event") == "phase_failed" else None,
         "elapsed_min": round((last - start) / 60, 1) if start and last else None,
         "baseline_ms": base_ms,
+        # strong baseline (strong_baseline.py): the workload's reference optimisations
+        "compiled_ms": _num(baseline.get("compiled_ms")),
+        "baseline": baseline,
         "workload": baseline.get("workload"),
         "projected_ms": round(max(base_ms - saved, 0.0), 3) if base_ms else None,
         "best_e2e": best_e2e,
         "final": final or None,
+        "reference": integration.get("reference") or None,
         "evaluations": len(ledger_rows),
         "keeps": sum(r["status"] == KEEP for r in ledger_rows),
         "failures": sum(r["status"] in FAILURES for r in ledger_rows),

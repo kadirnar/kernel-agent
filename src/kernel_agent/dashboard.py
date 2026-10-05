@@ -86,12 +86,17 @@ def write_dashboard(run: RunDir) -> Path:
     running = s["phase_running"] or (s["phase"] != "report" and not s["phase_failed"])
     phase = ledger.phase_label(s)
 
+    comp = s["compiled_ms"]  # strong baseline (strong_baseline.py)
+    compiled = f"torch.compile {_ms(comp)} ({base / comp:.2f}×)" if comp and base else ""
+    vs_comp = f" · {comp / measured:.2f}× vs. compiled" if comp and measured else ""
     tiles = [
-        ("baseline", _ms(base), _e(s["workload"] or "")),
+        ("baseline (eager)", _ms(base), _e(compiled or s["workload"] or "")),
         (
             "measured end-to-end",
             _ms(measured),
-            f"{base / measured:.2f}× vs. baseline" if base and measured else "no passing run yet",
+            f"{base / measured:.2f}× vs. eager{vs_comp}"
+            if base and measured
+            else "no passing run yet",
         ),
         (
             "projected from kernels",

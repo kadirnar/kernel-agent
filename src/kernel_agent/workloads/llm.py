@@ -52,6 +52,18 @@ class LLMWorkload(Workload):
     def roots(self) -> dict[str, nn.Module]:
         return {"model": self.model}
 
+    def reference_optimizations(self) -> str | None:
+        """Static KV cache; ``generate`` then compiles the decode step itself
+        (transformers' automatic ``torch.compile(mode="reduce-overhead")`` for
+        compileable caches on CUDA; ``generation_config.compile_config`` tunes it)."""
+        if not getattr(self.model, "_can_compile_fullgraph", False):
+            return None  # the architecture does not declare torch.compile support
+        self.model.generation_config.cache_implementation = "static"
+        return (
+            "static KV cache (cache_implementation='static'); transformers then "
+            "torch.compiles the decode step (mode='reduce-overhead')"
+        )
+
     def make_inputs(self) -> dict[str, torch.Tensor]:
         ids = self.tokenizer(PROMPT, add_special_tokens=False, return_tensors="pt").input_ids[0]
         n = int(self.options["prompt_len"])

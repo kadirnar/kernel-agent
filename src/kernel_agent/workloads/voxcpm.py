@@ -92,6 +92,22 @@ class VoxCPMWorkload(Workload):
     def roots(self) -> dict[str, nn.Module]:
         return {"model": self.model}
 
+    def reference_optimizations(self) -> str | None:
+        """VoxCPM's own fast path, ``model.optimize()``: ``torch.compile(mode=
+        "reduce-overhead", fullgraph=True)`` of both LMs' ``forward_step``, the
+        LocEnc and the LocDiT estimator.  ``model.feat_decoder`` itself stays a
+        Python call, so teacher forcing still applies."""
+        if self.options["compile"]:
+            return None  # `-o compile=true`: the measured baseline is already compiled
+        self.model.optimize()
+        # optimize() only prints a warning when it cannot compile; never time that as compiled.
+        if not hasattr(self.model, "_feat_encoder_raw"):
+            raise RuntimeError("model.optimize() did not compile the model (see its stderr)")
+        return (
+            "VoxCPM `model.optimize()`: torch.compile(mode='reduce-overhead', fullgraph=True) "
+            "of base_lm/residual_lm.forward_step, feat_encoder and feat_decoder.estimator"
+        )
+
     def make_inputs(self) -> str:
         return str(self.options["text"])
 

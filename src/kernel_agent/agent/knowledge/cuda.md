@@ -48,3 +48,9 @@ Verified example: `examples/nvrtc_rmsnorm.py`.
 General rules: coalesced 128-bit global loads, avoid SMEM bank conflicts
 (swizzle / padding), keep occupancy reasonable (registers ≤ 128/thread for
 memory-bound kernels), use warp shuffles for reductions, `__launch_bounds__`.
+
+Under `torch.compile` (the compiled baseline, e.g. VoxCPM's `model.optimize()`
+with `fullgraph=True`) a `load_inline` / NVRTC launcher is a graph break.
+Register it with `torch.library.custom_op` + `register_fake`
+(`examples/triton_rmsnorm_custom_op.py` shows the wrapper; only the launcher
+body changes) and check it with `evaluate_candidate(..., compile_check=true)`.

@@ -103,6 +103,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "kernels_reference",
             "eval_seconds",
             "compile_s",
+            "compile_check",  # torch.compile compatibility (kernels/compile_check.py)
             # speed of light (kernels/roofline.py)
             "pct_of_sol",
             "sol_ms_weighted",
@@ -289,6 +290,12 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
                     "description": "include per-kernel GPU time tables",
                     "default": False,
                 },
+                "compile_check": {
+                    "type": "boolean",
+                    "description": "also torch.compile the candidate: graph breaks and "
+                    "compiled outputs (does it survive the model's torch.compile?)",
+                    "default": False,
+                },
             },
             "required": ["target_id", "candidate", "hypothesis"],
         },
@@ -327,6 +334,7 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
             profile=bool(args.get("profile")),
             timeout=budget.eval_timeout_s,
             capture_sha256=capture_sha256,
+            **({"compile_check": True} if args.get("compile_check") else {}),
         )
         if result.get("status") == "tampered":  # the evaluator refused the capture
             keeper.alarm(capture, str(result.get("error")))

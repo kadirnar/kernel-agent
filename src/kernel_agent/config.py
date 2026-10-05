@@ -28,6 +28,9 @@ class OptimizeConfig:
     parallel: int = 1
     do_transforms: bool = True
     allow_harness_agent: bool = True
+    #: analyze: also time a generic torch.compile when the workload has no
+    #: reference_optimizations() hook (strong_baseline.py).
+    compile_baseline: bool = False
 
     claude_model: str = DEFAULT_MODEL
     effort: str | None = "high"

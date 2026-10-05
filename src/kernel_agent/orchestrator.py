@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import hub, ledger, program, toolchain, truth
+from kernel_agent import hub, ledger, program, strong_baseline, toolchain, truth
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import best_for_target, build_server, tool_names
@@ -204,6 +204,8 @@ class Orchestrator:
             log("WARNING: workload output is not deterministic; quality checks may be noisy")
         for message in probe_messages(result):  # sensitivity probe / teacher forcing
             log(message)
+        if (compiled := strong_baseline.describe(result)) is not None:
+            log("analyze: " + compiled.replace("**", ""))
         self.truth.seal_baseline(result["median_ms"])  # baseline.json + baseline_output.pt
         self._mark("analyze", baseline_ms=result["median_ms"])
 
@@ -483,13 +485,19 @@ class Orchestrator:
             "final": final,
             "history": history,
         }
+        baseline = self.truth.load_json(self.run.baseline_json)  # its compiled_ms
+        reference = self._with_reference(baseline, accepted, previous or {})
+        if reference is not None:
+            result["reference"] = reference
         write_json(integration, result)
         self.truth.seal(integration)
         export_optimized(self.run, [(k, a, 0.0) for k, a in accepted], digests=digests)
         if final:
+            _, vs_compiled = strong_baseline.speedups(baseline, final["median_ms"])
             log(
                 f"integrate: final {final['median_ms']:.1f} ms vs {base_ms:.1f} ms "
                 f"= {final['speedup']}x"
+                + (f" ({vs_compiled:.2f}x vs compiled)" if vs_compiled else "")
             )
         else:
             log("integrate: no optimisation survived end-to-end validation")
@@ -525,6 +533,39 @@ class Orchestrator:
             items.append(("transform", transform))
             digests[transform] = digest
         return items, digests
+
+    def _with_reference(
+        self, baseline: dict[str, Any], accepted: list[tuple[str, str]], previous: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The accepted kernels under the workload's reference optimisations
+        (``strong_baseline.py``): do they survive its torch.compile path, and beat it?
+        Measured only when ``analyze`` measured a compiled baseline; informational
+        (``accepted`` and ``final`` stay the greedy result)."""
+        compiled = strong_baseline.compiled_ms(baseline)
+        kernels = [a for k, a in accepted if k == "kernel"]
+        if compiled is None or not kernels:
+            return None
+        items = [*kernels, strong_baseline.REFERENCE_LABEL]
+        known = previous.get("reference") or {}
+        if known.get("items") == items:  # re-integration of the same kernels
+            return dict(known)
+        cli = ["--warmup", "2", "--iters", "5"]
+        for arg in kernels:
+            cli += ["--kernel", arg]
+        cli += ["--transform", str(strong_baseline.REFERENCE_TRANSFORM)]
+        r = self._worker("e2e", *cli, *self.truth.worker_args())
+        record = {"items": items, **strong_baseline.combination(r, compiled)}
+        log(
+            f"integrate: reference optimisations + {len(kernels)} kernel(s): "
+            + strong_baseline.combination_text(record)
+        )
+        ledger.event(
+            self.run,
+            "reference_combination",
+            verdict=record["verdict"],
+            median_ms=record.get("median_ms"),
+        )
+        return record
 
     # ------------------------------------------------------------ improve loop (improve.py)
 

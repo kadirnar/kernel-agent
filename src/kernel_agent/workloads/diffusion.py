@@ -46,6 +46,15 @@ class DiffusionWorkload(Workload):
             name: comp for name, comp in self.pipe.components.items() if isinstance(comp, nn.Module)
         }
 
+    def reference_optimizations(self) -> str | None:
+        """``torch.compile`` of the denoiser (``transformer`` or ``unet``), in place."""
+        name = next((n for n in ("transformer", "unet") if hasattr(self.pipe, n)), None)
+        denoiser = getattr(self.pipe, name) if name else None
+        if not isinstance(denoiser, nn.Module) or self.options["cpu_offload"]:
+            return None  # offloaded weights move between devices: nothing robust to compile
+        denoiser.compile()
+        return f"torch.compile of the denoiser (pipe.{name}.compile(), default mode)"
+
     def make_inputs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "prompt": self.options["prompt"],

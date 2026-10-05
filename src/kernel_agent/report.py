@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from kernel_agent import ledger, strong_baseline
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
@@ -15,6 +16,10 @@ def _fmt(v: Any, nd: int = 3) -> str:
     if isinstance(v, float):
         return f"{v:.{nd}f}"
     return "—" if v is None else str(v)
+
+
+def _x(v: float | None) -> str:
+    return "—" if v is None else f"{v:.2f}x"
 
 
 def _chart(run: RunDir, path: Path, alt: str) -> list[str]:
@@ -44,6 +49,15 @@ def write_report(run: RunDir) -> Path:
     costs = read_json(run.root / "costs.json", {})
     gpu = tc.get("gpu") or {}
     final = integration.get("final") or {}
+    compiled = strong_baseline.compiled_ms(baseline)
+    reference = integration.get("reference") or {}
+
+    def row(label: str, ms: Any, quality: str, eager_x: str | None = None) -> str:
+        vs_eager, vs_compiled = strong_baseline.speedups(baseline, ms)
+        return (
+            f"| {label} | {_fmt(ms, 1)} | {eager_x or _x(vs_eager)} | {_x(vs_compiled)} "
+            f"| {quality} |"
+        )
 
     lines = [
         f"# kernel-agent report: `{card['repo_id']}`",
@@ -55,19 +69,28 @@ def write_report(run: RunDir) -> Path:
         "",
         "## Result",
         "",
-        "| | latency (ms) | speedup | quality |",
-        "|---|---|---|---|",
-        f"| baseline | {_fmt(baseline.get('median_ms'), 1)} | 1.00x | reference |",
+        "| | latency (ms) | vs eager | vs compiled | quality |",
+        "|---|---|---|---|---|",
+        row("baseline (eager)", baseline.get("median_ms"), "reference"),
     ]
+    if compiled is not None:
+        quality = strong_baseline.quality_text(
+            (baseline.get("compiled_detail") or {}).get("quality")
+        )
+        lines.append(row("compiled baseline", compiled, quality))
     if final:
         metrics = ", ".join(f"{k}={v}" for k, v in _flat_metrics(final.get("metrics")).items())
         lines.append(
-            f"| optimised | {_fmt(final.get('median_ms'), 1)} | **{final.get('speedup')}x** | "
-            f"{metrics} |"
+            row("optimised", final.get("median_ms"), metrics, f"**{final.get('speedup')}x**")
         )
     else:
-        lines.append("| optimised | — | — | no optimisation passed end-to-end validation |")
+        lines.append("| optimised | — | — | — | no optimisation passed end-to-end validation |")
+    if reference:
+        text = strong_baseline.combination_text(reference)
+        lines.append(row("compiled baseline + accepted kernels", reference.get("median_ms"), text))
     lines.append("")
+    if (line := strong_baseline.describe(baseline)) is not None:
+        lines += [f"* {line}. *vs compiled* = against what users get without custom kernels.", ""]
     lines += _chart(run, run.root / "progress.png", "end-to-end progress")
     lines += _chart(run, run.root / "amdahl.png", "time split before and after the best kernels")
     lines += [
@@ -139,6 +162,9 @@ def write_report(run: RunDir) -> Path:
                 f"* tried {len(h['items'])} item(s): passed={h.get('passed')} "
                 f"speedup={h.get('speedup')} {h.get('reason') or ''}"
             )
+        if reference:
+            items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
+            lines.append(f"* {items}: " + strong_baseline.combination_text(reference))
     lines += report_lines(run)  # `kernel-agent improve` slices, re-integrations, rounds
     if costs:
         total = sum(c.get("usd", 0) for c in costs.values())
@@ -172,6 +198,14 @@ def write_report(run: RunDir) -> Path:
         f'import sys; sys.path.insert(0, "{run.optimized_dir}")',
         "from apply import apply_kernels",
         "apply_kernels(model)",
+        *(
+            [
+                "# then the reference optimisations (they compose with the kernels): "
+                + str((baseline.get("compiled_detail") or {}).get("description"))
+            ]
+            if reference.get("verdict") == "composes"
+            else []
+        ),
         "```",
         "",
     ]
