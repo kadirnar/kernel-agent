@@ -304,7 +304,52 @@ loads the capture in the parent.
 
 Limits: a candidate in the evaluator's process can still read the evaluator's
 memory (the nonce, the capture). A determined one could forge its saved outputs
-or its result. Full isolation would need the candidate in a separate process.
+or its result. Full isolation would need the candidate in a separate process;
+the re-check below is that second opinion for every winner.
+
+### Independent re-check of winners
+
+`kernel-agent recheck capture.pt candidate.py [--seeds 3]` (`kernels/recheck.py`)
+repeats the evaluator's verdict from scratch, sharing nothing with the evaluation:
+
+1. A **reference process**, which never imports a candidate, draws `--seeds` fresh
+   inputs per captured case with the captured shapes, dtypes, strides and
+   aliasing. Floating-point tensors are redrawn from each tensor's own mean and
+   std (normal for the first seed, uniform / Laplace / log-normal for the
+   others). Integer and boolean tensors (ids, positions, masks), additive masks
+   and mutable state objects such as KV caches stay as captured. It computes the
+   reference outputs and post-call state on them and times the reference on
+   the timed cases.
+2. The parent keeps those expected results in memory and deletes them from disk.
+   Then a **candidate process** builds the candidate (under the evaluator's
+   integrity snapshot), runs it on the same fresh inputs and times it the same
+   way: `time_call`, median of 3 rounds after warming the GPU. After timing it
+   runs the fresh inputs once more, which catches a kernel that changes
+   behaviour after its first calls.
+3. The parent compares outputs and in-place side effects with the strict
+   comparator (files loaded with `weights_only`). It computes the speedup
+   weighted by calls per run, as the evaluator does.
+
+The result says whether it `agrees` with the evaluator on correctness and on the
+speedup, within ±25 % or twice the measured spread of the rounds. It fails
+(`passed: false`) when the candidate is wrong on any fresh input (`incorrect`),
+does not build or run, changes watched state, or is slower than the evaluator's
+speedup by more than that noise (`slower`). A kernel that keeps outputs keyed by
+the captured shapes passes every captured case and fails here. Without
+`--speedup X` the command runs the evaluator first to get its verdict. On the
+bundled Triton RMSNorm (the RMSNorm smoke capture, RTX 5070 Ti) it is correct on
+3 fresh draws of both cases and measures 1.711× in separate processes vs 1.743×
+in the evaluator, in 3.6 s.
+
+**Integration** re-checks every kernel it considers before measuring anything
+end to end: each target's verified best and the kernels of the measured
+combination. A kernel that fails is refused, with a log line and a
+`recheck_failed` event carrying the reason; a combination that contains it does
+not seed the search. The results go to `integration.json` → `recheck` (status,
+`passed`, `agrees`, the evaluator's verdict, seeds, per-case speedups) and to
+`report.md`. A re-integration reuses the result for the same snapshot.
+`--no-recheck` turns this off. A simulated run (`improve --dry-run`) has no
+captures and records `skipped`.
 
 ### Ground truth the agents cannot quietly change
 
@@ -891,6 +936,70 @@ The prompts and `program.md` tell kernel engineers to tune block sizes,
 `num_warps`, `num_stages` and vector widths with one sweep per idea instead of
 one evaluation per value.
 
+### KernelBench regression suite
+
+`kernel-agent bench-suite` (`kernel_agent/suite.py`, `kernel_agent/kernelbench.py`)
+runs the engineer agent on KernelBench problems with a small budget and reports
+fast_p. Use it to A/B-test a `program.md`, prompt or evaluator change: run the
+same problems before and after the change and compare.
+
+* **Problems.** The KernelBench repository tarball is fetched at run time into
+  `~/.cache/kernel-agent/kernelbench/<ref>/`; only `KernelBench/level*/*.py` is
+  kept, and later runs reuse it. `--kernelbench-dir` reads a local checkout
+  instead. The dataset is not vendored. `--n 20` takes the first 20 problems by
+  id; `--problems 1,19,36` picks problems by id.
+* **Sizes.** Current KernelBench inputs are sized for 80 GB GPUs (`19_ReLU`
+  takes a 6.4 GB tensor). The integer constants that `get_inputs()` reads are
+  halved until one call's inputs + outputs, measured on the meta device, fit
+  `--max-input-mb` (default 16). Constants only `get_inputs()` reads go first,
+  then the ones it shares with `get_init_inputs()`. A value the model rejects is
+  put back. The new values are appended to the problem's source with the
+  originals in comments, e.g. `dim = 1536  # KernelBench: 393216`. All 100
+  level-1 problems fit in 16 MB this way.
+* **Captures.** Each problem's source is copied to
+  `.truth/kernelbench/<module>.py` (sealed) and imported with its classes
+  pickling by value, as region rewrites do. The pickled `Model` therefore loads
+  in the evaluator's subprocesses without path setup, and the capture's digest
+  covers its source. The capture holds `Model(*get_init_inputs())` with weights
+  from seed 0, one timed case from `get_inputs()` at seed 0, and two
+  correctness-only cases (`count` 0) at seeds 1 and 2.
+* **Agent.** `Orchestrator.kernels()` runs the normal engineer session per
+  problem: `--evaluations 4`, the cross-run library off (no prior winners,
+  nothing stored), no transforms, no integration. `--dry-run` replaces Claude
+  with a fake engineer, so everything runs without Claude. It writes one
+  candidate per problem and evaluates it like the tool does: the bundled Triton
+  RMSNorm kernel for RMSNorm problems, otherwise the problem's own torch code
+  as a class of the candidate file. On the GPU the evaluator rejects that
+  rewrite as `fallback`, because it re-launches the reference's kernels.
+* **Score.** Each problem's best snapshot is evaluated again with
+  `compile_baseline=True`. That gives its speedup vs eager and vs
+  `torch.compile` (`max-autotune-no-cudagraphs`) on the timed case. fast_p at
+  p = 1.0, 1.1, 1.25, 1.5 and 2 is KernelBench's metric: the share of **all**
+  problems whose kernel is correct and more than p× faster. Problems that failed
+  to capture or have no correct kernel count as misses.
+* **Output.** The suite is an ordinary run directory
+  (`runs/KernelBench--level1/<stamp>/`, so `kernel-agent status` and `watch`
+  work on it). It holds `suite.json` (configuration, source, summary, one row per
+  problem with eager / compile / kernel ms, evaluations and cost), `suite.md`
+  (the fast_p table and the rows) and `fast_p.png`.
+
+Running it for real starts one Claude session per problem, so set a budget:
+
+```bash
+kernel-agent bench-suite --kernelbench-level 1 --n 20 --evaluations 4 \
+    --max-usd 40 --agent-minutes 20 --program my_program.md
+# the same problems with the default program.md, for the A/B:
+kernel-agent bench-suite --kernelbench-level 1 --n 20 --evaluations 4 --max-usd 40 --agent-minutes 20
+kernel-agent bench-suite --problems 1,19,36 --dry-run   # the pipeline only, no Claude
+```
+
+On an RTX 5070 Ti a dry run of the first 20 level-1 problems takes 73 s. All 20
+are captured and every rewrite is rejected as `fallback` (fast_p 0). A dry run of
+problems 1, 19 and 36 takes 27 s. The sizes are scaled to N 1024, ReLU
+1024 × 1536 and RMSNorm 28 × 64 × 32 × 32. The RMSNorm example kernel is correct
+and runs at 0.71× eager and 0.84× torch.compile, because the dry run's adapter
+copies the features to the last dimension first.
+
 ### GPUs and the GPU lock
 
 Every evaluation, worker command (`analyze`, `capture`, `e2e`) and peak
@@ -1072,6 +1181,7 @@ kernel-agent optimize <hf-url> [options]
                                        workloads without reference_optimizations()
   --ab-rounds 8 --ab-min-win-rate 0.8 --ab-min-gain 0.01
                                        paired A/B of each integration step (see above)
+  --no-recheck                         integration: no re-check of kernels on fresh inputs
   --no-library --no-librarian          cross-run kernel library / lessons agent off
   --librarian-model MODEL              (see "Kernel library and lessons")
 
@@ -1085,6 +1195,12 @@ kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--co
                                        [--quick] [--timeout 300]
                                        [--sweep configs.json [--max-configs 32]]
                                        (a full capture, e.g. <run_dir>/.truth/captures/<id>.pt)
+kernel-agent recheck capture.pt candidate.py [--seeds 3] [--seed S] [--speedup X] [--no-evaluate]
+                                       fresh inputs, reference and candidate in separate
+                                       processes (see "Independent re-check of winners")
+kernel-agent bench-suite [--kernelbench-level 1] [--n 20 | --problems 1,19,36] [--evaluations 4]
+  [--dry-run] [--kernelbench-dir DIR | --kernelbench-ref main] [--max-input-mb 16]
+  [--max-usd U] [--agent-minutes 30] [--program FILE]   KernelBench fast_p (see above)
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")

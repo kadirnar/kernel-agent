@@ -40,6 +40,9 @@ class OptimizeConfig:
     ab_rounds: int = 8
     ab_min_win_rate: float = 0.8
     ab_min_gain: float = 0.01
+    #: Integration: re-check every kernel on fresh inputs, reference and kernel timed in
+    #: processes of their own (kernels/recheck.py); a kernel that fails it is refused.
+    recheck: bool = True
 
     claude_model: str = DEFAULT_MODEL
     effort: str | None = "high"

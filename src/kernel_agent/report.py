@@ -9,6 +9,7 @@ from kernel_agent import abtest, ledger, library, strong_baseline
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
+from kernel_agent.kernels import recheck
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 
@@ -200,6 +201,12 @@ def write_report(run: RunDir) -> Path:
             )
         for item in integration.get("accepted", []):
             lines.append(f"* accepted {item['kind']}: `{item['item']}`")
+        for r in integration.get("recheck") or []:  # kernels/recheck.py
+            lines.append(
+                f"* recheck `{r.get('target')}` (`{r.get('snapshot')}`): "
+                + recheck.describe(r)
+                + ("" if r.get("passed") else " — refused")
+            )
         for h in integration.get("history", []):
             ab = h.get("ab") or {}
             verdict = ""
