@@ -59,7 +59,9 @@ and once per run the AudioVAE vocoder.
   GPU busy 47 %, 507k kernel launches per run (5 µs average): launch bound
   before anything else.
 * Decode attention is the top kernel: `fmha_cutlassF` 1151 ms, 45 % of GPU
-  time. `MiniCPMAttention.forward_step` attends over all 8192 slots of the
+  time (20 patches: 383 ms for 720 calls, while the DiT and LocEnc
+  flash-attention kernels take 12.5 ms for 2412 calls).
+  `MiniCPMAttention.forward_step` attends over all 8192 slots of the
   static KV cache with a mask while ~70 hold data (prompt + generated
   patches: 17..36 of 8192 slots with 20 patches). Attend over the valid
   length only (`position_id + 1` slots: slice the cache or use a split-KV

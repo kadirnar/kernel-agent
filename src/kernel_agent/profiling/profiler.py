@@ -469,9 +469,15 @@ def summarize(profile: dict[str, Any], baseline_ms: float, top: int = 30) -> str
     return "\n".join(lines) + "\n"
 
 
-def _phase_split(classes: list[dict[str, Any]]) -> list[str]:
-    """Classes called in both phases: candidates for one target per phase."""
-    split = [c for c in classes if len(c.get("phases") or {}) > 1]
+def _phase_split(classes: list[dict[str, Any]], min_share: float = 0.05) -> list[str]:
+    """Classes that spend at least ``min_share`` of their time in each of both phases:
+    candidates for one target per phase."""
+
+    def both(c: dict[str, Any]) -> bool:
+        times = [p["inclusive_ms"] for p in (c.get("phases") or {}).values()]
+        return len(times) > 1 and min(times) >= min_share * (sum(times) or 1.0)
+
+    split = [c for c in classes if both(c)]
     if not split:
         return []
     lines = [

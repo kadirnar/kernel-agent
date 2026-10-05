@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import math
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -299,8 +301,6 @@ def test_profile_summary_shows_phase_split(mixed):
     assert stat.phases["decode"]["calls"] == 6 and stat.phases["prefill"]["calls"] == 9
     assert stat.phases["decode"]["groups"] == {"model.lm.*": 2}
     assert stat.phases["decode"]["top_signature"].startswith("forward_step: a0[1, 8]")
-    from dataclasses import asdict
-
     kernel_view = {
         "gpu_busy_ms": 1.0,
         "gpu_busy_fraction": 0.5,
@@ -309,10 +309,16 @@ def test_profile_summary_shows_phase_split(mixed):
         "kernels": [],
         "aten_ops": [],
     }
-    profile = {"module_calls": 1, "classes": [asdict(stat)], "kernel_view": kernel_view}
+    mixed_stat = asdict(stat)
+    mixed_stat["phases"]["decode"]["inclusive_ms"] = 3.0
+    mixed_stat["phases"]["prefill"]["inclusive_ms"] = 7.0
+    linear = copy.deepcopy(mixed_stat)  # a class whose decode time is negligible
+    linear["cls"] = "Linear"
+    linear["phases"]["decode"]["inclusive_ms"] = 0.01
+    profile = {"module_calls": 1, "classes": [mixed_stat, linear], "kernel_view": kernel_view}
     text = summarize(profile, 2.0)
-    assert "## Phase split" in text and "| `Mixed` | decode | 6 |" in text
-    assert "`model.lm.*` (2)" in text
+    assert "## Phase split" in text and "| `Mixed` | decode | 6 | 3.00 | 30% |" in text
+    assert "`model.lm.*` (2)" in text and "| `Linear` | decode" not in text
 
 
 # ------------------------------------------------------------------ patching
@@ -400,8 +406,6 @@ def test_route_strips_copied_routers():
     first = Mixed()
     route(a, first, "decode", ["forward_step"])
     assert "forward_step" in vars(a)
-    import copy
-
     second = copy.copy(a)  # build() of the next target copies the router too
     route(a, second, "prefill", ["forward"])
     assert "forward_step" not in vars(second)
