@@ -1,4 +1,6 @@
-"""Workloads: deterministic end-to-end runs of a model, one per modality."""
+"""Workloads: deterministic end-to-end runs of a model, one per modality, plus
+built-in workloads for model families whose inference code is not
+``transformers``/``diffusers`` (``spec.family``)."""
 
 from __future__ import annotations
 
@@ -14,6 +16,10 @@ def create_workload(spec: WorkloadSpec) -> Workload:
         from kernel_agent.workloads.harness import load_harness
 
         return load_harness(spec.harness, spec)
+    if spec.family == "voxcpm":
+        from kernel_agent.workloads.voxcpm import VoxCPMWorkload
+
+        return VoxCPMWorkload(spec)
     modality = Modality(spec.modality)
     if modality is Modality.LLM:
         from kernel_agent.workloads.llm import LLMWorkload
