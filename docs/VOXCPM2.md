@@ -1,11 +1,11 @@
-# VoxCPM2 on an RTX 5070 Ti: 7.3–7.4× faster with kernel-agent
+# VoxCPM2 on an RTX 5070 Ti: 10.5× faster with kernel-agent
 
 The motivating case for the roadmap ([ROADMAP.md](ROADMAP.md), tracking issue
 [#24](https://github.com/kadirnar/kernel-agent/issues/24)): make
 `openbmb/VoxCPM2` (voxcpm 2.0.3, bf16) fast on one RTX 5070 Ti (16 GB, sm_120,
 torch 2.14.1+cu130) with the continuous `kernel-agent improve` loop.
 
-## Result
+## Round 2 result (bf16, exact)
 
 Benchmark workload (built-in VoxCPM workload: 60 patches = 9.6 s of 48 kHz
 audio, 10 flow-matching steps, CFG 2.0, seed 0):
@@ -32,7 +32,48 @@ match (4.6–5.0 s per sentence).
 Cost: 19 agent sessions, **$31.67** of Claude usage, 4 h 41 min wall clock
 (two `improve` rounds), 113 ledger rows.
 
-## What made it fast
+
+## Round 3: FP8 weights, near-lossless (10.48×)
+
+After round 2 the integrated model was GPU-bound at ~92–95 % of the **bf16**
+memory-bandwidth floor (LM decode streams 3.4 GB of weights per patch, the
+LocDiT 0.5 GB per estimator call). Round 3 changed the rules instead of the
+kernels' tiling: `--quality near-lossless` (#71) allows FP8 e4m3 weight-only
+storage (#72) when a perceptual gate (Whisper-large-v3 WER, WavLM speaker
+similarity, UTMOS) on voice-cloned held-out sentences stays within the noise of
+eager, plus a teacher-forcing sanity floor. All agent sessions ran on the
+Claude Code subscription (`--auth subscription`, #70).
+
+| configuration | latency per run | vs eager | vs VoxCPM `torch.compile` |
+|---|---|---|---|
+| eager | 5,476 ms | 1.00× | 0.69× |
+| VoxCPM `optimize()` | 3,760 ms | 1.46× | 1.00× |
+| round 2 (bf16, exact) | 731 ms | 7.49× | 5.14× |
+| **round 3 (FP8 weights, near-lossless)** | **522.5 ms** | **10.48×** | **7.20×** |
+
+Real use through `generate()` at natural length (`examples/voxcpm2_optimized.py`):
+8.54 s → 1.01 s for three sentences (**8.5×**, RTF 0.57 → 0.06–0.09), identical
+Whisper WER. FP8 shifts the natural stop by a patch on some sentences (4.48–4.80 s
+of audio vs 4.96 s), which the near-lossless stop check allows.
+
+Accepted: the agents' FP8 fused decoder-layer kernels for the LocDiT/LocEnc path
+(`dit_layer_fp8`, module 12.2×) and the LM decode step (`lm_step_fp8`, 10.5×),
+plus the hoisted + CUDA-graphed CFM solver, dead-work removal, channels-last VAE
+and a graphed prefill. The integration also tried swapping each FP8 kernel back
+to the round-2 bf16 prior; both swaps failed the perceptual gate and the FP8
+versions stayed.
+
+Issues found and fixed during this round: the GPU drops its memory clock after
+about a second idle, which made bandwidth-bound kernels time up to 12× slower
+in-process (#81, every timing round now waits for full clocks); a recheck cache
+reused measurements from before that fix (#83); and integration never tried newer
+versions of kernels already in the seed combination (#84, 731 → 522.5 ms once
+fixed). Still open: the round-2 re-profile of the FP8-optimised model fails
+(#86), so this run stopped after one round.
+
+![round 3 integration](images/voxcpm2-round3-integration.png)
+
+## Round 2: what made it fast
 
 The range comes from two independent final integrations with the current
 code: the first accepted four items (below, 730.8 ms); the second, after the
