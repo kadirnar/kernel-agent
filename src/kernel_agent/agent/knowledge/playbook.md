@@ -60,14 +60,18 @@ and once per run the AudioVAE vocoder.
   before anything else.
 * Decode attention is the top kernel: `fmha_cutlassF` 1151 ms, 45 % of GPU
   time. `MiniCPMAttention.forward_step` attends over all 8192 slots of the
-  static KV cache with a mask while ~70 hold data. Attend over the valid
+  static KV cache with a mask while ~70 hold data (prompt + generated
+  patches: 17..36 of 8192 slots with 20 patches). Attend over the valid
   length only (`position_id + 1` slots: slice the cache or use a split-KV
   decode kernel that stops there). `workload_profile.md` gives the valid range.
-* DiT layers run tiny `[2, 11, 1024]` problems hundreds of times per patch
-  batch: fuse the whole layer (norm, QKV, RoPE, attention, o-proj, MLP) into
-  a few launches and keep cond + uncond in one batch-2 call.
-  `MiniCPMAttention` serves both the LM (`forward_step`) and the DiT
-  (`forward`): split it into a `decode` and a `prefill` target.
+* The LocDiT runs 9 guided Euler steps per patch (the first of the 10 is
+  zero-initialised), each a batch-2 pass through 12 layers: 108 attention
+  calls on `[2, 11, 1024]` per patch, 68 % of all `MiniCPMAttention` calls
+  in a 20-patch capture (LM decode: 23 %, 36 layers × 1 position). Such
+  tiny problems are launch bound: fuse the whole layer (norm, QKV, RoPE,
+  attention, o-proj, MLP) into a few launches and keep cond + uncond in one
+  batch-2 call. One class serves both: split `MiniCPMAttention` into a
+  `decode` target (`forward_step`) and a `prefill` target (`forward`, the DiT).
 * CUDA graphs per step remove most launches, but teacher forcing (the only
   valid quality check: one-ulp changes diverge the free run after ~18 steps,
   spectral cosine 0.69 for a verified RMSNorm) wraps `model.feat_decoder`

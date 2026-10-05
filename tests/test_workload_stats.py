@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 import torch
 from test_methods import LAYERS, MAX_LEN, PREFIX, STEPS, ToyWorkload, _candidate
+from test_voxcpm import _voxcpm2_cached
 from torch import nn
 
 from kernel_agent import orchestrator, worker
@@ -525,3 +526,55 @@ def test_workload_stats_skip_device_work_without_tensors():
     p = stats.finalize(m)
     assert _arg(p, "forward", "hidden_states")["values"] == {"'text'": 1}
     assert math.isclose(p["groups"][0]["share"], 1.0)
+
+
+# ------------------------------------------------------------------ GPU: VoxCPM2
+
+SAME_ATTENTION = """
+import copy
+
+
+def build(reference):
+    class Same(type(reference)):  # reference math; only the routing is under test
+        pass
+
+    new = copy.copy(reference)
+    new.__class__ = Same
+    return new
+"""
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _voxcpm2_cached(), reason="needs voxcpm + openbmb/VoxCPM2 in the HF cache")
+def test_voxcpm2_workload_profile_and_decode_routing(tmp_path):
+    from kernel_agent.workloads import create_workload
+
+    spec = WorkloadSpec("openbmb/VoxCPM2", "tts", family="voxcpm", options={"patches": 8})
+    wl = create_workload(spec)
+    wl.load()
+    inputs = wl.make_inputs()
+    with torch.inference_mode():
+        reference = wl.run(inputs)
+    info = capture_module(wl, inputs, "MiniCPMAttention", tmp_path / "cap.pt", phase="decode")
+    assert set(info["methods"]) == {"forward_step"} and "base_lm." in info["qualname"]
+    profile = json.loads((tmp_path / "workload_profile.json").read_text())
+    methods = profile["methods"]
+    assert methods["forward_step"]["phases"] == {"decode": methods["forward_step"]["calls"]}
+    assert methods["forward"]["phases"] == {"prefill": methods["forward"]["calls"]}
+    assert methods["forward"]["calls"] > methods["forward_step"]["calls"]  # DiT + LocEnc
+    kv = _arg(profile, "forward_step", "kv_cache")["cache"]
+    assert kv["slots"] == [8192] and kv["valid_from"] == "position_id"
+    assert 1 < kv["valid_min"] < kv["valid_max"] < 8192 // 20
+    assert any("static cache of 8192 slots" in f for f in profile["facts"])
+
+    # A decode-phase patch keeps every instance and routes only forward_step calls.
+    candidate = _write(tmp_path, "same", SAME_ATTENTION)
+    patch = KernelPatch("dec", "MiniCPMAttention", candidate, None, ["forward_step"], "decode")
+    report = apply_kernels(wl.roots(), [patch])
+    assert report.replaced["dec"] == profile["instances"]
+    attention = [m for m in wl.model.modules() if type(m).__name__ == "MiniCPMAttention"]
+    assert len(attention) == profile["instances"]  # still the original instances
+    assert all("forward_step" in vars(m) for m in attention)
+    with torch.inference_mode():
+        out = wl.run(inputs)
+    assert torch.equal(out["latents"], reference["latents"])
