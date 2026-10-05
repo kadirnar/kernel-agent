@@ -348,7 +348,16 @@ precision yet.
 ### What "faster" means
 
 Reference and candidate are timed in alternating rounds with CUDA events
-after a GPU warm-up, and the median round is reported. Mutable inputs (caches)
+after a GPU warm-up, and the median round is reported. Every round runs at full
+clocks: after a second or more without work the GPU drops to a lower performance
+state (RTX 5070 Ti: memory clock 7001 or 405 MHz instead of 13801) and the driver
+raises it again only after 0.3 s to several seconds of load. A bandwidth-bound
+kernel timed meanwhile runs 2-27x slower while a launch-bound eager reference
+hardly changes (a fused decoder layer measured 0.67x, 5.1x and 8.3x in different
+processes). So a round starts once a DRAM bandwidth probe reads at least 70 % of
+the GPU's bandwidth (the roofline's `dram_gbps`; the GPU is spun until it does,
+at most 10 s) and is timed again when the probe after it reads less; `clock` per
+case is the lowest probe (about 1 at full clocks). Mutable inputs (caches)
 are deep-copied outside the timed region; other inputs rotate between three
 copies made before timing. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
@@ -535,7 +544,7 @@ repeats the evaluator's verdict from scratch, sharing nothing with the evaluatio
 2. The parent keeps those expected results in memory and deletes them from disk.
    Then a **candidate process** builds the candidate (under the evaluator's
    integrity snapshot), runs it on the same fresh inputs and times it the same
-   way: `time_call`, median of 3 rounds after warming the GPU. After timing it
+   way: `time_call`, median of 3 rounds at full clocks. After timing it
    runs the fresh inputs once more, which catches a kernel that changes
    behaviour after its first calls.
 3. The parent compares outputs and in-place side effects with the strict

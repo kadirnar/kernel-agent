@@ -164,13 +164,14 @@ def measure_peaks() -> dict[str, Any]:
     import torch
     from torch import nn
 
-    from kernel_agent.kernels.bench import time_call, warm_gpu
+    from kernel_agent.kernels.bench import ensure_clocks, time_call, warm_gpu
 
     tc = toolchain.setup()
     if tc.gpu is None:
         raise RuntimeError("no CUDA GPU")
     torch.backends.cuda.matmul.allow_tf32 = False  # fp32 peak means real fp32 math
     warm_gpu()
+    ensure_clocks()  # the memory clock too: these peaks are what its probes compare with
     free, _ = torch.cuda.mem_get_info()
     peaks: dict[str, Any] = {
         "gpu": tc.gpu.name,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import random
 import statistics
@@ -23,6 +24,27 @@ _elapsed: Callable[..., float] = _EventBase.elapsed_time
 _current_stream = torch.cuda.current_stream
 _synchronize: Callable[[], Any] = getattr(torch._C, "_cuda_synchronize", torch.cuda.synchronize)
 _perf_counter = time.perf_counter
+_empty = torch.empty
+_copy: Callable[..., Any] = torch.Tensor.copy_
+
+#: Clock guard (#81). After about a second without work the GPU drops to a lower
+#: performance state (an RTX 5070 Ti: memory clock 7001 or 405 MHz instead of 13801, DRAM
+#: bandwidth 2x to 50x lower), and the driver raises it again only after 0.3 s to several
+#: seconds of load. A launch-bound reference hardly notices; a bandwidth-bound kernel timed
+#: meanwhile runs 2x to 27x slower (a fused decoder layer: 0.67x in one evaluation, 8x in
+#: the next). So :func:`time_call` measures after :func:`ensure_clocks` and before one more
+#: DRAM bandwidth probe (:func:`clock_state`), and measures again when either reads below
+#: CLOCK_OK of the GPU's bandwidth (at most CLOCK_RETRIES times).
+CLOCK_OK = 0.7
+CLOCK_RETRIES = 3
+#: :func:`ensure_clocks` spins at most this long per call (a GPU busy with other processes,
+#: or capped, never gets there), and at most WARM_BUDGET_S in all per process.
+WARM_MAX_S = 10.0
+WARM_BUDGET_S = 20.0
+#: Without the roofline's measured bandwidth to compare probes with, the first
+#: :func:`ensure_clocks` of a process spins this long: the slowest clock ramp seen, with margin.
+WARM_UNCALIBRATED_S = 2.5
+_PROBE_MIN_BYTES = 64 * 1024 * 1024
 
 
 def _events() -> tuple[Any, Any]:
@@ -50,10 +72,15 @@ def has_mutable_state(args: Any, kwargs: Any) -> bool:
 
 _L2_FLUSH: torch.Tensor | None = None
 _WARMED = False
+_PEAK_GBPS: float | None = None  # the roofline's dram_gbps (0: none cached, or not reached)
+_BEST_GBPS = 0.0  # the best clock probe of this process
+_CALIBRATED = False  # ensure_clocks ran in this process
+_SPENT_S = 0.0  # seconds ensure_clocks spent in this process
 
 
 def warm_gpu(ms: float = 300.0) -> None:
-    """Spin the GPU (and CPU launch path) so clocks leave idle states before timing."""
+    """Spin the GPU (and CPU launch path) so clocks leave idle states before timing
+    (once per process; :func:`ensure_clocks` checks the clocks)."""
     global _WARMED
     if _WARMED:
         return
@@ -69,6 +96,85 @@ def warm_gpu(ms: float = 300.0) -> None:
         if start.elapsed_time(end) > ms:
             break
     _WARMED = True
+
+
+def dram_gbps() -> float | None:
+    """DRAM bandwidth (GB/s, bytes read + written) of one copy between two buffers of twice
+    the L2 cache (at least 64 MiB each), as the roofline measures ``dram_gbps``; None when
+    they cannot be allocated."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    n = max(_PROBE_MIN_BYTES, 2 * int(getattr(props, "L2_cache_size", 0) or 0))
+    try:
+        src = _empty(n, dtype=torch.uint8, device="cuda")
+        dst = _empty(n, dtype=torch.uint8, device="cuda")
+    except RuntimeError:  # out of memory
+        return None
+    start, end = _events()
+    _mark(start)
+    _copy(dst, src)
+    _mark(end)
+    _synchronize()
+    return 2 * n / max(_elapsed(start, end), 1e-6) / 1e6
+
+
+def _peak_gbps() -> float:
+    """The roofline's ``dram_gbps`` of this GPU (:func:`kernels.roofline.current_peaks`;
+    0 when it is not cached)."""
+    global _PEAK_GBPS
+    if _PEAK_GBPS is None:
+        _PEAK_GBPS = 0.0
+        with contextlib.suppress(Exception):
+            from kernel_agent.kernels.roofline import current_peaks
+
+            _PEAK_GBPS = float((current_peaks() or {}).get("dram_gbps") or 0.0)
+    return _PEAK_GBPS
+
+
+def clock_state() -> float | None:
+    """One DRAM bandwidth probe (:func:`dram_gbps`) as a share of the GPU's bandwidth (the
+    roofline's, at least the best probe of this process): about 1 at full clocks, 0.5 at a
+    halved memory clock (None: no probe)."""
+    global _BEST_GBPS
+    gbps = dram_gbps()
+    if gbps is None:
+        return None
+    _BEST_GBPS = max(_BEST_GBPS, gbps)
+    return gbps / max(_peak_gbps(), _BEST_GBPS)
+
+
+def _spin() -> None:
+    """A few milliseconds of matmuls (:func:`ensure_clocks` adds a DRAM copy: its probe)."""
+    a = torch.randn(2048, 2048, device="cuda", dtype=torch.float16)
+    for _ in range(10):
+        a = (a @ a).clamp_(-1, 1)
+
+
+def ensure_clocks() -> float | None:
+    """Spin the GPU until a clock probe reads CLOCK_OK; returns the last :func:`clock_state`.
+
+    At most WARM_MAX_S per call and WARM_BUDGET_S per process; a call that does not get
+    there makes the best probe of this process the reference (the GPU is busy or capped;
+    a drop below that still counts). The first call without the roofline's bandwidth
+    spins WARM_UNCALIBRATED_S (no reference yet: the best probe is the current one)."""
+    global _CALIBRATED, _SPENT_S, _PEAK_GBPS
+    begin = _perf_counter()
+    floor = 0.0
+    if not _CALIBRATED:
+        _CALIBRATED = True
+        floor = 0.0 if _peak_gbps() else WARM_UNCALIBRATED_S
+    state = clock_state()
+    while True:
+        spun = _perf_counter() - begin
+        if spun >= floor and (state is None or state >= CLOCK_OK):
+            break
+        if spun >= max(floor, min(WARM_MAX_S, WARM_BUDGET_S - _SPENT_S)):
+            _PEAK_GBPS = 0.0
+            state = clock_state()
+            break
+        _spin()
+        state = clock_state()  # a DRAM copy: the memory clock follows DRAM traffic
+    _SPENT_S += _perf_counter() - begin
+    return state
 
 
 def flush_l2() -> None:
@@ -120,6 +226,11 @@ def time_call(
     call count, or left over in reused memory, no longer matches) and is
     recorded in ``result["kept"]``: its inputs before and after the call and its
     output (copies made outside the timed region).
+
+    The measurement runs after :func:`ensure_clocks` and before one more clock probe, and
+    is repeated (at most CLOCK_RETRIES times) when either reads below CLOCK_OK: ``clock``
+    is the lower of the two of the measurement returned (about 1: full clocks),
+    ``clock_retries`` the repeats.
     """
     mutable = has_mutable_state(args, kwargs)
     sets = [(args, kwargs)]
@@ -134,6 +245,43 @@ def time_call(
         turn += 1
         return sets[(turn - 1) % len(sets)]
 
+    retries = 0
+    while True:
+        before = ensure_clocks()
+        result = _measure(
+            fn,
+            fresh,
+            warmup=warmup,
+            min_iters=min_iters,
+            max_iters=max_iters,
+            target_ms=target_ms,
+            l2_flush=l2_flush,
+            keep=keep,
+        )
+        probes = [s for s in (before, clock_state()) if s is not None]
+        clock = min(probes, default=None)
+        if clock is None or clock >= CLOCK_OK or retries == CLOCK_RETRIES:
+            break
+        retries += 1
+    if clock is not None:
+        result["clock"] = round(clock, 3)
+    if retries:
+        result["clock_retries"] = retries
+    return result
+
+
+def _measure(
+    fn: Callable[..., Any],
+    fresh: Callable[[], tuple[tuple[Any, ...], dict[str, Any]]],
+    *,
+    warmup: int,
+    min_iters: int,
+    max_iters: int,
+    target_ms: float,
+    l2_flush: bool,
+    keep: bool,
+) -> dict[str, Any]:
+    """One measurement of :func:`time_call` (inputs from ``fresh()``)."""
     kept: dict[str, Any] | None = None
     with torch.inference_mode():
         for _ in range(warmup):
@@ -257,12 +405,17 @@ def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> d
 
 def median_round(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     """The median of timing rounds (:func:`time_call` results), with ``spread``: the
-    range of the round medians relative to it."""
+    range of the round medians relative to it, and the lowest ``clock`` and all
+    ``clock_retries`` of the rounds."""
     ordered = sorted(rounds, key=lambda r: r["median_ms"])
     best = dict(ordered[len(ordered) // 2])
     best["spread"] = (ordered[-1]["median_ms"] - ordered[0]["median_ms"]) / max(
         best["median_ms"], 1e-9
     )
+    if clocks := [r["clock"] for r in rounds if "clock" in r]:
+        best["clock"] = min(clocks)
+    if retries := sum(r.get("clock_retries", 0) for r in rounds):
+        best["clock_retries"] = retries
     return best
 
 
@@ -279,7 +432,9 @@ def compare_timing(
     """Interleave reference/candidate timing rounds; report the median round.
 
     Interleaving cancels slow drifts (clock boost, thermal, background load)
-    that would otherwise favour whichever function ran second.  With ``verify``
+    that would otherwise favour whichever function ran second; every round runs at
+    full clocks (:func:`time_call`'s clock guard: a low performance state slows a
+    bandwidth-bound function far more than a launch-bound one).  With ``verify``
     one random timed call of the candidate's last round runs on redrawn inputs
     and its output is checked against a fresh reference call on the same inputs
     (``candidate_result["timed_output"]``: the iteration and failing checks)."""
