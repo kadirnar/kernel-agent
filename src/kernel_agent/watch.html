@@ -347,8 +347,8 @@ td.nowrap { white-space: nowrap; }
   // inserted as text nodes or attributes, never parsed as HTML.
   const NS = "http://www.w3.org/2000/svg";
   const PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"];
-  const FAILURES = ["incorrect", "incorrect_timed_output", "incorrect_perturbed", "build_error",
-    "runtime_error", "crash", "timeout"];
+  const FAILURES = ["incorrect", "incorrect_timed_output", "incorrect_perturbed",
+    "integrity_violation", "fallback", "build_error", "runtime_error", "crash", "timeout"];
   // not benchmark evaluations (ledger.UNMEASURED): quick checks and duplicates
   const UNMEASURED = ["quick_ok", "quick_fail", "duplicate"];
   const MAX_EVENTS = 600, MAX_LOGS = 400;

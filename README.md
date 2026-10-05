@@ -211,6 +211,85 @@ latency (baseline − Σ est. saved ms: a kernel's module-level estimate, a
 transform's measured gain alone) next to the measured one; `report.md` shows
 both. A re-integration reuses an A/B only for the same A and B files.
 
+### Anti-gaming guards
+
+The candidate runs inside the evaluator's process, so it could patch the
+timer, the comparator or the reference, or hide work from the timer
+(`kernels/integrity.py`). These are rejected with `integrity_violation`:
+
+* **Patching.** Before the candidate is imported, the evaluator records the
+  identities of the timing primitives (`torch.cuda.Event`,
+  `torch.cuda.synchronize`, `time.perf_counter`), its own functions and
+  constants (`compare.TOLERANCES`, ...), the functions of `torch`,
+  `torch.Tensor` and `torch.nn.functional`, the `forward` of every `torch.nn`
+  module class, the methods of the reference's classes and instances, the
+  reference's weights, and the backend flags: TF32, cuDNN, the SDPA backends,
+  matmul precision, deterministic algorithms, the default dtype, the current
+  stream, torch function/dispatch modes and an active profiler. Any change after
+  `build()`, after the correctness checks, after timing or at the end is a
+  violation, and it is undone. A thread that runs code from the candidate's
+  directory is a violation too. The timer is bound when the evaluator starts, so
+  a patch cannot change a measurement before it is caught.
+* **Hidden work.** For every case, reference and candidate calls alternate in
+  random order, each between two device-wide synchronisations. When the
+  candidate's wall time exceeds its CUDA-event time by more than the
+  reference's does, GPU work is running on streams or threads the timer does
+  not see. The threshold is the median of the paired differences above 0.1 ms
+  and above 50 % of the event time, confirmed by a second measurement. On a
+  quiet GPU legitimate kernels stay within ±1 µs; the side-stream fixture hides
+  0.54 ms.
+* **One profiled pass over the dominant case** (largest calls × reference
+  time): GPU work launched from another thread, or still running on another
+  stream when the timed stream moves on (a side stream never joined back), is
+  a violation. The same pass measures `custom_kernel_share`, the share of the
+  candidate's GPU time in kernels the reference does not launch, and counts
+  calls into the reference's entrypoint code (`sys.monitoring`).
+* **Outside the candidate's process** (`run_evaluation`): the candidate's
+  outputs from the correctness stage are saved, then compared with the capture
+  by the parent process's own comparator. The reference time of each case must
+  be within 10 % of one measured in a candidate-free subprocess (more when either
+  timing is noisy: twice the timing spread, or twice the gap between the clean
+  run's two measurements). That measurement is cached per capture and process,
+  and a slowdown counts only when a fresh measurement confirms it. The result
+  line carries a nonce that the subprocess reads from stdin before the candidate
+  is imported.
+
+A candidate falls back to the reference, with status `fallback`, in two cases
+on the dominant case:
+
+* the reference's entrypoint code runs (`type(ref).forward(...)`, an inherited
+  `forward` or `super().forward`) and less than half of its GPU time is in
+  kernels of its own;
+* none of its GPU time is in kernels of its own (`custom_kernel_share` 0) and
+  it launches every kernel of the reference at least as often: the same
+  multiset of kernel names or a superset, so it re-runs the reference's torch
+  ops.
+
+Pure-torch restructurings that launch fewer kernels pass. Examples are q/k/v
+or gate/up weights concatenated once in `build()` (one GEMM instead of three,
+or two) and dropped casts or copies, even when cuBLAS picks the very same
+kernel. On the fixtures, merged QKV goes from 3 launches to 1 and merged
+gate/up from 5 to 4, both with share 0. The result reports
+`kernel_launches_reference` and `kernel_launches_candidate` (per call of the
+dominant case). Other cases may still fall back. On CPU, where nothing is
+profiled, the call into the reference's code alone decides. A quick check (`mode="quick"`) runs the in-process guards,
+the fallback check through the code alone and the parent's output comparison
+on its two cases. It has no timing, so no timing guard applies.
+
+The fixtures in `tests/test_evaluator_exploits.py` cover the known exploits:
+side streams, background threads, a patched `Event.elapsed_time`, patched
+tolerances, SDPA flags turned off for the reference, a dispatcher override that
+slows `aten::rsqrt`, a comparator blinded through `Tensor.__sub__`, and both
+fallbacks. On the RMSNorm smoke capture the guards add no measurable time
+to an evaluation (median `eval_seconds` 2.1 s before and after). The first
+evaluation of a capture in a process pays for the candidate-free reference
+timing: 2 s for RMSNorm, 4–5 s for a VoxCPM2 attention capture, which also
+loads the capture in the parent.
+
+Limits: a candidate in the evaluator's process can still read the evaluator's
+memory (the nonce, the capture). A determined one could forge its saved outputs
+or its result. Full isolation would need the candidate in a separate process.
+
 ### Ground truth the agents cannot quietly change
 
 Agents have a Bash tool, so file permissions alone cannot protect what the
@@ -1039,8 +1118,9 @@ value for that column.
   Kernels start from the reference module (1.0×), `e2e` rows from the baseline.
   A correct result that is not better is `discard`. Failures are `incorrect`,
   `incorrect_timed_output`, `incorrect_perturbed` (see "What correct means"),
-  `build_error`, `runtime_error`, `crash` or `timeout`. The keep rule is the
-  same one the budget advice uses. `quick_ok` / `quick_fail` (quick checks) and
+  `integrity_violation`, `fallback` (see "Anti-gaming guards"), `build_error`,
+  `runtime_error`, `crash` or `timeout`. The keep rule is the same one the
+  budget advice uses. `quick_ok` / `quick_fail` (quick checks) and
   `duplicate` rows are not benchmark evaluations: no chart, count, budget or
   streak uses them (see "Parallel workers, duplicates and quick checks").
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,

@@ -5,10 +5,32 @@ from __future__ import annotations
 import copy
 import random
 import statistics
+import time
 from collections.abc import Callable
 from typing import Any
 
 import torch
+
+# Timing primitives, bound when the evaluator imports this module (before any
+# candidate): a candidate that later patches ``torch.cuda.Event.elapsed_time``,
+# ``torch.cuda.synchronize`` or ``time.perf_counter`` cannot change a measurement
+# (kernels/integrity.py reports the attempt).  The C base class of the event
+# cannot be patched.
+_EventBase: Any = getattr(torch._C, "_CudaEventBase", torch.cuda.Event)
+_Event = torch.cuda.Event
+_record: Callable[..., Any] = _EventBase.record
+_elapsed: Callable[..., float] = _EventBase.elapsed_time
+_current_stream = torch.cuda.current_stream
+_synchronize: Callable[[], Any] = getattr(torch._C, "_cuda_synchronize", torch.cuda.synchronize)
+_perf_counter = time.perf_counter
+
+
+def _events() -> tuple[Any, Any]:
+    return _Event(enable_timing=True), _Event(enable_timing=True)
+
+
+def _mark(event: Any) -> None:
+    _record(event, _current_stream())
 
 
 def has_mutable_state(args: Any, kwargs: Any) -> bool:
@@ -117,16 +139,16 @@ def time_call(
         for _ in range(warmup):
             a, k = fresh()
             fn(*a, **k)
-        torch.cuda.synchronize()
+        _synchronize()
 
         # Estimate per-call time to choose the iteration count.
         a, k = fresh()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
+        start, end = _events()
+        _mark(start)
         fn(*a, **k)
-        end.record()
-        torch.cuda.synchronize()
-        est = max(start.elapsed_time(end), 1e-3)
+        _mark(end)
+        _synchronize()
+        est = max(_elapsed(start, end), 1e-3)
         iters = int(min(max(target_ms / est, min_iters), max_iters))
         checked = random.SystemRandom().randrange(iters) if keep else -1
 
@@ -136,13 +158,13 @@ def time_call(
             if i == checked:
                 a, k = _perturbed_copy(a, k)
                 pre = _snapshot((a, k))
-                torch.cuda.synchronize()
+                _synchronize()
             if l2_flush:
                 flush_l2()
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            start.record()
+            start, end = _events()
+            _mark(start)
             out = fn(*a, **k)
-            end.record()
+            _mark(end)
             events.append((start, end))
             if i == checked:
                 kept = {
@@ -152,8 +174,8 @@ def time_call(
                     "output": _snapshot(out),
                 }
             del out
-        torch.cuda.synchronize()
-        ms = [s.elapsed_time(e) for s, e in events]
+        _synchronize()
+        ms = [_elapsed(s, e) for s, e in events]
     ms.sort()
     trimmed = ms[: max(1, int(len(ms) * 0.9))]
     result: dict[str, Any] = {
@@ -165,6 +187,54 @@ def time_call(
     if kept is not None:
         result["kept"] = kept
     return result
+
+
+def wall_check(
+    reference: Callable[..., Any],
+    candidate: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    iters: int = 10,
+) -> dict[str, float]:
+    """Per-call CUDA-event time vs device-synchronised wall time (ms).
+
+    The events only see the current stream; the wall clock (device-wide
+    ``synchronize()`` before and after each call) sees every stream and thread.
+    Each iteration calls the reference and the candidate once, in random order;
+    ``hidden_ms`` is the median over iterations of the candidate's wall-minus-event
+    gap minus the reference's (the fixed synchronisation overhead cancels): GPU
+    work the timer does not see.  Pairing and the median keep a busy GPU (other
+    processes) from looking like hidden work; ``*_wall_ms`` / ``*_event_ms`` are
+    medians."""
+    mutable = has_mutable_state(args, kwargs)
+    walls: dict[str, list[float]] = {"ref": [], "new": []}
+    evts: dict[str, list[float]] = {"ref": [], "new": []}
+    order = [("ref", reference), ("new", candidate)]
+    rng = random.SystemRandom()
+    with torch.inference_mode():
+        for _ in range(iters):
+            rng.shuffle(order)
+            for label, fn in order:
+                a, k = (copy.deepcopy(args), copy.deepcopy(kwargs)) if mutable else (args, kwargs)
+                start, end = _events()
+                _synchronize()
+                t0 = _perf_counter()
+                _mark(start)
+                fn(*a, **k)
+                _mark(end)
+                _synchronize()
+                walls[label].append((_perf_counter() - t0) * 1e3)
+                evts[label].append(_elapsed(start, end))
+    out: dict[str, float] = {}
+    for label in ("ref", "new"):
+        out[f"{label}_wall_ms"] = statistics.median(walls[label])
+        out[f"{label}_event_ms"] = statistics.median(evts[label])
+    gaps = {k: [w - e for w, e in zip(walls[k], evts[k], strict=True)] for k in walls}
+    out["hidden_ms"] = statistics.median(
+        n - r for n, r in zip(gaps["new"], gaps["ref"], strict=True)
+    )
+    return out
 
 
 def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> dict[str, Any]:

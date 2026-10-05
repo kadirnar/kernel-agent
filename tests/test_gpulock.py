@@ -357,6 +357,8 @@ def test_evaluation_and_worker_run_on_the_locked_gpu(lock_dir, foreign, monkeypa
     def run(cmd, *, env, **kwargs):
         envs.append(env)
         marker = "@@KA_RESULT@@" if "evaluate" in cmd[2] else worker.MARKER
+        nonce = (kwargs.get("input") or "").strip()  # run_evaluation's result-line nonce
+        marker += f"{nonce}@@" if nonce else ""
         return subprocess.CompletedProcess(cmd, 0, marker + json.dumps({"status": "ok"}), "")
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -388,7 +390,8 @@ def test_parallel_evaluations_run_one_per_gpu(monkeypatch, tmp_path):
         time.sleep(0.2)
         with guard:
             busy[gpu] -= 1
-        return subprocess.CompletedProcess(cmd, 0, "@@KA_RESULT@@" + json.dumps({}), "")
+        tag = kwargs["input"].strip() + "@@"  # run_evaluation's result-line nonce
+        return subprocess.CompletedProcess(cmd, 0, "@@KA_RESULT@@" + tag + json.dumps({}), "")
 
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(evaluate, "ensure_peaks", lambda: None)

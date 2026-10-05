@@ -117,6 +117,9 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             # which correctness stage failed (kernels/evaluate.py)
             "stage",
             "failed_check",
+            "custom_kernel_share",
+            "kernel_launches_reference",
+            "kernel_launches_candidate",
             "kernels_candidate",
             "kernels_reference",
             "eval_seconds",
