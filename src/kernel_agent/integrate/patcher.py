@@ -14,6 +14,7 @@ from torch import nn
 from kernel_agent.kernels.evaluate import load_candidate_module
 from kernel_agent.phases import PHASES, route
 from kernel_agent.profiling.methods import entrypoints_of
+from kernel_agent.region import Rewrite, apply_rewrites
 
 
 @dataclass
@@ -28,6 +29,9 @@ class KernelPatch:
     #: ``prefill`` / ``decode``: only that phase's calls of ``methods`` go to the
     #: replacement; the instance stays in the model (:func:`kernel_agent.phases.route`).
     phase: str | None = None
+    #: Region target (:mod:`kernel_agent.region`): the rewrite that adds the
+    #: ``module_class`` modules to its parent class, applied before every kernel.
+    rewrite: Rewrite | None = None
 
 
 class PatchError(RuntimeError):
@@ -40,6 +44,7 @@ class PatchReport:
     skipped: dict[str, int] = field(default_factory=dict)
     transforms: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    rewritten: dict[str, int] = field(default_factory=dict)  # parents, per region target
 
 
 def _set_child(root: nn.Module, qualname: str, new: nn.Module) -> None:
@@ -62,8 +67,12 @@ def apply_kernels(
 
     Raises :class:`PatchError` when a replacement lacks one of the patch's
     entrypoints that the original instance has (e.g. ``forward_step``): the
-    model would call it and either crash or silently bypass the kernel."""
+    model would call it and either crash or silently bypass the kernel.
+
+    The rewrites of region targets' parents come first, so their kernels (and
+    the kernels of classes the region modules contain) find the new modules."""
     report = report or PatchReport()
+    report.rewritten.update(apply_rewrites(roots, [p.rewrite for p in patches if p.rewrite]))
     for patch in patches:
         module = load_candidate_module(patch.candidate)
         pattern = re.compile(patch.qualname_regex) if patch.qualname_regex else None

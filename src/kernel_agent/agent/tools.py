@@ -14,7 +14,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from kernel_agent import dedup, ledger, truth, workers
+from kernel_agent import dedup, ledger, region, truth, workers
 from kernel_agent.budget import Budget
 from kernel_agent.dashboard import refresh
 from kernel_agent.kernels.evaluate import run_evaluation
@@ -708,10 +708,31 @@ def build_server(
         }
         return _text(info)
 
+    @tool(
+        "verify_rewrite",
+        "Region targets: apply rewrite.py to a copy of the captured parent module and replay "
+        "every captured call. Outputs and in-place side effects must equal the reference "
+        "(bitwise, or within about one unit in the last place) and the parent must call its "
+        "Region_<id> module. Reports per case: ok, bitwise, max_abs_err, region_calls.",
+        {"target_id": str},
+    )
+    async def verify_rewrite(args: dict[str, Any]) -> dict[str, Any]:
+        timeout = budget.eval_timeout_s
+        target_id = str(args["target_id"])
+        result = await asyncio.to_thread(region.check, run, target_id, keeper, timeout=timeout)
+        return _text(result)
+
     return create_sdk_mcp_server(
         SERVER_NAME,
         version="0.1.0",
-        tools=[evaluate_candidate, best_result, evaluate_e2e, check_harness, run_info],
+        tools=[
+            evaluate_candidate,
+            best_result,
+            evaluate_e2e,
+            check_harness,
+            run_info,
+            verify_rewrite,
+        ],
     )
 
 

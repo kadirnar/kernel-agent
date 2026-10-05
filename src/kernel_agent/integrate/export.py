@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import phases
+from kernel_agent import phases, region
 from kernel_agent.truth import TamperError, alarm, read_verified
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -36,8 +36,8 @@ HERE = Path(__file__).resolve().parent
 MANIFEST = json.loads((HERE / "manifest.json").read_text())
 
 
-def _load(path: Path):
-    name = f"ka_opt_{{path.stem}}"
+def _load(path: Path, name: str | None = None):
+    name = name or f"ka_opt_{{path.stem}}"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -45,12 +45,41 @@ def _load(path: Path):
     return module
 
 
+def _rewrite_parents(roots, entry) -> int:
+    """Region target: ``rewrite()`` every instance of its parent class first, which adds
+    the ``Region_<id>`` modules that the entry's kernel then replaces."""
+    rewrite = entry["rewrite"]
+    module = _load(HERE / rewrite["file"], f"ka_region_{{entry['target']}}")
+    regex = rewrite.get("qualname_regex")
+    n = 0
+    for root in roots:
+        for name, child in list(root.named_modules()):
+            if not name or type(child).__name__ != rewrite["parent_class"]:
+                continue
+            names = [name, *(f"{{r}}.{{name}}" for r in MANIFEST.get("roots", []))]
+            if regex and not any(re.search(regex, q) for q in names):
+                continue
+            new = module.rewrite(child)
+            parent_name, _, attr = name.rpartition(".")
+            parent = root.get_submodule(parent_name) if parent_name else root
+            if isinstance(parent, (nn.ModuleList, nn.Sequential)) and attr.isdigit():
+                parent[int(attr)] = new
+            else:
+                setattr(parent, attr, new)
+            n += 1
+    return n
+
+
 def apply_kernels(*roots: nn.Module) -> dict[str, int]:
     """Replace every matching module instance in ``roots``; returns counts.
 
     An entry with a ``phase`` keeps the instance and sends only that phase's
-    calls to the kernel (``phases.py``), as the integration did."""
+    calls to the kernel (``phases.py``), as the integration did. Region targets'
+    rewrites (``rewrites/``) come first."""
     counts: dict[str, int] = {{}}
+    for entry in MANIFEST["kernels"]:
+        if entry.get("rewrite"):
+            counts[f"{{entry['target']}}:rewrite"] = _rewrite_parents(roots, entry)
     for entry in MANIFEST["kernels"]:
         module = _load(HERE / entry["file"])
         regex = entry.get("qualname_regex")
@@ -129,6 +158,13 @@ def export_optimized(
             scope = {k: spec[k] for k in ("phase", "qualname_regex") if spec.get(k)}
             if "phase" in scope:
                 scope["routed"] = list(methods)  # entrypoints whose phase calls go to the kernel
+            if (rewrite := region.rewrite_of(run, target_id, spec)) is not None:
+                (out / "rewrites").mkdir(exist_ok=True)
+                _copy(run, rewrite.path, out / "rewrites" / f"{target_id}.py", digests)
+                scope["rewrite"] = {"file": f"rewrites/{target_id}.py"}
+                scope["rewrite"]["parent_class"] = rewrite.parent_class
+                if regex := scope.pop("qualname_regex", None):  # it selects parent instances
+                    scope["rewrite"]["qualname_regex"] = regex
             manifest["kernels"].append(
                 {
                     "target": target_id,

@@ -25,6 +25,7 @@ from kernel_agent import (
     ledger,
     library,
     program,
+    region,
     research,
     scheduler,
     strong_baseline,
@@ -280,10 +281,7 @@ class Orchestrator:
         known = {c["cls"] for c in profile.get("classes", [])}
         targets = []
         for t in plan["targets"][: self.cfg.max_targets]:
-            if t["module_class"] not in known:
-                log(f"plan: dropping {t['id']}: class {t['module_class']} not in profile")
-                continue
-            if problem := _scope(t):
+            if problem := region.validate(t, known) or _scope(t):
                 log(f"plan: dropping {t['id']}: {problem}")
                 continue
             t["backends"] = [b for b in t.get("backends", []) if b in backends] or backends[:2]
@@ -301,27 +299,87 @@ class Orchestrator:
 
     async def capture(self) -> None:
         plan = read_json(self.run.plan_json, {})
-        self._mark("capture", targets=self._capture(plan.get("targets", [])))
+        self._mark("capture", targets=await self.capture_targets(plan.get("targets", [])))
+
+    async def capture_targets(self, targets: list[dict[str, Any]]) -> list[str]:
+        """:meth:`_capture`, then the refactor step of the region targets; returns the ids."""
+        kept = self._capture(targets)
+        for t in targets:
+            if region.is_region(t) and t["id"] in kept and not await self.refactor(t["id"]):
+                kept.remove(t["id"])
+        return kept
 
     def _capture(self, targets: list[dict[str, Any]]) -> list[str]:
-        """Create ``targets/<id>/spec.json`` and capture each target; returns the captured ids."""
+        """Create ``targets/<id>/spec.json`` and capture each target (of a region target: its
+        parent class, see ``region.py``); returns the captured ids."""
         kept = []
         for t in targets:
             target_dir = self.run.target(t["id"])
             (target_dir / "candidates").mkdir(parents=True, exist_ok=True)
             spec = {**t}
             write_json(target_dir / "spec.json", spec)
-            log(f"capture: {t['id']} ({t['module_class']})")
-            info = self._worker("capture", "--target", t["id"])
+            parent = ["--parent"] if region.is_region(t) else []
+            log(f"capture: {t['id']} ({t['parent_class'] if parent else t['module_class']})")
+            info = self._worker("capture", "--target", t["id"], *parent)
             if "error" in info:
                 log(f"capture: {t['id']} failed, dropping target:\n{info['error'][-800:]}")
                 (target_dir / "spec.json").rename(target_dir / "spec.failed.json")
                 continue
-            if (capture := self.run.capture_file(t["id"])).exists():
+            capture = self.run.capture_file(t["id"])
+            if parent:
+                capture = region.parent_capture(self.run, t["id"])
+            if capture.exists():
                 self.truth.seal(capture)
             log(f"capture: {t['id']} cases={[(c['signature'], c['count']) for c in info['cases']]}")
             kept.append(t["id"])
         return kept
+
+    async def refactor(self, target_id: str) -> bool:
+        """The refactor step of a region target (``region.py``): a ``refactor-<id>`` session
+        writes ``rewrite.py`` (read-only tools + ``verify_rewrite``; it may write that file
+        only), a sealed copy is verified on the parent's capture, and the ``Region_<id>``
+        module it adds is captured. False (the target is dropped) when a step fails."""
+        target_dir = self.run.target(target_id)
+        spec = read_json(target_dir / "spec.json")
+        rewrite = target_dir / region.REWRITE_FILE
+
+        def install() -> dict[str, Any]:
+            timeout = self.budget.eval_timeout_s
+            return region.install(self.run, target_id, self.truth, timeout=timeout)
+
+        # a resumed run, or a rewrite written by hand: no session when it verifies
+        result = await asyncio.to_thread(install) if rewrite.is_file() else {}
+        if not result.get("verified") and (reason := self.budget.exhausted()):
+            result = {"status": "budget_skipped", "error": reason}
+        elif not result.get("verified"):
+            await self._agent(
+                f"refactor-{target_id}",
+                prompt=(
+                    f"Isolate the region of target `{target_id}` in a new submodule: write "
+                    f"{rewrite} and check it with verify_rewrite."
+                ),
+                system_append=prompts.refactor_prompt(spec, spec.get("parent_capture", {})),
+                cwd=target_dir,
+                mcp_tools=tool_names("verify_rewrite"),
+                tools=[*READ_TOOLS, "Write", "Edit"],
+                writable=[rewrite],
+            )
+            result = await asyncio.to_thread(install)
+        spec["rewrite"] = region.summary(result)
+        write_json(target_dir / "spec.json", spec)
+        if result.get("verified"):
+            how = "bitwise" if result.get("bitwise") else "within one ulp"
+            log(f"refactor: {target_id}: rewrite verified ({how}); capture {spec['module_class']}")
+            info = self._worker("capture", "--target", target_id)
+            if "error" not in info:
+                self.truth.seal(self.run.capture_file(target_id))
+                cases = [(c["signature"], c["count"]) for c in info["cases"]]
+                log(f"capture: {target_id} cases={cases}")
+                return True
+            result = {"status": "capture_failed", "error": info["error"]}
+        log(f"refactor: {target_id} dropped ({result.get('status')}):\n{_why(result)[-800:]}")
+        (target_dir / "spec.json").rename(target_dir / "spec.failed.json")
+        return False
 
     async def kernels(self) -> None:
         profile = read_json(self.run.profile_dir / "profile.json", {})
@@ -524,7 +582,9 @@ class Orchestrator:
         bests = []
         for target_id in self.run.target_ids():
             best = best_for_target(self.run, target_id, self.truth)
-            if best and best["speedup"] >= self.cfg.min_speedup:
+            # a region target's kernel needs its verified rewrite, unchanged (region.py)
+            ok = region.rewrite_ok(self.run, target_id, self.truth)
+            if best and best["speedup"] >= self.cfg.min_speedup and ok:
                 bests.append((target_id, best))
         return bests
 
@@ -678,6 +738,8 @@ class Orchestrator:
             kernel = str(self.run.history_dir(target_id) / Path(best["snapshot"]).name)
             items.append(("kernel", f"{target_id}={kernel}"))
             digests[kernel] = best.get("snapshot_sha256")
+            if (rewrite := region.verified_rewrite(self.run, target_id)).exists():
+                digests[str(rewrite)] = self.truth.expect(rewrite)  # the export checks it
         best_tf: dict[str, tuple[float, str, str | None]] = {}
         for rec, snaps in self._e2e_records():
             for snap in snaps:
@@ -739,6 +801,8 @@ class Orchestrator:
         snapshot of a correct evaluation with that file name, else None."""
         target_id, _, path = item.partition("=")
         if target_id not in self.run.target_ids():
+            return None
+        if not region.rewrite_ok(self.run, target_id, self.truth):  # a region: its rewrite
             return None
         try:
             records = self.truth.records(self.run.results_file(target_id))
@@ -930,15 +994,12 @@ class Orchestrator:
         taken = {(s.get("module_class"), s.get("phase")) for s in specs}
         new = []
         for t in plan.get("targets", [])[: self.cfg.max_targets]:
+            problem = region.validate(t, known) or _scope(t)
             cls = t.get("module_class")
-            problem = _scope(t)
             phase = t.get("phase")
             overlap = any(c == cls and (None in (p, phase) or p == phase) for c, p in taken)
-            if cls not in known or overlap or problem or self.run.target(t["id"]).exists():
-                log(
-                    f"replan: dropping {t['id']} ({cls}): "
-                    + (problem or "not in the profile or already a target")
-                )
+            if overlap or problem or self.run.target(t["id"]).exists():
+                log(f"replan: dropping {t['id']} ({cls}): " + (problem or "already a target"))
                 continue
             t["backends"] = [b for b in t.get("backends", []) if b in backends] or backends[:2]
             new.append(t)
@@ -1076,6 +1137,12 @@ def _item_key(item: tuple[str, str]) -> str:
     if kind == "kernel":
         return f"kernel {arg.partition('=')[0]}"
     return f"transform {ledger.snapshot_stem(arg)}"
+
+
+def _why(result: dict[str, Any]) -> str:
+    """The error of a failed step, else its first failing cases."""
+    failed = [c for c in result.get("cases") or [] if not c.get("ok")]
+    return str(result.get("error") or json.dumps(failed[:2], default=str))
 
 
 def _short(r: dict[str, Any]) -> dict[str, Any]:
