@@ -23,6 +23,17 @@ cases) feeds :class:`~kernel_agent.profiling.workload_stats.WorkloadStats`,
 written to ``workload_profile.md`` / ``.json`` (in the target directory). A
 target with a ``phase`` (:mod:`kernel_agent.phases`) records only that phase's
 calls as cases; ``qualname_regex`` restricts the instances it covers.
+
+Correctness coverage beyond one call per signature:
+
+* KV-length buckets: decode steps share their primary input while the KV
+  cache grows, so a survey run counts them first and the recording keeps the
+  first, middle and last step of every decode signature (``bucket``,
+  ``decode_step``); each stands for a third of the calls in the timing weights.
+* Extra settings: ``Workload.variants()`` (other prompt lengths, batch sizes,
+  texts) are run once more each; calls with primary inputs the main run lacks
+  become *correctness-only* cases (``count`` 0, ``correctness_only``) that the
+  evaluator checks but does not time.
 """
 
 from __future__ import annotations
@@ -122,13 +133,32 @@ def _detach(value: Any) -> Any:
         return value
 
 
+def bucket_plan(n: int) -> list[tuple[str, int, int]]:
+    """``(bucket, call index, calls it stands for)`` of ``n`` decode calls that share
+    a primary input: the first, middle and last step (thirds of the calls each), so
+    the KV cache is checked short, half full and full, and timings weighted by
+    third.  One call: no buckets."""
+    if n < 2:
+        return []
+    if n == 2:
+        return [("first", 0, 1), ("last", 1, 1)]
+    third = n // 3
+    return [("first", 0, third), ("middle", n // 2, n - 2 * third), ("last", n - 1, third)]
+
+
 class _Recorder:
     """Records the calls of one module instance through all of its entrypoints.
 
     ``peers`` (other instances of the class) are only watched to count which
     instances call which entrypoint (``callers``). With ``phase`` only calls of
     that phase are recorded and counted. ``stats`` sees every call of the
-    module and its peers, whatever the phase."""
+    module and its peers, whatever the phase.
+
+    ``steps`` (decode calls per ``(method, primary signature)`` in one run, from a
+    survey run) splits decode calls into KV-length buckets (:func:`bucket_plan`):
+    besides its first call, a decode signature keeps its middle and last call as
+    cases. Those extra cases do not count against ``max_cases``. Keys in ``skip``
+    are never recorded."""
 
     def __init__(
         self,
@@ -139,17 +169,25 @@ class _Recorder:
         *,
         phase: str | None = None,
         stats: WorkloadStats | None = None,
+        steps: dict[tuple[str, str], int] | None = None,
+        skip: set[tuple[str, str]] | None = None,
     ) -> None:
         self.module = module
         self.max_cases = max_cases
         self.phase = phase if phase in PHASES else None
         self.stats = stats
+        self.steps = steps or {}
+        self.skip = skip or set()
         self.cases: dict[tuple[str, str], dict[str, Any]] = {}
+        #: Middle / last decode-step cases of a bucketed key (see ``steps``).
+        self.extra: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._index: collections.Counter[tuple[str, str]] = collections.Counter()
         #: Calls per entrypoint during the run (all signatures, captured or not).
         self.calls: collections.Counter[str] = collections.Counter()
         #: Entrypoint -> ids of the instances (``module`` and peers) that called it.
         self.callers: dict[str, set[int]] = collections.defaultdict(set)
-        self._pending: list[tuple[tuple[str, str], Any, Any] | None] = []
+        #: Per open call: (key, (bucket, decode step) or None, args, kwargs), or None.
+        self._pending: list[tuple[tuple[str, str], tuple[str, int] | None, Any, Any] | None] = []
         self._ctx: Any = instrument(
             [module, *peers], {type(module): list(methods)}, self._pre, self._post
         )
@@ -173,12 +211,18 @@ class _Recorder:
         # Group calls by entrypoint and primary input only: decode steps share
         # it even though masks / cache positions grow every step.
         key = (method, call_signature(method, args, kwargs, limit=1))
+        index = self._index[key]
+        self._index[key] += 1
+        plan = bucket_plan(self.steps.get(key, 0)) if phase == "decode" else []
+        bucket = next(((name, index) for name, i, _ in plan if i == index), None)
         case = self.cases.get(key)
         if case is not None:
             case["count"] += 1
+        if key in self.skip or (case is not None and bucket is None):
             self._pending.append(None)
-        elif self._make_room(method):
-            self._pending.append((key, _detach(args), _detach(kwargs)))
+        elif case is not None or self._make_room(method):
+            # a new case, or the middle / last step of a bucketed decode signature
+            self._pending.append((key, bucket, _detach(args), _detach(kwargs)))
         else:
             self._pending.append(None)
 
@@ -197,7 +241,9 @@ class _Recorder:
         victims = [key for key in self.cases if per_method[key[0]] > 1]
         if not victims:
             return False
-        del self.cases[min(victims, key=lambda key: self.cases[key]["count"])]
+        victim = min(victims, key=lambda key: self.cases[key]["count"])
+        del self.cases[victim]
+        self.extra.pop(victim, None)
         return True
 
     def _post(
@@ -213,8 +259,8 @@ class _Recorder:
         pending = self._pending.pop() if self._pending else None
         if pending is None:
             return
-        key, pre_args, pre_kwargs = pending
-        self.cases[key] = {
+        key, bucket, pre_args, pre_kwargs = pending
+        case: dict[str, Any] = {
             "method": method,
             "signature": key[1],
             "full_signature": signature_of(pre_args, pre_kwargs, limit=8),
@@ -225,11 +271,47 @@ class _Recorder:
             "post_args": _detach(args),
             "post_kwargs": _detach(kwargs),
         }
+        if bucket is not None:
+            case["bucket"], case["decode_step"] = bucket
+        if key in self.cases:  # a middle / last decode step
+            case["count"] = 0
+            self.extra.setdefault(key, []).append(case)
+        else:
+            self.cases[key] = case
 
     def remove(self) -> None:
         if self._ctx is not None:
             self._ctx.__exit__(None, None, None)
             self._ctx = None
+
+    def recorded(self) -> list[dict[str, Any]]:
+        """The cases, most-called signature first, each followed by its middle / last
+        decode-step cases; bucketed cases share their signature's calls by bucket."""
+        out: list[dict[str, Any]] = []
+        for key, case in sorted(self.cases.items(), key=lambda kv: -kv[1]["count"]):
+            members = [case, *self.extra.get(key, [])]
+            if any("bucket" in c for c in members):
+                _split_calls(members, total=case["count"])
+            out += members
+        return out
+
+
+def _split_calls(members: list[dict[str, Any]], total: int) -> None:
+    """Counts and signatures of the bucket cases of one decode signature.
+
+    The ``total`` calls are split as :func:`bucket_plan` says; a bucket without a
+    case (the run made other calls than the survey run) adds its calls to the
+    closest earlier case, so the counts still add up to ``total``."""
+    members.sort(key=lambda c: c.get("decode_step", 0))
+    for case in members:
+        case["count"] = 0
+    for _, index, count in bucket_plan(total) or [("first", 0, total)]:
+        owner = [c for c in members if c.get("decode_step", 0) <= index] or members
+        owner[-1]["count"] += count
+    for case in members:
+        step = case.get("decode_step", 0) + 1
+        case["decode_steps"] = total
+        case["signature"] = f"{case['signature']} @ decode step {step}/{total}"
 
 
 def instances_of(
@@ -269,25 +351,67 @@ def count_calls(roots: dict[str, nn.Module], cls: str) -> int:
     return sum(1 for root in roots.values() for m in root.modules() if type(m).__name__ == cls)
 
 
-def _busiest(
-    workload: Workload, inputs: Any, candidates: list[tuple[str, nn.Module]], phase: str
-) -> tuple[str, nn.Module]:
-    """The candidate instance with the most ``phase`` calls in one run (the first on ties)."""
-    counts: collections.Counter[int] = collections.Counter()
+#: A survey count: ``(id(instance), method, primary-input signature, phase)``.
+SurveyKey = tuple[int, str, str, str]
+
+
+def _survey(
+    workload: Workload, inputs: Any, modules: Sequence[nn.Module]
+) -> collections.Counter[SurveyKey]:
+    """Calls per instance, entrypoint, primary input and phase in one run."""
+    counts: collections.Counter[SurveyKey] = collections.Counter()
     extra = workload_entrypoints(workload)
-    methods = {t: entrypoints_of(t, extra) for t in {type(m) for _, m in candidates}}
+    methods = {t: entrypoints_of(t, extra) for t in {type(m) for m in modules}}
 
     def pre(module: nn.Module, method: str, args: Any, kwargs: Any) -> None:
-        if call_phase(method, args, kwargs) == phase:
-            counts[id(module)] += 1
+        signature = call_signature(method, args, kwargs, limit=1)
+        counts[(id(module), method, signature, call_phase(method, args, kwargs))] += 1
 
-    with (
-        instrument([m for _, m in candidates], methods, pre, lambda *_: None),
-        torch.inference_mode(),
-    ):
+    with instrument(modules, methods, pre, lambda *_: None), torch.inference_mode():
         workload.run(inputs)
         synchronize()
-    return max(candidates, key=lambda c: counts[id(c[1])])
+    return counts
+
+
+def _record_variant(
+    workload: Workload,
+    module: nn.Module,
+    methods: Sequence[str],
+    overrides: dict[str, Any],
+    known: set[tuple[str, str]],
+    *,
+    max_cases: int,
+    phase: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Cases of ``module`` with primary inputs not in ``known`` from one run under the
+    option ``overrides`` (``Workload.variants``): correctness-only, ``count`` 0."""
+    label = ", ".join(f"{k}={v}" for k, v in overrides.items())
+    info: dict[str, Any] = {"options": dict(overrides)}
+    recorder: _Recorder | None = None
+    try:
+        with workload.with_options(overrides):
+            inputs = workload.make_inputs()
+            recorder = _Recorder(module, max_cases, methods, phase=phase, skip=known)
+            with torch.inference_mode():
+                workload.run(inputs)
+                synchronize()
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"[:500]
+        return [], info
+    finally:
+        if recorder is not None:
+            recorder.remove()
+    known |= set(recorder.cases)
+    cases = recorder.recorded()
+    for case in cases:
+        case.update(
+            count=0,
+            correctness_only=True,
+            variant=label,
+            signature=f"{case['signature']} [correctness only: {label}]",
+        )
+    info["cases"] = len(cases)
+    return cases, info
 
 
 def capture_module(
@@ -301,30 +425,54 @@ def capture_module(
     qualname_regex: str | None = None,
     phase: str | None = None,
     profile_dir: Path | None = None,
+    decode_buckets: bool = True,
+    variants: Sequence[dict[str, Any]] = (),
+    variant_cases: int = 2,
 ) -> dict[str, Any]:
-    """Run the workload once and save one instance of ``cls`` plus its calls.
+    """Run the workload and save one instance of ``cls`` plus its calls.
 
     The target's instances are those a patch replaces (``cls``, matching
     ``qualname_regex``); every call of theirs goes into the workload profile
     (``workload_profile.md`` in ``profile_dir``, default: next to ``path``).
     The captured instance is ``qualname``, else the one with the most
-    ``phase`` calls when a phase is given (one extra run), else the first.
-    With ``phase`` only that phase's calls become cases."""
+    ``phase`` calls when a phase is given, else the first.
+    With ``phase`` only that phase's calls become cases.
+
+    A survey run counts the calls first (unless ``phase`` is ``prefill`` and no
+    instance has to be picked): with ``decode_buckets`` every decode signature
+    keeps its first, middle and last step (:func:`bucket_plan`), so caching bugs
+    at longer KV lengths are caught and timings are weighted per bucket.  Each
+    of ``variants`` (option overrides, ``Workload.variants``) is one more run
+    that adds up to ``variant_cases`` cases with primary inputs the main run
+    lacks, as correctness-only cases (``count`` 0: checked, not timed)."""
     phase = phase if phase in PHASES else None
     roots = workload.roots()
     candidates = instances_of(roots, cls, qualname_regex)
-    if qualname is not None:
-        full, module = find_instance(roots, cls, qualname)
-    elif phase is not None and len(candidates) > 1:
-        full, module = _busiest(workload, inputs, candidates, phase)
-    elif candidates:
-        full, module = candidates[0]
-    else:
+    chosen = find_instance(roots, cls, qualname) if qualname is not None else None
+    if chosen is None and not candidates:
         raise LookupError(f"no module of class {cls!r} (qualname_regex={qualname_regex!r})")
+    busiest = chosen is None and phase is not None and len(candidates) > 1
+    survey: collections.Counter[SurveyKey] = collections.Counter()
+    if busiest or (decode_buckets and phase != "prefill"):
+        modules = [m for _, m in candidates]
+        if chosen is not None and all(m is not chosen[1] for m in modules):
+            modules.append(chosen[1])
+        survey = _survey(workload, inputs, modules)
+    if chosen is None and busiest:
+        per_instance: collections.Counter[int] = collections.Counter()
+        for (mid, _, _, call), n in survey.items():
+            per_instance[mid] += n if call == phase else 0
+        chosen = max(candidates, key=lambda c: per_instance[id(c[1])])  # first on ties
+    full, module = chosen or candidates[0]
+    steps = {
+        (method, sig): n
+        for (mid, method, sig, call), n in survey.items()
+        if mid == id(module) and call == "decode" and decode_buckets
+    }
     methods = entrypoints_of(type(module), workload_entrypoints(workload))
     peers = [m for _, m in candidates if m is not module]
     stats = WorkloadStats()
-    recorder = _Recorder(module, max_cases, methods, peers, phase=phase, stats=stats)
+    recorder = _Recorder(module, max_cases, methods, peers, phase=phase, stats=stats, steps=steps)
     try:
         with torch.inference_mode():
             workload.run(inputs)
@@ -338,7 +486,15 @@ def capture_module(
     if not recorder.cases:
         what = f"{phase} calls" if phase else "calls"
         raise RuntimeError(f"{full} ({cls}) had no {what} during the workload run")
-    cases = sorted(recorder.cases.values(), key=lambda c: -c["count"])
+    cases = recorder.recorded()
+    known = set(recorder.cases)
+    variant_info = []
+    for overrides in variants:
+        found, info = _record_variant(
+            workload, module, methods, overrides, known, max_cases=variant_cases, phase=phase
+        )
+        cases += found
+        variant_info.append(info)
     calls = dict(recorder.calls.most_common())
     # Instances that call each entrypoint (VoxCPM: forward_step only on the LM
     # layers, forward on every MiniCPMAttention) – weights the estimated saving.
@@ -364,10 +520,17 @@ def capture_module(
         "methods": calls,
         "method_instances": method_instances,
         "cases": [
-            {"method": c["method"], "signature": c["signature"], "count": c["count"]} for c in cases
+            {
+                "method": c["method"],
+                "signature": c["signature"],
+                "count": c["count"],
+                **{k: c[k] for k in ("bucket", "correctness_only") if k in c},
+            }
+            for c in cases
         ],
         "bytes": path.stat().st_size,
         **({"phase": phase} if phase else {}),
+        **({"variants": variant_info} if variant_info else {}),
         # every call of the target's instances; the facts go into the engineer prompt
         "workload": {"calls": profile["calls"], "facts": profile["facts"]},
     }

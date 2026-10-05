@@ -10,6 +10,7 @@ runs/<org>--<name>/<timestamp>/
   profile/              profile.json, summary.md, kernels.txt
   plan.json             planner output: targets + model-level transforms
   .truth/               what the evaluator trusts (read-only, hashed): baseline_output.pt,
+                        baseline_output_holdout.pt (held-out input),
                         captures/<id>.pt, targets/<id>/{results.jsonl,history/},
                         transforms/{results.jsonl,history/}
   targets/<id>/         spec.json, capture_inputs.pt (no outputs), reference_source.py,
@@ -160,6 +161,10 @@ class RunDir:
     def baseline_output(self) -> Path:
         """Output of the baseline run that ``e2e`` compares against."""
         return (self.truth_dir if self.sealed() else self.root) / "baseline_output.pt"
+
+    def baseline_output_holdout(self) -> Path:
+        """Baseline output of the held-out input (``workloads/holdout.py``)."""
+        return (self.truth_dir if self.sealed() else self.root) / "baseline_output_holdout.pt"
 
     def capture_file(self, target_id: str) -> Path:
         """The full capture of a target (module, inputs, reference outputs)."""

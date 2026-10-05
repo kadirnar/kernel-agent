@@ -13,9 +13,11 @@ per-step predictions are compared, so errors cannot compound.
 
 from __future__ import annotations
 
+import contextlib
 import statistics
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar
 
@@ -146,6 +148,42 @@ class Workload(ABC):
         kernels.  The default does nothing (no compiled baseline unless
         ``--compile-baseline`` asks for a generic ``torch.compile`` of the roots)."""
         return None
+
+    def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
+        """Option overrides for held-out input number ``variant`` (``None``: none).
+
+        Variant 1 is the held-out e2e input: ``analyze`` stores its baseline output
+        and ``e2e`` judges every candidate on it as well, untimed
+        (:mod:`kernel_agent.workloads.holdout`). It differs in content from the main
+        input (another prompt, text, audio or seed) and keeps its shapes where it
+        can. Variants ``>= 2`` are the memoisation probe's fresh inputs: the shapes of
+        variant 1, content that differs from variant 1 (another seed, say).
+
+        Overrides apply to ``self.options`` around :meth:`make_inputs`, :meth:`run`
+        and teacher forcing (:meth:`with_options`), so seeds read in ``run`` count.
+        The default changes ``seed`` when the workload has one."""
+        if "seed" not in self.options:
+            return None
+        return {"seed": int(self.options["seed"]) + variant}
+
+    def variants(self) -> list[dict[str, Any]]:
+        """Option overrides of extra workload settings (other prompt lengths, batch
+        sizes, texts) whose calls ``capture`` records as *correctness-only* cases:
+        checked by the evaluator, not timed, not weighted. Keep them short (few
+        decode steps); only calls with shapes the main run lacks are kept."""
+        return []
+
+    @contextlib.contextmanager
+    def with_options(self, overrides: dict[str, Any] | None) -> Iterator[None]:
+        """Apply option ``overrides`` (in place, so references to ``self.options``
+        see them) and restore the previous options afterwards."""
+        saved = dict(self.options)
+        self.options.update(overrides or {})
+        try:
+            yield
+        finally:
+            self.options.clear()
+            self.options.update(saved)
 
     def describe(self) -> str:
         opts = ", ".join(f"{k}={v}" for k, v in sorted(self.options.items()))

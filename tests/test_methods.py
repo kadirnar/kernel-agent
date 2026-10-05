@@ -336,17 +336,31 @@ def test_capture_records_forward_step_cases(toy, tmp_path):
     assert info["qualname"] == "model.layers.0.attn"
     assert info["methods"] == {"forward_step": STEPS, "forward": 1}
     assert info["method_instances"] == {"forward_step": LAYERS, "forward": LAYERS}
-    assert [(c["method"], c["count"]) for c in info["cases"]] == [
-        ("forward_step", STEPS),
-        ("forward", 1),
+    # KV-length buckets: first, middle and last decode step, a third of the calls each
+    assert [(c["method"], c["count"], c.get("bucket")) for c in info["cases"]] == [
+        ("forward_step", 2, "first"),
+        ("forward_step", 2, "middle"),
+        ("forward_step", 2, "last"),
+        ("forward", 1, None),
     ]
     # Only the per-layer K/V views are stored, not the whole [2, layers, ...] cache.
-    assert info["bytes"] < 3 * 2**20
+    assert info["bytes"] < 8 * 2**20
     cap = load_capture(tmp_path / "cap.pt", device="cpu")
     assert cap["methods"] == {"forward_step": STEPS, "forward": 1}
     assert cap["method_instances"] == {"forward_step": LAYERS, "forward": LAYERS}
-    step = next(c for c in cap["cases"] if c["method"] == "forward_step")
-    assert step["signature"] == "forward_step: a0[1, 32]:float32"
+    first, middle, last = (c for c in cap["cases"] if c["method"] == "forward_step")
+    assert first["signature"] == f"forward_step: a0[1, 32]:float32 @ decode step 1/{STEPS}"
+    assert last["signature"].endswith(f"@ decode step {STEPS}/{STEPS}")
+    assert [int(c["args"][1]) for c in (first, middle, last)] == [
+        PREFIX,
+        PREFIX + STEPS // 2,
+        PREFIX + STEPS - 1,
+    ]
+    # the last step sees the longest KV cache: every earlier position is filled
+    assert torch.count_nonzero(last["args"][2][0][0, : PREFIX + STEPS - 1].abs().sum(-1)) == (
+        PREFIX + STEPS - 1
+    )
+    step = first
     key_pre, value_pre = step["args"][2]
     key_post, _ = step["post_args"][2]
     assert key_pre.shape == (1, MAX_LEN, D)
@@ -538,8 +552,9 @@ def test_forward_step_capture_and_evaluate_on_gpu(tmp_path):
     assert info["methods"] == {"forward_step": STEPS, "forward": 1}
     result = evaluate(tmp_path / "cap.pt", _candidate(tmp_path, "same"))
     assert result["status"] == "ok" and result["correct"], result
-    step = next(c for c in result["cases"] if c["method"] == "forward_step")
-    assert step["calls_per_run"] == STEPS and step["new_ms"] > 0 and step["ref_ms"] > 0
+    steps = [c for c in result["cases"] if c["method"] == "forward_step"]
+    assert sum(c["calls_per_run"] for c in steps) == STEPS  # first / middle / last bucket
+    assert all(c["new_ms"] > 0 and c["ref_ms"] > 0 for c in steps)
     assert result["speedup"] > 0
     expected = sum(
         c["calls_per_run"] * (c["ref_ms"] - c["new_ms"]) * LAYERS for c in result["cases"]

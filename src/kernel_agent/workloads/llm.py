@@ -17,6 +17,13 @@ PROMPT = (
     "written in domain specific languages that hide the hardware details while still "
     "exposing tiling, memory hierarchy and parallelism to the programmer. "
 )
+#: Held-out prompt (``holdout_options``): other content, the same ``prompt_len``.
+HOLDOUT_PROMPT = (
+    "A lighthouse keeper on a remote island kept a careful log of every storm, every "
+    "passing ship and every change in the colour of the sea. Years later, sailors read "
+    "the notebooks to learn which currents were safe and which harbours offered shelter "
+    "when the weather turned without warning. "
+)
 
 
 class LLMWorkload(Workload):
@@ -64,11 +71,31 @@ class LLMWorkload(Workload):
             "torch.compiles the decode step (mode='reduce-overhead')"
         )
 
+    def _prompt_ids(self, prompt: str) -> torch.Tensor:
+        ids: torch.Tensor = self.tokenizer(
+            prompt, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0]
+        return ids
+
+    def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
+        """Another prompt at the same length; variants ``>= 2`` rotate it by 1..L-1 tokens."""
+        length = max(self._prompt_ids(HOLDOUT_PROMPT).numel(), 2)
+        shift = 0 if variant <= 1 else 1 + (variant - 2) % (length - 1)
+        return {"prompt": HOLDOUT_PROMPT, "prompt_shift": shift}
+
+    def variants(self) -> list[dict[str, Any]]:
+        """A short prompt and a longer batch-2 prompt, a few decode steps each."""
+        return [
+            {"prompt_len": 37, "new_tokens": 4},
+            {"prompt_len": 301, "batch_size": 2, "new_tokens": 4},
+        ]
+
     def make_inputs(self) -> dict[str, torch.Tensor]:
-        ids = self.tokenizer(PROMPT, add_special_tokens=False, return_tensors="pt").input_ids[0]
+        ids = self._prompt_ids(str(self.options.get("prompt") or PROMPT))
         n = int(self.options["prompt_len"])
-        reps = n // max(ids.numel(), 1) + 1
-        ids = ids.repeat(reps)[:n]
+        shift = int(self.options.get("prompt_shift") or 0) % max(ids.numel(), 1)
+        reps = (n + shift) // max(ids.numel(), 1) + 1
+        ids = ids.repeat(reps)[shift : shift + n]
         batch = ids.unsqueeze(0).repeat(int(self.options["batch_size"]), 1).to(self.device)
         return {"input_ids": batch, "attention_mask": torch.ones_like(batch)}
 

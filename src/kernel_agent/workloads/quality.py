@@ -23,6 +23,7 @@ import torch
 from torch import nn
 
 from kernel_agent.kernels.compare import flatten
+from kernel_agent.workloads import holdout
 from kernel_agent.workloads.base import Comparison, Workload
 
 #: Free-running sanity check: RMS energy of every float output within ±25 %.
@@ -252,7 +253,7 @@ def probe_messages(baseline: dict[str, Any]) -> list[str]:
                 f"WARNING: teacher-forcing self-check FAILED ({detail}); every candidate will "
                 "fail end-to-end validation"
             )
-    return messages
+    return messages + holdout.messages(baseline)
 
 
 def _fmt(metrics: dict[str, Any] | None) -> str:
@@ -309,4 +310,5 @@ def summary_section(baseline: dict[str, Any]) -> str:
             lines.append(f"* {tf['note']}")
         if tf.get("error"):
             lines.append(f"* teacher-forcing self-check error: `{tf['error'][-300:]}`")
+    lines += holdout.summary_lines(baseline)
     return "\n".join(lines) + "\n"

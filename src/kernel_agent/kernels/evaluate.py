@@ -236,6 +236,8 @@ def evaluate(
     new_total = 0.0
     for report, case in zip(case_reports, cases, strict=True):
         method = case["method"]
+        if not case["count"]:  # correctness-only case (another workload setting): not timed
+            continue
         try:
             ref_t, new_t = compare_timing(
                 entrypoint(reference, method),
