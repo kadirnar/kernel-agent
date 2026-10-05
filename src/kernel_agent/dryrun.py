@@ -1,10 +1,13 @@
 """``kernel-agent improve --dry-run``: a simulated model, agents and GPU worker.
 
 No GPU and no Claude. The simulated agents write the files a real run has
-(candidates, snapshots, ``NOTES.md`` with open ideas, transforms) and record
-every evaluation through the same code as the evaluation tools
-(``record_candidate``, ``record_e2e_result``), so the ledger, the budget
-advice, the charts, the dashboard and the report are exercised end to end.
+(candidates, snapshots, ``NOTES.md`` with open ideas, transforms, a research
+``plan.md``) and record every evaluation through the same code as the evaluation
+tools (``record_candidate`` with an ``idea_id``, ``record_e2e_result``), so the
+ledger, the budget advice, the research trigger, the charts, the dashboard and
+the report are exercised end to end. The simulated engineer retries an idea
+once after a failed attempt and starts from the plan's directions; the research
+agent writes its plan from the ledger (the outcomes do not depend on either).
 The simulated worker runs the integration's end-to-end measurements, the
 re-profile of a round and the capture of new targets.
 
@@ -43,6 +46,7 @@ from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapsh
 from kernel_agent.budget import Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.kernels.roofline import sol_signal
+from kernel_agent.research import PLAN_FILE
 from kernel_agent.scheduler import class_shares, snapshot_record, systems_rows
 from kernel_agent.workspace import RunDir, read_json, read_jsonl, write_json
 
@@ -423,6 +427,7 @@ class World:
         system_append: str,
         cwd: Path,
         result: AgentResult | None = None,
+        writable: list[Path] | None = None,
         **_: Any,
     ) -> AgentResult:
         result = result or AgentResult(name=name)
@@ -439,8 +444,12 @@ class World:
             evals = self._systems()
             result.cost_usd = 0.3 + 0.5 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("kernel-"):
-            evals = self._kernel(name.removeprefix("kernel-"))
+            evals = self._kernel(name.removeprefix("kernel-"), system_append)
             result.cost_usd = 0.25 + 0.35 * evals * rng.uniform(0.8, 1.2)
+        elif name.startswith("research-"):
+            self._research(name.removeprefix("research-"), writable or [])
+            self.clock.advance(rng.uniform(240, 480))
+            result.cost_usd = 0.6 * rng.uniform(0.8, 1.2)
         result.tool_calls = {"evaluate": evals} if evals else {}
         result.turns = 4 + 5 * evals
         result.seconds = self.clock.now() - start
@@ -465,12 +474,13 @@ class World:
             return True
         return advice == "consider_stopping" and rng.random() < 0.5
 
-    def _kernel(self, target_id: str) -> int:
+    def _kernel(self, target_id: str, system: str = "") -> int:
         target_dir = self.run.target(target_id)
         spec = read_json(target_dir / "spec.json", {}) or {}
         sim = sim_target(spec)
         ref_ms = self.ref_ms(sim.cls) or 10.0
         instances = self.shares.get(sim.cls, (0.0, 1))[1]
+        plan = _plan_directions(system)  # a research plan in the digest comes first
         used = 0
         while True:
             rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
@@ -479,9 +489,8 @@ class World:
             kept = [r for r in rows if r["status"] == ledger.KEEP]
             best = ledger.best_kept(rows)
             backend = sim.backends[(k // 5) % len(sim.backends)]
-            hypothesis = sim.hypotheses[k % len(sim.hypotheses)]
-            if k >= len(sim.hypotheses):
-                hypothesis += f" (variant {k // len(sim.hypotheses) + 1})"
+            idea, hypothesis = _next_idea(sim, rows, plan)
+            expected = best * _rng(self.seed, "expect", target_id, k).uniform(1.05, 1.4)
             outcome = self._kernel_outcome(sim, best, rng)
             self.clock.advance(rng.uniform(150, 330))
             src = target_dir / "candidates" / f"{backend}_v{k + 1}.py"
@@ -501,6 +510,8 @@ class World:
                 parent=f"history/{kept[-1]['snapshot']}" if kept else None,
                 eval_s=round(rng.uniform(25, 70), 1),
                 when=self.clock.now(),
+                idea=idea,
+                expected_speedup=round(expected, 2),
             )
             used += 1
             _note(target_dir / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
@@ -564,6 +575,15 @@ class World:
             results = self.run.results_file()
             if self._advice("systems", results, self.orch.budget.transform_evals, rng):
                 return used
+
+    def _research(self, target_id: str, writable: list[Path]) -> None:
+        """A research session: ``plan.md`` from the target's ledger rows, if it may write it."""
+        plan = self.run.target(target_id) / PLAN_FILE
+        if plan.resolve() not in {p.resolve() for p in writable}:
+            return
+        spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
+        rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
+        plan.write_text(_plan_md(target_id, sim_target(spec), rows))
 
     def _plan(self, cwd: Path) -> dict[str, Any]:
         profile = read_json(cwd / "profile" / "profile.json", {}) or {}
@@ -756,6 +776,117 @@ def _e2e_result(ms: float) -> dict[str, Any]:
         "peak_mem_gb": 2.1,
         "patches": {},
     }
+
+
+def _idea_of(hypothesis: str) -> str:
+    """The simulated engineer's ``idea_id`` of a hypothesis: its first three words."""
+    return ledger.idea_slug(" ".join(hypothesis.split()[:3]))
+
+
+def _base(sim: SimTarget, idea: str, default: str) -> str:
+    return next((h for h in sim.hypotheses if _idea_of(h) == idea), default)
+
+
+def _plan_directions(system: str) -> tuple[int, list[tuple[str, str]]]:
+    """``(exp, [(idea_id, hypothesis)])`` of the research plan in a slice digest: the
+    ranked directions of a plan written after ``exp`` (as :func:`_plan_md` writes them)."""
+    plan = system.split("## Research plan", 1)[1] if "## Research plan" in system else ""
+    after = re.search(r"after exp (\d+)", plan)
+    ranked = plan.split("## Ranked directions", 1)[-1].split("\n## ", 1)[0] if plan else ""
+    found = re.findall(r"^\d+\. `([a-z0-9_-]+)`: (.+)$", ranked, re.M)
+    return (int(after[1]) if after else 0), found
+
+
+def _next_idea(
+    sim: SimTarget, rows: list[dict[str, Any]], plan: tuple[int, list[tuple[str, str]]]
+) -> tuple[str, str]:
+    """``(idea_id, hypothesis)`` of the simulated engineer's next candidate.
+
+    The research plan's directions not tried since it was written come first; then
+    one fix of an idea whose attempt failed (a bug is not evidence against the
+    idea); then the target's ideas in turn, later passes as variants."""
+    after, directions = plan
+    for idea, hypothesis in directions:
+        if not any(r.get("idea") == idea and (r["exp"] or 0) > after for r in rows):
+            return idea, hypothesis
+    last = rows[-1] if rows else None
+    if last and last["status"] in ledger.FAILURES and last.get("idea"):
+        before = rows[-2] if len(rows) > 1 else None
+        if before is None or before.get("idea") != last["idea"]:
+            base = _base(sim, last["idea"], str(last["hypothesis"]))
+            return last["idea"], f"fix of exp {last['exp']} ({last['status']}): {base}"
+    k = len(rows)
+    hypothesis = sim.hypotheses[k % len(sim.hypotheses)]
+    if k >= len(sim.hypotheses):
+        hypothesis += f" (variant {k // len(sim.hypotheses) + 1})"
+    return _idea_of(hypothesis), hypothesis
+
+
+def _plan_md(target_id: str, sim: SimTarget, rows: list[dict[str, Any]]) -> str:
+    """The simulated research agent's ``plan.md``: the pathology checklist applied to the
+    ledger, untried and buggy ideas ranked first, ideas measured slow on the do-not-try list."""
+    stats = ledger.ideas(rows)
+    tried = {s["idea"] for s in stats}
+    keeps = [r for r in rows if r["status"] == ledger.KEEP]
+    best = max(keeps, key=lambda r: r["speedup"] or 0.0, default=None)
+    streak = len(rows) - (rows.index(keeps[-1]) + 1 if keeps else 0)
+    recent = rows[-5:]
+    failed = sum(r["status"] in ledger.FAILURES for r in recent)
+    fresh = [(_idea_of(h), h) for h in sim.hypotheses if _idea_of(h) not in tried]
+    buggy = [s for s in stats if s["verdict"] == "buggy"]
+    slow = [s for s in stats if s["verdict"] == "slow"]
+    repeated = [f"`{s['idea']}` ×{s['tries']}" for s in stats if s["tries"] >= 3]
+    ranked = (
+        fresh[:3]
+        + [(s["idea"], _base(sim, s["idea"], s["last_hypothesis"])) for s in buggy][
+            : max(0, 3 - len(fresh))
+        ]
+    )
+    if not ranked:  # every idea tried and none buggy: the best design, further
+        idea = (best or {}).get("idea") or _idea_of(sim.hypotheses[0])
+        ranked = [(idea, f"{_base(sim, idea, idea)}, tuned for the dominant decode case")]
+    slow = [s for s in slow if s["idea"] not in {idea for idea, _ in ranked}]
+    checks = [
+        f"repetition loop ({', '.join(repeated)})" if repeated else "",
+        f"correctness wall ({failed} of the last {len(recent)} failed)" if failed >= 3 else "",
+        f"missing fundamentals ({len(fresh)} planned ideas never tried)" if fresh else "",
+    ]
+    lines = [
+        f"# Plan: `{target_id}` after exp {rows[-1]['exp'] if rows else 0} (simulated)",
+        "",
+        "## Diagnosis",
+        f"{streak} evaluations without a new best; best "
+        + (f"{best['speedup']:.3f}x (exp {best['exp']})" if best else "none correct")
+        + ". Checklist: "
+        + ("; ".join(c for c in checks if c) or "local minimum of one design")
+        + ".",
+        "",
+        "## Strategy",
+        "**pivot**: the ideas never tried, ahead of more variants of the current design."
+        if fresh
+        else "**targeted fixes**: fix the buggy ideas, then tune the best design.",
+        "",
+        "## Ranked directions",
+        *(f"{i}. `{idea}`: {text}" for i, (idea, text) in enumerate(ranked, 1)),
+        "",
+        "## Retry (failed, not refuted)",
+        *(
+            f"* `{s['idea']}`: {', '.join(s['statuses'])} in exp " + ", ".join(map(str, s["exps"]))
+            for s in buggy
+        ),
+        "",
+        "## Do not try",
+        *(
+            f"* `{s['idea']}`: measured correct and not faster (exp "
+            + ", ".join(map(str, s["exps"]))
+            + f"; best {s['best']:.3f}x)"
+            for s in slow
+        ),
+        "",
+        "## Notes for the engineer",
+        f"Build on `history/{best['snapshot']}`." if best else "Start from the reference.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def _note(path: Path, row: dict[str, Any], ideas: tuple[str, ...] | list[str]) -> None:

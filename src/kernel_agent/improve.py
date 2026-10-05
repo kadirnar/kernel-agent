@@ -4,8 +4,10 @@
 
     until the budget is spent or every arm has stopped:
         pick the arm with the best score            (scheduler.py: Amdahl × UCB, stop rules)
+        it has plateaued: first a clean-context research session that writes its
+            plan.md (research.py; at most one per --research-every slices of the arm)
         run one slice: a fresh agent session with --slice evaluations, seeded with
-            a digest (last ledger rows, best snapshot, NOTES.md, open ideas)
+            a digest (last ledger rows, ideas, best snapshot, plan.md, NOTES.md)
         every --integrate-every kept results: measured re-integration
     every arm stopped: with --rounds > 1 and a real end-to-end gain in this round,
         re-profile the optimised model, re-plan with the prior rounds as context
@@ -17,10 +19,11 @@ Slices go through ``Orchestrator.kernel_slice`` / ``systems_slice`` and so throu
 log apply to every session. Each slice is a new session, so the context of an
 agent never grows beyond its digest.
 
-State: ``improve.json`` in the run directory (slices, integrations, rounds and why
-the loop stopped). Everything else is read from the ledger, so a restart after
-Ctrl-C or a crash continues where the loop stopped; a slice that was running is
-recorded as ``interrupted`` together with the evaluations it made.
+State: ``improve.json`` in the run directory (slices, research sessions,
+integrations, rounds and why the loop stopped). Everything else is read from the
+ledger, so a restart after Ctrl-C or a crash continues where the loop stopped; a
+slice that was running is recorded as ``interrupted`` together with the
+evaluations it made.
 """
 
 from __future__ import annotations
@@ -35,11 +38,22 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import ledger
+from kernel_agent import ledger, research
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
-from kernel_agent.scheduler import KERNEL, SYSTEMS, Arm, Policy, build_arms, pick, snapshot_record
+from kernel_agent.research import rows_table
+from kernel_agent.scheduler import (
+    KERNEL,
+    SYSTEMS,
+    Arm,
+    Policy,
+    build_arms,
+    pick,
+    plateau,
+    rank,
+    snapshot_record,
+)
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 if TYPE_CHECKING:
@@ -65,6 +79,7 @@ class ImproveConfig:
     rounds: int = 1  # 1 = never re-profile / re-plan
     integrate_every: int = 4  # kept results between measured re-integrations
     max_slices: int | None = None  # slices in this invocation (None: until budget / plateau)
+    research_every: int = 3  # slices of a target between its research sessions (0: none)
     policy: Policy = field(default_factory=Policy)
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +96,7 @@ def load_state(run: RunDir) -> dict[str, Any]:
     return {
         "start_exp": len(ledger.rows(run)),  # rows before the first improve slice
         "slices": [],
+        "research": [],
         "integrations": [],
         "rounds": [{"n": 1, "speedup": 1.0}],
     }
@@ -105,21 +121,6 @@ def _tail(text: str, limit: int = NOTES_CHARS) -> str:
         return text
     cut = text[-limit:]
     return "…\n" + cut[cut.find("\n") + 1 :] if "\n" in cut else "…" + cut
-
-
-def _rows_table(rows: list[dict[str, Any]]) -> list[str]:
-    lines = [
-        "| exp | status | speedup | backend | snapshot | hypothesis |",
-        "|---|---|---|---|---|---|",
-    ]
-    for r in rows:
-        speedup = "" if r["speedup"] is None else f"{r['speedup']:.3f}x"
-        hypothesis = str(r["hypothesis"] or "")[:200].replace("|", "/")
-        lines.append(
-            f"| {r['exp']} | {r['status']} | {speedup} | {r['backend']} | {r['snapshot']} "
-            f"| {hypothesis} |"
-        )
-    return lines
 
 
 def _notes(path: Path, what: str) -> list[str]:
@@ -155,7 +156,8 @@ def _footer(notes: str) -> list[str]:
         "## Before you finish",
         f"Update `{notes}`: one line per evaluation (hypothesis → result) and a "
         "`## Open ideas` section with the untried ideas worth testing next, most promising "
-        "first. The next session sees only that file, the ledger and a digest like this one.",
+        "first (with `idea_id`, expected gain and ceiling where you have them). The next "
+        "session sees only that file, the ledger and a digest like this one.",
     ]
 
 
@@ -174,7 +176,11 @@ def kernel_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Polic
     rows = arm.rows[-LAST_ROWS:]
     if rows:
         lines += ["", f"## Last {len(rows)} evaluations (oldest first; `keep` = new best)", ""]
-        lines += _rows_table(rows)
+        lines += rows_table(rows)
+    if stats := research.target_ideas(run, arm.id)[-LAST_ROWS:]:
+        lines += ["", "## Ideas so far (`idea_id`; buggy = never correct: retry, not refuted)", ""]
+        lines += research.ideas_table(stats)
+    lines += research.plan_section(run, arm.id)
     lines += _notes(run.target(arm.id) / "NOTES.md", "NOTES.md")
     lines += [
         "",
@@ -190,11 +196,11 @@ def kernel_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Polic
 def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy) -> str:
     lines = _header(n, evaluations, "`results.jsonl`, `NOTES.md` and `history/`")
     base = (read_json(run.baseline_json, {}) or {}).get("median_ms")
-    lines += ["", "## Best transform so far (alone, end to end)"]
+    lines += ["", "## Best end-to-end configuration so far (transforms, plus kernels if listed)"]
     if arm.best_snapshot and base:
         lines.append(
             f"* `{arm.best_snapshot}`: {float(base) / arm.best:.1f} ms vs the {float(base):.1f} "
-            f"ms baseline ({arm.best:.3f}x)"
+            f"ms baseline ({arm.best:.3f}x); `+<target>` names a kernel it ran on top of"
         )
     else:
         lines.append("* no transform has beaten the baseline yet")
@@ -219,7 +225,7 @@ def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Poli
     rows = arm.rows[-LAST_ROWS:]
     if rows:
         lines += ["", f"## Last {len(rows)} evaluations (oldest first)", ""]
-        lines += _rows_table(rows)
+        lines += rows_table(rows)
     lines += _notes(run.transforms_dir / "NOTES.md", "NOTES.md")
     lines += [
         "",
@@ -285,6 +291,7 @@ class Improver:
             icfg.policy, systems=icfg.policy.systems and orch.cfg.do_transforms
         )
         self.state = load_state(self.run)
+        self.state.setdefault("research", [])  # improve.json from before research sessions
         self.require_capture = require_capture  # dry runs have no captures
         self.live_charts = live_charts
 
@@ -311,7 +318,37 @@ class Improver:
             targets=self.targets(),
             rounds=self.state["rounds"],
             rows=rows,
+            research=self.state["research"],
         )
+
+    def research_due(self, arm: Arm) -> str | None:
+        """Why ``arm`` gets a research session before its next slice, or None.
+
+        It has plateaued (:func:`~kernel_agent.scheduler.plateau`), and its last
+        research session, if any, was at least ``research_every`` of its slices ago
+        and, if it wrote a plan, the plan led to a new best (a plan that did not
+        leaves the plateau standing: the arm stops).
+        """
+        every = self.icfg.research_every
+        why = plateau(arm, self.policy) if every > 0 else None
+        done = [r for r in self.state["research"] if r["arm"] == arm.id]
+        if why is None or not done:
+            return why
+        last = done[-1]
+        if last.get("plan") and arm.best <= float(last.get("best") or 1.0):
+            return None
+        since = sum(
+            s["arm"] == arm.id and s["n"] > last["after_slice"] for s in self.state["slices"]
+        )
+        return why if since >= every else None
+
+    def _pickable(self) -> list[Arm]:
+        """The arms, ranked; an arm stopped by its plateau waits for its research session."""
+        arms = self.arms()
+        for arm in arms:
+            if arm.stop and self.research_due(arm):
+                arm.stop = None
+        return rank(arms, self.policy)
 
     def keeps_since_integration(self) -> int:
         done = self.state["integrations"]
@@ -355,7 +392,7 @@ class Improver:
             if self.icfg.max_slices is not None and done >= self.icfg.max_slices:
                 return f"--max-slices {self.icfg.max_slices} reached"
             await self.orch.seed_library(self.targets())  # library priors before any slice
-            arms = self.arms()
+            arms = self._pickable()
             arm = pick(arms)
             if arm is None:
                 if await self._next_round(arms):
@@ -363,6 +400,9 @@ class Improver:
                 return (
                     "every arm has stopped (" + "; ".join(f"{a.id}: {a.stop}" for a in arms) + ")"
                 )
+            if (why := self.research_due(arm)) is not None:
+                await self._research(arm, why)
+                continue  # its plan restarts the arm's patience; the next slice reads it
             rec = await self._slice(arm, arms)
             done += 1
             failed = failed + 1 if rec["status"] == "failed" else 0
@@ -424,6 +464,7 @@ class Improver:
                     evaluations=evaluations, digest=digest, label=label
                 )
             else:
+                self._restart_advice(arm)
                 digest = kernel_digest(self.run, arm, n, evaluations, self.policy)
                 result = await self.orch.kernel_slice(
                     arm.id, evaluations=evaluations, digest=digest, label=label
@@ -439,6 +480,16 @@ class Improver:
         status = "timed_out" if result.timed_out else "error" if result.is_error else "done"
         self._close(rec, status, usd=result.cost_usd)
         return rec
+
+    def _restart_advice(self, arm: Arm) -> None:
+        """Let the evaluation advice count the arm's plateau from its last research plan,
+        as the scheduler does (else the first evaluation after a plan says stop)."""
+        plans = [r["exp"] for r in self.state["research"] if r["arm"] == arm.id and r.get("plan")]
+        if plans:
+            done = sum((r["exp"] or 0) <= max(plans) for r in arm.rows)
+            self.orch.budget.restarted[arm.agent] = done
+        else:
+            self.orch.budget.restarted.pop(arm.agent, None)
 
     def _close(
         self,
@@ -480,8 +531,75 @@ class Improver:
             f"{rec['best_before']:.2f}x → {best:.2f}x"
         )
 
+    async def _research(self, arm: Arm, why: str) -> dict[str, Any]:
+        """A research session for a plateaued arm (``Orchestrator.research``) and its record.
+
+        ``plan`` in the record: whether the session wrote a new ``plan.md``; only
+        then does the arm's count of evaluations without a new best restart."""
+        n = len(self.state["slices"])
+        plan = research.plan_path(self.run, arm.id)
+        before = plan.read_bytes() if plan.is_file() else None
+        rec: dict[str, Any] = {
+            "n": len(self.state["research"]) + 1,
+            "arm": arm.id,
+            "round": self.round,
+            "after_slice": n,
+            "label": f"research-{arm.id}#{n}",
+            "why": why,
+            "status": "running",
+            "started": _ts(),
+            "exp": len(ledger.rows(self.run)),
+            "best": arm.best,
+        }
+        self.state["research"].append(rec)
+        self.save()
+        log(f"research: {arm.id} has plateaued ({why}); clean-context review of the target")
+        ledger.event(self.run, "research_start", arm=arm.id, why=why, label=rec["label"])
+        usd = None
+        try:
+            result = await self.orch.research(arm.id, reason=why, label=rec["label"])
+            usd = result.cost_usd
+            status = "timed_out" if result.timed_out else "error" if result.is_error else "done"
+        except Exception as exc:  # like a failed slice: the loop goes on without a plan
+            log(f"research: {arm.id}: agent session failed: {exc!r}")
+            rec["error"] = repr(exc)[:500]
+            status = "failed"
+        except BaseException:  # Ctrl-C, cancellation
+            self._close_research(rec, "interrupted", plan=False)
+            raise
+        wrote = plan.is_file() and plan.read_bytes() != before
+        self._close_research(rec, status, plan=wrote, usd=usd)
+        return rec
+
+    def _close_research(
+        self,
+        rec: dict[str, Any],
+        status: str,
+        *,
+        plan: bool,
+        usd: float | None = None,
+        ended: float | None = None,
+    ) -> None:
+        ended = _ts() if ended is None else ended
+        rec.update(
+            status=status,
+            ended=ended,
+            seconds=round(max(ended - rec["started"], 0.0), 1),
+            plan=plan,
+        )
+        if usd is not None:
+            rec["usd"] = round(usd, 4)
+        self.save()
+        ledger.event(self.run, "research_done", arm=rec["arm"], status=status, plan=plan)
+        where = f"targets/{rec['arm']}/{research.PLAN_FILE}"
+        log(f"research: {rec['arm']} {status}; " + (f"plan in {where}" if plan else "no new plan"))
+
     def _recover(self) -> None:
-        """Close slices left ``running`` by a process that did not exit cleanly."""
+        """Close slices and research sessions left ``running`` by a process that did not
+        exit cleanly (an interrupted research session counts as one without a plan)."""
+        for res in self.state["research"]:
+            if res.get("status") == "running":
+                self._close_research(res, "interrupted", plan=False, ended=res["started"])
         for rec in self.state["slices"]:
             if rec.get("status") != "running":
                 continue
@@ -616,6 +734,17 @@ def report_lines(run: RunDir) -> list[str]:
     integrations = state.get("integrations", [])
     if integrations:
         lines += ["", "Re-integrations: " + ", ".join(f"{i['speedup']:.3f}x" for i in integrations)]
+    sessions = state.get("research") or []
+    if sessions:
+        lines += ["", "Research sessions on plateaued targets (`targets/<id>/plan.md`):", ""]
+        for r in sessions:
+            outcome = "wrote a plan" if r.get("plan") else f"no plan ({r.get('status')})"
+            later = [s for s in slices if s["arm"] == r["arm"] and s["n"] > r["after_slice"]]
+            best = max([float(r.get("best") or 1.0), *(s.get("best_after") or 0 for s in later)])
+            lines.append(
+                f"* `{r['arm']}` after slice {r['after_slice']} ({r['why']}): {outcome}; "
+                f"best {float(r.get('best') or 1.0):.3f}x → {best:.3f}x since"
+            )
     return [*lines, ""]
 
 
@@ -682,6 +811,18 @@ def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
                 color=charts._ink_on(charts.KEEP_COLOR),
                 zorder=4,
             )
+    sessions = [r for r in state.get("research") or [] if r["arm"] in lane]
+    for res in sessions:  # research sessions sit between the arm's slices
+        ax.plot(
+            (minutes(res["started"]) + minutes(res.get("ended") or res["started"])) / 2,
+            lane[res["arm"]],
+            marker="D",
+            markersize=6.5,
+            color=charts.INK_2 if res.get("plan") else charts.FAIL_COLOR,
+            markeredgecolor=charts.SURFACE,
+            linestyle="none",
+            zorder=5,
+        )
     for rnd in state.get("rounds", [])[1:]:
         x = minutes(rnd.get("started"))
         ax.axvline(x, color=charts.INK_2, lw=1.2, zorder=2)
@@ -735,6 +876,11 @@ def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
                 label="interrupted, failed or timed out",
             ),
             Line2D([], [], color=charts.PROJECTED_COLOR, ls=(0, (4, 3)), label="re-integration"),
+            *(
+                [Line2D([], [], color=charts.INK_2, marker="D", ls="none", label="research plan")]
+                if sessions
+                else []
+            ),
         ],
     )
 

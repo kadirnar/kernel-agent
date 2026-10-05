@@ -64,3 +64,19 @@ Key facts
 * Errors are raised at trace time with MLIR diagnostics: read them carefully,
   usually a type mismatch (Float32 vs BFloat16) or a non-constexpr value used
   where a compile-time constant is required.
+
+Plan amnesia and false infeasibility
+CuTe DSL converges slower than Triton, and the cause is process: every change
+takes several compile rounds, then several correctness rounds, before it has a
+number. Three failure modes follow:
+* **Plan amnesia**: compile-error churn crowds out the goal. After every fix,
+  re-read the idea in `NOTES.md` (and `plan.md` if there is one) and state the
+  goal in one sentence before the next edit. If you cannot, you have drifted.
+* **Abandoned restructurings**: big changes are expensive, so they get dropped
+  halfway. Keep the last correct candidate, change one tile, layout or atom at
+  a time, and revert to the last good file rather than pressing on through a
+  fourth compile round.
+* **False infeasibility**: an attempt you gave up on is not evidence. Write
+  "abandoned after N compile rounds: <why>", never "X doesn't work", unless X
+  measured correct and slower. A wrongly recorded infeasibility blocks the idea
+  for every later session. Keep its `idea_id` so a later session can retry it.

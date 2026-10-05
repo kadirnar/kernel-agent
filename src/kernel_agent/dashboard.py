@@ -146,7 +146,7 @@ def write_dashboard(run: RunDir) -> Path:
             _x(r["speedup"]),
             _ms(r["new_ms"], 3) if r["target"] != ledger.E2E else _ms(r["new_ms"]),
             _ms(r["est_saved_ms"]),
-            _e(r["hypothesis"]),
+            _e(ledger.labelled(r)),
         ]
         for r in reversed(s["rows"][-30:])
     ]

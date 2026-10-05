@@ -144,6 +144,7 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         rounds=ns.rounds,
         integrate_every=ns.integrate_every,
         max_slices=ns.max_slices,
+        research_every=ns.research_every,
         policy=Policy(
             patience=ns.patience,
             sol_stop=ns.sol_stop or None,
@@ -358,6 +359,13 @@ def main(argv: list[str] | None = None) -> int:
         "--speedup-goal", type=float, default=2.0, help="stop a target at this speedup (0: off)"
     )
     p.add_argument("--max-slices", type=int, help="stop after this many slices")
+    p.add_argument(
+        "--research-every",
+        type=int,
+        default=3,
+        help="research session on a plateaued target at most once per this many of its "
+        "slices (0: never)",
+    )
     p.add_argument(
         "--dry-run", action="store_true", help="simulated agents and GPU (no Claude, no GPU)"
     )

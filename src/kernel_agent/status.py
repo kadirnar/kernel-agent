@@ -150,7 +150,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
                     r["backend"],
                     r["status"],
                     _x(r["speedup"]),
-                    r["hypothesis"] or r["snapshot"] or "",
+                    ledger.labelled(r) or r["snapshot"] or "",
                 ]
                 for r in recent
             ],

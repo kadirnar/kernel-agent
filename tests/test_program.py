@@ -64,8 +64,8 @@ def test_parse_sections():
     assert len(warnings) == 1 and "`## notes for me`" in warnings[0]
     assert "its text is ignored" in warnings[0]
 
-    _, warnings = parse("## kernel, research\nx\n##\ny\n")
-    assert "unknown name research" in warnings[0] and "only kernel receive it" in warnings[0]
+    _, warnings = parse("## kernel, reviewer\nx\n##\ny\n")
+    assert "unknown name reviewer" in warnings[0] and "only kernel receive it" in warnings[0]
     assert "no name" in warnings[1]
     assert parse("") == ({}, [])
     assert parse("no sections at all\n### deeper only\n") == ({}, [])
@@ -79,7 +79,8 @@ def test_role_routing():
         "systems",
         "harness",
     ]
-    assert role_of("research") is None
+    assert role_of("research-rms_norm") == "research"  # plateau reviews of a target
+    assert role_of("reviewer") is None
     sections, _ = parse(TEXT)
     prog = Program(sections, "f" * 64)
     kernel = prog.prompt_note("kernel-t1")
@@ -102,11 +103,14 @@ def test_template_covers_every_role():
     prog = Program.load(program.TEMPLATE)
     assert prog.warnings == () and prog.sha256 == sha(program.TEMPLATE.read_text())
     assert set(prog.sections) == set(program.SECTIONS)
-    for agent in ("planner", "kernel-x", "systems", "harness"):
+    for agent in ("planner", "kernel-x", "systems", "harness", "research-x"):
         note = prog.prompt_note(agent)
         assert "one hypothesis per evaluation" in note  # from `## all`
         assert "Edit this file" not in note  # the preamble is for humans
     assert "Amdahl" in prog.prompt_note("planner") and "Amdahl" not in prog.prompt_note("systems")
+    research = prog.prompt_note("research-x")
+    assert "untested, not refuted" in research and "idea_id" not in prog.prompt_note("systems")
+    assert "`idea_id`" in prog.prompt_note("kernel-x") and "ceiling" in research
 
 
 def test_missing_file(tmp_path):

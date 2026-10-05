@@ -34,10 +34,15 @@ consecutive evaluations without a new best (across slices), ≥ ``sol_stop`` of
 the speed of light, ``target_hours`` spent in its slices, or the module speedup
 ``speedup_goal`` reached. The loop stops when the budget is spent or every arm
 has stopped (:mod:`kernel_agent.improve`).
+
+A kernel arm that has plateaued (:func:`plateau`) gets a research session
+before the patience rule stops it (:mod:`kernel_agent.research`); a plan it
+wrote restarts the arm's count of evaluations without a new best.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -45,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger
-from kernel_agent.budget import PRIOR_HYPOTHESIS, SOL_STOP_PCT, improves
+from kernel_agent.budget import PLATEAU, PRIOR_HYPOTHESIS, SOL_STOP_PCT, improves
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
@@ -53,6 +58,7 @@ SYSTEMS = "systems"  # pseudo-target: the systems agent's slices
 KERNEL = "kernel"
 MIN_FURTHER = 1.1  # without a SOL estimate, assume at least 10 % more is always possible
 IDLE_SLICES = 2  # an arm whose last slices made no evaluation at all is stopped
+FAIL_STREAK = 3  # failed evaluations in a row that call for a research session
 
 
 @dataclass(frozen=True)
@@ -82,7 +88,8 @@ class Arm:
     estimate: float = 2.0
     evals: int = 0
     gain_ms: float = 0.0  # ms per run saved by the arm's kept results
-    streak: int = 0  # evaluations since the last new best
+    streak: int = 0  # evaluations since the last new best (or the last research plan)
+    fails: int = 0  # failed evaluations in a row (since the last research plan)
     stale: int = 0  # slices since the last slice that found a new best
     idle: int = 0  # finished slices in a row without a single evaluation
     hours: float = 0.0  # time spent in this arm's improve slices
@@ -217,16 +224,31 @@ def _improves(row: dict[str, Any], best: float) -> bool:
     return improves(rec, best, ok_key="passed")
 
 
-def _kernel_history(arm: Arm, rows: list[dict[str, Any]]) -> None:
+def _kernel_history(arm: Arm, rows: list[dict[str, Any]], planned: int | None = None) -> None:
     """Best, gain and streak of a kernel target from its ledger rows (``keep`` = new best;
-    the library's prior winners do not extend the streak)."""
-    for row in rows:
+    the library's prior winners do not extend the streak).
+
+    ``planned``: the ledger size when the last research plan of the target was
+    written; the streak and the failures count only the evaluations after it.
+    """
+    prior = [str(r["hypothesis"] or "").startswith(PRIOR_HYPOTHESIS) for r in rows]
+    for row, is_prior in zip(rows, prior, strict=True):
         if row["status"] == ledger.KEEP and row["speedup"]:
             new = float(row["speedup"])
             arm.gain_ms += arm.ref_ms * (1.0 / arm.best - 1.0 / new)
             arm.best, arm.best_snapshot, arm.streak = new, row["snapshot"], 0
-        elif not str(row["hypothesis"] or "").startswith(PRIOR_HYPOTHESIS):
+        elif not is_prior:
             arm.streak += 1
+    recent = [
+        r
+        for r, is_prior in zip(rows, prior, strict=True)
+        if not is_prior and (planned is None or (r["exp"] or 0) > planned)
+    ]
+    arm.streak = min(arm.streak, len(recent))
+    for row in reversed(recent):
+        if row["status"] not in ledger.FAILURES:
+            break
+        arm.fails += 1
 
 
 def e2e_kernels(
@@ -322,8 +344,12 @@ def build_arms(
     targets: list[str] | None = None,
     rounds: list[dict[str, Any]] | None = None,
     rows: list[dict[str, Any]] | None = None,
+    research: list[dict[str, Any]] | None = None,
 ) -> list[Arm]:
-    """Every arm with its history, stop reason and score (live arms first, best first)."""
+    """Every arm with its history, stop reason and score (live arms first, best first).
+
+    ``research``: the research sessions (``improve.json``); one that wrote a plan
+    (``plan``) restarts its arm's streak at its ``exp``."""
     rows = ledger.rows(run) if rows is None else rows
     profiles = _profiles(run, rounds or [])
     base_ms = profiles[-1]["baseline_ms"] if profiles else 0.0
@@ -339,7 +365,8 @@ def build_arms(
             estimate=estimate,
             rows=[r for r in rows if r["target"] == target_id],
         )
-        _kernel_history(arm, arm.rows)
+        plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
+        _kernel_history(arm, arm.rows, max(plans, default=None))
         arm.sol = sol_fraction(snapshot_record(run, target_id, arm.best_snapshot))
         arms.append(arm)
     if policy.systems:
@@ -379,6 +406,24 @@ def stop_reason(arm: Arm, policy: Policy) -> str | None:
         return f"time cap: {arm.hours:.1f} h in its slices (cap {policy.target_hours:g} h)"
     if arm.kind == KERNEL and policy.speedup_goal and arm.best >= policy.speedup_goal:
         return f"speedup goal reached: {arm.best:.2f}x (goal {policy.speedup_goal:g}x)"
+    return None
+
+
+def plateau(arm: Arm, policy: Policy) -> str | None:
+    """Why a kernel arm needs a research session, or None.
+
+    It has plateaued: :data:`~kernel_agent.budget.PLATEAU` evaluations in a row
+    without a new best (the evaluation advice is ``consider_stopping`` then; fewer
+    with a smaller ``patience``), or :data:`FAIL_STREAK` failed ones. And nothing
+    but the plateau stops it (the speed of light, the time cap or the goal do not).
+    """
+    if arm.kind != KERNEL or stop_reason(dataclasses.replace(arm, streak=0), policy):
+        return None
+    limit = min(PLATEAU, policy.patience) if policy.patience else PLATEAU
+    if arm.fails >= FAIL_STREAK:
+        return f"{arm.fails} failed evaluations in a row"
+    if arm.streak >= limit:
+        return f"{arm.streak} evaluations in a row without a new best"
     return None
 
 

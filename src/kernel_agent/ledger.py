@@ -12,6 +12,10 @@ experiment:
 * ``discard`` correct, but not better
 * ``incorrect``, ``build_error``, ``runtime_error``, ``crash``, ``timeout``: failures
 
+Kernel rows carry the ``idea`` the agent tagged the candidate with (``idea_id`` of
+``evaluate_candidate``); :func:`ideas` aggregates a target's rows per idea, so that a
+buggy attempt is not mistaken for a refuted idea.
+
 ``results.jsonl`` (``RunDir.results_file``) keeps the full records; the TSV is the readable
 summary that the charts, ``kernel-agent status`` and ``dashboard.html`` read.
 """
@@ -23,7 +27,7 @@ import re
 import statistics
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +50,7 @@ COLUMNS = (
     "spread",
     "pct_of_sol",
     "eval_s",
+    "idea",
     "hypothesis",
 )
 KEEP = "keep"
@@ -139,6 +144,73 @@ def item_label(item: str) -> str:
     return re.sub(r"^\d+_|_[0-9a-f]{8}$", "", Path(item).stem)
 
 
+# ------------------------------------------------------------------ ideas
+
+
+def idea_slug(value: Any) -> str:
+    """An ``idea_id`` as a short slug: lowercase letters, digits, ``_``, ``-`` ("" if none)."""
+    text = re.sub(r"[^a-z0-9-]+", "_", str(value or "").strip().lower()).strip("_-")
+    return text[:40].strip("_-")
+
+
+def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-idea aggregates of a target's ledger rows (or records), in order of first try.
+
+    Rows without an ``idea`` are skipped. Per idea: ``tries``; ``best``, the best correct
+    speedup; ``kept``, new bests; ``slow``, correct but not a new best; ``bugs``, not
+    correct (wrong results, build or runtime errors, crashes, timeouts), with every
+    ``statuses`` count; ``expected``, the last ``expected_speedup`` given; the
+    ``last_hypothesis``; the ``exps``; and a ``verdict``: ``kept``, ``slow`` (measured
+    correct and never a new best) or ``buggy`` (never correct: untested, not refuted).
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        idea = str(row.get("idea") or "")
+        if not idea:
+            continue
+        agg = out.setdefault(
+            idea,
+            {
+                "idea": idea,
+                "tries": 0,
+                "best": None,
+                "kept": 0,
+                "slow": 0,
+                "bugs": 0,
+                "statuses": {},
+                "expected": None,
+                "last_hypothesis": "",
+                "exps": [],
+            },
+        )
+        status = str(row.get("status") or "")
+        agg["tries"] += 1
+        agg["statuses"][status] = agg["statuses"].get(status, 0) + 1
+        if not row.get("correct"):
+            agg["bugs"] += 1
+        elif status == KEEP:
+            agg["kept"] += 1
+        else:
+            agg["slow"] += 1
+        speedup = _num(row.get("speedup")) if row.get("correct") else None
+        if speedup is not None and (agg["best"] is None or speedup > agg["best"]):
+            agg["best"] = speedup
+        if (expected := _num(row.get("expected_speedup"))) is not None:
+            agg["expected"] = expected
+        agg["last_hypothesis"] = str(row.get("hypothesis") or agg["last_hypothesis"])
+        if row.get("exp") is not None:
+            agg["exps"].append(row["exp"])
+    for agg in out.values():
+        agg["verdict"] = "kept" if agg["kept"] else "slow" if agg["slow"] else "buggy"
+    return list(out.values())
+
+
+def labelled(row: dict[str, Any]) -> str:
+    """``[idea] hypothesis`` of a row; the hypothesis alone for rows without an idea."""
+    hypothesis = str(row.get("hypothesis") or "")
+    return f"[{row['idea']}] {hypothesis}".strip() if row.get("idea") else hypothesis
+
+
 # ------------------------------------------------------------------ the TSV
 
 
@@ -230,6 +302,7 @@ def record_kernel(
     source: str = "",
     eval_s: float | None = None,
     when: float | None = None,
+    idea: str = "",
 ) -> dict[str, Any]:
     """Classify a kernel evaluation against the target's running best and append it."""
     with _lock:
@@ -251,6 +324,7 @@ def record_kernel(
                 "spread": kernel_spread(result),
                 "pct_of_sol": _num(result.get("pct_of_sol")),
                 "eval_s": eval_s if eval_s is not None else _num(result.get("eval_seconds")),
+                "idea": idea,
                 "hypothesis": hypothesis,
             },
         )
@@ -341,6 +415,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
                 "spread": kernel_spread(rec),
                 "pct_of_sol": _num(rec.get("pct_of_sol")),
                 "eval_s": _num(rec.get("eval_seconds")),
+                "idea": rec.get("idea") or "",
                 "hypothesis": rec.get("hypothesis") or "",
             }
             kept.append(row)
@@ -362,6 +437,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
             "est_saved_ms": round(base - new, 3) if base is not None and new is not None else None,
             "spread": e2e_spread(rec),
             "eval_s": None,
+            "idea": "",
             "hypothesis": rec.get("hypothesis") or "",
         }
         kept.append(row)
