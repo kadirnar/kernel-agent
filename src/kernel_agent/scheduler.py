@@ -23,7 +23,9 @@ Expected gain (Amdahl), in ms per run of the whole model::
 * ``stale``: consecutive slices of this arm that found no new best.
 
 A kernel arm's rows are its benchmark evaluations (``ledger.measured``: quick
-checks and duplicates count for nothing) of all its workers (``workers.py``).
+checks and duplicates count for nothing) of all its workers (``workers.py``). The
+integration's re-evaluations are not evaluations either, but replace a snapshot's
+earlier result in the arm's best, as in the ledger's keep bar (``ledger.standing``).
 
 UCB on the observed gain per evaluation (as in KernelBand): ``rate`` is the ms
 per run an arm's kept results saved, divided by its evaluations. Each arm's
@@ -53,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger
-from kernel_agent.budget import PLATEAU, PRIOR_HYPOTHESIS, SOL_STOP_PCT, improves
+from kernel_agent.budget import PLATEAU, PRIOR_HYPOTHESIS, SOL_STOP_PCT, Standing, improves
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
@@ -248,25 +250,38 @@ def _improves(row: dict[str, Any], best: float) -> bool:
     return improves(rec, best, ok_key="passed")
 
 
+def _prior(row: dict[str, Any]) -> bool:
+    return str(row["hypothesis"] or "").startswith(PRIOR_HYPOTHESIS)
+
+
 def _kernel_history(arm: Arm, rows: list[dict[str, Any]], planned: int | None = None) -> None:
     """Best, gain and streak of a kernel target from its ledger rows (``keep`` = new best;
-    the library's prior winners do not extend the streak).
+    the library's prior winners do not extend the streak). A ``re-evaluated`` row is not
+    an evaluation, but replaces its snapshot's earlier result in the best (and the gain)
+    so far (:class:`~kernel_agent.budget.Standing`, the ledger's keep bar).
 
     ``planned``: the ledger size when the last research plan of the target was
     written; the streak and the failures count only the evaluations after it.
     """
-    prior = [str(r["hypothesis"] or "").startswith(PRIOR_HYPOTHESIS) for r in rows]
-    for row, is_prior in zip(rows, prior, strict=True):
-        if row["status"] == ledger.KEEP and row["speedup"]:
-            new = float(row["speedup"])
-            arm.gain_ms += arm.ref_ms * (1.0 / arm.best - 1.0 / new)
-            arm.best, arm.best_snapshot, arm.streak = new, row["snapshot"], 0
-        elif not is_prior:
+    stand = Standing()
+    for row in rows:
+        if row["status"] == ledger.REEVALUATED:
+            stand.replace(row)
+        elif row["status"] in ledger.UNMEASURED:
+            continue
+        elif row["status"] == ledger.KEEP and row["speedup"]:
+            stand.keep(row)
+            arm.streak = 0
+        elif not _prior(row):
             arm.streak += 1
+        if (new := stand.best) != arm.best:
+            arm.gain_ms += arm.ref_ms * (1.0 / arm.best - 1.0 / new)
+            arm.best = new
+    arm.best_snapshot = top["snapshot"] if (top := stand.top) else None
     recent = [
         r
-        for r, is_prior in zip(rows, prior, strict=True)
-        if not is_prior and (planned is None or (r["exp"] or 0) > planned)
+        for r in ledger.measured(rows)
+        if not _prior(r) and (planned is None or (r["exp"] or 0) > planned)
     ]
     arm.streak = min(arm.streak, len(recent))
     for row in reversed(recent):
@@ -381,16 +396,17 @@ def build_arms(
     for target_id in run.target_ids() if targets is None else targets:
         spec = read_json(run.target(target_id) / "spec.json", {}) or {}
         estimate = ledger._num(spec.get("expected_speedup")) or policy.estimate
+        target_rows = [r for r in rows if r["target"] == target_id]
         arm = Arm(
             target_id,
             KERNEL,
             _ref_ms(target_id, spec, profiles) or _region_ref_ms(run, target_id, spec, profiles),
             module_class=spec.get("module_class"),
             estimate=estimate,
-            rows=ledger.measured(r for r in rows if r["target"] == target_id),
+            rows=ledger.measured(target_rows),
         )
         plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
-        _kernel_history(arm, arm.rows, max(plans, default=None))
+        _kernel_history(arm, target_rows, max(plans, default=None))
         arm.sol = sol_fraction(snapshot_record(run, target_id, arm.best_snapshot))
         arms.append(arm)
     if policy.systems:

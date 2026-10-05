@@ -16,13 +16,15 @@ import torch
 from kernel_agent import charts, dryrun, ledger, orchestrator, truth
 from kernel_agent.agent.prompts import EXAMPLES_DIR
 from kernel_agent.agent.tools import best_for_target, record_candidate, snapshot
+from kernel_agent.budget import PLATEAU, Budget, results_streak
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.kernels import recheck
 from kernel_agent.kernels.evaluate import EVALUATOR_SCHEMA, evaluate, evaluator_version
 from kernel_agent.profiling.capture import capture_calls
 from kernel_agent.report import write_report
+from kernel_agent.scheduler import Policy, build_arms, plateau
 from kernel_agent.selftest import RMSNorm, make_rmsnorm_capture
-from kernel_agent.workspace import read_json
+from kernel_agent.workspace import read_json, read_jsonl
 
 HONEST = """import torch
 from torch import nn
@@ -516,6 +518,46 @@ def test_a_stale_record_is_re_evaluated_and_the_kernel_accepted(tmp_path, simula
     assert ledger.best_kept([r for r in ledger.rows(run) if r["target"] == "attn"]) == 18.31
     kernel(run, "attn", 20.0, name="v2")
     assert ledger.rows(run)[-1]["status"] == ledger.KEEP
+
+
+def test_a_re_evaluation_sets_the_bar_of_the_advice_and_the_scheduler(tmp_path, simulated):
+    """#64: once attn_fused's stale 46.89x stands as its re-evaluated 18.31x, the evaluation
+    advice's streak and the scheduler's arm measure against 18.31x, like the ledger: a later
+    20x candidate is a new best (``keep``) and resets the streak."""
+    orch = make(tmp_path)
+    run = orch.run
+    v1 = Path(kernel(run, "attn", 46.89, spread=0.628, version=None).partition("=")[2]).name
+    for i, speedup in enumerate((15.0, 14.0), 2):  # not new bests: 46.89x set the bar
+        kernel(run, "attn", speedup, name=f"v{i}")
+    fakes(orch, {"v1": (18.433, 0.052)}, {"v1": ok(18.31)})
+    orch.worker = worker([])
+    asyncio.run(orch.integrate())
+    results = run.results_file("attn")
+    assert read_jsonl(results)[-1]["reevaluates"]["speedup"] == 46.89
+
+    def attn():
+        return next(a for a in build_arms(run, Policy(), []) if a.id == "attn")
+
+    budget = Budget(run)
+    budget.start_agent("kernel-attn")
+    arm = attn()
+    assert results_streak(results) == arm.streak == 2  # the re-evaluation is not an evaluation
+    assert (arm.best, arm.best_snapshot, arm.evals) == (18.31, v1, 3)
+    assert arm.gain_ms == pytest.approx(arm.ref_ms * (1 - 1 / 18.31))
+    for i, speedup in enumerate((17.0, 18.4), 4):  # 18.4x: within the noise of 18.31x
+        kernel(run, "attn", speedup, name=f"v{i}")
+        advice = budget.feedback("kernel-attn", results, None)
+    assert ledger.rows(run)[-1]["status"] == ledger.DISCARD
+    assert advice["advice"] == "consider_stopping" and advice["budget"]["non_improving"] == PLATEAU
+    assert attn().streak == PLATEAU and plateau(attn(), Policy(speedup_goal=None))
+
+    kernel(run, "attn", 20.0, name="v6")
+    assert ledger.rows(run)[-1]["status"] == ledger.KEEP
+    advice = budget.feedback("kernel-attn", results, None)
+    assert advice["advice"] == "continue" and advice["budget"]["non_improving"] == 0
+    arm = attn()
+    assert (arm.best, arm.streak, arm.evals) == (20.0, 0, 6)
+    assert arm.gain_ms == pytest.approx(arm.ref_ms * (1 - 1 / 20.0))
 
 
 @pytest.mark.parametrize(

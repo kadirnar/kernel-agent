@@ -19,6 +19,7 @@ from kernel_agent.agent.runner import AgentResult
 from kernel_agent.budget import (
     PLATEAU,
     Budget,
+    Standing,
     improves,
     non_improving_streak,
     results_streak,
@@ -49,6 +50,48 @@ def test_non_improving_streak():
     assert improves({"passed": True, "speedup": 1.5}, 1.0, ok_key="passed")
     assert not improves({"passed": True, "speedup": 1.5}, 1.0)  # wrong ok key
     assert non_improving_streak([{"passed": True, "speedup": 1.1}], ok_key="passed") == 0
+
+
+def test_streak_uses_the_standing_records():
+    """attn_fused of the VoxCPM2 run (#64): 46.89x recorded by the evaluator before #6/#7,
+    re-evaluated at 18.1x; a later 20x is a new best, as in the ledger (``keep``)."""
+
+    def rec(speedup, name, **extra):
+        out = {"correct": speedup is not None, "speedup": speedup, "snapshot": f"history/{name}"}
+        return out | {"cases": [{"timing_spread": 0.005}], **extra}
+
+    stale = rec(46.89, "001_v1.py")
+    records = [stale, rec(15.0, "002_v2.py"), rec(None, "003_v3.py")]
+    again = rec(18.1, "001_v1.py", reevaluates={"exp": 1, "speedup": 46.89})
+    assert non_improving_streak([*records, again]) == 2  # the re-evaluation is not the agent's
+    assert non_improving_streak([*records, again, rec(20.0, "004_v4.py")]) == 0
+    assert non_improving_streak([*records, rec(20.0, "004_v4.py")]) == 3  # not re-evaluated
+    assert non_improving_streak([*records, again, rec(18.2, "004_v4.py")]) == 3  # within noise
+
+    stand = Standing()
+    stand.keep(stale)
+    assert stand.best == 46.89 and stand.top is stale
+    stand.replace(again)  # stands instead of the stale record
+    assert stand.rows == [again] and stand.best == 18.1 and stand.top is again
+    stand.replace(rec(None, "001_v1.py", reevaluates={"exp": 4}))  # wrong by the current one
+    assert stand.rows == [] and stand.best == 1.0 and stand.top is None
+    slower = Standing(rows=[rec(0.8, "001_v1.py")])  # never below the reference
+    assert slower.best == 1.0 and slower.top is None
+
+
+def test_feedback_restart_counts_evaluations_only(tmp_path):
+    """A research plan restarts the streak after 3 evaluations; a re-evaluation appended
+    since is not an evaluation of the agent."""
+    run = RunDir.create(tmp_path, "org/m")
+    results = run.target("t") / "results.jsonl"
+    for name, speedup in (("a", 1.5), ("b", 1.2), ("c", 1.1)):
+        append_jsonl(results, {"correct": True, "speedup": speedup, "snapshot": f"history/{name}"})
+    again = {"correct": True, "speedup": 1.45, "snapshot": "history/a", "reevaluates": {"exp": 1}}
+    append_jsonl(results, again)
+    append_jsonl(results, {"correct": True, "speedup": 1.3, "snapshot": "history/d"})
+    budget = Budget(run, restarted={"kernel-t": 3})
+    assert results_streak(results) == 3
+    assert budget.feedback("kernel-t", results, None)["budget"]["non_improving"] == 1
 
 
 def test_feedback_advice(tmp_path):

@@ -367,7 +367,8 @@ correct on the fresh inputs. The re-evaluation runs the current evaluator on the
 verified snapshot and appends its record to the target's `results.jsonl`
 (`reevaluates`: the old `exp`, speedup, version and why), with a `re-evaluated`
 ledger row. From then on it stands in for the old record: in the target's
-ranking, the keep bar of later candidates, the projection, `status` and the
+ranking, the keep bar of later candidates and the count of evaluations without
+a new best (the advice's and the scheduler's), the projection, `status` and the
 report. The re-check is then judged against it. `integration.json` → `recheck` →
 `reevaluated` keeps the old and the new speedup. In the VoxCPM2 run, the
 attention kernel's 46.89× came from the evaluator before the hardening of #6/#7.
@@ -1362,8 +1363,9 @@ value for that column.
   streak uses them (see "Parallel workers, duplicates and quick checks").
   Neither are `re-evaluated` rows, the integration's re-evaluations of stale
   records (see "Independent re-check of winners"). They do replace the
-  snapshot's earlier row as the target's best in `status`, the report, the
-  live dashboard and the projection.
+  snapshot's earlier row in the results that stand: the keep bar, the
+  budget advice's and the scheduler's streaks, and the target's best in
+  `status`, the report, the live dashboard and the projection.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
   there is no custom kernel).

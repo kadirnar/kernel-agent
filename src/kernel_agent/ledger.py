@@ -48,7 +48,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent.budget import improves
+from kernel_agent.budget import Standing, improves
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
 
 COLUMNS = (
@@ -161,23 +161,27 @@ def e2e_spread(result: dict[str, Any]) -> float | None:
     return round((max(times) - min(times)) / median, 4) if median > 0 else None
 
 
+def _standing(rows: Iterable[dict[str, Any]]) -> Standing:
+    stand = Standing()
+    for row in rows:
+        if row["status"] == REEVALUATED:
+            stand.replace(row)
+        elif row["status"] == KEEP:
+            stand.keep(row)
+    return stand
+
+
 def standing(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The results of one target that stand: ``keep`` rows and correct ``re-evaluated``
-    ones, except a snapshot's rows before its last re-evaluation (which stands instead)."""
-    rows = list(rows)
-    last = {r.get("snapshot"): i for i, r in enumerate(rows) if r["status"] == REEVALUATED}
-    return [
-        r
-        for i, r in enumerate(rows)
-        if last.get(r.get("snapshot"), i) <= i
-        and (r["status"] == KEEP or (r["status"] == REEVALUATED and r.get("correct")))
-    ]
+    """The results of one target that stand (:class:`~kernel_agent.budget.Standing`):
+    ``keep`` rows and correct ``re-evaluated`` ones, except a snapshot's rows before its
+    last re-evaluation (which stands instead)."""
+    return _standing(rows).rows
 
 
-def best_kept(rows: list[dict[str, Any]]) -> float:
+def best_kept(rows: Iterable[dict[str, Any]]) -> float:
     """Running best of a target's (or ``e2e``'s) kept rows; 1.0 = reference / baseline. A
     re-evaluated snapshot counts with its re-evaluation (:func:`standing`)."""
-    return max((r["speedup"] for r in standing(rows) if r["speedup"]), default=1.0)
+    return _standing(rows).best
 
 
 def e2e_backend(transforms: list[Any], kernels: list[str]) -> str:
