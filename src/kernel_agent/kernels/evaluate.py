@@ -351,7 +351,8 @@ def run_evaluation(
     quick: bool = False,
 ) -> dict[str, Any]:
     """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``, ``quick``:
-    see :func:`evaluate`; the subprocess checks the bytes it loads)."""
+    see :func:`evaluate`; the subprocess checks the bytes it loads). The result says on
+    which GPU of the pool it ran (``gpu_index``, :mod:`kernel_agent.gpulock`)."""
     cmd = [
         sys.executable,
         "-m",
@@ -373,18 +374,19 @@ def run_evaluation(
         cmd.append("--compile-check")
     if quick:
         cmd.append("--quick")
-    with gpu_lock():
+    with gpu_lock() as gpu:  # reference and candidate run on this GPU, in one process
         ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout, env=child_env()
             )
         except subprocess.TimeoutExpired as exc:
-            return _timeout_result(timeout, exc.stderr)
+            return _timeout_result(timeout, exc.stderr) | {"gpu_index": gpu}
     marker = "@@KA_RESULT@@"
     for line in proc.stdout.splitlines()[::-1]:
         if line.startswith(marker):
             data: dict[str, Any] = json.loads(line[len(marker) :])
+            data["gpu_index"] = gpu
             return data
     tail = (proc.stderr or proc.stdout)[-4000:]
     return {
@@ -392,6 +394,7 @@ def run_evaluation(
         "correct": False,
         "returncode": proc.returncode,
         "error": tail,
+        "gpu_index": gpu,
     }
 
 

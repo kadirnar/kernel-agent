@@ -364,27 +364,34 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def call_worker(run: RunDir, command: str, *args: str, timeout: float = 3600.0) -> dict[str, Any]:
-    """Run a worker command under the GPU lock; returns its JSON result."""
+    """Run a worker command under the GPU lock; returns its JSON result, with the GPU of
+    the pool it ran on (``gpu_index``)."""
     cmd = [sys.executable, "-m", "kernel_agent.worker", command, "--run-dir", str(run.root), *args]
     log = run.root / "logs" / f"worker-{command}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
-    with gpu_lock():
+    with gpu_lock() as gpu:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout, env=child_env()
             )
         except subprocess.TimeoutExpired:
-            return {"status": "timeout", "error": f"worker {command} exceeded {timeout:.0f}s"}
+            return {
+                "status": "timeout",
+                "error": f"worker {command} exceeded {timeout:.0f}s",
+                "gpu_index": gpu,
+            }
     with log.open("a") as fh:
         fh.write(f"$ {' '.join(cmd)}\n{proc.stdout[-20000:]}\n{proc.stderr[-20000:]}\n")
     for line in proc.stdout.splitlines()[::-1]:
         if line.startswith(MARKER):
             data: dict[str, Any] = json.loads(line[len(MARKER) :])
+            data["gpu_index"] = gpu
             return data
     return {
         "status": "crash",
         "returncode": proc.returncode,
         "error": (proc.stderr or proc.stdout)[-6000:],
+        "gpu_index": gpu,
     }
 
 
