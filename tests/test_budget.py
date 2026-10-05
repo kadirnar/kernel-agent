@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
+from ab_fake import with_ab
 from claude_agent_sdk import ClaudeAgentOptions
 
 from kernel_agent import cli, orchestrator
@@ -218,7 +219,7 @@ def make_orchestrator(tmp_path, monkeypatch, calls, *, sleep=0.0, costs=None, **
         e2e.append(args)
         return {"status": "ok", "passed": True, "median_ms": 8.0, "speedup": 1.25}
 
-    monkeypatch.setattr(orchestrator, "call_worker", fake_worker)
+    monkeypatch.setattr(orchestrator, "call_worker", with_ab(fake_worker, base_ms=10.0))
     return orchestrator.Orchestrator(run, cfg), e2e
 
 

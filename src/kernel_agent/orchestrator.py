@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import (
+    abtest,
     hub,
     ledger,
     library,
@@ -29,6 +30,7 @@ from kernel_agent import (
     research,
     scheduler,
     strong_baseline,
+    telemetry,
     toolchain,
     truth,
     workers,
@@ -606,9 +608,23 @@ class Orchestrator:
         unless the best combination the systems agent measured (its transforms
         on top of kernels, ``integration.json`` ``composite``) is faster again
         now: then that combination seeds it as a whole.
-        ``reuse`` (re-integrations of the improve loop) takes combinations of the
-        same snapshot files that the previous integration measured from
-        ``integration.json`` instead of measuring them again.
+
+        Every measurement is a paired A/B (``abtest.py``): A and B alternate in
+        one process (``worker e2e_ab``). An item alone is B against the
+        unmodified model (a candidate when it passes the quality checks and its
+        gain is positive; ordered by that gain). B is accepted when it passes
+        the quality checks, wins at least ``ab_min_win_rate`` of the rounds and
+        the 95 % CI of its gain is above ``ab_min_gain``: the seed (the first
+        candidate accepted against the unmodified model, or the combination
+        against the best single item), then each step B = the accepted set A +
+        the next candidate. Sets that cannot be undone in-process are measured in
+        two processes back to back instead (``abtest.SEPARATE_ITERS`` runs each,
+        A measured again). ``integration.json`` keeps each step's ``ab`` record
+        and the ``projection`` (baseline − Σ est. saved ms) of every accepted set.
+
+        ``reuse`` (re-integrations of the improve loop) takes the measurements
+        of the same snapshot files (the same A and B for an A/B) from the
+        previous ``integration.json`` instead of measuring them again.
 
         Everything comes from the verified truth (``truth.py``): the baseline
         latency the orchestrator recorded, records and snapshots whose digests
@@ -625,85 +641,109 @@ class Orchestrator:
         history: list[dict[str, Any]] = []
         integration = self.run.root / "integration.json"
         previous = self.truth.load_json(integration) if reuse else {}
-        measured = {tuple(h["items"]): h for h in (previous or {}).get("history", [])}
+        known = (previous or {}).get("history", [])
+        paired = {_ab_key(h): h for h in known if h.get("ab")}
+        # items whose state cannot be undone in-process (snapshot paths: content-addressed)
+        irreversible = set((previous or {}).get("irreversible") or [])
 
-        def e2e(combo: list[tuple[str, str]], note: str = "") -> dict[str, Any]:
-            if (known := measured.get(tuple(a for _, a in combo))) is not None:
-                history.append(known)
-                return known
-            cli = ["--warmup", "2", "--iters", "5"]
-            for kind, arg in combo:
-                cli += ["--kernel" if kind == "kernel" else "--transform", arg]
-            start = time.perf_counter()
-            r = self._worker("e2e", *cli, *self.truth.worker_args())
-            history.append({"items": [a for _, a in combo], **_short(r)})
-            names = [ledger.item_label(a) for _, a in combo]
-            ledger.record_e2e(
-                self.run,
-                r,
-                backend="integrate",
-                snapshot="+".join(names),
-                hypothesis="integration: "
-                + " + ".join(names)
-                + (" alone" if len(names) == 1 else note),
-                eval_s=round(time.perf_counter() - start, 1),
-            )
+        def ab(
+            a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = ""
+        ) -> dict[str, Any]:
+            """B's result with its ``ab`` record (decided) against A."""
+            a_items = [x for _, x in a]
+            hit = paired.get((tuple(a_items), tuple(x for _, x in b)))
+            r = dict(hit) if hit is not None else self._paired(a, b, note, irreversible)
+            record = {**(r.get("ab") or {}), "a_items": a_items}
+            if record.get("a_ms") and record.get("b_ms"):
+                record = abtest.judge(
+                    record, min_win_rate=self.cfg.ab_min_win_rate, min_gain=self.cfg.ab_min_gain
+                )
+            else:  # B failed before any timed round
+                why = record.get("why") or r.get("reason") or r.get("status")
+                record.update(accepted=False, why=why)
+            r["ab"] = record
+            history.append({"items": [x for _, x in b], **_short(r), "ab": record})
             return r
 
         singles: list[tuple[tuple[str, str], dict[str, Any]]] = []
-        for item in items:
-            r = e2e([item])
-            if r.get("passed") and r["median_ms"] < base_ms:
+        for item in items:  # against the unmodified model of the same session
+            r = ab([], [item])
+            if r.get("passed") and float(r["ab"].get("gain") or 0.0) > 0.0:
                 singles.append((item, r))
-                log(f"integrate: alone {Path(item[1]).name}: {r['median_ms']:.1f} ms")
+                log(
+                    f"integrate: alone {Path(item[1]).name}: {r['median_ms']:.1f} ms "
+                    f"({abtest.describe(r['ab'])})"
+                )
             else:
-                log(f"integrate: drop {Path(item[1]).name} ({r.get('reason') or r.get('status')})")
-        singles.sort(key=lambda s: s[1]["median_ms"])
+                reason = r.get("reason") or r.get("status")
+                if r.get("passed"):
+                    reason = f"not faster than the baseline: {abtest.describe(r['ab'])}"
+                log(f"integrate: drop {Path(item[1]).name} ({reason})")
+        singles.sort(key=lambda s: -float(s[1]["ab"]["gain"]))
 
         accepted: list[tuple[str, str]] = []
         final: dict[str, Any] | None = None
         seed: dict[str, Any] | None = None
+        sets: list[tuple[list[tuple[str, str]], dict[str, Any]]] = []  # each accepted set
         if composite is not None:  # measured again, like everything else
             combo, rec = composite
-            r = e2e(combo, f" (the combination of exp {rec.get('exp')})")
-            best_ms = singles[0][1]["median_ms"] if singles else base_ms
-            seeded = bool(r.get("passed")) and r["median_ms"] < best_ms
+            best = [singles[0][0]] if singles else []
+            r = ab(best, combo, f" (the combination of exp {rec.get('exp')})")
+            seeded = bool(r.get("passed")) and r["ab"]["accepted"]
             seed = {"items": [a for _, a in combo], "exp": rec.get("exp"), "seeded": seeded}
             names = " + ".join(ledger.item_label(a) for _, a in combo)
             if seeded:
                 accepted, final = list(combo), r
-                log(f"integrate: seed {names} (exp {rec.get('exp')}): {r['median_ms']:.1f} ms")
+                log(
+                    f"integrate: seed {names} (exp {rec.get('exp')}): {r['median_ms']:.1f} ms "
+                    f"({abtest.describe(r['ab'])})"
+                )
             else:
                 reason = r.get("reason") or r.get("status")
                 if r.get("passed"):
-                    reason = f"{r['median_ms']:.1f} ms, not faster than {best_ms:.1f} ms"
+                    than = ledger.item_label(best[0][1]) if best else "the baseline"
+                    reason = f"not faster than {than}: {abtest.describe(r['ab'])}; {r['ab']['why']}"
                 log(f"integrate: no seed {names} (exp {rec.get('exp')}): {reason}")
-        if final is None and singles:
-            accepted, final = [singles[0][0]], singles[0][1]
+        if final is None and singles:  # the fastest item that passes the rule on its own
+            first = next(((i, r) for i, r in singles if r["ab"]["accepted"]), None)
+            if first is not None:
+                accepted, final = [first[0]], first[1]
+            else:
+                log("integrate: no item alone passes the A/B rule against the unmodified model")
+        if final is not None:
+            sets.append((list(accepted), final))
         for item, _ in singles:
             if final is None or item in accepted:  # part of the seed
                 continue
             if any(_item_key(item) == _item_key(a) for a in accepted):
                 log(f"integrate: = {Path(item[1]).name} (a version of it is accepted)")
                 continue
-            r = e2e([*accepted, item])
-            if r.get("passed") and r["median_ms"] < final["median_ms"] * 0.99:
+            r = ab(accepted, [*accepted, item])
+            if r.get("passed") and r["ab"]["accepted"]:
                 accepted.append(item)
                 final = r
-                log(f"integrate: + {Path(item[1]).name} -> {r['median_ms']:.1f} ms")
+                sets.append((list(accepted), r))
+                log(
+                    f"integrate: + {Path(item[1]).name} -> {r['median_ms']:.1f} ms "
+                    f"({abtest.describe(r['ab'])})"
+                )
             else:
                 reason = r.get("reason") or r.get("status")
                 if r.get("passed"):
-                    reason = f"no gain ({r['median_ms']:.1f} ms)"
+                    reason = f"no significant gain: {abtest.describe(r['ab'])}; {r['ab']['why']}"
                 log(f"integrate: - {Path(item[1]).name} ({reason})")
+        projection = self._projection(base_ms, sets, history)
         result = {
             "baseline_ms": base_ms,
             "accepted": [{"kind": k, "item": a} for k, a in accepted],
             "final": final,
             "history": history,
+            "projection": projection,
         }
         if seed is not None:
             result["composite"] = seed
+        if irreversible:
+            result["irreversible"] = sorted(irreversible)
         baseline = self.truth.load_json(self.run.baseline_json)  # its compiled_ms
         reference = self._with_reference(baseline, accepted, previous or {})
         if reference is not None:
@@ -714,14 +754,123 @@ class Orchestrator:
         self._library_store([a for k, a in accepted if k == "kernel"], final)
         if final:
             _, vs_compiled = strong_baseline.speedups(baseline, final["median_ms"])
+            projected = projection[-1]["projected_ms"]
             log(
                 f"integrate: final {final['median_ms']:.1f} ms vs {base_ms:.1f} ms "
                 f"= {final['speedup']}x"
                 + (f" ({vs_compiled:.2f}x vs compiled)" if vs_compiled else "")
+                + f"; projected {projected:.1f} ms"
             )
         else:
             log("integrate: no optimisation survived end-to-end validation")
         self._mark("integrate", speedup=final["speedup"] if final else 1.0)
+
+    def _integration_call(
+        self, command: str, combo: list[tuple[str, str]], cli: list[str], note: str
+    ) -> dict[str, Any]:
+        """One integration measurement (``e2e`` / ``e2e_ab`` of ``combo``) and its ledger row
+        (none when an A/B could not run in-process: nothing was measured)."""
+        start = time.perf_counter()
+        r = self._worker(command, *cli, *self.truth.worker_args())
+        if command == "e2e_ab" and r.get("status") in abtest.FALLBACK:
+            return r
+        names = [ledger.item_label(a) for _, a in combo] or ["baseline"]
+        ledger.record_e2e(
+            self.run,
+            r,
+            backend="integrate",
+            snapshot="+".join(names),
+            hypothesis="integration: "
+            + " + ".join(names)
+            + (" alone" if len(names) == 1 and not note else note),
+            eval_s=round(time.perf_counter() - start, 1),
+        )
+        gpu = r.get("gpu") or (r.get("ab") or {}).get("gpu")
+        if message := telemetry.warning(gpu):
+            log(f"integrate: WARNING {message}")
+        return r
+
+    def _paired(
+        self, a: list[tuple[str, str]], b: list[tuple[str, str]], note: str, irreversible: set[str]
+    ) -> dict[str, Any]:
+        """B's result with an ``ab`` record of its timings against A: from one process
+        (``e2e_ab``), or from two back to back when a state cannot be undone in-process
+        (``irreversible`` collects such items)."""
+        why = "an item cannot be undone in-process"
+        if not irreversible.intersection(x for _, x in [*a, *b]):
+            cli = [*_cli(a, warmup=2), *_cli(b, prefix="--b-")]
+            cli += ["--rounds", str(self.cfg.ab_rounds)]
+            r = self._integration_call("e2e_ab", b, cli, note)
+            if r.get("status") not in abtest.FALLBACK:
+                return r
+            irreversible.update(r.get("irreversible") or [])
+            why = str(r.get("reason") or r.get("status"))
+            log(f"integrate: no in-process A/B ({why[:300]}); separate processes")
+        iters = abtest.SEPARATE_ITERS
+        ra = self._integration_call(
+            "e2e", a, _cli(a, iters=iters), " (A of an A/B in separate processes)"
+        )
+        rb = self._integration_call("e2e", b, _cli(b, iters=iters), note)
+        rb["ab"] = {
+            "mode": "separate",
+            "a_ms": ra.get("times_ms") or [],
+            "b_ms": rb.get("times_ms") or [],
+            "fallback": why,
+        }
+        if not ra.get("times_ms"):
+            rb["ab"]["why"] = f"A measured again: {ra.get('reason') or ra.get('status')}"
+        return rb
+
+    def _projection(
+        self,
+        base_ms: float,
+        sets: list[tuple[list[tuple[str, str]], dict[str, Any]]],
+        history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Projected (baseline − Σ est. saved ms of its items) vs measured latency of every
+        accepted set: a kernel's saving is its module-level estimate, a transform's its
+        measured gain alone (paired against the unmodified model)."""
+        alone = {
+            h["items"][0]: base_ms * float(h["ab"]["gain"])
+            for h in history
+            if len(h["items"]) == 1
+            and not (h.get("ab") or {}).get("a_items")
+            and h.get("passed")
+            and (h.get("ab") or {}).get("gain") is not None
+        }
+        out = []
+        for combo, r in sets:
+            saved: dict[str, float | None] = {}
+            for kind, arg in combo:
+                est = None
+                if kind == "kernel":
+                    target_id, _, path = arg.partition("=")
+                    est = self._kernel_saving(target_id, Path(path).name)
+                elif arg in alone:
+                    est = alone[arg]
+                saved[arg] = None if est is None else round(est, 3)
+            known = [v for v in saved.values() if v is not None]
+            out.append(
+                {
+                    "items": [a for _, a in combo],
+                    "projected_ms": round(base_ms - sum(known), 3),
+                    "measured_ms": r.get("median_ms"),
+                    "est_saved_ms": saved,
+                }
+            )
+        return out
+
+    def _kernel_saving(self, target_id: str, snapshot: str) -> float | None:
+        """``est_saved_ms_per_run`` of the verified evaluation of a kernel snapshot."""
+        try:
+            records = self.truth.records(self.run.results_file(target_id))
+        except truth.TamperError:
+            return None
+        for rec in records:
+            if Path(str(rec.get("snapshot", ""))).name == snapshot:
+                est = rec.get("est_saved_ms_per_run")
+                return float(est) if est is not None else None
+        return None
 
     def _integration_items(self) -> tuple[list[tuple[str, str]], dict[str, str | None]]:
         """Kernel winners + the best transform per idea, and their snapshots' sha256.
@@ -1143,6 +1292,22 @@ def _why(result: dict[str, Any]) -> str:
     """The error of a failed step, else its first failing cases."""
     failed = [c for c in result.get("cases") or [] if not c.get("ok")]
     return str(result.get("error") or json.dumps(failed[:2], default=str))
+
+
+def _cli(
+    combo: list[tuple[str, str]], *, prefix: str = "--", warmup: int | None = 2, iters: int = 0
+) -> list[str]:
+    """Worker flags applying ``combo`` (``prefix`` ``--b-``: state B of ``e2e_ab``)."""
+    cli = ["--warmup", str(warmup)] if warmup is not None and prefix == "--" else []
+    cli += ["--iters", str(iters)] if iters else []
+    for kind, arg in combo:
+        cli += [f"{prefix}{kind}", arg]
+    return cli
+
+
+def _ab_key(h: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(A items, B items) of an A/B history entry: what a re-integration may reuse."""
+    return tuple(h["ab"].get("a_items") or []), tuple(h["items"])
 
 
 def _short(r: dict[str, Any]) -> dict[str, Any]:

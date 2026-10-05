@@ -11,6 +11,7 @@ from typing import Any
 
 from torch import nn
 
+from kernel_agent.integrate.undo import Undo, declared, record
 from kernel_agent.kernels.evaluate import load_candidate_module
 from kernel_agent.phases import PHASES, route
 from kernel_agent.profiling.methods import entrypoints_of
@@ -57,7 +58,11 @@ def _set_child(root: nn.Module, qualname: str, new: nn.Module) -> None:
 
 
 def apply_kernels(
-    roots: dict[str, nn.Module], patches: list[KernelPatch], report: PatchReport | None = None
+    roots: dict[str, nn.Module],
+    patches: list[KernelPatch],
+    report: PatchReport | None = None,
+    *,
+    handles: list[Undo] | None = None,
 ) -> PatchReport:
     """Replace every instance of each patch's module class with ``build(instance)``.
 
@@ -70,8 +75,16 @@ def apply_kernels(
     model would call it and either crash or silently bypass the kernel.
 
     The rewrites of region targets' parents come first, so their kernels (and
-    the kernels of classes the region modules contain) find the new modules."""
+    the kernels of classes the region modules contain) find the new modules.
+
+    ``handles``: append an :class:`~kernel_agent.integrate.undo.Undo` handle that
+    restores the original modules (rewritten parents included), also when this fails."""
     report = report or PatchReport()
+    if handles is not None:
+        label = "kernels " + ", ".join(p.target_id for p in patches)
+        with record(label, roots) as handle:
+            handles.append(handle)
+            return apply_kernels(roots, patches, report)
     report.rewritten.update(apply_rewrites(roots, [p.rewrite for p in patches if p.rewrite]))
     for patch in patches:
         module = load_candidate_module(patch.candidate)
@@ -135,8 +148,20 @@ def load_transform(path: Path) -> Any:
     return module
 
 
-def apply_transforms(workload: Any, paths: list[Path], report: PatchReport) -> PatchReport:
+def apply_transforms(
+    workload: Any, paths: list[Path], report: PatchReport, *, handles: list[Undo] | None = None
+) -> PatchReport:
+    """Apply each transform file's ``apply(workload)``. ``handles``: append one
+    :class:`~kernel_agent.integrate.undo.Undo` handle per transform (its optional
+    ``undo`` declaration decides how it is undone)."""
     for path in paths:
-        load_transform(path).apply(workload)
+        module = load_transform(path)
+        if handles is None:
+            module.apply(workload)
+        else:
+            with record(f"transform {path.stem}", workload.roots(), workload) as handle:
+                handles.append(handle)
+                declared(handle, module, workload)
+                module.apply(workload)
         report.transforms.append(path.stem)
     return report

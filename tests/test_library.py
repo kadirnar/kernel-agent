@@ -12,6 +12,7 @@ import shutil
 from types import SimpleNamespace
 
 import pytest
+from ab_fake import with_ab
 
 from kernel_agent import budget, charts, cli, dryrun, ledger, library, orchestrator, scheduler
 from kernel_agent.agent.runner import AgentResult
@@ -97,7 +98,7 @@ def fake_worker(gains):
             ms /= gains.get(item.partition("=")[0], 1.0)
         return dryrun._e2e_result(ms)
 
-    return worker
+    return with_ab(worker, BASE)
 
 
 def fake_evaluator(monkeypatch, outcome=1.4, pct=None):

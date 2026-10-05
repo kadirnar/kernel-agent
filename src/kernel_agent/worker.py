@@ -5,6 +5,8 @@ orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
     python -m kernel_agent.worker capture --run-dir R --target ID [--parent]
     python -m kernel_agent.worker e2e     --run-dir R [--kernel ID=PATH ...] [--transform PATH ...]
                                           [--baseline-ms MS] [--verify REL=SHA256 ...]
+    python -m kernel_agent.worker e2e_ab  --run-dir R [A: --kernel ... --transform ...]
+                                          [B: --b-kernel ... --b-transform ...] [--rounds K]
 """
 
 from __future__ import annotations
@@ -239,20 +241,12 @@ def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> 
 
 
 def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
-    import torch
-
     from kernel_agent.integrate.patcher import PatchReport, apply_kernels, apply_transforms
-    from kernel_agent.workloads import holdout
+    from kernel_agent.telemetry import Monitor
     from kernel_agent.workloads.base import measure
-    from kernel_agent.workloads.quality import assess, is_chaotic
 
-    # The baseline outputs and baseline.json, checked against the digests the
-    # orchestrator holds (--verify) before anything runs; read once, used later.
-    expected = dict(item.partition("=")[::2] for item in ns.verify or [])
     try:
-        reference_bytes = _truth_bytes(run, run.baseline_output(), expected)
-        baseline_bytes = _truth_bytes(run, run.baseline_json, expected, required=False)
-        holdout_bytes = _truth_bytes(run, run.baseline_output_holdout(), expected, required=False)
+        truth_files = _truth_files(run, ns)
     except truth.TamperError as exc:
         return {"status": "tampered", "passed": False, "error": str(exc)}
     workload = _workload(run)
@@ -262,9 +256,11 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         apply_kernels(workload.roots(), patches, report)
         apply_transforms(workload, [Path(p) for p in ns.transform or []], report)
     except Exception:
-        return {"status": "patch_error", "passed": False, "error": traceback.format_exc()[-4000:]}
+        return {"status": "patch_error", "passed": False, "error": _tb()}
 
     inputs = workload.make_inputs()
+    monitor = Monitor()  # GPU clocks / temperature / power before and after the timing
+    monitor.sample("before")
     try:
         timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     except Exception:
@@ -272,9 +268,52 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             "status": "runtime_error",
             "passed": False,
             "patches": report.__dict__,
-            "error": traceback.format_exc()[-4000:],
+            "error": _tb(),
         }
+    monitor.sample("after")
     output = timing.pop("output")
+    base_ms, verdict = _judge(ns, workload, inputs, output, timing["median_ms"], truth_files)
+    if verdict["status"] != "ok":
+        return {**verdict, "median_ms": round(timing["median_ms"], 3), "patches": report.__dict__}
+    return {
+        **verdict,
+        "median_ms": round(timing["median_ms"], 3),
+        "times_ms": [round(t, 3) for t in timing["times_ms"]],
+        "baseline_ms": round(base_ms, 3),
+        "speedup": round(base_ms / timing["median_ms"], 4),
+        "peak_mem_gb": round(timing["peak_mem_gb"], 3),
+        "patches": report.__dict__,
+        **({"gpu": gpu} if (gpu := monitor.summary()) else {}),
+    }
+
+
+def _truth_files(run: RunDir, ns: argparse.Namespace) -> tuple[bytes, bytes, bytes]:
+    """The baseline output, baseline.json and the held-out baseline output, checked against
+    the digests the orchestrator holds (``--verify``) before anything runs; read once."""
+    expected = dict(item.partition("=")[::2] for item in ns.verify or [])
+    return (
+        _truth_bytes(run, run.baseline_output(), expected),
+        _truth_bytes(run, run.baseline_json, expected, required=False),
+        _truth_bytes(run, run.baseline_output_holdout(), expected, required=False),
+    )
+
+
+def _judge(
+    ns: argparse.Namespace,
+    workload: Any,
+    inputs: Any,
+    output: Any,
+    median_ms: float,
+    truth_files: tuple[bytes, bytes, bytes],
+) -> tuple[float, dict[str, Any]]:
+    """(baseline ms, quality verdict) of a timed candidate output: ``status`` ok with
+    ``passed`` / ``reason`` / ``metrics``, or ``runtime_error`` when a check crashed."""
+    import torch
+
+    from kernel_agent.workloads import holdout
+    from kernel_agent.workloads.quality import assess, is_chaotic
+
+    reference_bytes, baseline_bytes, holdout_bytes = truth_files
     reference = torch.load(io.BytesIO(reference_bytes), weights_only=False)
     baseline = json.loads(baseline_bytes or b"{}")
     # the orchestrator's baseline latency (--baseline-ms), not what baseline.json says now
@@ -284,13 +323,11 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     try:
         verdict = assess(workload, inputs, reference, output, chaotic=chaotic)
     except Exception as exc:
-        return {
+        return base_ms, {
             "status": "runtime_error",
             "passed": False,
             "reason": f"quality check failed: {exc}"[:500],
-            "median_ms": round(timing["median_ms"], 3),
-            "patches": report.__dict__,
-            "error": traceback.format_exc()[-4000:],
+            "error": _tb(),
         }
     # Held-out input (untimed) + memoisation probe; failures are verdicts, not errors.
     held = holdout.check(
@@ -298,23 +335,127 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         torch.load(io.BytesIO(holdout_bytes), weights_only=False) if holdout_bytes else None,
         reference,
         main_output=output,
-        main_ms=timing["median_ms"],
+        main_ms=median_ms,
         baseline=baseline,
         chaotic=chaotic,
     )
     reasons = [verdict["reason"], held["reason"] and f"held-out input: {held['reason']}"]
-    return {
+    return base_ms, {
         "status": "ok",
         "passed": verdict["passed"] and held["passed"],
         "reason": "; ".join(r for r in reasons if r),
         "metrics": {**verdict["metrics"], "holdout": held},
-        "median_ms": round(timing["median_ms"], 3),
-        "times_ms": [round(t, 3) for t in timing["times_ms"]],
-        "baseline_ms": round(base_ms, 3),
-        "speedup": round(base_ms / timing["median_ms"], 4),
-        "peak_mem_gb": round(timing["peak_mem_gb"], 3),
-        "patches": report.__dict__,
     }
+
+
+def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    """Paired A/B (``abtest.py``): the model loaded once, A (``--kernel`` / ``--transform``)
+    and B (``--b-kernel`` / ``--b-transform``) built on it with undo handles
+    (``integrate/ab.py``), warmed up, then alternated for ``--rounds`` timed rounds; B's
+    quality is checked once, as in ``e2e``. Status ``irreversible`` / ``undo_failed``:
+    the states cannot be switched in-process, measure them in separate processes."""
+    import torch
+
+    from kernel_agent import abtest, telemetry
+    from kernel_agent.integrate import ab, undo
+
+    try:
+        truth_files = _truth_files(run, ns)
+    except truth.TamperError as exc:
+        return {"status": "tampered", "passed": False, "error": str(exc)}
+    a_kernels, a_transforms = ns.kernel or [], ns.transform or []
+    b_kernels, b_transforms = ns.b_kernel or [], ns.b_transform or []
+    declared = [t for t in [*a_transforms, *b_transforms] if undo.declaration(Path(t)) is False]
+    if declared:
+        return _irreversible([([t], "it declares undo = False") for t in dict.fromkeys(declared)])
+    workload = _workload(run)
+    session = ab.Session(workload, lambda items: _kernel_patches(run, items))
+    inputs = workload.make_inputs()
+    monitor = telemetry.Monitor()
+    if torch.cuda.is_available():
+        from kernel_agent.kernels.bench import warm_gpu
+
+        torch.cuda.reset_peak_memory_stats()
+        warm_gpu(500.0)  # the same clock warm-up as `e2e`
+    reference: dict[str, Any] = {}
+    reproducible: dict[str, bool] = {}
+    try:
+        a = session.build("A", a_kernels, a_transforms)
+        if bad := a.irreversible(keep=session.shareable(a, b_kernels)):
+            return _irreversible(bad)
+        reference["A"], reproducible["A"] = ab.warm(session, a, inputs, ns.warmup + 1)
+    except Exception:
+        why = "the accepted set A failed in-process"
+        return {"status": "undo_failed", "passed": False, "reason": why, "error": _tb()}
+    try:
+        b = session.build("B", b_kernels, b_transforms, on=a)
+    except Exception:  # its own items, or A's applied again: the separate processes tell
+        why = "B failed to apply in-process"
+        return {"status": "undo_failed", "passed": False, "reason": why, "error": _tb()}
+    if bad := b.irreversible():
+        return _irreversible(bad)
+    try:
+        reference["B"], reproducible["B"] = ab.warm(session, b, inputs, ns.warmup + 1)
+    except Exception:
+        return {
+            "status": "runtime_error",
+            "passed": False,
+            "patches": b.report.__dict__,
+            "error": _tb(),
+        }
+    rounds = ab.alternate(
+        session, (a, b), inputs, reference, reproducible, rounds=ns.rounds, sample=monitor.sample
+    )
+    if rounds.failed == "A" or rounds.mismatch:
+        why = rounds.mismatch or "A failed after a switch from B"
+        return {"status": "undo_failed", "passed": False, "reason": why, "error": rounds.error}
+    if rounds.failed == "B":
+        return {
+            "status": "runtime_error",
+            "passed": False,
+            "patches": b.report.__dict__,
+            "error": rounds.error,
+        }
+    session.to(b)
+    b_ms = ab.median(rounds.b_ms)
+    base_ms, verdict = _judge(ns, workload, inputs, rounds.output, b_ms, truth_files)
+    gpu = monitor.summary()
+    if message := telemetry.warning(gpu):
+        print(f"e2e_ab: WARNING {message}", file=sys.stderr, flush=True)
+    peak = torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+    result = {
+        **verdict,
+        "median_ms": round(b_ms, 3),
+        "times_ms": [round(t, 3) for t in rounds.b_ms],
+        "baseline_ms": round(base_ms, 3),
+        "speedup": round(base_ms / b_ms, 4),
+        "peak_mem_gb": round(peak, 3),
+        "patches": b.report.__dict__,
+    }
+    result["ab"] = {
+        **abtest.paired(rounds.a_ms, rounds.b_ms),
+        **rounds.ab(),
+        "warmup": max(ns.warmup + 1, 2),
+        "shared_kernels": bool(b.shared),
+        "a_patches": a.report.__dict__,
+        **({"gpu": gpu} if gpu else {}),
+    }
+    return result
+
+
+def _irreversible(bad: list[tuple[list[str], str]]) -> dict[str, Any]:
+    """``e2e_ab`` result: these items cannot be undone in-process ((items, why) pairs)."""
+    why = "; ".join(f"{', '.join(Path(i).name for i in items)}: {w}" for items, w in bad)
+    return {
+        "status": "irreversible",
+        "passed": False,
+        "reason": f"cannot be undone in-process: {why}",
+        "irreversible": [i for items, _ in bad for i in items],
+    }
+
+
+def _tb() -> str:
+    return traceback.format_exc()[-4000:]
 
 
 def _truth_bytes(
@@ -333,7 +474,12 @@ def _truth_bytes(
         raise truth.TamperError(f"{rel}: {exc}") from None
 
 
-COMMANDS = {"analyze": cmd_analyze, "capture": cmd_capture, "e2e": cmd_e2e}
+COMMANDS = {
+    "analyze": cmd_analyze,
+    "capture": cmd_capture,
+    "e2e": cmd_e2e,
+    "e2e_ab": cmd_e2e_ab,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -345,6 +491,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--parent", action="store_true", help="capture: a region's parent class")
     parser.add_argument("--kernel", action="append", help="TARGET_ID=CANDIDATE_PATH")
     parser.add_argument("--transform", action="append", help="transform .py path")
+    parser.add_argument("--b-kernel", action="append", help="e2e_ab: a kernel of state B")
+    parser.add_argument("--b-transform", action="append", help="e2e_ab: a transform of B")
+    parser.add_argument("--rounds", type=int, default=8, help="e2e_ab: timed A/B rounds")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--no-profile", action="store_true")

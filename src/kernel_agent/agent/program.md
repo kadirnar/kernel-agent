@@ -116,8 +116,9 @@ version is saved as `logs/program-<sha12>.md`.
 
 * Evaluate each transform alone first (`evaluate_e2e(transforms=[one])`),
   then on top of the kernel winners. Integration starts from the best single
-  item and adds the others one at a time, keeping each only if it lowers
-  measured latency by more than 1 %.
+  item and adds the others one at a time, keeping each only if a paired A/B
+  in one process shows it faster in at least 80 % of the rounds, with the
+  95 % confidence interval of the gain above 1 %.
 * One idea per transform file, so that integration can keep or drop it on
   its own.
 * Prefer changes with a clear mechanism (launches removed, host syncs

@@ -95,6 +95,9 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         eval_timeout_s=ns.eval_timeout,
         program=ns.program,
         compile_baseline=ns.compile_baseline,
+        ab_rounds=ns.ab_rounds,
+        ab_min_win_rate=ns.ab_min_win_rate,
+        ab_min_gain=ns.ab_min_gain,
         use_library=not ns.no_library,
         librarian=not ns.no_librarian,
         librarian_model=ns.librarian_model,
@@ -326,6 +329,21 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         help="do not reuse or store kernels and lessons of the cross-run library",
     )
     p.add_argument("--no-librarian", action="store_true", help="skip the lessons agent")
+    p.add_argument(
+        "--ab-rounds", type=int, default=8, help="integration: timed rounds per paired A/B"
+    )
+    p.add_argument(
+        "--ab-min-win-rate",
+        type=float,
+        default=0.8,
+        help="integration: share of the A/B rounds an item must win",
+    )
+    p.add_argument(
+        "--ab-min-gain",
+        type=float,
+        default=0.01,
+        help="integration: the 95%% CI of an item's A/B gain must start above this",
+    )
     p.add_argument("--librarian-model", help="model of the librarian (default: --claude-model)")
     p.add_argument("--verbose", "-v", action="store_true")
 

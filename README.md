@@ -47,6 +47,7 @@ HF URL ─► resolve (modality, arch, family, size)
         ─► integrate every winner measured alone, then combined greedily from
                      the fastest single item (or from the systems agent's
                      fastest measured combination, when it is faster again),
+                     each step a paired in-process A/B with a bootstrap CI,
                      validated against the baseline output; then the accepted
                      kernels under the compiled baseline
         ─► report    report.md + optimized/ (kernels + apply.py)
@@ -153,6 +154,62 @@ are deep-copied outside the timed region; other inputs rotate between three
 copies made before timing. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
 wall-clock latency of the whole workload.
+
+### Integration: paired A/B with undo handles
+
+Process-to-process variance on a consumer GPU is often larger than 1 %, so the
+integration does not compare medians from different processes. Every
+measurement is a paired A/B in one process, `worker e2e_ab`: each item alone
+against the unmodified model (a candidate when it passes and its paired gain
+is positive, ordered by that gain; the first that passes the acceptance rule
+below seeds the search), then each step of the greedy search, the accepted
+set A against B = A + the next candidate (and the systems agent's measured
+combination against the best single item):
+
+* The model is loaded once. A is applied, warmed up, then B is built the way a
+  fresh `e2e` process applies it (kernels, then transforms): B shares A's
+  kernel replacements when its kernels extend A's, and applies every transform
+  afresh, so CUDA graphs or compiled code that A captured lazily never serve B.
+* `apply_kernels(..., handles=h)` / `apply_transforms(..., handles=h)` append
+  undo handles (`integrate/undo.py`). A handle diffs snapshots taken before and
+  after `apply`: the `__dict__` of the workload, of every module under its
+  roots, of plain objects they hold and of their classes (one level into
+  `_modules`, `_parameters`, `_buffers`, hooks), `__class__`, `.data`
+  rebinding of parameters and buffers, the globals of the model's packages,
+  monkeypatched callables of `torch` / `torch.nn.functional`, torch backend
+  flags and the dynamo / inductor configs. `undo()` puts back the very same
+  objects (rewritten region parents included); `redo()` re-installs what
+  `apply` made with its lazily built state (captured graphs) intact.
+* After warm-up, A and B alternate for `--ab-rounds 8` rounds (A B, B A, ...),
+  every run timed. A state whose warm-up output is bit-reproducible must
+  reproduce it in every round, which catches a switch that did not restore it.
+* B is accepted when it passes the quality checks (teacher forcing, held-out
+  input and memoisation probe, run once in state B as in `e2e`), wins at least
+  `--ab-min-win-rate 0.8` of the rounds **and** the lower bound of the
+  bootstrap 95 % confidence interval of its gain `1 − ΣB / ΣA` is above
+  `--ab-min-gain 0.01` (`abtest.py`).
+* A transform that changes weights in place (`param.mul_()`), declares
+  `undo = False`, or whose state does not survive a switch, and an A/B whose
+  process fails (two states in memory, say), are measured in two processes
+  back to back instead, `abtest.SEPARATE_ITERS` (10) timed runs
+  each and A measured again in the same session; the win rate is then over
+  all (A run, B run) pairs and the interval comes from resampling both.
+  Such items are remembered (`integration.json` → `irreversible`). A
+  transform may also define `undo(workload)` to revert what the snapshots
+  cannot see; it is then applied again (plus a warm-up run) to re-enter its
+  state.
+* GPU clocks, temperature, power and clock-event reasons are sampled around
+  every timed run through NVML (`pynvml`, when installed) or `nvidia-smi`
+  (`ab.gpu`, `gpu` of `e2e`); a power or thermal slowdown is logged as a
+  warning.
+
+Every step in `integration.json` → `history` carries its `ab` record: `mode`
+(`paired` / `separate`), `a_items`, the timings `a_ms` / `b_ms`, `wins`,
+`win_rate`, `gain`, `ci95`, `accepted`, `why`, the `rule`, the undo check and
+the GPU telemetry. `projection` lists, for every accepted set, the projected
+latency (baseline − Σ est. saved ms: a kernel's module-level estimate, a
+transform's measured gain alone) next to the measured one; `report.md` shows
+both. A re-integration reuses an A/B only for the same A and B files.
 
 ### Ground truth the agents cannot quietly change
 
@@ -852,6 +909,8 @@ kernel-agent optimize <hf-url> [options]
   --until analyze|plan|capture|kernels|transforms|integrate
   --compile-baseline                   also measure a generic torch.compile baseline for
                                        workloads without reference_optimizations()
+  --ab-rounds 8 --ab-min-win-rate 0.8 --ab-min-gain 0.01
+                                       paired A/B of each integration step (see above)
   --no-library --no-librarian          cross-run kernel library / lessons agent off
   --librarian-model MODEL              (see "Kernel library and lessons")
 
@@ -1033,7 +1092,9 @@ profile, then the same bar with every target at its best module speedup
 
 `integration.png`: the greedy integration as a waterfall. It starts at the
 baseline, then the best single item, then each item added on top: accepted
-(green, ms saved), rejected for no gain (hatched) or failed (red ×).
+(green, ms saved), rejected for no gain (hatched) or failed (red ×). A step
+judged by a paired A/B starts at A's median of that session, so its bar is
+the paired difference.
 
 The candidates are every kernel winner and every transform of a passing
 `evaluate_e2e` record that beat the baseline, alone or combined with other

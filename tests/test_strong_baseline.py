@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from ab_fake import with_ab
 from synthetic_run import BASELINE_MS, make_run
 from torch import nn
 
@@ -358,7 +359,7 @@ def test_integrate_tries_reference_plus_kernels(tmp_path, monkeypatch):
             }
         return {"status": "ok", "passed": True, "median_ms": 1200.0, "speedup": base / 1200}
 
-    orch.worker = fake_worker
+    orch.worker = with_ab(fake_worker, base)
     asyncio.run(orch.integrate())
     data = read_json(orch.run.root / "integration.json")
     assert [a["item"] for a in data["accepted"]] == [item]  # greedy result unchanged
@@ -396,7 +397,7 @@ def test_integrate_without_compiled_baseline_is_unchanged(tmp_path, monkeypatch)
         calls.append(args)
         return {"status": "ok", "passed": True, "median_ms": 1200.0, "speedup": 1.27}
 
-    orch.worker = fake_worker
+    orch.worker = with_ab(fake_worker, read_json(orch.run.baseline_json)["median_ms"])
     asyncio.run(orch.integrate())
     assert len(calls) == 1
     assert "reference" not in read_json(orch.run.root / "integration.json")
