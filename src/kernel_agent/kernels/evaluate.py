@@ -24,7 +24,11 @@ Stages and their failure statuses:
    side effects (:mod:`kernels.compare`), plus aliasing parity with a live
    reference call (:func:`kernels.verify.alias_errors`).
 3. ``incorrect_timed_output``: timing (CUDA only, :func:`kernels.bench.compare_timing`)
-   rotates between input copies and checks the output of one random timed call.
+   rotates between input copies and checks the output of one random timed call. Every
+   round runs at full GPU clocks (:func:`kernels.bench.time_call`; ``clock`` per case:
+   the lowest DRAM bandwidth probe around its rounds, about 1 at full clocks), and
+   before the profiled activity pass below (its CUPTI subscription stays: every later
+   launch of the process is 1.5-3 us slower).
 4. ``incorrect_perturbed``: re-verification after timing (on CPU right after
    stage 2) at fresh addresses and with redrawn inputs (:mod:`kernels.verify`).
 
@@ -99,7 +103,9 @@ ACTIVITY_CALLS = 3
 #: Measurement semantics of this evaluator: bump it when a change makes earlier results
 #: incomparable (what is timed and how, how cases are weighted, what counts as correct).
 #: Records without ``evaluator_version`` predate it and count as schema 0.
-EVALUATOR_SCHEMA = 1
+#: 2: every timing round at full GPU clocks (#81; earlier records may be measured in an
+#: idle performance state, bandwidth-bound kernels up to 27x too slow).
+EVALUATOR_SCHEMA = 2
 
 
 _run = subprocess.run  # bound at import: tests replace subprocess.run for the evaluator
@@ -667,6 +673,8 @@ def _evaluate(
         report["new_ms"] = round(new_t["median_ms"], 5)
         report["speedup"] = round(ref_t["median_ms"] / max(new_t["median_ms"], 1e-9), 3)
         report["timing_spread"] = round(max(ref_t["spread"], new_t["spread"]), 3)
+        if clocks := [t["clock"] for t in (ref_t, new_t) if "clock" in t]:
+            report["clock"] = round(min(clocks), 2)  # the lowest clock probe (1: full clocks)
         if compiled_ref is not None:
             try:
                 if method not in compiled:
