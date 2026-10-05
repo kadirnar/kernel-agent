@@ -2,7 +2,7 @@
 orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
 
     python -m kernel_agent.worker analyze --run-dir R [--out-dir D --kernel ID=PATH ...]
-    python -m kernel_agent.worker capture --run-dir R --target ID
+    python -m kernel_agent.worker capture --run-dir R --target ID [--parent]
     python -m kernel_agent.worker e2e     --run-dir R [--kernel ID=PATH ...] [--transform PATH ...]
                                           [--baseline-ms MS] [--verify REL=SHA256 ...]
 """
@@ -141,19 +141,22 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 def _kernel_patches(run: RunDir, kernels: list[str]) -> list[Any]:
     """``KernelPatch`` per ``TARGET_ID=PATH`` item (``e2e`` and the re-profile of ``analyze``)."""
     from kernel_agent.integrate.patcher import KernelPatch
+    from kernel_agent.region import rewrite_of
 
     patches = []
     for item in kernels:
         target_id, _, path = item.partition("=")
         spec = read_json(run.target(target_id) / "spec.json")
+        rewrite = rewrite_of(run, target_id, spec)  # a region target: its regex is the parent's
         patches.append(
             KernelPatch(
                 target_id=target_id,
                 module_class=spec["module_class"],
                 candidate=Path(path),
-                qualname_regex=spec.get("qualname_regex"),
+                qualname_regex=None if rewrite else spec.get("qualname_regex"),
                 methods=list(spec.get("capture", {}).get("method_instances", [])),
                 phase=spec.get("phase"),
+                rewrite=rewrite,
             )
         )
     return patches
@@ -169,32 +172,44 @@ def _apply_patches(run: RunDir, workload: Any, kernels: list[str], transforms: l
 
 
 def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    from kernel_agent import region
     from kernel_agent.profiling.capture import capture_module
 
     target_dir = run.target(ns.target)
     spec = read_json(target_dir / "spec.json")
     workload = _workload(run)
+    cls, out, capture = spec["module_class"], target_dir, run.capture_file(ns.target)
+    scope = {k: spec.get(k) for k in ("qualname", "qualname_regex", "phase")}
+    parent = getattr(ns, "parent", False)
+    if parent:  # region target (region.py), first: its parent class, every phase
+        cls, out = spec["parent_class"], target_dir / region.PARENT_DIR
+        capture, scope["phase"] = region.parent_capture(run, ns.target), None
+    elif (rewrite := region.rewrite_of(run, ns.target, spec)) is not None:
+        region.apply_rewrites(workload.roots(), [rewrite])  # then Region_<id> in the rewrite
+        scope["qualname"] = scope["qualname_regex"] = None  # they select parent instances
     inputs = workload.make_inputs()
     with __import__("torch").inference_mode():
         workload.run(inputs)  # warm-up so lazily-initialised state exists
-    capture = truth.replace(run.capture_file(ns.target))  # .truth/captures/ of a sealed run
+    capture = truth.replace(capture)  # .truth/captures/ of a sealed run
     info = capture_module(
         workload,
         inputs,
-        spec["module_class"],
+        cls,
         capture,
-        qualname=spec.get("qualname"),
+        qualname=scope["qualname"],
         max_cases=int(ns.max_cases),
-        qualname_regex=spec.get("qualname_regex"),
-        phase=spec.get("phase"),
-        profile_dir=target_dir,  # workload_profile.md is for the agent
+        qualname_regex=scope["qualname_regex"],
+        phase=scope["phase"],
+        profile_dir=out,  # workload_profile.md is for the agent
         variants=workload.variants(),  # extra settings: correctness-only cases
     )
     if run.sealed():  # the agent's copy: module + inputs, no reference outputs
-        truth.write_inputs_capture(capture, target_dir / "capture_inputs.pt")
-    spec["capture"] = info
+        truth.write_inputs_capture(capture, out / "capture_inputs.pt")
+    spec["parent_capture" if parent else "capture"] = info
     write_json(target_dir / "spec.json", spec)
-    _write_reference_source(workload, spec, target_dir / "reference_source.py")
+    _write_reference_source(
+        workload, {"module_class": cls, "capture": info}, out / "reference_source.py"
+    )
     return info
 
 
@@ -327,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--target")
     parser.add_argument("--max-cases", type=int, default=4)
+    parser.add_argument("--parent", action="store_true", help="capture: a region's parent class")
     parser.add_argument("--kernel", action="append", help="TARGET_ID=CANDIDATE_PATH")
     parser.add_argument("--transform", action="append", help="transform .py path")
     parser.add_argument("--warmup", type=int, default=1)

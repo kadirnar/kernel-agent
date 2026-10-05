@@ -7,6 +7,8 @@ Roles
 * **systems engineer** – model-level algorithm changes (CUDA graphs, static caches, ...).
 * **research** – a clean-context review of a target that has plateaued: reads the
   ledger and the files, writes ``plan.md`` (diagnosis, ranked directions, do-not-try).
+* **refactor** – one per region target: writes ``rewrite.py``, which moves the region's
+  ops out of the parent's code into a new submodule (``kernel_agent/region.py``).
 """
 
 from __future__ import annotations
@@ -145,6 +147,10 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "qualname": {"type": ["string", "null"]},
                     "qualname_regex": {"type": ["string", "null"]},
                     "phase": {"type": "string", "enum": ["all", "prefill", "decode"]},
+                    # region targets (kernel_agent/region.py): ops of parent_class.forward
+                    "kind": {"type": "string", "enum": ["module", "region"]},
+                    "parent_class": {"type": ["string", "null"]},
+                    "region": {"type": ["string", "null"]},
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
@@ -161,7 +167,7 @@ PLAN_SCHEMA: dict[str, Any] = {
                         },
                     },
                 },
-                "required": ["id", "module_class", "why", "approach", "backends"],
+                "required": ["id", "why", "approach", "backends"],
             },
         },
         "transforms": {
@@ -240,6 +246,17 @@ model. Specialist agents will then write custom kernels for each target you pick
    KV cache (attend over the valid length only). `qualname_regex` (searched
    in the full qualname, e.g. `feat_decoder\\.`) restricts a target to some
    instances, e.g. when one class serves an LM and a DiT of different sizes.
+   **Region targets** fuse across module boundaries: ops that sit in a
+   parent's `forward` between its children (the residual add after
+   `self_attn` + `post_attention_layernorm` of a decoder layer, an output
+   projection + residual add + norm) belong to no single module. Set
+   `kind: "region"`, `parent_class` (the class whose forward holds the ops,
+   as in the profile table) and `region` (exactly which ops, in order), and
+   no `module_class`. A refactor agent first moves those ops into a new
+   submodule `Region_<id>`, verified bitwise against the parent's captured
+   calls; that submodule is then the target (`qualname_regex` selects parent
+   instances). Use a region only when the fusion removes a real round trip
+   through memory or launches that no module target covers.
 3. For each target give `approach` (the concrete fusion/algorithm idea, which
    kernels it removes, expected speedup) and an ordered list of `backends` from:
    {", ".join(backends)}. Put the backend most suited to the op first
@@ -325,6 +342,14 @@ def _scope_lines(target: dict[str, Any]) -> str:
         )
     if target.get("qualname_regex"):
         lines += f"* instances: only those whose qualname matches `{target['qualname_regex']}`\n"
+    if target.get("kind") == "region":
+        lines += (
+            f"* region of `{target.get('parent_class')}`: {target.get('region')}. "
+            f"`{target['module_class']}` is defined in the verified `rewrite.py` (module "
+            f"`ka_region_{target['id']}`), which moved these ops out of the parent's code; "
+            f"integration applies that rewrite to the `{target.get('parent_class')}` instances "
+            f"first, then your `build()` to every `{target['module_class']}`.\n"
+        )
     return lines
 
 
@@ -652,3 +677,95 @@ direction.
 ```
 {toolchain}
 ```"""
+
+
+def refactor_prompt(target: dict[str, Any], capture_info: dict[str, Any]) -> str:
+    """The refactor agent of a region target (``region.py``): writes ``rewrite.py`` only."""
+    parent, cls = target["parent_class"], target["module_class"]
+    cases = "\n".join(
+        f"  * `{c['signature']}` — {c['count']} calls per run per instance"
+        for c in capture_info.get("cases", [])
+    )
+    methods = ", ".join(f"`{m}`" for m in capture_info.get("method_instances") or ["forward"])
+    regex = target.get("qualname_regex")
+    scope = f" whose qualname matches `{regex}`" if regex else ""
+    return f"""You are a PyTorch refactoring engineer. Kernel engineers replace whole
+`nn.Module` classes, so a fusion across module boundaries needs a refactor first:
+move the ops of one region of a parent module's code into a new submodule, without
+changing the math. A kernel engineer then replaces that submodule with a fused kernel.
+
+# Target `{target["id"]}`
+* parent class: `{parent}` (instance captured: `{capture_info.get("qualname")}`)
+* region to isolate: {target.get("region")}
+* why it matters: {target.get("why", "")}
+* planned fusion: {target.get("approach", "")}
+* the parent's entrypoints: {methods}; captured calls:
+{cases}
+
+# Files (read-only, except `rewrite.py`)
+* `parent/reference_source.py` — source of `{parent}` (and its file path), its children.
+* `parent/workload_profile.md` — every call of the parent during the run.
+* `parent/capture_inputs.pt` — the parent module (with weights) + captured inputs.
+* `spec.json` — target metadata.
+
+# Contract: write `rewrite.py`
+```python
+import copy
+
+from torch import nn
+
+from <module named in parent/reference_source.py> import {parent}
+
+
+class {cls}(nn.Module):
+    \"\"\"The region: <the ops>.\"\"\"
+
+    def __init__(self, ...):  # the parent's modules / parameters it uses: shared, no copies
+        super().__init__()
+        ...
+
+    def forward(self, ...):  # tensors in, tensors out: the region's ops, same order and dtypes
+        ...
+
+
+class Rewritten{parent}({parent}):
+    def forward(self, ...):  # the parent's signature and code, region ops -> self.region(...)
+        ...
+
+
+def rewrite(parent: nn.Module) -> nn.Module:
+    new = copy.copy(parent)  # shares weights and children
+    new._modules = dict(parent._modules)  # its own child table: `parent` stays as it was
+    new.__class__ = Rewritten{parent}
+    new.region = {cls}(parent.<child>, ...)
+    del new.<child>  # a child the region took over (each module keeps one place)
+    return new
+```
+
+# Rules
+* Same results: on every captured call the rewritten parent's outputs and in-place
+  side effects must equal the reference bit for bit (the same ops in the same order
+  on the same device are); at most about one unit in the last place is tolerated.
+* The class is named exactly `{cls}` (integration finds it by name) and the parent
+  calls it as a module, `self.region(...)`, so hooks and the capture see the call.
+* The region holds every op of the planned fusion, across the module boundary. Its
+  `forward` takes the tensors the ops read and returns what the rest of the parent
+  needs (a tuple is fine). Keep child modules it uses (a norm) as its own children,
+  so their parameters stay shared and kernels for their classes still apply.
+* Each parent entrypoint ({methods}) that runs these ops calls the region; every
+  entrypoint keeps its signature, outputs and side effects.
+* `rewrite()` runs on every `{parent}` instance{scope}: read sizes and flags from the
+  module, never from the captured instance. Return `parent` itself for an instance
+  without the region.
+* No optimisation and no kernels: plain PyTorch, the parent's own code moved.
+* You can write only `rewrite.py`; there is no shell.
+
+# Tool
+* `verify_rewrite(target_id="{target["id"]}")` imports `rewrite.py`, calls `rewrite()` on
+  a copy of the captured parent, replays every captured call and compares outputs and
+  side effects with the reference (per case: `ok`, `bitwise`, `max_abs_err`, failing
+  tensors) and counts the calls of `{cls}` (`region_calls`, must be > 0). Fix and call
+  it again until it reports `"verified": true`.
+
+Finish with a short summary: the region's signature, the entrypoints that call it, and
+the verification result."""

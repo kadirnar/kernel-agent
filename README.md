@@ -35,7 +35,9 @@ HF URL ─► resolve (modality, arch, family, size)
                      KV-cache side effects, every entrypoint such as
                      forward_step, correctness-only cases from extra
                      settings), plus statistics of every call
-                     (workload_profile.md)                          [GPU worker]
+                     (workload_profile.md); a region target is first
+                     refactored into its own submodule by a Claude
+                     "refactor" agent, verified bitwise     [GPU worker]
         ─► kernels   one Claude "kernel engineer" per target (or k isolated
                      workers, --seeds-per-target) writes candidates,
                      calls evaluate_candidate (correctness + interleaved
@@ -271,6 +273,44 @@ sends only that phase's calls of the captured entrypoints to the kernel. The
 other calls keep the reference, so a `prefill` and a `decode` target on the
 same class combine. `optimized/apply.py` applies them the same way.
 
+### Region targets: fusions across module boundaries
+
+A target replaces one module class, so ops that sit in a parent's `forward`
+between its children cannot be fused by a kernel target: the residual add
+after attention and the next RMSNorm of a decoder layer, or an output
+projection + residual add + norm (`kernel_agent/region.py`, after the Fuser
+of KernelAgent). The planner marks such a fusion `"kind": "region"` with a
+`parent_class` (e.g. `LlamaDecoderLayer`) and a `region` (the ops, e.g. "the
+residual add after self_attn + post_attention_layernorm"). Before the kernel
+engineer starts:
+
+1. the parent class is captured (every phase) to `.truth/captures/<id>.parent.pt`;
+2. a `refactor-<id>` agent (read-only tools plus `verify_rewrite`; it may
+   write only `targets/<id>/rewrite.py`, no shell) writes
+   `rewrite(parent) -> nn.Module`: a drop-in parent whose entrypoints call a
+   new submodule of class `Region_<id>` for the region, the same ops in the
+   same order;
+3. kernel-agent seals a copy of `rewrite.py` and replays every captured call
+   of the parent with it applied. Outputs and in-place side effects (KV
+   caches) must be bitwise identical, or within about one unit in the last
+   place with no mismatch allowance, and the parent must call `Region_<id>`.
+   A rewrite that changes the math (say, the norm before the residual add) is
+   rejected and the target dropped;
+4. the workload runs with the rewrite applied to every parent instance and
+   `Region_<id>` is captured. From here on it is a normal target.
+
+Wherever the kernel is applied (`e2e`, integration, re-profiles,
+`optimized/apply.py`), the target's verified rewrite runs first on every
+instance of the parent class (`qualname_regex` selects parent instances),
+then the kernel replaces the `Region_<id>` modules. A rewrite that changed
+after its verification keeps the kernel out of the integration. A
+`targets/<id>/rewrite.py` that exists before the refactor step (a resumed run,
+or one written by hand) is verified first; the agent runs only when it fails.
+The classes a rewrite defines are pickled by value, so the region's capture
+loads in the evaluator and in the agent's own scripts without the rewrite on
+the import path; a candidate can subclass the region class with
+`from ka_region_<id> import Region_<id>` or `type(reference)`.
+
 ### Speed of light
 
 Every timed `evaluate_candidate` result says how close each case is to the
@@ -354,8 +394,9 @@ You can steer the agents by editing a Markdown file instead of the code, as
 in karpathy/autoresearch (`kernel_agent/program.py`). Each `## <section>` is
 appended to the system prompt of the matching agents. `## all` goes to every
 agent. `## planner`, `## kernel` (each `kernel-<target>` agent), `## systems`,
-`## harness` and `## research` (each `research-<target>` session, see "Research
-on plateaus") go to that role only. A heading can name several roles
+`## harness`, `## research` (each `research-<target>` session, see "Research
+on plateaus") and `## refactor` (each `refactor-<target>` session of a region
+target) go to that role only. A heading can name several roles
 (`## kernel, systems`). Unknown sections are ignored with a warning. Text
 above the first `##` heading and `<!-- comments -->` are not sent to agents.
 
@@ -797,7 +838,8 @@ runs/<org>--<name>/<timestamp>/
     baseline_output.pt          output of the baseline run
     baseline_output_holdout.pt  ... of the held-out input
     captures/<id>.pt            module + real inputs/outputs + post-call state
-    targets/<id>/history/       snapshot of every evaluated version
+    captures/<id>.parent.pt     region target: the capture of its parent class
+    targets/<id>/history/       snapshot of every evaluated version (region: + rewrite.py)
     targets/<id>/results.jsonl  every evaluation (full record + snapshot sha256)
     targets/<id>/quick.jsonl    every quick check (mode="quick", not a benchmark)
     transforms/                 history/ + results.jsonl of the transforms
@@ -807,6 +849,8 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/candidates/    files the agent writes
   targets/<id>/workers/<k>/   --seeds-per-target: a worker's candidates/ + NOTES.md (+ links)
   targets/<id>/plan.md        improve: the research plan of a plateaued target
+  targets/<id>/rewrite.py     region target: the refactor agent's rewrite (+ parent/: its
+                              parent's capture_inputs.pt, reference_source.py, profile)
   targets/<id>/history/ results.jsonl   the agent's copies (never read back)
   targets/<id>/progress.png   speedup per evaluation (see "Charts")
   transforms/                 model-level transforms (+ the agent's copies)
@@ -817,7 +861,7 @@ runs/<org>--<name>/<timestamp>/
   improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256
-  optimized/                  apply.py + manifest.json + kernels/
+  optimized/                  apply.py + manifest.json + kernels/ (+ rewrites/ of region targets)
 ```
 
 To use the result in your own code:

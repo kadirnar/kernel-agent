@@ -10,6 +10,8 @@ is appended to the system prompt of the matching agents:
 * `## harness`: writes `harness.py` when no built-in workload runs the model
 * `## research`: reviews a target that has plateaued, from a clean context,
   and writes its `plan.md` (no code)
+* `## refactor`: moves the ops of a region target out of its parent module's
+  code into a new submodule (`rewrite.py`), without changing the math
 
 A heading can name several roles (`## kernel, systems`). Other `##` headings
 are ignored with a warning. Text above the first `##` heading (this
@@ -144,3 +146,12 @@ version is saved as `logs/program-<sha12>.md`.
   untested, not refuted. Put it under retry with the bug to fix, never under
   "do not try". Only ideas measured correct and not faster, or variants of a
   direction already exhausted, belong on the do-not-try list.
+
+## refactor
+
+* Move code, do not rewrite it: copy the parent's lines into the region
+  module unchanged (same ops, same order, same dtype casts). A refactor that
+  is not bitwise identical is a bug to find, not noise to accept.
+* Cut the region where the planned fusion needs it, no wider: the inputs it
+  reads and the outputs the rest of the parent uses, nothing the kernel
+  cannot fuse.

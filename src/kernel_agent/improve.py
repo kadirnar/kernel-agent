@@ -757,7 +757,7 @@ class Improver:
                 applied[target_id] = float(rec.get("speedup") or 1.0)
         context = rounds_context(self.run, self.state, n, accepted, arms)
         new = await self.orch.replan(round_dir, context, label=f"planner#round{n}")
-        captured = self.orch._capture(new) if new else []
+        captured = await self.orch.capture_targets(new) if new else []
         self.state["rounds"].append(
             {
                 "n": n,

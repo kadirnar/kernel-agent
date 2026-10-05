@@ -211,6 +211,27 @@ def _ref_ms(target_id: str, spec: dict[str, Any], profiles: list[dict[str, Any]]
     return 0.0
 
 
+def _region_ref_ms(
+    run: RunDir, target_id: str, spec: dict[str, Any], profiles: list[dict[str, Any]]
+) -> float:
+    """A region target's ``Region_<id>`` class is in no profile (``kernel_agent/region.py``):
+    its reference time per run from the timed cases of its newest timed evaluation, else
+    the time of its parent class (an upper bound) until it has one."""
+    if spec.get("kind") != "region":
+        return 0.0
+    users = (spec.get("capture") or {}).get("method_instances") or {}
+    for rec in reversed(read_jsonl(run.results_file(target_id))):
+        timed = [c for c in rec.get("cases") or [] if c.get("ref_ms") is not None]
+        if timed:
+            return sum(
+                float(c["ref_ms"])
+                * float(c.get("calls_per_run") or 0)
+                * float(users.get(c.get("method") or "forward", 1))
+                for c in timed
+            )
+    return _ref_ms(target_id, {**spec, "module_class": spec.get("parent_class")}, profiles)
+
+
 def gpu_busy(run: RunDir) -> float | None:
     profile = read_json(run.profile_dir / "profile.json", {}) or {}
     busy = ledger._num((profile.get("kernel_view") or {}).get("gpu_busy_fraction"))
@@ -363,7 +384,7 @@ def build_arms(
         arm = Arm(
             target_id,
             KERNEL,
-            _ref_ms(target_id, spec, profiles),
+            _ref_ms(target_id, spec, profiles) or _region_ref_ms(run, target_id, spec, profiles),
             module_class=spec.get("module_class"),
             estimate=estimate,
             rows=ledger.measured(r for r in rows if r["target"] == target_id),
