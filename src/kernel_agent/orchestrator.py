@@ -173,6 +173,8 @@ class Orchestrator:
         return avail
 
     def _worker(self, command: str, *args: str) -> dict[str, Any]:
+        if command == "capture":  # a target's tolerance tier follows the run's quality mode
+            args = (*args, "--quality", self.cfg.quality)
         return (self.worker or call_worker)(self.run, command, *args)
 
     async def _agent(

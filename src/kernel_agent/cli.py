@@ -101,6 +101,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         ab_min_win_rate=ns.ab_min_win_rate,
         ab_min_gain=ns.ab_min_gain,
         recheck=not ns.no_recheck,
+        quality=ns.quality,
         use_library=not ns.no_library,
         librarian=not ns.no_librarian,
         librarian_model=ns.librarian_model,
@@ -412,6 +413,14 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         "--no-recheck",
         action="store_true",
         help="integration: do not re-check kernels on fresh inputs in separate processes",
+    )
+    p.add_argument(
+        "--quality",
+        default="exact",
+        choices=["exact", "near-lossless"],
+        help="exact: numerics within rounding noise of eager; near-lossless: numerics-changing "
+        "optimisations (FP8 weights, ...) pass a perceptual gate instead (WER, speaker "
+        "similarity, MOS for TTS; workloads/perceptual.py)",
     )
     p.add_argument("--verbose", "-v", action="store_true")
 

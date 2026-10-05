@@ -577,10 +577,16 @@ def compare_saved_outputs(capture: dict[str, Any], saved: Any) -> list[dict[str,
     """Failed checks of the saved candidate outputs (``{"cases": capture indices,
     "outputs": flat_outputs(...)}``) against the capture: the same checks as the
     evaluator's correctness stage, run outside the candidate's process."""
-    from kernel_agent.kernels.compare import compare_side_effects_flat, compare_tensors, flatten
+    from kernel_agent.kernels.compare import (
+        compare_side_effects_flat,
+        compare_tensors,
+        flatten,
+        tier_of,
+    )
 
     failures: list[dict[str, Any]] = []
     cases = capture["cases"]
+    tier = tier_of(capture)
     indices = saved.get("cases") if isinstance(saved, dict) else None
     outputs = saved.get("outputs") if isinstance(saved, dict) else None
     if (
@@ -599,10 +605,13 @@ def compare_saved_outputs(capture: dict[str, Any], saved: Any) -> list[dict[str,
             if name not in new_out:
                 checks.append({"name": name, "ok": False, "error": "missing in saved outputs"})
             else:
-                checks.append(compare_tensors(name, ref, new_out[name]))
+                checks.append(compare_tensors(name, ref, new_out[name], tier=tier))
         for key in ("args", "kwargs"):
             checks += compare_side_effects_flat(
-                flatten(case[key], key), flatten(case[f"post_{key}"], key), new.get(key, {})
+                flatten(case[key], key),
+                flatten(case[f"post_{key}"], key),
+                new.get(key, {}),
+                tier=tier,
             )
         failures += [{"case": i, **c} for c in checks if not c.get("ok")]
     return failures

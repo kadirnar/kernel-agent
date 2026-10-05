@@ -428,8 +428,10 @@ def capture_module(
     decode_buckets: bool = True,
     variants: Sequence[dict[str, Any]] = (),
     variant_cases: int = 2,
+    tier: str | None = None,
 ) -> dict[str, Any]:
-    """Run the workload and save one instance of ``cls`` plus its calls.
+    """Run the workload and save one instance of ``cls`` plus its calls (``tier``: the
+    tolerance tier the evaluator applies, :mod:`kernel_agent.kernels.compare`).
 
     The target's instances are those a patch replaces (``cls``, matching
     ``qualname_regex``); every call of theirs goes into the workload profile
@@ -511,6 +513,7 @@ def capture_module(
             "methods": calls,
             "cases": cases,
             **({"phase": phase} if phase else {}),
+            **({"tier": tier} if tier else {}),
         },
         path,
     )
@@ -530,6 +533,7 @@ def capture_module(
         ],
         "bytes": path.stat().st_size,
         **({"phase": phase} if phase else {}),
+        **({"tier": tier} if tier else {}),
         **({"variants": variant_info} if variant_info else {}),
         # every call of the target's instances; the facts go into the engineer prompt
         "workload": {"calls": profile["calls"], "facts": profile["facts"]},

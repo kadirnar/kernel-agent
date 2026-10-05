@@ -102,6 +102,11 @@ class Workload(ABC):
     #: :mod:`kernel_agent.objective`). A streaming workload that calls :meth:`mark_chunk`
     #: for every output chunk can add ``"ttfa"``.
     metrics: ClassVar[tuple[str, ...]] = (objective.LATENCY,)
+    #: ``--quality near-lossless`` with the perceptual gate (:mod:`.perceptual`): option
+    #: overrides of the end-to-end checks, a looser *sanity floor* (teacher-forcing
+    #: thresholds that numerics-changing variants such as FP8 weights pass and broken
+    #: kernels still fail, ``stop_tolerance``). Options the user set win.
+    near_lossless_options: ClassVar[dict[str, Any]] = {}
 
     def __init__(self, spec: WorkloadSpec) -> None:
         self.spec = spec
@@ -274,6 +279,37 @@ class Workload(ABC):
             "chunk_ms": chunk_ms,
             "rtf": rtf,
         }
+
+    def perceptual_samples(self) -> list[dict[str, Any]]:
+        """Held-out samples of the perceptual gate (``--quality near-lossless``,
+        :mod:`kernel_agent.workloads.perceptual`): option overrides of :meth:`run`, one per
+        sample, plain JSON-able values (TTS: ``text`` + ``language`` + ``seed`` at natural
+        length; LLM: held-out prompts). ``[]`` (the default): the workload has no
+        perceptual gate, and a near-lossless run keeps the exact checks.
+
+        ``analyze`` runs them free running on the baseline, scores them
+        (:meth:`perceptual_quality`) and stores outputs and scores in ``.truth/``;
+        ``e2e`` runs the same samples on every candidate, untimed, and compares the scores
+        paired (:meth:`compare_perceptual`). Both go through :meth:`run`, the code path the
+        run's metric times (``metric=ttfa``: the whole streamed output). Keep them few and
+        short."""
+        return []
+
+    def perceptual_quality(self, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Scores of generated samples (``{"options", "output"}`` each: the overrides of
+        :meth:`perceptual_samples` and the output of :meth:`run` under them), one dict per
+        sample, plain data (TTS: transcript + error rate against the text, speaker
+        embedding, MOS; LLM: tokens + log-likelihood of held-out text). Load scoring models
+        here, lazily, and free them before returning."""
+        raise NotImplementedError(f"{type(self).__name__} has no perceptual gate")
+
+    def compare_perceptual(
+        self, reference: list[dict[str, Any]], candidate: list[dict[str, Any]]
+    ) -> Comparison:
+        """Paired comparison of the candidate's :meth:`perceptual_quality` scores with the
+        baseline's (sample *i* with sample *i*): pass when the perceptual quality stays
+        within the noise of the baseline (calibrated thresholds)."""
+        raise NotImplementedError(f"{type(self).__name__} has no perceptual gate")
 
     @contextlib.contextmanager
     def with_options(self, overrides: dict[str, Any] | None) -> Iterator[None]:

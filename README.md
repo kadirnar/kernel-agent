@@ -30,6 +30,7 @@ HF URL ─► resolve (modality, arch, family, size)
         ─► analyze   load model, baseline latency, determinism check,
                      sensitivity probe, teacher-forcing self-check,
                      held-out input + natural-length (stop) baselines,
+                     perceptual baseline (--quality near-lossless),
                      module-level + kernel-level
                      profile, compiled baseline (the model's own
                      torch.compile path)                           [GPU worker]
@@ -166,6 +167,94 @@ same time.
   the step where the decisions differ is a near-tie (`|margin| <=
   stop_near_tie`, default 0.5). Details are in `metrics.natural_length`;
   workloads without a stop condition are unaffected.
+
+### Quality modes: exact and near-lossless
+
+`--quality exact` (the default) is everything above: numerics within rounding
+noise of eager. Once a model runs near the memory-bandwidth floor of its bf16
+weights (VoxCPM2 after two `improve` rounds: 92–95 % of it), the next gains
+change numerics by design (FP8 weights first), and teacher forcing and the
+module tolerances reject them. `--quality near-lossless` (in `run.json`, passed
+to every `e2e` and `capture` by the orchestrator) accepts such changes when the
+*perceptual* quality stays within the noise of eager (`workloads/perceptual.py`):
+
+* **Perceptual gate.** The workload declares held-out samples
+  (`perceptual_samples()`; VoxCPM: three English and one German sentence × two
+  seeds at natural length, cloned from a fixed reference voice,
+  `workloads/assets/voxcpm_speaker.wav`, so that every sample has the same
+  speaker whatever the seed). `analyze` generates them with the eager model and
+  scores them: Whisper-large-v3 transcript and word error rate against the
+  text (character error rate for languages written without spaces), a
+  WavLM-base-plus-SV speaker embedding (speechbrain, for ECAPA, is not a
+  dependency) and a UTMOS22 MOS when that predictor is in the torch hub cache
+  (otherwise MOS is skipped: `"mos": "unavailable"`). Outputs and scores are
+  sealed in `.truth/baseline_output_perceptual.pt`; `baseline.json` →
+  `perceptual` has the per-sample transcripts and the means. `e2e` generates
+  the same samples with the candidate (free running, untimed), scores them and
+  compares them paired with eager's: the mean error rate may rise by at most
+  0.05, the speaker similarity to eager's sample of the same text and seed
+  must be >= 0.93 on average and >= 0.85 for every sample, and the mean MOS
+  may drop by at most 0.3 (`-o max_error_increase=…`, `min_speaker_similarity`,
+  `min_speaker_similarity_worst`, `max_mos_drop`). Details are in
+  `metrics.perceptual`; the report shows them next to the latency. The scoring
+  models load in the worker process only when the gate runs, one at a time,
+  and are freed afterwards. Baseline and candidate samples run through
+  `Workload.run` under the run's metric, so the gate judges the audio of the
+  code path the objective times: with `-o metric=ttfa` VoxCPM's streaming path
+  (`generate_streaming`, the whole streamed audio with its chunk-wise AudioVAE
+  decode), otherwise `generate`. A perceptual baseline recorded under another
+  metric fails every candidate (re-run `analyze`).
+* **Sanity floor.** Teacher forcing, the held-out input and the stop check
+  stay, with the workload's looser `near_lossless_options` (VoxCPM: mean step
+  cosine >= 0.95, min >= 0.2; the stop check accepts ±1 patch at a near-tie of
+  the stop logits, margins reported). Options set with `-o` win. A candidate
+  below the floor is rejected without running the gate.
+* **Module tolerance tier.** A target whose spec allows reduced precision
+  (`"precision": "reduced"` in the plan; when the planner sets it is issue #72)
+  is captured with the `near-lossless` tier of `kernels/compare.py`, recorded
+  in its sealed capture (an edited `spec.json` cannot change it, and a
+  candidate that changes `compare.TIER` is an integrity violation): instead of
+  per-element (atol, rtol), cosine >= 0.996, relative L2 error <= 0.08, the
+  norm within ±2 % (rounding noise is unbiased, a wrong scale is not) and every
+  element within 0.5 × RMS + 0.125 × |reference| (a corrupted row fails).
+  Other targets keep the exact tier.
+* Without a perceptual baseline (the workload declares no samples, or
+  `analyze` ran in exact mode) a near-lossless run keeps the exact checks;
+  `metrics.perceptual.skipped` says why.
+
+Calibration on VoxCPM2 (RTX 5070 Ti; the 8 cloned samples, each paired with
+eager's sample of the same text and seed; teacher forcing on the 60-patch main
+input; FP8 = every `nn.Linear` weight of both LMs and the LocDiT quantised to
+e4m3 per output channel and back to bf16, i.e. simulated FP8 weight storage):
+
+| variant | error-rate increase | speaker similarity (mean / worst) | MOS change | teacher forcing (mean / min step cosine) | exact | near-lossless |
+|---|---|---|---|---|---|---|
+| eager, other seeds (a fully diverged, correct run) | 0.000 | 0.972 / 0.961 | +0.05 | — | — | pass |
+| `model.optimize()` (torch.compile) | 0.000 | 0.993 / 0.974 | +0.02 | 0.998 / 0.958 | pass | pass |
+| FP8 weight-only fake quant (343 `nn.Linear`) | 0.000 | 0.988 / 0.966 | +0.04 | 0.987 / 0.650 | fail | pass |
+| RMSNorm eps 1e-2 | +0.742 | 0.912 / 0.710 | −0.42 | 0.704 / 0.102 | fail | fail |
+| one KV head dropped | +1.000 | 0.724 / 0.598 | −2.03 | 0.301 / −0.009 | fail | fail |
+| int4 per-tensor fake quant | +1.000 | 0.620 / 0.325 | −2.02 | 0.215 / −0.114 | fail | fail |
+
+Eager transcribes with WER 0 on all 8 samples (mean UTMOS 3.26). The
+dropped KV head and int4 never stop (120 patches of noise); RMSNorm eps 1e-2
+mumbles ("the coin coin chips over the legend…"). Module tier, FP8 weights on
+real VoxCPM2 inputs: 147 `nn.Linear` calls (GEMVs and prefill GEMMs) reach
+cosine >= 0.9992, relative L2 <= 0.040 and a norm within 0.7 %; MLPs <= 0.036,
+the whole LocDiT estimator <= 0.054; all pass the tier. int4 per tensor fails
+it in 140 of 147 calls, weights × 1.05 in 142 and a dropped output channel
+(channel 0 zeroed) in 88: in the other 59 that channel's outputs are small next
+to the tensor's RMS, within FP8 noise at module level and left to the
+end-to-end checks.
+
+Cost on the RTX 5070 Ti: `analyze` takes 34 s longer (the 8 eager samples
+17.8 s, scoring 16.5 s). Each `e2e` (and each paired A/B of the integration)
+of a candidate that passes the sanity floor takes about 11 s of scoring
+(Whisper-large-v3, WavLM and UTMOS22 loaded one after the other, one cold pass
+each) plus the candidate's own generation of the 8 samples: 18 s at eager
+speed, about 2.5 s for a candidate 7× faster, so +29 s and +14 s on top of the
+~67 s of an eager-speed `e2e`. A candidate below the floor costs nothing extra.
+Peak memory is the candidate model plus Whisper-large-v3 in fp16 (3.1 GB).
 
 ### What "faster" means
 
@@ -430,9 +519,9 @@ writes them: in the orchestrator's memory (the authority) and in `run.json` →
   subprocess, which hashes the bytes it loads; a changed capture is refused
   (`status: tampered`). A snapshot that changes during its evaluation voids
   the result.
-* `e2e` gets the baseline latency from the orchestrator (`--baseline-ms`) and
-  verifies `baseline.json` and the baseline outputs, main, held-out and
-  natural-length (`--verify`).
+* `e2e` gets the baseline latency and the quality mode from the orchestrator
+  (`--baseline-ms`, `--quality`) and verifies `baseline.json` and the baseline
+  outputs, main, held-out, natural-length and perceptual (`--verify`).
 * Each record stores its snapshot's sha256. Winners (`best_for_target`), the
   integration and the export use only records kernel-agent wrote (lines
   appended by anyone else are ignored) whose snapshot still has that digest.
@@ -1268,7 +1357,11 @@ kernel-agent optimize <hf-url> [options]
                                        VoxCPM: text, patches, timesteps, cfg, seed, compile,
                                                min_step_cosine, min_mean_step_cosine, min_spec_cosine,
                                                natural_text, natural_max_patches,
-                                               stop_tolerance, stop_near_tie
+                                               stop_tolerance, stop_near_tie,
+                                               near-lossless: max_error_increase, max_mos_drop,
+                                               min_speaker_similarity(_worst), perceptual_max_patches
+  --quality exact|near-lossless        near-lossless: numerics-changing optimisations pass a
+                                       perceptual gate (see "Quality modes")
   --backends cuda,triton,cute,tilelang,nvrtc
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
@@ -1348,6 +1441,7 @@ runs/<org>--<name>/<timestamp>/
     baseline_output.pt          output of the baseline run
     baseline_output_holdout.pt  ... of the held-out input
     baseline_output_natural.pt  ... of the natural-length run (stop condition)
+    baseline_output_perceptual.pt  perceptual samples + scores (--quality near-lossless)
     captures/<id>.pt            module + real inputs/outputs + post-call state
     captures/<id>.parent.pt     region target: the capture of its parent class
     targets/<id>/history/       snapshot of every evaluated version (region: + rewrite.py)
@@ -1642,6 +1736,15 @@ whenever an audio chunk reaches the caller, and optionally implement
 `metric_window()` (a context in which `run` stops after the first chunk) so the
 profile covers the time-to-first-audio window. `Workload.metric_value` is the
 extension point for further metrics.
+
+To opt in to the perceptual gate of `--quality near-lossless` (see "Quality
+modes"), implement `perceptual_samples()` (option overrides of a few short
+held-out samples, plain values), `perceptual_quality(samples)` (scores of
+`{"options", "output"}` samples; load scoring models lazily and free them) and
+`compare_perceptual(reference, candidate)` (paired, calibrated thresholds),
+and set `near_lossless_options` (the looser teacher-forcing floor).
+`workloads/perceptual.py` has the TTS scorers (`score_tts`, `compare_tts`);
+an LLM would score token-match rate and the perplexity delta on held-out text.
 
 ## Using it interactively from Claude Code
 

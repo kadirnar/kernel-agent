@@ -399,6 +399,9 @@ def evaluate(
     finally:
         for guard in guards:
             guard.restore()
+        from kernel_agent.kernels import compare
+
+        compare.TIER = compare.EXACT_TIER  # _evaluate set it from the capture
 
 
 def _evaluate(
@@ -425,6 +428,7 @@ def _evaluate(
 
         toolchain.setup()
 
+    from kernel_agent.kernels import compare as comparator
     from kernel_agent.kernels import integrity
     from kernel_agent.kernels.bench import compare_timing, time_call, wall_check
     from kernel_agent.kernels.compare import compare_side_effects, compare_structures
@@ -456,6 +460,9 @@ def _evaluate(
     cases = capture["cases"]
     for case in cases:
         case.setdefault("method", "forward")  # captures written before entrypoints existed
+    comparator.TIER = comparator.tier_of(capture)  # before the snapshot, which watches it
+    if comparator.TIER != comparator.EXACT_TIER:
+        result["tolerance_tier"] = comparator.TIER
     guard = integrity.Snapshot(reference)  # before the candidate is imported
     guards.append(guard)
 
@@ -889,6 +896,7 @@ def _check_outputs(
         else:
             keys = ("method", "signature", "output", "args", "kwargs", "post_args", "post_kwargs")
             truth = {"cases": [{k: c.get(k) for k in keys} for c in capture["cases"]]}
+            truth["tier"] = capture.get("tier")  # the tolerance tier (kernels/compare.py)
             _TRUTH.clear()  # one capture at a time: answer keys can be large
             _TRUTH[key] = truth
     if truth is not None:

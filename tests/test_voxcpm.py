@@ -265,6 +265,30 @@ def test_ttfa_rejects_a_broken_streaming_path(streaming):
         streaming.run(inputs)
 
 
+@pytest.mark.parametrize("metric", ["latency", "ttfa"])
+def test_perceptual_samples_run_on_the_metrics_code_path(fake, monkeypatch, metric):
+    """``--quality near-lossless`` (#71): the gate's samples go through ``run``, the path
+    the metric times (``generate`` / ``generate_streaming``), natural length, cloned voice."""
+    from kernel_agent.workloads import perceptual
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    fake.options["metric"] = metric
+    samples = fake.perceptual_samples()
+    generated, _ = perceptual.generate(fake, samples)
+    calls = fake.model.calls[-len(samples) :]
+    assert len(generated) == len(samples) == 8
+    for call, sample, gen in zip(calls, samples, generated, strict=True):
+        assert call["text"] == sample["text"] and call["min_len"] == 2 and call["max_len"] == 120
+        assert Path(call["reference_wav_path"]).is_file()
+        assert ("stream" in call) == (metric == "ttfa")
+        assert gen["output"]["audio"].numel() == 13 * 512  # stopped at patch 13, every chunk
+    assert "reference_wav" not in fake.options and fake.options["metric"] == metric
+
+    other = "latency" if metric == "ttfa" else "ttfa"  # a baseline of the other code path
+    result = perceptual.check(fake, {"metric": other, "samples": []})
+    assert not result["passed"] and "re-run analyze" in result["reason"]
+
+
 # ---------------------------------------------------------------- GPU calibration
 
 BROKEN_RMSNORM = """
