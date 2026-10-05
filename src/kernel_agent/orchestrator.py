@@ -716,14 +716,19 @@ class Orchestrator:
         the 95 % CI of its gain is above ``ab_min_gain``: the seed (the first
         candidate accepted against the unmodified model, or the combination
         against the best single item), then each step B = the accepted set A +
-        the next candidate. Sets that cannot be undone in-process are measured in
-        two processes back to back instead (``abtest.SEPARATE_ITERS`` runs each,
-        A measured again). ``integration.json`` keeps each step's ``ab`` record
-        and the ``projection`` (baseline − Σ est. saved ms) of every accepted set.
+        the next candidate, then the version swaps (:meth:`_swaps`): B = A with
+        one accepted item replaced by another version of it (the target's best
+        kernel, say, when the combination holds an older one). Sets that cannot
+        be undone in-process are measured in two processes back to back instead
+        (``abtest.SEPARATE_ITERS`` runs each, A measured again).
+        ``integration.json`` keeps each step's ``ab`` record (a swap's with
+        ``kind: swap``, ``old`` and ``new``) and the ``projection`` (baseline −
+        Σ est. saved ms) of every accepted set.
 
         ``reuse`` (re-integrations of the improve loop) takes the measurements
         of the same snapshot files (the same A and B for an A/B) from the
-        previous ``integration.json`` instead of measuring them again.
+        previous ``integration.json`` instead of measuring them again, and
+        tries the versions it swapped in or accepted again first.
 
         Everything comes from the verified truth (``truth.py``): the baseline
         latency the orchestrator recorded, records and snapshots whose digests
@@ -744,16 +749,20 @@ class Orchestrator:
         paired = {_ab_key(h): h for h in known if h.get("ab")}
         # items whose state cannot be undone in-process (snapshot paths: content-addressed)
         irreversible = set((previous or {}).get("irreversible") or [])
+        versions = self._previous_versions(previous or {}, digests)
         rechecks: list[dict[str, Any]] = []
         if self.cfg.recheck:  # fresh inputs, separate processes; failing kernels are refused
             items, composite, rechecks = self._recheck_kernels(
-                items, composite, previous or {}, digests
+                items, composite, previous or {}, digests, versions
             )
+            refused = {r["item"] for r in rechecks if not r.get("passed")}
+            versions = [v for v in versions if v[1] not in refused]
 
         def ab(
-            a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = ""
+            a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = "", **swap: str
         ) -> dict[str, Any]:
-            """B's result with its ``ab`` record (decided) against A."""
+            """B's result with its ``ab`` record (decided) against A (``swap``: the
+            ``kind``, ``old`` and ``new`` item of a version swap, kept in its history entry)."""
             a_items = [x for _, x in a]
             hit = paired.get((tuple(a_items), tuple(x for _, x in b)))
             r = dict(hit) if hit is not None else self._paired(a, b, note, irreversible)
@@ -766,7 +775,7 @@ class Orchestrator:
                 why = record.get("why") or r.get("reason") or r.get("status")
                 record.update(accepted=False, why=why)
             r["ab"] = record
-            history.append({"items": [x for _, x in b], **_short(r), "ab": record})
+            history.append({**swap, "items": [x for _, x in b], **_short(r), "ab": record})
             return r
 
         singles: list[tuple[tuple[str, str], dict[str, Any]]] = []
@@ -836,6 +845,22 @@ class Orchestrator:
                 if r.get("passed"):
                     reason = f"no significant gain: {abtest.describe(r['ab'])}; {r['ab']['why']}"
                 log(f"integrate: - {Path(item[1]).name} ({reason})")
+        for key, new in self._swaps(accepted, singles, versions, _alone(base_ms, history)):
+            old = next(a for a in accepted if _item_key(a) == key)
+            if _same_file(old, new):  # another snapshot of the same file: nothing to measure
+                continue
+            b = [new if a == old else a for a in accepted]  # in place: the same order
+            what = f"{ledger.item_label(new[1])} {Path(old[1]).name} -> {Path(new[1]).name}"
+            r = ab(accepted, b, f" (swap {what})", kind="swap", old=old[1], new=new[1])
+            if r.get("passed") and r["ab"]["accepted"]:
+                accepted, final = b, r
+                sets.append((list(accepted), r))
+                log(f"integrate: swap {what}: {r['median_ms']:.1f} ms ({abtest.describe(r['ab'])})")
+            else:
+                reason = r.get("reason") or r.get("status")
+                if r.get("passed"):
+                    reason = f"no significant gain: {abtest.describe(r['ab'])}; {r['ab']['why']}"
+                log(f"integrate: keep {Path(old[1]).name}, not {Path(new[1]).name} ({reason})")
         projection = self._projection(base_ms, sets, history)
         result = {
             "baseline_ms": base_ms,
@@ -877,17 +902,20 @@ class Orchestrator:
         composite: tuple[list[tuple[str, str]], dict[str, Any]] | None,
         previous: dict[str, Any],
         digests: dict[str, str | None] | None = None,
+        versions: list[tuple[str, str]] | None = None,
     ) -> tuple[
         list[tuple[str, str]],
         tuple[list[tuple[str, str]], dict[str, Any]] | None,
         list[dict[str, Any]],
     ]:
         """The independent re-check (``kernels/recheck.py``) of every kernel the integration
-        considers (each target's best and the kernels of the measured combination): fresh
-        inputs of the captured shapes against a freshly computed reference, reference and
-        kernel timed in processes of their own. A kernel that fails it is refused (a log
-        line and a ``recheck_failed`` event with the reason), and so is a combination with
-        it. A re-integration reuses the result of the same snapshot (``previous``).
+        considers (each target's best, the kernels of the measured combination and the
+        ``versions`` a re-integration tries as swaps): fresh inputs of the captured shapes
+        against a freshly computed reference, reference and kernel timed in processes of
+        their own. A kernel that fails it is refused (a log line and a ``recheck_failed``
+        event with the reason; a refused version is a record with ``passed: false``), and
+        so is a combination with it. A re-integration reuses the result of the same
+        snapshot (``previous``).
 
         A correct kernel whose speedup disagrees with its record (``speed_disagrees``) is a
         warning (a log line and a ``recheck_speed_disagrees`` event), not a refusal: it is
@@ -969,7 +997,7 @@ class Orchestrator:
                 items[i] = (kind, current)
                 if digests is not None:
                     digests[current.partition("=")[2]] = digest
-        for kind, arg in composite[0] if composite else []:
+        for kind, arg in [*(composite[0] if composite else []), *(versions or [])]:
             if kind == "kernel":
                 check(arg)
         if refused:
@@ -1191,25 +1219,13 @@ class Orchestrator:
         """Projected (baseline − Σ est. saved ms of its items) vs measured latency of every
         accepted set: a kernel's saving is its module-level estimate, a transform's its
         measured gain alone (paired against the unmodified model)."""
-        alone = {
-            h["items"][0]: base_ms * float(h["ab"]["gain"])
-            for h in history
-            if len(h["items"]) == 1
-            and not (h.get("ab") or {}).get("a_items")
-            and h.get("passed")
-            and (h.get("ab") or {}).get("gain") is not None
-        }
+        alone = _alone(base_ms, history)
         out = []
         for combo, r in sets:
             saved: dict[str, float | None] = {}
-            for kind, arg in combo:
-                est = None
-                if kind == "kernel":
-                    target_id, _, path = arg.partition("=")
-                    est = self._kernel_saving(target_id, Path(path).name)
-                elif arg in alone:
-                    est = alone[arg]
-                saved[arg] = None if est is None else round(est, 3)
+            for item in combo:
+                est = self._saving(item, alone)
+                saved[item[1]] = None if est is None else round(est, 3)
             known = [v for v in saved.values() if v is not None]
             out.append(
                 {
@@ -1220,6 +1236,78 @@ class Orchestrator:
                 }
             )
         return out
+
+    def _saving(self, item: tuple[str, str], alone: dict[str, float]) -> float | None:
+        """Est. saved ms of an integration item: a kernel's module-level estimate
+        (:meth:`_kernel_saving`), a transform's measured gain alone (``alone``)."""
+        kind, arg = item
+        if kind == "kernel":
+            target_id, _, path = arg.partition("=")
+            return self._kernel_saving(target_id, Path(path).name)
+        return alone.get(arg)
+
+    def _swaps(
+        self,
+        accepted: list[tuple[str, str]],
+        singles: list[tuple[tuple[str, str], dict[str, Any]]],
+        versions: list[tuple[str, str]],
+        alone: dict[str, float],
+    ) -> list[tuple[str, tuple[str, str]]]:
+        """The version swaps to try on the accepted set, as (item key, new version): the
+        seed (the measured combination above all) can hold an older version of a kernel
+        target or transform idea than its best one, which the greedy additions skip.
+
+        Of every accepted target and idea, first the ``versions`` a previous integration
+        swapped in or accepted, in its order (a re-integration of the same files takes the
+        same steps: the reuse cache), then its best version measured alone (``singles``: the
+        target's best verified and re-checked kernel, the idea's transform of the fastest
+        passing record) ordered by expected gain: the new version's est. saved ms minus the
+        accepted one's (:meth:`_saving`: a kernel's module-level estimate at its
+        conservative speedup, a transform's paired gain alone; unknown last)."""
+        current = {_item_key(a): a for a in accepted}
+        seen = set(accepted)
+        swaps: list[tuple[str, tuple[str, str]]] = []
+        for group, rank in ((versions, False), ([i for i, _ in singles], True)):
+            ranked: list[tuple[float | None, str, tuple[str, str]]] = []
+            for item in group:
+                key = _item_key(item)
+                if key not in current or item in seen:
+                    continue
+                seen.add(item)
+                new, old = self._saving(item, alone), self._saving(current[key], alone)
+                ranked.append((None if new is None else new - (old or 0.0), key, item))
+            if rank:
+                ranked.sort(key=lambda g: (g[0] is None, -(g[0] or 0.0)))
+            swaps += [(key, item) for _, key, item in ranked]
+        return swaps
+
+    def _previous_versions(
+        self, previous: dict[str, Any], digests: dict[str, str | None]
+    ) -> list[tuple[str, str]]:
+        """The versions a previous integration swapped in (tried, in order) or accepted that
+        are still verified snapshots: a kernel of a correct record of its target, a
+        transform of a passing ``evaluate_e2e`` record faster than the baseline (their
+        sha256 go to ``digests``). A re-integration tries them as swaps first (:meth:`_swaps`)."""
+        news = [h.get("new") for h in previous.get("history") or [] if h.get("kind") == "swap"]
+        olds = [a.get("item") for a in previous.get("accepted") or []]
+        transforms = {
+            Path(s[0]).name: s for _, snaps in self._e2e_records() for s in snaps if s is not None
+        }
+        versions: list[tuple[str, str]] = []
+        for arg in map(str, filter(None, [*news, *olds])):
+            target_id, sep, _ = arg.partition("=")
+            if sep and "/" not in target_id:  # target=path
+                if (kernel := self._kernel_snapshot(arg)) is None:
+                    continue
+                item, (path, digest) = ("kernel", f"{kernel[0]}={kernel[1]}"), kernel[1:]
+            elif (snap := transforms.get(Path(arg).name)) is not None:
+                item, (path, digest) = ("transform", snap[0]), snap
+            else:
+                continue
+            if item not in versions:
+                versions.append(item)
+                digests[path] = digest
+        return versions
 
     def _kernel_saving(self, target_id: str, snapshot: str) -> float | None:
         """``est_saved_ms_per_run`` of the verified evaluation of a kernel snapshot; with a
@@ -1657,6 +1745,15 @@ def _item_key(item: tuple[str, str]) -> str:
     return f"transform {ledger.snapshot_stem(arg)}"
 
 
+def _same_file(a: tuple[str, str], b: tuple[str, str]) -> bool:
+    """Whether two integration items apply files of the same content."""
+    try:
+        paths = [Path(arg.partition("=")[2] if kind == "kernel" else arg) for kind, arg in (a, b)]
+        return truth.sha256_file(paths[0]) == truth.sha256_file(paths[1])
+    except OSError:
+        return False
+
+
 def _reranks(result: dict[str, Any]) -> bool:
     """Whether a re-check changed how its target's snapshots rank (a re-evaluation, a
     speed cap)."""
@@ -1721,6 +1818,19 @@ def _cli(
 def _ab_key(h: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """(A items, B items) of an A/B history entry: what a re-integration may reuse."""
     return tuple(h["ab"].get("a_items") or []), tuple(h["items"])
+
+
+def _alone(base_ms: float, history: list[dict[str, Any]]) -> dict[str, float]:
+    """Est. saved ms of every item that passed alone: its paired gain against the
+    unmodified model × the baseline."""
+    return {
+        h["items"][0]: base_ms * float(h["ab"]["gain"])
+        for h in history
+        if len(h["items"]) == 1
+        and not (h.get("ab") or {}).get("a_items")
+        and h.get("passed")
+        and (h.get("ab") or {}).get("gain") is not None
+    }
 
 
 def _short(r: dict[str, Any]) -> dict[str, Any]:

@@ -918,13 +918,18 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
     The best single item seeds the combination, or the systems agent's best
     measured combination (``composite``) when it was faster; every later history
     entry adds one item to the accepted set and is either accepted (new level),
-    rejected for no gain, or failed (quality check / error). A step judged by a
+    rejected for no gain, or failed (quality check / error). A version swap
+    (``kind: swap``) replaces an accepted item by another version of it
+    (``swap``: its label reads ``target #old → #new``). A step judged by a
     paired A/B (``ab``) starts at A's median of that session, so its bar is the
     paired difference; its ``rule`` is the acceptance rule.
     """
     base = _num(data.get("baseline_ms"))
     history = data.get("history") or []
     accepted = [a.get("item") for a in data.get("accepted") or []]
+    for h in reversed(history):  # the accepted set before its swaps: the seed + additions
+        if h.get("kind") == "swap" and _swapped(h) and h.get("new") in accepted:
+            accepted[accepted.index(h["new"])] = h.get("old")
     composite = data.get("composite") or {}
     together = composite.get("items")
     if base is None:
@@ -940,13 +945,24 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
         level = float(seed["median_ms"])
     for h in history:
         items = h.get("items") or []
-        if len(items) < 2 or (items == together and h is seed):
+        swap = h.get("kind") == "swap"
+        if not swap and (len(items) < 2 or (items == together and h is seed)):
             continue
         item, ms = items[-1], _num(h.get("median_ms"))
         ab = h.get("ab") or {}
         start = _num(ab.get("a_median_ms"))
         start = level if start is None else start
-        if items == together:  # measured, but slower than the best single item
+        if swap:
+            old, new = str(h.get("old")), str(h.get("new"))
+            if _swapped(h) and ms is not None:
+                step, level = _step("keep", new, start, ms), ms
+            elif h.get("passed") and ms is not None:
+                step = _step("nogain", new, start, ms)
+            else:
+                step = _step("fail", new, level, ms, h.get("reason") or h.get("status"))
+            label = f"{ledger.item_label(new)} {ledger.item_version(old)} → "
+            step.update(label=label + ledger.item_version(new), swap=True)
+        elif items == together:  # measured, but slower than the best single item
             kind = "nogain" if h.get("passed") and ms is not None else "fail"
             reason = None if kind == "nogain" else h.get("reason") or h.get("status")
             step = _together(_step(kind, item, level, ms, reason), composite)
@@ -975,6 +991,11 @@ def _step(
         "ms": ms,
         "reason": str(reason or ""),
     }
+
+
+def _swapped(h: dict[str, Any]) -> bool:
+    """Whether a version swap of ``integration.json`` ``history`` was accepted."""
+    return bool(h.get("passed") and (h.get("ab") or {}).get("accepted"))
 
 
 def _together(step: dict[str, Any], composite: dict[str, Any]) -> dict[str, Any]:
@@ -1099,14 +1120,16 @@ def _draw_integration(
         if s["kind"] == "total":
             names.append(s["label"])
         else:
-            name = "\n".join(textwrap.wrap(f"+ {s['label']}".replace("_", "_ "), 15))
+            label = s["label"] if s.get("swap") else f"+ {s['label']}"
+            name = "\n".join(textwrap.wrap(label.replace("_", "_ "), 15))
             names.append(name.replace("_ ", "_") + f"\n({s['source']})")
     ax.set_xticks(range(len(steps)), names)
     ax.tick_params(axis="x", length=0)
     ax.grid(axis="x", visible=False)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
     ax.set_ylabel(f"{metric.label} (ms)")
-    kept = sum(s["kind"] == "keep" for s in steps)
+    kept = sum(s["kind"] == "keep" and not s.get("swap") for s in steps)
+    swaps = sum(s["kind"] == "keep" and bool(s.get("swap")) for s in steps)
     dropped = [ledger.item_label(h["items"][0]) for h in singles if not h.get("passed")]
     rule = next((s["rule"] for s in steps if s.get("rule")), None)
     test = "gain > 1 %"
@@ -1119,6 +1142,8 @@ def _draw_integration(
         f"{len(singles)} items measured alone, {kept} combined greedily (each must pass the "
         f"quality check and {test})"
     )
+    if swaps:
+        subtitle += f", {swaps} version swap{'s' if swaps > 1 else ''}"
     if dropped:
         subtitle += f"  ·  failed alone: {_short(', '.join(dropped), 60)}"
     _header(ax, f"Integration: {base:,.1f} → {final:,.1f} ms ({base / final:.2f}×)", subtitle)
