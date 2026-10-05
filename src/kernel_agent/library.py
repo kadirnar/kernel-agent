@@ -13,8 +13,8 @@ definition + solution + evaluation per kernel)::
         result.json   its evaluation: speedup and per-case numbers, % of SOL, backend
         NOTES.md      the kernel engineer's notes of that run
         entry.json    model repo, torch version, dates, signature summary (method +
-                      shapes/dtypes of the captured cases), flags, and the sha256 of
-                      every file above
+                      shapes/dtypes of the captured cases), flags, precision (``exact``,
+                      or e.g. ``fp8_weights``), and the sha256 of every file above
       lessons/<backend>.md  lessons/<module_family>.md   rules distilled by the librarian
 
 * **Store** (:func:`store_run`, after every integration): the verified best kernel
@@ -24,7 +24,8 @@ definition + solution + evaluation per kernel)::
   updates its entry (``runs`` lists every run that stored it).
 * **Reuse** (:func:`seed_target`, before a target's first agent session): up to
   :data:`MAX_PRIORS` entries of the same module class and GPU architecture whose
-  entrypoints and dtypes cover the target's are copied to
+  entrypoints and dtypes cover the target's (and whose precision the target allows: a
+  reduced-precision kernel serves only a target of that precision) are copied to
   ``candidates/prior_<entry-id>.py`` and evaluated like any candidate (verified
   capture, snapshot, ``results.jsonl``, a ledger row with the hypothesis ``prior
   winner from <repo>``), at no LLM cost. The engineer prompt lists them slow → fast
@@ -289,14 +290,24 @@ def find(entry_id_or_prefix: str, *, base: Path | None = None) -> list[Entry]:
     return found or [e for e in entries(base=base) if e.id.startswith(entry_id_or_prefix)]
 
 
+def precision_of(capture_info: dict[str, Any]) -> str:
+    """The precision a target's kernels may use: its capture's reduced precision
+    (``fp8_weights``; recorded only in the near-lossless tier), else ``exact``."""
+    return str(capture_info.get("precision") or "exact")
+
+
 def matches(arch: str, spec: dict[str, Any], *, limit: int = MAX_PRIORS) -> list[Entry]:
     """Entries of ``arch`` that can serve the target ``spec``: same module class, compatible
-    entrypoints and dtypes; closest shapes, accepted end to end and fastest first; one entry
-    per kernel source."""
+    entrypoints and dtypes, and a precision the target allows (an ``exact`` kernel serves
+    any target, a reduced-precision one only a target of that precision); closest shapes,
+    accepted end to end and fastest first; one entry per kernel source."""
     target_sig = signature_summary(spec.get("capture") or {})
+    allowed = {"exact", precision_of(spec.get("capture") or {})}
     found = []
     for entry in entries(arch, str(spec.get("module_class") or "")):
         if entry.meta.get("broken") or entry.meta.get("module_class") != spec.get("module_class"):
+            continue
+        if str(entry.meta.get("precision") or "exact") not in allowed:
             continue
         if compatible(entry.meta.get("signature") or {}, target_sig, entry.source()):
             found.append(entry)
@@ -445,6 +456,7 @@ def store_run(
             "dtype": (data.get("workload") or {}).get("dtype"),
             "target_id": target_id,
             "phase": spec.get("phase"),
+            "precision": precision_of(spec.get("capture") or {}),  # exact | fp8_weights | ...
             "backend": backend,
             "speedup": speedup,
             "pct_of_sol": rec.get("pct_of_sol"),
@@ -958,6 +970,8 @@ def cmd_list(ns: argparse.Namespace) -> int:
         m = e.meta
         problem = e.problem()
         flags = "accepted" if m.get("accepted") else "winner" if m.get("module_winner") else ""
+        if m.get("precision") not in (None, "exact"):  # e.g. fp8_weights
+            flags = f"{flags} {m['precision']}".strip()
         sol = m.get("pct_of_sol")
         rows.append(
             (
@@ -995,6 +1009,7 @@ def cmd_show(ns: argparse.Namespace) -> int:
         "repo_id",
         "target_id",
         "phase",
+        "precision",
         "backend",
         "speedup",
         "pct_of_sol",

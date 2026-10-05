@@ -429,9 +429,12 @@ def capture_module(
     variants: Sequence[dict[str, Any]] = (),
     variant_cases: int = 2,
     tier: str | None = None,
+    precision: str | None = None,
 ) -> dict[str, Any]:
     """Run the workload and save one instance of ``cls`` plus its calls (``tier``: the
-    tolerance tier the evaluator applies, :mod:`kernel_agent.kernels.compare`).
+    tolerance tier the evaluator applies, :mod:`kernel_agent.kernels.compare`;
+    ``precision``: the reduced precision the target may use, e.g. ``fp8_weights``, for the
+    speed of light of :mod:`kernel_agent.kernels.roofline`).
 
     The target's instances are those a patch replaces (``cls``, matching
     ``qualname_regex``); every call of theirs goes into the workload profile
@@ -514,6 +517,7 @@ def capture_module(
             "cases": cases,
             **({"phase": phase} if phase else {}),
             **({"tier": tier} if tier else {}),
+            **({"precision": precision} if precision else {}),
         },
         path,
     )
@@ -534,6 +538,7 @@ def capture_module(
         "bytes": path.stat().st_size,
         **({"phase": phase} if phase else {}),
         **({"tier": tier} if tier else {}),
+        **({"precision": precision} if precision else {}),
         **({"variants": variant_info} if variant_info else {}),
         # every call of the target's instances; the facts go into the engineer prompt
         "workload": {"calls": profile["calls"], "facts": profile["facts"]},
@@ -569,11 +574,14 @@ def capture_calls(
     path: Path,
     *,
     instances: int = 1,
+    tier: str | None = None,
+    precision: str | None = None,
 ) -> None:
     """Build a capture file from explicit ``(args, kwargs, count[, method])`` calls.
 
     Used by tests and for synthetic shapes (e.g. other batch sizes) that the
-    workload run did not exercise.  ``method`` defaults to ``"forward"``."""
+    workload run did not exercise.  ``method`` defaults to ``"forward"``; ``tier`` and
+    ``precision`` as in :func:`capture_module`."""
     cases = []
     totals: collections.Counter[str] = collections.Counter()
     with torch.inference_mode():
@@ -607,6 +615,8 @@ def capture_calls(
             "instances": instances,
             "methods": dict(totals.most_common()),
             "cases": cases,
+            **({"tier": tier} if tier else {}),
+            **({"precision": precision} if precision else {}),
         },
         path,
     )

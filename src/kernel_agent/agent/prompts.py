@@ -155,9 +155,11 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
-                    # "reduced": --quality near-lossless captures the target with the
-                    # near-lossless tolerance tier (kernels/compare.py); default exact
-                    "precision": {"type": "string", "enum": ["exact", "reduced"]},
+                    # fp8_weights / reduced (kernels.compare.PRECISIONS): --quality
+                    # near-lossless captures the target with the near-lossless tolerance
+                    # tier; an exact run refuses it. Default exact.
+                    "precision": {"type": "string", "enum": ["exact", "fp8_weights", "reduced"]},
+                    "precision_why": {"type": "string"},
                     # other starting points for parallel workers (workers.py)
                     "alternatives": {
                         "type": "array",
@@ -191,6 +193,35 @@ PLAN_SCHEMA: dict[str, Any] = {
 }
 
 
+def precision_policy(quality: str) -> str:
+    """The planner's precision rules for the run's ``--quality`` mode."""
+    if quality == "near-lossless":
+        return """
+# Precision (`--quality near-lossless`)
+Numerics-changing optimisations are allowed where the perceptual quality stays
+within the noise of eager. For a target whose time goes into streaming weights
+(decode GEMVs and skinny GEMMs: `nn.Linear` layers, MLP or attention projections
+at a few rows per call, memory or launch bound) set `precision: "fp8_weights"`
+and a one-line `precision_why` with the number that justifies it (e.g. "M=1
+decode GEMVs, 40 % of the run, memory bound: FP8 halves the bytes"). Its
+kernels then store the weights in FP8 e4m3 with one scale per output channel
+(activations stay bf16), the target is checked in the near-lossless tolerance
+tier, and every end-to-end evaluation in the run's perceptual gate.
+`precision: "reduced"` (also
+with `precision_why`) is for another numerics-changing idea. Leave `precision`
+unset (exact) where lower precision buys nothing or risks the output: norms,
+softmax and attention math, element-wise ops, compute-bound GEMMs (~64+ rows
+per call, e.g. a DiT at batch 8 under CFG), and the output / stop heads of
+autoregressive models.
+"""
+    return """
+# Precision (`--quality exact`)
+This run keeps full precision: do not set `precision` (a target with
+`fp8_weights` or `reduced` is refused); every kernel must match eager within
+rounding noise.
+"""
+
+
 def planner_prompt(
     card: dict[str, Any],
     baseline: dict[str, Any],
@@ -199,6 +230,7 @@ def planner_prompt(
     max_targets: int,
     python: str,
     toolchain: str,
+    quality: str = "exact",
 ) -> str:
     base = {k: baseline.get(k) for k in ("workload", "median_ms", "peak_mem_gb", "deterministic")}
     if "compiled_ms" in baseline:  # the strong baseline (strong_baseline.py)
@@ -273,7 +305,7 @@ model. Specialist agents will then write custom kernels for each target you pick
    + CUDA graphs, merged projections, precomputed tables, removing host syncs)
    when the profile shows launch/CPU-bound behaviour or redundant work.
 5. Ids are short snake_case.
-
+{precision_policy(quality)}
 Return the plan as structured output.
 
 {_env_block(python, toolchain)}"""
@@ -373,6 +405,50 @@ check with a fallback.
 """
 
 
+def reduced_precision(target: dict[str, Any], capture_info: dict[str, Any]) -> str | None:
+    """The reduced precision a target may use: its spec's ``precision`` when its capture is
+    in the near-lossless tier (``--quality near-lossless``), else None."""
+    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, REDUCED_PRECISIONS
+
+    precision = target.get("precision")
+    if precision in REDUCED_PRECISIONS and capture_info.get("tier") == NEAR_LOSSLESS_TIER:
+        return str(precision)
+    return None
+
+
+def _precision_block(precision: str | None, target: dict[str, Any]) -> str:
+    """The reduced-precision contract of the engineer prompt (empty for exact targets)."""
+    if precision is None:
+        return ""
+    why = f" (planner: {target['precision_why']})" if target.get("precision_why") else ""
+    if precision == "fp8_weights":
+        contract = """FP8 weight-only:
+* quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
+  quantize_fp8, fp8_error`): e4m3 codes, one fp32 scale per output channel; keep
+  no bf16 copy of a quantised weight (half the bytes is the point);
+* activations stay bf16 (never quantise them), accumulate in fp32, apply the
+  scale (and bias) once per output in the epilogue, round to bf16 once;
+* verified examples: `cuda_fp8_gemv.py` (decode GEMV, M <= 4),
+  `cuda_fp8_skinny_gemm.py` (bf16 tensor cores, M <= 32); guide: "Low-precision
+  weights" below;
+* report the numerical error in `NOTES.md`: `fp8_error(weight, q, scale)` of the
+  weights and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
+    else:
+        contract = """Reduced precision: keep the change to the numerics as small as the speedup
+allows, and report the numerical error (the evaluator's per-case `min_cosine` /
+`max_rel_l2`) in `NOTES.md`."""
+    return f"""
+# Precision: `{precision}`
+This target may change numerics{why}.
+The evaluator checks it in the near-lossless tolerance tier: per output tensor
+cosine >= 0.996, relative L2 error <= 0.08, norm within ±2 %, every element
+within 0.5 x RMS + 0.125 x |reference| (the exact tier would reject FP8
+weights). End to end, the run's perceptual gate decides. This replaces the "no
+fp8/int8" rule below for this target only.
+{contract}
+"""
+
+
 def engineer_prompt(
     target: dict[str, Any],
     capture_info: dict[str, Any],
@@ -385,6 +461,9 @@ def engineer_prompt(
     guides = []
     for b in dict.fromkeys(BACKEND_GUIDES[b] for b in backends if b in BACKEND_GUIDES):
         guides.append(knowledge(b))
+    precision = reduced_precision(target, capture_info)
+    if precision is not None:
+        guides.append(knowledge("low_precision.md"))
     backend_list = "\n".join(
         f"  {i + 1}. `{b}` — {BACKEND_NAMES.get(b, b)}" for i, b in enumerate(backends)
     )
@@ -451,7 +530,7 @@ instances' configuration generically (read sizes from the module). Expose tuning
 parameters (block sizes, `num_warps`, `num_stages`, vector widths) as keyword
 arguments with defaults, `def build(reference, BLOCK=1024, num_warps=4)`, and
 tune them with `sweep_candidate`.
-{entrypoints}
+{entrypoints}{_precision_block(precision, target)}
 # Backends (in priority order)
 {backend_list}
 Start with the first. When it is correct and fast, try the next one only if
@@ -610,6 +689,12 @@ def research_prompt(
         f"  * `{c['signature']}` — {c['count']} calls per run per instance"
         for c in capture_info.get("cases", [])
     )
+    precision = ""
+    if reduced := reduced_precision(target, capture_info):  # knowledge/low_precision.md
+        precision = (
+            f"* precision: `{reduced}` (near-lossless tolerance tier; low_precision.md): "
+            f"{target.get('precision_why', '')}\n"
+        )
     return f"""You are a senior GPU performance researcher, brought in with a clean context.
 The kernel engineer of the target below has plateaued. You do not know its reasoning:
 form your conclusions from the files and the ledger only. You do not write kernel
@@ -621,7 +706,7 @@ session, which starts fresh with your plan, the ledger digest and `NOTES.md`.
 {_scope_lines(target)}* why it matters: {target.get("why", "")}
 * planner's approach: {target.get("approach", "")}
 * backends: {", ".join(target.get("backends", []))}
-* captured cases:
+{precision}* captured cases:
 {cases}
 {_workload_block(capture_info)}
 # Evidence

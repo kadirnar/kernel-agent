@@ -14,7 +14,7 @@ benchmark harness for it first.
 
 ```bash
 uv sync --extra all
-uv run kernel-agent doctor --smoke      # check GPU, compilers, all 5 backends
+uv run kernel-agent doctor --smoke      # check GPU, compilers, all 5 backends (+ FP8 examples)
 uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
 ```
 
@@ -210,10 +210,11 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   the stop logits, margins reported). Options set with `-o` win. A candidate
   below the floor is rejected without running the gate.
 * **Module tolerance tier.** A target whose spec allows reduced precision
-  (`"precision": "reduced"` in the plan; when the planner sets it is issue #72)
-  is captured with the `near-lossless` tier of `kernels/compare.py`, recorded
-  in its sealed capture (an edited `spec.json` cannot change it, and a
-  candidate that changes `compare.TIER` is an integrity violation): instead of
+  (`"precision": "fp8_weights"` or `"reduced"` in the plan, see "Low-precision
+  weights" below) is captured with the `near-lossless` tier of
+  `kernels/compare.py`, recorded in its sealed capture (an edited `spec.json`
+  cannot change it, and a candidate that changes `compare.TIER` is an
+  integrity violation): instead of
   per-element (atol, rtol), cosine >= 0.996, relative L2 error <= 0.08, the
   norm within ±2 % (rounding noise is unbiased, a wrong scale is not) and every
   element within 0.5 × RMS + 0.125 × |reference| (a corrupted row fails).
@@ -255,6 +256,94 @@ each) plus the candidate's own generation of the 8 samples: 18 s at eager
 speed, about 2.5 s for a candidate 7× faster, so +29 s and +14 s on top of the
 ~67 s of an eager-speed `e2e`. A candidate below the floor costs nothing extra.
 Peak memory is the candidate model plus Whisper-large-v3 in fp16 (3.1 GB).
+
+### Low-precision weights (FP8)
+
+Decode GEMVs and skinny GEMMs stream their weights once per call, so storing
+the weights in FP8 halves their time. The precision policy follows the quality
+mode:
+
+* **Planner.** In a `--quality near-lossless` run the planner prompt allows
+  `"precision": "fp8_weights"` on a target whose time goes into streaming
+  weights (`nn.Linear`, MLP or attention projections at a few rows per call),
+  with a one-line `precision_why`; `"reduced"` is for another numerics-changing
+  idea. Norms, attention math, compute-bound GEMMs and output / stop heads stay
+  exact. In an exact run the prompt forbids it and the orchestrator drops a
+  planned target with a reduced precision (`plan: dropping <id>: precision
+  'fp8_weights' needs --quality near-lossless`), in `plan` and in `improve`'s
+  re-plans. `capture` records the precision next to the tier in the sealed
+  capture (`kernels/compare.py`: `REDUCED_PRECISIONS`).
+* **Engineer.** The prompt of such a target states the contract: quantise once
+  in `build()` (e4m3, one fp32 scale per output channel, no bf16 copy kept),
+  bf16 activations, fp32 accumulation, scale and bias in the epilogue, and
+  report the numerical error (`kernel_agent.kernels.quant.fp8_error` for the
+  weights; the evaluator adds `max_rel_l2` per case in the near-lossless tier).
+  It gets `knowledge/low_precision.md` (formats, scales, dequantisation in
+  registers, outliers, what sm_120 supports, when FP4 is worth it) and two
+  verified examples: `examples/cuda_fp8_gemv.py` (decode GEMV, M <= 4) and
+  `examples/cuda_fp8_skinny_gemm.py` (M <= 32, bf16 `mma.sync` fed with
+  e4m3 codes upcast in registers). Both pass the evaluator in the
+  near-lossless tier and fail the exact tier (relative L2 ~0.026 > 0.02, ~20 %
+  of the elements outside the bf16 tolerance); `doctor --smoke` checks both
+  on sm_89+ GPUs.
+* **Speed of light.** For a `fp8_weights` target the 2-D weights count at one
+  byte per element plus 4 bytes of scale per output channel, so `pct_of_sol`
+  measures the FP8 kernel against the bytes it must stream.
+* **Library.** Entries record their precision; an FP8 kernel is only reused
+  for a target of that precision, an exact one for any target.
+
+Measured on the RTX 5070 Ti (VoxCPM2 shapes; "streamed": a CUDA graph of
+back-to-back calls over enough weight copies to exceed the 48 MB L2, as in the
+model; scratch benchmark, not part of the test suite):
+
+| GEMM | cuBLAS bf16 | FP8 example | speedup |
+|---|---|---|---|
+| [1, 2048] x [2048, 6144] (base LM gate / up) | 32.3 us (780 GB/s) | GEMV 16.2 us (777 GB/s) | 1.99x |
+| [1, 2048] x [2048, 12288] (gate + up merged) | 62.8 us | GEMV 30.8 us (819 GB/s) | 2.04x |
+| [1, 6144] x [6144, 2048] (base LM down) | 31.7 us | GEMV 16.5 us (764 GB/s) | 1.93x |
+| [22, 1024] x [1024, 4096] (LocDiT up) | 12.1 us | skinny 6.9 us (610 GB/s) | 1.75x |
+| [22, 4096] x [4096, 1024] (LocDiT down) | 13.2 us | skinny 7.6 us (556 GB/s) | 1.75x |
+| [32, 2048] x [2048, 6144] | 34.9 us | skinny 18.9 us (667 GB/s) | 1.85x |
+| [8 / 16, 2048] x [2048, 6144] (`batch_size` 8 / 16: LM gate / up) | 31.5 / 31.7 us | skinny 16.3 / 16.6 us | 1.94x / 1.91x |
+| [8 / 16, 2048] x [2048, 12288] (gate + up merged) | 65.4 / 66.1 us | skinny 30.8 / 31.2 us | 2.12x / 2.12x |
+| [8 / 16, 6144] x [6144, 2048] (LM down) | 39.0 / 39.1 us | skinny 17.0 / 17.6 us | 2.30x / 2.22x |
+| [176, 1024] x [1024, 4096] (`batch_size` 8: LocDiT, CFG) | 20.0 us | skinny 26.6 us | 0.75x |
+
+End to end on VoxCPM2 (eager, batch 1): the skinny example applied to all 343
+`nn.Linear` of both LMs and the LocDiT (as a transform: real e4m3 storage and
+the example's kernels) passes `--quality near-lossless` (teacher forcing mean
+step cosine 0.986, held-out input, stop check; perceptual gate: error rate
++0.00, speaker similarity 0.989 / worst 0.962, MOS +0.06) at 4952 ms instead
+of 5576 ms (1.13x: eager decode is launch bound), with the model's allocated
+memory down from 5.31 to 3.40 GB (the 3.82 GB of bf16 `nn.Linear` weights
+become 1.91 GB). In exact mode teacher forcing rejects it (0.986 < 0.99).
+
+In the batched workload (`-o batch_size=N`) the LM GEMMs (M = N) stay
+weight-bandwidth bound and gain like M = 1; the LocDiT at M = 2N × 11 is
+compute bound (cuBLAS bf16 at ~74 TFLOP/s), so FP8 weights do not help there
+(the skinny kernel runs it in groups of 32 tokens, slower than cuBLAS bf16).
+
+Against the VoxCPM2 run's own fused bf16 MLP kernel (two launches, one pybind
+call), an FP8 MLP composed from the examples (merged gate / up GEMV, `silu *
+up` in torch, down GEMV) streams the base LM decode MLP in 48.8 us instead of
+92.1 us (1.89x) and the LocDiT MLP (`[2, 11, 1024]`) in 22.8 us instead of
+33.7 us (1.48x); called eagerly, its extra launches make the LocDiT one slower
+(61 vs 37 us): a fused FP8 MLP is the agent's job. The module evaluator times
+eager calls with a warm L2: a weight that fits in L2 stays cached between its
+calls, so FP8 gains less there (the GEMV on [2048, 6144]: 1.3-1.7x, the skinny
+GEMM on `[2, 11, 1024]`: 1.4x; host overhead ~16-19 us per call included),
+while the merged gate + up weight (50 MB, more than L2; `doctor --smoke`'s
+GEMV case) measures 2.0x. A bf16 reference that only just fits in L2 can time
+slower next to the candidate's weights than alone, which the evaluator's
+reference-timing check flags (rarely: once in ~15 evaluations of the
+[2048, 6144] case). Output error against bf16: relative L2 0.026 per
+GEMM, 0.046 per MLP (gate, up and down in FP8). On sm_120 with this toolchain
+(nvcc 13.4) `mma.sync` with e4m3 x e4m3 inputs works (W8A8, not weight-only),
+block-scaled FP4 MMA needs `-gencode=arch=compute_120a,code=sm_120a`, and
+torch's `_scaled_mm` runs FP8 row-wise and NVFP4 (both quantise activations).
+NVFP4 weights (e2m1, e4m3 scale per 16) have ~0.10 relative L2 error on
+Gaussian rows, above the module tier's 0.08: there is no `nvfp4_weights`
+precision yet.
 
 ### What "faster" means
 
@@ -725,6 +814,10 @@ hardware limit (`kernel_agent/kernels/roofline.py`).
   reuses the same inputs and runs them with a warm cache. The result also has
   the weighted `pct_of_sol` (cases weighted by calls per run), `sol_ms_weighted`,
   the dominant `bound` and `launch_floor_ms`.
+* A `fp8_weights` target (its capture's `precision`, see "Low-precision
+  weights") counts its 2-D weights at one byte per element plus one fp32
+  scale per output channel (`roofline.WEIGHT_BITS`), the bytes its kernels must
+  stream.
 * `new_ms < 0.9 × sol_ms` is faster than the hardware allows. That case and the
   result get `suspicious_faster_than_sol`, which is a warning and not a
   rejection. If the reference itself beats 0.9 × `sol_ms`, the estimate is wrong
@@ -1347,8 +1440,10 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
   session: at the start of the `optimize` kernels phase, and in `improve`
   before the scheduler picks a slice. This costs no LLM calls. An entry
   matches when it has the same module class and GPU architecture, implements
-  the target's entrypoints (`forward_step`, ...) and was verified on the
-  target's dtypes. Shapes may differ, because kernels read their sizes from the
+  the target's entrypoints (`forward_step`, ...), was verified on the
+  target's dtypes and has a precision the target allows (`entry.json` →
+  `precision`: an `fp8_weights` kernel serves only an `fp8_weights` target, an
+  `exact` one any target). Shapes may differ, because kernels read their sizes from the
   module. Up to 3 matches are tried, closest shapes first. Each one is copied
   to `candidates/prior_<entry-id>.py` and evaluated through the normal
   truth-verified path (`capture_sha256`, snapshot, `results.jsonl`). Its ledger
@@ -1419,6 +1514,10 @@ kernel-agent library path
 There are verified example kernels for every backend in
 `src/kernel_agent/agent/examples/`, and backend guides plus an optimisation
 playbook in `src/kernel_agent/agent/knowledge/`. Both are fed to the agents.
+The FP8 weight-only examples (`cuda_fp8_gemv.py`, `cuda_fp8_skinny_gemm.py`)
+and `low_precision.md` go to the engineer of an `fp8_weights` target (see
+"Low-precision weights"); `doctor --smoke` also runs them (sm_89+), in the
+near-lossless tier and against the exact tier, which must reject them.
 
 **No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
 (`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a

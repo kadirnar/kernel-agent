@@ -56,6 +56,11 @@ from kernel_agent import toolchain
 
 SUSPICIOUS_RATIO = 0.9  # new_ms below this share of sol_ms is faster than the hardware allows
 MASKED = -1e4  # additive attention-mask values at or below this mask the position out
+#: Bits per weight element of a reduced-precision target (its capture's ``precision``):
+#: the 2-D floating-point parameters the reference reads count at this width plus one fp32
+#: scale per output channel (row), so ``pct_of_sol`` of an FP8 kernel is measured against
+#: the bytes it must stream, not the bf16 weights it replaced.
+WEIGHT_BITS = {"fp8_weights": 8}
 _MiB = 1024**2
 
 # Ops that look at a tensor argument's metadata only (no data read).
@@ -509,10 +514,33 @@ def _changed_elements(before: Any, after: Any) -> int:
     return int(diff.sum())
 
 
+def _weight_shares(module: Any, precision: str | None) -> dict[tuple[str, int], tuple[float, int]]:
+    """``storage key -> (share of the bytes read, scale bytes added)`` of the weights a
+    reduced-precision kernel streams narrower (:data:`WEIGHT_BITS`; none for exact)."""
+    bits = WEIGHT_BITS.get(precision or "")
+    shares: dict[tuple[str, int], tuple[float, int]] = {}
+    if not bits:
+        return shares
+    for p in module.parameters():
+        width = 8 * p.element_size()
+        if p.dim() == 2 and p.is_floating_point() and width > bits:
+            key = _key(p)
+            if key is not None:
+                shares[key] = (bits / width, 4 * int(p.shape[0]))
+    return shares
+
+
 def count_case(
-    module: Any, args: tuple[Any, ...], kwargs: dict[str, Any], *, method: str | None = None
+    module: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    method: str | None = None,
+    precision: str | None = None,
 ) -> CaseCost:
-    """FLOPs (per dtype) and minimum bytes of one reference call (inputs are not mutated)."""
+    """FLOPs (per dtype) and minimum bytes of one reference call (inputs are not mutated).
+    ``precision`` (``fp8_weights``): the weights count at their reduced width
+    (:data:`WEIGHT_BITS`)."""
     import torch
     from torch.utils.flop_counter import FlopCounterMode
 
@@ -523,6 +551,7 @@ def count_case(
         key = _key(t)
         if key is not None:
             external[key] = t.untyped_storage().nbytes()
+    narrow = _weight_shares(module, precision)
     fn = module if method in (None, "forward") else getattr(module, method)
     with torch.inference_mode(), FlopCounterMode(display=False) as counter:
         tracker = _tracker(counter, external)
@@ -533,9 +562,11 @@ def count_case(
 
     reads = 0
     for key in set(tracker.reads) | set(tracker.gathered):
-        reads += min(
-            _union(tracker.reads.get(key, [])) + tracker.gathered.get(key, 0), external[key]
-        )
+        n = min(_union(tracker.reads.get(key, [])) + tracker.gathered.get(key, 0), external[key])
+        if key in narrow:  # a reduced-precision weight: its codes + one scale per channel
+            share, scales = narrow[key]
+            n = math.ceil(n * share) + scales
+        reads += n
 
     after = _flatten((a, k))
     produced: dict[tuple[str, int], list[tuple[int, int]]] = collections.defaultdict(list)
@@ -654,14 +685,19 @@ def annotate(
     *,
     peaks: dict[str, Any] | None = None,
     l2_flush: bool = False,
+    precision: str | None = None,
 ) -> None:
-    """Add SOL fields to a timed evaluation result in place; never raises."""
+    """Add SOL fields to a timed evaluation result in place; never raises. ``precision``:
+    the capture's reduced precision (weights counted at :data:`WEIGHT_BITS`)."""
     peaks = peaks or current_peaks()
     if not peaks:
         result["sol_note"] = "GPU peaks not measured yet (`kernel-agent doctor` measures them)"
         return
     try:
-        costs = [count_case(module, c["args"], c["kwargs"], method=c.get("method")) for c in cases]
+        costs = [
+            count_case(module, c["args"], c["kwargs"], method=c.get("method"), precision=precision)
+            for c in cases
+        ]
         apply_sol(result, costs, peaks, hot_l2=not l2_flush)
     except Exception as exc:
         result["sol_error"] = f"{type(exc).__name__}: {exc}"[:300]
