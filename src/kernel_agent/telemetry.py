@@ -2,10 +2,20 @@
 
 Read through NVML (``pynvml``, from the ``nvidia-ml-py`` package) when it is
 importable, else through ``nvidia-smi``; neither is a dependency, and without
-both there are no samples. A clock-event reason that lowers the clocks (power
-cap, thermal or hardware slowdown) during a measurement is a warning: the
-paired A/B design keeps such drift out of the comparison, but the absolute
-latencies of that session are pessimistic and separate-process numbers noisy.
+both there are no samples. A measurement is *throttled*, and logged as a
+warning, when the GPU actually slowed down during it:
+
+* a thermal or hardware slowdown reason was active (:data:`SLOWDOWN`), or
+* the SM clock of a sample taken under load fell below :data:`CLOCK_DROP` of the
+  highest SM clock of the measurement (``clock_drop``).
+
+The clock-event reasons of every sample are recorded (``reasons``); ``sw_power_cap``
+alone is informational, since consumer GPUs report it routinely while they run at
+full boost. The board's maximum SM clock (``clocks.max.sm``, ``sm_max_mhz``) is
+recorded too but is not the reference: boards often never reach it under load (an
+RTX 5070 Ti boosts to ~2.9 of its 3.1 GHz). The paired A/B design keeps throttling
+out of the comparison, but the absolute latencies of a throttled measurement are
+pessimistic and separate-process numbers noisy.
 """
 
 from __future__ import annotations
@@ -16,15 +26,19 @@ import subprocess
 import time
 from typing import Any
 
-#: NVML clock-event reasons that slow the GPU down (``nvmlClocksEventReason*``).
-THROTTLE = {
+#: NVML clock-event reasons recorded with a sample (``nvmlClocksEventReason*``).
+REASONS = {
     0x4: "sw_power_cap",
     0x8: "hw_slowdown",
     0x20: "sw_thermal",
     0x40: "hw_thermal",
     0x80: "hw_power_brake",
 }
-_QUERY = "clocks.sm,clocks.mem,temperature.gpu,power.draw,clocks_event_reasons.active"
+#: Reasons that mean the GPU slowed down (``sw_power_cap`` is not one of them).
+SLOWDOWN = frozenset({"hw_slowdown", "sw_thermal", "hw_thermal", "hw_power_brake"})
+#: A sample under load whose SM clock is below this share of the highest one is a drop.
+CLOCK_DROP = 0.9
+_QUERY = "clocks.sm,clocks.max.sm,clocks.mem,temperature.gpu,power.draw,clocks_event_reasons.active"
 _FORMAT = "csv,noheader,nounits"
 
 
@@ -42,11 +56,19 @@ def _bus_id() -> str | None:
 
 
 def reasons(mask: int) -> list[str]:
-    return [name for bit, name in THROTTLE.items() if mask & bit]
+    return [name for bit, name in REASONS.items() if mask & bit]
+
+
+def _mhz(value: str) -> int | None:
+    """An ``nvidia-smi`` clock (None: ``[N/A]``)."""
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
 
 
 class Monitor:
-    """Samples of one GPU; :meth:`summary` for results, :meth:`warning` for logs."""
+    """Samples of one GPU; :meth:`summary` for results, :func:`warning` for logs."""
 
     def __init__(self, bus_id: str | None = None) -> None:
         self.samples: list[dict[str, Any]] = []
@@ -74,6 +96,7 @@ class Monitor:
             reasons_of = reasons_of or nvml.nvmlDeviceGetCurrentClocksThrottleReasons  # old name
             return {
                 "sm_mhz": nvml.nvmlDeviceGetClockInfo(h, nvml.NVML_CLOCK_SM),
+                "sm_max_mhz": nvml.nvmlDeviceGetMaxClockInfo(h, nvml.NVML_CLOCK_SM),
                 "mem_mhz": nvml.nvmlDeviceGetClockInfo(h, nvml.NVML_CLOCK_MEM),
                 "temp_c": nvml.nvmlDeviceGetTemperature(h, nvml.NVML_TEMPERATURE_GPU),
                 "power_w": round(nvml.nvmlDeviceGetPowerUsage(h) / 1000.0, 1),
@@ -86,17 +109,21 @@ class Monitor:
             timeout=10,
             check=True,
         ).stdout
-        sm, mem, temp, power, mask = (v.strip() for v in out.strip().splitlines()[0].split(","))
+        values = [v.strip() for v in out.strip().splitlines()[0].split(",")]
+        sm, sm_max, mem, temp, power, mask = values
         return {
             "sm_mhz": int(float(sm)),
+            "sm_max_mhz": _mhz(sm_max),
             "mem_mhz": int(float(mem)),
             "temp_c": int(float(temp)),
             "power_w": round(float(power), 1),
             "mask": int(mask, 16),
         }
 
-    def sample(self, label: str = "") -> dict[str, Any] | None:
-        """One sample (None: no backend, or it failed and is now off)."""
+    def sample(self, label: str = "", *, loaded: bool = True) -> dict[str, Any] | None:
+        """One sample (None: no backend, or it failed and is now off). ``loaded``: taken
+        right after timed GPU work (False: e.g. before it, when the clocks may be idling);
+        only such samples count for a clock drop."""
         if self.backend is None:
             return None
         try:
@@ -109,38 +136,59 @@ class Monitor:
             "t_s": round(time.monotonic() - self._start, 2),
             **({"label": label} if label else {}),
             **values,
-            "throttle": reasons(mask),
+            "reasons": reasons(mask),
+            **({} if loaded else {"loaded": False}),
         }
         self.samples.append(sample)
         return sample
 
     def summary(self) -> dict[str, Any]:
-        """Ranges over the samples (``{}``: none) and whether any was throttled."""
+        """Ranges over the samples (``{}``: none), the clock-event reasons seen and whether
+        the GPU slowed down (``throttle``: the :data:`SLOWDOWN` reasons and ``clock_drop``
+        seen, ``throttled_samples``)."""
         if not self.samples:
             return {}
-        sm = [s["sm_mhz"] for s in self.samples]
+        loaded = [s for s in self.samples if s.get("loaded", True)] or self.samples
+        sm = [s["sm_mhz"] for s in loaded]
+        floor = round(CLOCK_DROP * max(sm))
+        slowed: list[list[str]] = []
+        for s in self.samples:
+            why = sorted(SLOWDOWN.intersection(s["reasons"]))
+            if s.get("loaded", True) and s["sm_mhz"] < floor:
+                why.append("clock_drop")
+            if why:
+                slowed.append(why)
         mem = [s["mem_mhz"] for s in self.samples]
-        seen = sorted({r for s in self.samples for r in s["throttle"]})
+        sm_max = [s["sm_max_mhz"] for s in self.samples if s.get("sm_max_mhz")]
+        throttle = sorted({r for why in slowed for r in why})
         return {
             "backend": self.backend or "off",
             "samples": len(self.samples),
             "sm_mhz": [min(sm), round(statistics.median(sm)), max(sm)],
+            **({"sm_max_mhz": max(sm_max)} if sm_max else {}),
+            "clock_drop_below_mhz": floor,
             "mem_mhz": [min(mem), max(mem)],
             "temp_c_max": max(s["temp_c"] for s in self.samples),
             "power_w_max": max(s["power_w"] for s in self.samples),
-            "throttle": seen,
-            "throttled_samples": sum(bool(s["throttle"]) for s in self.samples),
-            "throttled": bool(seen),
+            "reasons": sorted({r for s in self.samples for r in s["reasons"]}),
+            "throttle": throttle,
+            "throttled_samples": len(slowed),
+            "throttled": bool(slowed),
         }
 
 
 def warning(summary: dict[str, Any] | None) -> str | None:
-    """Log line for a throttled measurement (None: not throttled or no samples)."""
+    """Log line for a throttled measurement (None: no samples, or the GPU did not slow
+    down, e.g. ``sw_power_cap`` reported at full clocks)."""
     if not summary or not summary.get("throttled"):
         return None
     lo, _, hi = summary["sm_mhz"]
+    why = [
+        f"SM clock below {summary.get('clock_drop_below_mhz')} MHz" if r == "clock_drop" else r
+        for r in summary.get("throttle") or []
+    ]
     return (
-        f"GPU throttled ({', '.join(summary['throttle'])}) in {summary['throttled_samples']}/"
+        f"GPU throttled ({', '.join(why)}) in {summary['throttled_samples']}/"
         f"{summary['samples']} samples: SM clock {lo}-{hi} MHz, up to {summary['temp_c_max']} "
         f"°C and {summary['power_w_max']} W"
     )

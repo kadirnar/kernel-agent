@@ -263,7 +263,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     inputs = workload.make_inputs()
     monitor = Monitor()  # GPU clocks / temperature / power before and after the timing
-    monitor.sample("before")
+    monitor.sample("before", loaded=False)  # the clocks may still be idling
     try:
         timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     except Exception:

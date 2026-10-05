@@ -214,10 +214,14 @@ combination against the best single item):
   transform may also define `undo(workload)` to revert what the snapshots
   cannot see; it is then applied again (plus a warm-up run) to re-enter its
   state.
-* GPU clocks, temperature, power and clock-event reasons are sampled around
-  every timed run through NVML (`pynvml`, when installed) or `nvidia-smi`
-  (`ab.gpu`, `gpu` of `e2e`); a power or thermal slowdown is logged as a
-  warning.
+* GPU clocks (with the board's maximum SM clock), temperature, power and
+  clock-event reasons are sampled around every timed run through NVML
+  (`pynvml`, when installed) or `nvidia-smi` (`ab.gpu`, `gpu` of `e2e`). A
+  warning is logged only when the GPU really slowed down: a thermal or hardware
+  slowdown reason (`hw_slowdown`, `sw_thermal`, `hw_thermal`, `hw_power_brake`),
+  or an SM clock under load below 90 % of the highest one of that measurement
+  (`clock_drop`). `sw_power_cap` alone is recorded in `reasons` but not
+  reported: consumer GPUs show it at full boost (an RTX 5070 Ti at 2.9 GHz).
 
 Every step in `integration.json` → `history` carries its `ab` record: `mode`
 (`paired` / `separate`), `a_items`, the timings `a_ms` / `b_ms`, `wins`,
@@ -331,10 +335,13 @@ repeats the evaluator's verdict from scratch, sharing nothing with the evaluatio
    weighted by calls per run, as the evaluator does.
 
 The result says whether it `agrees` with the evaluator on correctness and on the
-speedup, within ±25 % or twice the measured spread of the rounds. It fails
-(`passed: false`) when the candidate is wrong on any fresh input (`incorrect`),
-does not build or run, changes watched state, or is slower than the evaluator's
-speedup by more than that noise (`slower`). A kernel that keeps outputs keyed by
+speedup. Two speedups agree when each is within a factor 1 + t of the other,
+whichever is larger (|log a − log b| ≤ log(1 + t)); t is twice the larger timing
+spread of the two measurements (the re-check's rounds, the evaluator's cases), at
+least 25 % and at most 50 %, so noisy rounds cannot make 2.9× and 5.5× agree. It
+fails (`passed: false`) when the candidate is wrong on any fresh input
+(`incorrect`), does not build or run, changes watched state, or when the speedups
+disagree in either direction (`disagrees`). A kernel that keeps outputs keyed by
 the captured shapes passes every captured case and fails here. Without
 `--speedup X` the command runs the evaluator first to get its verdict. On the
 bundled Triton RMSNorm (the RMSNorm smoke capture, RTX 5070 Ti) it is correct on
@@ -350,6 +357,36 @@ not seed the search. The results go to `integration.json` → `recheck` (status,
 `report.md`. A re-integration reuses the result for the same snapshot.
 `--no-recheck` turns this off. A simulated run (`improve --dry-run`) has no
 captures and records `skipped`.
+
+A stored speedup can be stale. Every evaluation records `evaluator_version`
+(`schema`, bumped when the evaluator's measurement semantics change, and the
+`git` commit when kernel-agent runs from a checkout). A record from an older
+schema, or from before the field existed, is re-evaluated before the re-check.
+So is a record whose speedup the re-check disagrees with while the kernel is
+correct on the fresh inputs. The re-evaluation runs the current evaluator on the
+verified snapshot and appends its record to the target's `results.jsonl`
+(`reevaluates`: the old `exp`, speedup, version and why), with a `re-evaluated`
+ledger row. From then on it stands in for the old record: in the target's
+ranking, the keep bar of later candidates, the projection, `status` and the
+report. The re-check is then judged against it. `integration.json` → `recheck` →
+`reevaluated` keeps the old and the new speedup. In the VoxCPM2 run, the
+attention kernel's 46.89× came from the evaluator before the hardening of #6/#7.
+Re-evaluated, it measures 18.25×, the re-check agrees (17.84×), and the kernel is
+integrated instead of being refused.
+
+The integration's re-check is about correctness and grossly inflated claims; the
+paired end-to-end A/B decides on speed. A speedup that still disagrees is
+re-checked once more, in new processes, and the run that agrees better counts
+(`rechecks` lists both). If it still disagrees, the correct kernel is kept with a
+warning (`speed_disagrees`: a log line, a `recheck_speed_disagrees` event and a
+report line with both speedups). Its A/B decides. Until then it ranks and
+projects by the conservative speedup, the smaller of the two. A kernel is refused
+when it is wrong on fresh inputs or violates integrity in either re-check, when
+its re-evaluation fails (`reevaluation_failed`), or when a stale record's
+re-evaluation disagrees with a re-check that measures no speedup at all (≤ 1×).
+If another snapshot of the target now ranks first, that one is re-checked and
+integrated instead. The standalone `kernel-agent recheck` command still fails on
+a disagreement.
 
 ### Ground truth the agents cannot quietly change
 
@@ -1323,6 +1360,9 @@ value for that column.
   budget advice uses. `quick_ok` / `quick_fail` (quick checks) and
   `duplicate` rows are not benchmark evaluations: no chart, count, budget or
   streak uses them (see "Parallel workers, duplicates and quick checks").
+  Neither are `re-evaluated` rows, the integration's re-evaluations of stale
+  records (see "Independent re-check of winners"). They do replace the
+  snapshot's earlier row as the target's best in `status` and the report.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
   there is no custom kernel).

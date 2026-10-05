@@ -16,13 +16,17 @@ experiment:
   later correctness stages, ``integrity_violation`` and ``fallback`` its
   anti-gaming guards, see :mod:`kernel_agent.kernels.evaluate`)
 
-Rows that are not benchmark evaluations (:data:`UNMEASURED`, see :func:`measured`): they
-count against no budget or streak and the charts do not plot them:
+Rows that are not the agents' benchmark evaluations (:data:`UNMEASURED`, see
+:func:`measured`): they count against no budget or streak and the charts do not plot them:
 
 * ``quick_ok`` / ``quick_fail``: ``evaluate_candidate(mode="quick")``, correctness on the
   smallest and largest captured case, no timing
 * ``duplicate``: a candidate whose normalised source was evaluated before
   (:mod:`kernel_agent.dedup`); ``snapshot`` names the earlier snapshot, nothing ran
+* ``re-evaluated``: the integration's re-evaluation of a snapshot whose record is stale
+  (an older evaluator) or disagrees with its re-check (:mod:`kernel_agent.kernels.recheck`);
+  ``correct`` and ``speedup`` are the current evaluator's and stand in for that snapshot's
+  earlier row (:func:`standing`); the ``hypothesis`` names the earlier speedup
 
 Kernel rows carry the ``idea`` the agent tagged the candidate with (``idea_id`` of
 ``evaluate_candidate``); :func:`ideas` aggregates a target's rows per idea, so that a
@@ -84,7 +88,9 @@ STATUSES = (KEEP, DISCARD, *FAILURES)
 QUICK_OK = "quick_ok"
 QUICK_FAIL = "quick_fail"
 DUPLICATE = "duplicate"
-UNMEASURED = (QUICK_OK, QUICK_FAIL, DUPLICATE)  # rows that are not benchmark evaluations
+REEVALUATED = "re-evaluated"
+# rows that are not the agents' benchmark evaluations
+UNMEASURED = (QUICK_OK, QUICK_FAIL, DUPLICATE, REEVALUATED)
 E2E = "e2e"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -155,9 +161,23 @@ def e2e_spread(result: dict[str, Any]) -> float | None:
     return round((max(times) - min(times)) / median, 4) if median > 0 else None
 
 
+def standing(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The results of one target that stand: ``keep`` rows and correct ``re-evaluated``
+    ones, except a snapshot's rows before its last re-evaluation (which stands instead)."""
+    rows = list(rows)
+    last = {r.get("snapshot"): i for i, r in enumerate(rows) if r["status"] == REEVALUATED}
+    return [
+        r
+        for i, r in enumerate(rows)
+        if last.get(r.get("snapshot"), i) <= i
+        and (r["status"] == KEEP or (r["status"] == REEVALUATED and r.get("correct")))
+    ]
+
+
 def best_kept(rows: list[dict[str, Any]]) -> float:
-    """Running best of a target's (or ``e2e``'s) kept rows; 1.0 = reference / baseline."""
-    return max((r["speedup"] for r in rows if r["status"] == KEEP and r["speedup"]), default=1.0)
+    """Running best of a target's (or ``e2e``'s) kept rows; 1.0 = reference / baseline. A
+    re-evaluated snapshot counts with its re-evaluation (:func:`standing`)."""
+    return max((r["speedup"] for r in standing(rows) if r["speedup"]), default=1.0)
 
 
 def e2e_backend(transforms: list[Any], kernels: list[str]) -> str:
@@ -567,7 +587,8 @@ def summary(run: RunDir) -> dict[str, Any]:
         spec = read_json(run.target(target_id) / "spec.json", {}) or {}
         trows = measured(r for r in ledger_rows if r["target"] == target_id)
         kept = [r for r in trows if r["status"] == KEEP]
-        best = max(kept, key=lambda r: r["speedup"] or 0.0, default=None)
+        stand = standing(r for r in ledger_rows if r["target"] == target_id)  # re-evaluations
+        best = max(stand, key=lambda r: r["speedup"] or 0.0, default=None)
         targets.append(
             {
                 "id": target_id,

@@ -69,7 +69,9 @@ were valid, and the run was launch-bound (47 % GPU busy, 507k launches).
   #5–#8 close them, and a memoising transform that would have reported
   285,656× is now rejected. Re-checking the winners with the hardened
   evaluator showed the attention kernel's module speedup is 18.8×, not the
-  46.9× the old evaluator recorded (#58 tracks re-evaluating stale records).
+  46.9× the old evaluator recorded. Stale records are now re-evaluated by the
+  current evaluator before the re-check (#58): the attention kernel's record is
+  18.3×.
 
 ## Reproduce
 

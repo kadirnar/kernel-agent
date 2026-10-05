@@ -37,12 +37,19 @@ from kernel_agent import (
 )
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import READ_TOOLS, AgentResult, agent_env, run_agent
-from kernel_agent.agent.tools import best_for_target, build_server, tool_names
+from kernel_agent.agent.tools import (
+    best_for_target,
+    build_server,
+    current_records,
+    ranked_for_target,
+    record_candidate,
+    tool_names,
+)
 from kernel_agent.budget import MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.export import export_optimized
-from kernel_agent.kernels import recheck
+from kernel_agent.kernels import evaluate, recheck
 from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
@@ -75,6 +82,12 @@ class Orchestrator:
         # The integration's re-check of a kernel (kernels/recheck.py); None = the real one,
         # which a simulated run (dryrun.py: no captures) skips.
         self.rechecker: Callable[..., dict[str, Any]] | None = None
+        # Its re-evaluation of a stale or disagreeing record (kernels/evaluate.py
+        # run_evaluation); None = the real one.
+        self.reevaluator: Callable[..., dict[str, Any]] | None = None
+        # (target, snapshot name) -> the conservative speedup of a kernel whose re-check
+        # disagrees with its record (recheck.speed_warning): what ranks and projects it.
+        self.speed_caps: dict[tuple[str, str], float] = {}
         self.simulated = "dry_run" in run.load()
 
     # ------------------------------------------------------------ creation
@@ -586,16 +599,27 @@ class Orchestrator:
             log(f"kernels: {target_id}: round 2 of its workers from {starts}")
             await asyncio.gather(*(job(s, again, f"{target_id}/r2w{s.worker}") for s in again))
 
+    def _kernel_best(self, target_id: str) -> dict[str, Any] | None:
+        """The verified best record of a target when its kernel is worth integrating. A
+        snapshot with a speed cap (``speed_caps``) ranks by it: its ``speedup`` is the
+        conservative one, ``evaluator_speedup`` the record's."""
+        best = None
+        for rec in ranked_for_target(self.run, target_id, self.truth):
+            if best is not None and rec["speedup"] <= best["speedup"]:
+                break  # ranked by the records' speedups, which a cap only lowers
+            cap = self.speed_caps.get((target_id, Path(str(rec["snapshot"])).name))
+            if cap is not None and cap < rec["speedup"]:
+                rec = {**rec, "speedup": cap, "evaluator_speedup": rec["speedup"]}
+            if best is None or rec["speedup"] > best["speedup"]:
+                best = rec
+        # a region target's kernel needs its verified rewrite, unchanged (region.py)
+        ok = region.rewrite_ok(self.run, target_id, self.truth)
+        return best if best and best["speedup"] >= self.cfg.min_speedup and ok else None
+
     def _kernel_bests(self) -> list[tuple[str, dict[str, Any]]]:
         """(target_id, verified best record) of every kernel worth integrating."""
-        bests = []
-        for target_id in self.run.target_ids():
-            best = best_for_target(self.run, target_id, self.truth)
-            # a region target's kernel needs its verified rewrite, unchanged (region.py)
-            ok = region.rewrite_ok(self.run, target_id, self.truth)
-            if best and best["speedup"] >= self.cfg.min_speedup and ok:
-                bests.append((target_id, best))
-        return bests
+        bests = [(t, self._kernel_best(t)) for t in self.run.target_ids()]
+        return [(t, best) for t, best in bests if best is not None]
 
     def _kernel_winners(self) -> list[tuple[str, str, float]]:
         """(target_id, snapshot path, module speedup) of every kernel worth integrating,
@@ -654,7 +678,9 @@ class Orchestrator:
         irreversible = set((previous or {}).get("irreversible") or [])
         rechecks: list[dict[str, Any]] = []
         if self.cfg.recheck:  # fresh inputs, separate processes; failing kernels are refused
-            items, composite, rechecks = self._recheck_kernels(items, composite, previous or {})
+            items, composite, rechecks = self._recheck_kernels(
+                items, composite, previous or {}, digests
+            )
 
         def ab(
             a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = ""
@@ -782,6 +808,7 @@ class Orchestrator:
         items: list[tuple[str, str]],
         composite: tuple[list[tuple[str, str]], dict[str, Any]] | None,
         previous: dict[str, Any],
+        digests: dict[str, str | None] | None = None,
     ) -> tuple[
         list[tuple[str, str]],
         tuple[list[tuple[str, str]], dict[str, Any]] | None,
@@ -792,25 +819,45 @@ class Orchestrator:
         inputs of the captured shapes against a freshly computed reference, reference and
         kernel timed in processes of their own. A kernel that fails it is refused (a log
         line and a ``recheck_failed`` event with the reason), and so is a combination with
-        it. A re-integration reuses the result of the same snapshot (``previous``)."""
-        kernels = [a for k, a in items if k == "kernel"]
-        for kind, arg in composite[0] if composite else []:
-            if kind == "kernel" and arg not in kernels:
-                kernels.append(arg)
+        it. A re-integration reuses the result of the same snapshot (``previous``).
+
+        A correct kernel whose speedup disagrees with its record (``speed_disagrees``) is a
+        warning (a log line and a ``recheck_speed_disagrees`` event), not a refusal: it is
+        ranked and projected by its conservative speedup (``speed_caps``) and its A/B
+        decides. A re-evaluation or a speed cap (:meth:`_recheck_one`) can rank another
+        snapshot of the target first: that one is re-checked too and, when it passes,
+        integrated instead (its sha256 goes to ``digests``)."""
         known = {(r.get("item"), r.get("sha256")): r for r in previous.get("recheck") or []}
         records: list[dict[str, Any]] = []
         refused: set[str] = set()
-        for arg in kernels:
+        checked: dict[str, dict[str, Any]] = {}
+
+        def check(arg: str) -> dict[str, Any]:
+            if arg in checked:
+                return checked[arg]
             target_id, _, path = arg.partition("=")
             snap = Path(path)
             rec = self._kernel_record(target_id, snap.name)
             sha = (rec or {}).get("snapshot_sha256")
             hit = known.get((arg, sha)) if sha else None
             result = dict(hit) if hit is not None else self._recheck_one(target_id, snap, rec)
+            checked[arg] = result
             records.append(
                 {**result, "item": arg, "target": target_id, "snapshot": snap.name, "sha256": sha}
             )
-            log(f"integrate: recheck {target_id} ({snap.name}): {recheck.describe(result)}")
+            warn = "WARNING " if result.get("status") == recheck.SPEED_DISAGREES else ""
+            log(f"integrate: {warn}recheck {target_id} ({snap.name}): {recheck.describe(result)}")
+            if warn:
+                self.speed_caps[(target_id, snap.name)] = float(result["conservative_speedup"])
+                ledger.event(
+                    self.run,
+                    "recheck_speed_disagrees",
+                    target=target_id,
+                    snapshot=snap.name,
+                    evaluator=(result.get("evaluator") or {}).get("speedup"),
+                    recheck=result.get("speedup"),
+                    conservative=result.get("conservative_speedup"),
+                )
             if not result.get("passed"):
                 refused.add(arg)
                 ledger.event(
@@ -821,6 +868,29 @@ class Orchestrator:
                     status=result.get("status"),
                     reason=str(result.get("reason"))[:500],
                 )
+            return result
+
+        items = list(items)
+        for i, (kind, arg) in enumerate(items):
+            if kind != "kernel":
+                continue
+            current, digest = arg, None
+            while _reranks(check(current)):  # the target's ranking may have changed
+                top = self._kernel_item(arg.partition("=")[0])
+                if top is None or top[0] == current or check(top[0]).get("passed") is not True:
+                    break
+                current, digest = top
+            if current != arg:
+                log(
+                    f"integrate: {Path(current).name} ranks first after the re-check; "
+                    f"it replaces {Path(arg).name}"
+                )
+                items[i] = (kind, current)
+                if digests is not None:
+                    digests[current.partition("=")[2]] = digest
+        for kind, arg in composite[0] if composite else []:
+            if kind == "kernel":
+                check(arg)
         if refused:
             items = [(k, a) for k, a in items if not (k == "kernel" and a in refused)]
             if composite is not None and refused.intersection(a for _, a in composite[0]):
@@ -834,7 +904,18 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """:func:`kernels.recheck.run_recheck` of one kernel snapshot on its target's capture,
         against the verified evaluation record ``rec``. In a run with ``.truth/`` a missing or
-        changed capture fails it; a run from before that layout without one skips it."""
+        changed capture fails it; a run from before that layout without one skips it.
+
+        A record from an older evaluator (:func:`kernels.evaluate.stale`) is re-evaluated
+        first, and so is one whose speedup the re-check disagrees with when the kernel is
+        correct on the fresh inputs (:meth:`_reevaluate`): the current evaluator's result
+        is then the verdict (``reevaluated``: old and new speedup). A speedup that still
+        disagrees is re-checked once more, in new processes, and the run that agrees
+        better counts (``rechecks``: both). If it still disagrees, the kernel is kept with
+        a warning (:func:`kernels.recheck.speed_warning`). It is refused when it is wrong on
+        fresh inputs or violates integrity in either re-check, when the re-evaluation
+        fails, or when a stale record's re-evaluation disagrees with a re-check that
+        measures no speedup at all (≤ 1x)."""
         if self.rechecker is None and self.simulated:
             return {"status": "skipped", "passed": True, "reason": "simulated run (no captures)"}
         capture = self.run.capture_file(target_id)
@@ -844,28 +925,125 @@ class Orchestrator:
             return {"status": "tampered", "passed": False, "reason": str(exc)}
         if capture_sha256 is None and not capture.exists():
             return {"status": "skipped", "passed": True, "reason": f"no capture file {capture}"}
-        verdict = {"correct": rec.get("correct"), "speedup": rec.get("speedup")} if rec else None
+        fresh: dict[str, Any] | None = None
+        why = evaluate.stale(rec) if rec is not None else None
+        stale = bool(why)
+        if rec is not None and why:
+            fresh = self._reevaluate(target_id, snap, rec, capture_sha256, why)
+            if not fresh.get("correct"):
+                return _reevaluation_failed({}, rec, fresh, why)
+
+        def run_recheck(verdict: dict[str, Any] | None) -> dict[str, Any]:
+            try:
+                return (self.rechecker or recheck.run_recheck)(
+                    capture,
+                    snap,
+                    verdict=verdict,
+                    capture_sha256=capture_sha256,
+                    timeout=2 * self.budget.eval_timeout_s,
+                )
+            except Exception as exc:  # the re-check broke: the kernel is not confirmed
+                return {"status": "error", "passed": False, "reason": repr(exc)[:500]}
+
+        result = run_recheck(_verdict(fresh or rec))
+        if fresh is None and rec is not None and result.get("status") == recheck.DISAGREES:
+            why = f"the re-check measured {result.get('speedup')}x"
+            fresh = self._reevaluate(target_id, snap, rec, capture_sha256, why)
+            if not fresh.get("correct"):
+                return _reevaluation_failed(result, rec, fresh, why)
+            result = recheck.judge(result, _verdict(fresh))
+        if result.get("status") == recheck.DISAGREES:  # once more, in new processes
+            again = run_recheck(_verdict(fresh or rec))
+            if again.get("status") not in ("ok", recheck.DISAGREES):
+                result = {**again, "reason": f"on a second re-check: {again.get('reason')}"}
+            else:
+                runs = [result, again]  # an agreeing run first, else the closer one
+                result = min(runs, key=lambda r: (r["status"] != "ok", recheck.disagreement(r)))
+                result["rechecks"] = [
+                    {k: r.get(k) for k in ("speedup", "timing_spread", "seed", "speedup_ratio")}
+                    for r in runs
+                ]
+        if result.get("status") == recheck.DISAGREES:
+            if stale and float(result.get("speedup") or 0.0) <= 1.0:
+                result["reason"] += "; no speedup at all in separate processes"
+            else:
+                result = recheck.speed_warning(result)
+        if rec is not None and fresh is not None and why:
+            result["reevaluated"] = _reevaluation(rec, fresh, why)
+        return result
+
+    def _reevaluate(
+        self,
+        target_id: str,
+        snap: Path,
+        rec: dict[str, Any],
+        capture_sha256: str | None,
+        why: str,
+    ) -> dict[str, Any]:
+        """The current evaluator on a kernel snapshot whose record ``rec`` is stale or
+        disagrees with its re-check (``why``), appended to the target's records as a
+        ``re-evaluated`` ledger row that replaces ``rec`` (``reevaluates``,
+        :func:`agent.tools.current_records`); returns the new record. A snapshot that is
+        not (or no longer) the file ``rec`` measured is ``tampered`` and not recorded."""
+        sha = rec.get("snapshot_sha256")
+        changed = {"status": "tampered", "correct": False, "error": f"{snap.name} changed"}
+        if not self.truth.snapshot_ok(snap, sha):
+            return changed
+        sha = sha or truth.sha256_file(snap)
+        start = time.perf_counter()
         try:
-            return (self.rechecker or recheck.run_recheck)(
-                capture,
+            result = (self.reevaluator or evaluate.run_evaluation)(
+                self.run.capture_file(target_id),
                 snap,
-                verdict=verdict,
+                timeout=self.budget.eval_timeout_s,
                 capture_sha256=capture_sha256,
-                timeout=2 * self.budget.eval_timeout_s,
             )
-        except Exception as exc:  # the re-check itself broke: the kernel is not confirmed
-            return {"status": "error", "passed": False, "reason": repr(exc)[:500]}
+        except Exception as exc:
+            result = {"status": "error", "correct": False, "error": repr(exc)[:500]}
+        if truth.sha256_file(snap) != sha:
+            self.truth.alarm(snap, "snapshot changed during its re-evaluation")
+            return changed
+        src = self.run.target(target_id) / str(rec.get("candidate") or f"history/{snap.name}")
+        record, _ = record_candidate(
+            self.run,
+            target_id,
+            src,
+            snap,
+            result,
+            hypothesis=f"re-evaluation of exp {rec.get('exp')} ({rec.get('speedup')}x): {why}",
+            parent=rec.get("parent"),
+            eval_s=round(time.perf_counter() - start, 1),
+            snapshot_sha256=sha,
+            keeper=self.truth,
+            idea=str(rec.get("idea") or ""),
+            reevaluates={
+                "exp": rec.get("exp"),
+                "speedup": rec.get("speedup"),
+                "evaluator_version": rec.get("evaluator_version"),
+                "why": why,
+            },
+        )
+        return record
 
     def _kernel_record(self, target_id: str, snapshot: str) -> dict[str, Any] | None:
-        """The verified correct evaluation record of a kernel snapshot (None: there is none)."""
+        """The verified correct evaluation record of a kernel snapshot (None: there is none);
+        of a re-evaluated snapshot its re-evaluation (:func:`agent.tools.current_records`)."""
         try:
-            records = self.truth.records(self.run.results_file(target_id))
+            records = current_records(self.truth.records(self.run.results_file(target_id)))
         except truth.TamperError:
             return None
         for rec in records:
             if rec.get("correct") and Path(str(rec.get("snapshot", ""))).name == snapshot:
                 return rec
         return None
+
+    def _kernel_item(self, target_id: str) -> tuple[str, str | None] | None:
+        """The integration item (``target=snapshot``) and sha256 of a target's best kernel."""
+        best = self._kernel_best(target_id)
+        if best is None:
+            return None
+        snap = self.run.history_dir(target_id) / Path(best["snapshot"]).name
+        return f"{target_id}={snap}", best.get("snapshot_sha256")
 
     def _integration_call(
         self, command: str, combo: list[tuple[str, str]], cli: list[str], note: str
@@ -963,15 +1141,22 @@ class Orchestrator:
         return out
 
     def _kernel_saving(self, target_id: str, snapshot: str) -> float | None:
-        """``est_saved_ms_per_run`` of the verified evaluation of a kernel snapshot."""
+        """``est_saved_ms_per_run`` of the verified evaluation of a kernel snapshot; with a
+        speed cap (``speed_caps``) the saving at that conservative speedup."""
         try:
-            records = self.truth.records(self.run.results_file(target_id))
+            records = current_records(self.truth.records(self.run.results_file(target_id)))
         except truth.TamperError:
             return None
         for rec in records:
             if Path(str(rec.get("snapshot", ""))).name == snapshot:
                 est = rec.get("est_saved_ms_per_run")
-                return float(est) if est is not None else None
+                if est is None:
+                    return None
+                speedup = float(rec.get("speedup") or 0.0)
+                cap = self.speed_caps.get((target_id, snapshot))
+                if cap is not None and 0.0 < cap < speedup and speedup > 1.0:  # ∝ 1 - 1/speedup
+                    return float(est) * (1 - 1 / cap) / (1 - 1 / speedup)
+                return float(est)
         return None
 
     def _integration_items(self) -> tuple[list[tuple[str, str]], dict[str, str | None]]:
@@ -1056,7 +1241,7 @@ class Orchestrator:
         if not region.rewrite_ok(self.run, target_id, self.truth):  # a region: its rewrite
             return None
         try:
-            records = self.truth.records(self.run.results_file(target_id))
+            records = current_records(self.truth.records(self.run.results_file(target_id)))
         except truth.TamperError:
             return None
         snap = self.run.history_dir(target_id) / Path(path).name
@@ -1388,6 +1573,50 @@ def _item_key(item: tuple[str, str]) -> str:
     if kind == "kernel":
         return f"kernel {arg.partition('=')[0]}"
     return f"transform {ledger.snapshot_stem(arg)}"
+
+
+def _reranks(result: dict[str, Any]) -> bool:
+    """Whether a re-check changed how its target's snapshots rank (a re-evaluation, a
+    speed cap)."""
+    return bool(result.get("reevaluated")) or result.get("status") == recheck.SPEED_DISAGREES
+
+
+def _verdict(rec: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What a re-check compares with: an evaluation's correctness, speedup and timing spread."""
+    if rec is None:
+        return None
+    verdict = {"correct": rec.get("correct"), "speedup": rec.get("speedup")}
+    if (spread := recheck.spread(rec)) is not None:
+        verdict["timing_spread"] = spread
+    return verdict
+
+
+def _reevaluation(rec: dict[str, Any], fresh: dict[str, Any], why: str) -> dict[str, Any]:
+    """``reevaluated`` of a re-check: the record it replaced and the current evaluator's."""
+    return {
+        "why": why,
+        "old_exp": rec.get("exp"),
+        "old_speedup": rec.get("speedup"),
+        "new_exp": fresh.get("exp"),
+        "new_status": fresh.get("status"),
+        "new_correct": bool(fresh.get("correct")),
+        "new_speedup": fresh.get("speedup"),
+    }
+
+
+def _reevaluation_failed(
+    result: dict[str, Any], rec: dict[str, Any], fresh: dict[str, Any], why: str
+) -> dict[str, Any]:
+    """``result`` refused: the current evaluator's re-evaluation of its record failed."""
+    error = fresh.get("error") or fresh.get("failed_check") or fresh.get("stage") or ""
+    return {
+        **result,
+        "status": "reevaluation_failed",
+        "passed": False,
+        "reason": f"the current evaluator's re-evaluation: {fresh.get('status')}: "
+        + str(error)[-500:],
+        "reevaluated": _reevaluation(rec, fresh, why),
+    }
 
 
 def _why(result: dict[str, Any]) -> str:
