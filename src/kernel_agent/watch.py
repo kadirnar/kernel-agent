@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from kernel_agent import charts, ledger
+from kernel_agent import charts, ledger, projection
 from kernel_agent.ledger import E2E, FAILURES, KEEP
 from kernel_agent.workspace import TRUTH_DIR, RunDir
 
@@ -299,6 +299,10 @@ class Watcher:
             shares = charts.target_shares(run)
         except Exception:  # a profile or spec in an unexpected shape: no shares
             shares = []
+        try:
+            tree = projection.tree(run, ids)
+        except Exception:  # the same: every target counts in full
+            tree = projection.Tree()
         self.files = {
             "run": _json(run.run_json),
             "baseline": _json(run.baseline_json),
@@ -308,6 +312,7 @@ class Watcher:
             "targets": ids,
             "specs": {t: _json(run.target(t) / "spec.json") for t in ids},
             "shares": shares,
+            "tree": tree,
         }
         return True
 
@@ -393,7 +398,10 @@ class Watcher:
         end = now if running else last
 
         targets = self._targets()
-        saved = sum(t["est_saved_ms"] or 0.0 for t in targets)
+        # nested targets counted once (projection.py), after every kept kernel for the chart
+        tree = files.get("tree") or projection.Tree()
+        proj = projection.project(tree, {t["id"]: t["est_saved_ms"] for t in targets}, base_ms or 0)
+        projected = projection.series(tree, base_ms, rows) if base_ms else []
         e2e = [r for r in rows if r["target"] == E2E]
         kept_e2e = [r for r in e2e if r["status"] == KEEP]
         integration = files.get("integration") or {}
@@ -458,7 +466,13 @@ class Watcher:
                     "compiled_ms": charts._compiled_ms(baseline),
                     "times_ms": baseline.get("times_ms"),
                 },
-                "projected_ms": round(max(base_ms - saved, 0.0), 3) if base_ms else None,
+                "projected_ms": proj.projected_ms if base_ms else None,
+                "projection": {
+                    **proj.as_dict(),
+                    "steps": {str(r["exp"]): p.projected_ms for r, p in projected},
+                }
+                if base_ms
+                else None,
                 "measured": measured,
                 "counts": {
                     "evaluations": len(ledger.measured(rows)),

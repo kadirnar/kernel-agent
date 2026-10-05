@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import abtest, ledger, library, strong_baseline
+from kernel_agent import abtest, ledger, library, projection, strong_baseline
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
@@ -149,10 +149,12 @@ def write_report(run: RunDir) -> Path:
         "| est. saved ms/run | best file |",
         "|---|---|---|---|---|---|---|",
     ]
+    saved: dict[str, float | None] = {}
     for target_id in run.target_ids():
         spec = read_json(run.target(target_id) / "spec.json", {})
         records = read_jsonl(run.results_file(target_id))
         best = best_for_target(run, target_id)
+        saved[target_id] = ledger._num((best or {}).get("est_saved_ms_per_run"))
         lines.append(
             f"| `{target_id}` | `{spec.get('module_class')}` | "
             f"{', '.join(spec.get('backends', []))} | "
@@ -173,6 +175,15 @@ def write_report(run: RunDir) -> Path:
                     f"{_fmt(case.get('new_ms'), 4)} ms{sol}) | | |"
                 )
     lines.append("")
+    proj = projection.of_run(run, saved, ledger._num(baseline.get("median_ms")))
+    if proj and proj.used:
+        lines += [
+            f"Projected from the best kernels: **{proj.projected_ms:.1f} ms** "
+            f"({_x(proj.baseline_ms / max(proj.projected_ms, 1e-9))} vs eager) = baseline − "
+            f"est. saved ms of {proj.describe()}. Nested targets count once: per instance the "
+            "better of the parent's kernel and the sum of its children's.",
+            "",
+        ]
     for target_id in run.target_ids():
         lines += _chart(run, run.target(target_id) / "progress.png", f"{target_id} progress")
     transforms = read_jsonl(run.results_file())
