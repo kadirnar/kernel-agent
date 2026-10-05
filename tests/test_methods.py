@@ -335,6 +335,7 @@ def test_capture_records_forward_step_cases(toy, tmp_path):
     info = capture_module(toy, inputs, "Attention", tmp_path / "cap.pt")
     assert info["qualname"] == "model.layers.0.attn"
     assert info["methods"] == {"forward_step": STEPS, "forward": 1}
+    assert info["method_instances"] == {"forward_step": LAYERS, "forward": LAYERS}
     assert [(c["method"], c["count"]) for c in info["cases"]] == [
         ("forward_step", STEPS),
         ("forward", 1),
@@ -343,6 +344,7 @@ def test_capture_records_forward_step_cases(toy, tmp_path):
     assert info["bytes"] < 3 * 2**20
     cap = load_capture(tmp_path / "cap.pt", device="cpu")
     assert cap["methods"] == {"forward_step": STEPS, "forward": 1}
+    assert cap["method_instances"] == {"forward_step": LAYERS, "forward": LAYERS}
     step = next(c for c in cap["cases"] if c["method"] == "forward_step")
     assert step["signature"] == "forward_step: a0[1, 32]:float32"
     key_pre, value_pre = step["args"][2]
@@ -363,19 +365,21 @@ def test_recorder_keeps_one_case_per_method():
         def forward_step(self, x):
             return x - 1
 
-    m = M()
-    recorder = _Recorder(m, max_cases=2, methods=["forward_step"])
+    m, peer = M(), M()
+    recorder = _Recorder(m, max_cases=2, methods=["forward_step"], peers=[peer])
     try:
         for n in (1, 2, 2, 3):
             m(torch.ones(n))
         for _ in range(4):
             m.forward_step(torch.ones(5))
         m(torch.ones(4))
+        peer(torch.ones(7))  # peers are only counted
     finally:
         recorder.remove()
     keys = {(meth, c["count"]) for (meth, _), c in recorder.cases.items()}
     assert keys == {("forward", 2), ("forward_step", 4)}
     assert recorder.calls == {"forward": 5, "forward_step": 4}
+    assert recorder.callers == {"forward": {id(m), id(peer)}, "forward_step": {id(m)}}
 
 
 def test_side_effects_compare_only_the_update():
@@ -495,6 +499,7 @@ def test_engineer_prompt_states_entrypoint_contract():
     info = {
         "qualname": "model.base_lm.layers.0.self_attn",
         "methods": {"forward_step": 60, "forward": 1},
+        "method_instances": {"forward_step": 36, "forward": 60},
         "cases": [
             {"method": "forward_step", "signature": "forward_step: a0[1, 2048]", "count": 60},
             {"method": "forward", "signature": "a0[1, 75, 2048]", "count": 1},
@@ -502,11 +507,22 @@ def test_engineer_prompt_states_entrypoint_contract():
     }
     text = prompts.engineer_prompt(target, info, ["triton"], "py", "tc", 4, None)
     assert "# Entrypoints" in text and "candidate.forward_step(*args, **kwargs)" in text
-    assert "class Fast(MiniCPMAttention)" in text and "`forward_step` (60 calls" in text
+    assert "class Fast(MiniCPMAttention)" in text
+    assert "`forward_step` (60 calls per run per instance, 36 instances)" in text
+    assert "Other instances" not in text
     plain = {"qualname": "m.norm", "cases": [{"signature": "a0[1, 8]", "count": 3}]}
     assert "# Entrypoints" not in prompts.engineer_prompt(
         target, plain, ["triton"], "p", "t", 4, None
     )
+    # The captured instance only runs forward, but other instances call forward_step.
+    dit = {
+        "qualname": "model.feat_decoder.estimator.decoder.layers.0.self_attn",
+        "methods": {"forward": 180},
+        "method_instances": {"forward": 60, "forward_step": 36},
+        "cases": [{"method": "forward", "signature": "a0[2, 11, 1024]", "count": 180}],
+    }
+    text = prompts.engineer_prompt(target, dit, ["triton"], "p", "t", 4, None)
+    assert "Other instances of the class also call `forward_step`" in text
 
 
 # ------------------------------------------------------------------ GPU end to end
@@ -525,6 +541,10 @@ def test_forward_step_capture_and_evaluate_on_gpu(tmp_path):
     step = next(c for c in result["cases"] if c["method"] == "forward_step")
     assert step["calls_per_run"] == STEPS and step["new_ms"] > 0 and step["ref_ms"] > 0
     assert result["speedup"] > 0
+    expected = sum(
+        c["calls_per_run"] * (c["ref_ms"] - c["new_ms"]) * LAYERS for c in result["cases"]
+    )
+    assert result["est_saved_ms_per_run"] == pytest.approx(expected, abs=1e-2)
     bad = evaluate(tmp_path / "cap.pt", _candidate(tmp_path, "forgets", value="0"))
     assert bad["status"] == "incorrect"
     only_forward = tmp_path / "only_forward.py"

@@ -218,10 +218,25 @@ def _entrypoints_block(capture_info: dict[str, Any], cls: str) -> str:
     calls: dict[str, int] = dict(capture_info.get("methods") or {})
     for c in capture_info.get("cases", []):
         calls.setdefault(c.get("method", "forward"), c.get("count", 0))
-    others = [m for m in calls if m != "forward"]
+    users: dict[str, int] = dict(capture_info.get("method_instances") or {})
+    uncaptured = [m for m in users if m not in calls and m != "forward"]
+    others = [m for m in calls if m != "forward"] + uncaptured
     if not others:
         return ""
-    listed = ", ".join(f"`{m}` ({n} calls per run per instance)" for m, n in calls.items())
+    listed = ", ".join(
+        f"`{m}` ({n} calls per run per instance"
+        + (f", {users[m]} instances" if m in users else "")
+        + ")"
+        for m, n in calls.items()
+    )
+    note = ""
+    if uncaptured:
+        note = (
+            "\nOther instances of the class also call "
+            + ", ".join(f"`{m}`" for m in uncaptured)
+            + ", which the captured instance does not: no case checks it, so keep the "
+            "reference implementation for it (integration fails without it)."
+        )
     first = others[0]
     return f"""
 # Entrypoints
@@ -231,9 +246,9 @@ The model calls this module through {listed}. Non-`forward` calls bypass
 captured method with the same signature, outputs and side effects (e.g. writing
 the new key/value into the passed KV-cache tensors at the given position — the
 evaluator checks the argument tensors after the call). A candidate without one
-of them fails with `build_error`. Spend the effort on the entrypoint with the
-most calls; the others may keep the reference implementation. Subclassing the
-reference class is a convenient way to do that:
+of them fails with `build_error`.{note} Spend the effort on the entrypoint with
+the most calls; the others may keep the reference implementation. Subclassing
+the reference class is a convenient way to do that:
 ```python
 import copy
 

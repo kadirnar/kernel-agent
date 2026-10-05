@@ -27,7 +27,8 @@ HF URL ─► resolve (modality, arch, size)
         ─► plan      Claude reads the profile + source, picks target modules,
                      an approach and backends for each, and model transforms
         ─► capture   each target module is saved with real inputs/outputs
-                     (prefill + decode shapes, KV-cache side effects)  [GPU worker]
+                     (prefill + decode shapes, KV-cache side effects, every
+                     entrypoint such as forward_step)               [GPU worker]
         ─► kernels   one Claude "kernel engineer" per target writes candidates,
                      calls evaluate_candidate (correctness + interleaved
                      benchmark + optional per-kernel profile) and iterates
@@ -47,8 +48,10 @@ illegal memory access can't kill the run, and parallel agents
 * **Module level** (`evaluate_candidate`): every captured case must match the
   reference outputs **and** the in-place side effects (for example KV-cache
   appends) within dtype-aware tolerances (bf16 2e-2, fp16 1e-2, fp32 1e-4;
-  at most 0.1 % of elements outside). If `build()` hands back the reference
-  module unchanged, the candidate is rejected.
+  at most 0.1 % of elements outside). Side effects are compared on the
+  elements the reference or the candidate changed, so writing one position of
+  an 8192-long cache (or forgetting to) is not lost in the 0.1 %. If `build()`
+  hands back the reference module unchanged, the candidate is rejected.
 * **Model level** (`e2e`): the workload's own comparison. For LLM/STT that is
   identical greedy tokens for the first N tokens plus first-step logits cosine
   ≥ 0.99. For TTS it is spectral cosine. For diffusion it is PSNR ≥ 25 dB on
@@ -61,6 +64,31 @@ after a GPU warm-up, and the median round is reported. Mutable inputs (caches)
 are deep-copied outside the timed region. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
 wall-clock latency of the whole workload.
+
+### Entrypoints other than `forward`
+
+Custom decode loops often call module methods directly, e.g. VoxCPM's
+`MiniCPMModel.forward_step → MiniCPMDecoderLayer.forward_step →
+MiniCPMAttention.forward_step`. Those calls bypass `nn.Module` hooks, so
+kernel-agent finds them by name (`forward*`, `step`, `decode*`, `prefill*`,
+`generate_step` defined on the model's own classes; add others with
+`-o entrypoints=Cls.method,...` or `Workload.entrypoints`) and wraps them per
+instance:
+
+* the profile shows a *methods* column (`forward_step×720 (638.4 ms) ·
+  forward×2448 (1208.7 ms)`) and signatures like `forward_step: a0[1, 2048]`;
+* capture records cases from every entrypoint (`"method": "forward_step"`),
+  keeping at least one case per entrypoint (`--max-cases`, default 4);
+* the evaluator replays each case through its method (`candidate.forward_step(...)`)
+  for correctness and timing; a candidate without a captured method is a
+  `build_error`, and integration refuses a replacement that lacks one.
+
+Arguments that are views into a much larger storage (one layer's K/V slice of
+a static `[2, layers, B, H, T, D]` cache) are captured compactly: only the
+memory the views span, with the same shapes, strides and aliasing between
+overlapping views (a full deep copy would store the whole cache for every
+case, before and after the call). Side effects are therefore checked on the
+memory the arguments cover, not on the rest of the buffer they were sliced from.
 
 ### Budgets
 
@@ -149,6 +177,7 @@ kernel-agent optimize <hf-url> [options]
                                        STT: audio=/path.wav, audio_seconds, new_tokens
                                        TTS: text, seed, min_spec_cosine
                                        diffusion: steps, height, width, prompt, cpu_offload, min_psnr
+                                       any: entrypoints=Cls.method,... (extra non-forward methods)
   --backends cuda,triton,cute,tilelang,nvrtc
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
@@ -306,10 +335,28 @@ def build(reference: torch.nn.Module) -> torch.nn.Module:
     `reference` for instances the kernel does not support."""
 ```
 
+If the model also calls the module through another entrypoint (the capture's
+cases say `"method": "forward_step"`), the replacement must implement that
+method too, with the same signature and side effects. Subclassing the
+reference class keeps the methods a kernel does not touch:
+
+```python
+class Fast(MiniCPMAttention):
+    def forward_step(self, hidden_states, position_emb, position_id, kv_cache): ...
+
+
+def build(reference):
+    new = copy.copy(reference)  # shares the weights
+    new.__class__ = Fast
+    return new
+```
+
 ## Harness contract (custom models)
 
 `harness.py` defines `create(spec) -> Workload`. Implement `load`, `roots`,
-`make_inputs`, `run` and `compare` (`kernel_agent/workloads/base.py`).
+`make_inputs`, `run` and `compare` (`kernel_agent/workloads/base.py`). If the
+inference loop calls module methods whose names the entrypoint pattern misses,
+list them in the class attribute `entrypoints = {"ClassName": ["method"]}`.
 
 ## Using it interactively from Claude Code
 
