@@ -20,7 +20,7 @@ class KernelPatch:
     module_class: str
     candidate: Path
     qualname_regex: str | None = None
-    #: Entrypoints the model calls on this class (``spec["capture"]["methods"]``,
+    #: Entrypoints the model calls on this class (``spec["capture"]["method_instances"]``,
     #: e.g. ``["forward", "forward_step"]``); replacements must provide them.
     methods: list[str] = field(default_factory=list)
 

@@ -163,7 +163,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
                 module_class=spec["module_class"],
                 candidate=Path(path),
                 qualname_regex=spec.get("qualname_regex"),
-                methods=list(spec.get("capture", {}).get("methods", [])),
+                methods=list(spec.get("capture", {}).get("method_instances", [])),
             )
         )
     report = PatchReport()

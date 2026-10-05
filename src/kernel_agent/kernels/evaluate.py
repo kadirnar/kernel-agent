@@ -246,12 +246,14 @@ def evaluate(
         n = case["count"]
         ref_total += n * ref_t["median_ms"]
         new_total += n * new_t["median_ms"]
-        saved += n * (ref_t["median_ms"] - new_t["median_ms"])
+        # times the instances that call this entrypoint (all instances for old captures)
+        users = capture.get("method_instances", {}).get(method, capture.get("instances", 1))
+        saved += n * (ref_t["median_ms"] - new_t["median_ms"]) * users
 
     result.update(
         status="ok",
         speedup=round(ref_total / max(new_total, 1e-9), 3),
-        est_saved_ms_per_run=round(saved * capture.get("instances", 1), 3),
+        est_saved_ms_per_run=round(saved, 3),
         ref_ms_weighted=round(ref_total, 4),
         new_ms_weighted=round(new_total, 4),
     )

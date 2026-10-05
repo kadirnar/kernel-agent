@@ -113,21 +113,37 @@ def _detach(value: Any) -> Any:
 
 
 class _Recorder:
-    """Records the calls of one module instance through all of its entrypoints."""
+    """Records the calls of one module instance through all of its entrypoints.
 
-    def __init__(self, module: nn.Module, max_cases: int, methods: Sequence[str] = ()) -> None:
+    ``peers`` (other instances of the class) are only watched to count which
+    instances call which entrypoint (``callers``)."""
+
+    def __init__(
+        self,
+        module: nn.Module,
+        max_cases: int,
+        methods: Sequence[str] = (),
+        peers: Sequence[nn.Module] = (),
+    ) -> None:
         self.module = module
         self.max_cases = max_cases
         self.cases: dict[tuple[str, str], dict[str, Any]] = {}
         #: Calls per entrypoint during the run (all signatures, captured or not).
         self.calls: collections.Counter[str] = collections.Counter()
+        #: Entrypoint -> ids of the instances (``module`` and peers) that called it.
+        self.callers: dict[str, set[int]] = collections.defaultdict(set)
         self._pending: list[tuple[tuple[str, str], Any, Any] | None] = []
-        self._ctx: Any = instrument([module], {type(module): list(methods)}, self._pre, self._post)
+        self._ctx: Any = instrument(
+            [module, *peers], {type(module): list(methods)}, self._pre, self._post
+        )
         self._ctx.__enter__()
 
     def _pre(
         self, module: nn.Module, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
+        self.callers[method].add(id(module))
+        if module is not self.module:
+            return
         self.calls[method] += 1
         # Group calls by entrypoint and primary input only: decode steps share
         # it even though masks / cache positions grow every step.
@@ -167,6 +183,8 @@ class _Recorder:
         kwargs: dict[str, Any],
         output: Any,
     ) -> None:
+        if module is not self.module:
+            return
         pending = self._pending.pop() if self._pending else None
         if pending is None:
             return
@@ -219,7 +237,13 @@ def capture_module(
     roots = workload.roots()
     full, module = find_instance(roots, cls, qualname)
     methods = entrypoints_of(type(module), workload_entrypoints(workload))
-    recorder = _Recorder(module, max_cases, methods)
+    peers = [
+        m
+        for root in roots.values()
+        for m in root.modules()
+        if type(m).__name__ == cls and m is not module
+    ]
+    recorder = _Recorder(module, max_cases, methods, peers)
     try:
         with torch.inference_mode():
             workload.run(inputs)
@@ -230,6 +254,9 @@ def capture_module(
         raise RuntimeError(f"{full} ({cls}) was never called during the workload run")
     cases = sorted(recorder.cases.values(), key=lambda c: -c["count"])
     calls = dict(recorder.calls.most_common())
+    # Instances that call each entrypoint (VoxCPM: forward_step only on the LM
+    # layers, forward on every MiniCPMAttention) – weights the estimated saving.
+    method_instances = {m: len(ids) for m, ids in recorder.callers.items()}
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -238,6 +265,7 @@ def capture_module(
             "class": cls,
             "module_path": f"{type(module).__module__}.{type(module).__qualname__}",
             "instances": count_calls(roots, cls),
+            "method_instances": method_instances,
             "methods": calls,
             "cases": cases,
         },
@@ -247,6 +275,7 @@ def capture_module(
         "qualname": full,
         # calls per run of this instance, per entrypoint (captured or not)
         "methods": calls,
+        "method_instances": method_instances,
         "cases": [
             {"method": c["method"], "signature": c["signature"], "count": c["count"]} for c in cases
         ],

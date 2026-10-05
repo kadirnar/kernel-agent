@@ -91,7 +91,7 @@ def export_optimized(run: RunDir, accepted: list[tuple[str, str, float]]) -> Pat
             spec = read_json(run.target(target_id) / "spec.json")
             dst = out / "kernels" / f"{target_id}.py"
             shutil.copy2(path, dst)
-            methods = spec.get("capture", {}).get("methods", {})
+            methods = spec.get("capture", {}).get("method_instances", {})
             manifest["kernels"].append(
                 {
                     "target": target_id,
