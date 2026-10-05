@@ -7,7 +7,9 @@
         it has plateaued: first a clean-context research session that writes its
             plan.md (research.py; at most one per --research-every slices of the arm)
         run one slice: a fresh agent session with --slice evaluations, seeded with
-            a digest (last ledger rows, ideas, best snapshot, plan.md, NOTES.md)
+            a digest (last ledger rows, ideas, best snapshot, plan.md, NOTES.md); a
+            target with workers (--seeds-per-target, workers.py) gets one session per
+            worker, concurrently up to --parallel, that share the slice's evaluations
         every --integrate-every kept results: measured re-integration
     every arm stopped: with --rounds > 1 and a real end-to-end gain in this round,
         re-profile the optimised model, re-plan with the prior rounds as context
@@ -38,7 +40,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import ledger, research
+from kernel_agent import ledger, research, workers
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
@@ -57,6 +59,7 @@ from kernel_agent.scheduler import (
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 if TYPE_CHECKING:
+    from kernel_agent.agent.runner import AgentResult
     from kernel_agent.orchestrator import Orchestrator
 
 STATE = "improve.json"
@@ -161,8 +164,11 @@ def _footer(notes: str) -> list[str]:
     ]
 
 
-def kernel_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy) -> str:
-    """Context of a fresh kernel-engineer session (bounded: no growth with the slice count)."""
+def kernel_digest(
+    run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy, worker: int | None = None
+) -> str:
+    """Context of a fresh kernel-engineer session (bounded: no growth with the slice count);
+    ``worker``: of that worker's session (its own NOTES.md, the target's shared ledger)."""
     lines = _header(n, evaluations, "`results.jsonl`, `NOTES.md` and `history/`")
     lines += ["", "## Best so far"]
     if arm.best_snapshot:
@@ -181,7 +187,7 @@ def kernel_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Polic
         lines += ["", "## Ideas so far (`idea_id`; buggy = never correct: retry, not refuted)", ""]
         lines += research.ideas_table(stats)
     lines += research.plan_section(run, arm.id)
-    lines += _notes(run.target(arm.id) / "NOTES.md", "NOTES.md")
+    lines += _notes(workers.notes_file(run, arm.id, worker), "NOTES.md")
     lines += [
         "",
         "## Where this target stands",
@@ -460,15 +466,23 @@ class Improver:
         try:
             if arm.kind == SYSTEMS:
                 digest = systems_digest(self.run, arm, n, evaluations, self.policy)
-                result = await self.orch.systems_slice(
-                    evaluations=evaluations, digest=digest, label=label
-                )
+                results = [
+                    await self.orch.systems_slice(
+                        evaluations=evaluations, digest=digest, label=label
+                    )
+                ]
+            elif team := self._team(arm, evaluations):
+                rec["workers"] = [s.worker for s in team]
+                self.save()
+                results = await self._workers(arm, team, n, rec)
             else:
                 self._restart_advice(arm)
                 digest = kernel_digest(self.run, arm, n, evaluations, self.policy)
-                result = await self.orch.kernel_slice(
-                    arm.id, evaluations=evaluations, digest=digest, label=label
-                )
+                results = [
+                    await self.orch.kernel_slice(
+                        arm.id, evaluations=evaluations, digest=digest, label=label
+                    )
+                ]
         except Exception as exc:  # an SDK / CLI failure must not end an unattended loop
             log(f"slice {n}: agent session failed: {exc!r}")
             rec["error"] = repr(exc)[:500]
@@ -477,19 +491,78 @@ class Improver:
         except BaseException:  # Ctrl-C, cancellation
             self._close(rec, "interrupted")
             raise
-        status = "timed_out" if result.timed_out else "error" if result.is_error else "done"
-        self._close(rec, status, usd=result.cost_usd)
+        status = "done"
+        if any(r.is_error for r in results) or rec.get("error"):
+            status = "error"
+        if any(r.timed_out for r in results):
+            status = "timed_out"
+        self._close(rec, status, usd=sum(r.cost_usd for r in results))
         return rec
 
-    def _restart_advice(self, arm: Arm) -> None:
+    def _team(self, arm: Arm, evaluations: int) -> list[workers.Seed]:
+        """The worker sessions of a kernel slice ([]: one classic session). With
+        ``--reseed-workers`` the slices after the arm's first worker slice start from its
+        two best snapshots (``workers.reseeds``)."""
+        team = self.orch.kernel_seeds(arm.id, evaluations)
+        earlier = [s for s in self.state["slices"] if s["arm"] == arm.id and s.get("workers")]
+        if team and earlier and self.orch.cfg.reseed_workers:
+            team = workers.reseeds(self.run, arm.id, team, evaluations, self.orch.truth) or team
+        return team
+
+    async def _workers(
+        self, arm: Arm, team: list[workers.Seed], n: int, rec: dict[str, Any]
+    ) -> list[AgentResult]:
+        """One session per worker, concurrently up to ``--parallel``, each with its share of
+        the slice's evaluations and a digest made when it starts (so a session that waited
+        for its slot sees the results of the ones before it). A session that raised is
+        logged in ``rec``; the slice fails only when every session raised."""
+        sem = asyncio.Semaphore(max(1, self.orch.cfg.parallel))
+        self._restart_advice(arm, [workers.agent_name(arm.id, s.worker) for s in team])
+        log(
+            f"slice {n}: {arm.id}: {len(team)} workers, "
+            + ", ".join(f"w{s.worker} {s.evaluations} evals ({s.origin})" for s in team)
+        )
+
+        async def one(seed: workers.Seed) -> AgentResult:
+            async with sem:
+                now = next((a for a in self.arms() if a.id == arm.id), arm)
+                digest = kernel_digest(
+                    self.run, now, n, seed.evaluations, self.policy, worker=seed.worker
+                )
+                return await self.orch.worker_session(
+                    arm.id,
+                    seed,
+                    team,
+                    prompt=f"Continue optimising target `{arm.id}` as worker {seed.worker} "
+                    "(see the `# Worker` section). Read the `# Improve slice` section first: "
+                    "it says where the previous sessions left off.",
+                    digest=digest,
+                    label=f"{workers.agent_name(arm.id, seed.worker)}#{n}",
+                )
+
+        out = await asyncio.gather(*(one(s) for s in team), return_exceptions=True)
+        failed = [r for r in out if isinstance(r, BaseException)]
+        for exc in failed:
+            if not isinstance(exc, Exception):  # cancellation: the slice is interrupted
+                raise exc
+        if failed and len(failed) == len(out):
+            raise failed[0]
+        if failed:
+            log(f"slice {n}: {len(failed)} of {len(out)} worker sessions failed: {failed[0]!r}")
+            rec["error"] = repr(failed[0])[:500]
+        return [r for r in out if not isinstance(r, BaseException)]
+
+    def _restart_advice(self, arm: Arm, agents: list[str] | None = None) -> None:
         """Let the evaluation advice count the arm's plateau from its last research plan,
-        as the scheduler does (else the first evaluation after a plan says stop)."""
+        as the scheduler does (else the first evaluation after a plan says stop);
+        ``agents``: the sessions it applies to (default: the arm's classic session)."""
         plans = [r["exp"] for r in self.state["research"] if r["arm"] == arm.id and r.get("plan")]
-        if plans:
-            done = sum((r["exp"] or 0) <= max(plans) for r in arm.rows)
-            self.orch.budget.restarted[arm.agent] = done
-        else:
-            self.orch.budget.restarted.pop(arm.agent, None)
+        done = sum((r["exp"] or 0) <= max(plans) for r in arm.rows) if plans else None
+        for agent in agents or [arm.agent]:
+            if done is None:
+                self.orch.budget.restarted.pop(agent, None)
+            else:
+                self.orch.budget.restarted[agent] = done
 
     def _close(
         self,
@@ -930,6 +1003,9 @@ async def improve(
                 if getattr(cfg, k) is not None
             },
             **{k: False for k in ("use_library", "librarian") if not getattr(cfg, k)},
+            **({"seeds_per_target": cfg.seeds_per_target} if cfg.seeds_per_target else {}),
+            **({"reseed_workers": True} if cfg.reseed_workers else {}),
+            **({"parallel": cfg.parallel} if cfg.parallel > 1 else {}),
         }
         orch = Orchestrator.resume(path, overrides)
     elif dry_run:

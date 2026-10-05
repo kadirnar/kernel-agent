@@ -12,9 +12,18 @@ experiment:
 * ``discard`` correct, but not better
 * ``incorrect``, ``build_error``, ``runtime_error``, ``crash``, ``timeout``: failures
 
+Rows that are not benchmark evaluations (:data:`UNMEASURED`, see :func:`measured`): they
+count against no budget or streak and the charts do not plot them:
+
+* ``quick_ok`` / ``quick_fail``: ``evaluate_candidate(mode="quick")``, correctness on the
+  smallest and largest captured case, no timing
+* ``duplicate``: a candidate whose normalised source was evaluated before
+  (:mod:`kernel_agent.dedup`); ``snapshot`` names the earlier snapshot, nothing ran
+
 Kernel rows carry the ``idea`` the agent tagged the candidate with (``idea_id`` of
 ``evaluate_candidate``); :func:`ideas` aggregates a target's rows per idea, so that a
-buggy attempt is not mistaken for a refuted idea.
+buggy attempt is not mistaken for a refuted idea, and the ``worker`` that produced them
+when the target has parallel workers (:mod:`kernel_agent.workers`; empty otherwise).
 
 ``results.jsonl`` (``RunDir.results_file``) keeps the full records; the TSV is the readable
 summary that the charts, ``kernel-agent status`` and ``dashboard.html`` read.
@@ -50,6 +59,7 @@ COLUMNS = (
     "spread",
     "pct_of_sol",
     "eval_s",
+    "worker",
     "idea",
     "hypothesis",
 )
@@ -57,6 +67,10 @@ KEEP = "keep"
 DISCARD = "discard"
 FAILURES = ("incorrect", "build_error", "runtime_error", "crash", "timeout")
 STATUSES = (KEEP, DISCARD, *FAILURES)
+QUICK_OK = "quick_ok"
+QUICK_FAIL = "quick_fail"
+DUPLICATE = "duplicate"
+UNMEASURED = (QUICK_OK, QUICK_FAIL, DUPLICATE)  # rows that are not benchmark evaluations
 E2E = "e2e"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -105,6 +119,11 @@ def classify(result: dict[str, Any], best: float, *, e2e: bool = False) -> str:
     if e2e:  # run-to-run spread of the end-to-end timing
         result = {**result, "timing_spread": e2e_spread(result) or 0.0}
     return KEEP if improves(result, best, ok_key=ok_key) else DISCARD
+
+
+def measured(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The rows that are benchmark evaluations (no quick checks, no duplicates)."""
+    return [r for r in rows if r.get("status") not in UNMEASURED]
 
 
 def kernel_spread(result: dict[str, Any]) -> float | None:
@@ -169,17 +188,18 @@ def idea_slug(value: Any) -> str:
 def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per-idea aggregates of a target's ledger rows (or records), in order of first try.
 
-    Rows without an ``idea`` are skipped. Per idea: ``tries``; ``best``, the best correct
-    speedup; ``kept``, new bests; ``slow``, correct but not a new best; ``bugs``, not
-    correct (wrong results, build or runtime errors, crashes, timeouts), with every
-    ``statuses`` count; ``expected``, the last ``expected_speedup`` given; the
-    ``last_hypothesis``; the ``exps``; and a ``verdict``: ``kept``, ``slow`` (measured
-    correct and never a new best) or ``buggy`` (never correct: untested, not refuted).
+    Rows without an ``idea`` and rows that measured nothing (:data:`UNMEASURED`) are
+    skipped. Per idea: ``tries``; ``best``, the best correct speedup; ``kept``, new
+    bests; ``slow``, correct but not a new best; ``bugs``, not correct (wrong results,
+    build or runtime errors, crashes, timeouts), with every ``statuses`` count;
+    ``expected``, the last ``expected_speedup`` given; the ``last_hypothesis``; the
+    ``exps``; and a ``verdict``: ``kept``, ``slow`` (measured correct and never a new
+    best) or ``buggy`` (never correct: untested, not refuted).
     """
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
         idea = str(row.get("idea") or "")
-        if not idea:
+        if not idea or row.get("status") in UNMEASURED:
             continue
         agg = out.setdefault(
             idea,
@@ -316,8 +336,13 @@ def record_kernel(
     eval_s: float | None = None,
     when: float | None = None,
     idea: str = "",
+    worker: int | None = None,
+    status: str | None = None,
 ) -> dict[str, Any]:
-    """Classify a kernel evaluation against the target's running best and append it."""
+    """Classify a kernel evaluation against the target's running best and append it.
+
+    ``status``: a status of :data:`UNMEASURED` instead of the classification;
+    ``worker``: the target's worker that ran it (:mod:`kernel_agent.workers`)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == target_id])
         row = append(
@@ -328,7 +353,7 @@ def record_kernel(
                 "backend": detect_backend(source),
                 "snapshot": Path(snapshot).name,
                 "parent": parent or "",
-                "status": classify(result, best),
+                "status": status or classify(result, best),
                 "correct": bool(result.get("correct")),
                 "speedup": _num(result.get("speedup")),
                 "ref_ms": _num(result.get("ref_ms_weighted")),
@@ -339,9 +364,13 @@ def record_kernel(
                 "eval_s": eval_s if eval_s is not None else _num(result.get("eval_seconds")),
                 "idea": idea,
                 "hypothesis": hypothesis,
+                "worker": worker,
             },
         )
-    event(run, "evaluation", when=when, target=target_id, exp=row["exp"], status=row["status"])
+    tag = {"worker": worker} if worker else {}
+    event(
+        run, "evaluation", when=when, target=target_id, exp=row["exp"], status=row["status"], **tag
+    )
     return row
 
 
@@ -430,6 +459,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
                 "eval_s": _num(rec.get("eval_seconds")),
                 "idea": rec.get("idea") or "",
                 "hypothesis": rec.get("hypothesis") or "",
+                "worker": rec.get("worker"),
             }
             kept.append(row)
             out.append(row)
@@ -521,7 +551,7 @@ def summary(run: RunDir) -> dict[str, Any]:
     ids += sorted({r["target"] for r in ledger_rows} - {E2E} - set(ids))
     for target_id in ids:
         spec = read_json(run.target(target_id) / "spec.json", {}) or {}
-        trows = [r for r in ledger_rows if r["target"] == target_id]
+        trows = measured(r for r in ledger_rows if r["target"] == target_id)
         kept = [r for r in trows if r["status"] == KEEP]
         best = max(kept, key=lambda r: r["speedup"] or 0.0, default=None)
         targets.append(
@@ -538,6 +568,7 @@ def summary(run: RunDir) -> dict[str, Any]:
                 "best_backend": best["backend"] if best else None,
                 "est_saved_ms": best["est_saved_ms"] if best else None,
                 "last_hypothesis": trows[-1]["hypothesis"] if trows else "",
+                "workers": sorted({str(r["worker"]) for r in trows if r.get("worker")}, key=int),
             }
         )
     saved = sum(t["est_saved_ms"] or 0.0 for t in targets)
@@ -577,7 +608,7 @@ def summary(run: RunDir) -> dict[str, Any]:
         "best_e2e": best_e2e,
         "final": final or None,
         "reference": integration.get("reference") or None,
-        "evaluations": len(ledger_rows),
+        "evaluations": len(measured(ledger_rows)),
         "keeps": sum(r["status"] == KEEP for r in ledger_rows),
         "failures": sum(r["status"] in FAILURES for r in ledger_rows),
         "targets": targets,

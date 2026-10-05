@@ -5,9 +5,12 @@ No GPU and no Claude. The simulated agents write the files a real run has
 ``plan.md``) and record every evaluation through the same code as the evaluation
 tools (``record_candidate`` with an ``idea_id``, ``record_e2e_result``), so the
 ledger, the budget advice, the research trigger, the charts, the dashboard and
-the report are exercised end to end. The simulated engineer retries an idea
-once after a failed attempt and starts from the plan's directions; the research
-agent writes its plan from the ledger (the outcomes do not depend on either).
+the report are exercised end to end, with workers per target too
+(``--seeds-per-target``: a worker session writes to its own directory and follows
+the evaluation budget of its ``# Worker`` section). The simulated engineer
+retries an idea once after a failed attempt and starts from the plan's
+directions; the research agent writes its plan from the ledger (the outcomes do
+not depend on either).
 The simulated worker runs the integration's end-to-end measurements, the
 re-profile of a round and the capture of new targets.
 
@@ -40,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import ledger, program, truth
+from kernel_agent import ledger, program, truth, workers
 from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.budget import Budget
@@ -444,7 +447,8 @@ class World:
             evals = self._systems()
             result.cost_usd = 0.3 + 0.5 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("kernel-"):
-            evals = self._kernel(name.removeprefix("kernel-"), system_append)
+            target_id, worker = workers.parse_agent(name)
+            evals = self._kernel(target_id, system_append, worker=worker)
             result.cost_usd = 0.25 + 0.35 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("research-"):
             self._research(name.removeprefix("research-"), writable or [])
@@ -474,8 +478,11 @@ class World:
             return True
         return advice == "consider_stopping" and rng.random() < 0.5
 
-    def _kernel(self, target_id: str, system: str = "") -> int:
+    def _kernel(self, target_id: str, system: str = "", worker: int | None = None) -> int:
         target_dir = self.run.target(target_id)
+        home = workers.directory(self.run, target_id, worker) if worker else target_dir
+        agent = workers.agent_name(target_id, worker) if worker else f"kernel-{target_id}"
+        budget = re.search(r"budget in this session: (\d+) evaluations", system)
         spec = read_json(target_dir / "spec.json", {}) or {}
         sim = sim_target(spec)
         ref_ms = self.ref_ms(sim.cls) or 10.0
@@ -488,12 +495,12 @@ class World:
             rng = _rng(self.seed, "kernel", target_id, k)
             kept = [r for r in rows if r["status"] == ledger.KEEP]
             best = ledger.best_kept(rows)
-            backend = sim.backends[(k // 5) % len(sim.backends)]
+            backend = sim.backends[(k // 5 + (worker or 1) - 1) % len(sim.backends)]
             idea, hypothesis = _next_idea(sim, rows, plan)
             expected = best * _rng(self.seed, "expect", target_id, k).uniform(1.05, 1.4)
             outcome = self._kernel_outcome(sim, best, rng)
             self.clock.advance(rng.uniform(150, 330))
-            src = target_dir / "candidates" / f"{backend}_v{k + 1}.py"
+            src = home / "candidates" / f"{backend}_v{k + 1}.py"
             header = HEADERS.get(backend, "import torch\n")
             src.write_text(
                 f'{header}\n"""{hypothesis}"""\n\n\ndef build(reference):\n    return reference\n'
@@ -512,14 +519,15 @@ class World:
                 when=self.clock.now(),
                 idea=idea,
                 expected_speedup=round(expected, 2),
+                worker=worker,
             )
             used += 1
-            _note(target_dir / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
+            _note(home / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
             if self.hook:
-                self.hook(f"kernel-{target_id}", used)
+                self.hook(agent, used)
             results = self.run.results_file(target_id)
-            evals = self.orch.budget.kernel_evals
-            if self._advice(f"kernel-{target_id}", results, evals, rng, sol_signal(result)):
+            evals = int(budget[1]) if budget else self.orch.budget.kernel_evals
+            if self._advice(agent, results, evals, rng, sol_signal(result)):
                 return used
 
     @staticmethod

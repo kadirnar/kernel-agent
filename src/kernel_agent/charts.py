@@ -49,6 +49,8 @@ OTHER_COLOR = "#d9d8d1"
 # Categorical order for targets (validated for adjacent CVD separation); green
 # and red are left out so they keep meaning "kept" and "failed".
 TARGET_COLORS = ("#2a78d6", "#eb6834", "#4a3aa7", "#eda100", "#e87ba4", "#008300")
+# Marker of each parallel worker of a target (workers.py); the colour stays kept / discarded.
+WORKER_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*")
 
 _RC: dict[Any, Any] = {  # matplotlib types its rc keys as literals
     "font.family": "DejaVu Sans",
@@ -293,8 +295,10 @@ def _thousands() -> Any:
 def target_progress(
     run: RunDir, target_id: str, rows: list[dict[str, Any]] | None = None
 ) -> Path | None:
-    """``targets/<id>/progress.png``: speedup per evaluation with the running best."""
+    """``targets/<id>/progress.png``: speedup per evaluation with the running best (benchmark
+    evaluations only: no quick checks or duplicates; one marker shape per worker)."""
     rows = [r for r in (ledger.rows(run) if rows is None else rows) if r["target"] == target_id]
+    rows = ledger.measured(rows)
     if not rows or not available():
         return None
     spec = read_json(run.target(target_id) / "spec.json", {}) or {}
@@ -356,26 +360,21 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
         )
         taken.append(_label_box(ax, best_label))
 
+    team = sorted({str(r["worker"]) for r in rows if r.get("worker")}, key=int)
+
+    def marker(row: dict[str, Any]) -> str:
+        worker = str(row.get("worker") or "")
+        return WORKER_MARKERS[(int(worker) - 1) % len(WORKER_MARKERS)] if worker else "o"
+
+    def scatter(points: list[tuple[int, dict[str, Any]]], **style: Any) -> None:
+        for shape in dict.fromkeys(marker(r) for _, r in points):
+            mine = [(i, r) for i, r in points if marker(r) == shape]
+            ax.scatter([i for i, _ in mine], [r["speedup"] for _, r in mine], marker=shape, **style)
+
     if discarded:
-        ax.scatter(
-            [i for i, _ in discarded],
-            [r["speedup"] for _, r in discarded],
-            s=34,
-            color=DISCARD_COLOR,
-            edgecolors=SURFACE,
-            linewidths=1.0,
-            zorder=4,
-        )
+        scatter(discarded, s=34, color=DISCARD_COLOR, edgecolors=SURFACE, linewidths=1.0, zorder=4)
     if kept:
-        ax.scatter(
-            [i for i, _ in kept],
-            [r["speedup"] for _, r in kept],
-            s=62,
-            color=KEEP_COLOR,
-            edgecolors=INK,
-            linewidths=0.8,
-            zorder=5,
-        )
+        scatter(kept, s=62, color=KEEP_COLOR, edgecolors=INK, linewidths=0.8, zorder=5)
     if failed:
         ax.scatter(
             [i for i, _ in failed],
@@ -427,6 +426,8 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
     parts = [f"`{spec.get('module_class')}`" if spec.get("module_class") else ""]
     if spec.get("backends"):
         parts.append("backends: " + ", ".join(spec["backends"]))
+    if team:
+        parts.append(f"{len(team)} workers")
     if kinds:
         parts.append(
             "failures: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in kinds.items())
@@ -447,6 +448,19 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
             Line2D([], [], ls="", marker="x", ms=7, mec=FAIL_COLOR, mew=1.8, label="failed"),
             Line2D([], [], color=KEEP_COLOR, lw=2, label="running best"),
             Line2D([], [], color=INK_2, lw=1, ls=(0, (5, 4)), label="reference module"),
+            *(
+                Line2D(
+                    [],
+                    [],
+                    ls="",
+                    marker=marker({"worker": w}),
+                    ms=6,
+                    mfc="none",
+                    mec=INK_2,
+                    label=f"worker {w}",
+                )
+                for w in team
+            ),
         ],
     )
 

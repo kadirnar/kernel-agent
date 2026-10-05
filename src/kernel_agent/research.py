@@ -24,6 +24,7 @@ from typing import Any
 from kernel_agent import ledger, truth
 from kernel_agent.agent.tools import best_for_target, idea_rows
 from kernel_agent.truth import TamperError, Truth
+from kernel_agent.workers import all_notes
 from kernel_agent.workspace import RunDir
 
 PLAN_FILE = "plan.md"
@@ -40,10 +41,12 @@ def _cell(text: Any, limit: int = 200) -> str:
 
 
 def rows_table(rows: list[dict[str, Any]], *, sol: bool = False) -> list[str]:
-    """Ledger rows as a Markdown table; ``idea`` only when a row has one, ``sol``: % of SOL."""
+    """Ledger rows as a Markdown table; ``idea`` / ``worker`` only when a row has one,
+    ``sol``: % of SOL."""
     ideas = any(r.get("idea") for r in rows)
+    team = any(r.get("worker") for r in rows)
     head = ["exp", "status", "speedup"] + (["% SOL"] if sol else []) + (["idea"] if ideas else [])
-    head += ["backend", "snapshot", "hypothesis"]
+    head += (["worker"] if team else []) + ["backend", "snapshot", "hypothesis"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for r in rows:
         cells = [str(r["exp"]), r["status"], "" if r["speedup"] is None else f"{r['speedup']:.3f}x"]
@@ -52,6 +55,8 @@ def rows_table(rows: list[dict[str, Any]], *, sol: bool = False) -> list[str]:
             cells.append("" if pct is None else f"{pct:.0f}")
         if ideas:
             cells.append(_cell(r.get("idea"), 40))
+        if team:
+            cells.append(f"w{r['worker']}" if r.get("worker") else "")
         cells += [r["backend"], r["snapshot"], _cell(r["hypothesis"])]
         lines.append("| " + " | ".join(cells) + " |")
     return lines
@@ -137,7 +142,7 @@ def _best(run: RunDir, target_id: str, keeper: Truth | None) -> list[str]:
 def evidence(run: RunDir, target_id: str, reason: str, keeper: Truth | None = None) -> str:
     """The ``# Evidence`` of a research session: why it runs, the best result with its
     speed of light per case, the per-idea aggregates and the target's ledger rows."""
-    rows = [r for r in ledger.rows(run) if r["target"] == target_id]
+    rows = ledger.measured(r for r in ledger.rows(run) if r["target"] == target_id)
     stats = target_ideas(run, target_id, keeper)
     kept = sum(r["status"] == ledger.KEEP for r in rows)
     failed = sum(r["status"] in ledger.FAILURES for r in rows)
@@ -165,6 +170,12 @@ def evidence(run: RunDir, target_id: str, reason: str, keeper: Truth | None = No
             "`keep` = new best)",
             "",
             *rows_table(shown, sol=True),
+        ]
+    notes = [f"`{p.relative_to(run.target(target_id))}`" for _, p in all_notes(run, target_id)]
+    if len(notes) > 1:
+        lines += [
+            "",
+            f"The target has parallel workers; read every notes file: {', '.join(notes)}.",
         ]
     if plan_path(run, target_id).is_file():
         lines += [

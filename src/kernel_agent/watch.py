@@ -461,7 +461,7 @@ class Watcher:
                 "projected_ms": round(max(base_ms - saved, 0.0), 3) if base_ms else None,
                 "measured": measured,
                 "counts": {
-                    "evaluations": len(rows),
+                    "evaluations": len(ledger.measured(rows)),
                     "keeps": sum(r["status"] == KEEP for r in rows),
                     "failures": sum(r["status"] in FAILURES for r in rows),
                     "e2e": len(e2e),
@@ -497,7 +497,7 @@ class Watcher:
         out = []
         for target_id in ids:
             spec = (files.get("specs") or {}).get(target_id) or {}
-            trows = [r for r in rows if r["target"] == target_id]
+            trows = ledger.measured(r for r in rows if r["target"] == target_id)
             kept = [r for r in trows if r["status"] == KEEP]
             best = max(kept, key=lambda r: r["speedup"] or 0.0, default=None)
             out.append(

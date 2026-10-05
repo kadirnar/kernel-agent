@@ -148,6 +148,18 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
+                    # other starting points for parallel workers (workers.py)
+                    "alternatives": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "approach": {"type": "string"},
+                                "backends": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["approach", "backends"],
+                        },
+                    },
                 },
                 "required": ["id", "module_class", "why", "approach", "backends"],
             },
@@ -232,7 +244,10 @@ model. Specialist agents will then write custom kernels for each target you pick
    kernels it removes, expected speedup) and an ordered list of `backends` from:
    {", ".join(backends)}. Put the backend most suited to the op first
    (e.g. load_inline CUDA or CuTe for launch-bound micro-ops, Triton/TileLang for
-   tiled GEMM/attention fusions). Usually list 2.
+   tiled GEMM/attention fusions). Usually list 2. For the hottest targets add
+   1-2 `alternatives` (`approach` + `backends`): a genuinely different
+   algorithm or fusion boundary, not a retuning. A target may get parallel
+   workers, each starting from one of them.
 4. Propose model-level **transforms** (algorithm changes such as static KV cache
    + CUDA graphs, merged projections, precomputed tables, removing host syncs)
    when the profile shows launch/CPU-bound behaviour or redundant work.
@@ -426,6 +441,11 @@ their structure.
   in the result: `keep` (beats the best by more than the timing noise),
   `discard`, or the failure kind.
   `profile=true` adds per-kernel GPU time tables for candidate and reference.
+  `mode="quick"` only checks correctness on the smallest and the largest case
+  (no timing, no speedup, not counted against your budget): use it to debug a
+  candidate before you spend a full evaluation on it. A candidate whose code
+  was evaluated before (comments and formatting aside) is not run again: the
+  result says `duplicate` and returns the earlier one.
 * `best_result(target_id="{target["id"]}")`: best correct result so far, and per
   idea: tries, best speedup, bugs (failed attempts) vs slow (correct, not faster).
 You have a budget of about {evaluations} evaluations. Stop early once further

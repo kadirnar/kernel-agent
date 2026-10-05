@@ -55,7 +55,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, truth
+from kernel_agent import ledger, truth, workers
 from kernel_agent.budget import PRIOR_HYPOTHESIS
 from kernel_agent.toolchain import CACHE_DIR
 from kernel_agent.truth import TamperError, Truth, read_verified, sha256_bytes, sha256_file
@@ -404,7 +404,7 @@ def store_run(
         old = read_json(dst / "entry.json", {}) if (dst / "entry.json").exists() else {}
         old = old if isinstance(old, dict) else {}
         backend = ledger.detect_backend(code.decode(errors="replace"))
-        notes_path = target_dir / "NOTES.md"
+        notes_path = workers.notes_file(run, target_id, rec.get("worker"))  # its worker's
         notes = notes_path.read_bytes()[-NOTES_CHARS:] if notes_path.exists() else b""
         accepted_now = bool(pick.get("accepted"))
         now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -797,8 +797,10 @@ def librarian_prompt(run: RunDir, names: dict[str, str], *, arch: str | None = N
             for c in (spec.get("capture") or {}).get("cases", [])[:4]
         )
         trows = [r for r in rows if r["target"] == target_id][-LIBRARIAN_ROWS:]
-        notes_path = run.target(target_id) / "NOTES.md"
-        notes = notes_path.read_text(errors="replace").strip() if notes_path.exists() else ""
+        notes = "\n\n".join(  # the target's and its workers' (workers.py)
+            (f"[{label}]\n" if label else "") + path.read_text(errors="replace").strip()
+            for label, path in workers.all_notes(run, target_id)
+        ).strip()
         if len(notes) > LIBRARIAN_NOTES_CHARS:
             notes = "…" + notes[-LIBRARIAN_NOTES_CHARS:]
         lines += [

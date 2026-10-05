@@ -53,6 +53,16 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
     return 0
 
 
+def _seeds(raw: str) -> int | str | None:
+    """``--seeds-per-target``: a count or ``auto``."""
+    from kernel_agent import workers
+
+    try:
+        return workers.parse(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def _config(ns: argparse.Namespace) -> OptimizeConfig:
     return OptimizeConfig(
         model_ref=ns.model,
@@ -66,6 +76,8 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         max_targets=ns.max_targets,
         evaluations_per_target=ns.evaluations,
         parallel=ns.parallel,
+        seeds_per_target=ns.seeds_per_target,
+        reseed_workers=ns.reseed_workers,
         do_transforms=not ns.no_transforms,
         claude_model=ns.claude_model,
         effort=ns.effort,
@@ -170,6 +182,7 @@ def cmd_eval(ns: argparse.Namespace) -> int:
         compile_baseline=ns.compile_baseline,
         timeout=ns.timeout,
         compile_check=ns.compile_check,
+        quick=ns.quick,
     )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("correct") else 1
@@ -261,6 +274,20 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-targets", type=int, default=4)
     p.add_argument("--evaluations", type=int, default=12, help="evaluation budget per target")
     p.add_argument("--parallel", type=int, default=1, help="kernel agents running concurrently")
+    p.add_argument(
+        "--seeds-per-target",
+        type=_seeds,
+        metavar="K|auto",
+        help="isolated workers per target, each from another approach or backend (auto: 2 "
+        "for targets with >= 20%% of the profile); the target's evaluation budget is split "
+        "across them (default 1)",
+    )
+    p.add_argument(
+        "--reseed-workers",
+        action="store_true",
+        help="with several workers: a second round of sessions from each target's two best "
+        "snapshots (half of the budget)",
+    )
     p.add_argument("--no-transforms", action="store_true", help="skip model-level transforms")
     p.add_argument("--claude-model", default=DEFAULT_MODEL)
     p.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
@@ -381,6 +408,9 @@ def main(argv: list[str] | None = None) -> int:
         "--compile-check",
         action="store_true",
         help="also torch.compile the candidate: graph breaks + compiled outputs",
+    )
+    p.add_argument(
+        "--quick", action="store_true", help="correctness on the smallest + largest case, untimed"
     )
     p.add_argument("--timeout", type=float, default=300.0, help="seconds before giving up")
     p.set_defaults(func=cmd_eval)

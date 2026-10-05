@@ -26,9 +26,11 @@ from kernel_agent import (
     library,
     program,
     research,
+    scheduler,
     strong_baseline,
     toolchain,
     truth,
+    workers,
 )
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import READ_TOOLS, AgentResult, agent_env, run_agent
@@ -148,7 +150,9 @@ class Orchestrator:
         **kwargs: Any,
     ) -> AgentResult:
         """Run an agent session; ``label`` keys its ``costs.json`` entry (default: ``name``),
-        ``config`` overrides fields of the run's config for this session (e.g. the model)."""
+        ``config`` overrides fields of the run's config for this session (e.g. the model),
+        ``mcp_server`` (in ``kwargs``) replaces the run's tools (a worker's, ``workers.py``)."""
+        server = kwargs.pop("mcp_server", None) or self.server
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
         ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)
@@ -163,7 +167,7 @@ class Orchestrator:
                 result = await (self.agent_runner or run_agent)(
                     name,
                     cfg=cfg,
-                    mcp_server=self.server,
+                    mcp_server=server,
                     env=self.env,
                     log_dir=self.run.root / "logs",
                     result=result,
@@ -328,6 +332,7 @@ class Orchestrator:
         sem = asyncio.Semaphore(max(1, self.cfg.parallel))
 
         async def one(target_id: str) -> None:
+            team: list[workers.Seed] = []
             async with sem:
                 if reason := self.budget.exhausted():
                     log(f"kernels: skipping {target_id}: {reason}")
@@ -338,42 +343,44 @@ class Orchestrator:
                 if reason := self._prior_suffices(target_id):
                     log(f"kernels: {target_id}: no agent session needed: {reason}")
                     return
-                target_dir = self.run.target(target_id)
-                spec = read_json(target_dir / "spec.json")
-                system = prompts.engineer_prompt(
-                    spec,
-                    spec.get("capture", {}),
-                    spec["backends"],
-                    self.python,
-                    self.tc.summary(),
-                    self.cfg.evaluations_per_target,
-                    stats.get(spec["module_class"]),
-                ) + self._library_note(target_id, spec)
-                (target_dir / "NOTES.md").touch()
-                await self._agent(
-                    f"kernel-{target_id}",
-                    prompt=(
-                        f"Optimise target `{target_id}`. Start by reading reference_source.py "
-                        "and spec.json, then write and evaluate candidates."
-                    ),
-                    system_append=system,
-                    cwd=target_dir,
-                    mcp_tools=tool_names("evaluate_candidate", "best_result"),
-                    add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
-                )
-                best = best_for_target(self.run, target_id, self.truth)
-                log(
-                    f"kernels: {target_id} best = "
-                    + (f"{best['speedup']}x ({best['snapshot']})" if best else "none correct")
-                )
-                data = self.run.load()
-                fin = (
-                    data.setdefault("phases", {})
-                    .setdefault("kernels", {})
-                    .setdefault("finished", [])
-                )
-                fin.append(target_id)
-                write_json(self.run.run_json, data)
+                first, _ = workers.rounds(self.cfg.evaluations_per_target, self.cfg.reseed_workers)
+                team = self.kernel_seeds(target_id, first)
+                if not team:  # one engineer session in the target directory
+                    target_dir = self.run.target(target_id)
+                    spec = read_json(target_dir / "spec.json")
+                    system = prompts.engineer_prompt(
+                        spec,
+                        spec.get("capture", {}),
+                        spec["backends"],
+                        self.python,
+                        self.tc.summary(),
+                        self.cfg.evaluations_per_target,
+                        stats.get(spec["module_class"]),
+                    ) + self._library_note(target_id, spec)
+                    (target_dir / "NOTES.md").touch()
+                    await self._agent(
+                        f"kernel-{target_id}",
+                        prompt=(
+                            f"Optimise target `{target_id}`. Start by reading "
+                            "reference_source.py and spec.json, then write and evaluate "
+                            "candidates."
+                        ),
+                        system_append=system,
+                        cwd=target_dir,
+                        mcp_tools=tool_names("evaluate_candidate", "best_result"),
+                        add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+                    )
+            if team:  # every worker session takes its own --parallel slot
+                await self._kernel_workers(target_id, team, sem)
+            best = best_for_target(self.run, target_id, self.truth)  # across the workers
+            log(
+                f"kernels: {target_id} best = "
+                + (f"{best['speedup']}x ({best['snapshot']})" if best else "none correct")
+            )
+            data = self.run.load()
+            fin = data.setdefault("phases", {}).setdefault("kernels", {}).setdefault("finished", [])
+            fin.append(target_id)
+            write_json(self.run.run_json, data)
 
         await asyncio.gather(*(one(t) for t in pending))
         self._mark("kernels")  # `finished` lists the targets whose agent ran
@@ -410,6 +417,107 @@ class Orchestrator:
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
         )
         self._mark("transforms")
+
+    # ------------------------------------------------------------ workers (workers.py)
+
+    def _share(self, spec: dict[str, Any]) -> float:
+        """A target's share of the profiled time (``--seeds-per-target auto``)."""
+        profile = read_json(self.run.profile_dir / "profile.json", {}) or {}
+        shares = scheduler.class_shares(profile)
+        share, instances = shares.get(str(spec.get("module_class")), (0.0, 1))
+        return share / instances if spec.get("qualname") and instances > 1 else share
+
+    def kernel_seeds(self, target_id: str, total: int) -> list[workers.Seed]:
+        """The first-round worker sessions of a target for ``total`` evaluations, or [] when
+        it has a single worker (the classic session in the target directory)."""
+        spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
+        k = workers.count(self.cfg.seeds_per_target, self._share(spec))
+        if k <= 1:
+            return []
+        return workers.seeds(spec, k, total, self._available_backends())
+
+    async def worker_session(
+        self,
+        target_id: str,
+        seed: workers.Seed,
+        team: list[workers.Seed],
+        *,
+        prompt: str,
+        digest: str = "",
+        label: str | None = None,
+    ) -> AgentResult:
+        """One worker session of a target: its own directory and tools bound to it (paths,
+        the ``worker`` of its ledger rows, its evaluation budget), the engineer prompt with
+        the worker's approach and backends, and a ``# Worker`` section (``team``: the round)."""
+        profile = read_json(self.run.profile_dir / "profile.json", {})
+        stats = {c["cls"]: c for c in profile.get("classes", [])}
+        spec = read_json(self.run.target(target_id) / "spec.json")
+        cwd = workers.prepare(self.run, target_id, seed.worker)
+        name = workers.agent_name(target_id, seed.worker)
+        system = (
+            prompts.engineer_prompt(
+                {**spec, "approach": seed.approach},
+                spec.get("capture", {}),
+                list(seed.backends) or spec["backends"],
+                self.python,
+                self.tc.summary(),
+                seed.evaluations,
+                stats.get(spec["module_class"]),
+            )
+            + self._library_note(target_id, spec)
+            + workers.prompt_note(target_id, seed, team)
+        )
+        binding = workers.Binding(target_id, seed.worker, name, seed.evaluations)
+        return await self._agent(
+            name,
+            label,
+            prompt=prompt,
+            system_append=system + digest,
+            cwd=cwd,
+            mcp_tools=tool_names("evaluate_candidate", "best_result"),
+            add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+            mcp_server=build_server(self.run, self.budget, self.truth, binding),
+        )
+
+    async def _kernel_workers(
+        self, target_id: str, team: list[workers.Seed], sem: asyncio.Semaphore
+    ) -> None:
+        """The ``kernels`` phase of a target with workers: ``team`` (round 1), then with
+        ``--reseed-workers`` round 2 from its two best snapshots. Each session waits for a
+        ``--parallel`` slot; finished sessions are skipped by a resumed run."""
+        finished = set(self.run.load().get("phases", {}).get("kernels", {}).get("workers", []))
+
+        async def job(seed: workers.Seed, members: list[workers.Seed], key: str) -> None:
+            if key in finished:
+                return
+            async with sem:
+                if reason := self.budget.exhausted():
+                    log(f"kernels: skipping {key}: {reason}")
+                    agent = workers.agent_name(target_id, seed.worker)
+                    self.budget.note(
+                        "kernels", "budget_skipped", {"agent": agent, "reason": reason}
+                    )
+                    return
+                await self.worker_session(
+                    target_id,
+                    seed,
+                    members,
+                    prompt=f"Optimise target `{target_id}` as worker {seed.worker} (see the "
+                    "`# Worker` section). Start by reading reference_source.py and spec.json, "
+                    "then write and evaluate candidates in your candidates/.",
+                )
+            data = self.run.load()
+            kernels = data.setdefault("phases", {}).setdefault("kernels", {})
+            kernels.setdefault("workers", []).append(key)
+            write_json(self.run.run_json, data)
+
+        await asyncio.gather(*(job(s, team, f"{target_id}/w{s.worker}") for s in team))
+        _, second = workers.rounds(self.cfg.evaluations_per_target, self.cfg.reseed_workers)
+        again = workers.reseeds(self.run, target_id, team, second, self.truth) if second else []
+        if again:
+            starts = ", ".join(f"{s.parent} ({s.parent_speedup:.2f}x)" for s in again)
+            log(f"kernels: {target_id}: round 2 of its workers from {starts}")
+            await asyncio.gather(*(job(s, again, f"{target_id}/r2w{s.worker}") for s in again))
 
     def _kernel_bests(self) -> list[tuple[str, dict[str, Any]]]:
         """(target_id, verified best record) of every kernel worth integrating."""

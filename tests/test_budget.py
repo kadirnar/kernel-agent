@@ -146,12 +146,14 @@ def test_evaluate_candidate_carries_budget(tmp_path, monkeypatch):
     budget = Budget(run, eval_timeout_s=123.0, kernel_evals=PLATEAU + 1)
     server = {t.name: t for t in tools_mod.build_server(run, budget)}
 
-    async def evaluate() -> dict:
+    async def evaluate(version: int) -> dict:
+        # a new kernel each time: the same source again would be a duplicate (dedup.py)
+        (tdir / "candidates" / "v1.py").write_text(f"V = {version}\ndef build(r): ...\n")
         args = {"target_id": "t", "candidate": "candidates/v1.py", "hypothesis": "same kernel"}
         out = await server["evaluate_candidate"].handler(args)
         return json.loads(out["content"][0]["text"])
 
-    outs = [asyncio.run(evaluate()) for _ in range(PLATEAU + 1)]
+    outs = [asyncio.run(evaluate(i)) for i in range(PLATEAU + 1)]
     assert timeouts == [123.0] * (PLATEAU + 1)
     assert outs[0]["compile_s"] == 3.0 and outs[0]["advice"] == "continue"
     assert outs[PLATEAU - 1]["advice"] == "consider_stopping"  # 1.0x never beats the reference

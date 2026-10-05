@@ -158,7 +158,10 @@ def test_evaluate_candidate_echoes_ideas_and_best_result_aggregates(tmp_path, mo
         out = asyncio.run(server[tool].handler(args))
         return json.loads(out["content"][0]["text"])
 
-    def evaluate_candidate(hypothesis, **args):
+    versions = iter(range(10))
+
+    def evaluate_candidate(hypothesis, **args):  # a changed kernel each time (no duplicates)
+        (tdir / "candidates" / "v1.py").write_text(f"V = {next(versions)}\ndef build(r): ...\n")
         return call(
             "evaluate_candidate",
             target_id="t",
