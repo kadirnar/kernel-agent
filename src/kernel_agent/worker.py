@@ -163,6 +163,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
                 module_class=spec["module_class"],
                 candidate=Path(path),
                 qualname_regex=spec.get("qualname_regex"),
+                methods=list(spec.get("capture", {}).get("method_instances", [])),
             )
         )
     report = PatchReport()
@@ -209,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=sorted(COMMANDS))
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--target")
-    parser.add_argument("--max-cases", type=int, default=3)
+    parser.add_argument("--max-cases", type=int, default=4)
     parser.add_argument("--kernel", action="append", help="TARGET_ID=CANDIDATE_PATH")
     parser.add_argument("--transform", action="append", help="transform .py path")
     parser.add_argument("--warmup", type=int, default=1)

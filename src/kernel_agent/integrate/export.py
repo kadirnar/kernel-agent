@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -54,6 +55,16 @@ def apply_kernels(*roots: nn.Module) -> dict[str, int]:
                 new = module.build(child)
                 if new is None or new is child:
                     continue
+                # Entrypoints other than forward the model calls (e.g. forward_step).
+                missing = [
+                    m
+                    for m in entry.get("methods", [])
+                    if callable(getattr(child, m, None)) and not callable(getattr(new, m, None))
+                ]
+                if missing:
+                    raise RuntimeError(
+                        f"{{entry['target']}}: the replacement for {{name}} lacks {{missing}}"
+                    )
                 parent_name, _, attr = name.rpartition(".")
                 parent = root.get_submodule(parent_name) if parent_name else root
                 if isinstance(parent, (nn.ModuleList, nn.Sequential)) and attr.isdigit():
@@ -73,18 +84,20 @@ def export_optimized(run: RunDir, accepted: list[tuple[str, str, float]]) -> Pat
     (out / "kernels").mkdir(parents=True)
     (out / "transforms").mkdir()
     card = run.load()["card"]
-    manifest: dict[str, list[dict[str, str]]] = {"kernels": [], "transforms": []}
+    manifest: dict[str, list[dict[str, Any]]] = {"kernels": [], "transforms": []}
     for kind, arg, _ in accepted:
         if kind == "kernel":
             target_id, _, path = arg.partition("=")
             spec = read_json(run.target(target_id) / "spec.json")
             dst = out / "kernels" / f"{target_id}.py"
             shutil.copy2(path, dst)
+            methods = spec.get("capture", {}).get("method_instances", {})
             manifest["kernels"].append(
                 {
                     "target": target_id,
                     "module_class": spec["module_class"],
                     "file": f"kernels/{dst.name}",
+                    "methods": [m for m in methods if m != "forward"],
                 }
             )
         else:

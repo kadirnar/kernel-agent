@@ -8,6 +8,12 @@ Candidate contract (``candidates/<name>.py``)::
         (e.g. KV-cache updates).  Reuse ``reference``'s parameters/buffers.
         Return ``reference`` itself for instances the kernel does not support.'''
 
+Each captured case is replayed through the entrypoint it was recorded from:
+``candidate(*args, **kwargs)`` for ``forward`` cases and
+``candidate.<method>(*args, **kwargs)`` otherwise (e.g. ``forward_step`` of a
+custom decode loop), for correctness and timing alike.  A candidate that lacks
+a captured method is a ``build_error``.
+
 Run as a subprocess (so compiler crashes and illegal memory accesses cannot
 take down the orchestrator)::
 
@@ -17,6 +23,7 @@ take down the orchestrator)::
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import hashlib
 import importlib.util
@@ -88,16 +95,23 @@ def evaluate(
     profile: bool = False,
     l2_flush: bool = False,
     compile_baseline: bool = False,
+    device: str | None = None,
 ) -> dict[str, Any]:
-    from kernel_agent import toolchain
-
-    toolchain.setup()
-
+    """Build, check and time one candidate.  ``device`` defaults to CUDA when
+    available; on CPU only correctness is checked (timing needs CUDA events)."""
     import torch
 
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device.startswith("cuda"):
+        from kernel_agent import toolchain
+
+        toolchain.setup()
+
     from kernel_agent.kernels.bench import compare_timing, time_call
-    from kernel_agent.kernels.compare import compare_structures
+    from kernel_agent.kernels.compare import compare_side_effects, compare_structures
     from kernel_agent.profiling.capture import load_capture
+    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.workloads.base import synchronize
 
     result: dict[str, Any] = {
         "candidate": str(candidate_path),
@@ -105,9 +119,11 @@ def evaluate(
         "correct": False,
     }
     t0 = time.perf_counter()
-    capture = load_capture(capture_path, device="cuda")
+    capture = load_capture(capture_path, device=device)
     reference = capture["module"].eval()
     cases = capture["cases"]
+    for case in cases:
+        case.setdefault("method", "forward")  # captures written before entrypoints existed
 
     # 1. import + build
     t_build = time.perf_counter()
@@ -128,6 +144,21 @@ def evaluate(
             "(that fallback is only for instances the kernel does not support)",
         )
         return result
+    calls: collections.Counter[str] = collections.Counter()
+    for case in cases:
+        calls[case["method"]] += case["count"]
+    missing = [m for m in calls if m != "forward" and not callable(getattr(candidate, m, None))]
+    if missing:
+        result.update(
+            status="build_error",
+            error=f"build() returned a {type(candidate).__name__} without "
+            + ", ".join(f"`{m}()`" for m in missing)
+            + "; the model calls this module through "
+            + ", ".join(f"`{m}` ({n} calls per run)" for m, n in calls.items())
+            + ". Implement every captured entrypoint with the reference signature and side "
+            "effects (subclassing the reference class keeps the ones you do not optimise).",
+        )
+        return result
 
     # 2. correctness on every captured case (outputs + in-place side effects)
     case_reports: list[dict[str, Any]] = []
@@ -136,8 +167,8 @@ def evaluate(
         args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
         try:
             with torch.inference_mode():
-                out = candidate(*args, **kwargs)
-            torch.cuda.synchronize()
+                out = entrypoint(candidate, case["method"])(*args, **kwargs)
+            synchronize()
         except Exception:
             result.update(status="runtime_error", error=_short_tb(), failed_case=i)
             return result
@@ -146,8 +177,8 @@ def evaluate(
             result["compile_s"] = round(time.perf_counter() - t_build, 1)
             print(f"{COMPILE_MARKER}{result['compile_s']}", file=sys.stderr, flush=True)
         checks = compare_structures(case["output"], out, "output")
-        checks += compare_structures(case["post_args"], args, "args")
-        checks += compare_structures(case["post_kwargs"], kwargs, "kwargs")
+        checks += compare_side_effects(case["args"], case["post_args"], args, "args")
+        checks += compare_side_effects(case["kwargs"], case["post_kwargs"], kwargs, "kwargs")
         bad = [c for c in checks if not c.get("ok")]
         ok = not bad
         all_ok &= ok
@@ -157,6 +188,7 @@ def evaluate(
         case_reports.append(
             {
                 "case": i,
+                "method": case["method"],
                 "signature": case["signature"],
                 "calls_per_run": case["count"],
                 "ok": ok,
@@ -171,21 +203,26 @@ def evaluate(
         result.update(status="incorrect")
         return result
     result["correct"] = True
+    if not device.startswith("cuda"):
+        result.update(status="ok", timing="skipped: no CUDA device")
+        result["eval_seconds"] = round(time.perf_counter() - t0, 1)
+        return result
 
-    # 3. performance (reference vs candidate, same inputs)
-    compiled = None
-    if compile_baseline:
-        try:
-            compiled = torch.compile(copy.deepcopy(reference), mode="max-autotune-no-cudagraphs")
-        except Exception:
-            compiled = None
+    # 3. performance (reference vs candidate, same inputs, same entrypoint)
+    compiled_ref = copy.deepcopy(reference) if compile_baseline else None
+    compiled: dict[str, Any] = {}
     saved = 0.0
     ref_total = 0.0
     new_total = 0.0
     for report, case in zip(case_reports, cases, strict=True):
+        method = case["method"]
         try:
             ref_t, new_t = compare_timing(
-                reference, candidate, case["args"], case["kwargs"], l2_flush=l2_flush
+                entrypoint(reference, method),
+                entrypoint(candidate, method),
+                case["args"],
+                case["kwargs"],
+                l2_flush=l2_flush,
             )
         except Exception:
             result.update(status="runtime_error", error=_short_tb())
@@ -194,29 +231,38 @@ def evaluate(
         report["new_ms"] = round(new_t["median_ms"], 5)
         report["speedup"] = round(ref_t["median_ms"] / max(new_t["median_ms"], 1e-9), 3)
         report["timing_spread"] = round(max(ref_t["spread"], new_t["spread"]), 3)
-        if compiled is not None:
+        if compiled_ref is not None:
             try:
-                comp_t = time_call(compiled, case["args"], case["kwargs"], l2_flush=l2_flush)
+                if method not in compiled:
+                    compiled[method] = torch.compile(
+                        entrypoint(compiled_ref, method), mode="max-autotune-no-cudagraphs"
+                    )
+                comp_t = time_call(
+                    compiled[method], case["args"], case["kwargs"], l2_flush=l2_flush
+                )
                 report["torch_compile_ms"] = round(comp_t["median_ms"], 5)
             except Exception as exc:
                 report["torch_compile_ms"] = f"failed: {exc}"[:200]
         n = case["count"]
         ref_total += n * ref_t["median_ms"]
         new_total += n * new_t["median_ms"]
-        saved += n * (ref_t["median_ms"] - new_t["median_ms"])
+        # times the instances that call this entrypoint (all instances for old captures)
+        users = capture.get("method_instances", {}).get(method, capture.get("instances", 1))
+        saved += n * (ref_t["median_ms"] - new_t["median_ms"]) * users
 
     result.update(
         status="ok",
         speedup=round(ref_total / max(new_total, 1e-9), 3),
-        est_saved_ms_per_run=round(saved * capture.get("instances", 1), 3),
+        est_saved_ms_per_run=round(saved, 3),
         ref_ms_weighted=round(ref_total, 4),
         new_ms_weighted=round(new_total, 4),
     )
     if profile:
         try:
             first = cases[0]
-            result["kernels_candidate"] = _kernel_table(candidate, first["args"], first["kwargs"])
-            result["kernels_reference"] = _kernel_table(reference, first["args"], first["kwargs"])
+            a, k, m = first["args"], first["kwargs"], first["method"]
+            result["kernels_candidate"] = _kernel_table(entrypoint(candidate, m), a, k)
+            result["kernels_reference"] = _kernel_table(entrypoint(reference, m), a, k)
         except Exception as exc:
             result["profile_error"] = str(exc)[:500]
     result["eval_seconds"] = round(time.perf_counter() - t0, 1)

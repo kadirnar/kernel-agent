@@ -91,3 +91,43 @@ def compare_structures(ref: Any, new: Any, prefix: str = "out") -> list[dict[str
             continue
         results.append(compare_tensors(name, tensor, new_flat[name]))
     return results
+
+
+def compare_side_effects(
+    pre: Any, ref_post: Any, new_post: Any, prefix: str = "args"
+) -> list[dict[str, Any]]:
+    """Compare the post-call state of a call's arguments (in-place side effects).
+
+    For argument tensors that keep their shape and dtype, only the elements that
+    the reference *or* the candidate changed are compared, so the mismatch
+    allowance (:data:`MAX_MISMATCH`) is relative to the update.  Otherwise
+    writing one position of an 8192-long KV cache (0.01 % of its elements), or
+    forgetting to, would vanish inside the allowance.  Other tensors (e.g. caches
+    that grow by concatenation) are compared whole."""
+    pre_flat = flatten(pre, prefix)
+    new_flat = flatten(new_post, prefix)
+    results: list[dict[str, Any]] = []
+    for name, ref in flatten(ref_post, prefix).items():
+        new = new_flat.get(name)
+        if new is None:
+            results.append({"name": name, "ok": False, "error": "missing in candidate arguments"})
+            continue
+        before = pre_flat.get(name)
+        if (
+            before is None
+            or not isinstance(new, torch.Tensor)
+            or not (before.shape == ref.shape == new.shape)
+            or not (before.dtype == ref.dtype == new.dtype)
+        ):
+            results.append(compare_tensors(name, ref, new))
+            continue
+        before, ref = before.to(new.device), ref.to(new.device)
+        changed = (ref != before) | (new != before)
+        count = int(changed.sum())
+        if count == 0:
+            results.append({"name": name, "ok": True, "changed_elements": 0, "max_abs_err": 0.0})
+            continue
+        result = compare_tensors(name, ref[changed], new[changed])
+        result["changed_elements"] = count
+        results.append(result)
+    return results
