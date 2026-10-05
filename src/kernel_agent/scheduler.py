@@ -12,7 +12,8 @@ Expected gain (Amdahl), in ms per run of the whole model::
 
 * ``remaining_ms``: what the arm still costs. Kernel targets: their share of the
   profiled time × the baseline ms ÷ their best module speedup so far. Systems:
-  the end-to-end time with the best transform so far.
+  the end-to-end time of its best run so far (transforms, on top of kernels or
+  not; a run is credited only for beating the best run with the same kernels).
 * ``headroom``: the share of ``remaining_ms`` that could still go. ``1 −
   pct_of_sol`` when the best result carries a trustworthy speed-of-light
   estimate (``pct_of_sol``, :mod:`kernel_agent.kernels.roofline`), else ``1 − 1 / further`` where
@@ -228,19 +229,78 @@ def _kernel_history(arm: Arm, rows: list[dict[str, Any]]) -> None:
             arm.streak += 1
 
 
-def _systems_history(arm: Arm, rows: list[dict[str, Any]]) -> None:
-    """Like :func:`_kernel_history`; only transform-only runs can set a new best.
+def e2e_kernels(
+    rows: list[dict[str, Any]], records: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], frozenset[str]]]:
+    """Every ``e2e`` row with the kernels it measured (``target=snapshot name``).
 
-    The ledger's ``keep`` of an ``e2e`` row compares with integration results too,
-    and runs that include kernels measure the kernels' gain as well.
+    A systems row takes them from its transforms ``results.jsonl`` record
+    (``kernels``: ``TARGET=path`` entries). An integration row only names its
+    items: its kernels are the targets it names, each with the kernel an
+    integration takes, the fastest correct one so far (``tools.best_for_target``).
+    A kernel file that is not a snapshot of its target matches no other row.
     """
+
+    def key(rec: dict[str, Any]) -> str:
+        return ledger.e2e_snapshot(rec.get("transforms") or [], rec.get("kernels") or [])
+
+    by_exp = {rec.get("exp"): rec for rec in records}
+    by_snapshot = {key(rec): rec for rec in records}
+    snapshots: dict[str, set[str]] = {}  # target → its evaluated snapshots so far
+    fastest: dict[str, tuple[float, str]] = {}  # target → (speedup, snapshot) of its best
+    out: list[tuple[dict[str, Any], frozenset[str]]] = []
     for row in rows:
-        if row["backend"] == "transform" and row["speedup"] and _improves(row, arm.best):
-            new = float(row["speedup"])
-            arm.gain_ms += arm.ref_ms * (1.0 / arm.best - 1.0 / new)
-            arm.best, arm.best_snapshot, arm.streak = new, row["snapshot"], 0
-        else:
-            arm.streak += 1
+        target, exp = row["target"], row["exp"]
+        if target != ledger.E2E:
+            snapshots.setdefault(target, set()).add(row["snapshot"])
+            if row["correct"] and (row["speedup"] or 0.0) > fastest.get(target, (0.0, ""))[0]:
+                fastest[target] = (float(row["speedup"]), row["snapshot"])
+            continue
+        rec = None
+        if row["backend"] != "integrate":  # integration steps have no transforms record
+            rec = by_exp.get(exp)
+            if rec is None or key(rec) != row["snapshot"]:
+                rec = by_snapshot.get(row["snapshot"])
+        if rec is not None:
+            pairs = [str(k).partition("=")[::2] for k in rec.get("kernels") or []]
+            named = [(t, Path(path).name) for t, path in pairs]
+        else:  # the targets named in the snapshot, with the kernel an integration takes
+            parts = [t for t in row["snapshot"].split("+") if t in snapshots]
+            named = [(t, fastest[t][1] if t in fastest else "") for t in parts]
+        kernels = {f"{t}={n}" if n in snapshots.get(t, ()) else f"{t}=?{exp}" for t, n in named}
+        out.append((row, frozenset(kernels)))
+    return out
+
+
+def _systems_history(arm: Arm, rows: list[tuple[dict[str, Any], frozenset[str]]]) -> None:
+    """Best, gain and streak of the systems agent from the ``e2e`` rows (:func:`e2e_kernels`).
+
+    The gain of the kernels in a run is not the systems agent's. A transform-only
+    run is a new best when it beats the best transform-only run so far (1.0: the
+    baseline); transforms on top of kernels when they beat the best run measured
+    with the same kernels: an integration or a kernels-only run, or the agent's
+    previous new best with them (its first run with them sets the bar). ``gain_ms``
+    adds the ms per run saved over that reference, ``best`` is the fastest new
+    best end to end (its kernels included).
+    """
+    refs: dict[frozenset[str], float] = {frozenset(): 1.0}  # kernels → speedup to beat
+    for row, kernels in rows:
+        measured = float(row["speedup"]) if row["correct"] and row["speedup"] else None
+        ref = refs.get(kernels)
+        if row["backend"] == "integrate":  # not an evaluation of the systems agent
+            if kernels and measured:
+                refs[kernels] = max(ref or 0.0, measured)
+            continue
+        transforms = "transform" in row["backend"]
+        if transforms and ref is not None and measured and _improves(row, ref):
+            arm.gain_ms += arm.ref_ms * (1.0 / ref - 1.0 / measured)
+            refs[kernels], arm.streak = measured, 0
+            if measured > arm.best:
+                arm.best, arm.best_snapshot = measured, row["snapshot"]
+            continue
+        arm.streak += 1
+        if kernels and measured and (ref is None or not transforms):
+            refs[kernels] = max(ref or 0.0, measured)  # the first run with them, or them alone
 
 
 def snapshot_record(run: RunDir, target_id: str, snapshot: str | None) -> dict[str, Any] | None:
@@ -286,7 +346,7 @@ def build_arms(
         busy = gpu_busy(run)
         estimate = max(policy.systems_estimate, 1.0 / busy if busy else 0.0)
         arm = Arm(SYSTEMS, SYSTEMS, base_ms, estimate=estimate, rows=systems_rows(rows))
-        _systems_history(arm, arm.rows)
+        _systems_history(arm, e2e_kernels(rows, read_jsonl(run.results_file())))
         arms.append(arm)
     for arm in arms:
         mine = [s for s in slices if s.get("arm") == arm.id]
