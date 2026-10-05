@@ -18,7 +18,7 @@ from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import record_candidate, snapshot
 from kernel_agent.budget import PLATEAU, Budget
 from kernel_agent.config import OptimizeConfig
-from kernel_agent.improve import ImproveConfig, Improver, kernel_digest
+from kernel_agent.improve import ImproveConfig, Improver, kernel_digest, systems_digest
 from kernel_agent.scheduler import KERNEL, SYSTEMS, Arm, Policy, build_arms, plateau
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl, write_json
 
@@ -490,3 +490,10 @@ def test_digest_has_ideas_and_the_plan(tmp_path):
     assert len(digest) < research.PLAN_CHARS + 8000
     (run.target("attn") / "plan.md").unlink()
     assert "## Research plan" not in kernel_digest(run, arm, 3, 4, Policy())
+
+    # the systems arm's best may be transforms on top of kernels (#40)
+    systems = next(a for a in build_arms(run, Policy(), []) if a.id == SYSTEMS)
+    systems.best, systems.best_snapshot = 1.6, "002_cuda_graph_0a1b2c3d.py+attn"
+    text = systems_digest(run, systems, 4, 4, Policy())
+    assert "## Best end-to-end configuration so far (transforms, plus kernels if listed)" in text
+    assert "`002_cuda_graph_0a1b2c3d.py+attn`" in text and "Best transform so far" not in text

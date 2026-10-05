@@ -196,11 +196,11 @@ def kernel_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Polic
 def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy) -> str:
     lines = _header(n, evaluations, "`results.jsonl`, `NOTES.md` and `history/`")
     base = (read_json(run.baseline_json, {}) or {}).get("median_ms")
-    lines += ["", "## Best transform so far (alone, end to end)"]
+    lines += ["", "## Best end-to-end configuration so far (transforms, plus kernels if listed)"]
     if arm.best_snapshot and base:
         lines.append(
             f"* `{arm.best_snapshot}`: {float(base) / arm.best:.1f} ms vs the {float(base):.1f} "
-            f"ms baseline ({arm.best:.3f}x)"
+            f"ms baseline ({arm.best:.3f}x); `+<target>` names a kernel it ran on top of"
         )
     else:
         lines.append("* no transform has beaten the baseline yet")
