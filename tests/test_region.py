@@ -295,6 +295,7 @@ def test_region_target_end_to_end(tmp_path, capsys, cpu):
 
     asyncio.run(orch.integrate())
     integration = keeper.load_json(run.root / "integration.json")
+    assert len(integration["accepted"]) == 1, integration.get("history")  # shows why on a flake
     (accepted,) = integration["accepted"]
     assert accepted["kind"] == "kernel" and accepted["item"].startswith(f"{TID}=")
     final = integration["final"]

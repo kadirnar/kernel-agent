@@ -511,6 +511,10 @@ def build_server(
                 compile_check=bool(args.get("compile_check")),
             )
             if cached is not None:
+                try:  # a duplicate skips the evaluator, which is where the capture is checked
+                    keeper.verify(capture)
+                except TamperError as exc:
+                    return _text({"status": "tampered", "correct": False, "error": str(exc)})
                 return _text(
                     await _duplicate(cached, args, hypothesis, source, idea, mine)
                     | _uncounted(budget, agent, evals_budget)
