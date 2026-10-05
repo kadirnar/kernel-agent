@@ -12,8 +12,9 @@ per-step predictions are compared, so errors cannot compound.
 
 What a run optimises is the workload's *metric* (``-o metric=``,
 :mod:`kernel_agent.objective`): the end-to-end latency by default, the time to the
-first audio chunk of a streaming run for ``metric=ttfa``. :func:`measure` returns its
-value as ``median_ms``.
+first audio chunk of a streaming run for ``metric=ttfa``, the wall time per second of
+generated audio for ``metric=throughput``. :func:`measure` returns its value as
+``median_ms`` (lower is better for every metric).
 """
 
 from __future__ import annotations
@@ -241,7 +242,8 @@ class Workload(ABC):
     def mark_chunk(self, audio_ms: float | None = None) -> None:
         """Streaming workloads: an output chunk is available now (call it when the chunk
         reaches the caller, e.g. on the host). GPU-synchronised. ``audio_ms``: the
-        duration of the chunk's audio, for the real-time factor."""
+        duration of the chunk's audio, for the real-time factor. ``metric=throughput``:
+        one request's complete output is available now (its latency)."""
         synchronize()
         self.chunk_marks.append((time.perf_counter(), audio_ms))
 
@@ -252,14 +254,34 @@ class Workload(ABC):
 
         ``ttfa``: the first mark minus ``start``; the details hold the median latency of
         the next ``steady_chunks`` chunks (``chunk_ms``), its real-time factor (``rtf``)
-        and the full run (``run_ms``). The extension point for new metrics (issue #74:
-        ``throughput``)."""
+        and the full run (``run_ms``).
+
+        ``throughput``: the run's wall time per second of generated audio
+        (:meth:`output_seconds`), i.e. ``1000 / throughput`` ms, so that lower is better
+        and a speedup is the throughput ratio; the details hold the ``throughput`` (audio
+        seconds per wall second), ``audio_s``, ``run_ms`` and the median latency of the
+        requests (``request_ms``: each marked when its output was ready). The extension
+        point for new metrics."""
         total = (end - start) * 1000
         metric = self.metric
         if metric == objective.LATENCY:
             return total, {}
+        if metric == objective.THROUGHPUT:
+            seconds = self.output_seconds()
+            if not seconds or seconds <= 0:
+                raise RuntimeError(
+                    "metric=throughput: the run generated no audio (Workload.output_seconds)"
+                )
+            done = [(t - start) * 1000 for t, _ in self.chunk_marks] or [total]
+            return total / seconds, {
+                "throughput": seconds * 1000 / total,
+                "audio_s": seconds,
+                "run_ms": total,
+                "requests": len(self.chunk_marks),
+                "request_ms": statistics.median(done),
+            }
         if metric != objective.TTFA:
-            raise NotImplementedError(f"metric={metric} is not implemented yet (issue #74)")
+            raise NotImplementedError(f"metric={metric} is not implemented")
         marks = self.chunk_marks
         if not marks:
             raise RuntimeError(
@@ -279,6 +301,20 @@ class Workload(ABC):
             "chunk_ms": chunk_ms,
             "rtf": rtf,
         }
+
+    def output_seconds(self) -> float:
+        """``metric=throughput``: seconds of audio the last run of :meth:`run` generated; by
+        default what it marked (``mark_chunk(audio_ms=...)``). A workload whose output
+        length is fixed by its options returns that length, so the objective cannot be
+        inflated by what a candidate reports."""
+        return sum(a for _, a in self.chunk_marks if a) / 1000
+
+    def self_check(self, inputs: Any, reference: Any) -> dict[str, Any] | None:
+        """Optional ``analyze`` check that the workload's own run is faithful to the model
+        (a batched loop against the model's batch-1 inference, say), given the baseline
+        output ``reference`` of ``inputs``: ``{"passed", "reason", "check", ...}``, stored
+        in ``baseline.json`` ``self_check``. ``None`` (the default): nothing to check."""
+        return None
 
     def perceptual_samples(self) -> list[dict[str, Any]]:
         """Held-out samples of the perceptual gate (``--quality near-lossless``,

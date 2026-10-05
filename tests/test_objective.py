@@ -69,7 +69,7 @@ def test_metric_names_and_validation():
         objective.get("bogus")
     assert _streamer().metric == "latency" and _streamer(metric="TTFA").metric == "ttfa"
     _streamer(metric="ttfa").check_metric()
-    with pytest.raises(ValueError, match=r"metric=throughput is not implemented yet \(issue #74\)"):
+    with pytest.raises(ValueError, match="Streamer cannot time metric=throughput"):
         _streamer(metric="throughput").check_metric()
 
     class LatencyOnly(Streamer):
@@ -88,8 +88,7 @@ def test_metric_names_and_validation():
     validate_metric(vox)
     # no built-in workload: the harness agent writes one, any implemented metric may be asked
     validate_metric(WorkloadSpec("org/odd", "unknown", options={"metric": "ttfa"}))
-    with pytest.raises(ValueError, match="issue #74"):
-        validate_metric(WorkloadSpec("org/odd", "unknown", options={"metric": "throughput"}))
+    validate_metric(WorkloadSpec("org/odd", "unknown", options={"metric": "throughput"}))
 
 
 def test_latency_is_unchanged():
@@ -146,6 +145,52 @@ def test_ttfa_needs_marked_chunks():
         timed_run(wl, wl.make_inputs())
 
 
+class Batcher(Streamer):
+    """A batch of ``requests`` requests of ``chunks`` x 40 ms of audio each, all ready after
+    ``first_s`` + the chunks; each request's output is marked when ready."""
+
+    metrics = (objective.THROUGHPUT,)
+    defaults = {**Streamer.defaults, "requests": 4}
+
+    def run(self, inputs: int) -> dict[str, Any]:
+        time.sleep(float(self.options["first_s"]) + CHUNKS * float(self.options["chunk_s"]))
+        for _ in range(int(self.options["requests"])):
+            self.mark_chunk(audio_ms=CHUNKS * 40.0)
+        return {"audio": torch.full((int(self.options["requests"]), 4), float(inputs))}
+
+
+def test_throughput_is_wall_time_per_second_of_audio():
+    wl = Batcher(WorkloadSpec("toy/batch", "tts", options={"metric": "throughput"}))
+    wl.check_metric()
+    timing = measure(wl, wl.make_inputs(), warmup=0, iters=3)
+    detail, run_s = timing["metric_detail"], FIRST_S + CHUNKS * CHUNK_S
+    assert timing["metric"] == "throughput" and detail["requests"] == 4
+    assert detail["audio_s"] == pytest.approx(4 * CHUNKS * 0.04)  # what the run marked
+    assert 1000 * run_s * 0.95 <= detail["run_ms"] < 1000 * run_s + 40
+    # lower is better: ms of wall time per second of audio, 1000 / throughput
+    assert timing["median_ms"] == pytest.approx(1000 / detail["throughput"], rel=0.05)
+    assert timing["median_ms"] == pytest.approx(detail["run_ms"] / detail["audio_s"], rel=0.05)
+    assert detail["request_ms"] == pytest.approx(detail["run_ms"], rel=0.05)
+    # twice the requests in the same wall time: half the value, a 2x speedup
+    with wl.with_options({"requests": 8}):
+        _, ms, _ = timed_run(wl, wl.make_inputs())
+    assert timing["median_ms"] / ms == pytest.approx(2.0, rel=0.15)
+    with wl.with_options({"requests": 0}), pytest.raises(RuntimeError, match="no audio"):
+        timed_run(wl, wl.make_inputs())
+
+    baseline = {"metric": "throughput", "median_ms": timing["median_ms"], **timing}
+    line = objective.describe(baseline)
+    assert line is not None and "(-o metric=throughput); throughput " in line
+    assert "s of audio per second (4 requests, 0.96 s of audio in" in line
+    assert "latency per request" in line
+    section = objective.summary_section(baseline)
+    assert "## Objective: wall time per second of generated audio" in section
+    assert "a speedup is the throughput ratio" in section
+    window = objective.profile_window(baseline)  # analyze profiles a whole run
+    assert window == (detail["run_ms"], "batched run (every request)", "per batched run")
+    assert objective.profile_window({"median_ms": 5.0}) == (5.0, "end-to-end latency", "per run")
+
+
 def test_objective_text():
     baseline = {
         "metric": "ttfa",
@@ -185,3 +230,22 @@ def test_reports_name_the_metric(ttfa_run):
     report = write_report(ttfa_run).read_text()
     assert "| | TTFA (ms) | vs eager | vs compiled | quality |" in report
     assert "* metric: time to first audio (-o metric=ttfa)" in report
+
+
+def test_reports_name_throughput(ttfa_run, tmp_path):
+    run = RunDir(tmp_path / "run")
+    shutil.copytree(ttfa_run.root, run.root)
+    baseline = read_json(run.baseline_json, {})
+    baseline.update(
+        metric="throughput",
+        metric_detail={"throughput": 14.4, "audio_s": 76.8, "run_ms": 5322.0, "requests": 8},
+    )
+    write_json(run.baseline_json, baseline)
+    text = render(run, width=200)
+    assert "metric: wall time per second of generated audio (-o metric=throughput)" in text
+    assert "throughput 14.40 s of audio per second (8 requests" in text
+    s = watch.state(run)["summary"]
+    assert s["metric"]["per"] == "per second of generated audio"
+    pytest.importorskip("matplotlib")
+    report = write_report(run).read_text()
+    assert "| | time per audio s (ms) | vs eager | vs compiled | quality |" in report

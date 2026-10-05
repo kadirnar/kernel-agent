@@ -8,9 +8,16 @@
   ``steady_chunks`` chunks (default :data:`STEADY_CHUNKS`) and their real-time factor
   (chunk latency / chunk audio duration; below 1 the stream keeps up with playback),
   and the full streamed run. Quality is judged on the full streamed output.
-* ``throughput``: reserved for issue #74 (a rate, higher is better); no workload
-  implements it yet. A new metric adds an entry here and a branch in
-  :meth:`~kernel_agent.workloads.base.Workload.metric_value`.
+* ``throughput``: seconds of audio generated per wall second by a batch of requests
+  (VoxCPM: ``-o batch_size=N``, :mod:`kernel_agent.workloads.voxcpm_batch`). A rate is
+  higher-is-better, so the value the optimiser sees is its reciprocal, the wall time per
+  second of generated audio (``1000 / throughput`` ms): every consumer of ``median_ms``
+  (A/B rounds, ledger, charts, reports) keeps "lower is better", and every speedup
+  ``base_ms / new_ms`` is exactly ``new_throughput / base_throughput``. ``metric_detail``
+  holds the throughput itself and the per-request latency.
+
+A new metric adds an entry here and a branch in
+:meth:`~kernel_agent.workloads.base.Workload.metric_value`.
 
 The value is ``median_ms`` everywhere (``baseline.json``, ``e2e`` results, A/B rounds,
 the integration): the optimiser minimises it and every speedup divides it.
@@ -48,7 +55,11 @@ METRICS: dict[str, Metric] = {
     ),
     TTFA: Metric(TTFA, "Time to first audio", "time to first audio", "TTFA", "to first audio"),
     THROUGHPUT: Metric(
-        THROUGHPUT, "Throughput", "throughput", "throughput", "per item", implemented=False
+        THROUGHPUT,
+        "Time per second of audio",
+        "wall time per second of generated audio",
+        "time per audio s",
+        "per second of generated audio",
     ),
 }
 
@@ -73,7 +84,7 @@ def check(name: str, supported: tuple[str, ...], workload: str) -> str:
     that says what to do."""
     metric = get(name)
     if not metric.implemented:
-        raise ValueError(f"metric={metric.name} is not implemented yet (issue #74)")
+        raise ValueError(f"metric={metric.name} is not implemented yet")
     if metric.name not in supported:
         raise ValueError(
             f"{workload} cannot time metric={metric.name} (it supports: {', '.join(supported)}); "
@@ -93,10 +104,20 @@ def aggregate(details: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def detail_text(detail: dict[str, Any] | None) -> str:
-    """One phrase on a ``metric=ttfa`` ``metric_detail``: the steady state and the full run."""
+    """One phrase on a ``metric_detail``: ``ttfa``, the steady state and the full run;
+    ``throughput``, the rate and the per-request latency."""
     if not detail:
         return ""
     parts = []
+    if detail.get("throughput") is not None:
+        requests = f"{detail['requests']:.0f} requests, " if detail.get("requests") else ""
+        parts.append(
+            f"throughput {detail['throughput']:,.2f} s of audio per second ({requests}"
+            f"{detail.get('audio_s') or 0:,.2f} s of audio in {detail.get('run_ms') or 0:,.0f} ms)"
+        )
+        if detail.get("request_ms") is not None:
+            parts.append(f"latency per request {detail['request_ms']:,.0f} ms")
+        return "; ".join(parts)
     if detail.get("chunk_ms") is not None:
         rtf = f", RTF {detail['rtf']:.3f}" if detail.get("rtf") is not None else ""
         parts.append(
@@ -107,6 +128,17 @@ def detail_text(detail: dict[str, Any] | None) -> str:
         chunks = f", {detail['chunks']:.0f} chunks" if detail.get("chunks") else ""
         parts.append(f"full streamed run {detail['run_ms']:,.1f} ms{chunks}")
     return "; ".join(parts)
+
+
+def profile_window(timing: dict[str, Any]) -> tuple[float, str, str]:
+    """``(ms, what, per)`` of the window ``analyze`` profiles, for the profile summary: the
+    metric's own (``timing`` is a ``measure()`` result or ``baseline.json``), except for
+    ``throughput``, whose value is a rate: there the whole batched run."""
+    metric = of(timing)
+    run_ms = (timing.get("metric_detail") or {}).get("run_ms")
+    if metric.name == THROUGHPUT and isinstance(run_ms, int | float):
+        return float(run_ms), "batched run (every request)", "per batched run"
+    return float(timing.get("median_ms") or 0.0), metric.title.lower(), metric.per
 
 
 def describe(baseline: dict[str, Any] | None) -> str | None:
@@ -143,6 +175,16 @@ def summary_section(baseline: dict[str, Any]) -> str:
             "* quality is judged on the full streamed output, as for the non-streaming run "
             "(teacher forcing on the latents, the audio of every chunk decoded by the "
             "stateful streaming decoder).",
+        ]
+    if metric.name == THROUGHPUT:
+        lines += [
+            "* throughput = seconds of audio generated per wall second by a batch of "
+            "different requests decoded together; the value above (and every ms of this "
+            "run) is its reciprocal, wall time per second of generated audio, so lower is "
+            "better and a speedup is the throughput ratio.",
+            "* the batch shares every weight read: decode steps run at batch N (the LocDiT "
+            "at 2N with CFG), so kernels and transforms must handle batch N (or fall back); "
+            "quality is judged per request, and one wrong request fails the candidate.",
         ]
     if text := detail_text(baseline.get("metric_detail")):
         lines.append(f"* baseline: {text} (reported, not optimised).")
