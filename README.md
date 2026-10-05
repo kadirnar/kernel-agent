@@ -397,7 +397,8 @@ against the unmodified model (a candidate when it passes and its paired gain
 is positive, ordered by that gain; the first that passes the acceptance rule
 below seeds the search), then each step of the greedy search, the accepted
 set A against B = A + the next candidate (and the systems agent's measured
-combination against the best single item):
+combination against the best single item), then each version swap, A against
+B = A with one item replaced by another version of it (see below):
 
 * The model is loaded once. A is applied, warmed up, then B is built the way a
   fresh `e2e` process applies it (kernels, then transforms): B shares A's
@@ -1181,7 +1182,9 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
 * **Re-integration.** After every `--integrate-every 4` kept results, the
   integration of `optimize` measures the combination end to end. Combinations of
   the same snapshot files that were measured before are reused instead of
-  measured again. Every measurement is a ledger row, so the progress chart shows
+  measured again. A target's better kernel version is swapped into the
+  accepted set even when the systems agent combined an older one (version
+  swaps, see the integration waterfall below). Every measurement is a ledger row, so the progress chart shows
   the measured latency going down. `optimized/` is re-exported each time.
 * **Rounds.** With `--rounds R` above 1, once every arm of a round has stopped
   and the round brought a real end-to-end gain, the optimised model (the
@@ -1800,10 +1803,10 @@ profile, then the same bar with every target at its best module speedup
 ![time split](docs/images/example-amdahl.png)
 
 `integration.png`: the greedy integration as a waterfall. It starts at the
-baseline, then the best single item, then each item added on top: accepted
-(green, ms saved), rejected for no gain (hatched) or failed (red ×). A step
-judged by a paired A/B starts at A's median of that session, so its bar is
-the paired difference.
+baseline, then the best single item, then each item added on top and each
+version swap: accepted (green, ms saved), rejected for no gain (hatched) or
+failed (red ×). A step judged by a paired A/B starts at A's median of that
+session, so its bar is the paired difference.
 
 The candidates are every kernel winner and every transform of a passing
 `evaluate_e2e` record that beat the baseline, alone or combined with other
@@ -1815,6 +1818,23 @@ passing combination the systems agent measured is measured again as a whole
 `seeded`); when it beats the best single item it seeds the search instead
 (`exp N combination` in the waterfall), and items that are already part of it,
 or another version of one, are not added again.
+
+Versions are swapped instead. The combination may hold an older version of a
+kernel target or transform idea than the best one (the systems agent measured
+it early, with the then best kernels or library priors). After the additions,
+each accepted item whose target's best verified and re-checked kernel (or
+idea's best transform) is another snapshot is tried as a swap: A = the
+accepted set, B = the same set with that version in its place, judged by the
+same paired A/B rule; the winner stays. Swaps are ordered by expected gain
+(the new version's est. saved ms minus the old one's: a kernel's module-level
+estimate at its conservative re-check speedup, a transform's paired gain
+alone). A re-integration first tries the versions the previous integration
+swapped in or accepted (re-checked, in the same order, so unchanged inputs
+come from the reuse cache), then the current best ones: a newer version with
+a higher module speedup is compared with the version that won, not with the
+combination's. Another snapshot of the same file is no swap. Each swap is a
+`history` entry with `kind: swap`, `old` and `new`, a `target #old → #new` step
+in the waterfall and a `swap` line in `report.md`.
 
 ![integration waterfall](docs/images/example-integration.png)
 

@@ -253,8 +253,12 @@ def write_report(run: RunDir) -> Path:
                     )
                 else:  # an item alone, against the unmodified model
                     verdict += " vs the unmodified model"
+            tried = f"tried {len(h['items'])} item(s)"
+            if h.get("kind") == "swap":  # another version of an accepted item
+                old, new = str(h.get("old")), str(h.get("new"))
+                tried = f"swap `{ledger.item_label(new)}` `{Path(old).name}` → `{Path(new).name}`"
             lines.append(
-                f"* tried {len(h['items'])} item(s): passed={h.get('passed')} "
+                f"* {tried}: passed={h.get('passed')} "
                 f"speedup={h.get('speedup')} {h.get('reason') or ''}{verdict}"
             )
         lines += _projection_lines(integration.get("projection") or [])

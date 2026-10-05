@@ -1,5 +1,6 @@
 """Integration candidates from every passing e2e record, and the measured combination as the
-seed of the greedy search (issue #43); every comparison of two sets a paired A/B (issue #11).
+seed of the greedy search (issue #43); every comparison of two sets a paired A/B (issue #11);
+newer versions of the combination's items swapped in (issue #84).
 
 CPU only: a simulated run (``dryrun.create_run``), records written through the evaluation
 tools' own code, and a fake e2e worker that knows the latency of the combinations of the
@@ -8,6 +9,7 @@ VoxCPM2 run in the issue (runs/openbmb--VoxCPM2/20261005-042829).
 
 import argparse
 import asyncio
+import math
 import os
 import random
 import statistics
@@ -479,3 +481,199 @@ def test_irreversible_items_are_measured_in_separate_processes(tmp_path):
     assert len(rows) == 8 and "(A of an A/B in separate processes)" in rows[1]["hypothesis"]
     assert rows[1]["snapshot"] == "baseline"
     assert [label(i) for i in data["irreversible"]] == ["inplace"]  # remembered
+
+
+# ------------------------------------------------------------------ version swaps (issue #84)
+
+#: True latency factor of each version (product over a set). The round-3 VoxCPM2 run of the
+#: issue (runs/openbmb--VoxCPM2/20261005-192504): ``attn`` plays dit_layer_fp8 and ``mlp``
+#: lm_step_fp8, whose bf16 library priors the systems agent combined with its transforms.
+VERSIONS = {
+    "hoist": 0.35,
+    "skip": 0.93,
+    "skip v2": 0.90,
+    "attn prior": 0.50,
+    "mlp prior": 0.80,
+    "attn fp8_v10": 0.38,  # the FP8 versions, much better at module level
+    "mlp fp8_v12": 0.77,
+    "attn fp8_v11": 0.37,  # a lower module speedup: never tried
+    "attn fp8_v13": 0.39,  # a higher module speedup, but slower end to end than v10
+    "mlp fp8_bad": 0.70,  # fails the quality check in the combination
+}
+VERSIONS_FP8 = ["attn fp8_v10", "mlp fp8_v12"]
+
+
+def version(run, target: str, name: str, speedup: float, saved: float) -> str:
+    """A correct evaluation of version ``name`` of a kernel target, ``saved`` x the baseline
+    its est. saved ms; returns ``target=<snapshot>`` (the agent's copy)."""
+    src = run.target(target) / "candidates" / f"{name}.py"
+    src.write_text(f"# {target} {name}\n")
+    snap = snapshot(run, src, target)
+    result = {"status": "ok", "correct": True, "speedup": speedup, "cases": []}
+    result["est_saved_ms_per_run"] = saved * BASE
+    record_candidate(run, target, src, snap, result, hypothesis=name)
+    return f"{target}={run.target(target) / 'history' / snap.name}"
+
+
+def truth_item(item: str) -> str:
+    """The integration item of a kernel the agent's copy names (its snapshot in .truth/)."""
+    return item.replace("/targets/", "/.truth/targets/")
+
+
+def tag(item: str) -> str:
+    """What an item applies, with its version: the first line of its file."""
+    path = item if item.startswith("/") else item.partition("=")[2]
+    return Path(path).read_text().splitlines()[0].removeprefix("# ")
+
+
+def versions_worker(calls: list[list[str]]):
+    """Paired ``e2e_ab`` timings of the product of the items' ``VERSIONS``; a combination
+    with ``mlp fp8_bad`` fails the quality check."""
+
+    def ms(items: list[str]) -> float:
+        return BASE * math.prod(VERSIONS[tag(i)] for i in items)
+
+    def worker(run, command, *args):
+        assert command == "e2e_ab"
+        ns = parse(args)
+        calls.append(list(args))
+        a, b = [*ns.kernel, *ns.transform], [*ns.b_kernel, *ns.b_transform]
+        bad = len(b) > 1 and "mlp fp8_bad" in map(tag, b)
+        return paired(ms(a), ms(b), ns.rounds, passed=not bad)
+
+    return worker
+
+
+def priors_combined(run) -> dict[str, str]:
+    """The systems agent's combination: its transforms + the bf16 priors of both targets."""
+    priors = {
+        "mlp": version(run, "mlp", "prior", 5.429, 0.20),
+        "attn": version(run, "attn", "prior", 7.968, 0.50),
+    }
+    e2e(run, 7.49, [write(run, "hoist"), write(run, "skip")], list(priors.values()))
+    return priors
+
+
+def test_a_newer_version_of_a_combined_kernel_is_swapped_in(tmp_path):
+    """The combination seeded the search with the priors, and later versions of the same
+    targets were skipped as "another version" forever. Now each is a swap: A = the accepted
+    set, B = the set with the target's best version in its place."""
+    orch = make(tmp_path)
+    run = orch.run
+    priors = priors_combined(run)
+    attn = version(run, "attn", "fp8_v10", 11.022, 0.62)
+    mlp = version(run, "mlp", "fp8_v12", 10.526, 0.23)
+    calls: list[list[str]] = []
+    orch.worker = versions_worker(calls)
+    asyncio.run(orch.integrate())
+
+    data = read_json(run.root / "integration.json")
+    assert data["composite"]["seeded"]
+    accepted = ["hoist", "skip", "mlp fp8_v12", "attn fp8_v10"]
+    assert [tag(a["item"]) for a in data["accepted"]] == accepted
+    assert data["final"]["median_ms"] == pytest.approx(BASE * 0.35 * 0.93 * 0.77 * 0.38, 1e-3)
+    *_, seed, first, second = data["history"]
+    assert [tag(i) for i in seed["items"]] == ["hoist", "skip", "mlp prior", "attn prior"]
+    # the larger expected gain first: attn's est. saved ms grows by 0.12 x the baseline
+    assert (first["kind"], first["old"], first["new"]) == (
+        "swap",
+        truth_item(priors["attn"]),
+        truth_item(attn),
+    )
+    assert first["items"] == [*seed["items"][:3], truth_item(attn)]  # in place
+    assert first["ab"]["a_items"] == seed["items"] and first["ab"]["accepted"]
+    assert (second["old"], second["new"]) == (truth_item(priors["mlp"]), truth_item(mlp))
+    assert second["ab"]["a_items"] == first["items"] and second["ab"]["accepted"]
+    assert len(calls) == 7  # 4 items alone, the combination, 2 swaps
+    assert [p["items"] for p in data["projection"]] == [h["items"] for h in data["history"][4:]]
+    exported = run.optimized_dir / "kernels"
+    assert [tag(str(exported / f"{t}.py")) for t in ("attn", "mlp")] == VERSIONS_FP8
+    rows = [r for r in ledger.rows(run) if r["backend"] == "integrate"]
+    swap = f"(swap mlp {Path(priors['mlp']).name} -> {Path(mlp).name})"
+    assert rows[-1]["hypothesis"].endswith(swap)
+
+    steps = charts.integration_steps(data)
+    assert [s["kind"] for s in steps] == ["total", "keep", "keep", "keep", "total"]
+    assert [s["label"] for s in steps[2:4]] == ["attn #001 → #002", "mlp #001 → #002"]
+    assert steps[2]["swap"] and steps[2]["from"] == first["ab"]["a_median_ms"]
+    assert steps[-1]["ms"] == data["final"]["median_ms"]
+    report = write_report(run).read_text()
+    assert f"* swap `attn` `{Path(priors['attn']).name}` → `{Path(attn).name}`" in report
+
+    calls.clear()  # a re-integration of the same files measures nothing again
+    asyncio.run(orch.integrate(reuse=True))
+    assert calls == []
+    assert read_json(run.root / "integration.json")["accepted"] == data["accepted"]
+
+    # a version with a lower module speedup is never tried; one with a higher module
+    # speedup is, against the set with v10 (not the priors), and loses: v10 stays
+    lower = version(run, "attn", "fp8_v11", 10.9, 0.63)
+    higher = version(run, "attn", "fp8_v13", 11.5, 0.625)
+    asyncio.run(orch.integrate(reuse=True))
+    again = read_json(run.root / "integration.json")
+    assert again["accepted"] == data["accepted"]
+    assert len(calls) == 2  # v13 alone and its swap
+    last = again["history"][-1]
+    assert (last["old"], last["new"]) == (truth_item(attn), truth_item(higher))
+    assert last["ab"]["a_items"] == second["items"] and not last["ab"]["accepted"]
+    assert not any(Path(lower).name in i for h in again["history"] for i in h["items"])
+    kinds = [s["kind"] for s in charts.integration_steps(again)]
+    assert kinds == ["total", "keep", "keep", "keep", "nogain", "total"]
+
+    calls.clear()  # the same steps again, every one from the reuse cache
+    asyncio.run(orch.integrate(reuse=True))
+    assert calls == []
+    assert read_json(run.root / "integration.json")["history"] == again["history"]
+
+
+def test_swaps_are_ordered_by_expected_gain_at_the_conservative_speedup(tmp_path):
+    orch = make(tmp_path)
+    run = orch.run
+    priors = {t: ("kernel", truth_item(a)) for t, a in priors_combined(run).items()}
+    attn = ("kernel", truth_item(version(run, "attn", "fp8_v10", 11.022, 0.62)))
+    mlp = ("kernel", truth_item(version(run, "mlp", "fp8_v12", 10.526, 0.23)))
+    accepted, singles = [priors["mlp"], priors["attn"]], [(mlp, {}), (attn, {})]
+
+    def order(versions: list) -> list:
+        return [item for _, item in orch._swaps(accepted, singles, versions, {})]
+
+    assert order([]) == [attn, mlp]  # +0.12 x the baseline before +0.03
+    # the re-check measured attn's v10 at 1.2x: what it saves at that speed is less than
+    # its prior's estimate
+    orch.speed_caps[("attn", Path(attn[1]).name)] = 1.2
+    assert order([]) == [mlp, attn]
+    # what a previous integration swapped in comes first, in its order
+    assert order([attn, priors["mlp"]]) == [attn, mlp]
+
+
+def test_a_swap_that_fails_the_quality_check_keeps_the_old_version(tmp_path):
+    """mlp's best version fails the quality check in the combination: its prior stays. A
+    transform idea whose best passing version is newer than the combination's is swapped
+    like a kernel (its fastest record has a kernel candidate, so it is no combination)."""
+    orch = make(tmp_path)
+    run = orch.run
+    priors = priors_combined(run)
+    version(run, "attn", "fp8_v10", 11.022, 0.62)
+    version(run, "mlp", "fp8_bad", 10.6, 0.25)
+    wip = run.target("attn") / "candidates" / "wip.py"
+    wip.write_text("# attn wip\n")
+    e2e(run, 7.6, [write(run, "hoist"), write(run, "skip", "v2")], [f"attn={wip}"])
+    orch.worker = versions_worker([])
+    asyncio.run(orch.integrate())
+
+    data = read_json(run.root / "integration.json")
+    accepted = [tag(a["item"]) for a in data["accepted"]]
+    assert accepted == ["hoist", "skip v2", "mlp prior", "attn fp8_v10"]
+    swaps = [h for h in data["history"] if h.get("kind") == "swap"]
+    # by expected gain: attn +0.12 x the baseline, skip v2 +0.10 (its paired gain alone),
+    # mlp +0.05
+    assert [tag(h["new"]) for h in swaps] == ["attn fp8_v10", "skip v2", "mlp fp8_bad"]
+    assert [h["passed"] for h in swaps] == [True, True, False]  # faster, but not the same
+    assert all(h["ab"]["accepted"] for h in swaps)
+    assert swaps[2]["old"] == truth_item(priors["mlp"])
+    assert data["final"]["median_ms"] == pytest.approx(BASE * 0.35 * 0.90 * 0.80 * 0.38, 1e-3)
+    assert data["final"]["median_ms"] == swaps[1]["median_ms"]
+    steps = charts.integration_steps(data)
+    assert [s["kind"] for s in steps] == ["total", "keep", "keep", "keep", "fail", "total"]
+    assert steps[3]["label"].startswith("skip #") and steps[3]["source"] == "transform"
+    assert "teacher-forced" in steps[4]["reason"]

@@ -935,7 +935,7 @@ td.nowrap { white-space: nowrap; }
     const steps = integ.steps, base = steps[0].ms, final = steps[steps.length - 1].ms;
     $("int-note").textContent = `${fmt.ms(base)} → ${fmt.ms(final)} (${fmt.x(base / final)})`;
     const narrow = host.clientWidth < 520, rowH = 30;
-    const names = steps.map((s) => (s.kind === "total" ? s.label : `+ ${s.label}`));
+    const names = steps.map((s) => (s.kind === "total" || s.swap ? s.label : `+ ${s.label}`));
     const labelW = Math.min(Math.max(...names.map((n) => textWidth(n, 11.5))) + 16, narrow ? 120 : 170);
     const f = frame(host, "integration", "Integration waterfall; arrow keys walk the steps",
       { height: steps.length * rowH + 34, left: labelW, top: 6, bottom: 28, right: narrow ? 64 : 92 });

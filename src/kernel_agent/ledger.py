@@ -201,6 +201,15 @@ def item_label(item: str) -> str:
     return snapshot_stem(item)
 
 
+def item_version(item: str) -> str:
+    """Which version of its target or idea an integration item is: the sequence number of
+    its snapshot (``#008`` of ``history/008_cuda_v10_ac510e25.py``), else its file name."""
+    target, sep, path = item.partition("=")
+    name = Path(path if sep and "/" not in target else item).name
+    number = re.match(r"\d{3,}(?=_)", name)
+    return f"#{number.group()}" if number else name
+
+
 _SNAPSHOT_AFFIX = re.compile(r"^\d{3,}_|_[0-9a-f]{8}$")
 
 
