@@ -391,3 +391,76 @@ def test_progress_end_labels_do_not_overlap(tmp_path, measured_ms, nested):
         assert subtitle.endswith("\nprojected from attn + mlp")
     for (a, box_a), (b, box_b) in itertools.combinations(texts.items(), 2):
         assert not box_a.overlaps(box_b), (a, b)
+
+
+# ------------------------------------------------------------------ amdahl.png
+
+
+def _amdahl_run(tmp_path, kept, specs=None):
+    """A layer (60 % of the profiled time) holding an attention (30 %) and an MLP (20 %),
+    and a RoPE (5 %) that holds and lies in nothing. ``kept``: target → (speedup, est.
+    saved ms) of its kept kernel."""
+    run = RunDir(tmp_path / "run")
+    run.root.mkdir(parents=True)
+    write_json(run.run_json, {"card": {"repo_id": "org/model"}, "created": "2026-10-05 09:00:00"})
+    write_json(run.baseline_json, {"median_ms": 1000.0})
+    classes = [cls("Model", {"model": 1}), LAYER, ATTN, MLP, cls("Rope", {"model.rope": 1})]
+    times = (100.0, 60.0, 30.0, 20.0, 5.0)
+    classes = [{**c, "inclusive_ms": ms} for c, ms in zip(classes, times, strict=True)]
+    write_json(run.profile_dir / "profile.json", {"classes": classes})
+    for target, s in (specs or {**SPECS, "rope": spec("Rope")}).items():
+        write_json(run.target(target) / "spec.json", s)
+    for target, (speedup, saved) in kept.items():
+        row = {"time": "2026-10-05 09:10:00", "target": target, "status": "keep"}
+        ledger.append(run, {**row, "correct": True, "speedup": speedup, "est_saved_ms": saved})
+    return run
+
+
+def test_amdahl_draws_nested_targets_once(tmp_path):
+    """Issue #67: amdahl.png drew the layer and the attention and MLP inside it side by side
+    (110 % of the profiled time, scaled down). Now it draws the set the projection counts."""
+    run = _amdahl_run(tmp_path, {"layer": (2.0, 300.0), "attn": (1.5, 100.0), "mlp": (1.3, 46.0)})
+    slices = {s.target: s for s in charts.amdahl_slices(run, 1000.0)}
+    assert list(slices) == [t for t, _, _ in charts.target_shares(run)]  # the colour order
+    assert sum(s.full_ms for s in slices.values()) == pytest.approx(1150.0)  # they overlap
+
+    # the layer's kernel saves more than the attention's and the MLP's together: drawn in full
+    layer, attn, mlp, rope = (slices[t] for t in ("layer", "attn", "mlp", "rope"))
+    assert (layer.ms, layer.after_ms, layer.part) == pytest.approx((600.0, 300.0, 1.0))
+    assert attn.ms == mlp.ms == attn.after_ms == 0.0
+    assert attn.nested_in == mlp.nested_in == ("layer",) and layer.holds == ()
+    # no kernel kept, inside nothing and holding nothing: in full, unchanged
+    assert (rope.ms, rope.speedup, rope.nested_in, rope.holds) == (50.0, 1.0, (), ())
+    drawn = sum(s.ms for s in slices.values())
+    assert drawn == pytest.approx(650.0)
+    after = sum(s.after_ms for s in slices.values()) + 1000.0 - drawn
+    assert after == pytest.approx(700.0)  # 300 + 50 + the 350 ms of "other"
+
+    # the children save more: they are drawn, the layer holds them
+    run = _amdahl_run(
+        tmp_path / "children", {"layer": (1.2, 100.0), "attn": (3.0, 200.0), "mlp": (2.0, 100.0)}
+    )
+    slices = {s.target: s for s in charts.amdahl_slices(run, 1000.0)}
+    assert {t: s.ms for t, s in slices.items()} == pytest.approx(
+        {"layer": 0.0, "attn": 300.0, "mlp": 200.0, "rope": 50.0}
+    )
+    assert slices["layer"].holds == ("attn", "mlp") and slices["layer"].nested_in == ()
+    assert sum(s.after_ms for s in slices.values()) == pytest.approx(250.0)  # 100 + 100 + 50
+
+    if charts.available():  # the chart draws these slices
+        assert charts.amdahl(run) == run.root / "amdahl.png"
+        assert (run.root / "amdahl.png").stat().st_size > 0
+
+
+def test_amdahl_never_exceeds_the_baseline(tmp_path):
+    """Two targets on the layer's instances in different phases add up (projection.py), but
+    both get the class's whole share (60 % each): scaled down to the baseline together."""
+    specs = {
+        "layer_decode": spec("Layer", phase="decode"),
+        "layer_prefill": spec("Layer", phase="prefill"),
+    }
+    run = _amdahl_run(tmp_path, {"layer_decode": (2.0, 200.0)}, specs)
+    slices = charts.amdahl_slices(run, 1000.0)
+    assert [(s.target, s.part) for s in slices] == [("layer_decode", 1.0), ("layer_prefill", 1.0)]
+    assert [s.ms for s in slices] == pytest.approx([500.0, 500.0])
+    assert sum(s.after_ms for s in slices) == pytest.approx(750.0)

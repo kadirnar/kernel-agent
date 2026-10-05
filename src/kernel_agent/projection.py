@@ -81,6 +81,17 @@ class Tree:
     def nested(self) -> bool:
         return any(p >= 0 for p in self.parents)
 
+    def holders(self) -> dict[str, set[str]]:
+        """Target → the other targets whose groups hold one of its groups, at any depth."""
+        out: dict[str, set[str]] = {g.target: set() for g in self.groups}
+        for i, g in enumerate(self.groups):
+            j = self.parents[i]
+            while j >= 0:
+                if self.groups[j].target != g.target:
+                    out[g.target].add(self.groups[j].target)
+                j = self.parents[j]
+        return out
+
 
 @dataclass(frozen=True)
 class Projection:
