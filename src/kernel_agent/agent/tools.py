@@ -12,7 +12,9 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from kernel_agent import ledger
 from kernel_agent.budget import Budget
+from kernel_agent.dashboard import refresh
 from kernel_agent.kernels.evaluate import run_evaluation
 from kernel_agent.worker import call_worker
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
@@ -87,6 +89,83 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
     return keep
 
 
+def record_candidate(
+    run: RunDir,
+    target_id: str,
+    src: Path,
+    snap: Path,
+    result: dict[str, Any],
+    *,
+    hypothesis: str,
+    parent: str | None = None,
+    eval_s: float | None = None,
+    when: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Append a kernel evaluation to ``results.jsonl`` and the run ledger."""
+    target_dir = run.target(target_id)
+    row = ledger.record_kernel(
+        run,
+        target_id,
+        result,
+        snapshot=snap.name,
+        hypothesis=hypothesis,
+        parent=parent,
+        source=snap.read_text(),
+        eval_s=eval_s,
+        when=when,
+    )
+    record = {
+        "time": time.strftime("%H:%M:%S", time.localtime(when)),
+        "candidate": str(src.relative_to(target_dir))
+        if src.is_relative_to(target_dir)
+        else str(src),
+        "snapshot": str(snap.relative_to(target_dir)),
+        **{k: v for k, v in result.items() if k not in ("kernels_candidate", "kernels_reference")},
+        "exp": row["exp"],
+        "ledger_status": row["status"],
+        "backend": row["backend"],
+        "hypothesis": hypothesis,
+        "parent": parent,
+    }
+    if isinstance(record.get("error"), str):
+        record["error"] = record["error"][-1500:]
+    append_jsonl(target_dir / "results.jsonl", record)
+    return record, row
+
+
+def record_e2e_result(
+    run: RunDir,
+    result: dict[str, Any],
+    snaps: list[Path],
+    kernels: list[str],
+    *,
+    hypothesis: str = "",
+    eval_s: float | None = None,
+    when: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Append an ``evaluate_e2e`` measurement to ``transforms/results.jsonl`` and the ledger."""
+    row = ledger.record_e2e(
+        run,
+        result,
+        backend=ledger.e2e_backend(snaps, kernels),
+        snapshot=ledger.e2e_snapshot(snaps, kernels),
+        hypothesis=hypothesis,
+        eval_s=eval_s,
+        when=when,
+    )
+    record = {
+        "time": time.strftime("%H:%M:%S", time.localtime(when)),
+        "transforms": [str(s.relative_to(run.transforms_dir)) for s in snaps],
+        "kernels": kernels,
+        **result,
+        "exp": row["exp"],
+        "ledger_status": row["status"],
+        "hypothesis": hypothesis,
+    }
+    append_jsonl(run.transforms_dir / "results.jsonl", record)
+    return record, row
+
+
 def best_for_target(run: RunDir, target_id: str) -> dict[str, Any] | None:
     best = None
     for rec in read_jsonl(run.target(target_id) / "results.jsonl"):
@@ -115,13 +194,21 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
                     "type": "string",
                     "description": "path to the candidate .py (relative to the target dir)",
                 },
+                "hypothesis": {
+                    "type": "string",
+                    "description": "one sentence: what changed and why it should be faster",
+                },
+                "parent": {
+                    "type": "string",
+                    "description": "snapshot (history/...) or candidate this one builds on",
+                },
                 "profile": {
                     "type": "boolean",
                     "description": "include per-kernel GPU time tables",
                     "default": False,
                 },
             },
-            "required": ["target_id", "candidate"],
+            "required": ["target_id", "candidate", "hypothesis"],
         },
     )
     async def evaluate_candidate(args: dict[str, Any]) -> dict[str, Any]:
@@ -131,7 +218,17 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
         src = _resolve(target_dir, args["candidate"])
         if not src.exists():
             return _text({"status": "error", "error": f"{src} does not exist"})
+        hypothesis = str(args.get("hypothesis") or "").strip()
+        if not hypothesis:
+            return _text(
+                {
+                    "status": "error",
+                    "error": "hypothesis is required: one sentence on what changed and why "
+                    "it should be faster",
+                }
+            )
         snap = _snapshot(src, target_dir / "history")
+        start = time.perf_counter()
         result = await asyncio.to_thread(
             run_evaluation,
             target_dir / "capture.pt",
@@ -139,22 +236,19 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
             profile=bool(args.get("profile")),
             timeout=budget.eval_timeout_s,
         )
-        record = {
-            "time": time.strftime("%H:%M:%S"),
-            "candidate": str(src.relative_to(target_dir))
-            if src.is_relative_to(target_dir)
-            else str(src),
-            "snapshot": str(snap.relative_to(target_dir)),
-            **{
-                k: v
-                for k, v in result.items()
-                if k not in ("kernels_candidate", "kernels_reference")
-            },
-        }
-        if isinstance(record.get("error"), str):
-            record["error"] = record["error"][-1500:]
-        append_jsonl(target_dir / "results.jsonl", record)
+        _, row = record_candidate(
+            run,
+            args["target_id"],
+            src,
+            snap,
+            result,
+            hypothesis=hypothesis,
+            parent=args.get("parent"),
+            eval_s=round(time.perf_counter() - start, 1),
+        )
+        await asyncio.to_thread(refresh, run, args["target_id"])
         out = compact(result)
+        out["ledger"] = {"exp": row["exp"], "status": row["status"]}
         best = best_for_target(run, args["target_id"])
         out["best_so_far"] = (
             {"snapshot": best["snapshot"], "speedup": best["speedup"]} if best else None
@@ -179,8 +273,9 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
                 "history": [
                     {
                         "snapshot": r.get("snapshot"),
-                        "status": r.get("status"),
+                        "status": r.get("ledger_status") or r.get("status"),
                         "speedup": r.get("speedup"),
+                        "hypothesis": r.get("hypothesis"),
                     }
                     for r in records[-15:]
                 ],
@@ -204,6 +299,10 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
                     "items": {"type": "string"},
                     "description": "TARGET_ID=path/to/candidate.py entries",
                 },
+                "hypothesis": {
+                    "type": "string",
+                    "description": "one sentence: what this combination tests",
+                },
             },
         },
     )
@@ -220,14 +319,18 @@ def build_server(run: RunDir, budget: Budget | None = None) -> Any:
         for k in args.get("kernels") or []:
             target_id, _, path = k.partition("=")
             cli += ["--kernel", f"{target_id}={_resolve(run.target(target_id), path)}"]
+        start = time.perf_counter()
         result = await asyncio.to_thread(call_worker, run, "e2e", *cli)
-        record = {
-            "time": time.strftime("%H:%M:%S"),
-            "transforms": [str(s.relative_to(run.transforms_dir)) for s in snaps],
-            "kernels": args.get("kernels") or [],
-            **result,
-        }
-        append_jsonl(run.transforms_dir / "results.jsonl", record)
+        _, row = record_e2e_result(
+            run,
+            result,
+            snaps,
+            args.get("kernels") or [],
+            hypothesis=str(args.get("hypothesis") or ""),
+            eval_s=round(time.perf_counter() - start, 1),
+        )
+        await asyncio.to_thread(refresh, run)
+        result["ledger"] = {"exp": row["exp"], "status": row["status"]}
         if isinstance(result.get("error"), str):
             result["error"] = result["error"][-3000:]
         result |= budget.feedback(

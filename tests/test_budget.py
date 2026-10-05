@@ -147,7 +147,7 @@ def test_evaluate_candidate_carries_budget(tmp_path, monkeypatch):
     server = {t.name: t for t in tools_mod.build_server(run, budget)}
 
     async def evaluate() -> dict:
-        args = {"target_id": "t", "candidate": "candidates/v1.py"}
+        args = {"target_id": "t", "candidate": "candidates/v1.py", "hypothesis": "same kernel"}
         out = await server["evaluate_candidate"].handler(args)
         return json.loads(out["content"][0]["text"])
 
@@ -238,7 +238,8 @@ def test_agent_timeout_is_enforced(tmp_path, monkeypatch):
     assert kernels["done"] and kernels["finished"] == ["t1", "t2"]
     assert [t["agent"] for t in kernels["timed_out"]] == ["kernel-t1", "kernel-t2"]
     events = read_jsonl(orch.run.root / "events.jsonl")
-    assert [e["event"] for e in events] == ["timed_out", "timed_out"]
+    timed_out = [e for e in events if e["event"] == "timed_out"]
+    assert [e["agent"] for e in timed_out] == ["kernel-t1", "kernel-t2"]
     assert orch.agent_results[0].timed_out
 
 

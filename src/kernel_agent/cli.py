@@ -160,6 +160,27 @@ def cmd_report(ns: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_status(ns: argparse.Namespace) -> int:
+    import time
+
+    from kernel_agent.status import render
+    from kernel_agent.workspace import RunDir
+
+    run = RunDir(Path(ns.run_dir).resolve())
+    if not run.run_json.exists():
+        raise SystemExit(f"{run.root} is not a run directory (no run.json)")
+    if not ns.watch:
+        print(render(run))
+        return 0
+    try:
+        while True:
+            text = render(run)
+            print("\033[2J\033[H" + text, flush=True)  # clear the screen, cursor home
+            time.sleep(ns.watch)
+    except KeyboardInterrupt:
+        return 0
+
+
 def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="Hugging Face URL or repo id (org/name[@revision])")
     p.add_argument(
@@ -256,9 +277,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("project", nargs="?", default=".")
     p.set_defaults(func=cmd_install_claude_code)
 
-    p = sub.add_parser("report", help="(re)write report.md for a run")
+    p = sub.add_parser("report", help="(re)write report.md, charts and dashboard.html for a run")
     p.add_argument("run_dir")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("status", help="per-target progress, e2e, cost and the latest evaluations")
+    p.add_argument("run_dir")
+    p.add_argument("--watch", type=float, metavar="SECONDS", help="refresh every SECONDS")
+    p.set_defaults(func=cmd_status)
 
     ns = parser.parse_args(argv)
     return int(ns.func(ns))

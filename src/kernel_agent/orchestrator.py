@@ -18,12 +18,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import hub, toolchain
+from kernel_agent import hub, ledger, toolchain
 from kernel_agent.agent import prompts
 from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import best_for_target, build_server, tool_names
 from kernel_agent.budget import Budget
 from kernel_agent.config import OptimizeConfig
+from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.export import export_optimized
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
@@ -111,6 +112,7 @@ class Orchestrator:
         return avail
 
     async def _agent(self, name: str, **kwargs: Any) -> AgentResult:
+        ledger.event(self.run, "agent_start", agent=name)
         result = AgentResult(name=name)
         timeout = self.budget.start_agent(name)
         cfg = self.budget.agent_config(self.cfg)
@@ -138,6 +140,14 @@ class Orchestrator:
         finally:
             self.budget.end_agent(name)
         self.agent_results.append(result)
+        ledger.event(
+            self.run,
+            "agent_done",
+            agent=name,
+            usd=round(result.cost_usd, 4),
+            minutes=round(result.seconds / 60, 1),
+            error=result.is_error,
+        )
         costs = read_json(self.run.root / "costs.json", {})
         costs[name] = {
             "usd": round(result.cost_usd, 4),
@@ -383,8 +393,20 @@ class Orchestrator:
             cli = ["--warmup", "2", "--iters", "5"]
             for kind, arg in combo:
                 cli += ["--kernel" if kind == "kernel" else "--transform", arg]
+            start = time.perf_counter()
             r = call_worker(self.run, "e2e", *cli)
             history.append({"items": [a for _, a in combo], **_short(r)})
+            names = [ledger.item_label(a) for _, a in combo]
+            ledger.record_e2e(
+                self.run,
+                r,
+                backend="integrate",
+                snapshot="+".join(names),
+                hypothesis="integration: "
+                + " + ".join(names)
+                + (" alone" if len(names) == 1 else ""),
+                eval_s=round(time.perf_counter() - start, 1),
+            )
             return r
 
         singles: list[tuple[tuple[str, str], dict[str, Any]]] = []
@@ -439,7 +461,14 @@ class Orchestrator:
             if self._phase_done(phase):
                 continue
             self.phase = phase
-            await getattr(self, phase)()
+            ledger.event(self.run, "phase_start", phase=phase)
+            try:
+                await getattr(self, phase)()
+            except BaseException as exc:  # SystemExit / Ctrl-C too: status must not say "running"
+                ledger.event(self.run, "phase_failed", phase=phase, error=repr(exc)[:300])
+                raise
+            ledger.event(self.run, "phase_done", phase=phase)
+            refresh(self.run)
             if phase == until:
                 break
         return self.run
