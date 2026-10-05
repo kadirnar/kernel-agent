@@ -2,15 +2,20 @@
 
 ```
 runs/<org>--<name>/<timestamp>/
-  run.json              run configuration (model card, workload spec, options)
+  run.json              run configuration (model card, workload spec, options) and the
+                        sha256 of every truth file (``truth``, see truth.py)
   toolchain.json        GPU + compiler + backend availability
   harness.py            (optional) agent-written workload for unusual models
   baseline.json         end-to-end baseline latency + reference outputs summary
   profile/              profile.json, summary.md, kernels.txt
   plan.json             planner output: targets + model-level transforms
-  targets/<id>/         spec.json, capture.pt, candidates/*.py, results.jsonl, NOTES.md,
-                        progress.png
-  transforms/           *.py model-level transforms + results.jsonl
+  .truth/               what the evaluator trusts (read-only, hashed): baseline_output.pt,
+                        captures/<id>.pt, targets/<id>/{results.jsonl,history/},
+                        transforms/{results.jsonl,history/}
+  targets/<id>/         spec.json, capture_inputs.pt (no outputs), reference_source.py,
+                        candidates/*.py, NOTES.md, progress.png, copies of history/ and
+                        results.jsonl for the agent
+  transforms/           *.py model-level transforms (+ copies of history/, results.jsonl)
   results.tsv           experiment ledger: one row per evaluation (kernel, transform, integration)
   events.jsonl          phase changes, agent start/stop, evaluations
   progress.png  amdahl.png  integration.png  dashboard.html   charts (see charts.py)
@@ -19,6 +24,10 @@ runs/<org>--<name>/<timestamp>/
   rounds/<n>/           improve --rounds: re-profile (baseline.json, profile/) + plan.json
   report.md             final report
 ```
+
+Runs created before ``.truth/`` existed (no ``truth`` in ``run.json``) keep
+``capture.pt``, ``results.jsonl`` and ``history/`` in ``targets/<id>/`` and
+``baseline_output.pt`` in the root; the path methods below return those.
 """
 
 from __future__ import annotations
@@ -28,6 +37,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+TRUTH_DIR = ".truth"
 
 
 def slug(repo_id: str) -> str:
@@ -135,6 +146,38 @@ class RunDir:
         if not self.targets_dir.exists():
             return []
         return sorted(p.name for p in self.targets_dir.iterdir() if (p / "spec.json").exists())
+
+    # ground truth (``.truth/`` in runs that have it, the old places otherwise)
+
+    @property
+    def truth_dir(self) -> Path:
+        return self.root / TRUTH_DIR
+
+    def sealed(self) -> bool:
+        """Whether the run keeps its ground truth in ``.truth/`` (``run.json`` has ``truth``)."""
+        return isinstance(self.load().get("truth"), dict)
+
+    def baseline_output(self) -> Path:
+        """Output of the baseline run that ``e2e`` compares against."""
+        return (self.truth_dir if self.sealed() else self.root) / "baseline_output.pt"
+
+    def capture_file(self, target_id: str) -> Path:
+        """The full capture of a target (module, inputs, reference outputs)."""
+        if self.sealed():
+            return self.truth_dir / "captures" / f"{target_id}.pt"
+        return self.target(target_id) / "capture.pt"
+
+    def results_file(self, target_id: str | None = None) -> Path:
+        """Evaluation records of a target (``None``: of the transforms)."""
+        return self._evals(target_id) / "results.jsonl"
+
+    def history_dir(self, target_id: str | None = None) -> Path:
+        """Snapshots of the evaluated files of a target (``None``: of the transforms)."""
+        return self._evals(target_id) / "history"
+
+    def _evals(self, target_id: str | None) -> Path:
+        base = self.truth_dir if self.sealed() else self.root
+        return base / "targets" / target_id if target_id else base / "transforms"
 
     def load(self) -> dict[str, Any]:
         data = read_json(self.run_json, {})

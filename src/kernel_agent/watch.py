@@ -44,7 +44,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from kernel_agent import charts, ledger
 from kernel_agent.ledger import E2E, FAILURES, KEEP
-from kernel_agent.workspace import RunDir
+from kernel_agent.workspace import TRUTH_DIR, RunDir
 
 PAGE = Path(__file__).with_name("watch.html")
 POLL_S = 1.0  # how often an SSE connection looks for new data
@@ -240,10 +240,15 @@ class Watcher:
             rel = f"targets/{row['target']}/history/{snapshot}"
         elif snapshot.split("+")[0].endswith(".py"):
             rel = f"transforms/history/{snapshot.split('+')[0]}"
-        try:
-            row["file"] = rel if rel and viewable(self.run.root, rel) else None
-        except FileError:
-            row["file"] = None
+        row["file"] = None
+        # the evaluated snapshot in .truth/ when the run has one, else the run's own copy
+        for path in (f"{TRUTH_DIR}/{rel}", rel) if rel else ():
+            try:
+                viewable(self.run.root, path)
+            except FileError:
+                continue
+            row["file"] = path
+            break
         return row
 
     def _read_events(self) -> tuple[list[dict[str, Any]], bool]:

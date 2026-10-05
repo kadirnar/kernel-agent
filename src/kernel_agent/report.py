@@ -90,7 +90,7 @@ def write_report(run: RunDir) -> Path:
     ]
     for target_id in run.target_ids():
         spec = read_json(run.target(target_id) / "spec.json", {})
-        records = read_jsonl(run.target(target_id) / "results.jsonl")
+        records = read_jsonl(run.results_file(target_id))
         best = best_for_target(run, target_id)
         lines.append(
             f"| `{target_id}` | `{spec.get('module_class')}` | "
@@ -114,7 +114,7 @@ def write_report(run: RunDir) -> Path:
     lines.append("")
     for target_id in run.target_ids():
         lines += _chart(run, run.target(target_id) / "progress.png", f"{target_id} progress")
-    transforms = read_jsonl(run.transforms_dir / "results.jsonl")
+    transforms = read_jsonl(run.results_file())
     if transforms:
         lines += [
             "",

@@ -285,7 +285,7 @@ class Improver:
             icfg.policy, systems=icfg.policy.systems and orch.cfg.do_transforms
         )
         self.state = load_state(self.run)
-        self.require_capture = require_capture  # dry runs have no capture.pt
+        self.require_capture = require_capture  # dry runs have no captures
         self.live_charts = live_charts
 
     # -------------------------------------------------------- helpers
@@ -300,7 +300,7 @@ class Improver:
     def targets(self) -> list[str]:
         ids = self.run.target_ids()
         if self.require_capture:
-            ids = [t for t in ids if (self.run.target(t) / "capture.pt").exists()]
+            ids = [t for t in ids if self.run.capture_file(t).exists()]
         return ids
 
     def arms(self, rows: list[dict[str, Any]] | None = None) -> list[Arm]:
@@ -503,7 +503,7 @@ class Improver:
         log(f"re-integrating: {why}")
         ledger.event(self.run, "reintegrate", why=why)
         await self.orch.integrate(reuse=True)
-        data = read_json(self.run.root / "integration.json", {}) or {}
+        data = self.orch.truth.load_json(self.run.root / "integration.json") or {}
         final = data.get("final") or {}
         speedup = float(final["speedup"]) if final.get("passed") and final.get("speedup") else 1.0
         spread = ledger.e2e_spread(final) or 0.0
@@ -547,7 +547,8 @@ class Improver:
     async def _start_round(self, integration: dict[str, Any], arms: list[Arm]) -> bool:
         n = self.round + 1
         round_dir = self.run.root / "rounds" / str(n)
-        accepted = (read_json(self.run.root / "integration.json", {}) or {}).get("accepted", [])
+        integrated = self.orch.truth.load_json(self.run.root / "integration.json") or {}
+        accepted = integrated.get("accepted", [])
         names = ", ".join(ledger.item_label(i["item"]) for i in accepted)
         log(f"round {n}: re-profiling the optimised model ({names or 'nothing applied'})")
         ledger.event(self.run, "reprofile", round=n, items=[i["item"] for i in accepted])
