@@ -182,19 +182,19 @@ def epoch(text: str | None) -> float | None:
         return None
 
 
+def parse_row(header: list[str], line: str) -> dict[str, Any]:
+    """One TSV line as a row dict (missing trailing cells are empty)."""
+    cells = line.split("\t")
+    cells += [""] * (len(header) - len(cells))
+    return {key: _parse(key, cell) for key, cell in zip(header, cells, strict=False)}
+
+
 def read_tsv(path: Path) -> list[dict[str, Any]]:
     lines = path.read_text().splitlines() if path.exists() else []
     if not lines:
         return []
     header = lines[0].split("\t")
-    rows = []
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        cells = line.split("\t")
-        cells += [""] * (len(header) - len(cells))
-        rows.append({key: _parse(key, cell) for key, cell in zip(header, cells, strict=False)})
-    return rows
+    return [parse_row(header, line) for line in lines[1:] if line.strip()]
 
 
 def append(run: RunDir, row: dict[str, Any]) -> dict[str, Any]:
@@ -380,10 +380,12 @@ def events(run: RunDir) -> list[dict[str, Any]]:
     return read_jsonl(run.events)
 
 
-def phase_spans(run: RunDir) -> list[tuple[str, float, float | None]]:
-    """``(phase, start_ts, end_ts or None while running)`` from the event log."""
+def phase_spans(
+    run: RunDir, log: list[dict[str, Any]] | None = None
+) -> list[tuple[str, float, float | None]]:
+    """``(phase, start_ts, end_ts or None while running)`` from the event log (or ``log``)."""
     spans: list[tuple[str, float, float | None]] = []
-    for ev in events(run):
+    for ev in events(run) if log is None else log:
         if "ts" not in ev:
             continue
         if ev.get("event") == "phase_start":

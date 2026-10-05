@@ -196,6 +196,16 @@ def cmd_status(ns: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_watch(ns: argparse.Namespace) -> int:
+    from kernel_agent.watch import serve
+
+    run_dir = Path(ns.run_dir).resolve()
+    if not (run_dir / "run.json").exists():
+        raise SystemExit(f"{run_dir} is not a run directory (no run.json)")
+    serve(run_dir, host=ns.host, port=ns.port)
+    return 0
+
+
 def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="Hugging Face URL or repo id (org/name[@revision])")
     p.add_argument(
@@ -313,6 +323,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_dir")
     p.add_argument("--watch", type=float, metavar="SECONDS", help="refresh every SECONDS")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("watch", help="live dashboard of a run in the browser (HTTP + SSE)")
+    p.add_argument("run_dir")
+    p.add_argument("--port", type=int, default=8765, help="0 picks a free port")
+    p.add_argument("--host", default="127.0.0.1", help="interface to bind (default: localhost)")
+    p.set_defaults(func=cmd_watch)
 
     ns = parser.parse_args(argv)
     return int(ns.func(ns))

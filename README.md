@@ -322,6 +322,7 @@ kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
+kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
 kernel-agent doctor [--smoke] [--remeasure-peaks]
 kernel-agent install-claude-code <project-dir>
 ```
@@ -455,6 +456,41 @@ baseline, then the best single item, then each item added on top: accepted
 
 The example images come from the synthetic run in `tests/synthetic_run.py`
 (`python tests/synthetic_run.py /tmp/demo` writes one and draws its charts).
+
+## Live dashboard
+
+`kernel-agent watch <run_dir> [--port 8765] [--host 127.0.0.1]` serves a live
+view of a run on http://127.0.0.1:8765. It needs only the standard library
+(`http.server` + Server-Sent Events) and only reads the run directory, so it
+can be started before, during or after a run. Every second it reads what was
+appended to `results.tsv`, `events.jsonl` and `logs/agent-*.jsonl` since the
+last byte offset (a half-written last line waits for the next poll) and
+re-reads `costs.json`, `integration.json` and `baseline.json` when they
+change. The page updates without reloading.
+
+The page shows the model, GPU, eager and `torch.compile` baselines, the best
+measured and projected end-to-end latency, elapsed time, USD spent, the
+pipeline phases and the agents that are running. Below that: a
+speedup-per-evaluation chart per target (running best as a step line,
+hypothesis on hover), projected and measured end-to-end latency over
+wall-clock time, cumulative agent cost, the integration waterfall, the latest
+events and agent tool calls, the ledger (filter by target and status, search
+the hypotheses) and a read-only file browser for candidates, snapshots,
+`NOTES.md` and `program.md`. The charts are inline SVG drawn in the browser
+(no CDN, works offline) in the same colours as the PNG charts. Light and dark
+mode follow the system (`?theme=dark` forces dark), tooltips also work from
+the keyboard (focus a chart, then use the arrow keys), and the layout works at
+phone width.
+
+![live dashboard](docs/images/example-watch.png)
+
+Endpoints: `/` the page, `/api/state` a JSON snapshot, `/events` the SSE
+stream (a `state` event on connect, then `delta` events with new ledger rows,
+events, agent-log lines and the updated summary), `/api/files` and
+`/file?path=` (text files inside the run directory only, at most 512 KB). The
+server binds to localhost by default and rejects requests whose `Host` header
+is not a local name. `--host 0.0.0.0` exposes the run, read-only, to your
+network.
 
 ## Candidate contract
 
