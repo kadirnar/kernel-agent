@@ -4,61 +4,176 @@ The capture file is the self-contained unit an agent optimises: it holds the
 original module (weights included), up to ``max_cases`` calls with distinct
 shape signatures, the reference outputs and the post-call state of the
 arguments (so in-place updates such as KV-cache appends are verified too).
+
+Calls are recorded from every entrypoint of the module: ``forward`` and the
+methods found by :mod:`kernel_agent.profiling.methods` (e.g. ``forward_step``
+of a custom decode loop).  Each case records the ``method`` it came from.
+
+Arguments are deep-copied, with one exception for memory: a tensor that is a
+view into a much larger storage (one layer's ``K``/``V`` slice of a static
+``[2, layers, B, H, T, D]`` KV-cache buffer, say) is copied compactly — only
+the memory its views span, with the same shape, strides and aliasing between
+overlapping views.  Deep-copying such a view would copy the whole buffer for
+every case and for both the pre- and post-call state.  As a consequence,
+side effects are checked on the memory the arguments cover, not on the rest
+of a larger buffer they were sliced from.
 """
 
 from __future__ import annotations
 
+import collections
 import copy
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 
-from kernel_agent.profiling.profiler import signature_of
+from kernel_agent.kernels.compare import flatten
+from kernel_agent.profiling.methods import (
+    entrypoint,
+    entrypoints_of,
+    instrument,
+    workload_entrypoints,
+)
+from kernel_agent.profiling.profiler import call_signature, signature_of
 from kernel_agent.workloads.base import Workload, synchronize
+
+#: A storage is copied compactly only when that saves at least this many bytes.
+COMPACT_MIN_BYTES = 1 << 20
+
+
+def _span(t: torch.Tensor) -> int:
+    """Number of storage elements ``t`` spans (from its first to its last element)."""
+    if t.numel() == 0:
+        return 0
+    return 1 + sum((int(n) - 1) * int(s) for n, s in zip(t.shape, t.stride(), strict=True))
+
+
+def _compact_views(value: Any) -> dict[int, torch.Tensor]:
+    """``copy.deepcopy`` memo entries that copy views of large storages compactly.
+
+    Tensors are grouped by storage; overlapping views are merged into one
+    interval, so aliasing between them survives the copy.  Groups that cover
+    most of their storage, mix dtypes or are not plain strided tensors are left
+    to the regular deep copy."""
+    groups: dict[tuple[str, int], list[torch.Tensor]] = collections.defaultdict(list)
+    seen: set[int] = set()
+    for t in flatten(value).values():
+        if id(t) in seen or not isinstance(t, torch.Tensor):
+            continue
+        seen.add(id(t))
+        if t.layout != torch.strided or t.is_quantized or t.is_conj() or t.is_neg():
+            continue
+        if t.device.type == "meta" or t.numel() == 0:
+            continue
+        try:
+            groups[(str(t.device), t.untyped_storage().data_ptr())].append(t)
+        except (RuntimeError, NotImplementedError):
+            continue
+
+    memo: dict[int, torch.Tensor] = {}
+    for tensors in groups.values():
+        if len({t.dtype for t in tensors}) != 1:
+            continue
+        intervals = sorted(
+            ((int(t.storage_offset()), int(t.storage_offset()) + _span(t), t) for t in tensors),
+            key=lambda item: (item[0], item[1]),
+        )
+        merged: list[tuple[int, int, list[torch.Tensor]]] = []
+        for start, end, t in intervals:
+            if merged and start < merged[-1][1]:
+                first, last, members = merged[-1]
+                merged[-1] = (first, max(last, end), [*members, t])
+            else:
+                merged.append((start, end, [t]))
+        size = tensors[0].element_size()
+        covered = sum(end - start for start, end, _ in merged) * size
+        storage = tensors[0].untyped_storage().nbytes()
+        if storage - covered < COMPACT_MIN_BYTES or storage < 2 * covered:
+            continue
+        for start, end, members in merged:
+            chunk = members[0].detach().as_strided((end - start,), (1,), start).clone()
+            for t in members:
+                memo[id(t)] = chunk.as_strided(t.shape, t.stride(), t.storage_offset() - start)
+    return memo
 
 
 def _detach(value: Any) -> Any:
+    """Deep copy of call arguments/outputs (views of large storages copied compactly)."""
     try:
-        return copy.deepcopy(value)
+        memo: dict[int, Any] = dict(_compact_views(value))
+    except Exception:
+        memo = {}
+    try:
+        return copy.deepcopy(value, memo)
     except Exception:
         return value
 
 
 class _Recorder:
-    def __init__(self, module: nn.Module, max_cases: int) -> None:
+    """Records the calls of one module instance through all of its entrypoints."""
+
+    def __init__(self, module: nn.Module, max_cases: int, methods: Sequence[str] = ()) -> None:
         self.module = module
         self.max_cases = max_cases
-        self.cases: dict[str, dict[str, Any]] = {}
-        self._pending: list[tuple[str, Any, Any] | None] = []
-        self.handles = [
-            module.register_forward_pre_hook(self._pre, with_kwargs=True),
-            module.register_forward_hook(self._post, with_kwargs=True),
-        ]
+        self.cases: dict[tuple[str, str], dict[str, Any]] = {}
+        #: Calls per entrypoint during the run (all signatures, captured or not).
+        self.calls: collections.Counter[str] = collections.Counter()
+        self._pending: list[tuple[tuple[str, str], Any, Any] | None] = []
+        self._ctx: Any = instrument([module], {type(module): list(methods)}, self._pre, self._post)
+        self._ctx.__enter__()
 
-    def _pre(self, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
-        # Group calls by the primary input only: decode steps share it even
-        # though masks / cache positions grow every step.
-        sig = signature_of(args, kwargs, limit=1)
-        case = self.cases.get(sig)
+    def _pre(
+        self, module: nn.Module, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> None:
+        self.calls[method] += 1
+        # Group calls by entrypoint and primary input only: decode steps share
+        # it even though masks / cache positions grow every step.
+        key = (method, call_signature(method, args, kwargs, limit=1))
+        case = self.cases.get(key)
         if case is not None:
             case["count"] += 1
             self._pending.append(None)
-        elif len(self.cases) < self.max_cases:
-            self._pending.append((sig, _detach(args), _detach(kwargs)))
+        elif self._make_room(method):
+            self._pending.append((key, _detach(args), _detach(kwargs)))
         else:
             self._pending.append(None)
 
+    def _make_room(self, method: str) -> bool:
+        """Whether a new case of ``method`` may be recorded.
+
+        Every entrypoint keeps at least one case: when the budget is full, an
+        entrypoint without a case evicts the least-called case of an entrypoint
+        that has several."""
+        pending = [p[0] for p in self._pending if p is not None]
+        if len(self.cases) + len(pending) < self.max_cases:
+            return True
+        if method in {m for m, _ in [*self.cases, *pending]}:
+            return False
+        per_method = collections.Counter(m for m, _ in self.cases)
+        victims = [key for key in self.cases if per_method[key[0]] > 1]
+        if not victims:
+            return False
+        del self.cases[min(victims, key=lambda key: self.cases[key]["count"])]
+        return True
+
     def _post(
-        self, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any], output: Any
+        self,
+        module: nn.Module,
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        output: Any,
     ) -> None:
         pending = self._pending.pop() if self._pending else None
         if pending is None:
             return
-        sig, pre_args, pre_kwargs = pending
-        self.cases[sig] = {
-            "signature": sig,
+        key, pre_args, pre_kwargs = pending
+        self.cases[key] = {
+            "method": method,
+            "signature": key[1],
             "full_signature": signature_of(pre_args, pre_kwargs, limit=8),
             "count": 1,
             "args": pre_args,
@@ -69,8 +184,9 @@ class _Recorder:
         }
 
     def remove(self) -> None:
-        for handle in self.handles:
-            handle.remove()
+        if self._ctx is not None:
+            self._ctx.__exit__(None, None, None)
+            self._ctx = None
 
 
 def find_instance(
@@ -97,12 +213,13 @@ def capture_module(
     path: Path,
     *,
     qualname: str | None = None,
-    max_cases: int = 3,
+    max_cases: int = 4,
 ) -> dict[str, Any]:
     """Run the workload once and save one instance of ``cls`` plus its calls."""
     roots = workload.roots()
     full, module = find_instance(roots, cls, qualname)
-    recorder = _Recorder(module, max_cases)
+    methods = entrypoints_of(type(module), workload_entrypoints(workload))
+    recorder = _Recorder(module, max_cases, methods)
     try:
         with torch.inference_mode():
             workload.run(inputs)
@@ -112,6 +229,7 @@ def capture_module(
     if not recorder.cases:
         raise RuntimeError(f"{full} ({cls}) was never called during the workload run")
     cases = sorted(recorder.cases.values(), key=lambda c: -c["count"])
+    calls = dict(recorder.calls.most_common())
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -120,13 +238,18 @@ def capture_module(
             "class": cls,
             "module_path": f"{type(module).__module__}.{type(module).__qualname__}",
             "instances": count_calls(roots, cls),
+            "methods": calls,
             "cases": cases,
         },
         path,
     )
     return {
         "qualname": full,
-        "cases": [{"signature": c["signature"], "count": c["count"]} for c in cases],
+        # calls per run of this instance, per entrypoint (captured or not)
+        "methods": calls,
+        "cases": [
+            {"method": c["method"], "signature": c["signature"], "count": c["count"]} for c in cases
+        ],
         "bytes": path.stat().st_size,
     }
 
@@ -144,24 +267,29 @@ def load_capture(path: Path, device: str | None = None) -> dict[str, Any]:
 
 def capture_calls(
     module: nn.Module,
-    calls: list[tuple[tuple[Any, ...], dict[str, Any], int]],
+    calls: Sequence[tuple[Any, ...]],
     path: Path,
     *,
     instances: int = 1,
 ) -> None:
-    """Build a capture file from explicit ``(args, kwargs, count)`` calls.
+    """Build a capture file from explicit ``(args, kwargs, count[, method])`` calls.
 
     Used by tests and for synthetic shapes (e.g. other batch sizes) that the
-    workload run did not exercise."""
+    workload run did not exercise.  ``method`` defaults to ``"forward"``."""
     cases = []
+    totals: collections.Counter[str] = collections.Counter()
     with torch.inference_mode():
-        for args, kwargs, count in calls:
+        for call in calls:
+            args, kwargs, count = call[0], call[1], int(call[2])
+            method = str(call[3]) if len(call) > 3 else "forward"
             pre_args, pre_kwargs = _detach(args), _detach(kwargs)
-            output = module(*args, **kwargs)
+            output = entrypoint(module, method)(*args, **kwargs)
             synchronize()
+            totals[method] += count
             cases.append(
                 {
-                    "signature": signature_of(pre_args, pre_kwargs, limit=1),
+                    "method": method,
+                    "signature": call_signature(method, pre_args, pre_kwargs, limit=1),
                     "full_signature": signature_of(pre_args, pre_kwargs, limit=8),
                     "count": count,
                     "args": pre_args,
@@ -179,6 +307,7 @@ def capture_calls(
             "class": type(module).__name__,
             "module_path": f"{type(module).__module__}.{type(module).__qualname__}",
             "instances": instances,
+            "methods": dict(totals.most_common()),
             "cases": cases,
         },
         path,

@@ -105,6 +105,10 @@ where the returned object subclasses `kernel_agent.workloads.base.Workload`
   `psnr`, `cosine`) with tolerances that accept bf16 numerical noise but catch
   broken kernels.
 * One `run()` should take roughly 0.2-10 s on the GPU.
+* If the inference loop calls module methods other than `forward` directly
+  (e.g. `layer.step_decode(...)`) and their names do not match
+  `forward*|step|decode*|prefill*|generate_step`, list them in the class
+  attribute `entrypoints = {{"ClassName": ["method"]}}` so they are profiled.
 * If the model needs an extra pip package that is not installed, install it with
   `uv pip install --python {python} <pkg>` (never torch/CUDA packages).
 
@@ -189,7 +193,11 @@ model. Specialist agents will then write custom kernels for each target you pick
    Targets may nest (a norm inside a decoder layer). Prefer non-overlapping
    targets; if you do pick a block and one of its children, say in the block's
    `approach` whether its replacement keeps calling that child module (so the
-   child's kernel still applies) or absorbs it.
+   child's kernel still applies) or absorbs it. Classes the model also calls
+   through methods other than `forward` (the *methods* column, e.g.
+   `forward_step` in a custom decode loop) are valid targets; their
+   replacement implements those methods too, so say which one the approach
+   speeds up.
 3. For each target give `approach` (the concrete fusion/algorithm idea, which
    kernels it removes, expected speedup) and an ordered list of `backends` from:
    {", ".join(backends)}. Put the backend most suited to the op first
@@ -203,6 +211,46 @@ model. Specialist agents will then write custom kernels for each target you pick
 Return the plan as structured output.
 
 {_env_block(python, toolchain)}"""
+
+
+def _entrypoints_block(capture_info: dict[str, Any], cls: str) -> str:
+    """Contract for modules the model calls through methods other than ``forward``."""
+    calls: dict[str, int] = dict(capture_info.get("methods") or {})
+    for c in capture_info.get("cases", []):
+        calls.setdefault(c.get("method", "forward"), c.get("count", 0))
+    others = [m for m in calls if m != "forward"]
+    if not others:
+        return ""
+    listed = ", ".join(f"`{m}` ({n} calls per run per instance)" for m, n in calls.items())
+    first = others[0]
+    return f"""
+# Entrypoints
+The model calls this module through {listed}. Non-`forward` calls bypass
+`nn.Module.__call__`, so the evaluator replays those cases as
+`candidate.{first}(*args, **kwargs)`. Your replacement must implement **every**
+captured method with the same signature, outputs and side effects (e.g. writing
+the new key/value into the passed KV-cache tensors at the given position — the
+evaluator checks the argument tensors after the call). A candidate without one
+of them fails with `build_error`. Spend the effort on the entrypoint with the
+most calls; the others may keep the reference implementation. Subclassing the
+reference class is a convenient way to do that:
+```python
+import copy
+
+from <module named in reference_source.py> import {cls}
+
+
+class Fast({cls}):
+    def {first}(self, ...):  # same signature as the reference
+        ...  # your kernels
+
+
+def build(reference):
+    new = copy.copy(reference)  # shares the reference's weights and submodules
+    new.__class__ = Fast
+    return new
+```
+"""
 
 
 def engineer_prompt(
@@ -220,10 +268,12 @@ def engineer_prompt(
     backend_list = "\n".join(
         f"  {i + 1}. `{b}` — {BACKEND_NAMES.get(b, b)}" for i, b in enumerate(backends)
     )
+    # Signatures of non-forward cases carry their method, e.g. `forward_step: a0[1, 2048]`.
     cases = "\n".join(
         f"  * `{c['signature']}` — {c['count']} calls per run per instance"
         for c in capture_info.get("cases", [])
     )
+    entrypoints = _entrypoints_block(capture_info, target["module_class"])
     stats = ""
     if class_stats:
         stats = (
@@ -252,15 +302,16 @@ Files in your working directory:
 # Candidate contract
 ```python
 def build(reference: torch.nn.Module) -> torch.nn.Module:
-    # Return a drop-in replacement: same forward signature (including kwargs
-    # such as attention_mask / position_embeddings / past_key_values /
+    # Return a drop-in replacement: same signature for every captured
+    # entrypoint (forward, and e.g. forward_step if listed above; including
+    # kwargs such as attention_mask / position_embeddings / past_key_values /
     # cache_position), same outputs, same in-place side effects. Reuse the
     # reference's parameters (you may pre-pack fused weights once here).
     # Return `reference` for instances you do not support.
 ```
 `build` is called on every instance of the class in the model, so handle the
 instances' configuration generically (read sizes from the module).
-
+{entrypoints}
 # Backends (in priority order)
 {backend_list}
 Start with the first. When it is correct and fast, try the next one only if

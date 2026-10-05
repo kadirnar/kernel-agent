@@ -64,6 +64,11 @@ class Workload(ABC):
     modality: ClassVar[Modality] = Modality.UNKNOWN
     #: Default knobs; overridden by ``spec.options``.
     defaults: ClassVar[dict[str, Any]] = {}
+    #: Extra module entrypoints besides ``forward`` that the run calls directly
+    #: (class name -> method names, e.g. ``{"Attention": ["step_decode"]}``) and
+    #: the name pattern in :mod:`kernel_agent.profiling.methods` misses.  The
+    #: ``entrypoints=Cls.method,...`` option adds more.
+    entrypoints: ClassVar[dict[str, list[str]]] = {}
 
     def __init__(self, spec: WorkloadSpec) -> None:
         self.spec = spec

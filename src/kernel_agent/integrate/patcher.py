@@ -20,6 +20,13 @@ class KernelPatch:
     module_class: str
     candidate: Path
     qualname_regex: str | None = None
+    #: Entrypoints the model calls on this class (``spec["capture"]["methods"]``,
+    #: e.g. ``["forward", "forward_step"]``); replacements must provide them.
+    methods: list[str] = field(default_factory=list)
+
+
+class PatchError(RuntimeError):
+    """A replacement cannot stand in for the module it replaces."""
 
 
 @dataclass
@@ -42,7 +49,11 @@ def _set_child(root: nn.Module, qualname: str, new: nn.Module) -> None:
 def apply_kernels(
     roots: dict[str, nn.Module], patches: list[KernelPatch], report: PatchReport | None = None
 ) -> PatchReport:
-    """Replace every instance of each patch's module class with ``build(instance)``."""
+    """Replace every instance of each patch's module class with ``build(instance)``.
+
+    Raises :class:`PatchError` when a replacement lacks one of the patch's
+    entrypoints that the original instance has (e.g. ``forward_step``): the
+    model would call it and either crash or silently bypass the kernel."""
     report = report or PatchReport()
     for patch in patches:
         module = load_candidate_module(patch.candidate)
@@ -66,6 +77,19 @@ def apply_kernels(
                 if new is None or new is instance:
                     skipped += 1
                     continue
+                missing = [
+                    m
+                    for m in patch.methods
+                    if m != "forward"
+                    and callable(getattr(instance, m, None))
+                    and not callable(getattr(new, m, None))
+                ]
+                if missing:
+                    raise PatchError(
+                        f"{patch.target_id}: build({root_name}.{name}) returned a "
+                        f"{type(new).__name__} without {', '.join(missing)}(), which the model "
+                        f"calls on {patch.module_class}"
+                    )
                 _set_child(root, name, new)
                 replaced += 1
         report.replaced[patch.target_id] = replaced
