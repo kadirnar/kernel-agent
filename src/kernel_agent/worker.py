@@ -1,7 +1,7 @@
 """GPU-side worker.  Every model-level step runs in a fresh subprocess so the
 orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
 
-    python -m kernel_agent.worker analyze --run-dir R
+    python -m kernel_agent.worker analyze --run-dir R [--out-dir D --kernel ID=PATH ...]
     python -m kernel_agent.worker capture --run-dir R --target ID
     python -m kernel_agent.worker e2e     --run-dir R [--kernel ID=PATH ...] [--transform PATH ...]
 """
@@ -56,13 +56,20 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     from kernel_agent.workloads import quality
     from kernel_agent.workloads.base import measure
 
+    if (ns.kernel or ns.transform) and not ns.out_dir:
+        raise ValueError("analyze --kernel/--transform needs --out-dir (keeps the run's baseline)")
     t0 = time.perf_counter()
     workload = _workload(run)
     load_s = time.perf_counter() - t0
+    out = run  # where baseline.json + profile/ go
+    if ns.out_dir:  # improve rounds: profile the optimised model next to the run's baseline
+        out = RunDir(ns.out_dir.resolve())
+        out.root.mkdir(parents=True, exist_ok=True)
+        _apply_patches(run, workload, ns.kernel or [], ns.transform or [])
     inputs = workload.make_inputs()
     timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     output = timing.pop("output")
-    torch.save(output, run.root / "baseline_output.pt")
+    torch.save(output, out.root / "baseline_output.pt")
 
     # Determinism check: a second run must pass the workload's own comparison.
     with torch.inference_mode():
@@ -87,16 +94,45 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             for name, m in workload.roots().items()
         },
     }
-    write_json(run.baseline_json, baseline)
+    write_json(out.baseline_json, baseline)
 
     if not ns.no_profile:
         profile = profile_workload(workload, inputs)
-        write_json(run.profile_dir / "profile.json", profile)
-        (run.profile_dir / "summary.md").write_text(
+        write_json(out.profile_dir / "profile.json", profile)
+        (out.profile_dir / "summary.md").write_text(
             summarize(profile, timing["median_ms"]) + quality.summary_section(baseline)
         )
-        baseline["profile"] = str(run.profile_dir / "summary.md")
+        baseline["profile"] = str(out.profile_dir / "summary.md")
     return baseline
+
+
+def _kernel_patches(run: RunDir, kernels: list[str]) -> list[Any]:
+    """``KernelPatch`` per ``TARGET_ID=PATH`` item (``e2e`` and the re-profile of ``analyze``)."""
+    from kernel_agent.integrate.patcher import KernelPatch
+
+    patches = []
+    for item in kernels:
+        target_id, _, path = item.partition("=")
+        spec = read_json(run.target(target_id) / "spec.json")
+        patches.append(
+            KernelPatch(
+                target_id=target_id,
+                module_class=spec["module_class"],
+                candidate=Path(path),
+                qualname_regex=spec.get("qualname_regex"),
+                methods=list(spec.get("capture", {}).get("method_instances", [])),
+            )
+        )
+    return patches
+
+
+def _apply_patches(run: RunDir, workload: Any, kernels: list[str], transforms: list[str]) -> None:
+    """Apply kernel replacements and transform files as ``e2e`` does (errors propagate)."""
+    from kernel_agent.integrate.patcher import PatchReport, apply_kernels, apply_transforms
+
+    report = PatchReport()
+    apply_kernels(workload.roots(), _kernel_patches(run, kernels), report)
+    apply_transforms(workload, [Path(p) for p in transforms], report)
 
 
 def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
@@ -149,29 +185,12 @@ def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> 
 def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     import torch
 
-    from kernel_agent.integrate.patcher import (
-        KernelPatch,
-        PatchReport,
-        apply_kernels,
-        apply_transforms,
-    )
+    from kernel_agent.integrate.patcher import PatchReport, apply_kernels, apply_transforms
     from kernel_agent.workloads.base import measure
     from kernel_agent.workloads.quality import assess, is_chaotic
 
     workload = _workload(run)
-    patches = []
-    for item in ns.kernel or []:
-        target_id, _, path = item.partition("=")
-        spec = read_json(run.target(target_id) / "spec.json")
-        patches.append(
-            KernelPatch(
-                target_id=target_id,
-                module_class=spec["module_class"],
-                candidate=Path(path),
-                qualname_regex=spec.get("qualname_regex"),
-                methods=list(spec.get("capture", {}).get("method_instances", [])),
-            )
-        )
+    patches = _kernel_patches(run, ns.kernel or [])
     report = PatchReport()
     try:
         apply_kernels(workload.roots(), patches, report)
@@ -235,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--no-profile", action="store_true")
+    parser.add_argument("--out-dir", type=Path, help="analyze: write baseline + profile here")
     ns = parser.parse_args(argv)
     run = RunDir(ns.run_dir.resolve())
     try:

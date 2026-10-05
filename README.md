@@ -269,6 +269,97 @@ changes: an attention softmax scale off by 5 % reaches mean cosine 0.994 and
 passes; the module-level check has to catch errors of that size. The model
 runs in its checkpoint dtype (bf16), and `--dtype` is ignored.
 
+### kernel-agent improve: the continuous loop
+
+```bash
+kernel-agent improve <run_dir | hf-url> [--max-hours 6] [--max-usd 60] [--slice 4] [--rounds 2]
+kernel-agent improve Qwen/Qwen3-0.6B --dry-run     # simulated: no GPU, no Claude
+```
+
+`optimize` gives each target one agent session with a fixed evaluation
+budget. `improve` keeps going, like autoresearch: it gives short sessions
+("slices") to whichever target pays most, keeps or discards every result in
+the ledger, re-integrates end to end as results come in, and stops only when
+the budget is spent or every target has stopped (`kernel_agent/improve.py`,
+`kernel_agent/scheduler.py`).
+
+* **Start or continue.** With a Hugging Face URL it runs analyze, plan and
+  capture first. With a run directory it continues that run, including one made
+  by `optimize`. Ctrl-C leaves the run consistent: run the same command again
+  and it continues. A slice that was running is recorded as `interrupted`
+  together with the evaluations it made. `--max-hours` and `--max-usd` are the
+  budget of this invocation: hours from now, and USD on top of what the run has
+  spent already. Without them the loop runs until every target has stopped.
+  `--agent-minutes` caps each slice.
+* **Scheduler.** Every kernel target is an arm, and so is the systems agent
+  (model-level transforms). The expected gain of an arm, in ms per model run,
+  is `remaining_ms × headroom × 0.7^k`:
+  * `remaining_ms`: the target's share of the profiled time × the baseline ms
+    ÷ its best module speedup. For the systems agent it is the end-to-end time
+    with its best transform.
+  * `headroom`: `1 − pct_of_sol` of the best result when the evaluator reports
+    a speed-of-light estimate. Otherwise `1 − 1/further`, where `further =
+    max(2 ÷ best, 1.1)` is the speedup still assumed possible. For the systems
+    agent, `further` starts at 1 ÷ the GPU-busy share of the profile (at least
+    1.25).
+  * `k`: slices of this arm in a row that found no new best.
+
+  The arm with the highest `expected gain × UCB index` gets the next slice. The
+  index is the arm's observed gain per evaluation (ms saved by its kept results
+  ÷ its evaluations, relative to the best arm's) plus `sqrt(2 ln(N + 2) / (n +
+  1))`, as in KernelBand. Untried arms get explored, and arms that keep paying
+  get more slices.
+* **Slices.** Each slice is a fresh agent session with `--slice` evaluations
+  (the evaluation advice says `stop` after them), so no context grows. It is
+  seeded with a digest in the system prompt: the arm's last 15 ledger rows with
+  hypotheses and status, the best snapshot with its speedup (and % of SOL), the
+  `## Open ideas` section and the tail of `NOTES.md`, and how far the target is
+  from its stop rules. The agent is asked to keep `NOTES.md` and its open ideas
+  current for the next session. Slices run through the same code as `optimize`
+  agents (budgets, timeouts, `program.md`, events). Their cost is in
+  `costs.json` as `kernel-<target>#<slice>` and `systems#<slice>`.
+* **Stop rules per arm** (AutoKernel's move-on rules): `--patience 5`
+  evaluations in a row without a new best, across slices; `--sol-stop 0.9` of
+  the speed of light; `--target-hours 2` spent in its slices; the module
+  `--speedup-goal 2` reached. `0` turns a rule off. An arm whose last two slices
+  made no evaluation stops too. The loop ends when the budget is spent or every
+  arm has stopped, or after 3 agent sessions in a row failed.
+* **Re-integration.** After every `--integrate-every 4` kept results, the
+  integration of `optimize` measures the combination end to end. Combinations of
+  the same snapshot files that were measured before are reused instead of
+  measured again. Every measurement is a ledger row, so the progress chart shows
+  the measured latency going down. `optimized/` is re-exported each time.
+* **Rounds.** With `--rounds R` above 1, once every arm of a round has stopped
+  and the round brought a real end-to-end gain, the optimised model (the
+  accepted integration applied) is profiled again into `rounds/<n>/`
+  (`worker analyze --out-dir D --kernel ... --transform ...`). The planner then
+  proposes new targets, with the earlier rounds and the existing targets as
+  context, and the loop continues with them. A target whose module was replaced
+  in the re-profile keeps the share it had in the first profile.
+* **Files.** `improve.json` holds the slices (arm, scores, evaluations,
+  outcome), the re-integrations, the rounds and why the loop stopped.
+  `improve.png` is drawn from it, and `report.md` gets an "Improve loop"
+  section.
+* **Dry run.** `--dry-run` replaces Claude and the GPU with a simulated
+  Qwen3-0.6B decode workload (`kernel_agent/dryrun.py`). Targets approach a
+  hidden ceiling with noise, failures and plateaus. Some report a speed-of-light
+  estimate and some do not. The CUDA graph the systems agent finds is
+  incompatible with the MLP kernel, and round 2 finds a new target. Time is
+  simulated too, so `--max-hours` counts simulated hours. The images below come
+  from `kernel-agent improve Qwen/Qwen3-0.6B --dry-run --rounds 2`.
+
+![improve progress](docs/images/example-improve-progress.png)
+
+`improve.png` has one lane per arm and a bar per slice: green when the slice
+found a new best, grey when it did not. Dashed lines are the re-integrations,
+labelled with the measured end-to-end speedup.
+
+![improve slices](docs/images/example-improve-slices.png)
+
+Limits: the evaluation budget of a slice is advice to the agent. The hard caps
+are `--agent-minutes` and the run budgets. Targets found by a re-plan are
+captured from the unmodified model.
+
 ## Backends
 
 | backend | how | host overhead (tiny op, measured) |
@@ -317,6 +408,9 @@ kernel-agent optimize <hf-url> [options]
   --until analyze|plan|capture|kernels|transforms|integrate
 
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
+kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4] [--rounds R]
+  --integrate-every 4 --patience 5 --sol-stop 0.9 --target-hours 2 --speedup-goal 2
+  --max-slices N --dry-run [--seed 0]  continuous loop (see "kernel-agent improve")
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE]
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
@@ -364,6 +458,8 @@ runs/<org>--<name>/<timestamp>/
   events.jsonl                phase changes, agent start/stop, evaluations
   progress.png  amdahl.png  integration.png  dashboard.html
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md)
+  improve.json  improve.png   improve loop: slices, re-integrations, rounds
+  rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256
   optimized/                  apply.py + manifest.json + kernels/
 ```

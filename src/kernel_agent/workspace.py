@@ -15,6 +15,8 @@ runs/<org>--<name>/<timestamp>/
   events.jsonl          phase changes, agent start/stop, evaluations
   progress.png  amdahl.png  integration.png  dashboard.html   charts (see charts.py)
   optimized/            exported winners + apply.py
+  improve.json          `kernel-agent improve`: slices, re-integrations, rounds (+ improve.png)
+  rounds/<n>/           improve --rounds: re-profile (baseline.json, profile/) + plan.json
   report.md             final report
 ```
 """
