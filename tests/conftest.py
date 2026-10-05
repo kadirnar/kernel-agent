@@ -23,3 +23,16 @@ def _private_library(tmp_path_factory):
         os.environ.pop("KERNEL_AGENT_LIBRARY", None)
     else:
         os.environ["KERNEL_AGENT_LIBRARY"] = old
+
+
+@pytest.fixture(autouse=True)
+def _gpu_lock_for_gpu_tests(request):
+    """`gpu` tests hold kernel-agent's GPU lock, so a plain `pytest` never benchmarks
+    on top of a running optimisation (or another test session)."""
+    if request.node.get_closest_marker("gpu") is None:
+        yield
+        return
+    from kernel_agent.gpulock import gpu_lock
+
+    with gpu_lock():
+        yield
