@@ -28,7 +28,9 @@ from scratch, with nothing shared with the evaluation:
 The re-check fails (``passed`` False) when the candidate is wrong on any fresh input
 (``incorrect``), fails to build or run, changes watched state, or when its speedup and
 the evaluator's disagree (``disagrees``, :func:`speedups_agree`: faster or slower).
-``agrees`` says whether correctness and speedup match the evaluator's verdict.
+``agrees`` says whether correctness and speedup match the evaluator's verdict. The
+integration keeps a correct kernel whose speedups disagree as a warning
+(:func:`speed_warning`) and lets its end-to-end A/B decide.
 
 Subprocesses::
 
@@ -64,6 +66,9 @@ SPEEDUP_TOLERANCE = 0.25
 SPEEDUP_TOLERANCE_MAX = 0.5
 #: ``status`` of a re-check whose speedup disagrees with the evaluator's (set by :func:`judge`).
 DISAGREES = "disagrees"
+#: ... the same, kept as a warning (:func:`speed_warning`): the kernel is correct, so the
+#: integration's end-to-end A/B decides on its speed.
+SPEED_DISAGREES = "speed_disagrees"
 ROUNDS = 3
 INPUTS, EXPECTED, CANDIDATE = "inputs.pt", "expected.pt", "candidate.pt"
 _dumps = json.dumps  # bound before any candidate is imported
@@ -396,10 +401,10 @@ def judge(
     ``tolerance`` its floor), whichever is larger. A result judged before is judged again
     from its measurement (against another verdict: a re-evaluation)."""
     verdict = verdict or {}
-    if result.get("status") == DISAGREES:  # judged before: the measurement itself was fine
+    if result.get("status") in (DISAGREES, SPEED_DISAGREES):  # judged before: measured fine
         result["status"] = "ok"
         result.pop("reason", None)
-    for key in ("speedup_ratio", "tolerance"):
+    for key in ("speedup_ratio", "tolerance", "warning", "conservative_speedup"):
         result.pop(key, None)
     claimed, measured = verdict.get("speedup"), result.get("speedup")
     result["evaluator"] = {"correct": verdict.get("correct"), "speedup": claimed}
@@ -422,6 +427,25 @@ def judge(
             f"(ratio {result['speedup_ratio']}, outside {1 / (1 + tol):.2f}-{1 + tol:.2f})"
         )
     result["passed"] = result.get("status") == "ok"
+    return result
+
+
+def disagreement(result: dict[str, Any]) -> float:
+    """How far a judged result's speedup is from the evaluator's: ``|log ratio|`` (0: no
+    timed comparison)."""
+    ratio = result.get("speedup_ratio")
+    return abs(math.log(ratio)) if isinstance(ratio, int | float) and ratio > 0 else 0.0
+
+
+def speed_warning(result: dict[str, Any]) -> dict[str, Any]:
+    """A correct result whose speedup disagrees with the evaluator's (:data:`DISAGREES`)
+    as a warning, not a failure: :data:`SPEED_DISAGREES`, ``passed``, the disagreement in
+    ``warning`` and the smaller of the two speedups as ``conservative_speedup``."""
+    claimed = float((result.get("evaluator") or {}).get("speedup") or 0.0)
+    measured = float(result.get("speedup") or 0.0)
+    result["warning"] = result.pop("reason", None)
+    result.update(status=SPEED_DISAGREES, passed=True)
+    result["conservative_speedup"] = round(min(claimed, measured), 3)
     return result
 
 
@@ -598,6 +622,14 @@ def describe(result: dict[str, Any]) -> str:
             + (f" vs {claimed}x in the evaluator" if claimed else "")
         )
     text = "; ".join(parts) or str(status)
+    if status == SPEED_DISAGREES:
+        runs = [f"{r.get('speedup')}x" for r in result.get("rechecks") or []]
+        text += (
+            f"; WARNING: the speedups disagree (ratio {result.get('speedup_ratio')}"
+            + (f"; re-checks: {', '.join(runs)}" if len(runs) > 1 else "")
+            + f"): not refused, ranked by the conservative {result.get('conservative_speedup')}x,"
+            " the end-to-end A/B decides"
+        )
     if not result.get("passed"):
         text = f"FAILED ({status}): {result.get('reason') or ''}".strip()
     return prefix + text

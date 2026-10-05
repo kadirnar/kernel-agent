@@ -165,19 +165,19 @@ def standing(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """The results of one target that stand: ``keep`` rows and correct ``re-evaluated``
     ones, except a snapshot's rows before its last re-evaluation (which stands instead)."""
     rows = list(rows)
-    last = {r["snapshot"]: i for i, r in enumerate(rows) if r["status"] == REEVALUATED}
+    last = {r.get("snapshot"): i for i, r in enumerate(rows) if r["status"] == REEVALUATED}
     return [
         r
         for i, r in enumerate(rows)
-        if last.get(r["snapshot"], i) <= i
-        and r["status"] in (KEEP, REEVALUATED)
-        and r.get("correct")
+        if last.get(r.get("snapshot"), i) <= i
+        and (r["status"] == KEEP or (r["status"] == REEVALUATED and r.get("correct")))
     ]
 
 
 def best_kept(rows: list[dict[str, Any]]) -> float:
-    """Running best of a target's (or ``e2e``'s) kept rows; 1.0 = reference / baseline."""
-    return max((r["speedup"] for r in rows if r["status"] == KEEP and r["speedup"]), default=1.0)
+    """Running best of a target's (or ``e2e``'s) kept rows; 1.0 = reference / baseline. A
+    re-evaluated snapshot counts with its re-evaluation (:func:`standing`)."""
+    return max((r["speedup"] for r in standing(rows) if r["speedup"]), default=1.0)
 
 
 def e2e_backend(transforms: list[Any], kernels: list[str]) -> str:

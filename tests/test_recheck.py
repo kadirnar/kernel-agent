@@ -140,6 +140,14 @@ def test_judge_compares_with_the_evaluator():
     again = recheck.judge(slower, {"correct": True, "speedup": 1.05})
     assert again["passed"] and again["status"] == "ok" and "reason" not in again
     assert again["evaluator"]["speedup"] == 1.05 and again["speedup_ratio"] == 0.952
+    # the integration keeps a correct kernel whose speedups disagree, as a warning
+    warned = recheck.speed_warning(judged(1.0, 2.0))
+    assert warned["passed"] and warned["status"] == recheck.SPEED_DISAGREES
+    assert warned["conservative_speedup"] == 1.0 and "2.0x claimed" in warned["warning"]
+    assert "reason" not in warned and "WARNING: the speedups" in recheck.describe(warned)
+    rejudged = recheck.judge(warned, {"correct": True, "speedup": 1.1})
+    assert rejudged["status"] == "ok" and "warning" not in rejudged
+    assert "conservative_speedup" not in rejudged
 
 
 def test_speedup_agreement_is_symmetric_with_a_floor_and_a_ceiling():
@@ -415,19 +423,28 @@ def test_a_combination_with_a_refused_kernel_seeds_nothing(tmp_path, simulated):
     assert [r["item"] for r in records] == [attn]
 
 
-def fakes(orch, measured: dict[str, tuple[float, float]], fresh: dict[str, dict]):
-    """A fake re-check (``measured``: snapshot stem -> (speedup, spread)) and re-evaluation
-    (``fresh``: snapshot stem -> its result); returns the verdicts and re-evaluations seen."""
+def fakes(orch, measured: dict[str, tuple | list], fresh: dict[str, dict]):
+    """A fake re-check (``measured``: snapshot stem -> (speedup, spread), or a list of what
+    its re-checks measure in turn, the last one repeated; a string is a failure status)
+    and re-evaluation (``fresh``: snapshot stem -> its result); returns the verdicts and
+    re-evaluations seen."""
     seen: dict[str, list] = {"verdicts": [], "reevaluated": []}
 
     def stem(snap) -> str:
         return Path(snap).stem.split("_")[1]  # 001_v1_<sha1> -> v1
 
     def fake_recheck(capture, snap, *, verdict, capture_sha256, timeout):
+        runs = measured[stem(snap)]
+        runs = runs if isinstance(runs, list) else [runs]
+        done = sum(s == stem(snap) for s, _ in seen["verdicts"])
         seen["verdicts"].append((stem(snap), verdict))
-        speedup, spread = measured[stem(snap)]
-        result = {"status": "ok", "correct": True, "seeds": 3, "cases": []}
-        result.update(speedup=speedup, timing_spread=spread)
+        run = runs[min(done, len(runs) - 1)]
+        if isinstance(run, str):
+            result = {"status": run, "correct": False, "seeds": 3, "cases": []}
+            result["reason"] = f"case 0, seed 9: {run} on fresh inputs"
+            return recheck.judge(result, verdict)
+        result = {"status": "ok", "correct": True, "seeds": 3, "cases": [], "seed": done}
+        result.update(speedup=run[0], timing_spread=run[1])
         return recheck.judge(result, verdict)
 
     def fake_reevaluate(capture, snap, *, timeout, capture_sha256):
@@ -440,12 +457,13 @@ def fakes(orch, measured: dict[str, tuple[float, float]], fresh: dict[str, dict]
     return seen
 
 
-def ok(speedup: float, spread: float = 0.01) -> dict:
+def ok(speedup: float, spread: float = 0.01, saved: float | None = None) -> dict:
     return {
         "status": "ok",
         "correct": True,
         "speedup": speedup,
         "cases": [{"timing_spread": spread}],
+        "est_saved_ms_per_run": saved,
     }
 
 
@@ -494,28 +512,101 @@ def test_a_stale_record_is_re_evaluated_and_the_kernel_accepted(tmp_path, simula
     asyncio.run(orch.integrate())
     assert seen["reevaluated"] == [] and [v["speedup"] for _, v in seen["verdicts"]] == [18.31]
 
+    # the keep bar of the target is the re-evaluated 18.31x, not the stale 46.89x
+    assert ledger.best_kept([r for r in ledger.rows(run) if r["target"] == "attn"]) == 18.31
+    kernel(run, "attn", 20.0, name="v2")
+    assert ledger.rows(run)[-1]["status"] == ledger.KEEP
 
-@pytest.mark.parametrize("fresh, passed", [(2.95, True), (5.4, False)])
-def test_a_disagreeing_speedup_is_re_evaluated(tmp_path, simulated, fresh, passed):
-    """decoder_layer_fused of the VoxCPM2 run: 2.921x in the re-check (spread 0.472) vs
-    5.456x recorded by the current evaluator; refused only when its re-evaluation
-    disagrees with the re-check too."""
+
+@pytest.mark.parametrize(
+    "fresh, retry, status",
+    [
+        (2.95, None, "ok"),  # the record was off: its re-evaluation agrees with the re-check
+        (5.47, (5.484, 0.892), "ok"),  # the second re-check agrees
+        (5.47, (2.927, 0.472), recheck.SPEED_DISAGREES),  # both disagree: a warning
+    ],
+)
+def test_a_disagreeing_speedup_is_re_evaluated_and_re_checked(
+    tmp_path, simulated, fresh, retry, status
+):
+    """decoder_layer_fused of the VoxCPM2 run: correct, 2.921x in the re-check (spread
+    0.472) vs 5.456x recorded, 5.47x re-evaluated, and 5.484x or 2.927x in a second
+    re-check (its forward_step takes 0.126 or 0.239 ms from one process to the next).
+    Never refused: its end-to-end A/B decides, on the conservative speedup until then."""
     orch = make(tmp_path)
     item = kernel(orch.run, "attn", 5.456, spread=0.012)
-    seen = fakes(orch, {"v1": (2.921, 0.472)}, {"v1": ok(fresh)})
+    runs = [(2.921, 0.472)] + ([retry] if retry else [])
+    seen = fakes(orch, {"v1": runs}, {"v1": ok(fresh, saved=100.0)})
     kept, _, (check,) = orch._recheck_kernels([("kernel", item)], None, {})
 
     assert seen["reevaluated"] == ["v1"]  # flagged: not passed by the noise of its rounds
-    assert [v["speedup"] for _, v in seen["verdicts"]] == [5.456]  # one re-check, judged twice
-    assert check["passed"] is passed and check["tolerance"] == 0.5
     assert check["reevaluated"]["why"] == "the re-check measured 2.921x"
-    assert check["evaluator"]["speedup"] == fresh
-    assert kept == ([("kernel", item)] if passed else [])
-    if not passed:
-        assert check["status"] == recheck.DISAGREES
-        assert "2.921x in separate processes vs 5.4x claimed" in check["reason"]
-        assert "re-evaluated (the re-check measured 2.921x)" in recheck.describe(check)
-    assert best_for_target(orch.run, "attn")["speedup"] == fresh  # recorded either way
+    assert check["evaluator"]["speedup"] == fresh and check["tolerance"] == 0.5
+    assert check["passed"] and check["status"] == status and kept == [("kernel", item)]
+    assert best_for_target(orch.run, "attn")["speedup"] == fresh  # the re-evaluation
+    assert len(seen["verdicts"]) == (1 if retry is None else 2)
+    if retry is not None:
+        assert [r["speedup"] for r in check["rechecks"]] == [2.921, retry[0]]
+        assert check["speedup"] == retry[0]  # the run that agrees better
+    events = [e for e in ledger.events(orch.run) if e["event"] == "recheck_speed_disagrees"]
+    if status == "ok":
+        assert events == [] and orch.speed_caps == {}
+        return
+    assert check["conservative_speedup"] == 2.927 and "5.47x claimed" in check["warning"]
+    assert [(e["evaluator"], e["recheck"], e["conservative"]) for e in events] == [
+        (5.47, 2.927, 2.927)
+    ]
+    text = recheck.describe(check)
+    assert "2.927x in separate processes vs 5.47x in the evaluator" in text
+    assert "WARNING: the speedups disagree (ratio 0.535; re-checks: 2.921x, 2.927x)" in text
+    assert "ranked by the conservative 2.927x" in text
+    # ranked and projected by the conservative speedup
+    snap = Path(item.partition("=")[2]).name
+    assert orch.speed_caps == {("attn", snap): 2.927}
+    best = orch._kernel_best("attn")
+    assert best["speedup"] == 2.927 and best["evaluator_speedup"] == 5.47
+    expected = 100.0 * (1 - 1 / 2.927) / (1 - 1 / 5.47)
+    assert orch._kernel_saving("attn", snap) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "version, runs, status",
+    [
+        (CURRENT, [(2.921, 0.472), "incorrect"], "incorrect"),  # wrong on the second draw
+        (CURRENT, ["integrity_violation"], "integrity_violation"),
+        (None, [(0.9, 0.01)], recheck.DISAGREES),  # stale, and no speedup at all
+        (None, [(1.5, 0.01)], recheck.SPEED_DISAGREES),  # stale, slower but a speedup
+    ],
+)
+def test_what_the_integration_still_refuses(tmp_path, simulated, version, runs, status):
+    orch = make(tmp_path)
+    item = kernel(orch.run, "attn", 5.0, version=version)
+    seen = fakes(orch, {"v1": runs}, {"v1": ok(5.1)})
+    kept, _, (check,) = orch._recheck_kernels([("kernel", item)], None, {})
+    assert check["status"] == status
+    assert len(seen["verdicts"]) == (1 if status == "integrity_violation" else 2)
+    refused = status != recheck.SPEED_DISAGREES
+    assert check["passed"] is not refused and kept == ([] if refused else [("kernel", item)])
+    if status == "incorrect":
+        assert check["reason"].startswith("on a second re-check: case 0, seed 9: incorrect")
+    if status == recheck.DISAGREES:
+        assert check["reason"].endswith("no speedup at all in separate processes")
+    failed = [e["status"] for e in ledger.events(orch.run) if e["event"] == "recheck_failed"]
+    assert failed == ([status] if refused else [])
+
+
+def test_a_speed_cap_can_rank_another_snapshot_first(tmp_path, simulated):
+    """v1 records 10x but re-checks at 4x twice (re-evaluated 10x): kept with a warning
+    at 4x, it ranks behind v2 (8x), which is re-checked and integrated instead."""
+    orch = make(tmp_path)
+    run = orch.run
+    kernel(run, "attn", 8.0, name="v2")
+    v1 = kernel(run, "attn", 10.0, name="v1")
+    seen = fakes(orch, {"v1": (4.0, 0.0), "v2": (7.9, 0.0)}, {"v1": ok(10.0)})
+    kept, _, checks = orch._recheck_kernels([("kernel", v1)], None, {})
+    assert [c["status"] for c in checks] == [recheck.SPEED_DISAGREES, "ok"]
+    assert [Path(a).stem.split("_")[1] for _, a in kept] == ["v2"]
+    assert [s for s, _ in seen["verdicts"]] == ["v1", "v1", "v2"]
 
 
 def test_a_failed_re_evaluation_refuses_the_kernel(tmp_path, simulated):

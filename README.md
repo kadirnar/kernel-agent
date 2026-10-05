@@ -367,14 +367,26 @@ correct on the fresh inputs. The re-evaluation runs the current evaluator on the
 verified snapshot and appends its record to the target's `results.jsonl`
 (`reevaluates`: the old `exp`, speedup, version and why), with a `re-evaluated`
 ledger row. From then on it stands in for the old record: in the target's
-ranking, the projection, `status` and the report. The re-check is then judged
-against it. The kernel is refused only when the re-evaluation fails
-(`reevaluation_failed`) or the re-check disagrees with it too. If another
-snapshot of the target now ranks first, that one is re-checked and integrated
-instead. `integration.json` → `recheck` → `reevaluated` keeps the old and the new
-speedup. In the VoxCPM2 run, the attention kernel's 46.89× came from the evaluator
-before the hardening of #6/#7. Re-evaluated, it measures 18.25×, the re-check
-agrees (17.84×), and the kernel is integrated instead of being refused.
+ranking, the keep bar of later candidates, the projection, `status` and the
+report. The re-check is then judged against it. `integration.json` → `recheck` →
+`reevaluated` keeps the old and the new speedup. In the VoxCPM2 run, the
+attention kernel's 46.89× came from the evaluator before the hardening of #6/#7.
+Re-evaluated, it measures 18.25×, the re-check agrees (17.84×), and the kernel is
+integrated instead of being refused.
+
+The integration's re-check is about correctness and grossly inflated claims; the
+paired end-to-end A/B decides on speed. A speedup that still disagrees is
+re-checked once more, in new processes, and the run that agrees better counts
+(`rechecks` lists both). If it still disagrees, the correct kernel is kept with a
+warning (`speed_disagrees`: a log line, a `recheck_speed_disagrees` event and a
+report line with both speedups). Its A/B decides. Until then it ranks and
+projects by the conservative speedup, the smaller of the two. A kernel is refused
+when it is wrong on fresh inputs or violates integrity in either re-check, when
+its re-evaluation fails (`reevaluation_failed`), or when a stale record's
+re-evaluation disagrees with a re-check that measures no speedup at all (≤ 1×).
+If another snapshot of the target now ranks first, that one is re-checked and
+integrated instead. The standalone `kernel-agent recheck` command still fails on
+a disagreement.
 
 ### Ground truth the agents cannot quietly change
 

@@ -41,6 +41,7 @@ from kernel_agent.agent.tools import (
     best_for_target,
     build_server,
     current_records,
+    ranked_for_target,
     record_candidate,
     tool_names,
 )
@@ -84,6 +85,9 @@ class Orchestrator:
         # Its re-evaluation of a stale or disagreeing record (kernels/evaluate.py
         # run_evaluation); None = the real one.
         self.reevaluator: Callable[..., dict[str, Any]] | None = None
+        # (target, snapshot name) -> the conservative speedup of a kernel whose re-check
+        # disagrees with its record (recheck.speed_warning): what ranks and projects it.
+        self.speed_caps: dict[tuple[str, str], float] = {}
         self.simulated = "dry_run" in run.load()
 
     # ------------------------------------------------------------ creation
@@ -596,8 +600,18 @@ class Orchestrator:
             await asyncio.gather(*(job(s, again, f"{target_id}/r2w{s.worker}") for s in again))
 
     def _kernel_best(self, target_id: str) -> dict[str, Any] | None:
-        """The verified best record of a target when its kernel is worth integrating."""
-        best = best_for_target(self.run, target_id, self.truth)
+        """The verified best record of a target when its kernel is worth integrating. A
+        snapshot with a speed cap (``speed_caps``) ranks by it: its ``speedup`` is the
+        conservative one, ``evaluator_speedup`` the record's."""
+        best = None
+        for rec in ranked_for_target(self.run, target_id, self.truth):
+            if best is not None and rec["speedup"] <= best["speedup"]:
+                break  # ranked by the records' speedups, which a cap only lowers
+            cap = self.speed_caps.get((target_id, Path(str(rec["snapshot"])).name))
+            if cap is not None and cap < rec["speedup"]:
+                rec = {**rec, "speedup": cap, "evaluator_speedup": rec["speedup"]}
+            if best is None or rec["speedup"] > best["speedup"]:
+                best = rec
         # a region target's kernel needs its verified rewrite, unchanged (region.py)
         ok = region.rewrite_ok(self.run, target_id, self.truth)
         return best if best and best["speedup"] >= self.cfg.min_speedup and ok else None
@@ -807,9 +821,12 @@ class Orchestrator:
         line and a ``recheck_failed`` event with the reason), and so is a combination with
         it. A re-integration reuses the result of the same snapshot (``previous``).
 
-        A re-evaluation (:meth:`_recheck_one`) can rank another snapshot of the target
-        first: that one is re-checked too and, when it passes, integrated instead (its
-        sha256 goes to ``digests``)."""
+        A correct kernel whose speedup disagrees with its record (``speed_disagrees``) is a
+        warning (a log line and a ``recheck_speed_disagrees`` event), not a refusal: it is
+        ranked and projected by its conservative speedup (``speed_caps``) and its A/B
+        decides. A re-evaluation or a speed cap (:meth:`_recheck_one`) can rank another
+        snapshot of the target first: that one is re-checked too and, when it passes,
+        integrated instead (its sha256 goes to ``digests``)."""
         known = {(r.get("item"), r.get("sha256")): r for r in previous.get("recheck") or []}
         records: list[dict[str, Any]] = []
         refused: set[str] = set()
@@ -828,7 +845,19 @@ class Orchestrator:
             records.append(
                 {**result, "item": arg, "target": target_id, "snapshot": snap.name, "sha256": sha}
             )
-            log(f"integrate: recheck {target_id} ({snap.name}): {recheck.describe(result)}")
+            warn = "WARNING " if result.get("status") == recheck.SPEED_DISAGREES else ""
+            log(f"integrate: {warn}recheck {target_id} ({snap.name}): {recheck.describe(result)}")
+            if warn:
+                self.speed_caps[(target_id, snap.name)] = float(result["conservative_speedup"])
+                ledger.event(
+                    self.run,
+                    "recheck_speed_disagrees",
+                    target=target_id,
+                    snapshot=snap.name,
+                    evaluator=(result.get("evaluator") or {}).get("speedup"),
+                    recheck=result.get("speedup"),
+                    conservative=result.get("conservative_speedup"),
+                )
             if not result.get("passed"):
                 refused.add(arg)
                 ledger.event(
@@ -846,14 +875,14 @@ class Orchestrator:
             if kind != "kernel":
                 continue
             current, digest = arg, None
-            while check(current).get("reevaluated"):  # the target's ranking may have changed
+            while _reranks(check(current)):  # the target's ranking may have changed
                 top = self._kernel_item(arg.partition("=")[0])
                 if top is None or top[0] == current or check(top[0]).get("passed") is not True:
                     break
                 current, digest = top
             if current != arg:
                 log(
-                    f"integrate: {Path(current).name} ranks first after the re-evaluation; "
+                    f"integrate: {Path(current).name} ranks first after the re-check; "
                     f"it replaces {Path(arg).name}"
                 )
                 items[i] = (kind, current)
@@ -880,8 +909,13 @@ class Orchestrator:
         A record from an older evaluator (:func:`kernels.evaluate.stale`) is re-evaluated
         first, and so is one whose speedup the re-check disagrees with when the kernel is
         correct on the fresh inputs (:meth:`_reevaluate`): the current evaluator's result
-        is then the verdict (``reevaluated``: old and new speedup). The kernel is refused
-        when that evaluation fails or the re-check disagrees with it too."""
+        is then the verdict (``reevaluated``: old and new speedup). A speedup that still
+        disagrees is re-checked once more, in new processes, and the run that agrees
+        better counts (``rechecks``: both). If it still disagrees, the kernel is kept with
+        a warning (:func:`kernels.recheck.speed_warning`). It is refused when it is wrong on
+        fresh inputs or violates integrity in either re-check, when the re-evaluation
+        fails, or when a stale record's re-evaluation disagrees with a re-check that
+        measures no speedup at all (≤ 1x)."""
         if self.rechecker is None and self.simulated:
             return {"status": "skipped", "passed": True, "reason": "simulated run (no captures)"}
         capture = self.run.capture_file(target_id)
@@ -893,27 +927,47 @@ class Orchestrator:
             return {"status": "skipped", "passed": True, "reason": f"no capture file {capture}"}
         fresh: dict[str, Any] | None = None
         why = evaluate.stale(rec) if rec is not None else None
+        stale = bool(why)
         if rec is not None and why:
             fresh = self._reevaluate(target_id, snap, rec, capture_sha256, why)
             if not fresh.get("correct"):
                 return _reevaluation_failed({}, rec, fresh, why)
-        try:
-            result = (self.rechecker or recheck.run_recheck)(
-                capture,
-                snap,
-                verdict=_verdict(fresh or rec),
-                capture_sha256=capture_sha256,
-                timeout=2 * self.budget.eval_timeout_s,
-            )
-        except Exception as exc:  # the re-check itself broke: the kernel is not confirmed
-            return {"status": "error", "passed": False, "reason": repr(exc)[:500]}
-        disagrees = (result.get("agrees") or {}).get("speedup") is False
-        if fresh is None and rec is not None and result.get("correct") and disagrees:
+
+        def run_recheck(verdict: dict[str, Any] | None) -> dict[str, Any]:
+            try:
+                return (self.rechecker or recheck.run_recheck)(
+                    capture,
+                    snap,
+                    verdict=verdict,
+                    capture_sha256=capture_sha256,
+                    timeout=2 * self.budget.eval_timeout_s,
+                )
+            except Exception as exc:  # the re-check broke: the kernel is not confirmed
+                return {"status": "error", "passed": False, "reason": repr(exc)[:500]}
+
+        result = run_recheck(_verdict(fresh or rec))
+        if fresh is None and rec is not None and result.get("status") == recheck.DISAGREES:
             why = f"the re-check measured {result.get('speedup')}x"
             fresh = self._reevaluate(target_id, snap, rec, capture_sha256, why)
             if not fresh.get("correct"):
                 return _reevaluation_failed(result, rec, fresh, why)
             result = recheck.judge(result, _verdict(fresh))
+        if result.get("status") == recheck.DISAGREES:  # once more, in new processes
+            again = run_recheck(_verdict(fresh or rec))
+            if again.get("status") not in ("ok", recheck.DISAGREES):
+                result = {**again, "reason": f"on a second re-check: {again.get('reason')}"}
+            else:
+                runs = [result, again]  # an agreeing run first, else the closer one
+                result = min(runs, key=lambda r: (r["status"] != "ok", recheck.disagreement(r)))
+                result["rechecks"] = [
+                    {k: r.get(k) for k in ("speedup", "timing_spread", "seed", "speedup_ratio")}
+                    for r in runs
+                ]
+        if result.get("status") == recheck.DISAGREES:
+            if stale and float(result.get("speedup") or 0.0) <= 1.0:
+                result["reason"] += "; no speedup at all in separate processes"
+            else:
+                result = recheck.speed_warning(result)
         if rec is not None and fresh is not None and why:
             result["reevaluated"] = _reevaluation(rec, fresh, why)
         return result
@@ -1087,7 +1141,8 @@ class Orchestrator:
         return out
 
     def _kernel_saving(self, target_id: str, snapshot: str) -> float | None:
-        """``est_saved_ms_per_run`` of the verified evaluation of a kernel snapshot."""
+        """``est_saved_ms_per_run`` of the verified evaluation of a kernel snapshot; with a
+        speed cap (``speed_caps``) the saving at that conservative speedup."""
         try:
             records = current_records(self.truth.records(self.run.results_file(target_id)))
         except truth.TamperError:
@@ -1095,7 +1150,13 @@ class Orchestrator:
         for rec in records:
             if Path(str(rec.get("snapshot", ""))).name == snapshot:
                 est = rec.get("est_saved_ms_per_run")
-                return float(est) if est is not None else None
+                if est is None:
+                    return None
+                speedup = float(rec.get("speedup") or 0.0)
+                cap = self.speed_caps.get((target_id, snapshot))
+                if cap is not None and 0.0 < cap < speedup and speedup > 1.0:  # ∝ 1 - 1/speedup
+                    return float(est) * (1 - 1 / cap) / (1 - 1 / speedup)
+                return float(est)
         return None
 
     def _integration_items(self) -> tuple[list[tuple[str, str]], dict[str, str | None]]:
@@ -1512,6 +1573,12 @@ def _item_key(item: tuple[str, str]) -> str:
     if kind == "kernel":
         return f"kernel {arg.partition('=')[0]}"
     return f"transform {ledger.snapshot_stem(arg)}"
+
+
+def _reranks(result: dict[str, Any]) -> bool:
+    """Whether a re-check changed how its target's snapshots rank (a re-evaluation, a
+    speed cap)."""
+    return bool(result.get("reevaluated")) or result.get("status") == recheck.SPEED_DISAGREES
 
 
 def _verdict(rec: dict[str, Any] | None) -> dict[str, Any] | None:
