@@ -62,10 +62,20 @@ same time.
 * **Module level** (`evaluate_candidate`): every captured case must match the
   reference outputs **and** the in-place side effects (for example KV-cache
   appends) within dtype-aware tolerances (bf16 2e-2, fp16 1e-2, fp32 1e-4;
-  at most 0.1 % of elements outside). Side effects are compared on the
-  elements the reference or the candidate changed, so writing one position of
-  an 8192-long cache (or forgetting to) is not lost in the 0.1 %. If `build()`
-  hands back the reference module unchanged, the candidate is rejected.
+  at most 0.1 % of elements outside, none of them by more than 10× its
+  tolerance). NaN, +inf and −inf must sit at the same positions as in the
+  reference. Tensors with more than 1024 elements must also match as a whole
+  (relative L2 error ≤ 0.02 and cosine ≥ 0.999 for bf16; fp16 0.01 / 0.9995,
+  fp32 0.005 / 0.99999) when the reference is above the absolute tolerance: on
+  VoxCPM2 attention outputs (std 0.025, so every element is inside atol) a
+  softmax scale off by 5 % fails with 0.027, while fp32-accumulating and
+  MATH-SDPA variants stay below 0.004. Outputs must be plain `torch.Tensor`s
+  (a subclass could compute lazily, after the timer stopped), and an output
+  shares memory with an input exactly when the reference's does (a live
+  reference call is checked). Side effects are compared on the elements the
+  reference or the candidate changed, so writing one position of an 8192-long
+  cache (or forgetting to) is not lost in the 0.1 %. If `build()` hands back
+  the reference module unchanged, the candidate is rejected.
 * **More than one KV length and one setting**: decode steps share their
   primary input while the KV cache grows, so `capture` runs the workload once
   to count them and keeps the **first, middle and last** decode step of every
@@ -78,6 +88,20 @@ same time.
   **correctness-only** cases (`count` 0, `[correctness only: ...]` in the
   signature): checked like the others, never timed. A kernel that only
   handles the captured length fails them.
+* **Beyond the captured values**: during timing, inputs rotate between three
+  copies, and one random timed call runs on redrawn input values; its output
+  and side effects must match a fresh reference call
+  (`incorrect_timed_output`). After timing, every case is re-run at fresh
+  addresses (against the capture), then with its floating-point inputs redrawn
+  in place (same addresses, a normal draw from each tensor's own mean and std,
+  KV-cache contents included) and from a random mix of uniform, Laplace and
+  log-normal draws, each compared with the reference called live on the same
+  inputs (`incorrect_perturbed`). Integer and boolean tensors (ids, positions,
+  masks) and additive masks are kept. So a candidate must recompute every call
+  for any input of the captured shapes: outputs cached by address, shape or
+  call count, skipped work and reads of unused cache slots are rejected.
+  Correctness-only cases are re-verified too. The result names the failed
+  `stage` and `failed_check`. These checks add about 0.2 s to an evaluation.
 * **Model level** (`e2e`): the workload's own comparison. For LLM/STT that is
   identical greedy tokens for the first N tokens plus first-step logits cosine
   ≥ 0.99. For TTS it is spectral cosine. For diffusion it is PSNR ≥ 25 dB on
@@ -125,7 +149,8 @@ same time.
 
 Reference and candidate are timed in alternating rounds with CUDA events
 after a GPU warm-up, and the median round is reported. Mutable inputs (caches)
-are deep-copied outside the timed region. A module's speedup is weighted by how
+are deep-copied outside the timed region; other inputs rotate between three
+copies made before timing. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
 wall-clock latency of the whole workload.
 
@@ -954,6 +979,7 @@ value for that column.
   by more than the noise: speedup > best × (1 + max(1 %, 2 × timing spread)).
   Kernels start from the reference module (1.0×), `e2e` rows from the baseline.
   A correct result that is not better is `discard`. Failures are `incorrect`,
+  `incorrect_timed_output`, `incorrect_perturbed` (see "What correct means"),
   `build_error`, `runtime_error`, `crash` or `timeout`. The keep rule is the
   same one the budget advice uses. `quick_ok` / `quick_fail` (quick checks) and
   `duplicate` rows are not benchmark evaluations: no chart, count, budget or

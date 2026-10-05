@@ -83,3 +83,46 @@ def test_compare_audio_and_psnr():
     img = torch.rand(1, 3, 8, 8)
     assert psnr(img, img) == float("inf")
     assert psnr(img, img + 0.01, data_range=1.0) > 35
+
+
+def test_compare_tensors_non_finite_positions_must_match():
+    ref = torch.tensor([1.0, float("-inf"), 2.0, 3.0])
+    assert compare_tensors("x", ref, ref.clone())["ok"]
+    nan = compare_tensors("x", ref, torch.full((4,), float("nan")))
+    assert not nan["ok"] and "NaN at 4 positions" in nan["error"]
+    finite = compare_tensors("x", ref, torch.tensor([1.0, -1e30, 2.0, 3.0]))
+    assert not finite["ok"] and "-inf" in finite["error"]
+    flipped = compare_tensors("x", torch.tensor([float("inf")]), torch.tensor([float("-inf")]))
+    assert not flipped["ok"]
+
+
+def test_compare_tensors_caps_outliers_and_checks_the_whole_tensor():
+    torch.manual_seed(0)
+    a = torch.randn(4096, dtype=torch.bfloat16)
+    one_off = a.clone()
+    one_off[7] = 1e4  # 1 of 4096 elements (< 0.1 %), but 1e5 tolerances away
+    res = compare_tensors("x", a, one_off)
+    assert not res["ok"] and res["mismatch_frac"] < 1e-3 and "tolerance away" in res["error"]
+    near = a.clone()
+    near[7] = a[7] + 5 * (2e-2 + 2e-2 * a[7].abs())  # 5x its tolerance: a rounding flip
+    assert compare_tensors("x", a, near)["ok"]
+    # small outputs: every element is within atol, the tensor as a whole is 10 % off
+    small = (a.float() * 0.1).to(torch.bfloat16)
+    biased = small + 0.01
+    res = compare_tensors("x", small, biased)
+    assert res["mismatch_frac"] == 0 and not res["ok"] and "relative L2" in res["error"]
+    # small tensors and outputs below the absolute tolerance skip the whole-tensor check
+    assert compare_tensors("x", small[:1000], biased[:1000])["ok"]
+    tiny = torch.full((4096,), 1e-3, dtype=torch.bfloat16)
+    assert compare_tensors("x", tiny, tiny * 1.5)["ok"]
+
+
+def test_compare_tensors_rejects_subclasses_and_other_devices():
+    class Sub(torch.Tensor):
+        pass
+
+    a = torch.randn(8)
+    res = compare_tensors("x", a, a.clone().as_subclass(Sub))
+    assert not res["ok"] and "subclass" in res["error"]
+    assert compare_tensors("w", a, torch.nn.Parameter(a.clone()))["ok"]
+    assert "meta" in compare_tensors("x", a, torch.empty(8, device="meta"))["error"]

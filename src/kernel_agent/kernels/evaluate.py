@@ -14,6 +14,19 @@ Each captured case is replayed through the entrypoint it was recorded from:
 custom decode loop), for correctness and timing alike.  A candidate that lacks
 a captured method is a ``build_error``.
 
+Stages and their failure statuses:
+
+1. ``build_error``: import and ``build()``.
+2. ``incorrect``: every captured case against the captured outputs and in-place
+   side effects (:mod:`kernels.compare`), plus aliasing parity with a live
+   reference call (:func:`kernels.verify.alias_errors`).
+3. ``incorrect_timed_output``: timing (CUDA only, :func:`kernels.bench.compare_timing`)
+   rotates between input copies and checks the output of one random timed call.
+4. ``incorrect_perturbed``: re-verification after timing (on CPU right after
+   stage 2) at fresh addresses and with redrawn inputs (:mod:`kernels.verify`).
+
+A failed stage is named in ``stage``, with details in ``failed_check``.
+
 Run as a subprocess (so compiler crashes and illegal memory accesses cannot
 take down the orchestrator)::
 
@@ -28,6 +41,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import time
@@ -110,6 +124,67 @@ def quick_cases(cases: list[dict[str, Any]]) -> list[int]:
     return sorted({order[0], order[-1]}) if order else []
 
 
+def _first_error(failures: list[dict[str, Any]]) -> str:
+    first = failures[0] if failures else {}
+    detail = first.get("error") or (
+        f"mismatch {first.get('mismatch_frac')}, max abs err {first.get('max_abs_err')}"
+    )
+    return f"{first.get('name', '?')}: {detail}"
+
+
+def _reverify(
+    result: dict[str, Any],
+    reference: Any,
+    candidate: Any,
+    cases: list[dict[str, Any]],
+    pristine: list[tuple[Any, Any]],
+    seed: int,
+    device: str,
+) -> bool:
+    """Stage 4 (:func:`kernels.verify.reverify_case` on every case); False and
+    ``incorrect_perturbed`` in ``result`` if a check fails."""
+    import torch
+
+    from kernel_agent.kernels.verify import reverify_case
+    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.workloads.base import synchronize
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    for i, (case, inputs) in enumerate(zip(cases, pristine, strict=True)):
+        method = case["method"]
+        try:
+            failed = reverify_case(
+                entrypoint(reference, method),
+                entrypoint(candidate, method),
+                case,
+                inputs,
+                gen,
+                synchronize,
+            )
+        except Exception:
+            result.update(status="runtime_error", correct=False, error=_short_tb(), failed_case=i)
+            return False
+        if failed:
+            check = failed[0]
+            result.update(
+                status="incorrect_perturbed",
+                correct=False,
+                stage="perturbed",
+                failed_check={"case": i, **check},
+                error=f"case {i} ({case['signature']}) passed as captured but failed with "
+                f"{check['what']} ({_first_error(check['failures'])}): the candidate must be "
+                "correct for any input of these shapes and dtypes, recomputed on every "
+                "call (no output caching by address, shape or values; no reading of "
+                "unused cache slots)",
+            )
+            return False
+    result["checks"] = ["captured", "aliasing", "timed_output", "perturbed"]
+    if "quick" in result or not device.startswith("cuda"):  # untimed
+        result["checks"].remove("timed_output")
+    return True
+
+
 def evaluate(
     capture_path: Path,
     candidate_path: Path,
@@ -137,6 +212,7 @@ def evaluate(
 
     from kernel_agent.kernels.bench import compare_timing, time_call
     from kernel_agent.kernels.compare import compare_side_effects, compare_structures
+    from kernel_agent.kernels.verify import alias_errors
     from kernel_agent.profiling.capture import load_capture
     from kernel_agent.profiling.methods import entrypoint
     from kernel_agent.workloads.base import synchronize
@@ -202,11 +278,12 @@ def evaluate(
         result["quick"] = {"cases": quick_cases(cases), "of": len(cases)}
         cases = [cases[i] for i in result["quick"]["cases"]]
 
-    # 2. correctness on every captured case (outputs + in-place side effects)
+    # 2. correctness on every captured case (outputs + in-place side effects + aliasing)
     case_reports: list[dict[str, Any]] = []
     all_ok = True
     for i, case in enumerate(cases):
         args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
+        ref_args, ref_kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
         try:
             with torch.inference_mode():
                 out = entrypoint(candidate, case["method"])(*args, **kwargs)
@@ -221,6 +298,11 @@ def evaluate(
         checks = compare_structures(case["output"], out, "output")
         checks += compare_side_effects(case["args"], case["post_args"], args, "args")
         checks += compare_side_effects(case["kwargs"], case["post_kwargs"], kwargs, "kwargs")
+        with torch.inference_mode():  # after the candidate: the aliasing of a live call
+            ref_out = entrypoint(reference, case["method"])(*ref_args, **ref_kwargs)
+        synchronize()
+        checks += alias_errors(ref_out, (ref_args, ref_kwargs), out, (args, kwargs))
+        del ref_out, ref_args, ref_kwargs
         bad = [c for c in checks if not c.get("ok")]
         ok = not bad
         all_ok &= ok
@@ -242,16 +324,26 @@ def evaluate(
         )
     result["cases"] = case_reports
     if not all_ok:
-        result.update(status="incorrect")
+        failed = next(i for i, r in enumerate(case_reports) if not r["ok"])
+        result.update(  # the failures are in result["cases"]
+            status="incorrect",
+            stage="correctness",
+            failed_check={"case": failed, "check": "captured"},
+        )
         return result
-    result["correct"] = True
     if compile_check:  # optional stage on a fresh build: graph breaks + compiled outputs
         from kernel_agent.kernels.compile_check import check
 
         result["compile_check"] = check(lambda: module.build(copy.deepcopy(reference)), cases)
-    if quick or not device.startswith("cuda"):
+    # Inputs as captured, for re-verification (timing writes into them, e.g. KV caches).
+    pristine = [(copy.deepcopy(c["args"]), copy.deepcopy(c["kwargs"])) for c in cases]
+    seed = int.from_bytes(os.urandom(4), "little")
+    result["perturb_seed"] = seed
+    if quick or not device.startswith("cuda"):  # re-verified, never timed
+        if not _reverify(result, reference, candidate, cases, pristine, seed, device):
+            return result
         timing = "skipped: quick check" if quick else "skipped: no CUDA device"
-        result.update(status="ok", timing=timing)
+        result.update(status="ok", correct=True, timing=timing)
         result["eval_seconds"] = round(time.perf_counter() - t0, 1)
         return result
 
@@ -261,7 +353,7 @@ def evaluate(
     saved = 0.0
     ref_total = 0.0
     new_total = 0.0
-    for report, case in zip(case_reports, cases, strict=True):
+    for i, (report, case) in enumerate(zip(case_reports, cases, strict=True)):
         method = case["method"]
         if not case["count"]:  # correctness-only case (another workload setting): not timed
             continue
@@ -274,7 +366,20 @@ def evaluate(
                 l2_flush=l2_flush,
             )
         except Exception:
-            result.update(status="runtime_error", error=_short_tb())
+            result.update(status="runtime_error", error=_short_tb(), failed_case=i)
+            return result
+        timed = new_t.get("timed_output") or {}
+        if timed.get("failures"):
+            result.update(
+                status="incorrect_timed_output",
+                stage="timed_output",
+                failed_check={"case": i, "check": "timed_output", **timed},
+                error=f"case {i} ({case['signature']}): the output of timed call "
+                f"#{timed['iteration']} differs from the reference on the same inputs "
+                f"({_first_error(timed['failures'])}); correctness was checked on the first "
+                "call only, so the candidate must compute every call (no caching by "
+                "address, shape or call count, no skipped work)",
+            )
             return result
         report["ref_ms"] = round(ref_t["median_ms"], 5)
         report["new_ms"] = round(new_t["median_ms"], 5)
@@ -299,8 +404,12 @@ def evaluate(
         users = capture.get("method_instances", {}).get(method, capture.get("instances", 1))
         saved += n * (ref_t["median_ms"] - new_t["median_ms"]) * users
 
+    # 4. re-verification after timing: fresh addresses and redrawn inputs
+    if not _reverify(result, reference, candidate, cases, pristine, seed, device):
+        return result
     result.update(
         status="ok",
+        correct=True,
         speedup=round(ref_total / max(new_total, 1e-9), 3),
         est_saved_ms_per_run=round(saved, 3),
         ref_ms_weighted=round(ref_total, 4),

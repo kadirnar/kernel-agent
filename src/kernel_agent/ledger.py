@@ -10,7 +10,9 @@ experiment:
               kernel targets start from the reference module (1.0×), ``e2e`` rows
               from the baseline run
 * ``discard`` correct, but not better
-* ``incorrect``, ``build_error``, ``runtime_error``, ``crash``, ``timeout``: failures
+* ``incorrect``, ``incorrect_timed_output``, ``incorrect_perturbed``, ``build_error``,
+  ``runtime_error``, ``crash``, ``timeout``: failures (the ``incorrect_*`` ones fail
+  the evaluator's later correctness stages, see :mod:`kernel_agent.kernels.evaluate`)
 
 Rows that are not benchmark evaluations (:data:`UNMEASURED`, see :func:`measured`): they
 count against no budget or streak and the charts do not plot them:
@@ -65,7 +67,15 @@ COLUMNS = (
 )
 KEEP = "keep"
 DISCARD = "discard"
-FAILURES = ("incorrect", "build_error", "runtime_error", "crash", "timeout")
+FAILURES = (
+    "incorrect",
+    "incorrect_timed_output",
+    "incorrect_perturbed",
+    "build_error",
+    "runtime_error",
+    "crash",
+    "timeout",
+)
 STATUSES = (KEEP, DISCARD, *FAILURES)
 QUICK_OK = "quick_ok"
 QUICK_FAIL = "quick_fail"
