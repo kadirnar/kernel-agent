@@ -38,7 +38,9 @@ unless noted:
 * one profiled pass over the dominant case: no GPU work launched from other
   threads or left running on other streams; ``fallback`` when the reference's
   entrypoint code runs there with less than half of the GPU time in kernels the
-  reference does not launch, or when none of it is (``custom_kernel_share`` 0);
+  reference does not launch, or when none of it is (``custom_kernel_share`` 0) and
+  it launches every kernel of the reference at least as often (re-running its ops;
+  fewer launches is a restructuring, e.g. merged projections);
 * :func:`run_evaluation` (outside the candidate's process) compares the
   candidate's saved outputs with the capture and the reference timing with one
   measured in a candidate-free process (10 % margin); results arrive on a line
@@ -255,28 +257,34 @@ def _intact(result: dict[str, Any], guard: Any, candidate_path: Path, where: str
 
 
 def _fallback(
-    result: dict[str, Any], i: int, case: dict[str, Any], ran: dict[str, int], share: Any
+    result: dict[str, Any],
+    i: int,
+    case: dict[str, Any],
+    ran: dict[str, int],
+    activity: dict[str, Any] | None = None,
 ) -> bool:
-    """Decide ``fallback`` for the main case ``i`` from the reference entrypoints that ran
-    during the candidate's calls (``ran``) and its ``custom_kernel_share``."""
-    from kernel_agent.kernels.integrity import MIN_CUSTOM_SHARE
+    """Decide ``fallback`` for the main case ``i`` (:func:`kernels.integrity.fallback_reason`)
+    from the reference entrypoints that ran during the candidate's calls (``ran``) and,
+    on CUDA, the profiled ``activity`` (custom kernel share, kernel launches)."""
+    from kernel_agent.kernels.integrity import fallback_reason
 
-    if share != 0 and not (ran and (share is None or share < MIN_CUSTOM_SHARE)):
+    activity = activity or {}
+    share = activity.get("custom_kernel_share")
+    why = fallback_reason(
+        ran, share, activity.get("reference_kernels"), activity.get("candidate_kernels")
+    )
+    if why is None:
         return False
-    why = []
-    if ran:
-        why.append("runs the reference's " + ", ".join(f"`{k}`" for k in sorted(ran)))
-    if share is not None:
-        why.append(f"spends {share:.0%} of its GPU time in kernels the reference does not launch")
     result.update(
         status="fallback",
         correct=False,
         stage="fallback",
         failed_check={"case": i, "check": "fallback", "reference_calls": ran, "share": share},
         error=f"case {i} ({case['signature']}, the dominant case: {case['count']} calls per "
-        f"run) {' and '.join(why)}: the dominant case must run your own kernels. Do not call "
-        "or inherit the reference's entrypoint for it and do not re-launch the reference's "
-        "ops; fall back only for shapes you do not support.",
+        f"run) {why}: the dominant case must run your own kernels or a genuine "
+        "restructuring of the reference's (fewer launches). Do not call or inherit the "
+        "reference's entrypoint for it and do not re-launch the reference's ops; fall back "
+        "only for shapes you do not support.",
     )
     return True
 
@@ -494,7 +502,7 @@ def _evaluate(
         with integrity.count_calls(codes) as counts, torch.inference_mode():
             entrypoint(candidate, cases[main]["method"])(*args, **kwargs)
         ran = {codes[c]: n for c, n in counts.items() if n}
-        if _fallback(result, main, cases[main], ran, None):
+        if _fallback(result, main, cases[main], ran):
             return result
         if not _reverify(result, reference, candidate, cases, pristine, seed, device):
             return result
@@ -599,6 +607,9 @@ def _evaluate(
         return result
     share = activity.get("custom_kernel_share")
     result["custom_kernel_share"] = share
+    if "reference_kernels" in activity:  # per call of the dominant case
+        result["kernel_launches_reference"] = sum(activity["reference_kernels"].values())
+        result["kernel_launches_candidate"] = round(sum(activity["candidate_kernels"].values()), 2)
     if activity.get("note"):
         result["activity_note"] = activity["note"]
     for key, what in (
@@ -617,7 +628,7 @@ def _evaluate(
                 details=activity[key],
             )
             return result
-    if _fallback(result, main, cases[main], activity["reference_calls"], share):
+    if _fallback(result, main, cases[main], activity["reference_calls"], activity):
         return result
 
     # 4. re-verification after timing: fresh addresses and redrawn inputs

@@ -254,13 +254,25 @@ timer, the comparator or the reference, or hide work from the timer
   line carries a nonce that the subprocess reads from stdin before the candidate
   is imported.
 
-A candidate falls back to the reference with status `fallback` when, on the
-dominant case, the reference's entrypoint code runs (`type(ref).forward(...)`,
-an inherited or `super().forward`) and less than half of its GPU time is in
-kernels of its own, or when none of it is (`custom_kernel_share` 0, which
-includes re-launching the reference's torch ops). Other cases may still fall
-back. On CPU, where nothing is profiled, the call into the reference's code
-alone decides. A quick check (`mode="quick"`) runs the in-process guards,
+A candidate falls back to the reference, with status `fallback`, in two cases
+on the dominant case:
+
+* the reference's entrypoint code runs (`type(ref).forward(...)`, an inherited
+  `forward` or `super().forward`) and less than half of its GPU time is in
+  kernels of its own;
+* none of its GPU time is in kernels of its own (`custom_kernel_share` 0) and
+  it launches every kernel of the reference at least as often: the same
+  multiset of kernel names or a superset, so it re-runs the reference's torch
+  ops.
+
+Pure-torch restructurings that launch fewer kernels pass. Examples are q/k/v
+or gate/up weights concatenated once in `build()` (one GEMM instead of three,
+or two) and dropped casts or copies, even when cuBLAS picks the very same
+kernel. On the fixtures, merged QKV goes from 3 launches to 1 and merged
+gate/up from 5 to 4, both with share 0. The result reports
+`kernel_launches_reference` and `kernel_launches_candidate` (per call of the
+dominant case). Other cases may still fall back. On CPU, where nothing is
+profiled, the call into the reference's code alone decides. A quick check (`mode="quick"`) runs the in-process guards,
 the fallback check through the code alone and the parent's output comparison
 on its two cases. It has no timing, so no timing guard applies.
 

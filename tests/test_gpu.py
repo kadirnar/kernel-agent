@@ -86,14 +86,12 @@ def test_in_place_side_effects_are_checked(tmp_path):
     assert result["status"] == "incorrect"
     assert any("kwargs" in f["name"] for f in result["cases"][0]["failures"])
     good = tmp_path / "good.py"
-    # x * 2 through a kernel the reference does not launch (lerp): a candidate that
-    # only re-runs the reference's ops is a `fallback`
     good.write_text(
         "import torch\n"
         "class M(torch.nn.Module):\n"
         "    def forward(self, x, cache):\n"
         "        cache.state += x\n"
-        "        return torch.lerp(x, x * 3, 0.5)\n"
+        "        return x + x\n"
         "def build(r):\n    return M()\n"
     )
     assert evaluate(capture, good)["correct"]

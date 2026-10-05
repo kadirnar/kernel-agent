@@ -23,8 +23,9 @@ reference.  The guards (all run by :mod:`kernels.evaluate`):
   work launched from another thread, or still running on another stream when
   the timed stream continues (not joined back), is a violation; it also
   measures ``custom_kernel_share`` (GPU time in kernels the reference does not
-  launch) and counts calls into the reference's entrypoint code
-  (:func:`count_calls`, ``sys.monitoring``), which decide ``fallback``.
+  launch), the kernel launches per call of both, and counts calls into the
+  reference's entrypoint code (:func:`count_calls`, ``sys.monitoring``), which
+  decide ``fallback`` (:func:`fallback_reason`).
 * Outside the candidate's process (:func:`compare_saved_outputs`,
   :func:`reference_slowdown`): ``run_evaluation`` compares the candidate's saved
   outputs with the capture itself and compares the reference timing with one
@@ -439,7 +440,9 @@ def activity_check(
     * ``custom_kernel_share``: share of the candidate's kernel time in kernels whose
       names the reference's call does not launch (None without kernels);
     * ``reference_calls``: starts of the reference's entrypoint code during the
-      candidate's calls (``{label: count}``).
+      candidate's calls (``{label: count}``);
+    * ``reference_kernels`` / ``candidate_kernels``: kernel launches per call by name
+      (:func:`fallback_reason`).
     """
     from torch.autograd.profiler import record_function
     from torch.profiler import ProfilerActivity, profile
@@ -481,7 +484,10 @@ def activity_check(
         out["note"] = "the profiler recorded no GPU activity; activity checks skipped"
         return out
     main_thread = marks[0][0].resource
-    ref_names = {w.name for e in within("ka::reference") for w in gpu[e.corr]}
+    ref_kernels: collections.Counter[str] = collections.Counter(
+        w.name for e in within("ka::reference") for w in gpu[e.corr] if w.kind == "kernel"
+    )
+    new_kernels: collections.Counter[str] = collections.Counter()
     own = total = 0
     for i in range(len(inputs)):
         mark = min((w.start for w in gpu[marks[i][0].corr]), default=None)
@@ -495,8 +501,9 @@ def activity_check(
                         f"{(work.end - mark) / 1e3:.0f} us past the end of call {i}"
                     )
                 if work.kind == "kernel":
+                    new_kernels[work.name] += 1
                     total += work.end - work.start
-                    own += (work.end - work.start) * (work.name not in ref_names)
+                    own += (work.end - work.start) * (work.name not in ref_kernels)
     first = ranges.get("ka::call0")
     for launch in launches:
         if launch.resource == main_thread or first is None or launch.start < first.start:
@@ -504,9 +511,45 @@ def activity_check(
         label = gpu[launch.corr][0].name[:80]
         out["foreign_threads"].append(f"{label} launched from thread {launch.resource}")
     out["custom_kernel_share"] = round(own / total, 3) if total else None
+    # kernel launches per call, by name (the candidate's averaged over its calls)
+    out["reference_kernels"] = dict(ref_kernels)
+    out["candidate_kernels"] = {k: n / len(inputs) for k, n in new_kernels.items()}
     for key in ("unjoined", "foreign_threads"):
         out[key] = sorted(set(out[key]))[:5]
     return out
+
+
+def fallback_reason(
+    ran: dict[str, int],
+    share: float | None,
+    ref_kernels: dict[str, float] | None = None,
+    new_kernels: dict[str, float] | None = None,
+) -> str | None:
+    """Why the candidate's call of the dominant case falls back to the reference (None:
+    it does not).
+
+    * The reference's entrypoint code ran (``ran``) and less than
+      :data:`MIN_CUSTOM_SHARE` of the GPU time is in kernels of its own (``share``;
+      None: not profiled, the code alone decides).
+    * Or none of it is (``share`` 0) and the candidate launches every kernel of the
+      reference at least as often (the same multiset of kernel names or a superset):
+      it re-runs the reference's ops.  Fewer launches of some kernel is a genuine
+      restructuring (merged QKV or gate/up projections: one GEMM instead of three or
+      two; dropped casts and copies) and is allowed.
+    """
+    if ran and (share is None or share < MIN_CUSTOM_SHARE):
+        why = "runs the reference's " + ", ".join(f"`{k}`" for k in sorted(ran))
+        if share is not None:
+            why += f" and spends {share:.0%} of its GPU time in kernels of its own"
+        return why
+    ref, new = ref_kernels or {}, new_kernels or {}
+    if share == 0 and ref and all(new.get(k, 0) >= n for k, n in ref.items()):
+        return (
+            f"launches only kernels the reference launches, each at least as often "
+            f"({sum(new.values()):g} launches per call vs {sum(ref.values()):g}): it re-runs "
+            "the reference's ops"
+        )
+    return None
 
 
 # ------------------------------------------------------------------ outside the candidate
