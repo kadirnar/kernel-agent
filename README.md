@@ -350,8 +350,9 @@ All limits are off by default (`kernel_agent/budget.py`).
 You can steer the agents by editing a Markdown file instead of the code, as
 in karpathy/autoresearch (`kernel_agent/program.py`). Each `## <section>` is
 appended to the system prompt of the matching agents. `## all` goes to every
-agent. `## planner`, `## kernel` (each `kernel-<target>` agent), `## systems`
-and `## harness` go to that role only. A heading can name several roles
+agent. `## planner`, `## kernel` (each `kernel-<target>` agent), `## systems`,
+`## harness` and `## research` (each `research-<target>` session, see "Research
+on plateaus") go to that role only. A heading can name several roles
 (`## kernel, systems`). Unknown sections are ignored with a warning. Text
 above the first `##` heading and `<!-- comments -->` are not sent to agents.
 
@@ -479,18 +480,43 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
 * **Slices.** Each slice is a fresh agent session with `--slice` evaluations
   (the evaluation advice says `stop` after them), so no context grows. It is
   seeded with a digest in the system prompt: the arm's last 15 ledger rows with
-  hypotheses and status, the best snapshot with its speedup (and % of SOL), the
-  `## Open ideas` section and the tail of `NOTES.md`, and how far the target is
-  from its stop rules. The agent is asked to keep `NOTES.md` and its open ideas
-  current for the next session. Slices run through the same code as `optimize`
-  agents (budgets, timeouts, `program.md`, events). Their cost is in
-  `costs.json` as `kernel-<target>#<slice>` and `systems#<slice>`.
+  ideas, hypotheses and status, the per-idea table (see "Experiment ledger"),
+  the best snapshot with its speedup (and % of SOL), the research `plan.md` if
+  there is one, the `## Open ideas` section and the tail of `NOTES.md`, and how
+  far the target is from its stop rules. The agent is asked to keep `NOTES.md`
+  and its open ideas current for the next session. Slices run through the same
+  code as `optimize` agents (budgets, timeouts, `program.md`, events). Their
+  cost is in `costs.json` as `kernel-<target>#<slice>` and `systems#<slice>`.
 * **Stop rules per arm** (AutoKernel's move-on rules): `--patience 5`
   evaluations in a row without a new best, across slices; `--sol-stop 0.9` of
   the speed of light; `--target-hours 2` spent in its slices; the module
   `--speedup-goal 2` reached. `0` turns a rule off. An arm whose last two slices
   made no evaluation stops too. The loop ends when the budget is spent or every
   arm has stopped, or after 3 agent sessions in a row failed.
+* **Research on plateaus** (`kernel_agent/research.py`, auto-gpu-kernel's
+  research subagent). When a kernel target has plateaued, i.e. 4 evaluations in
+  a row without a new best (the advice turns `consider_stopping`), `--patience`
+  reached, or 3 failed evaluations in a row, and no other stop rule applies, the
+  loop runs a `research-<target>` session before the target's next slice, or
+  before the patience rule stops it. The session starts from a clean context
+  with read-only tools (`Read`, `Glob`, `Grep`, `best_result`, web if allowed).
+  It may write one file, `targets/<id>/plan.md`, which a `PreToolUse` hook
+  enforces. It gets the target's ledger rows with ideas and statuses, the
+  per-idea table, the best result with `pct_of_sol` and `bound` per case, and
+  pointers to `NOTES.md`, `workload_profile.md`, the snapshots and the previous
+  plan. It writes a diagnosis along a 9-item pathology checklist (repetition
+  loop, local minimum, correctness wall, wrong bottleneck, missing fundamental,
+  over-engineering, ignored prior research, host overhead, overlooked
+  shortcuts), directions ranked by their ceiling, ideas to retry (failed, not
+  refuted) and a do-not-try list. The next slice of the target is a fresh
+  session with the plan in its digest. A written plan restarts the target's
+  count of evaluations without a new best. A target gets at most one session
+  per `--research-every 3` of its slices (`0`: never), and none again when its
+  last plan brought no new best: the target then stops at its next plateau.
+  The sessions go through the same code as the slices (budgets, `program.md`
+  `## research`, events `research_start` / `research_done`, `costs.json` as
+  `research-<target>#<slice>`). They are recorded in `improve.json` →
+  `research`, shown as diamonds in `improve.png` and listed in `report.md`.
 * **Re-integration.** After every `--integrate-every 4` kept results, the
   integration of `optimize` measures the combination end to end. Combinations of
   the same snapshot files that were measured before are reused instead of
@@ -504,22 +530,28 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   context, and the loop continues with them. A target whose module was replaced
   in the re-profile keeps the share it had in the first profile.
 * **Files.** `improve.json` holds the slices (arm, scores, evaluations,
-  outcome), the re-integrations, the rounds and why the loop stopped.
-  `improve.png` is drawn from it, and `report.md` gets an "Improve loop"
-  section.
+  outcome), the research sessions, the re-integrations, the rounds and why the
+  loop stopped. `improve.png` is drawn from it, and `report.md` gets an
+  "Improve loop" section.
 * **Dry run.** `--dry-run` replaces Claude and the GPU with a simulated
   Qwen3-0.6B decode workload (`kernel_agent/dryrun.py`). Targets approach a
   hidden ceiling with noise, failures and plateaus. Some report a speed-of-light
-  estimate and some do not. The CUDA graph the systems agent finds is
-  incompatible with the MLP kernel, and round 2 finds a new target. Time is
-  simulated too, so `--max-hours` counts simulated hours. The images below come
-  from `kernel-agent improve Qwen/Qwen3-0.6B --dry-run --rounds 2`.
+  estimate and some do not. The simulated engineer tags every candidate with an
+  `idea_id`, retries an idea once after a failed attempt and starts from the
+  directions of a research plan. The simulated research agent writes `plan.md`
+  from the ledger, so plateaus exercise the research trigger and its cap (the
+  simulated outcomes do not depend on the plan). The CUDA graph the systems
+  agent finds is incompatible with the MLP kernel, and round 2 finds a new
+  target. Time is simulated too, so `--max-hours` counts simulated hours. The
+  images below come from `kernel-agent improve Qwen/Qwen3-0.6B --dry-run
+  --rounds 2`.
 
 ![improve progress](docs/images/example-improve-progress.png)
 
 `improve.png` has one lane per arm and a bar per slice: green when the slice
 found a new best, grey when it did not. Dashed lines are the re-integrations,
-labelled with the measured end-to-end speedup.
+labelled with the measured end-to-end speedup. Diamonds are research sessions
+that wrote a plan.
 
 ![improve slices](docs/images/example-improve-slices.png)
 
@@ -721,6 +753,7 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/workload_profile.md  statistics of every call of the target (+ .json)
   targets/<id>/reference_source.py
   targets/<id>/candidates/    files the agent writes
+  targets/<id>/plan.md        improve: the research plan of a plateaued target
   targets/<id>/history/ results.jsonl   the agent's copies (never read back)
   targets/<id>/progress.png   speedup per evaluation (see "Charts")
   transforms/                 model-level transforms (+ the agent's copies)
@@ -728,7 +761,7 @@ runs/<org>--<name>/<timestamp>/
   events.jsonl                phase changes, agent start/stop, evaluations
   progress.png  amdahl.png  integration.png  dashboard.html
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md)
-  improve.json  improve.png   improve loop: slices, re-integrations, rounds
+  improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256
   optimized/                  apply.py + manifest.json + kernels/
@@ -752,16 +785,33 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  idea  hypothesis
 ```
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
-"Speed of light"). A ledger written before that column existed keeps its own
-layout.
+"Speed of light"). `idea` is the `idea_id` of a kernel candidate. A ledger
+written before a column existed keeps its own layout, and its rows have no
+value for that column.
 
 * `evaluate_candidate` requires a `hypothesis` (one sentence: what changed and
   why it should be faster) and accepts an optional `parent` snapshot.
   `evaluate_e2e` takes an optional `hypothesis`.
+* **Idea ledger** (Stanford's NL-level branching, K-Search's split of strategy
+  from implementation). `evaluate_candidate` also accepts `idea_id`, a short
+  slug that names the idea a candidate implements (the same id for every
+  attempt and fix of it), and `expected_speedup`. Both go into the record and
+  `idea` into the ledger. The result's `idea` shows expected next to measured,
+  the idea's tries so far and its verdict. A failed attempt gets a note that it
+  is a bug to fix, not evidence against the idea. `best_result` aggregates per
+  idea: tries, best speedup, `kept`, `slow` (correct, not a new best), `bugs`
+  (failed) with their statuses, the expected speedup, the last hypothesis and a
+  verdict (`kept`, `slow`, or `buggy`: never correct, so untested rather than
+  refuted). The engineer prompt and `program.md` ask for 3-5 distinct ideas
+  with expected gain and ceiling before any code, a retry of a buggy idea before
+  it is dropped, and "abandoned after N attempts: <why>" instead of "X doesn't
+  work". The CUDA and CuTe DSL guides describe plan amnesia and false
+  infeasibility. `status`, `dashboard.html` and `kernel-agent watch` show the
+  idea next to the hypothesis.
 * `status` is `keep` when the result is correct and beats the best kept result
   by more than the noise: speedup > best × (1 + max(1 %, 2 × timing spread)).
   Kernels start from the reference module (1.0×), `e2e` rows from the baseline.

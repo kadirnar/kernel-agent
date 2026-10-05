@@ -163,12 +163,15 @@ def record_candidate(
     when: float | None = None,
     snapshot_sha256: str | None = None,
     keeper: Truth | None = None,
+    idea: str = "",
+    expected_speedup: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
 
     The record carries the sha256 of the snapshot it measured (``snapshot_sha256``,
     computed from ``snap`` when not given); winners are picked only from records
     whose snapshot still has it. ``keeper``: this process's :class:`Truth` of the run.
+    ``idea`` / ``expected_speedup``: the agent's ``idea_id`` and the speedup it expected.
     """
     target_dir = run.target(target_id)
     row = ledger.record_kernel(
@@ -181,6 +184,7 @@ def record_candidate(
         source=snap.read_text(),
         eval_s=eval_s,
         when=when,
+        idea=idea,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -195,11 +199,57 @@ def record_candidate(
         "backend": row["backend"],
         "hypothesis": hypothesis,
         "parent": parent,
+        "idea": idea or None,
+        "expected_speedup": expected_speedup,
     }
     if isinstance(record.get("error"), str):
         record["error"] = record["error"][-1500:]
     _append(run, target_id, record, keeper)
     return record, row
+
+
+def _expected(value: Any) -> float | None:
+    """``expected_speedup`` as a positive float (None when missing or not a number)."""
+    try:
+        number = float(str(value).strip().rstrip("xX"))  # "1.5x" too
+    except ValueError:
+        return None
+    return number if 0 < number < 1e6 else None
+
+
+def idea_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``results.jsonl`` records as rows for :func:`kernel_agent.ledger.ideas`."""
+    return [
+        {
+            "idea": r.get("idea"),
+            "status": r.get("ledger_status") or r.get("status"),
+            "correct": bool(r.get("correct")),
+            "speedup": r.get("speedup"),
+            "expected_speedup": r.get("expected_speedup"),
+            "hypothesis": r.get("hypothesis"),
+            "exp": r.get("exp"),
+        }
+        for r in records
+    ]
+
+
+def idea_feedback(
+    records: list[dict[str, Any]], idea: str, expected: float | None, row: dict[str, Any]
+) -> dict[str, Any]:
+    """``idea`` part of an ``evaluate_candidate`` result: expected vs measured, the idea so far."""
+    out: dict[str, Any] = {"id": idea or None, "expected_speedup": expected}
+    out["speedup"] = row["speedup"] if row["correct"] else None
+    if row["correct"] and expected and row["speedup"]:
+        out["vs_expected"] = f"{row['speedup']:.3f}x measured vs {expected:.3f}x expected"
+    stats = next((s for s in ledger.ideas(idea_rows(records)) if s["idea"] == idea), None)
+    if stats:
+        out |= {k: stats[k] for k in ("tries", "best", "kept", "slow", "bugs", "verdict")}
+    if not row["correct"] and idea:
+        out["note"] = (
+            f"a {row['status']} is a bug in this attempt, not evidence against the idea: "
+            f"fix it and evaluate again with idea_id={idea!r} before you drop the idea"
+        )
+    return out
 
 
 def record_e2e_result(
@@ -285,6 +335,16 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
                     "type": "string",
                     "description": "snapshot (history/...) or candidate this one builds on",
                 },
+                "idea_id": {
+                    "type": "string",
+                    "description": "short slug of the idea this candidate implements, e.g. "
+                    "`splitk_gemv`: the same id for every attempt and fix of one idea",
+                },
+                "expected_speedup": {
+                    "type": "number",
+                    "description": "module speedup you expect if the idea works (the result "
+                    "puts it next to the measured one)",
+                },
                 "profile": {
                     "type": "boolean",
                     "description": "include per-kernel GPU time tables",
@@ -320,6 +380,8 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
                     "it should be faster",
                 }
             )
+        idea = ledger.idea_slug(args.get("idea_id"))
+        expected = _expected(args.get("expected_speedup"))
         try:
             capture_sha256 = keeper.expect(capture)
         except TamperError as exc:
@@ -356,10 +418,18 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
             eval_s=round(time.perf_counter() - start, 1),
             snapshot_sha256=snap_sha256,
             keeper=keeper,
+            idea=idea,
+            expected_speedup=expected,
         )
         await asyncio.to_thread(refresh, run, target_id)
         out = compact(result)
         out["ledger"] = {"exp": row["exp"], "status": row["status"]}
+        if idea or expected is not None:
+            try:
+                records = keeper.records(run.results_file(target_id))
+            except TamperError:
+                records = []
+            out["idea"] = idea_feedback(records, idea, expected, row)
         best = best_for_target(run, target_id, keeper)
         out["best_so_far"] = (
             {"snapshot": best["snapshot"], "speedup": best["speedup"]} if best else None
@@ -374,7 +444,9 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
 
     @tool(
         "best_result",
-        "Best correct evaluation so far for a target, plus the number of evaluations.",
+        "Best correct evaluation so far for a target, the number of evaluations, the last "
+        "15 and per idea (idea_id): tries, best speedup, bugs (failed) vs slow (correct, "
+        "not faster), verdict and last hypothesis.",
         {"target_id": str},
     )
     async def best_result(args: dict[str, Any]) -> dict[str, Any]:
@@ -392,10 +464,13 @@ def build_server(run: RunDir, budget: Budget | None = None, keeper: Truth | None
                         "snapshot": r.get("snapshot"),
                         "status": r.get("ledger_status") or r.get("status"),
                         "speedup": r.get("speedup"),
+                        "idea": r.get("idea"),
                         "hypothesis": r.get("hypothesis"),
                     }
                     for r in records[-15:]
                 ],
+                "ideas": ledger.ideas(idea_rows(records)),
+                "untagged": sum(not r.get("idea") for r in records),
             }
         )
 

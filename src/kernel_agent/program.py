@@ -6,7 +6,8 @@ reads a section:
 
 * ``## all`` – every agent
 * ``## planner``, ``## kernel`` (``kernel-<target>`` agents), ``## systems``,
-  ``## harness`` – that role only; ``## kernel, systems`` names several roles.
+  ``## harness``, ``## research`` (``research-<target>``: plateau reviews) – that
+  role only; ``## kernel, systems`` names several roles.
 
 Other ``##`` headings are ignored with a warning; text above the first ``##``
 heading and ``<!-- comments -->`` are for humans and never reach an agent.
@@ -31,7 +32,7 @@ from pathlib import Path
 
 from kernel_agent.workspace import RunDir, write_json
 
-ROLES = ("planner", "kernel", "systems", "harness")
+ROLES = ("planner", "kernel", "systems", "harness", "research")
 SECTIONS = ("all", *ROLES)
 FILENAME = "program.md"
 TEMPLATE = Path(__file__).parent / "agent" / "program.md"

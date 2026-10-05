@@ -20,9 +20,18 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import hub, ledger, library, program, strong_baseline, toolchain, truth
+from kernel_agent import (
+    hub,
+    ledger,
+    library,
+    program,
+    research,
+    strong_baseline,
+    toolchain,
+    truth,
+)
 from kernel_agent.agent import prompts
-from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
+from kernel_agent.agent.runner import READ_TOOLS, AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import best_for_target, build_server, tool_names
 from kernel_agent.budget import MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
@@ -641,6 +650,38 @@ class Orchestrator:
             cwd=self.run.transforms_dir,
             mcp_tools=tool_names("evaluate_e2e", "run_info"),
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
+        )
+
+    async def research(
+        self, target_id: str, *, reason: str, label: str | None = None
+    ) -> AgentResult:
+        """A clean-context research session on a plateaued target (``research.py``).
+
+        Read-only tools plus ``best_result``; it may write ``targets/<id>/plan.md``
+        and nothing else (``run_agent(writable=...)``)."""
+        target_dir = self.run.target(target_id)
+        spec = read_json(target_dir / "spec.json")
+        plan = research.plan_path(self.run, target_id)
+        system = prompts.research_prompt(
+            spec,
+            spec.get("capture", {}),
+            research.evidence(self.run, target_id, reason, self.truth),
+            plan,
+            self.tc.summary(),
+        )
+        return await self._agent(
+            f"research-{target_id}",
+            label,
+            prompt=(
+                f"Target `{target_id}` has plateaued ({reason}). Diagnose why from the ledger "
+                f"and the files, then write the plan to {plan}."
+            ),
+            system_append=system,
+            cwd=target_dir,
+            mcp_tools=tool_names("best_result"),
+            add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+            tools=[*READ_TOOLS, "Write"],
+            writable=[plan],
         )
 
     def reprofile(self, out_dir: Path, accepted: list[dict[str, Any]]) -> dict[str, Any]:

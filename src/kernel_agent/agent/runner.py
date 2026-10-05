@@ -14,17 +14,22 @@ from typing import Any
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    HookJSONOutput,
+    HookMatcher,
     ResultMessage,
     SystemMessage,
     TextBlock,
     ToolUseBlock,
     query,
 )
+from claude_agent_sdk.types import HookEvent
 
 from kernel_agent.config import OptimizeConfig
 
 BASE_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite"]
+READ_TOOLS = ["Read", "Glob", "Grep"]
 WEB_TOOLS = ["WebFetch", "WebSearch"]
+WRITE_TOOLS = "Write|Edit|MultiEdit|NotebookEdit"
 
 
 @dataclass
@@ -66,6 +71,34 @@ def agent_env(extra: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def write_guard(writable: list[Path], cwd: Path) -> dict[HookEvent, list[HookMatcher]]:
+    """PreToolUse hook that lets the file-writing tools touch only ``writable``.
+
+    A hook, not ``can_use_tool``: with ``bypassPermissions`` the CLI never asks."""
+    allowed = {p.resolve() for p in writable}
+
+    async def guard(data: Any, tool_use_id: str | None, context: Any) -> HookJSONOutput:
+        tool_input = data.get("tool_input") or {}
+        path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+        if path and _resolve(cwd, path) in allowed:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "this session may write only "
+                + ", ".join(str(p) for p in sorted(allowed)),
+            }
+        }
+
+    return {"PreToolUse": [HookMatcher(matcher=WRITE_TOOLS, hooks=[guard])]}
+
+
+def _resolve(cwd: Path, path: str) -> Path:
+    p = Path(path).expanduser()
+    return (p if p.is_absolute() else cwd / p).resolve()
+
+
 async def run_agent(
     name: str,
     *,
@@ -81,19 +114,24 @@ async def run_agent(
     output_format: dict[str, Any] | None = None,
     extra_tools: list[str] | None = None,
     result: AgentResult | None = None,
+    tools: list[str] | None = None,
+    writable: list[Path] | None = None,
 ) -> AgentResult:
     """Run one agent session to completion.
 
     ``result`` is filled in place while messages arrive, so a caller that
     cancels the session (e.g. a timeout) still has its session id, turns and
     tool calls so far. Cancelling terminates the Claude Code subprocess.
+    ``tools`` replaces :data:`BASE_TOOLS` as the built-in tools the session has at
+    all; with ``writable`` the file-writing tools may touch only those files.
     """
-    tools = BASE_TOOLS + (WEB_TOOLS if cfg.allow_web else []) + list(extra_tools or [])
+    builtin = list(BASE_TOOLS if tools is None else tools)
+    builtin += (WEB_TOOLS if cfg.allow_web else []) + list(extra_tools or [])
     options = ClaudeAgentOptions(
         system_prompt={"type": "preset", "preset": "claude_code", "append": system_append},
         cwd=str(cwd),
         add_dirs=[str(d) for d in (add_dirs or [])],
-        allowed_tools=tools + mcp_tools,
+        allowed_tools=builtin + mcp_tools,
         mcp_servers={"ka": mcp_server},
         permission_mode=cfg.permission_mode,  # type: ignore[arg-type]
         model=cfg.claude_model,
@@ -105,6 +143,10 @@ async def run_agent(
     )
     if cfg.effort:
         options.effort = cfg.effort  # type: ignore[assignment]
+    if tools is not None:  # a restricted session: no other built-in tool exists at all
+        options.tools = builtin
+    if writable is not None:
+        options.hooks = write_guard(writable, cwd)
 
     result = result or AgentResult(name=name)
     log_dir.mkdir(parents=True, exist_ok=True)

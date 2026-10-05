@@ -49,6 +49,15 @@ General rules: coalesced 128-bit global loads, avoid SMEM bank conflicts
 (swizzle / padding), keep occupancy reasonable (registers ≤ 128/thread for
 memory-bound kernels), use warp shuffles for reductions, `__launch_bounds__`.
 
+Long debug loops (nvcc builds take 20-60 s, wrong results need several rounds):
+* **Plan amnesia**: after every compile or correctness fix, re-read the idea in
+  `NOTES.md` (and `plan.md`) and state its goal in one sentence before the next
+  edit; fix rounds are not experiments. Keep the last correct candidate and
+  revert to it instead of stacking a third untested change on a broken one.
+* **False infeasibility**: if you stop, write "abandoned after N build rounds:
+  <why>", never "X doesn't work", unless X measured correct and slower; keep its
+  `idea_id` so a later session can retry it.
+
 Under `torch.compile` (the compiled baseline, e.g. VoxCPM's `model.optimize()`
 with `fullgraph=True`) a `load_inline` / NVRTC launcher is a graph break.
 Register it with `torch.library.custom_op` + `register_fake`

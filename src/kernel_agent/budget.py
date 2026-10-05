@@ -117,6 +117,8 @@ class Budget:
     started: float = field(default_factory=time.monotonic)
     deadlines: dict[str, float] = field(default_factory=dict)
     evals: dict[str, int] = field(default_factory=dict)
+    # agent -> records in its results file when its plateau count restarted (a research plan)
+    restarted: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, run: RunDir, cfg: OptimizeConfig) -> Budget:
@@ -241,7 +243,8 @@ class Budget:
         """``budget`` + ``advice`` for an evaluation tool result.
 
         Call once per evaluation, after it was appended to ``results``;
-        ``evals_used`` counts the evaluations of the current agent session.
+        ``evals_used`` counts the evaluations of the current agent session; the
+        non-improving streak starts again after ``restarted[agent]`` records.
         ``pct_of_sol`` is the evaluation's weighted share of its speed of light
         (:func:`kernel_agent.kernels.roofline.sol_signal`); at ``SOL_STOP_PCT`` or
         more further work cannot pay off, so the advice is ``stop``.
@@ -249,6 +252,8 @@ class Budget:
         used = self.evals[agent] = self.evals.get(agent, 0) + 1
         minutes = self.minutes_left(agent)
         streak = results_streak(results, ok_key=ok_key)
+        if (since := self.restarted.get(agent)) is not None:
+            streak = min(streak, max(len(read_jsonl(results)) - since, 0))
         usd = self.usd_left()
         if evals_budget is not None and used >= evals_budget:
             advice, why = "stop", f"evaluation budget used ({used} of {evals_budget})"

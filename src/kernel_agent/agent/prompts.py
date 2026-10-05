@@ -5,6 +5,8 @@ Roles
 * **planner** – reads the profile and picks targets (module classes) + transforms.
 * **kernel engineer** – one per target: writes and iterates kernel candidates.
 * **systems engineer** – model-level algorithm changes (CUDA graphs, static caches, ...).
+* **research** – a clean-context review of a target that has plateaued: reads the
+  ledger and the files, writes ``plan.md`` (diagnosis, ranked directions, do-not-try).
 """
 
 from __future__ import annotations
@@ -376,6 +378,19 @@ Files in your working directory:
 * `candidates/` — put your candidates here, one file per idea, e.g.
   `candidates/{backends[0]}_v1.py`.
 * `NOTES.md` — keep a short log: hypothesis → result for every evaluation.
+* `plan.md` (when present) — a research review of this target: diagnosis, ranked
+  next directions and a do-not-try list. Read it first and start from it.
+
+# Ideas
+Before you write code, list 3-5 distinct ideas in `NOTES.md` under `## Ideas`:
+an `idea_id` (short slug), the mechanism (which work, memory traffic or launches
+it removes), the expected module speedup and its ceiling (the best it could
+reach, from `sol_ms` / `bound`). Distinct means a different mechanism, not a
+different tile size. Work on the idea with the best expected gain and ceiling
+first. A build error or a wrong result is a bug in one attempt, not evidence
+against the idea: fix it and evaluate again under the same `idea_id` before you
+drop it. Never write "X doesn't work" unless X measured correct and slower;
+write "abandoned after N attempts: <why>".
 
 # Candidate contract
 ```python
@@ -399,15 +414,20 @@ their structure.
 
 # Tools
 * `evaluate_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py",
-  hypothesis="...", parent="history/<snapshot>.py", profile=false)`:
+  hypothesis="...", idea_id="<slug>", expected_speedup=1.4,
+  parent="history/<snapshot>.py", profile=false)`:
   compiles, checks correctness on all cases, benchmarks against the reference
   (interleaved rounds, median), snapshots the file and records the result.
   `hypothesis` is required: one sentence on what changed and why it should be
-  faster; `parent` (optional) is the snapshot it builds on. Every evaluation
-  is a row of the run's ledger, `ledger.status` in the result: `keep` (beats
-  the best by more than the timing noise), `discard`, or the failure kind.
+  faster; `idea_id` names the idea (the same id for every attempt and fix of
+  it); `expected_speedup` is the module speedup you expect, which the result
+  (`idea`) puts next to the measured one; `parent` (optional) is the snapshot
+  it builds on. Every evaluation is a row of the run's ledger, `ledger.status`
+  in the result: `keep` (beats the best by more than the timing noise),
+  `discard`, or the failure kind.
   `profile=true` adds per-kernel GPU time tables for candidate and reference.
-* `best_result(target_id="{target["id"]}")`: best correct result so far.
+* `best_result(target_id="{target["id"]}")`: best correct result so far, and per
+  idea: tries, best speedup, bugs (failed attempts) vs slow (correct, not faster).
 You have a budget of about {evaluations} evaluations. Stop early once further
 gains are unlikely. Every timed result reports the speed of light per case:
 `sol_ms` = max(FLOPs / peak FLOP/s, `min_bytes` / peak bandwidth) with peaks
@@ -505,3 +525,110 @@ Budget: about {evaluations} evaluations (each reloads the model).
 {_env_block(python, toolchain)}
 
 Finish with a summary of which transforms helped and by how much."""
+
+
+def research_prompt(
+    target: dict[str, Any],
+    capture_info: dict[str, Any],
+    evidence: str,
+    plan: Path,
+    toolchain: str,
+) -> str:
+    """The research agent of a plateaued target: read-only, writes ``plan`` (``plan.md``)."""
+    cases = "\n".join(
+        f"  * `{c['signature']}` — {c['count']} calls per run per instance"
+        for c in capture_info.get("cases", [])
+    )
+    return f"""You are a senior GPU performance researcher, brought in with a clean context.
+The kernel engineer of the target below has plateaued. You do not know its reasoning:
+form your conclusions from the files and the ledger only. You do not write kernel
+code. You find out why progress stopped and write a plan for the next engineer
+session, which starts fresh with your plan, the ledger digest and `NOTES.md`.
+
+# Target `{target["id"]}`
+* module class: `{target["module_class"]}` (instance captured: `{capture_info.get("qualname")}`)
+{_scope_lines(target)}* why it matters: {target.get("why", "")}
+* planner's approach: {target.get("approach", "")}
+* backends: {", ".join(target.get("backends", []))}
+* captured cases:
+{cases}
+{_workload_block(capture_info)}
+# Evidence
+{evidence}
+
+# Read
+In your working directory: `NOTES.md` (the engineer's log and ideas),
+`workload_profile.md` (every call of the module in the run: phases, masks,
+layouts, cache fill), `reference_source.py`, `spec.json`, `results.jsonl` (every
+evaluation: per-case times, errors, `sol_ms`, `pct_of_sol`, `bound`), `history/`
+(the evaluated snapshots: read the best one and those the ledger rows cite),
+`candidates/`, and the previous `plan.md` if there is one.
+`best_result(target_id="{target["id"]}")` returns the per-idea aggregates.
+Backend guides and the methodology: `{KNOWLEDGE_DIR}`; verified examples:
+`{EXAMPLES_DIR}`.
+
+# Diagnose: pathology checklist
+Go through every item, say whether it applies and cite `exp` numbers:
+1. **Repetition loop**: variants of one idea (same `idea`, or the same mechanism
+   under new ids).
+2. **Local minimum**: 5+ evaluations of one design with < 5 % gain each.
+3. **Correctness wall**: recent failures. Numerical (accumulation dtype,
+   reduction order) or semantic (an output, side effect or entrypoint the
+   candidate gets wrong)? Check the outputs against `reference_source.py`.
+4. **Wrong bottleneck**: compute work on a memory- or launch-bound kernel, or the
+   reverse (`bound`, `pct_of_sol`, `launch_floor_ms`). Without per-kernel times
+   in the records, recommend one evaluation with `profile=true` first.
+5. **Missing fundamental**: a standard technique never tried (fusion across the
+   module boundary, split-K / flash-decoding for one-position decode, 128-bit
+   vector loads, weights pre-packed in `build()`, a persistent kernel).
+6. **Over-engineering**: complexity that blocks further changes.
+7. **Ignored prior research**: directions of an earlier `plan.md` or open ideas
+   in `NOTES.md` that were never tried.
+8. **Host overhead and buffers**: per-call allocation, `.contiguous()` copies,
+   shape logic or weight packing that belongs in `build()` or a per-shape cache
+   (scratch buffers only: never cache inputs or outputs).
+9. **Overlooked shortcuts**: the workload profile makes the common case trivial
+   (a size-1 axis, an empty or all-ones mask, a cache with few valid slots).
+
+# Judge: the ceiling, not the current number
+A fresh approach is slower at its first attempt than a tuned one at its
+twentieth. Rank directions by their ceiling (what they could reach at the
+bandwidth, compute or launch floor, from `sol_ms` and the profile) times the
+share of calls they cover. Recommend a pivot when the current design's ceiling
+is below another's, even if that one has no good number yet. An idea whose
+attempts all failed is untested, not refuted.
+
+# Write `{plan}`
+This file only: the session cannot write anything else. Layout:
+```markdown
+# Plan: `{target["id"]}` after exp <N>
+
+## Diagnosis
+2-4 sentences with exp numbers; the checklist items that apply.
+
+## Strategy
+**pivot**, **refactor** or **targeted fixes**, and why in one sentence.
+
+## Ranked directions
+1. `<idea_id>`: what to change (the function, fusion boundary, tile or constant,
+   not "improve memory access"); why (the evidence); expected module speedup and
+   ceiling; the first evaluation to run.
+2. ...
+
+## Retry (failed, not refuted)
+* `<idea_id>`: the bug to fix (exp numbers) and why the idea is still worth it.
+
+## Do not try
+* `<idea_id>` or direction: measured correct and not faster (exp numbers), or
+  why its ceiling is below the best result.
+
+## Notes for the engineer
+The snapshot to build on, profile first or not, quick fixes or one larger change.
+```
+Keep it under about 80 lines. Finish with three lines: diagnosis, strategy, top
+direction.
+
+# Toolchain
+```
+{toolchain}
+```"""

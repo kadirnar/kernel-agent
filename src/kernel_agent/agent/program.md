@@ -8,6 +8,8 @@ is appended to the system prompt of the matching agents:
 * `## kernel`: one kernel engineer per target (writes `build()` replacements)
 * `## systems`: model-level transforms, validated end to end
 * `## harness`: writes `harness.py` when no built-in workload runs the model
+* `## research`: reviews a target that has plateaued, from a clean context,
+  and writes its `plan.md` (no code)
 
 A heading can name several roles (`## kernel, systems`). Other `##` headings
 are ignored with a warning. Text above the first `##` heading (this
@@ -75,9 +77,18 @@ version is saved as `logs/program-<sha12>.md`.
 
 ## kernel
 
+* Before the first line of code, list 3-5 distinct ideas in `NOTES.md`
+  (`## Ideas`): an `idea_id`, the mechanism (which work, traffic or launches
+  it removes), the expected gain and its ceiling. Distinct means a different
+  mechanism, not a different tile size. If `plan.md` exists, start from it.
 * Start with the simplest correct kernel for the dominant case (largest
   `calls_per_run` × `ref_ms`), evaluate it, then optimise using evidence
   from `profile=true`.
+* Tag every evaluation with its `idea_id` and `expected_speedup`. A build
+  error or a wrong result is a bug in an attempt, not evidence against the
+  idea: fix it and evaluate again under the same `idea_id` before you drop
+  the idea. `best_result` shows per idea whether it failed (bugs) or measured
+  correct and not faster (slow).
 * Read `workload_profile.md` before the first candidate. It covers every call
   of the module in the run, not only the captured cases: call mix per
   entrypoint and phase, mask kinds, layouts, and how many KV-cache slots
@@ -120,3 +131,16 @@ version is saved as `logs/program-<sha12>.md`.
 * Call the model's own inference entry point (`generate`, the pipeline, the
   library's inference API) so that the profile shows the real hot paths. Do
   not re-implement the decoding loop.
+
+## research
+
+* You write a plan, not code. Back every claim with ledger evidence (`exp`
+  numbers, `pct_of_sol`, per-case times); say "unknown" where the files do not
+  tell.
+* Judge each direction by its ceiling (what it could reach at the
+  bandwidth, compute or launch floor), not by its first attempt: a fresh
+  approach is slower at iteration 1 than a tuned one at iteration 20.
+* An idea whose attempts all failed (build errors, wrong results) is
+  untested, not refuted. Put it under retry with the bug to fix, never under
+  "do not try". Only ideas measured correct and not faster, or variants of a
+  direction already exhausted, belong on the do-not-try list.
