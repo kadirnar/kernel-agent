@@ -214,10 +214,14 @@ combination against the best single item):
   transform may also define `undo(workload)` to revert what the snapshots
   cannot see; it is then applied again (plus a warm-up run) to re-enter its
   state.
-* GPU clocks, temperature, power and clock-event reasons are sampled around
-  every timed run through NVML (`pynvml`, when installed) or `nvidia-smi`
-  (`ab.gpu`, `gpu` of `e2e`); a power or thermal slowdown is logged as a
-  warning.
+* GPU clocks (with the board's maximum SM clock), temperature, power and
+  clock-event reasons are sampled around every timed run through NVML
+  (`pynvml`, when installed) or `nvidia-smi` (`ab.gpu`, `gpu` of `e2e`). A
+  warning is logged only when the GPU really slowed down: a thermal or hardware
+  slowdown reason (`hw_slowdown`, `sw_thermal`, `hw_thermal`, `hw_power_brake`),
+  or an SM clock under load below 90 % of the highest one of that measurement
+  (`clock_drop`). `sw_power_cap` alone is recorded in `reasons` but not
+  reported: consumer GPUs show it at full boost (an RTX 5070 Ti at 2.9 GHz).
 
 Every step in `integration.json` → `history` carries its `ab` record: `mode`
 (`paired` / `separate`), `a_items`, the timings `a_ms` / `b_ms`, `wins`,
