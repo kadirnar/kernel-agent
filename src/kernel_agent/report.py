@@ -66,6 +66,21 @@ def _projection_lines(projection: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _quality_lines(data: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
+    """The quality mode, and eager's perceptual scores next to it (``near-lossless``)."""
+    mode = (data.get("config") or {}).get("quality") or "exact"
+    if mode == "exact":
+        return []
+    info = baseline.get("perceptual") or {}
+    if info.get("status") != "ok":
+        why = info.get("reason") or info.get("status") or "analyze predates it"
+        return [f"* quality: **{mode}**, no perceptual baseline ({why}): exact checks"]
+    mean = ", ".join(f"{k}={v}" for k, v in (info.get("mean") or {}).items())
+    return [
+        f"* quality: **{mode}**: perceptual gate on {info.get('samples')} samples (eager: {mean})"
+    ]
+
+
 def write_report(run: RunDir) -> Path:
     refresh(run)  # charts + dashboard.html, so the report embeds current images
     data = run.load()
@@ -96,6 +111,7 @@ def write_report(run: RunDir) -> Path:
         f"* GPU: {gpu.get('name')} ({gpu.get('arch')}), torch {tc.get('torch_version')}",
         f"* workload: `{baseline.get('workload')}`",
         *([f"* {line}"] if (line := objective.describe(baseline)) else []),
+        *_quality_lines(data, baseline),
         "",
         "## Result",
         "",
@@ -112,7 +128,12 @@ def write_report(run: RunDir) -> Path:
         found = dict(final.get("metrics") or {})
         held = found.pop("holdout", None)  # workloads/holdout.py: one phrase, not every metric
         natural = found.pop("natural_length", None)  # workloads/stopping.py: one phrase too
+        perceived = found.pop("perceptual", None)  # workloads/perceptual.py: near-lossless
         metrics = ", ".join(f"{k}={v}" for k, v in _flat_metrics(found).items())
+        if isinstance(perceived, dict):
+            from kernel_agent.workloads import perceptual
+
+            metrics = f"{perceptual.summary_text(perceived)}; {metrics}"
         if isinstance(held, dict):
             from kernel_agent.workloads.holdout import summary_text
 

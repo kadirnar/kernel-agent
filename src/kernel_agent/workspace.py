@@ -12,6 +12,7 @@ runs/<org>--<name>/<timestamp>/
   .truth/               what the evaluator trusts (read-only, hashed): baseline_output.pt,
                         baseline_output_holdout.pt (held-out input),
                         baseline_output_natural.pt (natural-length run, stop condition),
+                        baseline_output_perceptual.pt (--quality near-lossless),
                         captures/<id>.pt, targets/<id>/{results.jsonl,history/},
                         transforms/{results.jsonl,history/}
   targets/<id>/         spec.json, capture_inputs.pt (no outputs), reference_source.py,
@@ -170,6 +171,10 @@ class RunDir:
     def baseline_output_natural(self) -> Path:
         """Baseline of the natural-length run (stop condition, ``workloads/stopping.py``)."""
         return (self.truth_dir if self.sealed() else self.root) / "baseline_output_natural.pt"
+
+    def baseline_output_perceptual(self) -> Path:
+        """Baseline samples + scores of the perceptual gate (``workloads/perceptual.py``)."""
+        return (self.truth_dir if self.sealed() else self.root) / "baseline_output_perceptual.pt"
 
     def capture_file(self, target_id: str) -> Path:
         """The full capture of a target (module, inputs, reference outputs)."""

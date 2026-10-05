@@ -155,6 +155,9 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
+                    # "reduced": --quality near-lossless captures the target with the
+                    # near-lossless tolerance tier (kernels/compare.py); default exact
+                    "precision": {"type": "string", "enum": ["exact", "reduced"]},
                     # other starting points for parallel workers (workers.py)
                     "alternatives": {
                         "type": "array",

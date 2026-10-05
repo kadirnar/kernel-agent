@@ -47,6 +47,7 @@ import json
 import os
 import traceback
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -68,6 +69,24 @@ SHORT_TEXT = "Short sentences matter too."
 NATURAL_TEXT = "When the sentence is finished, the speaker stops talking and waits for the reply."
 #: ``min_len`` of the natural-length run: VoxCPM's own default.
 NATURAL_MIN_PATCHES = 2
+#: Perceptual gate (``--quality near-lossless``, ``perceptual_samples``): held-out
+#: sentences (language, text) x seeds at natural length, cloned from ``SPEAKER_WAV`` (a
+#: VoxCPM2 zero-shot voice, 16 kHz) so that every sample has the same speaker.
+PERCEPTUAL_TEXTS = (
+    (
+        "en",
+        "Please remember to bring your passport, a warm jacket and the charger for your laptop.",
+    ),
+    (
+        "en",
+        "The quick brown fox jumps over the lazy dog while the orchestra tunes its instruments.",
+    ),
+    ("en", "Every morning she walks along the river and feeds the ducks before going to work."),
+    ("de", "Der Zug nach Berlin fährt heute eine Stunde später ab, weil es stark geschneit hat."),
+)
+PERCEPTUAL_SEEDS = (0, 1)
+SPEAKER_WAV = "voxcpm_speaker.wav"
+ASSETS = Path(__file__).with_name("assets")
 
 
 class VoxCPMWorkload(Workload):
@@ -229,8 +248,15 @@ class VoxCPMWorkload(Workload):
             retry_badcase=False,
             # generate() caps max_len at len(text tokens) * ratio + 10: never below n.
             retry_badcase_ratio_threshold=float(n),
+            **self._reference_wav(),
         )
         return wav
+
+    def _reference_wav(self) -> dict[str, str]:
+        """``reference_wav`` option (perceptual samples): clone the voice of that file (a
+        name in ``assets/`` or a path), on the streaming path (``metric=ttfa``) as well."""
+        name = self.options.get("reference_wav")
+        return {"reference_wav_path": str(ASSETS / name)} if name else {}
 
     @contextlib.contextmanager
     def metric_window(self) -> Iterator[None]:
@@ -349,6 +375,75 @@ class VoxCPMWorkload(Workload):
         if not decoded.passed:
             reasons.append(f"audio decoded from the reference latents: {decoded.reason}")
         return Comparison(steps.passed and decoded.passed, metrics, "; ".join(reasons))
+
+    # ------------------------------------------------- perceptual gate (near-lossless)
+
+    #: ``--quality near-lossless``: the teacher-forced sanity floor and ±1 patch at a
+    #: near-tie of the stop logits. Calibrated on VoxCPM2 (main input, 60 patches): FP8
+    #: weight-only (e4m3 per output channel, every nn.Linear of both LMs and the LocDiT)
+    #: reaches mean step cosine 0.987, min 0.65 (the exact thresholds reject it);
+    #: `model.optimize()` 0.998 / 0.96; broken RMSNorm (eps 1e-2), a dropped KV head and
+    #: int4 per-tensor weights reach mean <= 0.70.
+    near_lossless_options = {
+        "min_step_cosine": 0.2,
+        "min_mean_step_cosine": 0.95,
+        "stop_tolerance": 1,
+    }
+
+    def perceptual_samples(self) -> list[dict[str, Any]]:
+        """``PERCEPTUAL_TEXTS`` x ``PERCEPTUAL_SEEDS``, natural length (the stop head
+        decides, ``perceptual_max_patches`` at most), in the voice of ``SPEAKER_WAV``.
+        They run through :meth:`run`, i.e. the path the run's metric times: ``generate``
+        by default, ``generate_streaming`` with ``metric=ttfa`` (the gate scores the whole
+        streamed audio, chunk-wise AudioVAE decode included)."""
+        n = int(self.options.get("perceptual_max_patches", 120))
+        return [
+            {
+                "text": text,
+                "language": language,
+                "seed": seed,
+                "patches": n,
+                "min_patches": NATURAL_MIN_PATCHES,
+                "reference_wav": SPEAKER_WAV,
+            }
+            for language, text in PERCEPTUAL_TEXTS
+            for seed in PERCEPTUAL_SEEDS
+        ]
+
+    def perceptual_quality(self, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        from kernel_agent.workloads.perceptual import score_tts
+
+        return score_tts(
+            [
+                {
+                    "audio": s["output"]["audio"],
+                    "sampling_rate": s["output"]["sampling_rate"],
+                    "text": s["options"]["text"],
+                    "language": s["options"].get("language", "en"),
+                }
+                for s in samples
+            ],
+            device=self.spec.device,
+        )
+
+    def compare_perceptual(
+        self, reference: list[dict[str, Any]], candidate: list[dict[str, Any]]
+    ) -> Comparison:
+        from kernel_agent.workloads import perceptual as p
+
+        opt = self.options  # thresholds: -o max_error_increase=... (calibration: README)
+        return p.compare_tts(
+            reference,
+            candidate,
+            max_error_increase=float(opt.get("max_error_increase", p.MAX_ERROR_INCREASE)),
+            min_speaker_similarity=float(
+                opt.get("min_speaker_similarity", p.MIN_SPEAKER_SIMILARITY)
+            ),
+            min_speaker_similarity_worst=float(
+                opt.get("min_speaker_similarity_worst", p.MIN_SPEAKER_SIMILARITY_WORST)
+            ),
+            max_mos_drop=float(opt.get("max_mos_drop", p.MAX_MOS_DROP)),
+        )
 
 
 def _streaming_failure(exc: BaseException) -> str:

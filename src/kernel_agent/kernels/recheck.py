@@ -208,6 +208,7 @@ def reference_main(
         "device": device,
         "redrawn": redrawn,
         "cases": [{k: c.get(k) for k in keys} for c in cases],
+        "tier": data.get("tier"),  # the capture's tolerance tier (kernels/compare.py)
     }
     if timing and device == "cuda":
         result["ms"] = _time_cases(reference, cases, entries, rounds)
@@ -343,10 +344,15 @@ def _first_error(failures: list[dict[str, Any]]) -> str:
 
 
 def compare_entries(
-    expected: list[dict[str, Any]], saved: Any, entries: list[tuple[int, int]]
+    expected: list[dict[str, Any]],
+    saved: Any,
+    entries: list[tuple[int, int]],
+    *,
+    tier: str | None = None,
 ) -> list[list[dict[str, Any]]]:
     """Failed checks per entry (``(case, seed)`` of ``entries``): the candidate's saved
-    outputs and post-call state against the reference's (:mod:`kernels.compare`)."""
+    outputs and post-call state against the reference's (:mod:`kernels.compare`, in the
+    capture's tolerance ``tier``)."""
     from kernel_agent.kernels.compare import compare_side_effects_flat, compare_tensors
 
     if not isinstance(saved, list) or len(saved) != len(expected):
@@ -361,10 +367,12 @@ def compare_entries(
             if name not in new_out:
                 checks.append({"name": name, "ok": False, "error": "missing in candidate output"})
             else:
-                checks.append(compare_tensors(name, ref, new_out[name]))
+                checks.append(compare_tensors(name, ref, new_out[name], tier=tier))
         for key in ("args", "kwargs"):
             pre = (exp.get("pre") or {}).get(key) or {}
-            checks += compare_side_effects_flat(pre, exp.get(key) or {}, new.get(key) or {})
+            checks += compare_side_effects_flat(
+                pre, exp.get(key) or {}, new.get(key) or {}, tier=tier
+            )
         failures.append([c for c in checks if not c.get("ok")])
     return failures
 
@@ -519,9 +527,12 @@ def run_recheck(
             got = None
             result["reason"] = f"the candidate's outputs are unreadable: {exc}"[:500]
         got = got if isinstance(got, dict) else {}
-        failures = compare_entries(expected["entries"], got.get("entries"), entries)
+        tier = ref.get("tier")
+        failures = compare_entries(expected["entries"], got.get("entries"), entries, tier=tier)
         if cand.get("ms"):  # timed: the same inputs once more after timing
-            after = compare_entries(expected["entries"], got.get("after_timing"), entries)
+            after = compare_entries(
+                expected["entries"], got.get("after_timing"), entries, tier=tier
+            )
             failures = [
                 first + [{**f, "after_timing": True} for f in again]
                 for first, again in zip(failures, after, strict=True)

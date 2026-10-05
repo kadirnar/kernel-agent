@@ -7,6 +7,8 @@ lives outside the agents' working directories, in ``<run>/.truth/``::
     .truth/baseline_output.pt         reference output of the baseline run
     .truth/baseline_output_holdout.pt ... of the held-out input (workloads/holdout.py)
     .truth/baseline_output_natural.pt ... of the natural-length run (workloads/stopping.py)
+    .truth/baseline_output_perceptual.pt samples + scores of the perceptual gate
+                                      (--quality near-lossless, workloads/perceptual.py)
     .truth/captures/<id>.pt           module + inputs + reference outputs + post-call state
     .truth/targets/<id>/results.jsonl evaluation records (each with its snapshot's sha256)
     .truth/targets/<id>/history/      the evaluated snapshots
@@ -23,7 +25,8 @@ The defence is the sha256 (and size) of every truth file, recorded when
 kernel-agent writes it, held in this process's memory (:class:`Truth`, one per
 run and process, see :func:`of`) and mirrored in ``run.json`` ``truth`` for a
 resumed run. Before use, the evaluator (``capture_sha256``), the e2e worker
-(``--verify`` + ``--baseline-ms``), :func:`kernel_agent.agent.tools.best_for_target`,
+(``--verify`` + ``--baseline-ms``; ``--quality`` passes the run's quality mode the same
+way), :func:`kernel_agent.agent.tools.best_for_target`,
 the integration and the export check the digests; a mismatch is refused with
 a ``TAMPER`` line on stderr and a ``tamper`` event in ``events.jsonl``.
 Records appended to a results file outside kernel-agent are ignored (the
@@ -153,12 +156,16 @@ class Truth:
 
     def __init__(self, run: RunDir) -> None:
         self.run = run
-        section = run.load().get("truth")
+        data = run.load()
+        section = data.get("truth")
         self.enabled = isinstance(section, dict)
         section = section if isinstance(section, dict) else {}
         self.files: dict[str, dict[str, Any]] = dict(section.get("files") or {})
         ms = section.get("baseline_ms")
         self.recorded_baseline_ms: float | None = float(ms) if ms else None
+        #: ``--quality`` of the run (exact / near-lossless): how e2e judges, so it is passed
+        #: to the worker from here, not read back from the agent-writable ``run.json``.
+        self.quality = str((data.get("config") or {}).get("quality") or "exact")
         self._lock = threading.RLock()
         self._reported: set[tuple[str, str]] = set()
 
@@ -214,6 +221,7 @@ class Truth:
             run.baseline_output(),
             run.baseline_output_holdout(),
             run.baseline_output_natural(),
+            run.baseline_output_perceptual(),
         )
 
     def seal_baseline(self, median_ms: float) -> None:
@@ -342,7 +350,8 @@ class Truth:
         return float(data["median_ms"])
 
     def worker_args(self) -> list[str]:
-        """``e2e`` worker flags: the baseline latency and the digests it must verify."""
+        """``e2e`` worker flags: the baseline latency, the digests it must verify and the
+        quality mode."""
         if not self.enabled:
             return []
         args = []
@@ -352,7 +361,7 @@ class Truth:
             entry = self.files.get(self.rel(path))
             if entry is not None:
                 args += ["--verify", f"{self.rel(path)}={entry['sha256']}"]
-        return args
+        return [*args, "--quality", self.quality]
 
 
 def _read(path: Path) -> bytes:

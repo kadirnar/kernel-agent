@@ -61,7 +61,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     from kernel_agent import objective, strong_baseline
     from kernel_agent.profiling.profiler import profile_workload, summarize
-    from kernel_agent.workloads import holdout, quality, stopping
+    from kernel_agent.workloads import holdout, perceptual, quality, stopping
     from kernel_agent.workloads.base import measure
 
     if (ns.kernel or ns.transform) and not ns.out_dir:
@@ -112,6 +112,10 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         # ... and the stop condition on a natural-length run (workloads/stopping.py)
         target = truth.replace(out.baseline_output_natural())
         baseline["natural_length"] = stopping.save_baseline(workload, target)
+        # ... and, with --quality near-lossless, the perceptual samples (workloads/perceptual.py)
+        target = truth.replace(out.baseline_output_perceptual())
+        mode = _quality(ns, run)
+        baseline["perceptual"] = perceptual.save_baseline(workload, target, quality=mode)
     write_json(out.baseline_json, baseline)
     # Strong baseline (strong_baseline.py): the full analyze of a run measures the
     # workload's reference optimisations (or, with --compile-baseline, a generic
@@ -184,6 +188,7 @@ def _apply_patches(run: RunDir, workload: Any, kernels: list[str], transforms: l
 
 def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     from kernel_agent import region
+    from kernel_agent.kernels.compare import EXACT_TIER, tier_for
     from kernel_agent.profiling.capture import capture_module
 
     target_dir = run.target(ns.target)
@@ -202,6 +207,9 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     with __import__("torch").inference_mode():
         workload.run(inputs)  # warm-up so lazily-initialised state exists
     capture = truth.replace(capture)  # .truth/captures/ of a sealed run
+    # near-lossless tolerances for a target whose spec allows reduced precision, recorded
+    # in the sealed capture (kernels/compare.py): the agent's spec.json cannot change it
+    tier = tier_for(_quality(ns, run), spec.get("precision")) if not parent else EXACT_TIER
     info = capture_module(
         workload,
         inputs,
@@ -213,6 +221,7 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         phase=scope["phase"],
         profile_dir=out,  # workload_profile.md is for the agent
         variants=workload.variants(),  # extra settings: correctness-only cases
+        tier=None if tier == EXACT_TIER else tier,
     )
     if run.sealed():  # the agent's copy: module + inputs, no reference outputs
         truth.write_inputs_capture(capture, out / "capture_inputs.pt")
@@ -298,17 +307,30 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _truth_files(run: RunDir, ns: argparse.Namespace) -> tuple[bytes, bytes, bytes, bytes]:
-    """The baseline output, baseline.json, the held-out baseline output and the
-    natural-length baseline, checked against the digests the orchestrator holds
-    (``--verify``) before anything runs; read once."""
+def _truth_files(run: RunDir, ns: argparse.Namespace) -> tuple[bytes, ...]:
+    """The baseline output, baseline.json, the held-out baseline output, the
+    natural-length baseline and the perceptual baseline, checked against the digests the
+    orchestrator holds (``--verify``) before anything runs; read once."""
     expected = dict(item.partition("=")[::2] for item in ns.verify or [])
     return (
         _truth_bytes(run, run.baseline_output(), expected),
         _truth_bytes(run, run.baseline_json, expected, required=False),
         _truth_bytes(run, run.baseline_output_holdout(), expected, required=False),
         _truth_bytes(run, run.baseline_output_natural(), expected, required=False),
+        _truth_bytes(run, run.baseline_output_perceptual(), expected, required=False),
     )
+
+
+def _quality(ns: argparse.Namespace, run: RunDir | None = None) -> str:
+    """The quality mode: ``--quality`` (the orchestrator's, from its memory), else
+    ``run.json``'s (``exact`` when unset)."""
+    from kernel_agent.workloads.perceptual import mode_of
+
+    if getattr(ns, "quality", None):
+        return mode_of(ns.quality)
+    if run is None and getattr(ns, "run_dir", None) is not None:
+        run = RunDir(Path(ns.run_dir).resolve())
+    return mode_of(((run.load() if run else {}).get("config") or {}).get("quality"))
 
 
 def _judge(
@@ -317,10 +339,50 @@ def _judge(
     inputs: Any,
     output: Any,
     median_ms: float,
-    truth_files: tuple[bytes, bytes, bytes, bytes],
+    truth_files: tuple[bytes, ...],
 ) -> tuple[float, dict[str, Any]]:
     """(baseline ms, quality verdict) of a timed candidate output: ``status`` ok with
-    ``passed`` / ``reason`` / ``metrics``, or ``runtime_error`` when a check crashed."""
+    ``passed`` / ``reason`` / ``metrics``, or ``runtime_error`` when a check crashed.
+    ``--quality near-lossless`` with a perceptual baseline: the checks of :func:`_checks`
+    with the workload's sanity floor, then the perceptual gate (workloads/perceptual.py)."""
+    import torch
+
+    from kernel_agent.workloads import perceptual
+
+    *files, perceptual_bytes = truth_files
+    mode = _quality(ns)
+    reference: dict[str, Any] | None = None
+    if perceptual_bytes and mode == perceptual.NEAR_LOSSLESS:
+        reference = torch.load(io.BytesIO(perceptual_bytes), weights_only=False)
+    with perceptual.judging(workload, mode, reference) as gate:
+        base_ms, verdict = _checks(ns, workload, inputs, output, median_ms, tuple(files))
+    if verdict["status"] != "ok":
+        return base_ms, verdict
+    result: dict[str, Any] | None
+    if reference is None or not gate:
+        result = perceptual.skipped(mode, json.loads(files[1] or b"{}"))
+    elif not verdict["passed"]:  # rejected already: spare the gate's runs
+        result = {"passed": False, "reason": "", "skipped": "the other checks failed"}
+    else:
+        result = perceptual.check(workload, reference)
+    if result is not None:
+        verdict["metrics"]["perceptual"] = result
+        verdict["passed"] = verdict["passed"] and result["passed"]
+        reasons = [verdict["reason"], result["reason"] and f"perceptual: {result['reason']}"]
+        verdict["reason"] = "; ".join(r for r in reasons if r)
+    return base_ms, verdict
+
+
+def _checks(
+    ns: argparse.Namespace,
+    workload: Any,
+    inputs: Any,
+    output: Any,
+    median_ms: float,
+    truth_files: tuple[bytes, ...],
+) -> tuple[float, dict[str, Any]]:
+    """:func:`_judge` without the perceptual gate: teacher forcing (or the workload's own
+    comparison), the held-out input and the stop condition."""
     import torch
 
     from kernel_agent.workloads import holdout, stopping
@@ -526,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--verify", action="append", help="e2e: REL=SHA256, refuse a run file without it"
     )
+    parser.add_argument("--quality", help="exact | near-lossless (default: run.json's)")
     ns = parser.parse_args(argv)
     run = RunDir(ns.run_dir.resolve())
     try:

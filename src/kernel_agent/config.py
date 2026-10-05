@@ -43,6 +43,10 @@ class OptimizeConfig:
     #: Integration: re-check every kernel on fresh inputs, reference and kernel timed in
     #: processes of their own (kernels/recheck.py); a kernel that fails it is refused.
     recheck: bool = True
+    #: "exact" (numerics within rounding noise) or "near-lossless": numerics-changing
+    #: optimisations pass when the perceptual quality stays within the noise of eager
+    #: (workloads/perceptual.py).
+    quality: str = "exact"
 
     claude_model: str = DEFAULT_MODEL
     effort: str | None = "high"
