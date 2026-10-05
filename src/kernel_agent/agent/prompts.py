@@ -269,9 +269,14 @@ overhead). Verified examples of every backend are in `{EXAMPLES_DIR}` — copy
 their structure.
 
 # Tools
-* `evaluate_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py", profile=false)`:
+* `evaluate_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py",
+  hypothesis="...", parent="history/<snapshot>.py", profile=false)`:
   compiles, checks correctness on all cases, benchmarks against the reference
   (interleaved rounds, median), snapshots the file and records the result.
+  `hypothesis` is required: one sentence on what changed and why it should be
+  faster; `parent` (optional) is the snapshot it builds on. Every evaluation
+  is a row of the run's ledger, `ledger.status` in the result: `keep` (beats
+  the best by more than the timing noise), `discard`, or the failure kind.
   `profile=true` adds per-kernel GPU time tables for candidate and reference.
 * `best_result(target_id="{target["id"]}")`: best correct result so far.
 You have a budget of about {evaluations} evaluations. Stop early once further
@@ -349,9 +354,10 @@ check (the tool reports it). Warm-up/compile time is excluded from timing
 (1 warm-up run), but the transform must not change the inputs or the work.
 
 # Tools
-* `evaluate_e2e(transforms=["transforms/<id>.py"], kernels=[])` loads the full
-  model in a fresh process, applies the transforms, runs the workload, compares
-  against the baseline output and reports latency + speedup.
+* `evaluate_e2e(transforms=["transforms/<id>.py"], kernels=[], hypothesis="...")` loads
+  the full model in a fresh process, applies the transforms, runs the workload,
+  compares against the baseline output and reports latency + speedup. Give a
+  one-sentence `hypothesis`; it is recorded in the run's ledger.
 Budget: about {evaluations} evaluations (each reloads the model).
 
 {COMMON_RULES}

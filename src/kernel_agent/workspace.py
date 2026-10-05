@@ -8,8 +8,12 @@ runs/<org>--<name>/<timestamp>/
   baseline.json         end-to-end baseline latency + reference outputs summary
   profile/              profile.json, summary.md, kernels.txt
   plan.json             planner output: targets + model-level transforms
-  targets/<id>/         spec.json, capture.pt, candidates/*.py, results.jsonl, NOTES.md
+  targets/<id>/         spec.json, capture.pt, candidates/*.py, results.jsonl, NOTES.md,
+                        progress.png
   transforms/           *.py model-level transforms + results.jsonl
+  results.tsv           experiment ledger: one row per evaluation (kernel, transform, integration)
+  events.jsonl          phase changes, agent start/stop, evaluations
+  progress.png  amdahl.png  integration.png  dashboard.html   charts (see charts.py)
   optimized/            exported winners + apply.py
   report.md             final report
 ```
@@ -109,6 +113,18 @@ class RunDir:
     @property
     def report(self) -> Path:
         return self.root / "report.md"
+
+    @property
+    def ledger(self) -> Path:
+        return self.root / "results.tsv"
+
+    @property
+    def events(self) -> Path:
+        return self.root / "events.jsonl"
+
+    @property
+    def dashboard(self) -> Path:
+        return self.root / "dashboard.html"
 
     def target(self, target_id: str) -> Path:
         return self.targets_dir / target_id

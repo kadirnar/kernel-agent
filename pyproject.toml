@@ -24,7 +24,8 @@ models = [
 cuda = ["cuda-python>=12.6", "ninja>=1.11", "nvidia-cuda-nvcc>=13.0; sys_platform == 'linux'", "nvidia-cuda-cccl>=13.0; sys_platform == 'linux'", "nvidia-cuda-crt>=13.0; sys_platform == 'linux'", "nvidia-nvvm>=13.0; sys_platform == 'linux'"]
 cute = ["nvidia-cutlass-dsl>=4.0"]
 tilelang = ["tilelang>=0.1.5", "nvidia-cuda-nvcc>=13.0; sys_platform == 'linux'", "nvidia-cuda-cccl>=13.0; sys_platform == 'linux'", "nvidia-cuda-crt>=13.0; sys_platform == 'linux'", "nvidia-nvvm>=13.0; sys_platform == 'linux'"]
-all = ["kernel-agent[models,cuda,cute,tilelang]"]
+viz = ["matplotlib>=3.8"]
+all = ["kernel-agent[models,cuda,cute,tilelang,viz]"]
 
 [project.scripts]
 kernel-agent = "kernel_agent.cli:main"

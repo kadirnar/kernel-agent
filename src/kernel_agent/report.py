@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent.agent.tools import best_for_target
+from kernel_agent.dashboard import refresh
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 
@@ -15,7 +16,13 @@ def _fmt(v: Any, nd: int = 3) -> str:
     return "—" if v is None else str(v)
 
 
+def _chart(run: RunDir, path: Path, alt: str) -> list[str]:
+    """Markdown image line for a chart that exists (charts need the ``viz`` extra)."""
+    return [f"![{alt}]({path.relative_to(run.root).as_posix()})", ""] if path.exists() else []
+
+
 def write_report(run: RunDir) -> Path:
+    refresh(run)  # charts + dashboard.html, so the report embeds current images
     data = run.load()
     card = data["card"]
     tc = read_json(run.toolchain_json, {})
@@ -48,7 +55,19 @@ def write_report(run: RunDir) -> Path:
         )
     else:
         lines.append("| optimised | — | — | no optimisation passed end-to-end validation |")
-    lines += ["", "## Planner analysis", "", plan.get("analysis", "(no plan)"), ""]
+    lines.append("")
+    lines += _chart(run, run.root / "progress.png", "end-to-end progress")
+    lines += _chart(run, run.root / "amdahl.png", "time split before and after the best kernels")
+    lines += [
+        "Every evaluation is a row of `results.tsv` (keep / discard / failure); "
+        "`dashboard.html` shows the charts and tables, `kernel-agent status <run_dir>` a "
+        "terminal summary.",
+        "",
+        "## Planner analysis",
+        "",
+        plan.get("analysis", "(no plan)"),
+        "",
+    ]
 
     lines += [
         "## Kernel targets",
@@ -75,6 +94,9 @@ def write_report(run: RunDir) -> Path:
                     f"{_fmt(case.get('speedup'))} ({_fmt(case.get('ref_ms'), 4)} → "
                     f"{_fmt(case.get('new_ms'), 4)} ms) | | |"
                 )
+    lines.append("")
+    for target_id in run.target_ids():
+        lines += _chart(run, run.target(target_id) / "progress.png", f"{target_id} progress")
     transforms = read_jsonl(run.transforms_dir / "results.jsonl")
     if transforms:
         lines += [
@@ -92,6 +114,7 @@ def write_report(run: RunDir) -> Path:
             )
     if integration:
         lines += ["", "## Integration", ""]
+        lines += _chart(run, run.root / "integration.png", "integration waterfall")
         for item in integration.get("accepted", []):
             lines.append(f"* accepted {item['kind']}: `{item['item']}`")
         for h in integration.get("history", []):

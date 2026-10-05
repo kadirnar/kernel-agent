@@ -88,8 +88,7 @@ All limits are off by default (`kernel_agent/budget.py`).
   in a row that did not beat the best result by more than max(1 %, 2 × timing
   spread), or `stop` when the evaluation, time or USD budget is spent.
 * Timeouts and budget stops are recorded under `run.json` → `phases.<phase>`
-  (`timed_out`, `budget_skipped`), in `events.jsonl` if it exists, and in
-  `report.md`.
+  (`timed_out`, `budget_skipped`), in `events.jsonl` and in `report.md`.
 
 ## Backends
 
@@ -137,7 +136,8 @@ kernel-agent optimize <hf-url> [options]
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
 kernel-agent resume <run_dir> [--redo kernels]
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--timeout 300]
-kernel-agent report <run_dir>
+kernel-agent report <run_dir>          report.md + charts + dashboard.html
+kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
 kernel-agent doctor [--smoke]
 kernel-agent install-claude-code <project-dir>
 ```
@@ -171,8 +171,12 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/reference_source.py
   targets/<id>/candidates/    files the agent writes
   targets/<id>/history/       snapshot of every evaluated version
-  targets/<id>/results.jsonl  every evaluation
+  targets/<id>/results.jsonl  every evaluation (full record)
+  targets/<id>/progress.png   speedup per evaluation (see "Charts")
   transforms/                 model-level transforms + results.jsonl
+  results.tsv                 experiment ledger: one row per evaluation
+  events.jsonl                phase changes, agent start/stop, evaluations
+  progress.png  amdahl.png  integration.png  dashboard.html
   integration.json  report.md  logs/
   costs.json                  per agent: $, turns, minutes, tools, session_id
   optimized/                  apply.py + manifest.json + kernels/
@@ -188,6 +192,79 @@ from apply import apply_kernels
 
 apply_kernels(model)  # replaces every matching module instance
 ```
+
+## Experiment ledger
+
+Every evaluation of a run is one row of `results.tsv`: kernel candidates,
+model-level transforms and integration steps (`target = e2e`).
+
+```
+exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
+est_saved_ms  spread  eval_s  hypothesis
+```
+
+* `evaluate_candidate` requires a `hypothesis` (one sentence: what changed and
+  why it should be faster) and accepts an optional `parent` snapshot.
+  `evaluate_e2e` takes an optional `hypothesis`.
+* `status` is `keep` when the result is correct and beats the best kept result
+  by more than the noise: speedup > best × (1 + max(1 %, 2 × timing spread)).
+  Kernels start from the reference module (1.0×), `e2e` rows from the baseline.
+  A correct result that is not better is `discard`. Failures are `incorrect`,
+  `build_error`, `runtime_error`, `crash` or `timeout`. The keep rule is the
+  same one the budget advice uses.
+* `backend` is read from the candidate's imports (`load_inline` → `cuda`,
+  `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
+  there is no custom kernel).
+* `results.jsonl` still has the full records (cases, errors) plus `exp`,
+  `ledger_status` and `hypothesis`. For runs that predate the ledger, the
+  rows are rebuilt from the `results.jsonl` files.
+
+`kernel-agent status <run_dir> [--watch SECONDS]` prints the current phase, the
+baseline, the projected and measured end-to-end latency, the total cost from
+`costs.json`, a table per target (evaluations, keeps, failures, best speedup,
+estimated ms saved, last hypothesis) and the last 10 ledger rows.
+
+`dashboard.html` in the run directory is self-contained: charts inlined as
+PNG, the target table, the latest evaluations and the agent costs. It supports
+light and dark mode and reloads every 30 s while the run is going.
+
+## Charts
+
+The charts need matplotlib, which is in the optional `viz` extra:
+`uv sync --extra viz` (`all` includes it). Without matplotlib nothing is
+drawn, and the ledger, `status` and the dashboard tables still work. The charts
+and `dashboard.html` are redrawn after every evaluation and phase, and by
+`kernel-agent report`. `report.md` embeds them. The colours mean the same thing
+in every chart: green = kept, grey = discarded, red = failed.
+
+`progress.png`: end-to-end latency over wall-clock time. The blue step line
+is the projection from the best kernels (baseline − Σ est. saved ms of each
+target's best kept candidate). Diamonds are measured end-to-end runs
+(transforms and integration steps). Dashed lines mark the baseline and, when it
+is known, the `torch.compile` baseline. The shaded bands are the pipeline phases.
+
+![run progress](docs/images/example-progress.png)
+
+`targets/<id>/progress.png`: module speedup per evaluation. Each kept
+candidate is labelled with its hypothesis. Failures sit on the floor. The
+step line is the running best, and the dashed line is the reference module.
+
+![target progress](docs/images/example-target-progress.png)
+
+`amdahl.png`: the baseline time split by each target's share of the module
+profile, then the same bar with every target at its best module speedup
+(Amdahl's law), then the measured integrated result.
+
+![time split](docs/images/example-amdahl.png)
+
+`integration.png`: the greedy integration as a waterfall. It starts at the
+baseline, then the best single item, then each item added on top: accepted
+(green, ms saved), rejected for no gain (hatched) or failed (red ×).
+
+![integration waterfall](docs/images/example-integration.png)
+
+The example images come from the synthetic run in `tests/synthetic_run.py`
+(`python tests/synthetic_run.py /tmp/demo` writes one and draws its charts).
 
 ## Candidate contract
 
