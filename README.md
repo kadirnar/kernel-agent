@@ -18,6 +18,11 @@ uv run kernel-agent doctor --smoke      # check GPU, compilers, all 5 backends
 uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
 ```
 
+Further reading: [VoxCPM2 case study](docs/VOXCPM2.md) (7.3–7.4× vs eager,
+5.2× vs `torch.compile`) · [roadmap](docs/ROADMAP.md) ·
+[research notes](docs/RESEARCH.md) · [references: what was taken from which
+project or paper](docs/REFERENCES.md).
+
 ## How it works
 
 ```

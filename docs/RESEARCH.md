@@ -4,6 +4,7 @@ What kernel-agent can learn from related systems and papers. Compiled in
 October 2026 from source reading (cloned repositories) and paper pages. Numbers
 are the authors' own and unverified unless stated; "(?)" marks details we could
 not confirm. The roadmap built from these notes is in [ROADMAP.md](ROADMAP.md).
+Which feature came from which source: [REFERENCES.md](REFERENCES.md).
 
 ## 1. Closest systems, read at source level
 
