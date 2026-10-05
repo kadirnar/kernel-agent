@@ -176,6 +176,15 @@ def _short_tb(limit: int = 4000) -> str:
     return text if len(text) <= limit else "...\n" + text[-limit:]
 
 
+def capture_precision(capture: dict[str, Any]) -> str | None:
+    """The reduced precision of a capture in the near-lossless tier (``fp8_weights``: the
+    speed of light counts its weights at 8 bits, :mod:`kernels.roofline`), else None."""
+    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, tier_of
+
+    precision = capture.get("precision")
+    return str(precision) if precision and tier_of(capture) == NEAR_LOSSLESS_TIER else None
+
+
 def _kernel_table(fn: Any, args: Any, kwargs: Any, top: int = 15) -> list[dict[str, Any]]:
     import torch
     from torch.profiler import ProfilerActivity, profile
@@ -555,6 +564,9 @@ def _evaluate(
                 "failures": bad[:5],
             }
         )
+        if comparator.TIER != comparator.EXACT_TIER:  # the numerical error to report
+            rel_l2 = [c["rel_l2"] for c in checks if "rel_l2" in c]
+            case_reports[-1]["max_rel_l2"] = max(rel_l2, default=0.0)
     result["cases"] = case_reports
     if not all_ok:
         failed = next(i for i, r in enumerate(case_reports) if not r["ok"])
@@ -727,7 +739,7 @@ def _evaluate(
         new_ms_weighted=round(new_total, 4),
     )
     # speed of light per case (after timing, never inside it): sol_ms, pct_of_sol, bound
-    annotate(result, reference, cases, l2_flush=l2_flush)
+    annotate(result, reference, cases, l2_flush=l2_flush, precision=capture_precision(capture))
     if profile:
         try:
             first = cases[0]

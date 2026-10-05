@@ -222,6 +222,7 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         profile_dir=out,  # workload_profile.md is for the agent
         variants=workload.variants(),  # extra settings: correctness-only cases
         tier=None if tier == EXACT_TIER else tier,
+        precision=None if tier == EXACT_TIER else spec.get("precision"),  # roofline bytes
     )
     if run.sealed():  # the agent's copy: module + inputs, no reference outputs
         truth.write_inputs_capture(capture, out / "capture_inputs.pt")

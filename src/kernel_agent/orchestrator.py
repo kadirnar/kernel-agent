@@ -351,6 +351,7 @@ class Orchestrator:
                 self.cfg.max_targets,
                 self.python,
                 self.tc.summary(),
+                quality=self.cfg.quality,
             ),
             cwd=self.run.root,
             mcp_tools=[],
@@ -365,7 +366,9 @@ class Orchestrator:
         known = {c["cls"] for c in profile.get("classes", [])}
         targets = []
         for t in plan["targets"][: self.cfg.max_targets]:
-            if problem := region.validate(t, known) or _scope(t):
+            if problem := (
+                region.validate(t, known) or _scope(t) or _precision(t, self.cfg.quality)
+            ):
                 log(f"plan: dropping {t['id']}: {problem}")
                 continue
             t["backends"] = [b for b in t.get("backends", []) if b in backends] or backends[:2]
@@ -376,6 +379,7 @@ class Orchestrator:
             log(
                 f"plan: target {t['id']} = {t['module_class']} via {t['backends']}: "
                 f"{t['approach'][:120]}"
+                + (f" [{t['precision']}: {t.get('precision_why', '')}]" if "precision" in t else "")
             )
         for t in plan.get("transforms", []):
             log(f"plan: transform {t['id']}: {t['idea'][:120]}")
@@ -1475,6 +1479,7 @@ class Orchestrator:
                 self.cfg.max_targets,
                 self.python,
                 self.tc.summary(),
+                quality=self.cfg.quality,
             )
             + context,
             cwd=round_dir,
@@ -1494,7 +1499,7 @@ class Orchestrator:
         taken = {(s.get("module_class"), s.get("phase")) for s in specs}
         new = []
         for t in plan.get("targets", [])[: self.cfg.max_targets]:
-            problem = region.validate(t, known) or _scope(t)
+            problem = region.validate(t, known) or _scope(t) or _precision(t, self.cfg.quality)
             cls = t.get("module_class")
             phase = t.get("phase")
             overlap = any(c == cls and (None in (p, phase) or p == phase) for c, p in taken)
@@ -1727,6 +1732,28 @@ def _scope(target: dict[str, Any]) -> str | None:
         except re.error as exc:
             return f"bad qualname_regex {regex!r}: {exc}"
         target["qualname_regex"] = regex
+    return None
+
+
+def _precision(target: dict[str, Any], quality: str) -> str | None:
+    """Normalise a planned target's ``precision`` / ``precision_why`` in place; returns why
+    the target is refused, or None. A reduced precision (``fp8_weights``, ``reduced``:
+    ``kernels.compare.REDUCED_PRECISIONS``) needs ``--quality near-lossless``."""
+    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, PRECISIONS, REDUCED_PRECISIONS
+
+    precision = target.pop("precision", None) or "exact"
+    why = str(target.pop("precision_why", None) or "").strip()
+    if precision not in PRECISIONS:
+        return f"unknown precision {precision!r}"
+    if precision not in REDUCED_PRECISIONS:
+        return None
+    if quality != NEAR_LOSSLESS_TIER:
+        return f"precision {precision!r} needs --quality near-lossless (this run: {quality})"
+    target["precision"] = precision
+    if why:
+        target["precision_why"] = why
+    else:
+        log(f"plan: {target.get('id')}: precision {precision} without a precision_why")
     return None
 
 

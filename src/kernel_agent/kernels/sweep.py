@@ -429,9 +429,11 @@ def _speed_of_light(
     cases: list[dict[str, Any]],
     timed: list[int],
     l2_flush: bool,
+    precision: str | None = None,
 ) -> str | None:
     """``pct_of_sol`` of every timed row (:func:`kernels.roofline.apply_sol`, the work
-    counted once per case); a note when it cannot be computed."""
+    counted once per case, weights at the capture's ``precision``); a note when it cannot
+    be computed."""
     from kernel_agent.kernels.roofline import apply_sol, count_case, current_peaks
 
     peaks = current_peaks()
@@ -440,7 +442,11 @@ def _speed_of_light(
     try:
         costs = [
             count_case(
-                reference, cases[ci]["args"], cases[ci]["kwargs"], method=cases[ci]["method"]
+                reference,
+                cases[ci]["args"],
+                cases[ci]["kwargs"],
+                method=cases[ci]["method"],
+                precision=precision,
             )
             for ci in timed
         ]
@@ -482,7 +488,7 @@ def sweep(
         toolchain.setup()
     # Imported before the candidate: kernels.bench binds the timer when it is imported.
     from kernel_agent.kernels import bench
-    from kernel_agent.kernels.evaluate import evaluate, quick_cases
+    from kernel_agent.kernels.evaluate import capture_precision, evaluate, quick_cases
     from kernel_agent.profiling.capture import load_capture
 
     start = time.monotonic()
@@ -570,7 +576,8 @@ def sweep(
         )
         for case in out["cases"]:
             case["ref_ms"] = ref_ms[case["case"]]
-        if cuda and (note := _speed_of_light(rows, reference, cases, timed, l2_flush)):
+        precision = capture_precision(capture)  # reduced-precision weights: their own bytes
+        if cuda and (note := _speed_of_light(rows, reference, cases, timed, l2_flush, precision)):
             out["sol_note"] = note
     elif passing:
         out["timing"] = "skipped: no CUDA device" if timed else "skipped: no timed case"

@@ -51,7 +51,7 @@ GLOBAL_TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
 }
 #: Tolerance tiers. ``exact``: the checks above. ``near-lossless``
 #: (``--quality near-lossless``, a target whose spec allows reduced precision,
-#: ``"precision": "reduced"``; recorded in its capture as ``tier``): reduced-precision
+#: :data:`REDUCED_PRECISIONS`; recorded in its capture as ``tier``): reduced-precision
 #: weights (FP8) move every element of a GEMM's output by a few per cent of the output's
 #: RMS, so the per-element (atol, rtol) checks are replaced by whole-tensor bounds. Tensors
 #: without signal keep the exact checks. Calibrated on FP8 (e4m3, per output channel)
@@ -61,6 +61,12 @@ GLOBAL_TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
 EXACT_TIER = "exact"
 NEAR_LOSSLESS_TIER = "near-lossless"
 TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER)
+#: ``"precision"`` of a target spec that ``--quality near-lossless`` captures in the
+#: near-lossless tier: ``fp8_weights`` (FP8 weight-only storage, per-channel scales, bf16
+#: activations; agent/knowledge/low_precision.md) or ``reduced`` (another numerics-changing
+#: kernel). Anything else (``exact``, none) is the exact tier.
+REDUCED_PRECISIONS = ("fp8_weights", "reduced")
+PRECISIONS = (EXACT_TIER, *REDUCED_PRECISIONS)
 NEAR_LOSSLESS_MIN_COSINE = 0.996
 NEAR_LOSSLESS_MAX_REL_L2 = 0.08
 #: ``‖new‖ / ‖ref‖`` within this of 1: rounding noise is unbiased, a wrong scale is not.
@@ -83,8 +89,9 @@ def tier_of(capture: dict[str, Any] | None) -> str:
 
 def tier_for(quality: str | None, precision: str | None) -> str:
     """The tier of a target: ``near-lossless`` when the run's quality mode is
-    ``near-lossless`` and the target's spec allows reduced precision (``"reduced"``)."""
-    near = quality == NEAR_LOSSLESS_TIER and precision == "reduced"
+    ``near-lossless`` and the target's spec allows reduced precision
+    (:data:`REDUCED_PRECISIONS`)."""
+    near = quality == NEAR_LOSSLESS_TIER and precision in REDUCED_PRECISIONS
     return NEAR_LOSSLESS_TIER if near else EXACT_TIER
 
 

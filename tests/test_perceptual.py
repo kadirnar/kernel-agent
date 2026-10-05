@@ -226,28 +226,38 @@ def _call(capsys, run: RunDir, *argv):
     return json.loads(line[-1][len(worker.MARKER) :])
 
 
-@pytest.mark.parametrize("precision", [None, "reduced"])
+@pytest.mark.parametrize(
+    ("precision", "quality"),
+    [
+        (None, "near-lossless"),
+        ("reduced", "near-lossless"),
+        ("fp8_weights", "near-lossless"),
+        ("fp8_weights", "exact"),  # a spec edited after the plan: still the exact tier
+    ],
+)
 def test_capture_records_the_tier_of_reduced_precision_targets(
-    precision, tmp_path, monkeypatch, capsys
+    precision, quality, tmp_path, monkeypatch, capsys
 ):
     _cpu(monkeypatch)
-    run = _sealed(tmp_path, "near-lossless")
+    run = _sealed(tmp_path, quality)
     spec = {"module_class": "Linear", "qualname": "model.backbone", "precision": precision}
     write_json(run.target("lin") / "spec.json", spec)
-    info = _call(capsys, run, "capture", "--target", "lin", "--quality", "near-lossless")
+    info = _call(capsys, run, "capture", "--target", "lin", "--quality", quality)
     capture = run.capture_file("lin")
     keeper = truth.of(run)
     keeper.seal(capture)
     assert compare.tier_of(load_capture(capture)) == (info.get("tier") or "exact")
+    assert load_capture(capture).get("precision") == info.get("precision")
     cand = tmp_path / "fp8.py"
     cand.write_text(FP8_LINEAR)
     result = evaluate(capture, cand, device="cpu", capture_sha256=keeper.expect(capture))
     assert compare.TIER == "exact"  # reset after the evaluation
-    if precision == "reduced":
-        assert info["tier"] == "near-lossless"
+    if precision in compare.REDUCED_PRECISIONS and quality == "near-lossless":
+        assert info["tier"] == "near-lossless" and info["precision"] == precision
         assert result["correct"] and result["tolerance_tier"] == "near-lossless", result
     else:
-        assert "tier" not in info and not result["correct"], result
+        assert "tier" not in info and "precision" not in info
+        assert not result["correct"], result
 
 
 # ---------------------------------------------------------------- analyze + e2e, sealed
