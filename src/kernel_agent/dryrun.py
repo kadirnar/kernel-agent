@@ -639,8 +639,7 @@ class World:
         for path in transforms:
             name = Path(path).name
             rec = next((r for r in records if Path(r["transforms"][0]).name == name), {})
-            stem = re.sub(r"^\d+_|_[0-9a-f]{8}$", "", Path(path).stem)
-            family = FAMILIES.get(stem, "graph")
+            family = FAMILIES.get(ledger.snapshot_stem(path), "graph")
             families[family] = max(families.get(family, 1.0), float(rec.get("speedup") or 1.0))
         reason = next(
             (

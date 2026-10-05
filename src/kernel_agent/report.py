@@ -161,6 +161,12 @@ def write_report(run: RunDir) -> Path:
     if integration:
         lines += ["", "## Integration", ""]
         lines += _chart(run, run.root / "integration.png", "integration waterfall")
+        if composite := integration.get("composite"):
+            lines.append(
+                f"* the measured combination of exp {composite.get('exp')} "
+                f"({len(composite.get('items') or [])} items) "
+                + ("seeded the search" if composite.get("seeded") else "was not faster")
+            )
         for item in integration.get("accepted", []):
             lines.append(f"* accepted {item['kind']}: `{item['item']}`")
         for h in integration.get("history", []):

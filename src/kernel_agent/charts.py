@@ -848,27 +848,37 @@ def _draw_amdahl(
 def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
     """Waterfall steps of the greedy integration in ``integration.json``.
 
-    The best single item seeds the combination; every later history entry adds
-    one item to the accepted set and is either accepted (new level), rejected
-    for no gain, or failed (quality check / error).
+    The best single item seeds the combination, or the systems agent's best
+    measured combination (``composite``) when it was faster; every later history
+    entry adds one item to the accepted set and is either accepted (new level),
+    rejected for no gain, or failed (quality check / error).
     """
     base = _num(data.get("baseline_ms"))
     history = data.get("history") or []
     accepted = [a.get("item") for a in data.get("accepted") or []]
+    composite = data.get("composite") or {}
+    together = composite.get("items")
     if base is None:
         return []
     steps: list[dict[str, Any]] = [{"kind": "total", "label": "baseline", "ms": base}]
     level = base
-    seed = next((h for h in history if h.get("items") == accepted[:1]), None) if accepted else None
+    seeded = bool(composite.get("seeded"))
+    first = together if seeded else accepted[:1]
+    seed = next((h for h in history if h.get("items") == first), None) if accepted else None
     if seed is not None and _num(seed.get("median_ms")) is not None:
-        steps.append(_step("keep", accepted[0], level, float(seed["median_ms"])))
+        step = _step("keep", accepted[0], level, float(seed["median_ms"]))
+        steps.append(_together(step, composite) if seeded else step)
         level = float(seed["median_ms"])
     for h in history:
         items = h.get("items") or []
-        if len(items) < 2:
+        if len(items) < 2 or (items == together and h is seed):
             continue
         item, ms = items[-1], _num(h.get("median_ms"))
-        if item in accepted and h.get("passed") and ms is not None:
+        if items == together:  # measured, but slower than the best single item
+            kind = "nogain" if h.get("passed") and ms is not None else "fail"
+            reason = None if kind == "nogain" else h.get("reason") or h.get("status")
+            steps.append(_together(_step(kind, item, level, ms, reason), composite))
+        elif item in accepted and h.get("passed") and ms is not None:
             steps.append(_step("keep", item, level, ms))
             level = ms
         elif h.get("passed") and ms is not None:
@@ -892,6 +902,12 @@ def _step(
         "ms": ms,
         "reason": str(reason or ""),
     }
+
+
+def _together(step: dict[str, Any], composite: dict[str, Any]) -> dict[str, Any]:
+    """``step`` relabelled as the measured combination (``integration.json`` ``composite``)."""
+    n = len(composite.get("items") or [])
+    return {**step, "label": f"exp {composite.get('exp')} combination", "source": f"{n} items"}
 
 
 def integration(run: RunDir) -> Path | None:

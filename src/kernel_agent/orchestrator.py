@@ -434,7 +434,10 @@ class Orchestrator:
 
         Ordering by *measured* end-to-end gain (not module-level estimates)
         matters: a model-level transform can beat every kernel on its own and
-        be incompatible with them, so the best single item seeds the search.
+        be incompatible with them, so the best single item seeds the search,
+        unless the best combination the systems agent measured (its transforms
+        on top of kernels, ``integration.json`` ``composite``) is faster again
+        now: then that combination seeds it as a whole.
         ``reuse`` (re-integrations of the improve loop) takes combinations of the
         same snapshot files that the previous integration measured from
         ``integration.json`` instead of measuring them again.
@@ -445,14 +448,18 @@ class Orchestrator:
         """
         base_ms = self.truth.baseline_ms()
         items, digests = self._integration_items()
-        log(f"integrate: {len(items)} candidate optimisations")
+        composite = self._integration_composite(digests)
+        log(
+            f"integrate: {len(items)} candidate optimisations"
+            + (f" + the combination of exp {composite[1].get('exp')}" if composite else "")
+        )
 
         history: list[dict[str, Any]] = []
         integration = self.run.root / "integration.json"
         previous = self.truth.load_json(integration) if reuse else {}
         measured = {tuple(h["items"]): h for h in (previous or {}).get("history", [])}
 
-        def e2e(combo: list[tuple[str, str]]) -> dict[str, Any]:
+        def e2e(combo: list[tuple[str, str]], note: str = "") -> dict[str, Any]:
             if (known := measured.get(tuple(a for _, a in combo))) is not None:
                 history.append(known)
                 return known
@@ -470,7 +477,7 @@ class Orchestrator:
                 snapshot="+".join(names),
                 hypothesis="integration: "
                 + " + ".join(names)
-                + (" alone" if len(names) == 1 else ""),
+                + (" alone" if len(names) == 1 else note),
                 eval_s=round(time.perf_counter() - start, 1),
             )
             return r
@@ -487,25 +494,48 @@ class Orchestrator:
 
         accepted: list[tuple[str, str]] = []
         final: dict[str, Any] | None = None
-        if singles:
+        seed: dict[str, Any] | None = None
+        if composite is not None:  # measured again, like everything else
+            combo, rec = composite
+            r = e2e(combo, f" (the combination of exp {rec.get('exp')})")
+            best_ms = singles[0][1]["median_ms"] if singles else base_ms
+            seeded = bool(r.get("passed")) and r["median_ms"] < best_ms
+            seed = {"items": [a for _, a in combo], "exp": rec.get("exp"), "seeded": seeded}
+            names = " + ".join(ledger.item_label(a) for _, a in combo)
+            if seeded:
+                accepted, final = list(combo), r
+                log(f"integrate: seed {names} (exp {rec.get('exp')}): {r['median_ms']:.1f} ms")
+            else:
+                reason = r.get("reason") or r.get("status")
+                if r.get("passed"):
+                    reason = f"{r['median_ms']:.1f} ms, not faster than {best_ms:.1f} ms"
+                log(f"integrate: no seed {names} (exp {rec.get('exp')}): {reason}")
+        if final is None and singles:
             accepted, final = [singles[0][0]], singles[0][1]
-            for item, _ in singles[1:]:
-                r = e2e([*accepted, item])
-                if r.get("passed") and r["median_ms"] < final["median_ms"] * 0.99:
-                    accepted.append(item)
-                    final = r
-                    log(f"integrate: + {Path(item[1]).name} -> {r['median_ms']:.1f} ms")
-                else:
-                    reason = r.get("reason") or r.get("status")
-                    if r.get("passed"):
-                        reason = f"no gain ({r['median_ms']:.1f} ms)"
-                    log(f"integrate: - {Path(item[1]).name} ({reason})")
+        for item, _ in singles:
+            if final is None or item in accepted:  # part of the seed
+                continue
+            if any(_item_key(item) == _item_key(a) for a in accepted):
+                log(f"integrate: = {Path(item[1]).name} (a version of it is accepted)")
+                continue
+            r = e2e([*accepted, item])
+            if r.get("passed") and r["median_ms"] < final["median_ms"] * 0.99:
+                accepted.append(item)
+                final = r
+                log(f"integrate: + {Path(item[1]).name} -> {r['median_ms']:.1f} ms")
+            else:
+                reason = r.get("reason") or r.get("status")
+                if r.get("passed"):
+                    reason = f"no gain ({r['median_ms']:.1f} ms)"
+                log(f"integrate: - {Path(item[1]).name} ({reason})")
         result = {
             "baseline_ms": base_ms,
             "accepted": [{"kind": k, "item": a} for k, a in accepted],
             "final": final,
             "history": history,
         }
+        if seed is not None:
+            result["composite"] = seed
         baseline = self.truth.load_json(self.run.baseline_json)  # its compiled_ms
         reference = self._with_reference(baseline, accepted, previous or {})
         if reference is not None:
@@ -528,33 +558,91 @@ class Orchestrator:
     def _integration_items(self) -> tuple[list[tuple[str, str]], dict[str, str | None]]:
         """Kernel winners + the best transform per idea, and their snapshots' sha256.
 
-        Only records kernel-agent wrote and snapshots that are still the evaluated
-        files count; anything else is ignored (and reported as tampering)."""
+        A transform counts when it is part of a passing ``evaluate_e2e`` record that
+        beat the baseline, alone or with other transforms and kernels (the systems
+        agent evaluates its transforms on top of the kernel winners); of every idea
+        (file stem) the version of the fastest such record. Only records kernel-agent
+        wrote and snapshots that are still the evaluated files count; anything else
+        is ignored (and reported as tampering)."""
         items: list[tuple[str, str]] = []
         digests: dict[str, str | None] = {}
         for target_id, best in self._kernel_bests():
             kernel = str(self.run.history_dir(target_id) / Path(best["snapshot"]).name)
             items.append(("kernel", f"{target_id}={kernel}"))
             digests[kernel] = best.get("snapshot_sha256")
-        try:
-            records = self.truth.records(self.run.results_file())
-        except truth.TamperError:
-            records = []
-        history = self.run.history_dir()
-        best_tf: dict[str, tuple[dict[str, Any], str, str | None]] = {}
-        for rec in records:
-            if rec.get("passed") and not rec.get("kernels") and len(rec.get("transforms", [])) == 1:
-                snap = history / Path(rec["transforms"][0]).name
-                digest = (rec.get("transforms_sha256") or [None])[0]
-                if rec["speedup"] <= 1.0 or not self.truth.snapshot_ok(snap, digest):
+        best_tf: dict[str, tuple[float, str, str | None]] = {}
+        for rec, snaps in self._e2e_records():
+            for snap in snaps:
+                if snap is None:
                     continue
-                stem = re.sub(r"^\d+_|_[0-9a-f]{8}$", "", snap.stem)
-                if stem not in best_tf or rec["speedup"] > best_tf[stem][0]["speedup"]:
-                    best_tf[stem] = (rec, str(snap), digest)
+                stem = ledger.snapshot_stem(snap[0])
+                if stem not in best_tf or rec["speedup"] > best_tf[stem][0]:
+                    best_tf[stem] = (rec["speedup"], *snap)
         for _, transform, digest in best_tf.values():
             items.append(("transform", transform))
             digests[transform] = digest
         return items, digests
+
+    def _integration_composite(
+        self, digests: dict[str, str | None]
+    ) -> tuple[list[tuple[str, str]], dict[str, Any]] | None:
+        """The fastest passing combination the systems agent measured (two or more
+        transforms and kernels) as integration items, and its record (None: there is
+        none); its snapshots' sha256 go to ``digests``. A combination with a file that
+        is not a verified snapshot (a changed transform, a kernel candidate) is skipped."""
+        best: tuple[list[tuple[str, str]], dict[str, Any]] | None = None
+        files: dict[str, str | None] = {}
+        for rec, snaps in self._e2e_records():
+            kernels = [self._kernel_snapshot(k) for k in rec.get("kernels") or []]
+            parts = [*snaps, *kernels]
+            if len(parts) < 2 or None in parts:
+                continue
+            if best is None or rec["speedup"] > best[1]["speedup"]:  # first of equals wins
+                combo = [("transform", s[0]) for s in snaps if s]
+                combo += [("kernel", f"{k[0]}={k[1]}") for k in kernels if k]
+                files = {s[0]: s[1] for s in snaps if s} | {k[1]: k[2] for k in kernels if k}
+                best = (combo, rec)
+        digests.update(files)
+        return best
+
+    def _e2e_records(self) -> list[tuple[dict[str, Any], list[tuple[str, str | None] | None]]]:
+        """Passing ``evaluate_e2e`` records faster than the baseline, each with the snapshot
+        path and sha256 of its transforms (None: no longer the evaluated file)."""
+        try:
+            records = self.truth.records(self.run.results_file())
+        except truth.TamperError:
+            return []
+        history = self.run.history_dir()
+        out = []
+        for rec in records:
+            if not rec.get("passed") or float(rec.get("speedup") or 0.0) <= 1.0:
+                continue
+            shas = rec.get("transforms_sha256") or []
+            snaps: list[tuple[str, str | None] | None] = []
+            for i, name in enumerate(rec.get("transforms") or []):
+                snap, digest = history / Path(name).name, (shas[i] if i < len(shas) else None)
+                snaps.append((str(snap), digest) if self.truth.snapshot_ok(snap, digest) else None)
+            out.append((rec, snaps))
+        return out
+
+    def _kernel_snapshot(self, item: str) -> tuple[str, str, str | None] | None:
+        """(target, snapshot, sha256) of a kernel of an ``evaluate_e2e`` record
+        (``target=path``, usually the agent's copy of a snapshot): the verified
+        snapshot of a correct evaluation with that file name, else None."""
+        target_id, _, path = item.partition("=")
+        if target_id not in self.run.target_ids():
+            return None
+        try:
+            records = self.truth.records(self.run.results_file(target_id))
+        except truth.TamperError:
+            return None
+        snap = self.run.history_dir(target_id) / Path(path).name
+        for rec in records:
+            if rec.get("correct") and Path(str(rec.get("snapshot", ""))).name == snap.name:
+                digest = rec.get("snapshot_sha256")
+                if self.truth.snapshot_ok(snap, digest):
+                    return target_id, str(snap), digest
+        return None
 
     def _with_reference(
         self, baseline: dict[str, Any], accepted: list[tuple[str, str]], previous: dict[str, Any]
@@ -871,6 +959,15 @@ class Orchestrator:
             if phase == until:
                 break
         return self.run
+
+
+def _item_key(item: tuple[str, str]) -> str:
+    """What an integration item optimises (its kernel target or its transform's idea):
+    one version of each can be accepted."""
+    kind, arg = item
+    if kind == "kernel":
+        return f"kernel {arg.partition('=')[0]}"
+    return f"transform {ledger.snapshot_stem(arg)}"
 
 
 def _short(r: dict[str, Any]) -> dict[str, Any]:
