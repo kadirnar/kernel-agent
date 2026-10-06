@@ -50,6 +50,7 @@ from kernel_agent.agent.tools import (
 from kernel_agent.budget import MIN_AGENT_SECONDS, MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
+from kernel_agent.integrate import reuse as reuse_cache
 from kernel_agent.integrate.export import export_optimized
 from kernel_agent.kernels import evaluate, recheck
 from kernel_agent.phases import PHASES as CALL_PHASES
@@ -727,9 +728,13 @@ class Orchestrator:
         Σ est. saved ms, nested kernels counted once) of every accepted set.
 
         ``reuse`` (re-integrations of the improve loop) takes the measurements
-        of the same snapshot files (the same A and B for an A/B) from the
-        previous ``integration.json`` instead of measuring them again, and
-        tries the versions it swapped in or accepted again first.
+        of the same content (:mod:`kernel_agent.integrate.reuse`: the same A and
+        B for an A/B, by the sha256 of every file their items load, under the
+        same evaluator schema, baseline and A/B rounds) from the previous
+        ``integration.json`` instead of measuring them again, whatever the
+        snapshot names (each evaluation snapshots its files anew), and tries
+        the versions it swapped in or accepted again first. ``reuse`` counts
+        the reused and the measured steps.
 
         Everything comes from the verified truth (``truth.py``): the baseline
         latency the orchestrator recorded, records and snapshots whose digests
@@ -747,9 +752,15 @@ class Orchestrator:
         integration = self.run.root / "integration.json"
         previous = self.truth.load_json(integration) if reuse else {}
         known = (previous or {}).get("history", [])
-        paired = {_ab_key(h): h for h in known if h.get("ab")}
-        # items whose state cannot be undone in-process (snapshot paths: content-addressed)
-        irreversible = set((previous or {}).get("irreversible") or [])
+        # by content, not by snapshot name: every evaluation snapshots its files anew (#93)
+        keys = reuse_cache.Keys(self.run, self._reuse_context(base_ms))
+        paired = {  # a crash or timeout can be transient (another process, OOM): measure again
+            h["reuse_key"]: h
+            for h in known
+            if h.get("ab") and h.get("reuse_key") and h.get("status") not in _TRANSIENT
+        }
+        counts = {"reused": 0, "measured": 0}
+        irreversible = set((previous or {}).get("irreversible") or [])  # not undone in-process
         versions = self._previous_versions(previous or {}, digests)
         rechecks: list[dict[str, Any]] = []
         if self.cfg.recheck:  # fresh inputs, separate processes; failing kernels are refused
@@ -758,6 +769,10 @@ class Orchestrator:
             )
             refused = {r["item"] for r in rechecks if not r.get("passed")}
             versions = [v for v in versions if v[1] not in refused]
+        # and this integration's items with the content of such an item (another snapshot)
+        stuck = {k for x in irreversible if (k := keys.arg(x)) is not None}
+        everything = [*items, *(composite[0] if composite else []), *versions]
+        irreversible.update(x for k, x in everything if stuck and keys.item((k, x)) in stuck)
 
         def ab(
             a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = "", **swap: str
@@ -765,7 +780,12 @@ class Orchestrator:
             """B's result with its ``ab`` record (decided) against A (``swap``: the
             ``kind``, ``old`` and ``new`` item of a version swap, kept in its history entry)."""
             a_items = [x for _, x in a]
-            hit = paired.get((tuple(a_items), tuple(x for _, x in b)))
+            key = keys.step(a, b)
+            hit = paired.get(key) if key is not None else None
+            counts["measured" if hit is None else "reused"] += 1
+            if hit is not None:
+                names = " + ".join(ledger.item_label(x) for _, x in b)
+                log(f"integrate: reused {names}{note}: measured before with the same content")
             r = dict(hit) if hit is not None else self._paired(a, b, note, irreversible)
             record = {**(r.get("ab") or {}), "a_items": a_items}
             if record.get("a_ms") and record.get("b_ms"):
@@ -776,7 +796,8 @@ class Orchestrator:
                 why = record.get("why") or r.get("reason") or r.get("status")
                 record.update(accepted=False, why=why)
             r["ab"] = record
-            history.append({**swap, "items": [x for _, x in b], **_short(r), "ab": record})
+            entry = {**swap, "items": [x for _, x in b], **_short(r), "ab": record}
+            history.append({**entry, "reuse_key": key} if key is not None else entry)
             return r
 
         singles: list[tuple[tuple[str, str], dict[str, Any]]] = []
@@ -872,6 +893,7 @@ class Orchestrator:
         }
         if seed is not None:
             result["composite"] = seed
+        result["reuse"] = counts  # A/B steps taken from the previous integration / measured
         if irreversible:
             result["irreversible"] = sorted(irreversible)
         if rechecks:
@@ -882,6 +904,11 @@ class Orchestrator:
             result["reference"] = reference
         write_json(integration, result)
         self.truth.seal(integration)
+        if reuse:
+            log(
+                f"integrate: {counts['reused']} of {len(history)} measurements reused "
+                f"(unchanged content), {counts['measured']} measured"
+            )
         export_optimized(self.run, [(k, a, 0.0) for k, a in accepted], digests=digests)
         self._library_store([a for k, a in accepted if k == "kernel"], final)
         if final:
@@ -896,6 +923,21 @@ class Orchestrator:
         else:
             log("integrate: no optimisation survived end-to-end validation")
         self._mark("integrate", speedup=final["speedup"] if final else 1.0)
+
+    def _reuse_context(self, base_ms: float) -> dict[str, Any]:
+        """What an integration measurement depends on besides its items, part of every
+        reuse key (:mod:`kernel_agent.integrate.reuse`): the evaluator schema (a bump
+        invalidates every earlier measurement, as in :meth:`_recheck_kernels`), the
+        baseline the A/B ran against (its latency, ``baseline.json`` and the digests and
+        quality mode the worker verifies) and the A/B rounds."""
+        baseline = self.run.baseline_json
+        return {
+            "evaluator_schema": evaluate.EVALUATOR_SCHEMA,
+            "baseline_ms": base_ms,
+            "baseline_sha256": truth.sha256_file(baseline) if baseline.exists() else None,
+            "worker_args": self.truth.worker_args(),
+            "ab_rounds": self.cfg.ab_rounds,
+        }
 
     def _recheck_kernels(
         self,
@@ -1827,11 +1869,6 @@ def _cli(
     return cli
 
 
-def _ab_key(h: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """(A items, B items) of an A/B history entry: what a re-integration may reuse."""
-    return tuple(h["ab"].get("a_items") or []), tuple(h["items"])
-
-
 def _alone(base_ms: float, history: list[dict[str, Any]]) -> dict[str, float]:
     """Est. saved ms of every item that passed alone: its paired gain against the
     unmodified model × the baseline."""
@@ -1843,6 +1880,10 @@ def _alone(base_ms: float, history: list[dict[str, Any]]) -> dict[str, float]:
         and h.get("passed")
         and (h.get("ab") or {}).get("gain") is not None
     }
+
+
+#: Statuses of an integration measurement a re-integration measures again, not reuses.
+_TRANSIENT = ("crash", "error", "harness_error", "timeout")
 
 
 def _short(r: dict[str, Any]) -> dict[str, Any]:
