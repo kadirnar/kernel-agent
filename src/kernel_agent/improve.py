@@ -44,7 +44,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import interrupt, ledger, pivot, research, workers
+from kernel_agent import interrupt, ledger, objective, pivot, research, workers
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
@@ -227,12 +227,20 @@ def kernel_digest(
     lines += [
         "",
         "## Where this target stands",
-        f"* It costs about {arm.remaining_ms:.1f} ms per model run now; the scheduler expects "
+        # the scheduler's ms are the metric's (#114): per second of audio for throughput
+        f"* It costs about {arm.remaining_ms:.1f} ms {_per(run)} now; the scheduler expects "
         f"{arm.headroom:.0%} of that can still go.",
         f"* {arm.streak} evaluations in a row without a new best; after {policy.patience} the "
         "target is stopped, so prefer a fundamentally different idea over small variations.",
     ]
     return "\n".join(lines + _footer("NOTES.md"))
+
+
+def _per(run: RunDir) -> str:
+    """What a ms of the run's metric is per: ``per model run`` (the latency), ``per second
+    of generated audio`` (throughput), ``to first audio`` (ttfa)."""
+    metric = objective.of(read_json(run.baseline_json, {}) or {})
+    return "per model run" if metric.name == objective.LATENCY else metric.per
 
 
 def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy) -> str:

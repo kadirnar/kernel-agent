@@ -608,6 +608,35 @@ A workload that cannot time the requested metric is refused before the run
 starts. For `throughput` the profile covers the whole batched run (its value is
 a rate).
 
+A kernel's estimated saving (`est_saved_ms_per_run`: its gain per call × its
+calls per run) is in ms per run of the workload, not in the metric. Wherever it
+meets the metric (the projections of `integration.json`, `status`, `watch`, the
+dashboard, `progress.png`, `amdahl.png`, `report.md`, and the improve
+scheduler's region arms) it is converted first by one helper,
+`objective.from_run` (`projection.Units` per run):
+
+* `latency`: as it is.
+* `throughput`: ÷ the seconds of audio a batched run makes (`metric_detail.audio_s`),
+  giving ms per second of generated audio. On VoxCPM2 at batch 16 a run of 5,784 ms
+  makes 153.6 s of audio, so `loc_enc_decode`'s 323 ms per run is 2.1 ms of the
+  37.7 ms baseline. The integration of `20261006-004718-retest` had subtracted the
+  323 ms itself and projected −746 ms for a set measured at 6.8 ms. With the
+  conversion the projection is 12.8 ms.
+* `ttfa`: the capture times a full streamed run, so only the calls inside the
+  first-audio window count. The estimate's gain per call (its cases' calls per run ×
+  the instances calling their entrypoint, the evaluator's weights) is multiplied by
+  the calls of the target's instances in the profile, which is taken inside the
+  window: its class (a region: its parent class), its `phase`, and the instance
+  groups its `qualname_regex` matches (`classes[].work`). A class the window's
+  profile never saw makes no call before the first audio. Without a profile, a
+  capture, or the per-group calls a regex needs, the share is unknown. Such a target
+  is not projected, and the views say so (`not projected (its calls inside the
+  first-audio window are unknown): ...`).
+
+The scheduler's kernel arms already use the profile's share × the baseline, which
+is in the metric's ms, and the ceilings table stays in the profiled window's own
+unit (per batched run for `throughput`).
+
 ### Integration: paired A/B with undo handles
 
 Process-to-process variance on a consumer GPU is often larger than 1 %, so the
@@ -676,9 +705,11 @@ Every step in `integration.json` → `history` carries its `ab` record: `mode`
 (`paired` / `separate`), `a_items`, the timings `a_ms` / `b_ms`, `wins`,
 `win_rate`, `gain`, `ci95`, `accepted`, `why`, the `rule`, the undo check and
 the GPU telemetry. `projection` lists, for every accepted set, the projected
-latency (baseline − Σ est. saved ms: a kernel's module-level estimate, a
-transform's measured gain alone) next to the measured one; `report.md` shows
-both. Nested kernels count once, as in the run's projection (see Charts): a
+latency (baseline − Σ est. saved ms: a kernel's module-level estimate converted
+to the metric's ms, see "What faster means"; a transform's measured gain alone)
+next to the measured one; `report.md` shows both. `est_saved_unit: "metric"`
+marks the conversion. In a file written before it, a kernel's saving is per run,
+and `report.md` converts it when it reads the file. Nested kernels count once, as in the run's projection (see Charts): a
 decoder layer's kernel and the attention kernel inside it add up to the better
 of the two, not both. `counted_ms` holds the part of each item's saving that
 counts, and `report.md` names the kernels not counted.
@@ -2245,8 +2276,8 @@ value for that column.
 baseline, the projected (nested targets counted once, see Charts) and measured
 end-to-end latency, the total cost from
 `costs.json`, a table per target (evaluations, keeps, failures, best speedup,
-its % of speed of light, estimated ms saved, last hypothesis) and the last 10
-ledger rows.
+its % of speed of light, estimated ms saved in the metric's ms, last hypothesis)
+and the last 10 ledger rows.
 
 `dashboard.html` in the run directory is self-contained: charts inlined as
 PNG, the target table, the latest evaluations and the agent costs. It supports
@@ -2263,7 +2294,7 @@ in every chart: green = kept, grey = discarded, red = failed.
 
 `progress.png`: end-to-end latency over wall-clock time. The blue step line
 is the projection from the best kernels (baseline − Σ est. saved ms of each
-target's best kept candidate). Diamonds are measured end-to-end runs
+target's best kept candidate, in the metric's ms: see "What faster means"). Diamonds are measured end-to-end runs
 (transforms and integration steps). Dashed lines mark the baseline and, when it
 is known, the `torch.compile` baseline. The shaded bands are the pipeline phases.
 The end labels of the projection and of the highlighted measurement are placed

@@ -650,6 +650,14 @@ td.nowrap { white-space: nowrap; }
   function metricOf(sm) {
     return sm.metric || { name: "latency", title: "End-to-end latency", short: "latency", per: "per run" };
   }
+  // a row's est. saved ms in the metric's ms: a kernel's estimate is per run of the workload
+  // (× its factor, projection.Units; null when unknown), an e2e row's measured gain is not
+  function savedOf(r) {
+    const factors = S.summary.saved_factors;
+    if (r.target === "e2e" || r.est_saved_ms == null || !factors) return r.est_saved_ms;
+    const f = factors[r.target];
+    return f == null ? null : r.est_saved_ms * f;
+  }
   function renderTiles() {
     const sm = S.summary, run = sm.run, base = sm.baseline.eager_ms, comp = sm.baseline.compiled_ms;
     const mt = metricOf(sm), tag = mt.name === "latency" ? "" : ` · ${mt.short}`;
@@ -671,7 +679,9 @@ td.nowrap { white-space: nowrap; }
         keptKernel && proj && base
           ? `${fmt.x(base / proj)} if the best kernels add up` +
             (sm.projection && sm.projection.label ? ` · from ${sm.projection.label}` : "")
-          : "no kept kernel yet"],
+          : keptKernel && sm.projection && sm.projection.label
+            ? sm.projection.label  // every saving unknown in the metric (projection.py)
+            : "no kept kernel yet"],
       ["Evaluations", String(c.evaluations), `${c.keeps} kept · ${c.failures} failed · ${c.e2e} end-to-end`],
       ["Elapsed", fmt.dur(elapsedNow()), state, "elapsed"],
       ["Agent cost", fmt.usd(total),
@@ -792,7 +802,7 @@ td.nowrap { white-space: nowrap; }
       points.push({ x: xs(p.t), y: ys(p.ms), r: 6, open: openFor(r), tip: () => tipContent(
         `projected ${fmt.ms(p.ms)}`,
         `${fmt.x(base / p.ms)} vs eager · after #${r.exp} ${r.status === "keep" ? "kept" : r.status}`,
-        [`${r.target} ${fmt.x(r.speedup)} · ${r.backend} · ${fmt.ms(r.est_saved_ms)} saved`, r.time], r.hypothesis) });
+        [`${r.target} ${fmt.x(r.speedup)} · ${r.backend} · ${fmt.ms(savedOf(r))} saved`, r.time], r.hypothesis) });
     }
     for (const m of [...measured, ...failed]) {
       const r = m.row, ok = r.status === "keep" || r.status === "discard";
@@ -827,7 +837,7 @@ td.nowrap { white-space: nowrap; }
           h("div", { class: "best" }, h("span", {}, "best"), fmt.x(t.best_speedup))),
         h("p", { class: "stats" }, ...[
           `${t.evals} eval${t.evals === 1 ? "" : "s"}`, `${t.keeps} kept`, `${t.failures} failed`,
-          t.best_backend, t.est_saved_ms != null ? `−${fmt.ms(t.est_saved_ms)} per run` : null, share,
+          t.best_backend, t.saved_ms != null ? `−${fmt.ms(t.saved_ms)} ${metricOf(sm).per}` : null, share,
         ].filter(Boolean).flatMap((text, i) => [i ? " · " : null, h("span", { class: "nowrap" }, text)])),
         chart,
         t.last_hypothesis ? h("p", { class: "last", title: t.last_hypothesis }, `latest: ${t.last_hypothesis}`) : null);
@@ -1060,7 +1070,7 @@ td.nowrap { white-space: nowrap; }
         h("td", {}, h("span", { class: `pill ${k}` }, h("i", {}), r.status.replaceAll("_", " "))),
         h("td", { class: "num" }, fmt.x(r.speedup)),
         h("td", { class: "num" }, r.target === "e2e" ? fmt.ms(r.new_ms) : fmt.ms(r.new_ms, 3)),
-        h("td", { class: "num" }, fmt.ms(r.est_saved_ms)),
+        h("td", { class: "num" }, fmt.ms(savedOf(r))),
         h("td", { class: "hyp" }, r.idea ? [h("code", { title: "idea_id" }, r.idea), " "] : null,
           r.hypothesis || r.snapshot || ""),
         h("td", {}, r.file ? h("button", { class: "linkish", type: "button", title: r.file,

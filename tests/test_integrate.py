@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel_agent import abtest, charts, dryrun, ledger, orchestrator, truth
+from kernel_agent import abtest, charts, dryrun, ledger, orchestrator, projection, truth
 from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.report import write_report
@@ -449,6 +449,42 @@ def test_projection_counts_nested_kernels_once(tmp_path):
     assert second["measured_ms"] == data["final"]["median_ms"]
     report = write_report(run).read_text()
     assert "| `attn` + `layer` (not counted, nested: layer) |" in report
+
+
+def test_projection_puts_kernel_savings_in_the_metric(tmp_path):
+    """Issue #114: with metric=throughput the baseline is ms per second of generated audio,
+    a kernel's est. saved ms is per batched run. The projection subtracted the second from
+    the first (VoxCPM2 batch 16: 316 ms per run from 37.7 ms per audio s, −736.9 ms); it
+    divides it by the seconds of audio a run makes first."""
+    config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path)
+    run = dryrun.create_run(config)
+    audio_s = 100.0  # a batched run of BASE × 100 ms makes 100 s of audio
+    baseline = read_json(run.baseline_json)
+    baseline.update(metric="throughput", metric_detail={"audio_s": audio_s, "run_ms": BASE * 100})
+    truth.writable(run.baseline_json)
+    write_json(run.baseline_json, baseline)
+    truth.of(run).seal_baseline(BASE)
+    orch = orchestrator.Orchestrator(run, config)
+    kernel(run, "attn", 2.1, saved_ms=0.45 * BASE * audio_s)  # per run
+    orch.worker = noisy_worker([], {})
+    asyncio.run(orch.integrate())
+
+    data = read_json(run.root / "integration.json")
+    assert [label(a["item"]) for a in data["accepted"]] == ["attn"]
+    (entry,) = data["projection"]
+    (item,) = entry["items"]
+    assert entry["est_saved_ms"] == pytest.approx({item: 0.45 * BASE})
+    assert entry["projected_ms"] == pytest.approx(0.55 * BASE)
+    assert entry["est_saved_unit"] == projection.SAVED_UNIT
+    row = f"| `attn` | {0.55 * BASE:.1f} | {entry['measured_ms']:.1f} |"
+    assert row in write_report(run).read_text()
+
+    # an integration.json from before #114 holds the saving per run: the report converts it
+    old = {k: v for k, v in entry.items() if k not in ("est_saved_unit", "counted_ms")}
+    old.update(est_saved_ms={item: 0.45 * BASE * audio_s}, projected_ms=-43.0 * BASE)
+    truth.writable(run.root / "integration.json")
+    write_json(run.root / "integration.json", {**data, "projection": [old]})
+    assert row in write_report(run).read_text()
 
 
 def test_paired_singles_keep_a_kernel_a_busy_process_hid(tmp_path):

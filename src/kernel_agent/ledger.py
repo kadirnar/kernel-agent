@@ -592,6 +592,8 @@ def start_time(run: RunDir, ledger_rows: list[dict[str, Any]] | None = None) -> 
 
 def summary(run: RunDir) -> dict[str, Any]:
     """Everything ``status``, the dashboard and the report show about a run."""
+    from kernel_agent import projection  # it imports this module
+
     data = run.load() if run.run_json.exists() else {}
     ledger_rows = rows(run)
     baseline = read_json(run.baseline_json, {}) or {}
@@ -599,6 +601,7 @@ def summary(run: RunDir) -> dict[str, Any]:
     targets = []
     ids = list(run.target_ids())
     ids += sorted({r["target"] for r in ledger_rows} - {E2E} - set(ids))
+    units = projection.units_of(run, ids)  # est. saved ms per run → the metric's ms
     for target_id in ids:
         spec = read_json(run.target(target_id) / "spec.json", {}) or {}
         trows = measured(r for r in ledger_rows if r["target"] == target_id)
@@ -620,15 +623,15 @@ def summary(run: RunDir) -> dict[str, Any]:
                 "best_pct_of_sol": best.get("pct_of_sol") if best else None,
                 "best_snapshot": best["snapshot"] if best else None,
                 "best_backend": best["backend"] if best else None,
-                "est_saved_ms": best["est_saved_ms"] if best else None,
+                "est_saved_ms": best["est_saved_ms"] if best else None,  # per run
+                "saved_ms": units(target_id, best["est_saved_ms"]) if best else None,  # metric
                 "last_hypothesis": trows[-1]["hypothesis"] if trows else "",
                 "workers": sorted({str(r["worker"]) for r in trows if r.get("worker")}, key=int),
             }
         )
-    from kernel_agent import projection  # it imports this module
-
     # nested targets counted once (a decoder layer's kernel replaces its attention's)
-    proj = projection.of_run(run, {t["id"]: t["est_saved_ms"] for t in targets}, base_ms)
+    saved = {t["id"]: t["est_saved_ms"] for t in targets}
+    proj = projection.of_run(run, saved, base_ms, units)
     kept_e2e = [r for r in ledger_rows if r["target"] == E2E and r["status"] == KEEP]
     best_e2e = kept_e2e[-1] if kept_e2e else None  # running best end-to-end measurement
     integration = read_json(run.root / "integration.json", {}) or {}
@@ -661,8 +664,12 @@ def summary(run: RunDir) -> dict[str, Any]:
         "compiled_ms": _num(baseline.get("compiled_ms")),
         "baseline": baseline,
         "workload": baseline.get("workload"),
-        "projected_ms": proj.projected_ms if proj and base_ms else None,
+        # none when every saving is unknown in the metric (metric=ttfa without its window)
+        "projected_ms": proj.projected_ms
+        if proj and base_ms and (proj.used or not proj.unknown)
+        else None,
         "projection": proj,
+        "units": units,  # a row's est. saved ms in the metric's (projection.Units.of_row)
         "best_e2e": best_e2e,
         "final": final or None,
         "reference": integration.get("reference") or None,

@@ -81,8 +81,8 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         else:
             header[-1] += "  |  " + part
     lines += header
-    if s["projection"] and s["projection"].used:  # projection.py: nested targets counted once
-        text = f"projected from {s['projection'].describe()}"
+    if s["projection"] and s["projection"].shown:  # projection.py: nested targets counted once
+        text = s["projection"].headline()
         lines.append(text if len(text) <= width else text[: width - 1] + "…")
     if s["reference"]:
         lines.append(
@@ -104,7 +104,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
             str(t["failures"]),
             _x(t["best_speedup"]),
             _pct(t.get("best_pct_of_sol")),
-            _ms(t["est_saved_ms"]),
+            _ms(t["saved_ms"]),  # in the metric's ms (per audio s for metric=throughput)
             t["last_hypothesis"] or "",
         ]
         for t in s["targets"]

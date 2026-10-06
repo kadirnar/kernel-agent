@@ -42,16 +42,24 @@ Approximations:
 * a region overlaps none of its parent's other children;
 * every saving is still a module-level estimate: what shows up end to end is
   what the integration measures.
+
+Units (:class:`Units`): a kernel's est. saved ms is per run of the workload, the baseline
+in the run's metric (:mod:`kernel_agent.objective`). Every projection of kernel savings
+converts them first (:func:`kernel_agent.objective.from_run`): as they are for
+``latency``, ÷ the seconds of audio of a batched run for ``throughput`` (ms per second of
+generated audio), their share inside the first-audio window for ``ttfa``
+(:func:`window`). A saving with no value in the metric is not projected (``unknown``).
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger
+from kernel_agent import ledger, objective
 from kernel_agent.workspace import RunDir, read_json
 
 _INDEX = re.compile(r"\.\d+(?=\.|$)")
@@ -96,8 +104,10 @@ class Tree:
 @dataclass(frozen=True)
 class Projection:
     baseline_ms: float
-    savings: dict[str, float]  # each target's own est. saved ms (> 0)
+    savings: dict[str, float]  # each target's own est. saved ms (> 0), in the metric's ms
     counted: dict[str, float]  # the part of it the projection counts
+    unknown: tuple[str, ...] = ()  # a saving per run with no value in the metric: left out
+    unknown_why: str = ""  # why (objective.unknown_why)
 
     @property
     def saved_ms(self) -> float:
@@ -122,13 +132,25 @@ class Projection:
         own = self.savings.get(target, 0.0)
         return min(self.counted.get(target, 0.0) / own, 1.0) if own > 0 else 0.0
 
+    @property
+    def shown(self) -> bool:
+        """Whether there is anything to say: a counted saving or one left out as unknown."""
+        return bool(self.used or self.unknown)
+
     def describe(self) -> str:
-        """``a + b (40 %) + c; not counted (nested): d, e`` ("" without a saving)."""
+        """``a + b (40 %) + c; not counted (nested): d, e; not projected (why): f`` ("" without
+        a saving)."""
         used = [t if self.part(t) > 0.995 else f"{t} ({self.part(t):.0%})" for t in self.used]
-        text = " + ".join(used)
+        parts = [" + ".join(used)] if used else []
         if self.left_out:
-            text += "; not counted (nested): " + ", ".join(self.left_out)
-        return text
+            parts.append("not counted (nested): " + ", ".join(self.left_out))
+        if self.unknown:
+            parts.append(f"not projected ({self.unknown_why}): " + ", ".join(self.unknown))
+        return "; ".join(parts)
+
+    def headline(self) -> str:
+        """``projected from`` :meth:`describe`; only what is not projected without a saving."""
+        return f"projected from {self.describe()}" if self.used else self.describe()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +158,7 @@ class Projection:
             "saved_ms": round(self.saved_ms, 3),
             "counted": {t: round(ms, 3) for t, ms in self.counted.items()},
             "left_out": self.left_out,
+            "unknown": list(self.unknown),
             "label": self.describe(),
         }
 
@@ -146,11 +169,21 @@ class Projection:
 # ------------------------------------------------------------------ projection
 
 
-def project(tree: Tree, saved: Mapping[str, float | None], baseline_ms: float) -> Projection:
+def project(
+    tree: Tree,
+    saved: Mapping[str, float | None],
+    baseline_ms: float,
+    units: Units | None = None,
+) -> Projection:
     """``baseline − Σ saved`` over the best set of targets that do not overlap.
 
-    ``saved``: est. saved ms per run of each target (its best kept result). A
-    target that is not in the tree counts in full."""
+    ``saved``: est. saved ms of each target (its best kept result) in the metric's ms, or
+    per run of the workload with ``units``, which converts them (a saving it cannot
+    convert is left out: ``unknown``). A target that is not in the tree counts in full."""
+    unknown: list[str] = []
+    if units is not None:
+        per_run, saved = saved, units.convert(saved)
+        unknown = sorted(t for t, ms in per_run.items() if ms and ms > 0 and saved[t] is None)
     savings = {t: float(ms) for t, ms in saved.items() if ms is not None and ms > 0}
     groups, parents = tree.groups, tree.parents
     own = [savings.get(g.target, 0.0) * g.share for g in groups]
@@ -178,14 +211,16 @@ def project(tree: Tree, saved: Mapping[str, float | None], baseline_ms: float) -
     for target, ms in savings.items():
         if target not in in_tree:
             counted[target] = ms
-    return Projection(baseline_ms, savings, counted)
+    why = units.why if units is not None and unknown else ""
+    return Projection(baseline_ms, savings, counted, tuple(unknown), why)
 
 
 def series(
-    tree: Tree, baseline_ms: float, rows: Iterable[dict[str, Any]]
+    tree: Tree, baseline_ms: float, rows: Iterable[dict[str, Any]], units: Units | None = None
 ) -> list[tuple[dict[str, Any], Projection]]:
     """The projection after every kept or re-evaluated kernel row, each target at its best
-    result that stands (:func:`ledger.standing`, as in :func:`ledger.summary`)."""
+    result that stands (:func:`ledger.standing`, as in :func:`ledger.summary`); ``units``
+    converts the rows' est. saved ms per run to the metric (:func:`project`)."""
     mine: dict[str, list[dict[str, Any]]] = {}
     saved: dict[str, float | None] = {}
     out = []
@@ -197,14 +232,175 @@ def series(
             stand = ledger.standing(mine[row["target"]])
             best = max(stand, key=lambda r: r["speedup"] or 0.0, default=None)
             saved[row["target"]] = best.get("est_saved_ms") if best else None
-            out.append((row, project(tree, saved, baseline_ms)))
+            out.append((row, project(tree, saved, baseline_ms, units)))
     return out
 
 
 def of_run(
-    run: RunDir, saved: Mapping[str, float | None], baseline_ms: float | None
+    run: RunDir,
+    saved: Mapping[str, float | None],
+    baseline_ms: float | None,
+    units: Units | None = None,
 ) -> Projection | None:
-    return None if baseline_ms is None else project(tree(run), saved, baseline_ms)
+    """The run's projection of ``saved`` (est. saved ms per run of each target), converted
+    with ``units`` (default: the run's, :func:`units_of`)."""
+    if baseline_ms is None:
+        return None
+    return project(tree(run), saved, baseline_ms, units or units_of(run))
+
+
+def kernel_target(item: str) -> str | None:
+    """The target of an integration item that is a kernel (``target=path``), else None (a
+    transform's path)."""
+    target, sep, _ = item.partition("=")
+    return target if sep and "/" not in target else None
+
+
+#: ``integration.json`` ``projection[].est_saved_unit``: every saving is in the metric's ms
+#: (since #114; an entry without it holds a kernel's ms per run: :func:`in_metric`).
+SAVED_UNIT = "metric"
+
+
+def in_metric(
+    entry: Mapping[str, Any], tree: Tree, units: Units, baseline_ms: float
+) -> dict[str, Any]:
+    """An ``integration.json`` projection entry with every saving in the metric's ms. One
+    written before #114 (no ``est_saved_unit``) holds its kernels' est. saved ms per run
+    of the workload: :func:`of_set` projects it again with them converted (``units``)."""
+    if entry.get("est_saved_unit") == SAVED_UNIT:
+        return dict(entry)
+    saved: dict[str, float | None] = {}
+    for item, ms in (entry.get("est_saved_ms") or {}).items():
+        target = kernel_target(item)
+        value = units(target, ms) if target is not None else ms
+        saved[item] = None if value is None else round(value, 3)
+    return {**entry, **of_set(tree, saved, baseline_ms), "est_saved_unit": SAVED_UNIT}
+
+
+def of_set(tree: Tree, saved: Mapping[str, float | None], baseline_ms: float) -> dict[str, Any]:
+    """Projected ms of an integration's accepted set (``integration.json`` ``projection``):
+    ``saved`` maps each item (a kernel's ``target=path``, a transform's path) to its est.
+    saved ms in the metric's ms (a kernel's module-level estimate, :class:`Units`; a
+    transform's measured gain alone). Kernels nest by target; transforms are in no tree
+    and count in full, a slower one too. ``counted_ms``: the part of each saving counted."""
+    key = {a: kernel_target(a) or a for a in saved}
+    proj = project(tree, {key[a]: v for a, v in saved.items()}, baseline_ms)
+    slower = sum(v for v in saved.values() if v is not None and v < 0)
+    return {
+        "projected_ms": round(baseline_ms - proj.saved_ms - slower, 3),
+        "est_saved_ms": dict(saved),
+        "counted_ms": {
+            a: round(proj.counted.get(key[a], 0.0), 3)
+            for a, v in saved.items()
+            if v is not None and v > 0
+        },
+    }
+
+
+# ------------------------------------------------------------------ units
+
+
+@dataclass(frozen=True)
+class Units:
+    """A target's module-level estimate, ms per run of the workload, in the run's metric
+    (:func:`kernel_agent.objective.from_run`): ``baseline`` is its ``baseline.json``,
+    ``windows`` (``metric=ttfa``) each target's share inside the first-audio window
+    (:func:`window`). ``Units()`` keeps ms per run (the latency)."""
+
+    baseline: dict[str, Any] = field(default_factory=dict)
+    windows: dict[str, float] = field(default_factory=dict)
+
+    def __call__(self, target: str, ms: float | None) -> float | None:
+        return objective.from_run(ms, self.baseline, self.windows.get(target))
+
+    def convert(self, saved: Mapping[str, float | None]) -> dict[str, float | None]:
+        return {t: self(t, ms) for t, ms in saved.items()}
+
+    def factor(self, target: str) -> float | None:
+        """The metric's ms per ms per run of ``target`` (None: unknown)."""
+        return self(target, 1.0)
+
+    def of_row(self, row: Mapping[str, Any]) -> float | None:
+        """A ledger row's est. saved ms in the metric: a kernel row's estimate converted, an
+        ``e2e`` row's measured gain (baseline − new) as it is."""
+        ms = row.get("est_saved_ms")
+        return ms if row.get("target") == ledger.E2E else self(str(row.get("target")), ms)
+
+    @property
+    def why(self) -> str:
+        return objective.unknown_why(self.baseline)
+
+
+def units_of(
+    run: RunDir, targets: Iterable[str] | None = None, baseline: dict[str, Any] | None = None
+) -> Units:
+    """The :class:`Units` of a run (``metric=ttfa``: with the :func:`window` of each of
+    ``targets``, default every target); ``baseline``: its ``baseline.json`` when already
+    read (the orchestrator's, verified)."""
+    if baseline is None:
+        baseline = read_json(run.baseline_json, {}) or {}
+    if objective.of(baseline).name != objective.TTFA:
+        return Units(baseline)
+    ids = run.target_ids() if targets is None else list(targets)
+    profiles = [read_json(p, {}) or {} for p in _profile_paths(run)]
+    shares = {t: window(read_json(run.target(t) / "spec.json", {}) or {}, profiles) for t in ids}
+    return Units(baseline, {t: s for t, s in shares.items() if s is not None})
+
+
+def window(spec: Mapping[str, Any], profiles: Sequence[Mapping[str, Any]]) -> float | None:
+    """``metric=ttfa``: the share of a target's est. saved ms per run inside the first-audio
+    window, or None when the profiles cannot tell.
+
+    The estimate covers the calls of a full streamed run (the capture runs it whole): its
+    cases' calls per run × the instances that call their entrypoint, as the evaluator
+    weights them. The profiles are taken inside the window (``Workload.metric_window``):
+    the calls of the target's class there (a region: of its parent class), in its
+    ``phase``; with a ``qualname_regex``, of the instance groups it matches
+    (``classes[].work``; None without them). A class that no profile saw makes no call
+    before the first audio. The share = calls in the window ÷ calls covered (at most 1):
+    the estimate's gain per call × the calls inside the window."""
+    capture = spec.get("capture") or {}
+    users = capture.get("method_instances") or {}
+    covered = sum(
+        float(c.get("count") or 0) * float(users.get(str(c.get("method") or "forward")) or 1)
+        for c in capture.get("cases") or []
+    )
+    calls = _window_calls(spec, profiles)
+    return None if covered <= 0 or calls is None else min(calls / covered, 1.0)
+
+
+def _window_calls(spec: Mapping[str, Any], profiles: Sequence[Mapping[str, Any]]) -> float | None:
+    """Calls of a target's instances in the profiled window (:func:`window`)."""
+    region = spec.get("kind") == "region"
+    cls = str(spec.get("parent_class") if region else spec.get("module_class"))
+    phase, regex = spec.get("phase") or None, spec.get("qualname_regex")
+    for profile in profiles:
+        entries = [c for c in profile.get("classes") or [] if c.get("cls") == cls]
+        if not entries:
+            continue
+        if regex:
+            try:
+                matcher = re.compile(str(regex))
+            except re.error:
+                return None
+            work = [w for c in entries for w in c.get("work") or []]
+            if not work:  # calls per instance group unknown (a profile from before #90)
+                return None
+            mine = [w for w in work if _matches(matcher, str(w.get("group") or ""))]
+            return _calls(w for w in mine if phase is None or w.get("phase") == phase)
+        if phase:
+            return _calls((c.get("phases") or {}).get(phase) or {} for c in entries)
+        return _calls(entries)
+    return 0.0 if any(p.get("classes") for p in profiles) else None
+
+
+def _calls(stats: Iterable[Mapping[str, Any]]) -> float:
+    return float(sum(int(s.get("calls") or 0) for s in stats))
+
+
+def _matches(matcher: re.Pattern[str], pattern: str) -> bool:
+    """A ``qualname_regex`` on a folded qualname (``*`` also read as ``0``)."""
+    return bool(matcher.search(pattern) or matcher.search(pattern.replace("*", "0")))
 
 
 def _depth(parents: Sequence[int], i: int) -> int:
@@ -221,9 +417,13 @@ def tree(run: RunDir, targets: Iterable[str] | None = None) -> Tree:
     """The tree of the targets' instances, from their specs and the run's profile(s)."""
     ids = run.target_ids() if targets is None else list(targets)
     specs = {t: read_json(run.target(t) / "spec.json", {}) or {} for t in ids}
+    return build(specs, [read_json(p, {}) or {} for p in _profile_paths(run)])
+
+
+def _profile_paths(run: RunDir) -> list[Path]:
+    """The run's profile, then those of its improve rounds."""
     paths = [run.profile_dir / "profile.json"]
-    paths += sorted((run.root / "rounds").glob("*/profile/profile.json"))
-    return build(specs, [read_json(p, {}) or {} for p in paths])
+    return paths + sorted((run.root / "rounds").glob("*/profile/profile.json"))
 
 
 def build(specs: Mapping[str, Mapping[str, Any]], profiles: Sequence[Mapping[str, Any]]) -> Tree:
@@ -307,11 +507,7 @@ def _scoped(spec: Mapping[str, Any], instances: dict[str, float]) -> dict[str, t
         except re.error:
             matcher = None
         if matcher is not None:
-            instances = {
-                p: n
-                for p, n in instances.items()
-                if matcher.search(p) or matcher.search(p.replace("*", "0"))
-            }
+            instances = {p: n for p, n in instances.items() if _matches(matcher, p)}
     if not instances:
         return {fold(str(captured)) if captured else "": (1.0, 1.0)}
     return {p: (n, 1.0) for p, n in instances.items()}

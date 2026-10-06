@@ -1405,44 +1405,40 @@ class Orchestrator:
         history: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Projected (baseline − Σ est. saved ms of its items) vs measured latency of every
-        accepted set: a kernel's saving is its module-level estimate, a transform's its
-        measured gain alone (paired against the unmodified model). Nested kernels count
-        once (:mod:`kernel_agent.projection`: a decoder layer's kernel replaces the attention
+        accepted set: a kernel's saving is its module-level estimate in the metric's ms
+        (``projection.Units``: per second of audio for ``metric=throughput``), a transform's
+        its measured gain alone (paired against the unmodified model). Nested kernels count
+        once (:func:`projection.of_set`: a decoder layer's kernel replaces the attention
         kernel inside it); ``counted_ms`` is the part of each item's saving that counts."""
         alone = _alone(base_ms, history)
-        tree = projection.tree(self.run)
+        tree, units = projection.tree(self.run), self._units()
         out = []
         for combo, r in sets:
             saved: dict[str, float | None] = {}
             for item in combo:
-                est = self._saving(item, alone)
+                est = self._saving(item, alone, units)
                 saved[item[1]] = None if est is None else round(est, 3)
-            # kernels by target (the module tree's names); transforms are in no tree: in full
-            key = {a: a.partition("=")[0] if k == "kernel" else a for k, a in combo}
-            proj = projection.project(tree, {key[a]: v for a, v in saved.items()}, base_ms)
-            slower = sum(v for v in saved.values() if v is not None and v < 0)
-            out.append(
-                {
-                    "items": [a for _, a in combo],
-                    "projected_ms": round(base_ms - proj.saved_ms - slower, 3),
-                    "measured_ms": r.get("median_ms"),
-                    "est_saved_ms": saved,
-                    "counted_ms": {
-                        a: round(proj.counted.get(key[a], 0.0), 3)
-                        for a, v in saved.items()
-                        if v is not None and v > 0
-                    },
-                }
-            )
+            entry = {"items": [a for _, a in combo], **projection.of_set(tree, saved, base_ms)}
+            entry["measured_ms"] = r.get("median_ms")
+            entry["est_saved_unit"] = projection.SAVED_UNIT  # since #114: in the metric's ms
+            out.append(entry)
         return out
 
-    def _saving(self, item: tuple[str, str], alone: dict[str, float]) -> float | None:
-        """Est. saved ms of an integration item: a kernel's module-level estimate
-        (:meth:`_kernel_saving`), a transform's measured gain alone (``alone``)."""
+    def _units(self) -> projection.Units:
+        """A kernel's est. saved ms per run → the metric's ms (#114), from the sealed
+        ``baseline.json``."""
+        return projection.units_of(self.run, baseline=self.truth.load_json(self.run.baseline_json))
+
+    def _saving(
+        self, item: tuple[str, str], alone: dict[str, float], units: projection.Units
+    ) -> float | None:
+        """Est. saved ms of an integration item in the metric's ms: a kernel's module-level
+        estimate (:meth:`_kernel_saving`, per run) converted with ``units``, a transform's
+        measured gain alone (``alone``)."""
         kind, arg = item
         if kind == "kernel":
             target_id, _, path = arg.partition("=")
-            return self._kernel_saving(target_id, Path(path).name)
+            return units(target_id, self._kernel_saving(target_id, Path(path).name))
         return alone.get(arg)
 
     def _swaps(
@@ -1465,6 +1461,7 @@ class Orchestrator:
         conservative speedup, a transform's paired gain alone; unknown last)."""
         current = {_item_key(a): a for a in accepted}
         seen = set(accepted)
+        units = self._units()  # a kernel's saving in the metric's ms
         swaps: list[tuple[str, tuple[str, str]]] = []
         for group, rank in ((versions, False), ([i for i, _ in singles], True)):
             ranked: list[tuple[float | None, str, tuple[str, str]]] = []
@@ -1473,7 +1470,8 @@ class Orchestrator:
                 if key not in current or item in seen:
                     continue
                 seen.add(item)
-                new, old = self._saving(item, alone), self._saving(current[key], alone)
+                new = self._saving(item, alone, units)
+                old = self._saving(current[key], alone, units)
                 ranked.append((None if new is None else new - (old or 0.0), key, item))
             if rank:
                 ranked.sort(key=lambda g: (g[0] is None, -(g[0] or 0.0)))
