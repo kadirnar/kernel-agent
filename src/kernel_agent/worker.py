@@ -126,10 +126,10 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     compiled = not (ns.out_dir or ns.no_profile) and (generic or strong_baseline.has_hook(workload))
 
     if not ns.no_profile:
-        with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
-            profile = profile_workload(workload, inputs)
-        write_json(out.profile_dir / "profile.json", profile)
         window_ms, what, per = objective.profile_window(baseline)  # metric=throughput: a run
+        with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
+            profile = profile_workload(workload, inputs, reference_ms=window_ms)
+        write_json(out.profile_dir / "profile.json", profile)
         # Floors per class at bf16 / FP8 / FP4 (profile/ceilings.json + .md; issue #90).
         table = ceilings.write(out.profile_dir, profile, current_peaks(), window_ms, per=per)
         summary = (

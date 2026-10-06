@@ -426,6 +426,19 @@ often each captured shape runs per inference. The end-to-end speedup is
 wall-clock latency of the whole workload, unless the run optimises another
 metric.
 
+The kernel view of `analyze`'s profile (`torch.profiler`: kernel times,
+launches and the GPU busy share behind "launch/CPU bound" or "GPU bound" in
+`profile/summary.md`) is measured the same way: under the GPU lock, after a
+warm-up run and the same clock guard, as two profiled runs. Their GPU kernel
+time must stay within 105 % of the time the profiled window takes without the
+profiler, and within 20 % of each other. Otherwise the view is profiled once
+more; if it fails again, `summary.md` marks it unreliable and draws no
+conclusion from it, and the scheduler ignores its busy share. `profile.json`
+keeps every attempt: the kernel time per run, the clock probes before and
+after, GPU telemetry and the other processes on the GPU. A process computing
+outside the lock inflates every kernel: a re-profile reported 202 % of the
+end-to-end latency while another process held 13 GB of the GPU.
+
 `-o metric=` chooses what a run optimises (`kernel_agent/objective.py`):
 `latency` (the default), `ttfa`, the time to first audio of a streaming TTS
 run (VoxCPM, and harnesses that declare it): from the call of `workload.run`

@@ -14,7 +14,13 @@ Two complementary views are collected:
 * **Kernel view** – ``torch.profiler`` gives the CUDA kernels and aten ops that
   actually ran, the number of launches and the GPU busy fraction.  A low busy
   fraction means the run is launch/CPU bound, which calls for fusion, CUDA
-  graphs or static caches rather than faster individual kernels.
+  graphs or static caches rather than faster individual kernels.  Kernel times
+  inflate when the GPU's clocks are low or another process computes on it, so
+  the kernel view is guarded like a timing (:func:`guarded_kernel_profile`):
+  under the GPU lock, after a warm-up and the clock guard of ``time_call``, two
+  profiled runs that must agree with each other and with the end-to-end latency
+  (:func:`kernel_problems`), or the view is profiled again and, failing again,
+  marked unreliable: :func:`summarize` then draws no conclusion from it.
 
 Regions the module view cannot see into (an optimised model in a later improve
 round has them): a ``torch.compile``'d module is timed as one call (hooks inside
@@ -37,6 +43,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from kernel_agent import telemetry
+from kernel_agent.gpulock import gpu_lock
 from kernel_agent.phases import call_phase
 from kernel_agent.profiling.methods import (
     describe,
@@ -628,6 +636,118 @@ def _device_time(evt: Any, self_only: bool) -> float:
     return 0.0
 
 
+#: Kernel-view sanity check (#95): GPU kernel time above this share of the end-to-end
+#: latency measured without the profiler, or two profiled runs further apart than
+#: MAX_RUN_SPREAD (of the smaller), cannot be right: the GPU ran slow (low clocks, another
+#: process computing on it), as in a re-profile that reported 1056 ms of kernels (202 %)
+#: for a 523 ms run and 551 ms for the same 29,122 launches in another run.
+MAX_BUSY_SHARE = 1.05
+MAX_RUN_SPREAD = 0.2
+KERNEL_RUNS = 2  # profiled runs per attempt
+KERNEL_ATTEMPTS = 2  # a kernel view that fails the check is profiled once more
+
+
+def kernel_problems(busy_ms: list[float], reference_ms: float | None) -> list[str]:
+    """Why profiled runs with ``busy_ms`` of GPU kernel time each cannot be right for a run
+    that takes ``reference_ms`` without the profiler ([]: plausible)."""
+    if not busy_ms:
+        return []
+    low, high = min(busy_ms), max(busy_ms)
+    problems = []
+    if reference_ms and low > MAX_BUSY_SHARE * reference_ms:
+        problems.append(
+            f"GPU kernel time {low:.1f} ms is {low / reference_ms:.0%} of the "
+            f"{reference_ms:.1f} ms measured without the profiler"
+        )
+    if low > 0 and (high - low) / low > MAX_RUN_SPREAD:
+        problems.append(
+            "profiled runs disagree: "
+            + " vs ".join(f"{b:.1f}" for b in busy_ms)
+            + f" ms of GPU kernel time ({(high - low) / low:.0%} apart)"
+        )
+    return problems
+
+
+def guarded_kernel_profile(
+    workload: Workload, inputs: Any, reference_ms: float | None = None
+) -> dict[str, Any]:
+    """:func:`kernel_profile` measured like a timing and sanity-checked.
+
+    Under the GPU lock (``gpulock.gpu_lock``: a no-op in a worker whose parent holds it),
+    each attempt runs the workload once unprofiled (warm-up), spins the GPU to full clocks
+    (``bench.ensure_clocks``, the clock guard of ``time_call``), profiles KERNEL_RUNS runs
+    and probes the clocks again, with GPU telemetry and the other processes on the GPU
+    around them. Runs that fail :func:`kernel_problems` against ``reference_ms`` (the
+    end-to-end time of the profiled window) are profiled once more; if they fail again the
+    view says ``reliable: false`` and why (``unreliable``). The view returned is the run
+    with the least GPU kernel time of the last attempt; ``attempts`` keeps every attempt
+    (GPU kernel time per run, clock probes before / after, ``gpu`` telemetry,
+    ``other_gpu_processes``). Without CUDA: one attempt, no lock and no clock guard."""
+    cuda = torch.cuda.is_available()
+    attempts: list[dict[str, Any]] = []
+    views: list[dict[str, Any]] = []
+    problems: list[str] = []
+    with gpu_lock() if cuda else contextlib.nullcontext():
+        for _ in range(KERNEL_ATTEMPTS if cuda else 1):
+            with torch.inference_mode():
+                workload.run(inputs)  # warm-up: caches, allocator, lazy init
+            synchronize()
+            monitor = telemetry.Monitor() if cuda else None
+            clocks = [_clock(ensure=True)] if cuda else []
+            if monitor is not None:
+                monitor.sample("before")
+            others = monitor.processes() if monitor is not None else []
+            views = [kernel_profile(workload, inputs) for _ in range(KERNEL_RUNS)]
+            if cuda:
+                clocks.append(_clock(ensure=False))
+            if monitor is not None:
+                monitor.sample("after")
+            busy = [v["gpu_busy_ms"] for v in views]
+            problems = kernel_problems(busy, reference_ms)
+            attempts.append(
+                {
+                    "gpu_busy_ms": busy,
+                    "clock": clocks,
+                    "gpu": monitor.summary() if monitor is not None else {},
+                    "other_gpu_processes": others,
+                    **({"problems": problems} if problems else {}),
+                }
+            )
+            if not problems:
+                break
+    view = min(views, key=lambda v: v["gpu_busy_ms"])
+    view.update(
+        reference_ms=round(reference_ms, 2) if reference_ms else None,
+        reliable=not problems,
+        **({"unreliable": problems} if problems else {}),
+        attempts=attempts,
+    )
+    return view
+
+
+def _clock(*, ensure: bool) -> float | None:
+    """The DRAM clock probe of ``kernels.bench`` (about 1: full clocks), after spinning the
+    GPU to full clocks first with ``ensure``."""
+    from kernel_agent.kernels import bench
+
+    try:
+        state = bench.ensure_clocks() if ensure else bench.clock_state()
+    except Exception:  # no roofline peaks, out of memory: the profile goes on unguarded
+        return None
+    return round(state, 3) if state is not None else None
+
+
+def kernel_view_problems(kv: dict[str, Any], window_ms: float | None) -> list[str]:
+    """Why ``summarize`` must not draw conclusions from the kernel view ``kv`` ([]: none):
+    its own check failed, or (a profile from before the check) its GPU kernel time is above
+    MAX_BUSY_SHARE of ``window_ms``."""
+    if kv.get("reliable") is False:
+        return list(kv.get("unreliable") or ["it failed its sanity check"])
+    if "reliable" not in kv:
+        return kernel_problems([float(kv.get("gpu_busy_ms") or 0.0)], window_ms)
+    return []
+
+
 def kernel_profile(workload: Workload, inputs: Any, top: int = 40) -> dict[str, Any]:
     from torch.profiler import ProfilerActivity, profile
 
@@ -671,8 +791,12 @@ def kernel_profile(workload: Workload, inputs: Any, top: int = 40) -> dict[str, 
     }
 
 
-def profile_workload(workload: Workload, inputs: Any) -> dict[str, Any]:
-    """Module view + kernel view.  Assumes the workload is warmed up."""
+def profile_workload(
+    workload: Workload, inputs: Any, reference_ms: float | None = None
+) -> dict[str, Any]:
+    """Module view + kernel view (:func:`guarded_kernel_profile`; ``reference_ms``: the
+    end-to-end time of the profiled window, measured without the profiler). Assumes the
+    workload is warmed up."""
     roots = workload.roots()
     methods = discover_entrypoints(roots, workload_entrypoints(workload))
     synchronize()
@@ -682,7 +806,7 @@ def profile_workload(workload: Workload, inputs: Any) -> dict[str, Any]:
         synchronize()
     hooked_ms = (time.perf_counter() - start) * 1000
     classes = timer.class_stats()
-    kernel_view = kernel_profile(workload, inputs)
+    kernel_view = guarded_kernel_profile(workload, inputs, reference_ms)
     return {
         "hooked_wall_ms": round(hooked_ms, 2),
         "module_calls": len(timer.calls),
@@ -715,18 +839,29 @@ def summarize(
     kv = profile["kernel_view"]
     busy = kv["gpu_busy_ms"] / baseline_ms if baseline_ms else kv["gpu_busy_fraction"]
     total = max((c["inclusive_ms"] for c in profile["classes"]), default=0.0) or 1.0
+    unreliable = kernel_view_problems(kv, baseline_ms)
+    if unreliable:
+        verdict = (
+            "**UNRELIABLE kernel view** ("
+            + "; ".join(unreliable)
+            + "): no conclusion (launch/CPU or GPU bound) is drawn from it, and the kernel "
+            "and aten-op times below may be inflated: compare them with each other, not "
+            "with the latency."
+        )
+    elif busy < 0.6:
+        verdict = (
+            "LAUNCH/CPU BOUND: the GPU idles between tiny kernels. Fusing many small ops into "
+            "few kernels, CUDA graphs and static caches matter more than faster math."
+        )
+    else:
+        verdict = "GPU bound: faster kernels pay off directly"
     lines = [
         "# Profile summary",
         "",
         f"* {metric} (no hooks): **{baseline_ms:.1f} ms**",
         f"* GPU kernel time: {kv['gpu_busy_ms']:.1f} ms {per} = **{busy:.0%}** of the "
-        f"{metric} — "
-        + (
-            "LAUNCH/CPU BOUND: the GPU idles between tiny kernels. Fusing many small ops into "
-            "few kernels, CUDA graphs and static caches matter more than faster math."
-            if busy < 0.6
-            else "GPU bound: faster kernels pay off directly"
-        ),
+        f"{metric} — {verdict}",
+        *_guard_notes(kv),
         f"* kernel launches: {kv['kernel_launches']} (avg {kv['avg_kernel_us']:.1f} us/kernel)",
         f"* module calls: {profile['module_calls']}",
     ]
@@ -780,6 +915,38 @@ def summarize(
         lines.append(f"| `{o['name']}` | {o['calls']} | {o['device_ms']:.3f} |")
     lines += _roofline_note()
     return "\n".join(lines) + "\n"
+
+
+def _guard_notes(kv: dict[str, Any]) -> list[str]:
+    """How the kernel view was measured (:func:`guarded_kernel_profile`; [] for a profile
+    from before the guard)."""
+    attempts = kv.get("attempts") or []
+    if not attempts:
+        return []
+    last = attempts[-1]
+    busy = last.get("gpu_busy_ms") or []
+    clocks = last.get("clock")  # [] without CUDA: no lock, no clock guard
+    note = (
+        "* kernel view: "
+        + ("under the GPU lock after a warm-up and the clock guard; " if clocks else "")
+        + f"{len(busy)} profiled runs ({' and '.join(f'{b:.1f}' for b in busy)} ms of GPU "
+        "kernel time)"
+    )
+    if clocks:
+        probes = " / ".join("n/a" if c is None else f"{c:.2f}" for c in clocks)
+        note += f", DRAM clock probe {probes} before / after (1 = full clocks)"
+    if (sm := (last.get("gpu") or {}).get("sm_mhz")) and len(sm) == 3:
+        note += f", SM clock {sm[0]}-{sm[2]} MHz"
+    if len(attempts) > 1:
+        note += f"; profiled {len(attempts)} times (the first failed its sanity check)"
+    if others := last.get("other_gpu_processes") or []:
+        listed = ", ".join(
+            f"{p.get('name') or 'pid'} {p['pid']} ({p.get('used_mib') or '?'} MiB)"
+            for p in others[:3]
+        )
+        more = f" and {len(others) - 3} more" if len(others) > 3 else ""
+        note += f"; other processes on the GPU: {listed}{more}"
+    return [note]
 
 
 def _gap_notes(gaps: dict[str, Any]) -> list[str]:

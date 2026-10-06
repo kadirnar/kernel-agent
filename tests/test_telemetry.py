@@ -3,6 +3,7 @@
 CPU only: ``nvidia-smi`` is replaced by recorded output lines.
 """
 
+import os
 import subprocess
 
 from kernel_agent import telemetry
@@ -92,3 +93,33 @@ def test_no_samples_and_an_unreadable_maximum(monkeypatch):
     sample = mon.sample()
     assert sample is not None and sample["sm_max_mhz"] is None
     assert "sm_max_mhz" not in mon.summary()
+
+
+def test_other_processes_on_the_gpu(monkeypatch):
+    """`nvidia-smi --query-compute-apps=pid,used_memory,process_name`: this process left out,
+    most memory first."""
+    me = os.getpid()
+    lines = [
+        "1724, 13, python3",
+        "535548, 86, /usr/bin/nautilus",
+        f"{me}, 2000, /venv/bin/python",
+        "615627, 12928, /home/u/kernel-agent/.venv/bin/python",
+        "615843, [N/A], /home/u/kernel-agent/.venv/bin/python",
+    ]
+
+    def run(cmd, **kwargs):
+        assert cmd[0] == "nvidia-smi" and "--query-compute-apps=pid,used_memory,process_name" in cmd
+        assert cmd[cmd.index("-i") + 1] == "00000000:0B:00.0"
+        return subprocess.CompletedProcess(cmd, 0, "\n".join(lines) + "\n", "")
+
+    monkeypatch.setattr(telemetry.subprocess, "run", run)
+    mon = telemetry.Monitor(bus_id="00000000:0B:00.0")
+    mon.backend = "nvidia-smi"
+    assert mon.processes() == [
+        {"pid": 615627, "used_mib": 12928, "name": "python"},
+        {"pid": 535548, "used_mib": 86, "name": "nautilus"},
+        {"pid": 1724, "used_mib": 13, "name": "python3"},
+        {"pid": 615843, "used_mib": None, "name": "python"},
+    ]
+    mon.backend = None
+    assert mon.processes() == []
