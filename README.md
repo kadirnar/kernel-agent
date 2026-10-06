@@ -296,6 +296,54 @@ amax) - 2)`) saturates block maxima and shrinks real outputs by up to 13 %
 the block within ±6 (the MXFP4 row above); it still fails the FP4 tier in 3 of
 the 147 calls, 4 of the 18 MLP calls and 1 of the 3 LocDiT calls: prefer NVFP4.
 
+Redrawn inputs (#109). The first W8A8 kernels of the throughput run's pivot arm
+(`dit_layer__fp8_w8a8`, exp 100 and 101) passed the captured cases and failed
+the perturbed-input check on the element bound alone (element ratio 1.42 and
+1.65 at cosine 0.9999, relative L2 0.012). The reference math fails it too: on
+redrawn inputs, LocDiT channel 497, whose o_proj / down_proj weight rows are 10x
+/ 7x the median row norm (they write the layer's massive activation, up to 8576
+on real inputs), keeps that many times the rounding error of the other channels
+while its values now spread around zero instead of staying massive. Calibrated
+with each precision's reference math (fake quant as above; W8A8 through
+`quant.fp8_w8a8_linear`, on the GPU `torch._scaled_mm`) on real captures,
+50-100 seeds of both redraws per case; failed draws (worst element ratio) with
+the bounds of captured inputs and with the bounds for redrawn inputs:
+
+| module (rows per call) | precision | captured inputs: min cosine / max rel L2 / max element ratio | redrawn, old bounds | redrawn, new bounds |
+|---|---|---|---|---|
+| LocDiT layer (352, 176) | W8A8 | 0.99979 / 0.020 / 0.19 | 98 of 200 (2.40) | 0 of 200 (0.48) |
+| LocDiT layer (352, 176) | FP8 weights | 0.99989 / 0.015 / 0.14 | 0 of 200 (0.61) | 0 of 200 (0.31) |
+| LocDiT layer (352, 176) | NVFP4 | 0.99844 / 0.056 / 0.19 | 0 of 200 (0.97) | 0 of 200 (0.40) |
+| LocDiT layer (22) | W8A8 | 0.99979 / 0.021 / 0.16 | 3 of 120 (1.11) | 0 of 120 (0.40) |
+| LocDiT attention (352, 176) | W8A8 / FP8 / NVFP4 | 0.99979 / 0.020 / 0.30 (W8A8) | 110 / 52 / 95 of 120 | 0 / 0 / 0 |
+| LocDiT MLP (352, 176) | W8A8 / FP8 / NVFP4 | 0.99997 / 0.009 / 0.15 (W8A8) | 117 / 16 / 45 of 120 | 0 / 0 / 0 |
+| LocDiT o_proj (352, 176) | W8A8 / FP8 / NVFP4 | 1.0000 / 0.007 / 0.14 (W8A8) | 119 / 61 / 120 of 120 | 0 / 0 / 0 |
+| LocDiT down_proj (352, 176) | W8A8 / FP8 / NVFP4 | 0.99999 / 0.008 / 0.09 (W8A8) | 72 / 5 / 73 of 120 | 0 / 0 / 0 |
+| base LM decode layer (1, KV cache) | W8A8 / FP8 / NVFP4 | 0.99952 / 0.031 / 0.27 (W8A8) | 24 / 0 / 8 of 600 | 1 / 0 / 0 of 600 |
+| base LM down_proj GEMV (1) | W8A8 / FP8 / NVFP4 | 0.99995 / 0.012 / 0.09 (W8A8) | 1 / 0 / 2 of 180 | 0 / 0 / 0 |
+GPU_ROWS_PLACEHOLDER
+
+The other LocDiT and LM Linears pass both ways. So on redrawn inputs (the
+evaluator's perturbed-input check and the integration's re-check) the RMS in
+the element bound is the larger of the tensor's and the element's channel's: a
+GEMM's rounding error scales with its output channel's weight row, and the
+channel's spread measures that. Decode outputs (one row) have no channel
+statistics: the LM down_proj GEMV needs 0.43 x RMS with FP8 weights, 0.60 with
+W8A8 and 2.06 with NVFP4, hence 0.75 and 2.5. The norm of the LocDiT attention's
+output moves by up to 1.9 % with W8A8 (rows 497 and 247 hold 12 % of the o_proj
+weight energy, so their noise does not average out): ±3 %. NVFP4's V-cache slot
+of an LM decode step (256 values near the signal threshold, relative L2 0.20 on
+real inputs) reaches 0.33 and +9.7 % on redrawn ones, and failed the exact
+tolerance of a tensor without signal in 6 of 598 draws: the FP4 bounds and the
+no-signal floor above. The one remaining failure is W8A8 at M = 1 (the norm of a
+KV-cache slot, 3.2 %), which fails real decode inputs as well (`fp8_weights` is
+the decode precision). Broken weights still fail the captured cases (unchanged)
+and every redrawn draw of the LocDiT layer: weight scales x 1.05, a neighbour
+channel's scale, the first token's activation scale, a zeroed output channel,
+swapped FP4 nibbles, shifted FP4 block scales (FP4's x 1.05 and int4 per tensor
+only on the captured cases); activation scales cached from the first call pass
+the captured cases and fail 24 of 32 redrawn draws.
+
 Cost on the RTX 5070 Ti: `analyze` takes 34 s longer (the 8 eager samples
 17.8 s, scoring 16.5 s). Each `e2e` (and each paired A/B of the integration)
 of a candidate that passes the sanity floor takes about 11 s of scoring

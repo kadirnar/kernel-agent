@@ -125,42 +125,51 @@ NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]]
 #: :mod:`kernel_agent.kernels.recheck`, compare the candidate with the reference called on
 #: inputs redrawn from each tensor's own mean and std) have no outlier channels, so bounds
 #: calibrated on real inputs do not carry over (#109). A weight row that writes a massive
-#: activation (VoxCPM2 LocDiT o_proj / down_proj row 497: 10x / 7x the median row norm, real
+#: activation (VoxCPM2 LocDiT o_proj / down_proj row 497: 10x / 7x the median row norm; real
 #: outputs up to 8576 there) gives its output channel that many times the rounding error of
-#: the others, and on redrawn inputs that channel's values are no larger than theirs. With
-#: the bounds above, the reference math (fake quant; W8A8: ``quant.fp8_w8a8_linear``) of the
-#: LocDiT layer at M = 352 failed the element bound in 98 of 200 W8A8 draws (element ratio
-#: up to 2.4 at cosine >= 0.99988, relative L2 error <= 0.014; the run's W8A8 kernels 1.42
-#: and 1.65), and its attention, MLP and o_proj alone with every precision (FP8 weights up to
-#: 2.6, W8A8 5.9, NVFP4 3.4). So on redrawn inputs the RMS in the element bound is the larger
-#: of the tensor's and the element's channel's (one position of the last dimension, over at
-#: least CHANNEL_MIN_ROWS rows; for fewer, the tensor's), and a tensor without signal gets
-#: the larger of the exact tolerance and the tier's element bound at RMS = atol.
+#: the others. On real inputs that channel stays massive and the ``r * |ref|`` term covers
+#: it; on redrawn ones its values spread around zero, and where they are small the error is
+#: up to 2.8 x the tensor's RMS. With the bounds above, the reference math (fake quant;
+#: W8A8: ``quant.fp8_w8a8_linear``) of the LocDiT layer at M = 352 failed the element bound
+#: in 98 of 200 W8A8 draws (element ratio up to 2.4 at cosine >= 0.99988, relative L2 error
+#: <= 0.014; the run's W8A8 kernels: 1.42 and 1.65), and its attention, MLP, o_proj and
+#: down_proj alone with every precision (FP8 weights up to 2.6, W8A8 5.9, NVFP4 3.4). So on
+#: redrawn inputs the RMS in the element bound is the larger of the tensor's and the
+#: element's channel's (one position of the last dimension, over at least CHANNEL_MIN_ROWS
+#: rows; for fewer, the tensor's), and a tensor without signal gets the larger of the exact
+#: tolerance and the tier's element bound at RMS = atol.
 CHANNEL_MIN_ROWS = 16
 #: (min cosine, max relative L2 error, max norm change, element bound) of each tier on
 #: redrawn inputs, with the per-channel RMS above. Calibrated with the reference math of each
-#: precision on real VoxCPM2 captures and 30-100 seeds of both redraws (normal; uniform /
+#: precision on real VoxCPM2 captures, 30-100 seeds of both redraws (normal; uniform /
 #: Laplace / log-normal): the LocDiT layer (M = 352, 176, 22), its attention, MLP and seven
-#: nn.Linear, and a base-LM decode layer (M = 1, KV cache), its attention, MLP and Linears
-#: (README, "Quality modes"):
+#: nn.Linear, and a base-LM decode layer (M = 1, KV cache), its attention, MLP and seven
+#: nn.Linear (README, "Quality modes"); the GPU (``torch._scaled_mm``) and the run's W8A8
+#: kernels give the LocDiT layer's numbers:
 #:
-#: * ``near-lossless``: FP8 weights reach cosine >= 0.9987, relative L2 <= 0.050, norm within
-#:   0.9 %, element ``a`` (at r = 0.125) <= 0.22 with a channel RMS and 0.43 at decode (one
-#:   row: the LM down_proj GEMV, 0.86 of the bound above); W8A8 0.9981 / 0.071 / 3.2 % and
-#:   ``a`` <= 0.35 on the compute-bound GEMMs it is for (M >= 22), 0.60 at decode, hence
-#:   0.75. W8A8 at M = 1 keeps failing the norm of a 256-value KV-cache slot (24 of 600
-#:   draws, up to 3.2 %), as it fails on real decode inputs (#91): fp8_weights' job.
+#: * ``near-lossless``: FP8 weights reach cosine >= 0.9987, relative L2 <= 0.051, norm within
+#:   1.1 %, element ``a`` (at r = 0.125) <= 0.22 with a channel RMS and 0.43 at decode (one
+#:   row: the LM down_proj GEMV, 0.86 of the 0.5 above). W8A8 on the compute-bound GEMMs it
+#:   is for (M >= 22): cosine >= 0.9987, relative L2 <= 0.050, norm within 1.9 % (the
+#:   attention's o_proj output: rows 497 and 247 hold 12 % of its weight energy, so their
+#:   noise does not average out), ``a`` <= 0.36; at decode (M = 1) 0.9977 / 0.071 / 3.2 % /
+#:   0.60. Hence norm 3 % and ``a`` 0.75. W8A8 at M = 1 can still fail the norm of a
+#:   256-value KV-cache slot (1 of 600 draws), as it fails on real decode inputs (#91).
 #: * ``near-lossless-fp4``: NVFP4 reaches cosine >= 0.9506, relative L2 <= 0.333 and norm
-#:   within 9.7 % (the V-cache slot of an LM decode step: 256 values at the signal threshold,
-#:   0.20 relative L2 on real inputs; elsewhere <= 0.18 and 4.0 %), ``a`` (r = 0.25) <= 1.05
-#:   with a channel RMS and 2.06 at decode (LM down_proj).
+#:   within 9.7 % (the V-cache slot of an LM decode step: 256 values near the signal
+#:   threshold, 0.20 relative L2 on real inputs; everywhere else <= 0.18 and 4.0 %), ``a``
+#:   (at r = 0.25) <= 1.05 with a channel RMS (the LocDiT attention's k output) and 2.06 at
+#:   decode (LM down_proj). Its no-signal V-cache slots failed the exact tolerance in 6 of
+#:   598 draws, none with the floor.
 #:
-#: Broken weights still fail on redrawn inputs as on captured ones (weight scales x 1.05 by
-#: the norm, except FP4's, a neighbour channel's scale, the first token's activation scale,
-#: swapped FP4 nibbles, shifted block scales, int4 per tensor), and activation scales cached
-#: from the captured call fail only there (relative L2 0.10).
+#: Broken weights fail on captured inputs as before, and on every redrawn draw of the LocDiT
+#: layer: weight scales x 1.05 (norm 5 %), a neighbour channel's scale, the first token's
+#: activation scale, a zeroed output channel (FP8; FP4: 18 of 32, it passes FP4's captured
+#: check), swapped FP4 nibbles, block scales shifted by one block; FP4's x 1.05 and int4 per
+#: tensor fail only on captured inputs. Activation scales cached from the first call pass
+#: the captured cases and fail 24 of 32 redrawn draws (a candidate gets four).
 PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
-    NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.02, (0.75, 0.125)),
+    NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.03, (0.75, 0.125)),
     NEAR_LOSSLESS_FP4_TIER: (0.94, 0.40, 0.12, (2.5, 0.25)),
 }
 #: The tier of this process's comparisons when a call passes none. The evaluator sets it
