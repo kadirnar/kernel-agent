@@ -60,6 +60,8 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     import torch
 
     from kernel_agent import objective, strong_baseline
+    from kernel_agent.kernels.roofline import current_peaks
+    from kernel_agent.profiling import ceilings
     from kernel_agent.profiling.profiler import profile_workload, summarize
     from kernel_agent.workloads import holdout, perceptual, quality, stopping
     from kernel_agent.workloads.base import measure
@@ -128,8 +130,11 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             profile = profile_workload(workload, inputs)
         write_json(out.profile_dir / "profile.json", profile)
         window_ms, what, per = objective.profile_window(baseline)  # metric=throughput: a run
+        # Floors per class at bf16 / FP8 / FP4 (profile/ceilings.json + .md; issue #90).
+        table = ceilings.write(out.profile_dir, profile, current_peaks(), window_ms, per=per)
         summary = (
             summarize(profile, window_ms, metric=what, per=per)
+            + ceilings.markdown(table)
             + objective.summary_section(baseline)
             + quality.summary_section(baseline)
         )
