@@ -13,12 +13,21 @@ Two complementary views are collected:
   actually ran, the number of launches and the GPU busy fraction.  A low busy
   fraction means the run is launch/CPU bound, which calls for fusion, CUDA
   graphs or static caches rather than faster individual kernels.
+
+Regions the module view cannot see into (an optimised model in a later improve
+round has them): a ``torch.compile``'d module is timed as one call (hooks inside
+it would make Dynamo recompile it and compile the bookkeeping), a module that
+replays a CUDA graph has no child calls, and calls made while a graph is being
+captured are not timed. :meth:`ModuleTimer.gaps` lists them; their kernels are
+in the kernel view.
 """
 
 from __future__ import annotations
 
 import collections
+import contextlib
 import inspect
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -103,13 +112,31 @@ class ClassStat:
     groups: dict[str, int] = field(default_factory=dict)
 
 
+def _capturing() -> bool:
+    """A CUDA graph is being captured on the current stream: its work is recorded, not run,
+    so a module call there cannot be timed (an event recorded into a graph has no time)."""
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _compiled(module: nn.Module) -> nn.Module | None:
+    """The original module of a ``torch.compile``'d one (``OptimizedModule._orig_mod``)."""
+    orig = getattr(module, "_orig_mod", None)
+    return orig if isinstance(orig, nn.Module) else None
+
+
 class ModuleTimer:
     """Context manager that times every module call with CUDA events.
 
     ``methods`` maps module classes to their non-``forward`` entrypoints (by
     default :func:`~kernel_agent.profiling.methods.discover_entrypoints`); those
     calls are timed too and attributed to the class with their method name.
-    With ``cuda=False`` (default when no GPU) host wall-clock time is used."""
+    With ``cuda=False`` (default when no GPU) host wall-clock time is used.
+
+    The bookkeeping never crashes the profile: calls during a CUDA-graph capture
+    or inside code Dynamo traces are skipped, a post-hook without its pre-hook and
+    a call whose start/end cannot be paired are counted (:meth:`gaps`) and left
+    untimed. While the hooks are installed Dynamo compiles nothing new: compiled
+    code whose guards they break runs eagerly (``eager_on_recompile``)."""
 
     def __init__(
         self,
@@ -122,25 +149,55 @@ class ModuleTimer:
         self.methods = discover_entrypoints(roots) if methods is None else methods
         self.cuda = torch.cuda.is_available() if cuda is None else cuda
         self.calls: list[_Call] = []
-        self._stack: list[int] = []
+        #: Open calls: (index in ``calls``, id of the module, method).
+        self._stack: list[tuple[int, int, str]] = []
         self._names: dict[int, tuple[str, str]] = {}
-        self._ctx: Any = None
+        self._ctx: contextlib.ExitStack | None = None
+        #: ``torch.compile``'d modules (qualnames): timed as one call, inside not hooked.
+        self.compiled: list[str] = []
+        #: CUDA-graph replays per qualname of the module call that replayed them.
+        self.replays: collections.Counter[str] = collections.Counter()
+        #: ``capture``: calls during a CUDA-graph capture; ``unmatched_post``: post-hooks
+        #: without an open call of their module.
+        self.skipped: collections.Counter[str] = collections.Counter()
+        #: Calls :meth:`class_stats` could not time (no end, or start/end that do not pair).
+        self.untimed = 0
 
     def __enter__(self) -> ModuleTimer:
+        # Modules that run inside a compiled module are not hooked (#86): their hooks would
+        # break its guards (Dynamo recompiles it in the profiled run) or run in Dynamo's
+        # context, which compiles the hook frames too; an event made in compiled code is a
+        # ``torch.Event`` that cannot be paired with the eager ``torch.cuda.Event``s.
+        inside = {
+            id(m)
+            for root in self.roots.values()
+            for wrapper in root.modules()
+            if (orig := _compiled(wrapper)) is not None
+            for m in orig.modules()
+        }
         modules: list[nn.Module] = []
         for root_name, root in self.roots.items():
             for qualname, module in root.named_modules():
                 full = f"{root_name}.{qualname}" if qualname else root_name
-                if id(module) not in self._names:
-                    self._names[id(module)] = (root_name, full)
-                    modules.append(module)
-        self._ctx = instrument(modules, self.methods, self._pre, self._post)
-        self._ctx.__enter__()
+                if id(module) in inside or id(module) in self._names:
+                    continue
+                if _compiled(module) is not None:
+                    self.compiled.append(full)
+                self._names[id(module)] = (root_name, full)
+                modules.append(module)
+        with contextlib.ExitStack() as stack:
+            if "torch._dynamo" in sys.modules:  # something may be compiled
+                stack.enter_context(torch.compiler.set_stance("eager_on_recompile"))
+            register = getattr(torch.cuda.graphs, "register_graph_replay_start_hook", None)
+            if self.cuda and register is not None:
+                stack.callback(register(self._replay).remove)
+            stack.enter_context(instrument(modules, self.methods, self._pre, self._post))
+            self._ctx = stack.pop_all()
         return self
 
     def __exit__(self, *exc: object) -> None:
         if self._ctx is not None:
-            self._ctx.__exit__(None, None, None)
+            self._ctx.close()
             self._ctx = None
 
     def _now(self) -> Any:
@@ -151,19 +208,34 @@ class ModuleTimer:
         return event
 
     @staticmethod
-    def _elapsed_ms(call: _Call) -> float:
-        if call.end is None:
-            return 0.0
+    def _elapsed_ms(call: _Call) -> float | None:
+        """Inclusive ms of ``call``; None when it cannot be timed: its post-hook never ran,
+        or its start and end do not pair (#86: a ``torch.Event`` made in compiled code next
+        to a ``torch.cuda.Event``; an event recorded into a CUDA graph)."""
+        if call.end is None or type(call.start) is not type(call.end):
+            return None
         if isinstance(call.start, float):
             return (call.end - call.start) * 1000.0
-        return float(call.start.elapsed_time(call.end))
+        try:
+            return float(call.start.elapsed_time(call.end))
+        except (RuntimeError, TypeError):
+            return None
+
+    def _replay(self, graph: Any) -> None:
+        if self._stack:
+            self.replays[self.calls[self._stack[-1][0]].qualname] += 1
 
     def _pre(
         self, module: nn.Module, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
+        if torch.compiler.is_compiling():  # traced by Dynamo: keep the bookkeeping out
+            return
+        if _capturing():
+            self.skipped["capture"] += 1
+            return
         _, full = self._names.get(id(module), ("?", type(module).__name__))
         start = self._now()
-        parent = self._stack[-1] if self._stack else -1
+        parent = self._stack[-1][0] if self._stack else -1
         self.calls.append(
             _Call(
                 full,
@@ -178,7 +250,7 @@ class ModuleTimer:
         index = len(self.calls) - 1
         if parent >= 0:
             self.calls[parent].children.append(index)
-        self._stack.append(index)
+        self._stack.append((index, id(module), method))
 
     def _post(
         self,
@@ -188,15 +260,26 @@ class ModuleTimer:
         kwargs: dict[str, Any],
         output: Any,
     ) -> None:
-        if not self._stack:
+        if torch.compiler.is_compiling() or _capturing():
             return
-        index = self._stack.pop()
+        key = (id(module), method)
+        depth = len(self._stack) - 1
+        while depth >= 0 and self._stack[depth][1:] != key:
+            depth -= 1
+        if depth < 0:  # its pre-hook did not record (e.g. it ran during a capture)
+            self.skipped["unmatched_post"] += 1
+            return
+        # Calls opened above it never saw their post-hook: they stay untimed.
+        index = self._stack[depth][0]
+        del self._stack[depth:]
         self.calls[index].end = self._now()
 
     def class_stats(self) -> list[ClassStat]:
         if self.cuda:
             synchronize()
-        inclusive = [self._elapsed_ms(call) for call in self.calls]
+        times = [self._elapsed_ms(call) for call in self.calls]
+        self.untimed = sum(t is None for t in times)
+        inclusive = [t or 0.0 for t in times]
 
         modules: dict[str, nn.Module] = {}
         for root_name, root_module in self.roots.items():
@@ -300,6 +383,21 @@ class ModuleTimer:
         stats.sort(key=lambda s: -s.inclusive_ms)
         return stats
 
+    def gaps(self) -> dict[str, Any]:
+        """What the module view does not time (empty when it timed everything); after
+        :meth:`class_stats`. ``graph_replays``: qualnames with layer indices folded."""
+        replays: collections.Counter[str] = collections.Counter()
+        for qualname, n in self.replays.items():
+            replays[fold(qualname)] += n
+        out: dict[str, Any] = {
+            "compiled": self.compiled,
+            "graph_replays": dict(replays.most_common()),
+            "capture_calls": self.skipped["capture"],
+            "unmatched_post": self.skipped["unmatched_post"],
+            "untimed": self.untimed,
+        }
+        return {k: v for k, v in out.items() if v}
+
 
 def _phase_stat(p: dict[str, Any]) -> dict[str, Any]:
     """One phase of a class: totals, the top signature and where its instances live
@@ -391,6 +489,7 @@ def profile_workload(workload: Workload, inputs: Any) -> dict[str, Any]:
         "hooked_wall_ms": round(hooked_ms, 2),
         "module_calls": len(timer.calls),
         "entrypoints": describe(methods),
+        "module_gaps": timer.gaps(),
         "classes": [asdict(c) for c in classes],
         "kernel_view": kernel_view,
     }
@@ -438,6 +537,7 @@ def summarize(
             "* non-`forward` entrypoints (they bypass hooks and are instrumented separately): "
             + ", ".join(f"`{e}`" for e in profile["entrypoints"])
         )
+    lines += _gap_notes(profile.get("module_gaps") or {})
     lines += [
         "",
         "## Module classes by inclusive time",
@@ -482,6 +582,35 @@ def summarize(
         lines.append(f"| `{o['name']}` | {o['calls']} | {o['device_ms']:.3f} |")
     lines += _roofline_note()
     return "\n".join(lines) + "\n"
+
+
+def _gap_notes(gaps: dict[str, Any]) -> list[str]:
+    """Bullets on the regions the module view does not see into (:meth:`ModuleTimer.gaps`)."""
+    notes = []
+    if gaps.get("compiled"):
+        notes.append(
+            "* `torch.compile`d modules, timed as one call (no rows for their submodules): "
+            + ", ".join(f"`{q}`" for q in gaps["compiled"])
+        )
+    if gaps.get("graph_replays"):
+        notes.append(
+            "* CUDA-graph replays, by the module call that replays them (the modules captured "
+            "in the graph have no rows): "
+            + ", ".join(f"`{q}` ×{n}" for q, n in gaps["graph_replays"].items())
+        )
+    untimed = {
+        "during a CUDA-graph capture": gaps.get("capture_calls", 0),
+        "post-hooks without an open call": gaps.get("unmatched_post", 0),
+        "calls without a usable start/end": gaps.get("untimed", 0),
+    }
+    if any(untimed.values()):
+        notes.append(
+            "* module calls not timed: "
+            + ", ".join(f"{n} {what}" for what, n in untimed.items() if n)
+        )
+    if notes:
+        notes.append("* the kernel view below covers these regions (it sees every kernel)")
+    return notes
 
 
 def _phase_split(classes: list[dict[str, Any]], min_share: float = 0.05) -> list[str]:
