@@ -483,6 +483,57 @@ def test_little_time_left_goes_to_the_final_integration(tmp_path):
     assert state["finished"]["at"] - world.clock.t0 <= 5.0 * 3600
 
 
+def test_the_reserve_is_capped_and_the_final_integration_runs_past_the_budget(tmp_path, capsys):
+    """Round 2 of runs/openbmb--VoxCPM2/20261006-004718 kept 113 of its 180 min for the
+    final integration (issue #108). The reserve now takes at most a third of --max-hours;
+    the final integration runs to its end after it, on the GPU alone."""
+    orch, world = make(tmp_path, max_hours=2.0)  # simulated hours
+    _, reason = loop(orch, world, integrate_every=0)
+    out = capsys.readouterr().out
+    assert "40 min kept for the final integration (33% of --max-hours; estimated" in out
+    assert "40 min kept for integrate + report" in reason
+    assert "runs past --max-hours" in out and "it uses the GPU only, no agent sessions" in out
+    state = read_json(orch.run.root / "improve.json")
+    assert [i["why"] for i in state["integrations"]] == ["final integration"]
+    assert state["slices"][-1]["ended"] - world.clock.t0 > 2.0 * 3600 * 2 / 3 - 600
+    assert state["finished"]["at"] - world.clock.t0 > 2.0 * 3600  # past the budget
+
+
+@pytest.mark.parametrize(
+    "estimate, reserve, kept_min",
+    [
+        ((30, 228.0), None, 60.0),  # 114 min: capped at a third of 3 h
+        ((10, 228.0), None, 38.0),  # below the cap: the estimate
+        ((30, 228.0), 30.0, 30.0),  # --integration-reserve 30
+        ((30, 228.0), 0.0, 27.0),  # --integration-reserve 0: --budget-reserve (15 %) only
+    ],
+)
+def test_integration_reserve(tmp_path, monkeypatch, capsys, estimate, reserve, kept_min):
+    orch, _ = make(tmp_path, max_hours=3.0)
+    icfg = ImproveConfig(integration_reserve=reserve)
+    improver = Improver(orch, icfg, require_capture=False, live_charts=False)
+    monkeypatch.setattr(improver, "_integration_estimate", lambda: estimate)
+    improver._keep_time()
+    assert orch.budget.reserve_s() == pytest.approx(kept_min * 60)
+    assert orch.budget.estimate_reserve() == orch.budget.final_reserve_s  # after evaluations
+    assert capsys.readouterr().out.count(f"{kept_min:.0f} min kept for") == 1
+
+
+def test_cli_integration_reserve(monkeypatch, tmp_path):
+    seen = []
+
+    async def fake_improve(ref, cfg, icfg, *, dry_run=False, seed=0):
+        seen.append(icfg.integration_reserve)
+        return RunDir(tmp_path)
+
+    monkeypatch.setattr(improve, "improve", fake_improve)
+    for flag, value in (([], None), (["auto"], None), (["45"], 45.0), (["0"], 0.0)):
+        argv = ["improve", "runs/x", *(["--integration-reserve", *flag] if flag else [])]
+        assert cli.main(argv) == 0 and seen[-1] == value
+    with pytest.raises(SystemExit):
+        cli.main(["improve", "runs/x", "--integration-reserve", "-5"])
+
+
 def test_a_slice_out_of_time_does_not_stop_its_arm(tmp_path):
     orch, world = make(tmp_path)
     # 10 min for agents: enough for one slice of any arm (7-8 min), not for twice that

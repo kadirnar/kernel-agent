@@ -8,6 +8,10 @@ fields and the region rewrite the worker applies it with (:func:`item_key`); a m
 key adds the context it ran in (the evaluator schema, the baseline, the A/B rounds) and the
 keys of its A and B sets in order (:class:`Keys`). A file that cannot be read has no key,
 and a measurement without a key is never reused.
+
+An ``integration.json`` from before content keys has none; :func:`migrate` gives its
+measurements the keys they would have had where the run proves what they ran with
+(issue #108).
 """
 
 from __future__ import annotations
@@ -15,11 +19,13 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import kernel_agent
-from kernel_agent import region, truth
+from kernel_agent import ledger, region, truth
 from kernel_agent.workspace import RunDir, read_json
 
 #: The ``kernel_agent`` package: the modules an item imports from it are part of its key.
@@ -104,8 +110,7 @@ class Keys:
 
     def arg(self, arg: str) -> str | None:
         """The key of an item given by its argument alone (``target=path``: a kernel)."""
-        target, sep, _ = arg.partition("=")
-        return self.item(("kernel" if sep and "/" not in target else "transform", arg))
+        return self.item(as_item(arg))
 
     def step(self, a: list[tuple[str, str]], b: list[tuple[str, str]]) -> str | None:
         """Key of an A/B measurement of set B against set A (in their order: transforms
@@ -114,6 +119,147 @@ class Keys:
         if any(k is None for keys in sets for k in keys):
             return None
         return digest([self.context, *sets])
+
+    def entry(self, h: dict[str, Any]) -> str | None:
+        """The key the step of an ``integration.json`` history entry has now."""
+        a_items = (h.get("ab") or {}).get("a_items") or []
+        return self.step([as_item(x) for x in a_items], [as_item(x) for x in h.get("items") or []])
+
+
+def as_item(arg: str) -> tuple[str, str]:
+    """(kind, argument) of an integration item given by its argument (``target=path``: a
+    kernel, else a transform's path)."""
+    target, sep, _ = arg.partition("=")
+    return ("kernel" if sep and "/" not in target else "transform", arg)
+
+
+# ------------------------------------------------------------------ migration (issue #108)
+
+
+@dataclass
+class Migration:
+    """The measurements of an ``integration.json`` from before content keys that
+    :func:`migrate` keyed (``entries``), of its ``total``; ``why`` the others were not."""
+
+    total: int = 0
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    why: list[str] = field(default_factory=list)
+    proof: str = ""  # what showed the context they ran in
+
+    def note(self) -> str:
+        """The log line ("" when there was nothing to migrate)."""
+        if not self.total:
+            return ""
+        head = "integration.json predates content keys (#93): "
+        if not self.entries:
+            return head + f"none of its {self.total} measurements reused: " + "; ".join(self.why)
+        line = head + f"{len(self.entries)} of {self.total} measurements migrated ({self.proof})"
+        rest = self.total - len(self.entries)
+        return line + (f"; {rest} not: " + "; ".join(self.why) if rest else "")
+
+
+def migrate(
+    previous: dict[str, Any],
+    keys: Keys,
+    *,
+    schema: int,
+    baseline_ms: float,
+    ab_rounds: int,
+    perceptual: bool,
+    verified: Callable[[str], bool],
+) -> Migration:
+    """The history entries of ``previous`` (an ``integration.json`` without ``reuse_key``s)
+    with the key :meth:`Keys.entry` gives them now, where the run proves that they ran with
+    what that key covers; anything not proven is measured again:
+
+    * the evaluator schema: every ``recheck`` record of the file carries
+      ``evaluator_schema`` (the integration that wrote it stamped them), equal to
+      ``schema``; a file without re-check records proves none;
+    * the baseline: its ``baseline_ms`` is ``baseline_ms``. ``analyze`` measures the latency
+      anew and seals it together with ``baseline.json`` and the baseline outputs
+      (``Truth.seal_baseline``), so the digests the worker verifies are today's too; its
+      measurements carry ``metrics.perceptual`` exactly when the quality mode is
+      near-lossless (``perceptual``);
+    * the A/B rounds: every paired A/B with timed rounds ran ``ab_rounds`` of them;
+    * each item: its file is still the snapshot a verified record of the run evaluated
+      (``verified``: the sha256 the record holds; the integration measured only such
+      snapshots), and it loads nothing else. A ``kernel_agent`` module it imports may have
+      changed with kernel-agent since (an upgrade is what made the file pre-#93), and its
+      content then is not recorded; a region kernel's rewrite neither. A kernel's
+      ``spec.json`` fields are today's: kernel-agent writes them once, when it captures the
+      target."""
+    history = previous.get("history") or []
+    out = Migration()
+    if not history or any(h.get("reuse_key") for h in history):
+        return out  # nothing, or a file with content keys
+    out.total = len(history)
+    rechecks = previous.get("recheck") or []
+    schemas = {r.get("evaluator_schema") for r in rechecks}
+    rounds = {
+        ab.get("rounds")
+        for h in history
+        if (ab := h.get("ab") or {}).get("mode") == "paired" and ab.get("a_ms")
+    }
+    modes = {
+        "perceptual" in h["metrics"]
+        for h in history
+        if h.get("status") == "ok" and isinstance(h.get("metrics"), dict)
+    }
+    if not rechecks or None in schemas:
+        out.why.append("its evaluator schema is not recorded (no re-check records)")
+    elif schemas != {schema}:
+        out.why.append(f"measured by evaluator schema {sorted(schemas)} (now {schema})")
+    if previous.get("baseline_ms") != baseline_ms:
+        then = previous.get("baseline_ms")
+        out.why.append(f"measured against another baseline ({then} ms, now {baseline_ms} ms)")
+    if rounds - {ab_rounds}:
+        ran = ", ".join(map(str, sorted(rounds, key=str)))
+        out.why.append(f"its paired A/B steps ran {ran} rounds (now --ab-rounds {ab_rounds})")
+    if modes - {perceptual}:
+        out.why.append("measured in another --quality mode")
+    if out.why:
+        return out
+    out.proof = (
+        f"evaluator schema {schema} from its re-checks, baseline {baseline_ms:.2f} ms, "
+        f"{ab_rounds} A/B rounds, the same snapshots"
+    )
+    problems: dict[str, str | None] = {}
+
+    def problem(arg: str) -> str | None:
+        """Why the content of an item then is not proven (None: it is)."""
+        if arg not in problems:
+            problems[arg] = _unproven(keys.run, arg, verified)
+        return problems[arg]
+
+    missed: dict[str, set[str]] = {}  # why -> labels of the items
+    for h in history:
+        args = [*((h.get("ab") or {}).get("a_items") or []), *(h.get("items") or [])]
+        bad = [(why, arg) for arg in args if (why := problem(arg)) is not None]
+        for why, arg in bad:
+            missed.setdefault(why, set()).add(ledger.item_label(arg))
+        if not bad and (key := keys.entry(h)) is not None:
+            out.entries.append({**h, "reuse_key": key})
+    out.why = [f"{', '.join(sorted(labels))}: {why}" for why, labels in missed.items()]
+    return out
+
+
+def _unproven(run: RunDir, arg: str, verified: Callable[[str], bool]) -> str | None:
+    """Why a migrated measurement of an item cannot count as one of its content today."""
+    kind, _ = as_item(arg)
+    path = Path(arg.partition("=")[2] if kind == "kernel" else arg)
+    if not verified(arg):
+        return "not a verified snapshot of the run (missing, changed or no record)"
+    try:
+        files = loaded_files(path, run.root)
+    except OSError:
+        return "cannot be read"
+    if others := sorted(f for f in files if f):
+        return f"loads {', '.join(others)}, whose content then is not recorded"
+    if kind == "kernel":
+        spec = read_json(run.target(arg.partition("=")[0]) / "spec.json", {}) or {}
+        if region.is_region(spec):
+            return "a region kernel, applied with a rewrite whose content then is not recorded"
+    return None
 
 
 # ------------------------------------------------------------------ what a file loads

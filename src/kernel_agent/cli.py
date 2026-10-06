@@ -66,6 +66,19 @@ def _seeds(raw: str) -> int | str | None:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+def _integration_reserve(raw: str) -> float | None:
+    """``--integration-reserve``: ``auto`` (None) or minutes (``0``: none)."""
+    if raw.strip().lower() == "auto":
+        return None
+    try:
+        minutes = float(raw)
+    except ValueError:
+        minutes = -1.0
+    if not 0.0 <= minutes < float("inf"):
+        raise argparse.ArgumentTypeError(f"expected auto or minutes (>= 0), got {raw!r}")
+    return minutes
+
+
 def _config(ns: argparse.Namespace) -> OptimizeConfig:
     return OptimizeConfig(
         model_ref=ns.model,
@@ -170,6 +183,7 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         integrate_every=ns.integrate_every,
         max_slices=ns.max_slices,
         research_every=ns.research_every,
+        integration_reserve=ns.integration_reserve,
         policy=Policy(
             patience=ns.patience,
             sol_stop=ns.sol_stop or None,
@@ -479,6 +493,14 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=4,
         help="re-integrate after this many kept results (0: only the final integration)",
+    )
+    p.add_argument(
+        "--integration-reserve",
+        type=_integration_reserve,
+        default=None,
+        metavar="auto|MINUTES",
+        help="time --max-hours keeps for the final integration (auto: its estimate, at most "
+        "a third of --max-hours; a longer one runs past it; 0: none)",
     )
     p.add_argument(
         "--patience", type=int, default=5, help="stop a target after this many evals w/o a gain"

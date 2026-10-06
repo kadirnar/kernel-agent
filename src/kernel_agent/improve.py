@@ -39,7 +39,7 @@ import math
 import re
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -50,6 +50,7 @@ from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.research import rows_table
 from kernel_agent.scheduler import (
+    INTEGRATION_SHARE,
     KERNEL,
     SHORT_SLICE,
     SYSTEMS,
@@ -91,6 +92,9 @@ class ImproveConfig:
     max_slices: int | None = None  # slices in this invocation (None: until budget / plateau)
     research_every: int = 3  # slices of a target between its research sessions (0: none)
     policy: Policy = field(default_factory=Policy)
+    # minutes the time budget keeps for the final integration (None: its estimate, at most
+    # INTEGRATION_SHARE of --max-hours; --integration-reserve)
+    integration_reserve: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -328,6 +332,7 @@ class Improver:
         self.require_capture = require_capture  # dry runs have no captures
         self.live_charts = live_charts
         self.kept = ""  # what the time budget keeps for the final integration (last logged)
+        self.migrated = ""  # the migration of a pre-#93 integration.json (last logged)
         self.doing: str | None = None  # what the loop is busy with (``_doing``)
 
     # -------------------------------------------------------- helpers
@@ -423,25 +428,72 @@ class Improver:
 
     def _integration_estimate(self) -> tuple[int, float]:
         rows = ledger.rows(self.run)
-        return integration_estimate(self.run, rows, self.arms(rows), self.orch.cfg.min_speedup)
+        reusable, migrated = self.orch.reusable()  # a pre-#93 integration.json: migrated
+        if migrated and migrated != self.migrated:
+            log(migrated)
+            self.migrated = migrated
+        kernels = {  # the snapshot the integration takes (not the arm's keep bar)
+            t: f"{t}={self.run.history_dir(t) / Path(best['snapshot']).name}"
+            for t, best in self.orch._kernel_bests()
+        }
+        return integration_estimate(self.run, rows, kernels, reusable)
+
+    def _reserve(self, estimate_s: float) -> float:
+        """Seconds the time budget keeps for a final integration expected to take
+        ``estimate_s``: ``--integration-reserve`` minutes, else (``auto``) the estimate, at
+        most ``INTEGRATION_SHARE`` of ``--max-hours``."""
+        if (minutes := self.icfg.integration_reserve) is not None:
+            return minutes * 60
+        return min(estimate_s, INTEGRATION_SHARE * (self.orch.budget.max_hours or 0.0) * 3600)
 
     def _keep_time(self) -> None:
-        """Keep the final integration's expected duration out of the agents' time
-        (``Budget.final_reserve_s``, :func:`~kernel_agent.scheduler.integration_estimate`),
-        estimated again after every evaluation (an evaluation may add an item): no session
-        runs into it (the evaluation advice says ``stop``), and no slice starts in it."""
+        """Keep the final integration's time out of the agents' time
+        (``Budget.final_reserve_s``, :meth:`_reserve` of its expected duration,
+        :func:`~kernel_agent.scheduler.integration_estimate`), estimated again after every
+        evaluation (an evaluation may add an item): no session runs into it (the evaluation
+        advice says ``stop``), and no slice starts in it. A final integration longer than
+        that runs past ``--max-hours`` (:meth:`_past_budget`)."""
         budget = self.orch.budget
         if budget.max_hours is None:
             return
         steps, each = self._integration_estimate()
-        budget.final_reserve_s = steps * each
-        budget.estimate_reserve = lambda: math.prod(self._integration_estimate())
+        budget.final_reserve_s = self._reserve(steps * each)
+        budget.estimate_reserve = lambda: self._reserve(math.prod(self._integration_estimate()))
         what = f"integrate + report ({budget.reserve:.0%} of --max-hours)"
+        estimate = f"{steps} A/B measurements × {each / 60:.1f} min"
         if budget.final_reserve_s > budget.max_hours * 3600 * budget.reserve:
-            what = f"the final integration ({steps} A/B measurements × {each / 60:.1f} min)"
+            what = f"the final integration ({estimate})"
+            over = (steps * each - budget.final_reserve_s) / 60
+            if self.icfg.integration_reserve is not None:
+                what = (
+                    f"the final integration (--integration-reserve; estimated "
+                    f"{steps * each / 60:.0f} min: {estimate})"
+                )
+            elif over >= 0.5:
+                what = (
+                    f"the final integration ({INTEGRATION_SHARE:.0%} of --max-hours; estimated "
+                    f"{steps * each / 60:.0f} min: {estimate}, so it may run {over:.0f} min "
+                    "past --max-hours)"
+                )
         if (kept := f"{budget.reserve_s() / 60:.0f} min kept for {what}") != self.kept:
             log(kept)
             self.kept = kept
+
+    def _past_budget(self) -> None:
+        """Log it when the final integration is expected to end after ``--max-hours`` (its
+        reserve was capped, or the loop stopped late): it runs to the end all the same, on
+        the GPU alone (no agent sessions)."""
+        left = self.orch.budget.seconds_left()
+        if left is None:
+            return
+        with suppress(Exception):  # a log line only: it never keeps the integration from running
+            steps, each = self._integration_estimate()
+            if steps * each > max(left, 0.0):
+                log(
+                    f"the final integration ({steps} A/B measurements × {each / 60:.1f} min ≈ "
+                    f"{steps * each / 60:.0f} min) runs past --max-hours "
+                    f"({max(left, 0.0) / 60:.0f} min left): it uses the GPU only, no agent sessions"
+                )
 
     def _in_time(self, arms: list[Arm]) -> tuple[Arm | None, str]:
         """The best live arm with time left for one slice
@@ -541,6 +593,7 @@ class Improver:
     async def _finish(self, reason: str) -> None:
         integrated = (self.run.root / "integration.json").exists()
         if self.keeps_since_integration() or not integrated:
+            self._past_budget()
             await self.reintegrate("final integration")
         self.state["finished"] = {"reason": reason, "at": _ts()}
         self.save()

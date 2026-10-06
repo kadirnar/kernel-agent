@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel_agent import charts, dryrun, orchestrator
+from kernel_agent import charts, dryrun, orchestrator, truth
 from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.improve import ImproveConfig, Improver
@@ -228,6 +228,119 @@ def test_irreversible_items_are_remembered_by_content(tmp_path):
     with_enc = [h for h in integrated(run)["history"] if "enc" in map(label, h["items"])]
     assert with_enc and all(h["ab"]["mode"] == "separate" for h in with_enc)
     assert calls.count("e2e_ab") == 7 - len(with_enc)
+
+
+# ------------------------------------------------------------------ pre-#93 files (#108)
+
+
+def rewrite(orch, data: dict) -> None:
+    """``integration.json`` replaced by ``data``, sealed as kernel-agent seals what it writes."""
+    path = orch.run.root / "integration.json"
+    write_json(truth.replace(path), data)
+    orch.truth.seal(path)
+
+
+def pre_93(orch) -> dict:
+    """``integration.json`` as kernel-agent wrote it before content keys: no ``reuse_key``,
+    no ``reuse`` counts (its re-check records carry the evaluator schema, #83)."""
+    data = integrated(orch.run)
+    for h in data["history"]:
+        del h["reuse_key"]
+    del data["reuse"]
+    rewrite(orch, data)
+    return data
+
+
+def estimate(orch) -> int:
+    """A/B steps the improve loop expects its final integration to measure."""
+    improver = Improver(orch, ImproveConfig(), require_capture=False, live_charts=False)
+    return improver._integration_estimate()[0]
+
+
+def test_a_pre_93_integration_json_is_migrated(tmp_path, capsys):
+    """runs/openbmb--VoxCPM2/20261006-004718: its integration.json was written before #93,
+    so the final integration of round 2 and its time reserve measured all 23 items alone
+    again, though 18 of them were the very snapshots it had measured."""
+    orch, _, calls = first_integration(tmp_path)
+    old = pre_93(orch)
+    assert {r["evaluator_schema"] for r in old["recheck"]} == {evaluate.EVALUATOR_SCHEMA}
+    capsys.readouterr()
+    assert estimate(orch) == 0  # nothing new since: nothing to measure
+
+    calls.clear()
+    asyncio.run(orch.integrate(reuse=True))
+    out = capsys.readouterr().out
+    assert "integration.json predates content keys (#93): 7 of 7 measurements migrated" in out
+    assert calls == []
+    data = integrated(orch.run)
+    assert data["reuse"] == {"reused": 7, "measured": 0}
+    assert all(h["reuse_key"] for h in data["history"])  # the next one reuses them as keyed
+    assert [h["ab"] for h in data["history"]] == [h["ab"] for h in old["history"]]
+
+
+@pytest.mark.parametrize("change", ["no schema", "old schema", "baseline", "rounds", "quality"])
+def test_a_pre_93_file_that_proves_less_is_measured_again(tmp_path, capsys, change):
+    orch, _, calls = first_integration(tmp_path)
+    data = pre_93(orch)
+    if change == "no schema":  # a re-check record from before #83
+        for r in data["recheck"]:
+            del r["evaluator_schema"]
+    elif change == "old schema":
+        for r in data["recheck"]:
+            r["evaluator_schema"] = evaluate.EVALUATOR_SCHEMA - 1
+    elif change == "baseline":  # measured against the baseline of an earlier analyze
+        data["baseline_ms"] = BASE * 1.01
+    elif change == "rounds":
+        orch.cfg.ab_rounds = 16
+    else:  # measured with the perceptual gate (near-lossless); the run judges exact now
+        for h in data["history"]:
+            h["metrics"]["perceptual"] = {"passed": True, "reason": ""}
+    rewrite(orch, data)
+    assert estimate(orch) == 7  # 4 alone, then 3 steps
+
+    calls.clear()
+    asyncio.run(orch.integrate(reuse=True))
+    out = capsys.readouterr().out
+    assert "predates content keys (#93): none of its 7 measurements reused: " in out
+    assert len(calls) == 7 and integrated(orch.run)["reuse"] == {"reused": 0, "measured": 7}
+
+
+def test_a_pre_93_measurement_with_more_than_its_snapshot_is_measured_again(tmp_path, capsys):
+    """A ``kernel_agent`` module an item imports may have changed with kernel-agent since
+    (the FP8 transforms of the VoxCPM2 run import ``kernels/quant.py``, which #91 and #92
+    changed after the integration measured them); a snapshot that changed since is not what
+    was measured."""
+    orch = make(tmp_path)
+    run = orch.run
+    files = {name: write(run, name) for name in ("cfm", "lm v1", "enc")}
+    files["enc"].write_text(files["enc"].read_text() + "\nfrom kernel_agent.kernels import quant\n")
+    for f in files.values():
+        e2e(run, [f])
+    kernel(run)
+    calls: list[tuple[list[str], list[str]]] = []
+    orch.worker = fake_worker(calls)
+    asyncio.run(orch.integrate())
+    pre_93(orch)
+    capsys.readouterr()
+
+    calls.clear()
+    asyncio.run(orch.integrate(reuse=True))
+    out = capsys.readouterr().out
+    assert "enc: loads kernel_agent/kernels/__init__.py, kernel_agent/kernels/quant.py" in out
+    # cfm, lm v1 and attn alone and the steps before enc are migrated; enc's are measured
+    assert calls == [([], ["enc"]), (["attn", "cfm", "lm v1"], ["attn", "cfm", "lm v1", "enc"])]
+    data = integrated(run)
+    assert data["reuse"] == {"reused": 5, "measured": 2}
+
+    pre_93(orch)  # and a snapshot changed after it was measured
+    cfm = next(Path(h["items"][0]) for h in data["history"] if label(h["items"][0]) == "cfm")
+    truth.writable(cfm)
+    cfm.write_text(cfm.read_text() + "# changed\n")
+    known, note = orch.reusable()
+    assert note and "cfm: not a verified snapshot of the run" in note
+    held = [[*h["items"], *h["ab"]["a_items"]] for h in known]
+    assert known and all(str(cfm) not in items for items in held)
+    assert all("enc" not in map(label, items) for items in held)
 
 
 # ------------------------------------------------------------------ content keys
