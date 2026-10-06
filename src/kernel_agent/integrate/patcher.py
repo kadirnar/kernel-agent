@@ -11,6 +11,7 @@ from typing import Any
 
 from torch import nn
 
+from kernel_agent.integrate.owners import compact
 from kernel_agent.integrate.undo import Undo, declared, record
 from kernel_agent.kernels.evaluate import load_candidate_module
 from kernel_agent.phases import PHASES, route
@@ -46,6 +47,10 @@ class PatchReport:
     transforms: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     rewritten: dict[str, int] = field(default_factory=dict)  # parents, per region target
+    #: per kernel target and transform (file stem): the modules it changed and those it
+    #: replaced (:mod:`kernel_agent.integrate.owners`), also of a failed transform
+    touched: dict[str, list[str]] = field(default_factory=dict)
+    owns: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _set_child(root: nn.Module, qualname: str, new: nn.Module) -> None:
@@ -91,6 +96,7 @@ def apply_kernels(
         pattern = re.compile(patch.qualname_regex) if patch.qualname_regex else None
         phase = patch.phase if patch.phase in PHASES else None
         replaced = skipped = 0
+        names: list[str] = []
         for root_name, root in roots.items():
             targets = [
                 (name, m)
@@ -128,8 +134,10 @@ def apply_kernels(
                     methods = patch.methods or ["forward", *entrypoints_of(type(instance))]
                     route(instance, new, phase, methods)
                 replaced += 1
+                names.append(f"{root_name}.{name}")
         report.replaced[patch.target_id] = replaced
         report.skipped[patch.target_id] = skipped
+        report.touched[patch.target_id] = report.owns[patch.target_id] = compact(names)
     return report
 
 
@@ -151,17 +159,22 @@ def load_transform(path: Path) -> Any:
 def apply_transforms(
     workload: Any, paths: list[Path], report: PatchReport, *, handles: list[Undo] | None = None
 ) -> PatchReport:
-    """Apply each transform file's ``apply(workload)``. ``handles``: append one
+    """Apply each transform file's ``apply(workload)``, recording which modules it changes
+    (``report.touched`` / ``owns``). ``handles``: append one
     :class:`~kernel_agent.integrate.undo.Undo` handle per transform (its optional
     ``undo`` declaration decides how it is undone)."""
     for path in paths:
         module = load_transform(path)
-        if handles is None:
-            module.apply(workload)
-        else:
+        handle: Undo | None = None
+        try:
             with record(f"transform {path.stem}", workload.roots(), workload) as handle:
-                handles.append(handle)
-                declared(handle, module, workload)
+                if handles is not None:
+                    handles.append(handle)
+                    declared(handle, module, workload)
                 module.apply(workload)
+        finally:
+            if handle is not None:
+                report.touched[path.stem] = compact(handle.touched)
+                report.owns[path.stem] = compact(handle.owns)
         report.transforms.append(path.stem)
     return report

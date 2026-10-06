@@ -653,6 +653,16 @@ B = A with one item replaced by another version of it (see below):
   transform may also define `undo(workload)` to revert what the snapshots
   cannot see; it is then applied again (plus a warm-up run) to re-enter its
   state.
+* An A/B that runs out of GPU memory has status `oom` (`torch.OutOfMemoryError`
+  or a CUDA out-of-memory error anywhere in the step): each state applies its
+  transforms afresh, so both states' FP8 weight copies, CUDA graph pools and
+  compiled code are alive in one process (a 17-transform composite plus one
+  kernel did not fit in 16 GB). The step is measured in two processes instead,
+  each with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (`worker
+  --expandable-segments`), and a later step whose states both hold what ran
+  out of memory goes to two processes at once. Only a step that still runs out
+  of memory there is recorded as `oom`, a ledger status of its own (the
+  environment, not the items' code), and a re-integration measures it again.
 * GPU clocks (with the board's maximum SM clock), temperature, power and
   clock-event reasons are sampled around every timed run through NVML
   (`pynvml`, when installed) or `nvidia-smi` (`ab.gpu`, `gpu` of `e2e`). A
@@ -2283,6 +2293,29 @@ a higher module speedup is compared with the version that won, not with the
 combination's. Another snapshot of the same file is no swap. Each swap is a
 `history` entry with `kind: swap`, `old` and `new`, a `target #old → #new` step
 in the waterfall and a `swap` line in `report.md`.
+
+Items that change the same modules are alternatives, not additions. While it
+applies an item, the patcher records which modules it changes (`patches` →
+`touched`, per kernel target and transform: the modules whose attributes,
+hooks, parameters, buffers, class or children the undo snapshot sees change,
+`workload.<name>` for an attribute of the workload object) and which it
+replaced (`owns`: a kernel's replaced or routed modules, a transform's swapped
+children and changed classes); list indices read `*`
+(`integrate/owners.py`). Two items overlap when they change the same module or
+one changes something inside a module the other replaced: `loc_enc_decode`
+(a kernel of the LocEnc) and `graph_loc_enc` (its CUDA graph), the VAE decoder
+kernel and `vae_channels_last` / `vae_bf16`, two CUDA graphs of the CFM
+solver. A module that merely contains the other's (a CUDA graph of the solver
+around the DiT layers a kernel replaces) is no overlap. After an item's
+addition, an item that overlaps accepted items is also tried in their place: A
+= the accepted set (with it, when its addition was accepted), B = that set
+without them and with it in the first one's place; the winner stays, and an
+item that lost its place this way is not added again. Such a step is a
+`history` entry with `kind: replace`, `old` (the items it replaced) and `new`,
+an `item for old` step in the waterfall and an `instead of` line in
+`report.md`; `integration.json` → `owners` keeps what the accepted items
+change, and the planner of the next round sees, per accepted transform, its
+top-most changed modules.
 
 ![integration waterfall](docs/images/example-integration.png)
 

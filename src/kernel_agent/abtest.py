@@ -12,16 +12,18 @@ the systems agent's measured combination) in one process (``worker e2e_ab``,
   gain ``1 - sum(B) / sum(A)`` (rounds resampled with replacement) is above
   ``min_gain`` (1 %).
 
-When a state cannot be undone in-process, A and B are measured in two
-processes back to back with :data:`SEPARATE_ITERS` timed runs each (A measured
-again in the same session): the win rate is then the share of (A run, B run)
-pairs that B wins, the gain ``1 - median(B) / median(A)``, and its interval
-comes from resampling both sets of runs.
+When a state cannot be undone in-process, or A and B do not fit in one process
+together (:data:`OOM`), A and B are measured in two processes back to back
+with :data:`SEPARATE_ITERS` timed runs each (A measured again in the same
+session): the win rate is then the share of (A run, B run) pairs that B wins,
+the gain ``1 - median(B) / median(A)``, and its interval comes from resampling
+both sets of runs.
 """
 
 from __future__ import annotations
 
 import random
+import re
 import statistics
 from collections.abc import Sequence
 from typing import Any
@@ -32,10 +34,28 @@ MIN_GAIN = 0.01
 #: Timed runs per process when A and B are measured in separate processes.
 SEPARATE_ITERS = 10
 RESAMPLES = 10_000
+#: ``e2e`` / ``e2e_ab`` status of a step that ran out of GPU memory: a property of what else
+#: the process held (two states of the model in one A/B process), not of the items' code.
+OOM = "oom"
 #: ``e2e_ab`` statuses after which the integration measures in separate processes: a state
-#: cannot be undone in-process, a switch did not restore it, or the A/B process itself
-#: failed (two states in memory, say); a real failure of B shows again in its own process.
-FALLBACK = ("irreversible", "undo_failed", "crash", "error")
+#: cannot be undone in-process, a switch did not restore it, the A/B process itself failed
+#: or ran out of memory (two states in memory, say); a real failure of B shows again in its
+#: own process.
+FALLBACK = ("irreversible", "undo_failed", "crash", "error", OOM)
+_OOM = re.compile(
+    r"OutOfMemoryError|CUDA out of memory|CUDA error: out of memory|CUBLAS_STATUS_ALLOC_FAILED"
+)
+
+
+def out_of_memory(error: object) -> str | None:
+    """The line of ``error`` (an exception, a traceback) that says the GPU ran out of
+    memory; None when it is another error."""
+    if isinstance(error, BaseException):
+        error = f"{type(error).__name__}: {error}"
+    for line in reversed(str(error or "").splitlines()):
+        if _OOM.search(line):
+            return line.strip()[:300]
+    return None
 
 
 def _quantile(values: list[float], q: float) -> float:

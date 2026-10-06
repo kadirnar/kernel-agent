@@ -57,6 +57,8 @@ class Session:
         self.workload = workload
         self.patches = patches  # TARGET_ID=PATH items -> KernelPatch list
         self.applied: list[Undo] = []
+        #: The state of the last :meth:`build`, also when it failed (what it applied so far).
+        self.built: State | None = None
 
     def shareable(self, on: State, kernels: list[str]) -> int:
         """Handles of ``on`` a state with ``kernels`` shares: its kernel handle (1) when
@@ -70,14 +72,16 @@ class Session:
     ) -> State:
         """Apply a state (kernels, then transforms) on the pristine model, or on ``on``'s
         kernels when it can share them (:meth:`shareable`). A failure propagates with the
-        partially applied handles in ``self.applied``."""
-        state = State(name, list(kernels), list(transforms))
+        partially applied handles in ``self.applied`` (and the state in ``self.built``)."""
+        state = self.built = State(name, list(kernels), list(transforms))
         own = list(kernels)
         if on is not None and (shared := self.shareable(on, kernels)):
             state.handles, state.shared = on.handles[:shared], shared
             own = own[len(on.kernels) :]
-            for key in ("replaced", "skipped", "rewritten"):
-                getattr(state.report, key).update(getattr(on.report, key))
+            ids = {k.partition("=")[0] for k in on.kernels}  # not what A's transforms did
+            for key in ("replaced", "skipped", "rewritten", "touched", "owns"):
+                done = getattr(on.report, key)
+                getattr(state.report, key).update({k: v for k, v in done.items() if k in ids})
             state.report.errors += on.report.errors
         self.to(state)
         try:

@@ -7,6 +7,9 @@ orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
                                           [--baseline-ms MS] [--verify REL=SHA256 ...]
     python -m kernel_agent.worker e2e_ab  --run-dir R [A: --kernel ... --transform ...]
                                           [B: --b-kernel ... --b-transform ...] [--rounds K]
+
+A step that runs out of GPU memory has status ``oom`` (``abtest.OOM``); the integration
+measures it again in separate processes with ``--expandable-segments``.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import subprocess
 import sys
 import time
@@ -309,7 +313,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         apply_kernels(workload.roots(), patches, report)
         apply_transforms(workload, [Path(p) for p in ns.transform or []], report)
     except Exception:
-        return {"status": "patch_error", "passed": False, "error": _tb()}
+        return _failed("patch_error", patches=report.__dict__)
 
     inputs = workload.make_inputs()
     monitor = Monitor()  # GPU clocks / temperature / power before and after the timing
@@ -317,12 +321,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     try:
         timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     except Exception:
-        return {
-            "status": "runtime_error",
-            "passed": False,
-            "patches": report.__dict__,
-            "error": _tb(),
-        }
+        return _failed("runtime_error", patches=report.__dict__)
     monitor.sample("after")
     output = timing.pop("output")
     base_ms, verdict = _judge(ns, workload, inputs, output, timing["median_ms"], truth_files)
@@ -433,12 +432,7 @@ def _checks(
     try:
         verdict = assess(workload, inputs, reference, output, chaotic=chaotic)
     except Exception as exc:
-        return base_ms, {
-            "status": "runtime_error",
-            "passed": False,
-            "reason": f"quality check failed: {exc}"[:500],
-            "error": _tb(),
-        }
+        return base_ms, _failed("runtime_error", reason=f"quality check failed: {exc}"[:500])
     # Held-out input (untimed) + memoisation probe; failures are verdicts, not errors.
     held = holdout.check(
         workload,
@@ -473,7 +467,9 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     and B (``--b-kernel`` / ``--b-transform``) built on it with undo handles
     (``integrate/ab.py``), warmed up, then alternated for ``--rounds`` timed rounds; B's
     quality is checked once, as in ``e2e``. Status ``irreversible`` / ``undo_failed``:
-    the states cannot be switched in-process, measure them in separate processes."""
+    the states cannot be switched in-process, measure them in separate processes; so does
+    ``oom`` (both states did not fit in one process). A failure reports what each state
+    applied so far (``patches``, ``ab.a_patches``: the modules each item touched)."""
     import torch
 
     from kernel_agent import abtest, telemetry
@@ -499,43 +495,48 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         warm_gpu(500.0)  # the same clock warm-up as `e2e`
     reference: dict[str, Any] = {}
     reproducible: dict[str, bool] = {}
+    states: dict[str, ab.State] = {}
+
+    def failed(status: str, why: str | None = None, error: str | None = None) -> dict[str, Any]:
+        if session.built is not None:  # the state that failed to build: what it applied
+            states.setdefault(session.built.name, session.built)
+        a_patches = states["A"].report.__dict__ if "A" in states else None
+        return _failed(
+            status,
+            error,
+            reason=why,
+            patches=states["B"].report.__dict__ if "B" in states else None,
+            ab={"a_patches": a_patches} if a_patches is not None else None,
+        )
+
     try:
-        a = session.build("A", a_kernels, a_transforms)
+        a = states["A"] = session.build("A", a_kernels, a_transforms)
         if bad := a.irreversible(keep=session.shareable(a, b_kernels)):
             return _irreversible(bad)
         reference["A"], reproducible["A"] = ab.warm(session, a, inputs, ns.warmup + 1)
     except Exception:
-        why = "the accepted set A failed in-process"
-        return {"status": "undo_failed", "passed": False, "reason": why, "error": _tb()}
+        return failed("undo_failed", "the accepted set A failed in-process")
+    # No torch.cuda.empty_cache() between A and B: releasing the cached segments turned an
+    # out-of-bounds access of a VAE kernel that cached memory absorbs into an illegal
+    # address (#112); a step that does not fit is measured in two processes instead.
     try:
-        b = session.build("B", b_kernels, b_transforms, on=a)
+        b = states["B"] = session.build("B", b_kernels, b_transforms, on=a)
     except Exception:  # its own items, or A's applied again: the separate processes tell
-        why = "B failed to apply in-process"
-        return {"status": "undo_failed", "passed": False, "reason": why, "error": _tb()}
+        return failed("undo_failed", "B failed to apply in-process")
     if bad := b.irreversible():
         return _irreversible(bad)
     try:
         reference["B"], reproducible["B"] = ab.warm(session, b, inputs, ns.warmup + 1)
     except Exception:
-        return {
-            "status": "runtime_error",
-            "passed": False,
-            "patches": b.report.__dict__,
-            "error": _tb(),
-        }
+        return failed("runtime_error")
     rounds = ab.alternate(
         session, (a, b), inputs, reference, reproducible, rounds=ns.rounds, sample=monitor.sample
     )
     if rounds.failed == "A" or rounds.mismatch:
         why = rounds.mismatch or "A failed after a switch from B"
-        return {"status": "undo_failed", "passed": False, "reason": why, "error": rounds.error}
+        return failed("undo_failed", why, rounds.error or "")
     if rounds.failed == "B":
-        return {
-            "status": "runtime_error",
-            "passed": False,
-            "patches": b.report.__dict__,
-            "error": rounds.error,
-        }
+        return failed("runtime_error", None, rounds.error or "")
     session.to(b)
     b_ms = ab.median(rounds.b_ms)
     base_ms, verdict = _judge(ns, workload, inputs, rounds.output, b_ms, truth_files)
@@ -577,6 +578,20 @@ def _irreversible(bad: list[tuple[list[str], str]]) -> dict[str, Any]:
 
 def _tb() -> str:
     return traceback.format_exc()[-4000:]
+
+
+def _failed(status: str, error: str | None = None, **extra: Any) -> dict[str, Any]:
+    """A failed step: ``status``, or ``oom`` when ``error`` (default: the exception being
+    handled) says the GPU ran out of memory; ``extra`` keys that are None are left out."""
+    from kernel_agent import abtest
+
+    error = _tb() if error is None else error
+    result: dict[str, Any] = {"status": status, "passed": False}
+    result.update({k: v for k, v in extra.items() if v is not None})
+    if oom := abtest.out_of_memory(error):
+        reasons = [result.get("reason"), f"out of GPU memory: {oom}"]
+        result.update(status=abtest.OOM, reason="; ".join(r for r in reasons if r))
+    return {**result, "error": error}
 
 
 def _truth_bytes(
@@ -624,12 +639,23 @@ def main(argv: list[str] | None = None) -> int:
         "--verify", action="append", help="e2e: REL=SHA256, refuse a run file without it"
     )
     parser.add_argument("--quality", help="exact | near-lossless (default: run.json's)")
+    parser.add_argument(
+        "--expandable-segments",
+        action="store_true",
+        help="PYTORCH_CUDA_ALLOC_CONF expandable_segments:True (the retry of an oom step)",
+    )
     ns = parser.parse_args(argv)
+    if ns.expandable_segments:  # before the CUDA caching allocator starts
+        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(
+            filter(None, [conf, "expandable_segments:True"])
+        )
     run = RunDir(ns.run_dir.resolve())
     try:
         result = COMMANDS[ns.command](run, ns)
     except Exception:
-        result = {"status": "error", "error": traceback.format_exc()[-6000:]}
+        result = _failed("error", traceback.format_exc()[-6000:])
+        result.pop("passed")  # an error of the command, not a verdict (as before)
     print(MARKER + json.dumps(result, default=str), flush=True)
     return 1 if "error" in result else 0
 
