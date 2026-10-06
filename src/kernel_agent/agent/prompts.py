@@ -293,6 +293,11 @@ model. Specialist agents will then write custom kernels for each target you pick
    calls; that submodule is then the target (`qualname_regex` selects parent
    instances). Use a region only when the fusion removes a real round trip
    through memory or launches that no module target covers.
+   **Ceilings.** When the profile has a *Ceilings* table, rank targets by
+   ceiling × share (its *saves ms*, and the FP8 / FP4 floors where precision
+   may change), not by share alone, and name each target's bound with its
+   number in `why` (e.g. "compute bound: 80 TFLOP per run at M = 352, floor
+   0.81 s at bf16 vs 3.9 s now").
 3. For each target give `approach` (the concrete fusion/algorithm idea, which
    kernels it removes, expected speedup) and an ordered list of `backends` from:
    {", ".join(backends)}. Put the backend most suited to the op first

@@ -124,12 +124,22 @@ def format_peaks(peaks: dict[str, Any]) -> str:
     parts = [f"copy DRAM {peaks['dram_gbps']:.0f} GB/s"]
     if peaks.get("l2_gbps"):
         parts.append(f"L2 {peaks['l2_gbps']:.0f} GB/s")
-    short = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
+    short = {
+        "bfloat16": "bf16",
+        "float16": "fp16",
+        "float32": "fp32",
+        "float8_e4m3fn": "fp8",
+        "float4_e2m1fn_x2": "nvfp4",
+    }
     tflops = peaks.get("tflops") or {}
     if tflops:
         names = "/".join(short.get(k, k) for k in tflops)
         values = " / ".join(f"{v:.0f}" for v in tflops.values())
         parts.append(f"matmul {names} {values} TFLOP/s")
+    if peaks.get("tflops_unavailable"):  # low-precision matmuls torch has no kernel for here
+        parts.append(
+            "no " + "/".join(short.get(k, k) for k in peaks["tflops_unavailable"]) + " matmul"
+        )
     if peaks.get("launch_floor_us"):
         parts.append(f"launch floor {peaks['launch_floor_us']:.1f} us")
     return ", ".join(parts)

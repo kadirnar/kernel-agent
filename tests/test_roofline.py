@@ -356,6 +356,9 @@ def test_measured_peaks_and_rmsnorm_sol(tmp_path):
     assert peaks is not None, "peak measurement failed"
     assert 100 < peaks["dram_gbps"] < 10_000 and peaks["l2_gbps"] > peaks["dram_gbps"]
     assert peaks["tflops"]["bfloat16"] > peaks["tflops"]["float32"] > 1
+    for low in (roofline.FP8, roofline.FP4):  # measured, or why not (never a ratio)
+        assert low in peaks.get("tflops_unavailable", {}) or peaks["tflops"][low] > 1
+    assert peaks["version"] == roofline.PEAKS_VERSION
     assert 0.5 < peaks["launch_floor_us"] < 500
     print("peaks:", toolchain.format_peaks(peaks))
 

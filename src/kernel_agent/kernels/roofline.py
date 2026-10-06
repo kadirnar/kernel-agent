@@ -2,7 +2,9 @@
 
 * **Peaks** (:func:`measure_peaks`): device-to-device copy bandwidth from DRAM
   and from L2 (bytes read + bytes written), dense matmul TFLOP/s per dtype (best
-  of a few large shapes) and the launch floor (median time of a module call that
+  of a few large shapes; FP8 e4m3 via ``torch._scaled_mm`` and NVFP4 where torch
+  has a kernel for the GPU, else ``tflops_unavailable`` says why) and the launch
+  floor (median time of a module call that
   launches one tiny kernel, timed like a candidate).  :func:`ensure_peaks`
   measures them once per GPU + torch version in a subprocess under the GPU lock
   and caches them in ``<cache>/peaks-<gpu>-torch<version>.json``; they are never
@@ -61,6 +63,11 @@ MASKED = -1e4  # additive attention-mask values at or below this mask the positi
 #: scale per output channel (row), so ``pct_of_sol`` of an FP8 kernel is measured against
 #: the bytes it must stream, not the bf16 weights it replaced.
 WEIGHT_BITS = {"fp8_weights": 8}
+#: ``peaks["tflops"]`` keys of the low-precision tensor-core peaks: FP8 e4m3 and NVFP4.
+FP8, FP4 = "float8_e4m3fn", "float4_e2m1fn_x2"
+#: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks. :func:`ensure_peaks` measures an
+#: older cache again (once per process at most); until then it stays in use.
+PEAKS_VERSION = 2
 _MiB = 1024**2
 
 # Ops that look at a tensor argument's metadata only (no data read).
@@ -139,6 +146,14 @@ def _copy_gbps(src: Any, dst: Any, *, graph_reps: int = 0) -> float:
     return best
 
 
+def _gemm_tflops(fn: Any, m: int, n: int, k: int) -> float:
+    """TFLOP/s of ``fn``, one ``[m, k] x [k, n]`` matmul per call."""
+    fn()
+    est = _best_ms(fn, iters=2, trials=1)
+    ms = _best_ms(fn, iters=max(3, int(60 / est)))
+    return 2 * m * n * k / ms / 1e9
+
+
 def _matmul_tflops(dtype: Any, shapes: list[tuple[int, int, int]], free: int) -> float | None:
     import torch
 
@@ -150,12 +165,70 @@ def _matmul_tflops(dtype: Any, shapes: list[tuple[int, int, int]], free: int) ->
         a = torch.randn(m, k, device="cuda", dtype=dtype)
         b = torch.randn(k, n, device="cuda", dtype=dtype)
         c = torch.empty(m, n, device="cuda", dtype=dtype)
-        torch.mm(a, b, out=c)
-        est = _best_ms(lambda a=a, b=b, c=c: torch.mm(a, b, out=c), iters=2, trials=1)
-        ms = _best_ms(lambda a=a, b=b, c=c: torch.mm(a, b, out=c), iters=max(3, int(60 / est)))
-        tflops = 2 * m * n * k / ms / 1e9
+        tflops = _gemm_tflops(lambda a=a, b=b, c=c: torch.mm(a, b, out=c), m, n, k)
         best = tflops if best is None else max(best, tflops)
         del a, b, c
+    return None if best is None else round(best, 1)
+
+
+def _fp8_tflops(shapes: list[tuple[int, int, int]], free: int) -> float | None:
+    """Dense FP8 e4m3 x e4m3 -> bf16 (fp32 accumulation) via ``torch._scaled_mm``."""
+    import torch
+
+    best = None
+    for m, n, k in shapes:
+        if m * k + k * n + 2 * m * n > free // 2:
+            continue
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn).t()
+        one = torch.ones((), device="cuda")  # tensor-wise scales; b is column-major
+
+        def fp8_mm(a: Any = a, b: Any = b, one: Any = one) -> Any:
+            return torch._scaled_mm(a, b, scale_a=one, scale_b=one, out_dtype=torch.bfloat16)
+
+        tflops = _gemm_tflops(fp8_mm, m, n, k)
+        best = tflops if best is None else max(best, tflops)
+        del a, b
+    return None if best is None else round(best, 1)
+
+
+def _fp4_tflops(shapes: list[tuple[int, int, int]], free: int) -> float | None:
+    """Dense NVFP4 (e2m1, one e4m3 scale per 16 elements) x NVFP4 -> bf16 via
+    ``torch.nn.functional.scaled_mm``; raises where torch or the GPU has no such kernel."""
+    import torch
+    import torch.nn.functional as F
+
+    fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    scaled_mm = getattr(F, "scaled_mm", None)
+    if fp4 is None or scaled_mm is None:
+        raise RuntimeError("this torch has no NVFP4 scaled_mm")
+    blockwise, swizzle = F.ScalingType.BlockWise1x16, F.SwizzleType.SWIZZLE_32_4_4
+    best = None
+    for m, n, k in shapes:
+        if (m * k + k * n) // 2 + 2 * m * n > free // 2:
+            continue
+        # Random codes (every e2m1 code is finite) and scales: the values do not matter.
+        a = torch.randint(0, 256, (m, k // 2), device="cuda", dtype=torch.uint8).view(fp4)
+        b = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8).view(fp4).t()
+        scale_a = torch.rand(m, k // 16, device="cuda").to(torch.float8_e4m3fn)
+        scale_b = torch.rand(k // 16, n, device="cuda").to(torch.float8_e4m3fn)
+
+        def fp4_mm(a: Any = a, b: Any = b, sa: Any = scale_a, sb: Any = scale_b) -> Any:
+            return scaled_mm(
+                a,
+                b,
+                scale_a=[sa],
+                scale_recipe_a=[blockwise],
+                scale_b=[sb],
+                scale_recipe_b=[blockwise],
+                swizzle_a=[swizzle],
+                swizzle_b=[swizzle],
+                output_dtype=torch.bfloat16,
+            )
+
+        tflops = _gemm_tflops(fp4_mm, m, n, k)
+        best = tflops if best is None else max(best, tflops)
+        del a, b, scale_a, scale_b
     return None if best is None else round(best, 1)
 
 
@@ -174,6 +247,7 @@ def measure_peaks() -> dict[str, Any]:
     ensure_clocks()  # the memory clock too: these peaks are what its probes compare with
     free, _ = torch.cuda.mem_get_info()
     peaks: dict[str, Any] = {
+        "version": PEAKS_VERSION,
         "gpu": tc.gpu.name,
         "arch": tc.gpu.arch,
         "torch": tc.torch_version,
@@ -204,6 +278,20 @@ def measure_peaks() -> dict[str, Any]:
         if (tflops := _matmul_tflops(dtype, shapes, free)) is not None
     }
     torch.cuda.empty_cache()
+    # Low-precision tensor cores: measured where torch has a kernel for this GPU, else the
+    # reason is recorded (a ratio to bf16 is never assumed).
+    unavailable: dict[str, str] = {}
+    for name, measure in ((FP8, _fp8_tflops), (FP4, _fp4_tflops)):
+        try:
+            tflops = measure(big, free)
+        except Exception as exc:  # no kernel for this GPU / torch build
+            unavailable[name] = f"{type(exc).__name__}: {exc}"[:200]
+        else:
+            if tflops is not None:
+                peaks["tflops"][name] = tflops
+        torch.cuda.empty_cache()
+    if unavailable:
+        peaks["tflops_unavailable"] = unavailable
 
     # Launch floor: a module call that launches one tiny kernel, timed like a candidate.
     class _OneKernel(nn.Module):
@@ -219,7 +307,7 @@ def measure_peaks() -> dict[str, Any]:
 def _peaks_file() -> tuple[Any, Path] | None:
     """(toolchain, peaks cache file) of the current GPU, or None without one."""
     tc = toolchain.setup()
-    name = getattr(tc.gpu, "name", None)
+    name = getattr(getattr(tc, "gpu", None), "name", None)
     if not isinstance(name, str):
         return None
     return tc, toolchain.peaks_path(name, tc.torch_version)
@@ -239,30 +327,37 @@ def current_peaks() -> dict[str, Any] | None:
 _MEASURE_FAILED = False
 
 
+def _up_to_date(peaks: dict[str, Any] | None) -> bool:
+    return peaks is not None and int(peaks.get("version") or 1) >= PEAKS_VERSION
+
+
 def ensure_peaks(
     *, remeasure: bool = False, timeout: float = 600.0, verbose: bool = False
 ) -> dict[str, Any] | None:
-    """Cached peaks, measuring them first (subprocess, under the GPU lock) when missing.
+    """Cached peaks, measuring them first (subprocess, under the GPU lock) when missing
+    or older than :data:`PEAKS_VERSION`.
 
     Never raises; returns None without a GPU or when the measurement fails (it is
-    retried once per process at most). The peaks are measured on the GPU of the pool
-    this thread locks and filed under this process's GPU model: a pool of identical
-    GPUs shares one file (mixed models: restrict the pool, ``KERNEL_AGENT_GPUS``)."""
+    retried once per process at most; an older cache stays in use). The peaks are
+    measured on the GPU of the pool this thread locks and filed under this process's
+    GPU model: a pool of identical GPUs shares one file (mixed models: restrict the
+    pool, ``KERNEL_AGENT_GPUS``)."""
     global _MEASURE_FAILED
+    stale = None  # an older cache: kept when the measurement fails
     try:
         found = _peaks_file()
         if found is None:
             return None
         tc, path = found
         if not remeasure:
-            peaks = current_peaks()
-            if peaks is not None or _MEASURE_FAILED:
+            peaks = stale = current_peaks()
+            if _up_to_date(peaks) or _MEASURE_FAILED:
                 return peaks
         from kernel_agent.gpulock import child_env, gpu_lock
 
         with gpu_lock():
             peaks = None if remeasure else toolchain.load_peaks(path)  # another process won
-            if peaks is None:
+            if not _up_to_date(peaks):
                 if verbose:
                     print(f"measuring GPU peaks for the roofline -> {path}", file=sys.stderr)
                 cmd = [sys.executable, "-m", "kernel_agent.kernels.roofline", "--out", str(path)]
@@ -271,13 +366,13 @@ def ensure_peaks(
                 )
                 if proc.returncode != 0 and verbose:
                     print(proc.stderr[-2000:], file=sys.stderr)
-                peaks = toolchain.load_peaks(path)
+                peaks = toolchain.load_peaks(path) or stale
     except Exception as exc:  # OSError, TimeoutExpired, a broken toolchain, ...
         if verbose:
             print(f"peak measurement failed: {exc}", file=sys.stderr)
         _MEASURE_FAILED = True
-        return None
-    _MEASURE_FAILED = peaks is None
+        return stale
+    _MEASURE_FAILED = not _up_to_date(peaks)
     tc.peaks = peaks
     return peaks
 

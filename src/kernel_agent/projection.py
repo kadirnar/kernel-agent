@@ -252,8 +252,14 @@ def build(specs: Mapping[str, Mapping[str, Any]], profiles: Sequence[Mapping[str
             if region and pattern:
                 pattern = f"{pattern}.[{target_id}]"  # inside each parent instance
             groups.append(Group(target_id, pattern, n / total, phase, inside))
-    groups.sort(key=lambda g: g.pattern.count("."))  # outer groups first
-    return Tree(tuple(groups), tuple(_parent(groups, i) for i in range(len(groups))))
+    return of_groups(groups)
+
+
+def of_groups(groups: Iterable[Group]) -> Tree:
+    """The tree of explicit groups (:func:`build` without the specs; e.g. the ceilings
+    table's rows, ``profiling/ceilings.py``)."""
+    ordered = sorted(groups, key=lambda g: g.pattern.count("."))  # outer groups first
+    return Tree(tuple(ordered), tuple(_parent(ordered, i) for i in range(len(ordered))))
 
 
 def _instances(

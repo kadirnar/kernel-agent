@@ -819,11 +819,16 @@ hardware limit (`kernel_agent/kernels/roofline.py`).
   in `~/.cache/kernel-agent/peaks-<gpu>-torch<version>.json`. They are copy
   bandwidth from DRAM (512 MiB buffers) and from L2 (counting bytes read plus
   bytes written), dense matmul TFLOP/s for bf16, fp16 and fp32 (best of a few
-  large shapes, TF32 off), and the launch floor (a module call that launches
-  one tiny kernel, timed like a candidate). `kernel-agent doctor` measures and
-  prints them (`--remeasure-peaks` measures again). `toolchain.json` and the
-  agents' prompts include them. On the RTX 5070 Ti: copy DRAM 767 GB/s, L2
-  2970 GB/s, matmul bf16/fp16/fp32 99 / 94 / 34 TFLOP/s, launch floor ~16 µs.
+  large shapes, TF32 off) and for FP8 e4m3 (`torch._scaled_mm`, fp32
+  accumulation) and NVFP4 (`torch.nn.functional.scaled_mm`, one e4m3 scale per
+  16 elements) where torch has a kernel for the GPU (otherwise
+  `tflops_unavailable` says why; no ratio to bf16 is assumed), and the launch
+  floor (a module call that launches one tiny kernel, timed like a candidate).
+  `kernel-agent doctor` measures and prints them (`--remeasure-peaks` measures
+  again); a cache from before the FP8 / FP4 peaks is measured again once.
+  `toolchain.json` and the agents' prompts include them. On the RTX 5070 Ti:
+  copy DRAM 767 GB/s, L2 2970 GB/s, matmul bf16/fp16/fp32 99 / 94 / 34
+  TFLOP/s, FP8 333 TFLOP/s, NVFP4 641 TFLOP/s, launch floor ~16 µs.
 * **Work** is counted on the reference call. FLOPs come from
   `torch.utils.flop_counter.FlopCounterMode`, split by the dtype of each op's
   inputs. Attention (SDPA) FLOPs count only the query/key pairs that the mask
@@ -858,6 +863,60 @@ hardware limit (`kernel_agent/kernels/roofline.py`).
   span. Element-wise math counts as free. The launch floor is measured for a
   torch op, and backend launch paths add their own overhead on top of it
   (CUDA C++ ~19 µs, Triton ~43 µs, see Backends).
+
+### Ceilings for the planner
+
+The speed of light above is per kernel evaluation, after the plan. `analyze`
+also writes a ceilings table before it (`kernel_agent/profiling/ceilings.py`):
+how far each module class can go at the shapes and call counts of the profile,
+per precision. It goes to `profile/ceilings.md` + `ceilings.json` and to the end
+of `profile/summary.md`, so the planner sees it, and every improve round's
+re-profile makes a new one for its re-plan.
+
+* **Work.** The profiler records, per module call, the FLOPs and weights of the
+  `nn.Linear` and convolution calls inside it (`2 × rows × in × out`, each weight
+  read once per call) and the bytes of its first input and output.
+  `profile.json` → `classes[].work` sums them per instance group (qualname with
+  layer indices folded) and phase. A call whose insides the hooks do not see (a
+  compiled module, a CUDA-graph replay, a replaced kernel) is estimated from its
+  module's `nn.Linear` weights at its input's rows (`estimated_calls`, † in the
+  table).
+* **Rows.** One per class × instance group × phase; sibling groups of a leaf
+  class share one (`Linear` `model.base_lm.layers.*.self_attn.{k_proj,o_proj,q_proj,v_proj}`).
+  Columns: calls, *M* = FLOPs / (2 × weight elements) (the rows per weight read;
+  a bf16 GEMM turns compute bound near M = peak / bandwidth, ≈ 130 on the RTX
+  5070 Ti), *now* (hooked time scaled to the unhooked run) and its share, TFLOP
+  and weight GB per run, the bound, the floors and *saves* = now − exact floor.
+* **Floors** (ms per run) = max(FLOPs / peak, (weight + I/O bytes) / DRAM
+  bandwidth, calls × launch floor), per precision: *exact* (as profiled),
+  *FP8 w* (one byte per weight, bf16 math), *W8A8* (FP8 tensor-core peak),
+  *FP4 w* (NVFP4, 4.5 bits per weight, bf16 math) and *W4A4* (NVFP4 peak). A
+  precision whose peak was not measured is `?`.
+* **End to end**, per precision: the run with every class at its floor, nested
+  classes counted once (the non-overlapping set of `projection.py`).
+* The planner ranks targets by ceiling × share (*saves ms*) and names each
+  target's bound with its number.
+* Approximate: attention scores, KV-cache reads and element-wise math are not
+  counted, weights stream from DRAM on every call, fp32 convolutions are held
+  to the fp32 peak (cuDNN may use TF32). `python -m kernel_agent.profiling.ceilings
+  profile.json --baseline-ms <ms> [--peaks peaks.json]` prints the table of any
+  profile made since.
+
+VoxCPM2 at batch 16 (`-o metric=throughput`, eager, 5.80 s per batched run;
+peaks bf16 100, FP8 333, NVFP4 641 TFLOP/s, DRAM 770 GB/s), an excerpt:
+
+| target | calls | M | now ms | bound | exact | FP8 w | W8A8 | FP4 w | W4A4 |
+|---|---|---|---|---|---|---|---|---|---|
+| `VoxCPMLocDiT` `model.feat_decoder.estimator` | 540 | 346 | 3,867 | compute | 789 | 789 | 238 | 789 | 124 |
+| `VoxCPMLocEnc` `model.feat_encoder` (decode) | 60 | 80 | 466 | memory | 32.4 | 19.9 | 16.2 | 19.9 | 9.11 |
+| `MiniCPMMLP` `model.base_lm.layers.*.mlp` | 1708 | 20 | 237 | memory | 168 | 84.1 | 84.1 | 47.5 | 47.5 |
+| `Linear` `model.base_lm.layers.*.self_attn.{k_proj,o_proj,q_proj,v_proj}` | 6832 | 20 | 222 | launch | 104 | 104 | 104 | 104 | 104 |
+
+The LocDiT is compute bound at M = 352 rows (79 TFLOP per run: FP8 weights
+alone buy nothing there, W8A8 does), the batched LM decode streams 3.40 GB of
+bf16 weights per step (memory bound; its separate q/k/v/o GEMVs are launch
+bound), and the end-to-end floors are exact ≥ 1.73 s (3.4x), FP8 weights ≥ 1.61 s,
+W8A8 ≥ 0.98 s (5.9x), W4A4 ≥ 0.81 s.
 
 ### Budgets
 
@@ -1666,6 +1725,7 @@ runs/<org>--<name>/<timestamp>/
   baseline.json               eager baseline (+ compiled_ms / compiled_detail, see "Strong baseline")
   program.md                  agent instructions; edit it mid-run to steer the agents
   profile/summary.md          profile handed to the planner
+  profile/ceilings.md         floors per class at bf16 / FP8 / FP4 (+ ceilings.json; in summary.md)
   plan.json                   targets + transforms
   .truth/                     what the evaluator trusts (read-only, sha256 in run.json):
     baseline_output.pt          output of the baseline run

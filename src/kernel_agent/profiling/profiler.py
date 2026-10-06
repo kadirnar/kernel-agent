@@ -5,7 +5,9 @@ Two complementary views are collected:
 * **Module view** – CUDA events recorded by forward pre/post hooks on every
   ``nn.Module`` give inclusive and self time per module *class* and per input
   shape signature (e.g. prefill ``[1, 512, 896]`` vs decode ``[1, 1, 896]``).
-  These classes are the units the agent rewrites.  Entrypoints other than
+  These classes are the units the agent rewrites; ``work`` adds, per instance
+  group and phase, the ``nn.Linear`` / convolution FLOPs and weights inside the
+  calls (the ceilings table, :mod:`.ceilings`).  Entrypoints other than
   ``forward`` (``forward_step`` in a custom decode loop, ``decode`` of a VAE)
   bypass hooks; they are wrapped per instance (:mod:`.methods`) and reported
   per method.
@@ -85,6 +87,13 @@ class _Call:
     children: list[int] = field(default_factory=list)
     method: str = "forward"
     phase: str = "prefill"
+    # Work of this call alone (_input_work / _output_work; class_stats adds its children's):
+    rows: int = 0  # of the first tensor argument: numel / last dim
+    io_bytes: int = 0  # the first tensor argument + the first tensor of the output
+    flops: int = 0  # nn.Linear / convolution FLOPs, at ``dtype``
+    dtype: str = ""
+    weight_elems: int = 0  # weights (and bias) it reads
+    weight_bytes: int = 0
 
 
 @dataclass
@@ -110,6 +119,9 @@ class ClassStat:
     #: (``model.base_lm.layers.*.self_attn``: 28); the module tree of
     #: :mod:`kernel_agent.projection`.
     groups: dict[str, int] = field(default_factory=dict)
+    #: Per (folded qualname, phase): calls, inclusive_ms and the work of those calls, the
+    #: input of :mod:`kernel_agent.profiling.ceilings` (:meth:`ModuleTimer.class_stats`).
+    work: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _capturing() -> bool:
@@ -122,6 +134,72 @@ def _compiled(module: nn.Module) -> nn.Module | None:
     """The original module of a ``torch.compile``'d one (``OptimizedModule._orig_mod``)."""
     orig = getattr(module, "_orig_mod", None)
     return orig if isinstance(orig, nn.Module) else None
+
+
+_CONV = (
+    nn.Conv1d,
+    nn.Conv2d,
+    nn.Conv3d,
+    nn.ConvTranspose1d,
+    nn.ConvTranspose2d,
+    nn.ConvTranspose3d,
+)
+
+
+def _first_tensor(values: Any) -> torch.Tensor | None:
+    """The first tensor of a call's arguments or output (a tensor, or one level of a tuple,
+    list or dict-like output)."""
+    if isinstance(values, torch.Tensor):
+        return values
+    if isinstance(values, dict):
+        values = list(values.values())
+    if isinstance(values, tuple | list):
+        return next((v for v in values if isinstance(v, torch.Tensor)), None)
+    return None
+
+
+def _weights(module: nn.Module) -> list[torch.Tensor]:
+    return [
+        t
+        for t in (getattr(module, "weight", None), getattr(module, "bias", None))
+        if isinstance(t, torch.Tensor)
+    ]
+
+
+def _input_work(call: _Call, module: nn.Module, x: torch.Tensor | None) -> None:
+    """Rows and input bytes of a call; FLOPs and weights of an ``nn.Linear`` call
+    (``2 × rows × in × out``, its weight and bias read once)."""
+    if x is None:
+        return
+    call.io_bytes = x.numel() * x.element_size()
+    call.dtype = str(x.dtype).removeprefix("torch.")
+    floating = x.is_floating_point() and x.dim() > 0
+    call.rows = x.numel() // x.shape[-1] if floating and x.shape[-1] else x.numel()
+    weights = _weights(module) if isinstance(module, nn.Linear) else []
+    if weights and weights[0].dim() == 2:
+        call.flops = 2 * call.rows * weights[0].numel()
+        call.weight_elems = sum(t.numel() for t in weights)
+        call.weight_bytes = sum(t.numel() * t.element_size() for t in weights)
+
+
+def _output_work(
+    call: _Call, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any], output: Any
+) -> None:
+    """Output bytes of a call; FLOPs and weights of a convolution call."""
+    out = _first_tensor(output)
+    if out is None:
+        return
+    call.io_bytes += out.numel() * out.element_size()
+    weights = _weights(module) if isinstance(module, _CONV) else []
+    x = _first_tensor((*args, *kwargs.values()))
+    if weights and x is not None and weights[0].dim() > 2:
+        weight = weights[0]
+        # conv: every output element sums C_in/groups × kernel products; transposed: every
+        # input element feeds C_out/groups × kernel outputs (weight dim 0 is C_out / C_in).
+        per = weight.numel() // weight.shape[0]
+        call.flops = 2 * (x.numel() if getattr(module, "transposed", False) else out.numel()) * per
+        call.weight_elems = sum(t.numel() for t in weights)
+        call.weight_bytes = sum(t.numel() * t.element_size() for t in weights)
 
 
 class ModuleTimer:
@@ -236,17 +314,18 @@ class ModuleTimer:
         _, full = self._names.get(id(module), ("?", type(module).__name__))
         start = self._now()
         parent = self._stack[-1][0] if self._stack else -1
-        self.calls.append(
-            _Call(
-                full,
-                type(module).__name__,
-                call_signature(method, args, kwargs, limit=1),
-                parent,
-                start,
-                method=method,
-                phase=call_phase(method, args, kwargs),
-            )
+        call = _Call(
+            full,
+            type(module).__name__,
+            call_signature(method, args, kwargs, limit=1),
+            parent,
+            start,
+            method=method,
+            phase=call_phase(method, args, kwargs),
         )
+        with contextlib.suppress(Exception):  # the work estimate never breaks a profile
+            _input_work(call, module, _first_tensor((*args, *kwargs.values())))
+        self.calls.append(call)
         index = len(self.calls) - 1
         if parent >= 0:
             self.calls[parent].children.append(index)
@@ -273,6 +352,8 @@ class ModuleTimer:
         index = self._stack[depth][0]
         del self._stack[depth:]
         self.calls[index].end = self._now()
+        with contextlib.suppress(Exception):
+            _output_work(self.calls[index], module, args, kwargs, output)
 
     def class_stats(self) -> list[ClassStat]:
         if self.cuda:
@@ -286,6 +367,7 @@ class ModuleTimer:
             for qualname, module in root_module.named_modules():
                 full = f"{root_name}.{qualname}" if qualname else root_name
                 modules.setdefault(full, module)
+        work = self._subtree_work(modules)
 
         groups: dict[tuple[str, str], dict[str, Any]] = {}
         for idx, call in enumerate(self.calls):
@@ -309,6 +391,7 @@ class ModuleTimer:
                         }
                     ),
                     "example": call.qualname,
+                    "work": collections.defaultdict(_new_work),
                 },
             )
             # Do not double count recursive containers of the same class.
@@ -332,6 +415,9 @@ class ModuleTimer:
                 g["inclusive"] += inclusive[idx]
                 meth[1] += inclusive[idx]
                 phase["inclusive"] += inclusive[idx]
+                _add_work(
+                    g["work"][(fold(call.qualname), call.phase)], call, work[idx], inclusive[idx]
+                )
             sig = g["sigs"][call.signature]
             sig[0] += 1
             sig[1] += inclusive[idx]
@@ -378,10 +464,41 @@ class ModuleTimer:
                         )
                     },
                     groups=dict(_folded(g["qualnames"]).most_common()),
+                    work=[
+                        _work_entry(pattern, phase_name, w)
+                        for (pattern, phase_name), w in sorted(
+                            g["work"].items(), key=lambda kv: -kv[1]["inclusive"]
+                        )
+                    ],
                 )
             )
         stats.sort(key=lambda s: -s.inclusive_ms)
         return stats
+
+    def _subtree_work(self, modules: dict[str, nn.Module]) -> list[_Work]:
+        """Per call: its own work (``nn.Linear`` / convolution) plus that of every call inside
+        it. A call that saw no weights at all gets an estimate from its module's
+        ``nn.Linear`` weights at its input's rows (``estimated``): a compiled module or a
+        CUDA-graph replay hides its insides from the hooks, and a replaced kernel may not
+        call its Linear children."""
+        static: dict[str, tuple[int, int, int, str]] = {}
+        out: list[_Work] = [_Work()] * len(self.calls)
+        for i in range(len(self.calls) - 1, -1, -1):  # a call's children come after it
+            call = self.calls[i]
+            w = _Work({call.dtype: call.flops} if call.flops else {})
+            w.weight_elems, w.weight_bytes = call.weight_elems, call.weight_bytes
+            for c in call.children:
+                w.add(out[c])
+            if not w.weight_elems and call.rows and call.qualname in modules:
+                if call.qualname not in static:
+                    static[call.qualname] = _linear_weights(modules[call.qualname])
+                matmul, w.weight_elems, w.weight_bytes, dtype = static[call.qualname]
+                if matmul:
+                    dtype = call.dtype if "float" in call.dtype else dtype  # ids: the weights'
+                    w.flops = {dtype: 2 * call.rows * matmul}
+                    w.estimated = True
+            out[i] = w
+        return out
 
     def gaps(self) -> dict[str, Any]:
         """What the module view does not time (empty when it timed everything); after
@@ -397,6 +514,87 @@ class ModuleTimer:
             "untimed": self.untimed,
         }
         return {k: v for k, v in out.items() if v}
+
+
+@dataclass
+class _Work:
+    """Work of one call and the calls inside it."""
+
+    flops: dict[str, int] = field(default_factory=dict)  # per dtype
+    weight_elems: int = 0
+    weight_bytes: int = 0
+    estimated: bool = False  # some of it estimated from module weights (_subtree_work)
+
+    def add(self, other: _Work) -> None:
+        for dtype, n in other.flops.items():
+            self.flops[dtype] = self.flops.get(dtype, 0) + n
+        self.weight_elems += other.weight_elems
+        self.weight_bytes += other.weight_bytes
+        self.estimated |= other.estimated
+
+
+def _linear_weights(module: nn.Module) -> tuple[int, int, int, str]:
+    """(matmul weight elements, elements with bias, bytes, dtype) of the ``nn.Linear``
+    layers in ``module``."""
+    matmul = elems = nbytes = 0
+    dtype = ""
+    for sub in module.modules():
+        weights = _weights(sub) if isinstance(sub, nn.Linear) else []
+        if weights and weights[0].dim() == 2:
+            matmul += weights[0].numel()
+            elems += sum(t.numel() for t in weights)
+            nbytes += sum(t.numel() * t.element_size() for t in weights)
+            dtype = dtype or str(weights[0].dtype).removeprefix("torch.")
+    return matmul, elems, nbytes, dtype
+
+
+def _new_work() -> dict[str, Any]:
+    return {
+        "qualnames": set(),
+        "calls": 0,
+        "inclusive": 0.0,
+        "flops": collections.Counter(),
+        "weight_elems": 0,
+        "weight_bytes": 0,
+        "io_bytes": 0,
+        "estimated": 0,
+        "sigs": collections.Counter(),
+    }
+
+
+def _add_work(acc: dict[str, Any], call: _Call, work: _Work, ms: float) -> None:
+    acc["qualnames"].add(call.qualname)
+    acc["calls"] += 1
+    acc["inclusive"] += ms
+    acc["flops"].update(work.flops)
+    acc["weight_elems"] += work.weight_elems
+    acc["weight_bytes"] += work.weight_bytes
+    acc["io_bytes"] += call.io_bytes
+    acc["estimated"] += work.estimated
+    acc["sigs"][call.signature] += ms
+
+
+def _work_entry(group: str, phase: str, acc: dict[str, Any]) -> dict[str, Any]:
+    """One ``ClassStat.work`` entry: the calls of one instance group in one phase, totals
+    per run. ``flops`` per dtype and ``weight_*`` (read once per call) count the
+    ``nn.Linear`` and convolution calls inside; ``io_bytes`` the first input and output of
+    each call; ``estimated_calls`` those estimated from module weights (_subtree_work)."""
+    top = acc["sigs"].most_common(1)
+    entry = {
+        "group": group,
+        "phase": phase,
+        "instances": len(acc["qualnames"]),
+        "calls": acc["calls"],
+        "inclusive_ms": round(acc["inclusive"], 4),
+        "flops": dict(acc["flops"]),
+        "weight_elems": acc["weight_elems"],
+        "weight_bytes": acc["weight_bytes"],
+        "io_bytes": acc["io_bytes"],
+        "signature": top[0][0] if top else "",
+    }
+    if acc["estimated"]:
+        entry["estimated_calls"] = acc["estimated"]
+    return entry
 
 
 def _phase_stat(p: dict[str, Any]) -> dict[str, Any]:
