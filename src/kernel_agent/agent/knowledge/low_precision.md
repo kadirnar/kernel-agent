@@ -25,6 +25,16 @@ of the elements outside the bf16 tolerance). `"precision": "fp4_weights"`
 (block-scaled FP4 weights) has its own tier, **near-lossless-fp4**: cosine >=
 0.96, relative L2 error <= 0.28, norm within ±4 %, every element within 1.25 x
 RMS + 0.25 x |reference| ("FP4 weights" below); FP4 fails the FP8 tier.
+After timing the evaluator checks again on inputs redrawn from each tensor's own
+mean and std (the perturbed-input check). They have no outlier channels, so a
+weight row that writes a massive activation (VoxCPM2's LocDiT o_proj / down_proj
+row 497, 10x the median row norm) carries 10x the rounding error into a channel
+whose values are now small: there the RMS of the element bound is the larger of
+the tensor's and the element's channel's (last dimension), and the tiers have
+wider bounds (`compare.PERTURBED_BOUNDS`; near-lossless: every element within
+0.75 x RMS + 0.125 x |reference|). The reference math of every precision passes
+both checks; if only the perturbed check fails, run `fp8_w8a8_linear` /
+`dequantize_fp8` on the same redrawn inputs before you hunt the kernel.
 
 ## The contract
 
@@ -218,6 +228,17 @@ anyway) keep that GEMM weight-only (`fp8_weights`) or bf16. If a compute-bound
 GEMM fails, move a per-input-channel factor from the activations into the
 weights (SmoothQuant) before quantising; not needed on VoxCPM2.
 
+**Redrawn inputs.** In the VoxCPM2 run the first W8A8 LocDiT layer kernels
+(`dit_layer__fp8_w8a8`, exp 100-101) passed the captured cases and failed the
+perturbed-input check on the element bound alone (element ratio 1.42 and 1.65 at
+cosine 0.9999, relative L2 0.012); the engineer spent two slices hunting a GEMM.
+The reference math (`fp8_w8a8_linear` on every Linear) failed it as well, in 98
+of 200 draws: the error sat in channel 497, the massive-activation channel, whose
+values are small on redrawn inputs. The check now scales the element bound per
+channel and the same kernels pass (README "Quality modes"). Per-token scales are
+still checked there: activation scales cached from the first call pass the
+captured cases and fail the redrawn ones.
+
 **`torch._scaled_mm`** (cuBLASLt, sm_120, torch 2.14):
 `torch._scaled_mm(x_q, w_q.t(), scale_a=x_s[:, None], scale_b=w_s[None, :],
 out_dtype=torch.bfloat16)`: `x_q` [M, K] e4m3 row-major, the weight [N, K] as
@@ -314,7 +335,11 @@ GEMM outputs mean 0.055, worst 0.21 (a small, 256-wide decode output); MLPs
 worst), every element within 1.25 x RMS + 0.25 x |reference|. Swapped nibbles,
 block scales off by one block, a wrong tensor scale fail it; a dropped output
 channel often does not (FP4 noise hides it in a GEMV): the perceptual gate is
-the real judge.
+the real judge. On the perturbed-input check's redrawn inputs: cosine >= 0.94,
+relative L2 <= 0.40, norm within ±12 %, every element within 2.5 x RMS (the
+larger of the tensor's and its channel's) + 0.25 x |reference| (an LM decode
+step's 256-value V-cache slot reaches relative L2 0.33 and +9.7 % there, the LM
+down_proj GEMV 2.06 x RMS in its massive-activation channel).
 
 **The contract** (as FP8, with the block scales):
 

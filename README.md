@@ -223,6 +223,19 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   same checks with cosine >= 0.96, relative L2 error <= 0.28, the norm within
   ±4 % and every element within 1.25 × RMS + 0.25 × |reference| (calibration
   below). Other targets keep the exact tier.
+* **Redrawn inputs.** The evaluator's perturbed-input check and the
+  integration's re-check compare a candidate with the reference on inputs
+  redrawn from each tensor's own mean and std. Those have no outlier channels,
+  so a weight row that writes a massive activation carries its many times larger
+  rounding error into a channel whose values are now small (calibration
+  below). There the tiers use their own bounds (`compare.PERTURBED_BOUNDS`), and
+  the RMS in the element bound is the larger of the tensor's and the element's
+  channel's (the last dimension, over at least 16 rows): `near-lossless` every
+  element within 0.75 × RMS + 0.125 × |reference| (cosine, relative L2 and norm
+  as above); `near-lossless-fp4` cosine >= 0.94, relative L2 error <= 0.40, the
+  norm within ±12 % and every element within 2.5 × RMS + 0.25 × |reference|. A
+  tensor without signal gets the larger of the exact tolerance and the tier's
+  element bound at RMS = atol.
 * Without a perceptual baseline (the workload declares no samples, or
   `analyze` ran in exact mode) a near-lossless run keeps the exact checks;
   `metrics.perceptual.skipped` says why.

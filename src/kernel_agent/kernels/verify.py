@@ -16,7 +16,9 @@
      Laplace and (standardised) log-normal distributions.
 
   Perturbed draws are compared with the reference called live on copies of the
-  same inputs (outputs, in-place side effects and aliasing).  The candidate
+  same inputs (outputs, in-place side effects and aliasing), a reduced-precision
+  tier with its bounds for redrawn inputs (:data:`kernels.compare.PERTURBED_BOUNDS`:
+  redrawn inputs have no outlier channels).  The candidate
   always runs first and its output is copied right away, so it cannot return
   memory that the reference's call just freed.
 
@@ -198,9 +200,9 @@ def _against_reference(
     out = _call(new_fn, args, kwargs, sync)
     ref_args, ref_kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
     expected = _call(ref_fn, ref_args, ref_kwargs, sync)
-    checks = compare_structures(expected, out, "output")
-    checks += compare_side_effects(pre_args, ref_args, args, "args")
-    checks += compare_side_effects(pre_kwargs, ref_kwargs, kwargs, "kwargs")
+    checks = compare_structures(expected, out, "output", perturbed=True)
+    checks += compare_side_effects(pre_args, ref_args, args, "args", perturbed=True)
+    checks += compare_side_effects(pre_kwargs, ref_kwargs, kwargs, "kwargs", perturbed=True)
     return checks
 
 

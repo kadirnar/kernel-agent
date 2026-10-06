@@ -17,7 +17,9 @@ A floating-point tensor matches its reference when
 Integer and boolean tensors must match exactly. In the ``near-lossless`` tier
 (:data:`TIERS`: ``--quality near-lossless`` and a target whose spec allows reduced
 precision) whole-tensor bounds replace the per-element tolerances; FP4 weights
-(``fp4_weights``) get the wider bounds of the ``near-lossless-fp4`` tier.
+(``fp4_weights``) get the wider bounds of the ``near-lossless-fp4`` tier. On redrawn
+inputs (``perturbed``) these tiers use their own bounds (:data:`PERTURBED_BOUNDS`), with
+the element bound scaled per channel.
 """
 
 from __future__ import annotations
@@ -118,6 +120,49 @@ NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]]
         NEAR_LOSSLESS_FP4_ELEMENT,
     ),
 }
+#: Redrawn inputs (``perturbed``: the evaluator's perturbed-input check,
+#: :mod:`kernel_agent.kernels.verify`, and the integration's re-check,
+#: :mod:`kernel_agent.kernels.recheck`, compare the candidate with the reference called on
+#: inputs redrawn from each tensor's own mean and std) have no outlier channels, so bounds
+#: calibrated on real inputs do not carry over (#109). A weight row that writes a massive
+#: activation (VoxCPM2 LocDiT o_proj / down_proj row 497: 10x / 7x the median row norm, real
+#: outputs up to 8576 there) gives its output channel that many times the rounding error of
+#: the others, and on redrawn inputs that channel's values are no larger than theirs. With
+#: the bounds above, the reference math (fake quant; W8A8: ``quant.fp8_w8a8_linear``) of the
+#: LocDiT layer at M = 352 failed the element bound in 98 of 200 W8A8 draws (element ratio
+#: up to 2.4 at cosine >= 0.99988, relative L2 error <= 0.014; the run's W8A8 kernels 1.42
+#: and 1.65), and its attention, MLP and o_proj alone with every precision (FP8 weights up to
+#: 2.6, W8A8 5.9, NVFP4 3.4). So on redrawn inputs the RMS in the element bound is the larger
+#: of the tensor's and the element's channel's (one position of the last dimension, over at
+#: least CHANNEL_MIN_ROWS rows; for fewer, the tensor's), and a tensor without signal gets
+#: the larger of the exact tolerance and the tier's element bound at RMS = atol.
+CHANNEL_MIN_ROWS = 16
+#: (min cosine, max relative L2 error, max norm change, element bound) of each tier on
+#: redrawn inputs, with the per-channel RMS above. Calibrated with the reference math of each
+#: precision on real VoxCPM2 captures and 30-100 seeds of both redraws (normal; uniform /
+#: Laplace / log-normal): the LocDiT layer (M = 352, 176, 22), its attention, MLP and seven
+#: nn.Linear, and a base-LM decode layer (M = 1, KV cache), its attention, MLP and Linears
+#: (README, "Quality modes"):
+#:
+#: * ``near-lossless``: FP8 weights reach cosine >= 0.9987, relative L2 <= 0.050, norm within
+#:   0.9 %, element ``a`` (at r = 0.125) <= 0.22 with a channel RMS and 0.43 at decode (one
+#:   row: the LM down_proj GEMV, 0.86 of the bound above); W8A8 0.9981 / 0.071 / 3.2 % and
+#:   ``a`` <= 0.35 on the compute-bound GEMMs it is for (M >= 22), 0.60 at decode, hence
+#:   0.75. W8A8 at M = 1 keeps failing the norm of a 256-value KV-cache slot (24 of 600
+#:   draws, up to 3.2 %), as it fails on real decode inputs (#91): fp8_weights' job.
+#: * ``near-lossless-fp4``: NVFP4 reaches cosine >= 0.9506, relative L2 <= 0.333 and norm
+#:   within 9.7 % (the V-cache slot of an LM decode step: 256 values at the signal threshold,
+#:   0.20 relative L2 on real inputs; elsewhere <= 0.18 and 4.0 %), ``a`` (r = 0.25) <= 1.05
+#:   with a channel RMS and 2.06 at decode (LM down_proj).
+#:
+#: Broken weights still fail on redrawn inputs as on captured ones (weight scales x 1.05 by
+#: the norm, except FP4's, a neighbour channel's scale, the first token's activation scale,
+#: swapped FP4 nibbles, shifted block scales, int4 per tensor), and activation scales cached
+#: from the captured call fail only there (relative L2 0.10).
+PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
+    NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.02, (0.75, 0.125)),
+    NEAR_LOSSLESS_FP4_TIER: (0.94, 0.40, 0.12, (2.5, 0.25)),
+}
 #: The tier of this process's comparisons when a call passes none. The evaluator sets it
 #: from the capture before the candidate is imported, so the integrity snapshot
 #: (:mod:`kernel_agent.kernels.integrity`) watches it like the constants above.
@@ -192,6 +237,17 @@ def _non_finite_error(a: torch.Tensor, b: torch.Tensor) -> str | None:
     return "; ".join(problems) or None
 
 
+def _channel_rms(ref: torch.Tensor, rms: float) -> torch.Tensor | float:
+    """``max(rms, RMS of the element's channel)`` per element of ``ref`` (a channel: one
+    position of the last dimension, its RMS over all the other dimensions, non-finite
+    values as 0); ``rms`` for tensors with fewer than :data:`CHANNEL_MIN_ROWS` rows."""
+    if ref.dim() < 2 or ref.numel() < CHANNEL_MIN_ROWS * ref.shape[-1]:
+        return rms
+    values = torch.where(torch.isfinite(ref), ref, torch.zeros_like(ref))
+    channel = values.pow(2).mean(dim=tuple(range(ref.dim() - 1)), keepdim=True).sqrt()
+    return channel.clamp_min(rms).expand_as(ref)
+
+
 def compare_tensors(
     name: str,
     ref: torch.Tensor,
@@ -199,9 +255,10 @@ def compare_tensors(
     tol: tuple[float, float] | None = None,
     *,
     tier: str | None = None,
+    perturbed: bool = False,
 ) -> dict[str, Any]:
     """One tensor against its reference (module docstring); ``tier``: the tolerance tier
-    (default :data:`TIER`)."""
+    (default :data:`TIER`); ``perturbed``: on redrawn inputs (:data:`PERTURBED_BOUNDS`)."""
     result: dict[str, Any] = {"name": name, "ok": False}
     error = type_error(new)
     if error is not None:
@@ -224,20 +281,25 @@ def compare_tensors(
         result.update(ok=mismatches == 0, mismatch_frac=mismatches)
         return result
     atol, rtol = tol or TOLERANCES.get(ref.dtype, (1e-3, 1e-3))
-    a = ref.detach().to(new.device).float()
+    a = full = ref.detach().to(new.device).float()
     b = new.detach().float()
     error = _non_finite_error(a, b)
     if error is not None:
         result["error"] = error
         return result
     finite = torch.isfinite(a)
-    if not bool(finite.all()):  # identical non-finite positions: compare the rest
+    masked = not bool(finite.all())
+    if masked:  # identical non-finite positions: compare the rest
         a, b = a[finite], b[finite]
     diff = (a - b).abs()
+    ref_norm, new_norm = float(a.norm()), float(b.norm())
+    signal = a.numel() > 0 and ref_norm > atol * math.sqrt(a.numel())
+    near = (PERTURBED_BOUNDS if perturbed else NEAR_LOSSLESS_BOUNDS).get(tier or TIER)
     allowed = atol + rtol * a.abs()
+    if perturbed and near is not None and not signal:  # the tier's element bound at RMS atol
+        allowed = torch.maximum(allowed, near[3][0] * atol + near[3][1] * a.abs())
     mismatch = (diff > allowed).float().mean().item() if a.numel() else 0.0
     outlier = float((diff / allowed.clamp_min(1e-30)).max()) if a.numel() else 0.0
-    ref_norm, new_norm = float(a.norm()), float(b.norm())
     denom = ref_norm * new_norm
     cos = float((a.flatten() @ b.flatten()) / denom) if denom > 0 else 1.0
     rel_l2 = float(diff.norm()) / ref_norm if ref_norm > 0 else 0.0
@@ -253,12 +315,15 @@ def compare_tensors(
     )
     problems = []
     min_cos, max_rel = GLOBAL_TOLERANCES.get(ref.dtype, GLOBAL_TOLERANCES[torch.float32])
-    signal = a.numel() > 0 and ref_norm > atol * math.sqrt(a.numel())
-    near = NEAR_LOSSLESS_BOUNDS.get(tier or TIER)
     if near is not None and signal:
         min_cos, max_rel, max_norm_change, (e_atol, e_rtol) = near
         rms = ref_norm / math.sqrt(a.numel())
-        element = float((diff / (e_atol * rms + e_rtol * a.abs())).max())
+        scale: torch.Tensor | float = rms
+        if perturbed:  # the larger of the tensor's and the element's channel's RMS
+            scale = _channel_rms(full, rms)
+            if masked and isinstance(scale, torch.Tensor):
+                scale = scale[finite]
+        element = float((diff / (e_atol * scale + e_rtol * a.abs())).max())
         norm_ratio = new_norm / ref_norm
         result.update(
             tier=tier or TIER,
@@ -267,9 +332,11 @@ def compare_tensors(
             norm_ratio=round(norm_ratio, 6),
         )
         if element > 1.0:
+            where = " on redrawn inputs" if perturbed else ""
+            of = " (the larger of the tensor's and its channel's)" if perturbed else ""
             problems.append(
-                f"an element is {element:.3g}x its near-lossless tolerance away "
-                f"({e_atol:g} x RMS + {e_rtol:g} x |reference|)"
+                f"an element is {element:.3g}x its near-lossless tolerance away{where} "
+                f"({e_atol:g} x RMS{of} + {e_rtol:g} x |reference|)"
             )
         if abs(norm_ratio - 1.0) > max_norm_change:
             problems.append(
@@ -300,7 +367,7 @@ def compare_tensors(
 
 
 def compare_structures(
-    ref: Any, new: Any, prefix: str = "out", *, tier: str | None = None
+    ref: Any, new: Any, prefix: str = "out", *, tier: str | None = None, perturbed: bool = False
 ) -> list[dict[str, Any]]:
     ref_flat = flatten(ref, prefix)
     new_flat = flatten(new, prefix)
@@ -309,12 +376,20 @@ def compare_structures(
         if name not in new_flat:
             results.append({"name": name, "ok": False, "error": "missing in candidate output"})
             continue
-        results.append(compare_tensors(name, tensor, new_flat[name], tier=tier))
+        results.append(
+            compare_tensors(name, tensor, new_flat[name], tier=tier, perturbed=perturbed)
+        )
     return results
 
 
 def compare_side_effects(
-    pre: Any, ref_post: Any, new_post: Any, prefix: str = "args", *, tier: str | None = None
+    pre: Any,
+    ref_post: Any,
+    new_post: Any,
+    prefix: str = "args",
+    *,
+    tier: str | None = None,
+    perturbed: bool = False,
 ) -> list[dict[str, Any]]:
     """Compare the post-call state of a call's arguments (in-place side effects).
 
@@ -325,7 +400,11 @@ def compare_side_effects(
     forgetting to, would vanish inside the allowance.  Other tensors (e.g. caches
     that grow by concatenation) are compared whole."""
     return compare_side_effects_flat(
-        flatten(pre, prefix), flatten(ref_post, prefix), flatten(new_post, prefix), tier=tier
+        flatten(pre, prefix),
+        flatten(ref_post, prefix),
+        flatten(new_post, prefix),
+        tier=tier,
+        perturbed=perturbed,
     )
 
 
@@ -335,6 +414,7 @@ def compare_side_effects_flat(
     new_flat: dict[str, torch.Tensor],
     *,
     tier: str | None = None,
+    perturbed: bool = False,
 ) -> list[dict[str, Any]]:
     """:func:`compare_side_effects` on already flattened ``{name: tensor}`` states."""
     results: list[dict[str, Any]] = []
@@ -350,7 +430,7 @@ def compare_side_effects_flat(
             or not (before.shape == ref.shape == new.shape)
             or not (before.dtype == ref.dtype == new.dtype)
         ):
-            results.append(compare_tensors(name, ref, new, tier=tier))
+            results.append(compare_tensors(name, ref, new, tier=tier, perturbed=perturbed))
             continue
         before, ref = before.to(new.device), ref.to(new.device)
         changed = (ref != before) | (new != before)
@@ -358,7 +438,7 @@ def compare_side_effects_flat(
         if count == 0:
             results.append({"name": name, "ok": True, "changed_elements": 0, "max_abs_err": 0.0})
             continue
-        result = compare_tensors(name, ref[changed], new[changed], tier=tier)
+        result = compare_tensors(name, ref[changed], new[changed], tier=tier, perturbed=perturbed)
         result["changed_elements"] = count
         results.append(result)
     return results

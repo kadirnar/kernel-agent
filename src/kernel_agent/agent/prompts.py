@@ -530,15 +530,20 @@ def _tier_bounds(precision: str) -> str:
     from kernel_agent.kernels.compare import (
         NEAR_LOSSLESS_BOUNDS,
         NEAR_LOSSLESS_TIER,
+        PERTURBED_BOUNDS,
         PRECISION_TIERS,
     )
 
     tier = PRECISION_TIERS.get(precision, NEAR_LOSSLESS_TIER)
     cosine, rel_l2, norm, (a, r) = NEAR_LOSSLESS_BOUNDS[tier]
+    p_cosine, p_rel_l2, p_norm, (p_a, p_r) = PERTURBED_BOUNDS[tier]
     return (
         f"the {tier} tolerance tier: per output tensor\ncosine >= {cosine:g}, relative "
         f"L2 error <= {rel_l2:g}, norm within ±{norm * 100:g} %, every element\nwithin "
-        f"{a:g} x RMS + {r:g} x |reference|"
+        f"{a:g} x RMS + {r:g} x |reference|; on the perturbed-input check's redrawn\n"
+        f"inputs cosine >= {p_cosine:g}, relative L2 error <= {p_rel_l2:g}, norm within "
+        f"±{p_norm * 100:g} %,\nevery element within {p_a:g} x RMS (the larger of the "
+        f"tensor's and its channel's) + {p_r:g} x |reference|"
     )
 
 
