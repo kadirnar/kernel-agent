@@ -107,6 +107,10 @@ class Undo:
     #: The transform's own ``undo()``: called after the restore; re-entering means re-applying.
     revert: Callable[[], None] | None = None
     applied: bool = True
+    #: The modules whose bindings it changed and those it swapped for others
+    #: (:meth:`Snapshot.where`; :mod:`kernel_agent.integrate.owners`).
+    touched: list[str] = field(default_factory=list)
+    owns: list[str] = field(default_factory=list)
 
     @property
     def reversible(self) -> bool:
@@ -284,52 +288,118 @@ class Snapshot:
                 if isinstance(value, nn.Module):
                     for module in value.modules():
                         add(module)
-        for root in roots.values():
-            for module in root.modules():
+        #: where a change lands in the model (:meth:`where`): module qualnames, the module
+        #: holding each plain object, the object (and attribute) of each tracked dict or set
+        self.names: dict[int, str] = {}
+        for root_name, root in roots.items():
+            for name, module in root.named_modules():
                 add(module)
+                self.names.setdefault(id(module), f"{root_name}.{name}" if name else root_name)
+        self.extras = {id(obj) for obj in extra}
+        self.holders: dict[int, tuple[Any, str]] = {}
         for obj in list(objects.values()):  # plain objects held by them, one level
-            for value in list(vars(obj).values()):
+            for key, value in list(vars(obj).items()):
                 if _plain(value):
                     add(value)
+                    self.holders.setdefault(id(value), (obj, key))
         self.objects = list(objects.values())
         self.types = [(obj, type(obj)) for obj in self.objects]
         self.dicts: list[tuple[dict[Any, Any], dict[Any, Any]]] = []
         self.sets: list[tuple[set[Any], frozenset[Any]]] = []
+        self.owners: dict[int, tuple[Any, str | None]] = {}
         seen: set[int] = set()
         for obj in self.objects:
             d = vars(obj)
-            self._dict(d, seen)
-            for value in list(d.values()):
+            self._dict(d, seen, obj)
+            for key, value in list(d.items()):
                 if isinstance(value, dict) and len(value) <= MAX_DICT:
-                    self._dict(value, seen)
+                    self._dict(value, seen, obj, key)
                 elif isinstance(value, set) and id(value) not in seen:
                     seen.add(id(value))
                     self.sets.append((value, frozenset(value)))
+                    self.owners[id(value)] = (obj, key)
         classes: dict[type, None] = {}
         for _, cls in self.types:
             for klass in cls.__mro__[:-1]:  # not `object`
                 classes.setdefault(klass)
         self.classes = [(cls, dict(vars(cls))) for cls in classes]
         self.tensors: list[tuple[str, torch.Tensor, torch.Tensor, tuple[Any, ...], int | None]] = []
-        tseen: set[int] = set()
+        self.tensor_owners: dict[int, nn.Module] = {}
         for obj in self.objects:
             if not isinstance(obj, nn.Module):
                 continue
             for group in (obj._parameters, obj._buffers):
                 for name, t in group.items():
-                    if t is None or id(t) in tseen or t.is_meta:
+                    if t is None or id(t) in self.tensor_owners or t.is_meta:
                         continue
-                    tseen.add(id(t))
+                    self.tensor_owners[id(t)] = obj
                     label = f"{type(obj).__name__}.{name}"
                     self.tensors.append((label, t, t.detach(), _tensor_key(t), _version(t)))
         self.modules = self._python_modules(classes)
         self.flag_fns = _flags()
         self.flags = _read_flags(self.flag_fns)
 
-    def _dict(self, d: dict[Any, Any], seen: set[int]) -> None:
+    def _dict(self, d: dict[Any, Any], seen: set[int], owner: Any, attr: str | None = None) -> None:
         if id(d) not in seen:
             seen.add(id(d))
             self.dicts.append((d, dict(d)))
+            self.owners[id(d)] = (owner, attr)
+
+    def where(self, changes: list[Change]) -> tuple[list[str], list[str]]:
+        """Where ``changes`` landed: (touched, replaced). ``touched``: the qualnames of the
+        modules under the roots whose bindings changed (an instance attribute, hook,
+        parameter or buffer, a plain object the module holds, the class of an instance, an
+        attribute of its class: every instance of it, a child) and ``workload.<attribute>``
+        of the ``extra`` objects (the workload); ``replaced``: the modules swapped for
+        others (a child of a module, ``parent.child``, or the class of an instance). The
+        globals of Python modules, flags and configs belong to no module."""
+        touched: set[str] = set()
+        replaced: set[str] = set()
+        for change in changes:
+            for name, swapped in self._where(change):
+                touched.add(name)
+                if swapped:
+                    replaced.add(name)
+        return sorted(touched), sorted(replaced)
+
+    def _name(self, obj: Any) -> str | None:
+        """A module's qualname; of a plain object the name of what holds it."""
+        if (name := self.names.get(id(obj))) is not None:
+            return name
+        holder, key = self.holders.get(id(obj), (None, None))
+        if holder is None:
+            return None
+        return f"workload.{key}" if id(holder) in self.extras else self.names.get(id(holder))
+
+    def _where(self, change: Change) -> list[tuple[str, bool]]:
+        """(where, whether a module was swapped for another) of one change."""
+        kind, target = change.kind, change.target
+        if kind in ("item", "set"):
+            owner, attr = self.owners.get(id(target), (None, None))
+            if owner is not None and id(owner) in self.extras:
+                return [(f"workload.{attr or change.key}", False)]
+            name = None if owner is None else self._name(owner)
+            if name is None:  # a global of a Python module
+                return []
+            if attr == "_modules":
+                return [(f"{name}.{change.key}", True)]
+            return [(name, False)]
+        if kind == "attr":  # a class attribute: every instance of the class
+            found = []
+            for obj, cls in self.types:
+                if not issubclass(cls, target):
+                    continue
+                name = f"workload.{change.key}" if id(obj) in self.extras else self._name(obj)
+                if name is not None:
+                    found.append((name, False))
+            return found
+        if kind == "class":
+            name = self._name(target)
+            return [(name, isinstance(target, nn.Module))] if name is not None else []
+        if kind == "data":
+            name = self._name(self.tensor_owners.get(id(target)))
+            return [(name, False)] if name is not None else []
+        return []
 
     @staticmethod
     def _python_modules(
@@ -423,6 +493,7 @@ def record(label: str, roots: dict[str, nn.Module], *extra: Any) -> Iterator[Und
     finally:
         handle.changes, problems = snapshot.diff()
         handle.problems += problems if handle.revert is None else []
+        handle.touched, handle.owns = snapshot.where(handle.changes)
 
 
 def rollback(handles: list[Undo]) -> None:

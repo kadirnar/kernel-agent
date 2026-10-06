@@ -263,6 +263,9 @@ def write_report(run: RunDir) -> Path:
             if h.get("kind") == "swap":  # another version of an accepted item
                 old, new = str(h.get("old")), str(h.get("new"))
                 tried = f"swap `{ledger.item_label(new)}` `{Path(old).name}` → `{Path(new).name}`"
+            elif h.get("kind") == "replace":  # in the place of the items it overlaps
+                olds = ", ".join(f"`{ledger.item_label(o)}`" for o in h.get("old") or [])
+                tried = f"`{ledger.item_label(str(h.get('new')))}` instead of {olds}"
             lines.append(
                 f"* {tried}: passed={h.get('passed')} "
                 f"speedup={h.get('speedup')} {h.get('reason') or ''}{verdict}"

@@ -48,6 +48,7 @@ from kernel_agent import interrupt, ledger, pivot, research, workers
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
+from kernel_agent.integrate.owners import context_line
 from kernel_agent.research import rows_table
 from kernel_agent.scheduler import (
     INTEGRATION_SHARE,
@@ -260,9 +261,11 @@ def rounds_context(
     arms: list[Arm],
     *,
     quality: str = "exact",
+    owners: dict[str, dict[str, list[str]]] | None = None,
 ) -> str:
     """Planner context for round ``n``: what earlier rounds did and which targets exist (and,
-    in a near-lossless run, how to move one of them to another precision: ``pivot.py``)."""
+    in a near-lossless run, how to move one of them to another precision: ``pivot.py``);
+    ``owners``: the modules the accepted items change (``integration.json``)."""
     base = (read_json(run.baseline_json, {}) or {}).get("median_ms")
     lines = [
         "",
@@ -280,6 +283,8 @@ def rounds_context(
         lines.append(f"* round {rnd['n']}: started at {rnd.get('speedup', 1.0):.3f}x → {result}")
     lines += ["", "## Applied in this profile"]
     lines += [f"* {i['kind']} `{ledger.item_label(i['item'])}`" for i in accepted] or ["* none"]
+    if owned := context_line(owners):  # integrate/owners.py
+        lines += ["", owned]
     lines += ["", "## Existing targets (do not propose these module classes again)"]
     for arm in arms:
         if arm.kind == KERNEL:
@@ -961,7 +966,10 @@ class Improver:
                 rec = snapshot_record(self.run, target_id, path) or {}
                 applied[target_id] = float(rec.get("speedup") or 1.0)
         quality = self.orch.cfg.quality
-        context = rounds_context(self.run, self.state, n, accepted, arms, quality=quality)
+        owners = integrated.get("owners")
+        context = rounds_context(
+            self.run, self.state, n, accepted, arms, quality=quality, owners=owners
+        )
         with self._doing(f"re-plan for round {n}"):
             new = await self.orch.replan(round_dir, context, label=f"planner#round{n}")
             captured = await self.orch.capture_targets(new) if new else []

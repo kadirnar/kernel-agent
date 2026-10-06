@@ -51,6 +51,7 @@ from kernel_agent.agent.tools import (
 from kernel_agent.budget import MIN_AGENT_SECONDS, MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
+from kernel_agent.integrate import owners as owners_mod
 from kernel_agent.integrate import reuse as reuse_cache
 from kernel_agent.integrate.export import export_optimized
 from kernel_agent.kernels import evaluate, recheck
@@ -722,12 +723,21 @@ class Orchestrator:
         against the best single item), then each step B = the accepted set A +
         the next candidate, then the version swaps (:meth:`_swaps`): B = A with
         one accepted item replaced by another version of it (the target's best
-        kernel, say, when the combination holds an older one). Sets that cannot
-        be undone in-process are measured in two processes back to back instead
-        (``abtest.SEPARATE_ITERS`` runs each, A measured again).
+        kernel, say, when the combination holds an older one). An item that
+        overlaps accepted items (:mod:`kernel_agent.integrate.owners`: it changes
+        the modules they changed, or replaces a module they changed something
+        inside, as a LocEnc kernel and a CUDA graph of the LocEnc do) is also
+        tried in their place, after its addition: B = A with those items removed
+        and it in their place (``kind: replace``). Sets that cannot be undone
+        in-process, or did not fit in one process together (``oom``), are
+        measured in two processes back to back instead (``abtest.SEPARATE_ITERS``
+        runs each, A measured again; after an ``oom`` with
+        ``--expandable-segments``); a step that still runs out of memory is
+        recorded as ``oom``, which a re-integration measures again.
         ``integration.json`` keeps each step's ``ab`` record (a swap's with
-        ``kind: swap``, ``old`` and ``new``) and the ``projection`` (baseline −
-        Σ est. saved ms, nested kernels counted once) of every accepted set.
+        ``kind: swap``, ``old`` and ``new``), the ``projection`` (baseline −
+        Σ est. saved ms, nested kernels counted once) of every accepted set and
+        the ``owners`` (touched and owned modules) of the accepted items.
 
         ``reuse`` (re-integrations of the improve loop) takes the measurements
         of the same content (:mod:`kernel_agent.integrate.reuse`: the same A and
@@ -763,6 +773,8 @@ class Orchestrator:
         }
         counts = {"reused": 0, "measured": 0}
         irreversible = set((previous or {}).get("irreversible") or [])  # not undone in-process
+        crowded: list[set[str]] = []  # held by both states of an A/B that ran out of memory
+        owners = owners_mod.Owners()  # the modules each item changes (integrate/owners.py)
         versions = self._previous_versions(previous or {}, digests)
         rechecks: list[dict[str, Any]] = []
         if self.cfg.recheck:  # fresh inputs, separate processes; failing kernels are refused
@@ -777,10 +789,11 @@ class Orchestrator:
         irreversible.update(x for k, x in everything if stuck and keys.item((k, x)) in stuck)
 
         def ab(
-            a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = "", **swap: str
+            a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = "", **swap: Any
         ) -> dict[str, Any]:
             """B's result with its ``ab`` record (decided) against A (``swap``: the
-            ``kind``, ``old`` and ``new`` item of a version swap, kept in its history entry)."""
+            ``kind``, ``old`` and ``new`` item of a version swap or a replacement, kept in
+            its history entry)."""
             a_items = [x for _, x in a]
             key = keys.step(a, b)
             hit = paired.get(key) if key is not None else None
@@ -788,7 +801,9 @@ class Orchestrator:
             if hit is not None:
                 names = " + ".join(ledger.item_label(x) for _, x in b)
                 log(f"integrate: reused {names}{note}: measured before with the same content")
-            r = dict(hit) if hit is not None else self._paired(a, b, note, irreversible)
+            r = dict(hit) if hit is not None else self._paired(a, b, note, irreversible, crowded)
+            owners.note(a, (r.get("ab") or {}).get("a_patches"))
+            owners.note(b, r.get("patches"))
             record = {**(r.get("ab") or {}), "a_items": a_items}
             if record.get("a_ms") and record.get("b_ms"):
                 record = abtest.judge(
@@ -849,8 +864,9 @@ class Orchestrator:
                 log("integrate: no item alone passes the A/B rule against the unmodified model")
         if final is not None:
             sets.append((list(accepted), final))
+        replaced: set[tuple[str, str]] = set()  # an item in their place won their A/B
         for item, _ in singles:
-            if final is None or item in accepted:  # part of the seed
+            if final is None or item in accepted or item in replaced:  # seed, or lost its place
                 continue
             if any(_item_key(item) == _item_key(a) for a in accepted):
                 log(f"integrate: = {Path(item[1]).name} (a version of it is accepted)")
@@ -869,6 +885,26 @@ class Orchestrator:
                 if r.get("passed"):
                     reason = f"no significant gain: {abtest.describe(r['ab'])}; {r['ab']['why']}"
                 log(f"integrate: - {Path(item[1]).name} ({reason})")
+            overlaps = owners.overlapping(item, [a for a in accepted if a != item])
+            if not overlaps:
+                continue
+            olds = [o for o, _ in overlaps]
+            b = _in_place(accepted, olds, item)  # the alternative: it instead of them
+            names = ", ".join(ledger.item_label(o[1]) for o in olds)
+            what = f"{ledger.item_label(item[1])} instead of {names}"
+            shared = sorted({m for _, where in overlaps for m in where})
+            log(f"integrate: {what}? they change the same modules: " + _few(shared))
+            r = ab(accepted, b, f" ({what})", kind="replace", old=[o[1] for o in olds], new=item[1])
+            if r.get("passed") and r["ab"]["accepted"]:
+                accepted, final = b, r
+                sets.append((list(accepted), r))
+                replaced.update(olds)
+                log(f"integrate: {what}: {r['median_ms']:.1f} ms ({abtest.describe(r['ab'])})")
+            else:
+                reason = r.get("reason") or r.get("status")
+                if r.get("passed"):
+                    reason = f"no significant gain: {abtest.describe(r['ab'])}; {r['ab']['why']}"
+                log(f"integrate: keep {names}, not {Path(item[1]).name} instead ({reason})")
         for key, new in self._swaps(accepted, singles, versions, _alone(base_ms, history)):
             old = next(a for a in accepted if _item_key(a) == key)
             if _same_file(old, new):  # another snapshot of the same file: nothing to measure
@@ -898,6 +934,8 @@ class Orchestrator:
         result["reuse"] = counts  # A/B steps taken from the previous integration / measured
         if irreversible:
             result["irreversible"] = sorted(irreversible)
+        if found := owners.record(accepted):  # the re-plan of a round sees what they own
+            result["owners"] = found
         if rechecks:
             result["recheck"] = rechecks
         baseline = self.truth.load_json(self.run.baseline_json)  # its compiled_ms
@@ -1265,13 +1303,28 @@ class Orchestrator:
         return r
 
     def _paired(
-        self, a: list[tuple[str, str]], b: list[tuple[str, str]], note: str, irreversible: set[str]
+        self,
+        a: list[tuple[str, str]],
+        b: list[tuple[str, str]],
+        note: str,
+        irreversible: set[str],
+        crowded: list[set[str]] | None = None,
     ) -> dict[str, Any]:
         """B's result with an ``ab`` record of its timings against A: from one process
         (``e2e_ab``), or from two back to back when a state cannot be undone in-process
-        (``irreversible`` collects such items)."""
+        (``irreversible`` collects such items) or A and B do not fit in one process
+        together (``oom``). After an ``oom`` each process runs with
+        ``--expandable-segments``; ``crowded`` collects what both states of such a pair
+        held (each state applies it afresh), and a later pair whose states both hold one of
+        those sets goes to two processes at once."""
         why = "an item cannot be undone in-process"
-        if not irreversible.intersection(x for _, x in [*a, *b]):
+        a_items, b_items = {x for _, x in a}, {x for _, x in b}
+        full = next((c for c in crowded or [] if c <= a_items and c <= b_items), None)
+        oom = full is not None
+        if full is not None:
+            why = f"out of GPU memory before with {len(full)} of these items in both states"
+            log(f"integrate: no in-process A/B ({why}); separate processes")
+        elif not irreversible.intersection(a_items | b_items):
             cli = [*_cli(a, warmup=2), *_cli(b, prefix="--b-")]
             cli += ["--rounds", str(self.cfg.ab_rounds)]
             r = self._integration_call("e2e_ab", b, cli, note)
@@ -1279,17 +1332,24 @@ class Orchestrator:
                 return r
             irreversible.update(r.get("irreversible") or [])
             why = str(r.get("reason") or r.get("status"))
+            if r.get("status") == abtest.OOM:
+                oom = True
+                if crowded is not None and a_items & b_items:
+                    crowded.append(a_items & b_items)
             log(f"integrate: no in-process A/B ({why[:300]}); separate processes")
         iters = abtest.SEPARATE_ITERS
+        flags = ["--expandable-segments"] if oom else []
         ra = self._integration_call(
-            "e2e", a, _cli(a, iters=iters), " (A of an A/B in separate processes)"
+            "e2e", a, [*_cli(a, iters=iters), *flags], " (A of an A/B in separate processes)"
         )
-        rb = self._integration_call("e2e", b, _cli(b, iters=iters), note)
+        rb = self._integration_call("e2e", b, [*_cli(b, iters=iters), *flags], note)
         rb["ab"] = {
             "mode": "separate",
             "a_ms": ra.get("times_ms") or [],
             "b_ms": rb.get("times_ms") or [],
             "fallback": why,
+            **({"expandable_segments": True} if oom else {}),
+            **({"a_patches": ra["patches"]} if ra.get("patches") else {}),
         }
         if not ra.get("times_ms"):
             rb["ab"]["why"] = f"A measured again: {ra.get('reason') or ra.get('status')}"
@@ -1965,8 +2025,28 @@ def _alone(base_ms: float, history: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
-#: Statuses of an integration measurement a re-integration measures again, not reuses.
-_TRANSIENT = ("crash", "error", "harness_error", "timeout")
+#: Statuses of an integration measurement a re-integration measures again, not reuses
+#: (``oom``: what else the process held, not the items).
+_TRANSIENT = ("crash", "error", "harness_error", "timeout", abtest.OOM)
+
+
+def _few(names: list[str], n: int = 3) -> str:
+    """The first ``n`` of ``names``, and how many more."""
+    return ", ".join(names[:n]) + (f" (+{len(names) - n} more)" if len(names) > n else "")
+
+
+def _in_place(
+    accepted: list[tuple[str, str]], olds: list[tuple[str, str]], new: tuple[str, str]
+) -> list[tuple[str, str]]:
+    """``accepted`` without ``olds``, ``new`` in the place of the first of them (where it
+    is already, when it is accepted)."""
+    out = []
+    for item in accepted:
+        if item not in olds:
+            out.append(item)
+        elif new not in out and new not in accepted:
+            out.append(new)
+    return out
 
 
 def _short(r: dict[str, Any]) -> dict[str, Any]:

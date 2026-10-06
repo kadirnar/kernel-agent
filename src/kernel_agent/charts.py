@@ -1048,7 +1048,9 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
     entry adds one item to the accepted set and is either accepted (new level),
     rejected for no gain, or failed (quality check / error). A version swap
     (``kind: swap``) replaces an accepted item by another version of it
-    (``swap``: its label reads ``target #old → #new``). A step judged by a
+    (``swap``: its label reads ``target #old → #new``); a replacement (``kind:
+    replace``, :mod:`kernel_agent.integrate.owners`) puts an item in the place of the
+    accepted items it overlaps (``replace``: ``item for old, old``). A step judged by a
     paired A/B (``ab``) starts at A's median of that session, so its bar is the
     paired difference; its ``rule`` is the acceptance rule.
     """
@@ -1058,6 +1060,9 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
     for h in reversed(history):  # the accepted set before its swaps: the seed + additions
         if h.get("kind") == "swap" and _swapped(h) and h.get("new") in accepted:
             accepted[accepted.index(h["new"])] = h.get("old")
+        elif h.get("kind") == "replace" and _swapped(h):  # its A, and what came after it
+            before = (h.get("ab") or {}).get("a_items") or []
+            accepted = [*before, *(a for a in accepted if a not in h.get("items", []))]
     composite = data.get("composite") or {}
     together = composite.get("items")
     if base is None:
@@ -1073,7 +1078,7 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
         level = float(seed["median_ms"])
     for h in history:
         items = h.get("items") or []
-        swap = h.get("kind") == "swap"
+        swap = h.get("kind") in ("swap", "replace")
         if not swap and (len(items) < 2 or (items == together and h is seed)):
             continue
         item, ms = items[-1], _num(h.get("median_ms"))
@@ -1089,7 +1094,11 @@ def integration_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
             else:
                 step = _step("fail", new, level, ms, h.get("reason") or h.get("status"))
             label = f"{ledger.item_label(new)} {ledger.item_version(old)} → "
-            step.update(label=label + ledger.item_version(new), swap=True)
+            label += ledger.item_version(new)
+            if h.get("kind") == "replace":  # integrate/owners.py: it instead of them
+                olds = ", ".join(ledger.item_label(o) for o in h.get("old") or [])
+                label = f"{ledger.item_label(new)} for {_short(olds, 40)}"
+            step.update(label=label, swap=True, replace=h.get("kind") == "replace")
         elif items == together:  # measured, but slower than the best single item
             kind = "nogain" if h.get("passed") and ms is not None else "fail"
             reason = None if kind == "nogain" else h.get("reason") or h.get("status")
@@ -1257,7 +1266,8 @@ def _draw_integration(
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
     ax.set_ylabel(f"{metric.label} (ms)")
     kept = sum(s["kind"] == "keep" and not s.get("swap") for s in steps)
-    swaps = sum(s["kind"] == "keep" and bool(s.get("swap")) for s in steps)
+    swaps = sum(s["kind"] == "keep" and bool(s.get("swap")) and not s.get("replace") for s in steps)
+    replaced = sum(s["kind"] == "keep" and bool(s.get("replace")) for s in steps)
     dropped = [ledger.item_label(h["items"][0]) for h in singles if not h.get("passed")]
     rule = next((s["rule"] for s in steps if s.get("rule")), None)
     test = "gain > 1 %"
@@ -1272,6 +1282,8 @@ def _draw_integration(
     )
     if swaps:
         subtitle += f", {swaps} version swap{'s' if swaps > 1 else ''}"
+    if replaced:
+        subtitle += f", {replaced} in place of overlapping items"
     if dropped:
         subtitle += f"  ·  failed alone: {_short(', '.join(dropped), 60)}"
     _header(ax, f"Integration: {base:,.1f} → {final:,.1f} ms ({base / final:.2f}×)", subtitle)

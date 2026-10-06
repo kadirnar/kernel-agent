@@ -12,9 +12,11 @@ experiment:
 * ``discard`` correct, but not better
 * ``incorrect``, ``incorrect_timed_output``, ``incorrect_perturbed``,
   ``integrity_violation``, ``fallback``, ``build_error``, ``runtime_error``,
-  ``crash``, ``timeout``: failures (the ``incorrect_*`` ones fail the evaluator's
+  ``crash``, ``timeout``, ``oom``: failures (the ``incorrect_*`` ones fail the evaluator's
   later correctness stages, ``integrity_violation`` and ``fallback`` its
-  anti-gaming guards, see :mod:`kernel_agent.kernels.evaluate`)
+  anti-gaming guards, see :mod:`kernel_agent.kernels.evaluate`; ``oom``: an integration
+  step that ran out of GPU memory even in a process of its own, a property of what the
+  process held rather than of the items' code)
 
 Rows that are not the agents' benchmark evaluations (:data:`UNMEASURED`, see
 :func:`measured`): they count against no budget or streak and the charts do not plot them:
@@ -83,6 +85,7 @@ FAILURES = (
     "runtime_error",
     "crash",
     "timeout",
+    "oom",
 )
 STATUSES = (KEEP, DISCARD, *FAILURES)
 QUICK_OK = "quick_ok"
