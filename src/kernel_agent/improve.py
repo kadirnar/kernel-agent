@@ -80,7 +80,7 @@ def log(msg: str) -> None:
 class ImproveConfig:
     slice: int = 4  # evaluations per slice (one fresh agent session)
     rounds: int = 1  # 1 = never re-profile / re-plan
-    integrate_every: int = 4  # kept results between measured re-integrations
+    integrate_every: int = 4  # kept results between measured re-integrations (0: final only)
     max_slices: int | None = None  # slices in this invocation (None: until budget / plateau)
     research_every: int = 3  # slices of a target between its research sessions (0: none)
     policy: Policy = field(default_factory=Policy)
@@ -414,7 +414,8 @@ class Improver:
             failed = failed + 1 if rec["status"] == "failed" else 0
             if failed >= MAX_FAILED_SLICES:
                 return f"{failed} agent sessions in a row failed (last: {rec.get('error')})"
-            if (kept := self.keeps_since_integration()) >= self.icfg.integrate_every:
+            every = self.icfg.integrate_every  # 0: only the final integration
+            if every > 0 and (kept := self.keeps_since_integration()) >= every:
                 await self.reintegrate(f"{kept} kept results since the last integration")
             elif self.live_charts:
                 slices_chart(self.run)
@@ -710,6 +711,7 @@ class Improver:
             "spread": spread,
             "median_ms": final.get("median_ms"),
             "accepted": [ledger.item_label(i["item"]) for i in data.get("accepted", [])],
+            "reused": (data.get("reuse") or {}).get("reused"),  # measurements not repeated
             "gain": improves(
                 {"passed": True, "speedup": speedup, "timing_spread": spread},
                 before,

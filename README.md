@@ -428,7 +428,8 @@ B = A with one item replaced by another version of it (see below):
   back to back instead, `abtest.SEPARATE_ITERS` (10) timed runs
   each and A measured again in the same session; the win rate is then over
   all (A run, B run) pairs and the interval comes from resampling both.
-  Such items are remembered (`integration.json` → `irreversible`). A
+  Such items are remembered (`integration.json` → `irreversible`), by
+  content: another snapshot of the same file is measured that way too. A
   transform may also define `undo(workload)` to revert what the snapshots
   cannot see; it is then applied again (plus a warm-up run) to re-enter its
   state.
@@ -450,8 +451,22 @@ transform's measured gain alone) next to the measured one; `report.md` shows
 both. Nested kernels count once, as in the run's projection (see Charts): a
 decoder layer's kernel and the attention kernel inside it add up to the better
 of the two, not both. `counted_ms` holds the part of each item's saving that
-counts, and `report.md` names the kernels not counted. A re-integration reuses
-an A/B only for the same A and B files.
+counts, and `report.md` names the kernels not counted.
+
+A re-integration reuses an A/B (an item alone, a step, a swap) of the previous
+integration whose content is unchanged, whatever the snapshot names: every
+evaluation snapshots its files anew (`history/021_merge_..._cc6df165.py` and
+`history/034_merge_..._cc6df165.py` hold the same bytes), so each `history`
+entry has a `reuse_key` (`integrate/reuse.py`): the sha256 of every file the
+items of A and B load, in their order (a transform or kernel snapshot, the
+modules it imports from its own directory, the `kernel_agent` modules it
+imports, the source files its string literals name; a kernel's `spec.json`
+fields and region rewrite), the evaluator schema (`EVALUATOR_SCHEMA`), the
+baseline it ran against (its latency, `baseline.json` and the digests and
+quality mode the worker verifies) and `--ab-rounds`. A new schema or baseline
+measures everything again; a changed file only the steps that hold it.
+`integration.json` → `reuse` counts the `reused` and the `measured` steps (also
+in the log, and in `improve.json` → `integrations` → `reused`).
 
 ### Anti-gaming guards
 
@@ -1184,9 +1199,13 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   `research-<target>#<slice>`). They are recorded in `improve.json` →
   `research`, shown as diamonds in `improve.png` and listed in `report.md`.
 * **Re-integration.** After every `--integrate-every 4` kept results, the
-  integration of `optimize` measures the combination end to end. Combinations of
-  the same snapshot files that were measured before are reused instead of
-  measured again. A target's better kernel version is swapped into the
+  integration of `optimize` measures the combination end to end
+  (`--integrate-every 0`: only the final integration, and the one a new round
+  starts from). What was measured before with the same content (items alone,
+  steps and swaps of the same files, by sha256, under the same evaluator schema
+  and baseline) is reused instead of measured again, whatever the snapshot
+  names, so a re-integration costs about one A/B per new or changed item plus
+  the steps that hold it. A target's better kernel version is swapped into the
   accepted set even when the systems agent combined an older one (version
   swaps, see the integration waterfall below). Every measurement is a ledger row, so the progress chart shows
   the measured latency going down. `optimized/` is re-exported each time.
@@ -1599,7 +1618,8 @@ kernel-agent optimize <hf-url> [options]
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
 kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4] [--rounds R]
   --integrate-every 4 --patience 5 --sol-stop 0.9 --target-hours 2 --speedup-goal 2
-  --max-slices N --dry-run [--seed 0]  continuous loop (see "kernel-agent improve")
+  --max-slices N --dry-run [--seed 0]  continuous loop (see "kernel-agent improve");
+                                       --integrate-every 0: only the final integration
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]

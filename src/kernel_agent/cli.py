@@ -474,7 +474,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--slice", type=int, default=4, help="evaluations per slice (one session)")
     p.add_argument("--rounds", type=int, default=1, help="re-profile + re-plan rounds (1 = none)")
     p.add_argument(
-        "--integrate-every", type=int, default=4, help="re-integrate after this many kept results"
+        "--integrate-every",
+        type=int,
+        default=4,
+        help="re-integrate after this many kept results (0: only the final integration)",
     )
     p.add_argument(
         "--patience", type=int, default=5, help="stop a target after this many evals w/o a gain"
