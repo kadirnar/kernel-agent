@@ -21,7 +21,8 @@ from scratch, with nothing shared with the evaluation:
    (a kernel that changes behaviour after its first calls), under the evaluator's
    integrity snapshot;
 3. the parent compares them with the strict comparator (:mod:`kernels.compare`:
-   outputs and in-place side effects; files loaded with ``weights_only``) and the
+   outputs and in-place side effects, a reduced-precision tier with its bounds for
+   redrawn inputs; files loaded with ``weights_only``) and the
    weighted speedup (calls per run x ms, as the evaluator weighs it) with the
    evaluator's verdict.
 
@@ -352,7 +353,7 @@ def compare_entries(
 ) -> list[list[dict[str, Any]]]:
     """Failed checks per entry (``(case, seed)`` of ``entries``): the candidate's saved
     outputs and post-call state against the reference's (:mod:`kernels.compare`, in the
-    capture's tolerance ``tier``)."""
+    capture's tolerance ``tier``, with its bounds for redrawn inputs)."""
     from kernel_agent.kernels.compare import compare_side_effects_flat, compare_tensors
 
     if not isinstance(saved, list) or len(saved) != len(expected):
@@ -367,11 +368,11 @@ def compare_entries(
             if name not in new_out:
                 checks.append({"name": name, "ok": False, "error": "missing in candidate output"})
             else:
-                checks.append(compare_tensors(name, ref, new_out[name], tier=tier))
+                checks.append(compare_tensors(name, ref, new_out[name], tier=tier, perturbed=True))
         for key in ("args", "kwargs"):
             pre = (exp.get("pre") or {}).get(key) or {}
             checks += compare_side_effects_flat(
-                pre, exp.get(key) or {}, new.get(key) or {}, tier=tier
+                pre, exp.get(key) or {}, new.get(key) or {}, tier=tier, perturbed=True
             )
         failures.append([c for c in checks if not c.get("ok")])
     return failures

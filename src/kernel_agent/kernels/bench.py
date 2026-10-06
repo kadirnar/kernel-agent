@@ -387,8 +387,10 @@ def wall_check(
 
 def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> dict[str, Any]:
     """Compare a kept timed call of the candidate with a fresh reference call on the
-    same inputs (outputs and in-place side effects).  The reference runs after the
-    candidate, on copies, so it cannot leave the expected output in freed memory."""
+    same inputs (outputs and in-place side effects; the inputs are redrawn, so a
+    reduced-precision tier applies its bounds for redrawn inputs).  The reference runs
+    after the candidate, on copies, so it cannot leave the expected output in freed
+    memory."""
     from kernel_agent.kernels.compare import compare_side_effects, compare_structures
 
     pre_args, pre_kwargs = kept["pre"]
@@ -397,9 +399,9 @@ def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> d
         expected = reference(*ref_args, **ref_kwargs)
     torch.cuda.synchronize()
     new_args, new_kwargs = kept["post"]
-    checks = compare_structures(expected, kept["output"], "output")
-    checks += compare_side_effects(pre_args, ref_args, new_args, "args")
-    checks += compare_side_effects(pre_kwargs, ref_kwargs, new_kwargs, "kwargs")
+    checks = compare_structures(expected, kept["output"], "output", perturbed=True)
+    checks += compare_side_effects(pre_args, ref_args, new_args, "args", perturbed=True)
+    checks += compare_side_effects(pre_kwargs, ref_kwargs, new_kwargs, "kwargs", perturbed=True)
     return {"iteration": kept["iteration"], "failures": [c for c in checks if not c.get("ok")]}
 
 
