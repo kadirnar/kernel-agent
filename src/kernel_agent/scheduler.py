@@ -221,15 +221,19 @@ def _ref_ms(target_id: str, spec: dict[str, Any], profiles: list[dict[str, Any]]
     """Time per run of the target's class at 1.0×, from the newest profile that has the class.
 
     A re-profile (improve rounds) measured the model with the integrated kernels,
-    so a class whose kernel was applied there ran ``applied`` × faster.
+    so a class whose kernel was applied there ran ``applied`` × faster (the kernel of
+    the target or of another precision of it, ``pivot.py``: one of them is applied).
     """
+    from kernel_agent.pivot import family
+
     cls = spec.get("module_class")
     for prof in profiles:
         if cls in prof["shares"]:
             share, instances = prof["shares"][cls]
             if spec.get("qualname") and instances > 1:
                 share /= instances  # restricted to one instance of the class
-            applied = float(prof["applied"].get(target_id) or 1.0)
+            mine = [v for t, v in prof["applied"].items() if family(t) == family(target_id)]
+            applied = float(mine[0] or 1.0) if mine else 1.0
             return share * prof["baseline_ms"] * applied
     return 0.0
 

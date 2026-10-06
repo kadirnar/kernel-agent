@@ -192,6 +192,21 @@ PLAN_SCHEMA: dict[str, Any] = {
                 "required": ["id", "idea", "why"],
             },
         },
+        # round re-plans of a near-lossless run: move an existing target to another
+        # precision tier (pivot.py); the first plan has no targets to move
+        "pivots": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "precision": {"type": "string"},
+                    "precision_why": {"type": "string"},
+                    "approach": {"type": "string"},
+                },
+                "required": ["target", "precision", "precision_why"],
+            },
+        },
     },
     "required": ["analysis", "targets", "transforms"],
 }
@@ -410,6 +425,13 @@ def _scope_lines(target: dict[str, Any]) -> str:
             f"`ka_region_{target['id']}`), which moved these ops out of the parent's code; "
             f"integration applies that rewrite to the `{target.get('parent_class')}` instances "
             f"first, then your `build()` to every `{target['module_class']}`.\n"
+        )
+    if target.get("pivot_of"):  # pivot.py
+        lines += (
+            f"* precision pivot of `{target['pivot_of']}`: the same modules, moved to "
+            f"`{target.get('precision')}` mid-run. That target's kernels, `NOTES.md`, "
+            f"`plan.md` and results are in `../{target['pivot_of']}/`: a starting point at "
+            "its precision; this target's results are its own.\n"
         )
     return lines
 
@@ -754,8 +776,11 @@ def research_prompt(
     evidence: str,
     plan: Path,
     toolchain: str,
+    *,
+    pivot: Path | None = None,
 ) -> str:
-    """The research agent of a plateaued target: read-only, writes ``plan`` (``plan.md``)."""
+    """The research agent of a plateaued target: read-only, writes ``plan`` (``plan.md``)
+    and, with ``pivot`` (near-lossless runs), may propose a precision pivot there."""
     cases = "\n".join(
         f"  * `{c['signature']}` — {c['count']} calls per run per instance"
         for c in capture_info.get("cases", [])
@@ -824,9 +849,10 @@ bandwidth, compute or launch floor, from `sol_ms` and the profile) times the
 share of calls they cover. Recommend a pivot when the current design's ceiling
 is below another's, even if that one has no good number yet. An idea whose
 attempts all failed is untested, not refuted.
-
+{_pivot_block(target, pivot)}
 # Write `{plan}`
-This file only: the session cannot write anything else. Layout:
+This file{" (and `pivot.json` above)" if pivot else ""} only: the session cannot write \
+anything else. Layout:
 ```markdown
 # Plan: `{target["id"]}` after exp <N>
 
@@ -859,6 +885,34 @@ direction.
 ```
 {toolchain}
 ```"""
+
+
+def _pivot_block(target: dict[str, Any], pivot: Path | None) -> str:
+    """The precision pivot section of a research prompt (``pivot.py``; empty without one)."""
+    if pivot is None:
+        return ""
+    from kernel_agent.kernels.compare import REDUCED_PRECISIONS
+
+    current = target.get("precision") or "exact"
+    others = ", ".join(f"`{p}`" for p in REDUCED_PRECISIONS if p != current)
+    return f"""
+# Precision pivot (optional)
+This run allows reduced precision (`--quality near-lossless`) and this target is
+`{current}`. Its precision was fixed when it was planned. If the evidence shows
+that the remaining gain lies in another precision tier, propose a pivot: the
+module's GEMMs are compute bound at the bf16 peak (W8A8: twice the FLOP rate,
+`fp8_w8a8`) or bound by streaming weights (`fp8_weights`, `fp4_weights`), the
+current design sits near its ceiling at this precision, or a passing end-to-end
+transform above already uses that precision on these modules. Write `{pivot}`:
+```json
+{{"precision": "<one of {others}>",
+ "precision_why": "<the numbers: bound, ceiling, the transform's exp and gain>",
+ "approach": "<optional: where the new arm should start>"}}
+```
+kernel-agent then captures the target again in that tolerance tier as a new
+arm `{target["id"]}__<precision>` with a fresh capture and your plan; this arm
+and its results stay as they are. Without numbers, do not write it.
+"""
 
 
 def refactor_prompt(target: dict[str, Any], capture_info: dict[str, Any]) -> str:

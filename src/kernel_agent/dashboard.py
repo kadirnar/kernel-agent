@@ -132,6 +132,8 @@ def write_dashboard(run: RunDir) -> Path:
             f'<span class="swatch" style="background:{colors.get(t["id"], charts.OTHER_COLOR)}">'
             f"</span><code>{_e(t['id'])}</code>",
             f"<code>{_e(t['module_class'])}</code>",
+            _e(t["precision"])
+            + (f" (pivot of <code>{_e(t['pivot_of'])}</code>)" if t.get("pivot_of") else ""),
             _e(", ".join(t["backends"])),
             str(t["evals"]),
             str(t["keeps"]),
@@ -188,6 +190,7 @@ def write_dashboard(run: RunDir) -> Path:
             [
                 "target",
                 "class",
+                "precision",
                 "backends",
                 "evals",
                 "kept",
@@ -198,7 +201,7 @@ def write_dashboard(run: RunDir) -> Path:
                 "last hypothesis",
             ],
             target_rows,
-            {3, 4, 5, 6, 7},
+            {4, 5, 6, 7, 8},
         )
         + "</section>"
     )
