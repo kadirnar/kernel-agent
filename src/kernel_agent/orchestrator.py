@@ -754,7 +754,11 @@ class Orchestrator:
         known = (previous or {}).get("history", [])
         # by content, not by snapshot name: every evaluation snapshots its files anew (#93)
         keys = reuse_cache.Keys(self.run, self._reuse_context(base_ms))
-        paired = {h["reuse_key"]: h for h in known if h.get("ab") and h.get("reuse_key")}
+        paired = {  # a crash or timeout can be transient (another process, OOM): measure again
+            h["reuse_key"]: h
+            for h in known
+            if h.get("ab") and h.get("reuse_key") and h.get("status") not in _TRANSIENT
+        }
         counts = {"reused": 0, "measured": 0}
         irreversible = set((previous or {}).get("irreversible") or [])  # not undone in-process
         versions = self._previous_versions(previous or {}, digests)
@@ -1876,6 +1880,10 @@ def _alone(base_ms: float, history: list[dict[str, Any]]) -> dict[str, float]:
         and h.get("passed")
         and (h.get("ab") or {}).get("gain") is not None
     }
+
+
+#: Statuses of an integration measurement a re-integration measures again, not reuses.
+_TRANSIENT = ("crash", "error", "harness_error", "timeout")
 
 
 def _short(r: dict[str, Any]) -> dict[str, Any]:

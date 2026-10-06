@@ -311,3 +311,29 @@ def test_re_integrations_of_the_improve_loop_report_what_they_reused(tmp_path):
     data = integrated(orch.run)
     assert data["reuse"]["reused"] == done[-1]["reused"]
     assert sum(data["reuse"].values()) == len(data["history"])
+
+
+def test_a_timeout_is_measured_again_not_reused(tmp_path):
+    orch = make(tmp_path)
+    run = orch.run
+    for name in ("cfm", "enc"):
+        e2e(run, [write(run, name)])
+    calls: list[tuple[list[str], list[str]]] = []
+    ok = fake_worker(calls)
+
+    def flaky(run, command, *args):  # enc alone times out once (another process held the GPU)
+        result = ok(run, command, *args)
+        if calls[-1] == ([], ["enc"]) and len(calls) <= 2:
+            return {"status": "timeout", "passed": False, "reason": "worker timed out"}
+        return result
+
+    orch.worker = flaky
+    asyncio.run(orch.integrate())
+    first = [h for h in integrated(run)["history"] if [label(i) for i in h["items"]] == ["enc"]]
+    assert first and first[0]["status"] == "timeout"
+
+    calls.clear()
+    orch.worker = ok
+    asyncio.run(orch.integrate(reuse=True))
+    assert ([], ["enc"]) in calls  # measured again; cfm alone comes from the cache
+    assert ([], ["cfm"]) not in calls
