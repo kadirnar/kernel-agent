@@ -1,5 +1,6 @@
 """Backend smoke test: run every bundled example kernel through the evaluator (the FP8
-weight-only examples in the near-lossless tier, and their rejection by the exact tier)."""
+weight-only examples in the near-lossless tier, and their rejection by the exact tier; the
+FP4 one in the near-lossless-fp4 tier, and its rejection by the FP8 tier)."""
 
 from __future__ import annotations
 
@@ -53,6 +54,13 @@ FP8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     # LocDiT MLP up projection: [2, 11, 1024] per flow-matching step, a 32-row call and
     # (correctness only: 0 calls per run) 64 rows, two token groups
     "cuda_fp8_skinny_gemm.py": (1024, 4096, [((2, 11), 40), ((32,), 1), ((4, 16), 0)]),
+}
+
+
+#: The FP4 weight-only examples (``precision: fp4_weights``) on the GEMV's shapes above; a
+#: 22-row call (0 calls per run: correctness only) takes the dequantised fallback.
+FP4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cuda_fp4_gemv.py": (2048, 12288, [((1,), 28), ((4,), 1), ((2, 11), 0)]),
 }
 
 
@@ -119,6 +127,38 @@ def smoke_fp8(tmp: Path, verbose: bool = False) -> bool:
     return ok
 
 
+def smoke_fp4(tmp: Path, verbose: bool = False) -> bool:
+    """Every FP4 example passes the evaluator in the near-lossless-fp4 tier, and the FP8
+    near-lossless tier (a quick check) rejects it: FP4 needs its own tier."""
+    from kernel_agent.kernels.evaluate import run_evaluation
+
+    ok = True
+    for name, (k, n, calls) in FP4_EXAMPLES.items():
+        fp4 = make_linear_capture(
+            tmp / f"{name}.fp4.pt", k, n, calls, tier="near-lossless-fp4", precision="fp4_weights"
+        )
+        fp8 = make_linear_capture(
+            tmp / f"{name}.fp8.pt", k, n, calls, tier="near-lossless", precision="fp8_weights"
+        )
+        result = run_evaluation(fp4, EXAMPLES_DIR / name)
+        rejected = run_evaluation(fp8, EXAMPLES_DIR / name, quick=True)
+        passed = bool(result.get("correct")) and rejected.get("status") == "incorrect"
+        ok &= passed
+        if verbose:
+            if passed:
+                cases = result.get("cases") or [{}]
+                detail = (
+                    f"speedup {result.get('speedup')}x, rel L2 {cases[0].get('max_rel_l2')} "
+                    f"(near-lossless-fp4), the FP8 tier rejects it"
+                )
+            elif not result.get("correct"):
+                detail = f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+            else:
+                detail = f"the FP8 tier did not reject it: {rejected.get('status')}"
+            print(f"  {name.removesuffix('.py'):22s} {'OK ' if passed else 'FAIL'} {detail}")
+    return ok
+
+
 def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> bool:
     from kernel_agent import toolchain
     from kernel_agent.kernels.evaluate import run_evaluation
@@ -143,4 +183,5 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
                 print(f"  {backend:9s} {'OK ' if passed else 'FAIL'} {detail}")
         if fp8_supported(tc) and (backends is None or "cuda" in backends):
             ok &= smoke_fp8(Path(tmp), verbose)
+            ok &= smoke_fp4(Path(tmp), verbose)
     return ok

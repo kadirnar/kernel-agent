@@ -16,7 +16,8 @@ A floating-point tensor matches its reference when
 
 Integer and boolean tensors must match exactly. In the ``near-lossless`` tier
 (:data:`TIERS`: ``--quality near-lossless`` and a target whose spec allows reduced
-precision) whole-tensor bounds replace the per-element tolerances.
+precision) whole-tensor bounds replace the per-element tolerances; FP4 weights
+(``fp4_weights``) get the wider bounds of the ``near-lossless-fp4`` tier.
 """
 
 from __future__ import annotations
@@ -60,12 +61,19 @@ GLOBAL_TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
 #: within 0.47 of its bound below (README, "Quality modes").
 EXACT_TIER = "exact"
 NEAR_LOSSLESS_TIER = "near-lossless"
-TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER)
+#: ``near-lossless-fp4``: the near-lossless checks with the wider bounds of block-scaled FP4
+#: weights (``fp4_weights``, :data:`NEAR_LOSSLESS_BOUNDS`).
+NEAR_LOSSLESS_FP4_TIER = "near-lossless-fp4"
+TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER, NEAR_LOSSLESS_FP4_TIER)
 #: ``"precision"`` of a target spec that ``--quality near-lossless`` captures in the
 #: near-lossless tier: ``fp8_weights`` (FP8 weight-only storage, per-channel scales, bf16
 #: activations; agent/knowledge/low_precision.md) or ``reduced`` (another numerics-changing
-#: kernel). Anything else (``exact``, none) is the exact tier.
-REDUCED_PRECISIONS = ("fp8_weights", "reduced")
+#: kernel); ``fp4_weights`` (block-scaled FP4 weights, bf16 activations) in the
+#: near-lossless-fp4 tier (:data:`PRECISION_TIERS`). Anything else (``exact``, none) is the
+#: exact tier.
+REDUCED_PRECISIONS = ("fp8_weights", "reduced", "fp4_weights")
+#: The tier of a reduced precision other than the near-lossless tier.
+PRECISION_TIERS = {"fp4_weights": NEAR_LOSSLESS_FP4_TIER}
 PRECISIONS = (EXACT_TIER, *REDUCED_PRECISIONS)
 NEAR_LOSSLESS_MIN_COSINE = 0.996
 NEAR_LOSSLESS_MAX_REL_L2 = 0.08
@@ -74,6 +82,34 @@ NEAR_LOSSLESS_MAX_NORM_CHANGE = 0.02
 #: Every element within ``a * RMS(ref) + r * |ref|`` (``(a, r)``): a corrupted element or
 #: row fails, a massive activation keeps FP8's relative rounding step.
 NEAR_LOSSLESS_ELEMENT = (0.5, 0.125)
+#: The ``near-lossless-fp4`` tier's bounds (the same checks). Calibrated on NVFP4 weight-only
+#: nn.Linear calls (147), MLPs and the LocDiT estimator of VoxCPM2 on real inputs: cosine
+#: >= 0.9778, relative L2 error <= 0.21 (a 256-wide decode output; mean 0.055), norm within
+#: 2.1 % (noise adds energy: ``sqrt(1 + rel_l2²)``), every element within 0.81 of its bound
+#: below. Bugs: of the 147 calls, nibble-swapped codes and weights x 1.05 fail 139, block
+#: scales shifted by one block 85, int4 per tensor 86, a zeroed output channel 34; of the
+#: 21 MLP / LocDiT calls, nibble swaps and int4 fail all, shifted block scales 19 (README,
+#: "Quality modes").
+NEAR_LOSSLESS_FP4_MIN_COSINE = 0.96
+NEAR_LOSSLESS_FP4_MAX_REL_L2 = 0.28
+NEAR_LOSSLESS_FP4_MAX_NORM_CHANGE = 0.04
+NEAR_LOSSLESS_FP4_ELEMENT = (1.25, 0.25)
+#: (min cosine, max relative L2 error, max norm change, element bound) of each tier that
+#: replaces the per-element checks with whole-tensor bounds.
+NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
+    NEAR_LOSSLESS_TIER: (
+        NEAR_LOSSLESS_MIN_COSINE,
+        NEAR_LOSSLESS_MAX_REL_L2,
+        NEAR_LOSSLESS_MAX_NORM_CHANGE,
+        NEAR_LOSSLESS_ELEMENT,
+    ),
+    NEAR_LOSSLESS_FP4_TIER: (
+        NEAR_LOSSLESS_FP4_MIN_COSINE,
+        NEAR_LOSSLESS_FP4_MAX_REL_L2,
+        NEAR_LOSSLESS_FP4_MAX_NORM_CHANGE,
+        NEAR_LOSSLESS_FP4_ELEMENT,
+    ),
+}
 #: The tier of this process's comparisons when a call passes none. The evaluator sets it
 #: from the capture before the candidate is imported, so the integrity snapshot
 #: (:mod:`kernel_agent.kernels.integrity`) watches it like the constants above.
@@ -90,9 +126,10 @@ def tier_of(capture: dict[str, Any] | None) -> str:
 def tier_for(quality: str | None, precision: str | None) -> str:
     """The tier of a target: ``near-lossless`` when the run's quality mode is
     ``near-lossless`` and the target's spec allows reduced precision
-    (:data:`REDUCED_PRECISIONS`)."""
-    near = quality == NEAR_LOSSLESS_TIER and precision in REDUCED_PRECISIONS
-    return NEAR_LOSSLESS_TIER if near else EXACT_TIER
+    (:data:`REDUCED_PRECISIONS`; ``fp4_weights``: ``near-lossless-fp4``)."""
+    if quality != NEAR_LOSSLESS_TIER or precision not in REDUCED_PRECISIONS:
+        return EXACT_TIER
+    return PRECISION_TIERS.get(str(precision), NEAR_LOSSLESS_TIER)
 
 
 def flatten(value: Any, prefix: str = "out", depth: int = 0) -> dict[str, torch.Tensor]:
@@ -209,14 +246,14 @@ def compare_tensors(
     problems = []
     min_cos, max_rel = GLOBAL_TOLERANCES.get(ref.dtype, GLOBAL_TOLERANCES[torch.float32])
     signal = a.numel() > 0 and ref_norm > atol * math.sqrt(a.numel())
-    if (tier or TIER) == NEAR_LOSSLESS_TIER and signal:
-        min_cos, max_rel = NEAR_LOSSLESS_MIN_COSINE, NEAR_LOSSLESS_MAX_REL_L2
+    near = NEAR_LOSSLESS_BOUNDS.get(tier or TIER)
+    if near is not None and signal:
+        min_cos, max_rel, max_norm_change, (e_atol, e_rtol) = near
         rms = ref_norm / math.sqrt(a.numel())
-        e_atol, e_rtol = NEAR_LOSSLESS_ELEMENT
         element = float((diff / (e_atol * rms + e_rtol * a.abs())).max())
         norm_ratio = new_norm / ref_norm
         result.update(
-            tier=NEAR_LOSSLESS_TIER,
+            tier=tier or TIER,
             max_err_over_rms=round(float(diff.max()) / rms, 4),
             element_ratio=round(element, 4),
             norm_ratio=round(norm_ratio, 6),
@@ -226,9 +263,9 @@ def compare_tensors(
                 f"an element is {element:.3g}x its near-lossless tolerance away "
                 f"({e_atol:g} x RMS + {e_rtol:g} x |reference|)"
             )
-        if abs(norm_ratio - 1.0) > NEAR_LOSSLESS_MAX_NORM_CHANGE:
+        if abs(norm_ratio - 1.0) > max_norm_change:
             problems.append(
-                f"norm x{norm_ratio:.4f} (allowed ±{NEAR_LOSSLESS_MAX_NORM_CHANGE:.0%}): "
+                f"norm x{norm_ratio:.4f} (allowed ±{max_norm_change:.0%}): "
                 "a systematic error, not rounding noise"
             )
         whole = True

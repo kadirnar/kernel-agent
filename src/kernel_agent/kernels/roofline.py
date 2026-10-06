@@ -62,7 +62,10 @@ MASKED = -1e4  # additive attention-mask values at or below this mask the positi
 #: the 2-D floating-point parameters the reference reads count at this width plus one fp32
 #: scale per output channel (row), so ``pct_of_sol`` of an FP8 kernel is measured against
 #: the bytes it must stream, not the bf16 weights it replaced.
-WEIGHT_BITS = {"fp8_weights": 8}
+WEIGHT_BITS = {"fp8_weights": 8, "fp4_weights": 4}
+#: ... or, for block-scaled formats, plus one 1-byte scale per this many elements and one
+#: fp32 scale per tensor (``fp4_weights``: NVFP4, an e4m3 scale per 16).
+WEIGHT_SCALE_BLOCK = {"fp4_weights": 16}
 #: ``peaks["tflops"]`` keys of the low-precision tensor-core peaks: FP8 e4m3 and NVFP4.
 FP8, FP4 = "float8_e4m3fn", "float4_e2m1fn_x2"
 #: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks. :func:`ensure_peaks` measures an
@@ -614,6 +617,7 @@ def _weight_shares(module: Any, precision: str | None) -> dict[tuple[str, int], 
     """``storage key -> (share of the bytes read, scale bytes added)`` of the weights a
     reduced-precision kernel streams narrower (:data:`WEIGHT_BITS`; none for exact)."""
     bits = WEIGHT_BITS.get(precision or "")
+    block = WEIGHT_SCALE_BLOCK.get(precision or "")
     shares: dict[tuple[str, int], tuple[float, int]] = {}
     if not bits:
         return shares
@@ -622,7 +626,8 @@ def _weight_shares(module: Any, precision: str | None) -> dict[tuple[str, int], 
         if p.dim() == 2 and p.is_floating_point() and width > bits:
             key = _key(p)
             if key is not None:
-                shares[key] = (bits / width, 4 * int(p.shape[0]))
+                scales = -(-p.numel() // block) + 4 if block else 4 * int(p.shape[0])
+                shares[key] = (bits / width, scales)
     return shares
 
 
@@ -635,8 +640,8 @@ def count_case(
     precision: str | None = None,
 ) -> CaseCost:
     """FLOPs (per dtype) and minimum bytes of one reference call (inputs are not mutated).
-    ``precision`` (``fp8_weights``): the weights count at their reduced width
-    (:data:`WEIGHT_BITS`)."""
+    ``precision`` (``fp8_weights``, ``fp4_weights``): the weights count at their reduced
+    width (:data:`WEIGHT_BITS`, :data:`WEIGHT_SCALE_BLOCK`)."""
     import torch
     from torch.utils.flop_counter import FlopCounterMode
 
@@ -659,7 +664,7 @@ def count_case(
     reads = 0
     for key in set(tracker.reads) | set(tracker.gathered):
         n = min(_union(tracker.reads.get(key, [])) + tracker.gathered.get(key, 0), external[key])
-        if key in narrow:  # a reduced-precision weight: its codes + one scale per channel
+        if key in narrow:  # a reduced-precision weight: its codes + scales
             share, scales = narrow[key]
             n = math.ceil(n * share) + scales
         reads += n
