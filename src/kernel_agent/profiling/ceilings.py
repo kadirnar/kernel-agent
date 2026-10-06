@@ -28,16 +28,27 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   A precision whose peak was not measured is unknown: no ratio to bf16 is assumed.
 * **bound**: the term that sets the exact floor (``compute``, ``memory`` or ``launch``).
 * **now**: hooked inclusive ms scaled to the unhooked run (× baseline / hooked wall
-  ms); **saves** = now − floor.
+  ms); **saves** = now − floor. Rows rank by the exact one; a row already below its exact
+  floor (an optimised model that runs it at a lower precision) by its best lower-precision
+  one (``saves_best``).
 * **end to end**, per precision: the run with every row at its floor, nested rows
   counted once (Amdahl over the non-overlapping set, :func:`projection.project`).
+
+Calls whose insides the hooks did not see (an optimised model in an improve round: a
+compiled module, a CUDA-graph replay, a replaced kernel) take the work of the same call
+in the unmodified model (``reference_calls``, ‡; :class:`~kernel_agent.profiling.profiler.
+WorkReference`, the re-profile's hooked pass before the round's items are applied): the
+work is a property of the math, not of its implementation. Without one, a compiled or
+graph-replaying call's work is unknown (``unknown_calls``): its row has no floors (``?``)
+and stays at its time in the end-to-end line, never "0 FLOP, memory bound". A call that
+reads none of its module's weights (``F.linear`` on a child's weight) is estimated from
+its module's ``nn.Linear`` weights at its input's rows (``estimated_calls``, †).
 
 Approximations: attention scores, KV-cache reads and element-wise math are not
 counted (the floors of attention-heavy rows are too low); weights stream from DRAM
 on every call (no L2 reuse); fp32 convolutions are held to the fp32 peak (cuDNN may
-use TF32); a call whose insides the hooks did not see (a compiled module, a CUDA-graph
-replay, a replaced kernel) is estimated from its module's ``nn.Linear`` weights at
-its input's rows (``estimated_calls``).
+use TF32); ‡ rows have the math and dtypes of the unmodified model (a transform that
+merges or trims layers, or lowers the precision, makes them approximate).
 """
 
 from __future__ import annotations
@@ -96,6 +107,8 @@ def entries(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "weight_bytes": 0,
                     "io_bytes": 0,
                     "estimated_calls": 0,
+                    "reference_calls": 0,
+                    "unknown_calls": 0,
                     "signature": w.get("signature", ""),
                 },
             )
@@ -104,7 +117,8 @@ def entries(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
                 row["signature"], row["_top_ms"] = w.get("signature", ""), w.get("inclusive_ms", 0)
             for name in ("instances", "calls", "weight_elems", "weight_bytes", "io_bytes"):
                 row[name] += int(w.get(name) or 0)
-            row["estimated_calls"] += int(w.get("estimated_calls") or 0)
+            for name in ("estimated_calls", "reference_calls", "unknown_calls"):
+                row[name] += int(w.get(name) or 0)
             row["inclusive_ms"] += float(w.get("inclusive_ms") or 0.0)
             for dtype, n in (w.get("flops") or {}).items():
                 row["flops"][dtype] = row["flops"].get(dtype, 0) + int(n)
@@ -184,25 +198,34 @@ def build(
     tflops = (peaks or {}).get("tflops") or {}
     rows = []
     for row in entries(profile):
+        known = not row["unknown_calls"]  # else a call hid work the unmodified model lacks
         total = sum(row["flops"].values())
         now = row["inclusive_ms"] * scale
         row.update(
             target=f"{row['cls']}@{row['group']}",
             now_ms=_sig(now),
             share=round(now / baseline_ms, 4) if baseline_ms > 0 else 0.0,
-            flops_total=total,
-            m=round(total / (2 * row["weight_elems"]), 1) if row["weight_elems"] else None,
+            work_known=known,
+            flops_total=total if known else None,
+            m=round(total / (2 * row["weight_elems"]), 1)
+            if known and row["weight_elems"]
+            else None,
             floors={},
             saves_ms={},
         )
         for name, precision in PRECISIONS.items():
-            f = floor(row, precision, peaks) if usable and peaks is not None else None
+            f = floor(row, precision, peaks) if usable and known and peaks is not None else None
             row["floors"][name] = _sig(f["ms"]) if f else None
             row["saves_ms"][name] = _sig(max(now - f["ms"], 0.0)) if f else None
             if name == "exact" and f:
                 row["bound"] = f["bound"]
+        exact = row["floors"]["exact"]
+        lower = {k: v for k, v in row["saves_ms"].items() if k != "exact" and v}
+        if exact is not None and now < exact and lower:
+            best = max(lower, key=lambda k: lower[k])
+            row["saves_best"] = {"precision": best, "ms": lower[best]}
         rows.append(row)
-    rows.sort(key=lambda r: (-(r["saves_ms"]["exact"] or 0.0), -r["now_ms"], r["target"]))
+    rows.sort(key=lambda r: (-_rank_ms(r), -r["now_ms"], r["target"]))
     precisions = {}
     for name, p in PRECISIONS.items():
         info: dict[str, Any] = {"label": p.label, "weight_bytes": p.weight_bytes}
@@ -227,15 +250,25 @@ def build(
         "precisions": precisions,
         "rows": rows,
         "e2e": {name: _e2e(rows, name, baseline_ms) for name in PRECISIONS} if usable else {},
+        "unknown_work": [r["target"] for r in rows if not r["work_known"]],
     }
     return table
 
 
+def _rank_ms(row: Mapping[str, Any]) -> float:
+    """What reaching the floor saves: the exact one, else the best lower-precision one."""
+    best = row.get("saves_best")
+    return float(best["ms"] if best else row["saves_ms"]["exact"] or 0.0)
+
+
 def _e2e(rows: list[dict[str, Any]], precision: str, baseline_ms: float) -> dict[str, Any] | None:
-    """The run with every row at its ``precision`` floor, nested rows counted once."""
+    """The run with every row at its ``precision`` floor, nested rows counted once; a row
+    whose work is unknown stays at its time."""
     savings: dict[str, float] = {}
     patterns: dict[str, str] = {}
     for row in rows:
+        if not row["work_known"]:
+            continue
         saved = row["saves_ms"][precision]
         if saved is None:
             return None
@@ -262,6 +295,13 @@ def _ms(value: float | None) -> str:
     if value >= 100:
         return f"{value:,.0f}"
     return f"{value:.3g}"
+
+
+def _saves(row: Mapping[str, Any], precisions: Mapping[str, Any]) -> str:
+    """The *saves ms* cell: ``0 (W8A8 424)`` for a row already below its exact floor."""
+    best = row.get("saves_best")
+    text = _ms(row["saves_ms"]["exact"])
+    return f"{text} ({precisions[best['precision']]['label']} {_ms(best['ms'])})" if best else text
 
 
 def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01) -> str:
@@ -306,7 +346,8 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             f"bits per weight, bf16 math), {', '.join(peak_text)}. *now* = the hooked time "
             "scaled to the unhooked run (approximate: hooks inflate many small calls more than "
             "a few large ones); *saves* = now − exact floor (ceiling × share; 0 when the floor "
-            "is above *now*).",
+            "is above *now*, then the best saving at a lower precision in brackets: the row "
+            "already runs below its exact floor).",
             "",
         ]
     lines += [
@@ -315,16 +356,20 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in shown:
-        mark = " †" if r["estimated_calls"] else ""
+        marks = {"†": r["estimated_calls"], "‡": r.get("reference_calls")}
+        mark = "".join(f" {m}" for m, n in marks.items() if n)
         f = r["floors"]
+        known = r.get("work_known", True)
         m = "" if r["m"] is None else f"{r['m']:.0f}"
+        tflop = f"{r['flops_total'] / 1e12:.3g}" if known else "?"
+        weights = f"{r['weight_bytes'] / 1e9:.3g}" if known else "?"
         lines.append(
             f"| `{r['cls']}` `{r['group']}`{mark} | {r['phase']} | {r['instances']} | "
-            f"{r['calls']} | {m} | {_ms(r['now_ms'])} | "
-            f"{r['share']:.1%} | {r['flops_total'] / 1e12:.3g} | {r['weight_bytes'] / 1e9:.3g} | "
+            f"{r['calls']} | {m if known else '?'} | {_ms(r['now_ms'])} | "
+            f"{r['share']:.1%} | {tflop} | {weights} | "
             f"{r.get('bound', '?')} | {_ms(f['exact'])} | {_ms(f['fp8_weights'])} | "
             f"{_ms(f['w8a8'])} | {_ms(f['fp4_weights'])} | {_ms(f['w4a4'])} | "
-            f"{_ms(r['saves_ms']['exact'])} |"
+            f"{_saves(r, precisions)} |"
         )
     e2e = table.get("e2e") or {}
     if e2e:
@@ -335,10 +380,13 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
                 parts.append(f"{p['label']} unknown ({p.get('unknown', 'no peak')})"[:120])
             else:
                 parts.append(f"{p['label']} ≥ {_ms(e['floor_ms'])} ms ({e['speedup']}x)")
+        unknown = len(table.get("unknown_work") or [])
         lines += [
             "",
             f"**End to end** ({per}, baseline {_ms(table['baseline_ms'])} ms; every class at its "
-            "floor, nested classes counted once, the time outside them unchanged): "
+            "floor, nested classes counted once, the time outside them unchanged"
+            + (f", the {unknown} rows with unknown work (`?`) at their time" if unknown else "")
+            + "): "
             + "; ".join(parts)
             + ".",
         ]
@@ -348,8 +396,23 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
         "(floors of attention-heavy rows are low); weights stream from DRAM on every call; "
         "fp32 convolutions are held to the fp32 peak (cuDNN may use TF32)."
         + (
+            " ‡: the hooks did not see inside some calls (compiled, CUDA graph or replaced "
+            "kernel); their work is that of the same calls in the unmodified model, with its "
+            "math and dtypes (approximate where a transform merged or trimmed layers; *now* "
+            "can be below the exact floor where the model already runs at a lower precision: "
+            "compare it with the FP8 / FP4 floors)."
+            if any(r.get("reference_calls") for r in shown)
+            else ""
+        )
+        + (
+            " ?: work unknown (hidden from the hooks, and the unmodified model made no such "
+            "call): no floors, and the end-to-end line keeps its time."
+            if any(not r.get("work_known", True) for r in shown)
+            else ""
+        )
+        + (
             " †: partly estimated from the module's `nn.Linear` weights at its input's rows "
-            "(the hooks did not see inside: compiled, CUDA graph or replaced kernel)."
+            "(its calls read none of them: a replaced kernel or `F.linear` on a child's weight)."
             if any(r["estimated_calls"] for r in shown)
             else ""
         ),

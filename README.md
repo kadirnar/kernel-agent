@@ -1032,16 +1032,34 @@ re-profile makes a new one for its re-plan.
   `nn.Linear` and convolution calls inside it (`2 × rows × in × out`, each weight
   read once per call) and the bytes of its first input and output.
   `profile.json` → `classes[].work` sums them per instance group (qualname with
-  layer indices folded) and phase. A call whose insides the hooks do not see (a
-  compiled module, a CUDA-graph replay, a replaced kernel) is estimated from its
-  module's `nn.Linear` weights at its input's rows (`estimated_calls`, † in the
-  table).
+  layer indices folded) and phase.
+* **Optimised models.** The model an improve round re-profiles hides work from the
+  hooks: a compiled module is one call, a module that replays a CUDA graph has no
+  child calls, a replaced kernel does not call its `nn.Linear` children. That work
+  is a property of the math, not of its implementation, so the re-profile
+  (`worker analyze --out-dir … --kernel/--transform …`) first runs the model once
+  more with hooks and without timing, *before* it applies the round's items
+  (`profiler.work_reference`; about 13 s for eager VoxCPM2 at batch 16, 128k
+  module calls; `profile.json` → `work_reference`). A hidden call then takes the
+  work of the same call of the unmodified model, matched by qualname (or the
+  module's own identity, for a module a transform moved or wrapped, e.g. a
+  `torch.compile`d one), phase, entrypoint and input shape (`reference_calls`, ‡
+  in the table: the unmodified model's math and dtypes, approximate where a
+  transform merged or trimmed layers). A compiled or graph-replaying call without
+  such a match has unknown work (`unknown_calls`): its row shows `?` and the end
+  to end line keeps its time. A call that reads none of its module's weights
+  without a match (`F.linear` on a child's weight in the first analyze) is
+  estimated from its module's `nn.Linear` weights at its input's rows
+  (`estimated_calls`, †).
 * **Rows.** One per class × instance group × phase; sibling groups of a leaf
   class share one (`Linear` `model.base_lm.layers.*.self_attn.{k_proj,o_proj,q_proj,v_proj}`).
   Columns: calls, *M* = FLOPs / (2 × weight elements) (the rows per weight read;
   a bf16 GEMM turns compute bound near M = peak / bandwidth, ≈ 130 on the RTX
   5070 Ti), *now* (hooked time scaled to the unhooked run) and its share, TFLOP
   and weight GB per run, the bound, the floors and *saves* = now − exact floor.
+  Rows rank by *saves*; a row already below its exact floor (an optimised model
+  that runs it at a lower precision) by its best saving at a lower precision,
+  shown in brackets (`0 (W4A4 541)`).
 * **Floors** (ms per run) = max(FLOPs / peak, (weight + I/O bytes) / DRAM
   bandwidth, calls × launch floor), per precision: *exact* (as profiled),
   *FP8 w* (one byte per weight, bf16 math), *W8A8* (FP8 tensor-core peak),
@@ -1072,6 +1090,20 @@ alone buy nothing there, W8A8 does), the batched LM decode streams 3.40 GB of
 bf16 weights per step (memory bound; its separate q/k/v/o GEMVs are launch
 bound), and the end-to-end floors are exact ≥ 1.73 s (3.4x), FP8 weights ≥ 1.61 s,
 W8A8 ≥ 0.98 s (5.9x), W4A4 ≥ 0.81 s.
+
+The same model in improve round 2, with its 17 accepted items (CUDA graphs of
+the CFM solver and the LocEnc, a compiled bf16 AudioVAE, FP8 LocDiT and LM
+projections; 1.18 s per batched run):
+
+| target | calls | M | now ms | TFLOP | bound | exact | W8A8 | W4A4 | saves ms |
+|---|---|---|---|---|---|---|---|---|---|
+| `UnifiedCFM` `model.feat_decoder` ‡ | 60 | 346 | 663 | 79.1 | compute | 792 | 240 | 122 | 0 (W4A4 541) |
+| `AudioVAE` `model.audio_vae` ‡ | 1 | 30212 | 133 | 2.76 | compute | 81 | 8.37 | 4.25 | 52.3 |
+
+Before the reference pass, the CFM row was estimated from its `nn.Linear`
+weights at its input's 16 rows (M = 16, 0.41 TFLOP, "memory bound", exact floor
+33 ms) and the compiled AudioVAE had 0 FLOP; the end to end line read exact ≥
+309 ms (3.8x). It now reads exact ≥ 1,023 ms (1.16x), W8A8 ≥ 500 ms (2.37x).
 
 ### Budgets
 

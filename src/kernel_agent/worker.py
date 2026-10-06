@@ -72,9 +72,12 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     workload = _workload(run)
     load_s = time.perf_counter() - t0
     out = run  # where baseline.json + profile/ go
+    work = None
     if ns.out_dir:  # improve rounds: profile the optimised model next to the run's baseline
         out = RunDir(ns.out_dir.resolve())
         out.root.mkdir(parents=True, exist_ok=True)
+        if (ns.kernel or ns.transform) and not ns.no_profile:
+            work = _work_reference(workload)  # before the items hide it from the hooks
         _apply_patches(run, workload, ns.kernel or [], ns.transform or [])
     inputs = workload.make_inputs()
     timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
@@ -128,7 +131,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     if not ns.no_profile:
         window_ms, what, per = objective.profile_window(baseline)  # metric=throughput: a run
         with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
-            profile = profile_workload(workload, inputs, reference_ms=window_ms)
+            profile = profile_workload(workload, inputs, reference_ms=window_ms, work=work)
         write_json(out.profile_dir / "profile.json", profile)
         # Floors per class at bf16 / FP8 / FP4 (profile/ceilings.json + .md; issue #90).
         table = ceilings.write(out.profile_dir, profile, current_peaks(), window_ms, per=per)
@@ -156,6 +159,32 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             )
         baseline["profile"] = str(out.profile_dir / "summary.md")
     return baseline
+
+
+def _work_reference(workload: Any) -> Any:
+    """The work of the unmodified model's calls in the profiled window
+    (``profiler.work_reference``): the ceilings of the optimised model take it for the
+    calls whose insides the hooks do not see (#106). None when the pass fails."""
+    import gc
+
+    import torch
+
+    from kernel_agent.profiling.profiler import work_reference
+
+    try:
+        inputs = workload.make_inputs()
+        with workload.metric_window():
+            work = work_reference(workload, inputs)
+        print(f"analyze: work of the unmodified model: {work.info()}", file=sys.stderr)
+        return work
+    except Exception:
+        print(f"analyze: no work of the unmodified model:\n{_tb()}", file=sys.stderr)
+        return None
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()  # peak_mem_gb is the optimised model's
 
 
 def _kernel_patches(run: RunDir, kernels: list[str]) -> list[Any]:

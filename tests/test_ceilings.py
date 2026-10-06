@@ -1,19 +1,27 @@
-"""Ceilings table (#90): the profiler's per-call work and the floors per precision."""
+"""Ceilings table (#90): the profiler's per-call work and the floors per precision; on an
+optimised model (#106), the work of the calls the hooks cannot see into."""
 
 from __future__ import annotations
 
+import functools
 import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from kernel_agent import toolchain
+from kernel_agent import toolchain, worker
 from kernel_agent.agent import prompts
+from kernel_agent.hub import Modality
 from kernel_agent.kernels import roofline
-from kernel_agent.profiling import ceilings
+from kernel_agent.profiling import ceilings, profiler
 from kernel_agent.profiling.profiler import ModuleTimer
+from kernel_agent.workloads.base import Comparison, Workload, WorkloadSpec
+from kernel_agent.workspace import read_json, write_json
 
 # The RTX 5070 Ti's peaks (measured 2026-10-06; FP8 / NVFP4 via torch scaled_mm).
 PEAKS = {
@@ -202,6 +210,21 @@ def test_ceilings_reproduce_the_hand_numbers():
     assert first.startswith("| `UnifiedCFM`")  # ranked by what reaching the floor saves
 
 
+def test_a_row_below_its_exact_floor_ranks_by_its_best_lower_precision_saving():
+    profile = _profile()
+    for c in profile["classes"][:2]:  # the CFM and its LocDiT, already at W8A8: 600 ms now
+        c["work"][0]["inclusive_ms"] = 1200.0
+    table = ceilings.build(profile, PEAKS, 5000.0)
+    first = table["rows"][0]
+    assert first["target"] == "UnifiedCFM@model.feat_decoder" and first["now_ms"] == 600
+    assert first["floors"]["exact"] > 600 and first["saves_ms"]["exact"] == 0
+    w8a8 = 600 - 80.6e12 / 332.6e12 * 1e3
+    assert first["saves_best"] == {"precision": "w8a8", "ms": pytest.approx(w8a8, rel=1e-3)}
+    mlp = next(r for r in table["rows"] if r["cls"] == "MiniCPMMLP")
+    assert 0 < mlp["saves_ms"]["exact"] < w8a8 and "saves_best" not in mlp
+    assert "| 0 (W8A8 358) |" in ceilings.markdown(table)
+
+
 def test_ceilings_without_peaks_or_work(tmp_path):
     table = ceilings.build(_profile(), None, 5000.0)
     assert all(v is None for r in table["rows"] for v in r["floors"].values())
@@ -264,3 +287,304 @@ def test_peaks_cache_upgrade_and_low_precision_peaks(tmp_path, monkeypatch):
         }
     )
     assert line == "copy DRAM 767 GB/s, matmul bf16/fp8/nvfp4 99 / 333 / 641 TFLOP/s, no x matmul"
+
+
+# ------------------------------------------------------------------ optimised models (#106)
+
+D, STEPS, TOKENS = 64, 3, 22
+ROWS = 2 * 4 * TOKENS  # the DiT's rows: CFG x 4 input rows x patch tokens = 176
+# Peaks small enough that the toy's FLOPs and bytes, not launches, decide the bound.
+TOY_PEAKS = {"dram_gbps": 1.0, "launch_floor_us": 0.0, "tflops": {"float32": 0.01}}
+
+
+class Dit(nn.Module):
+    """A LocDiT-like stack of Linears."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(D, D, bias=False) for _ in range(2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return x
+
+
+def dit_math(dit: Dit, x: torch.Tensor) -> torch.Tensor:
+    """The DiT without module calls, as a captured CUDA graph or a fused kernel runs it."""
+    for layer in dit.layers:
+        x = torch.relu(F.linear(x, layer.weight))
+    return x
+
+
+class Solver(nn.Module):
+    """A CFM-like solver: its input has 4 rows, its DiT runs STEPS times at ROWS rows.
+    ``hide``: what an optimisation runs instead of the DiT's module calls."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dit = Dit()
+        self.hide: Any = None
+
+    def forward(self, mu: torch.Tensor) -> torch.Tensor:
+        x = mu[:, None].expand(-1, TOKENS, -1).repeat(2, 1, 1)
+        for _ in range(STEPS):
+            x = self.dit(x) if self.hide is None else self.hide(x)
+        return x[: mu.shape[0], 0]
+
+
+class Vae(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(4, 8, 3)
+        self.deconv = nn.ConvTranspose1d(8, 4, 3)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.deconv(self.conv(z))
+
+
+class Scope(nn.Module):
+    """A transform's wrapper (VoxCPM's ``_TF32Scope``): the module moves to ``.inner``."""
+
+    def __init__(self, inner: nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.inner(z)
+
+
+class Tts(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.solver = Solver()
+        self.vae = Vae()
+
+    def forward(self, mu: torch.Tensor, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.solver(mu), self.vae(z)
+
+
+def _run(model: Tts, reference: Any = None, *, replay: bool = False) -> ModuleTimer:
+    """One hooked run; ``replay``: the solver replays its DiT as a captured CUDA graph."""
+    mu, z = torch.ones(4, D), torch.ones(2, 4, 9)
+    with (
+        torch.inference_mode(),
+        ModuleTimer({"m": model}, {}, cuda=False, reference=reference) as timer,
+    ):
+        if replay:  # what torch's replay hook reports, then the graph's kernels
+
+            def graph(x: torch.Tensor) -> torch.Tensor:
+                timer._replay(None)
+                return dit_math(model.solver.dit, x)
+
+            model.solver.hide = graph
+        model(mu, z)
+    return timer
+
+
+def _table(timer: ModuleTimer) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    profile = {"hooked_wall_ms": 1.0, "classes": [asdict(s) for s in timer.class_stats()]}
+    table = ceilings.build(profile, TOY_PEAKS, 1.0)
+    return {r["target"]: r for r in table["rows"]}, table
+
+
+def test_a_graph_replayed_solver_takes_the_work_of_the_unmodified_model():
+    torch.manual_seed(0)
+    model = Tts()
+    eager = _run(model)
+    reference = eager.work_reference()  # before an optimisation hides the DiT
+    rows, _ = _table(eager)
+    flops = {"float32": 2 * ROWS * 2 * D * D * STEPS}
+    solver = rows["Solver@m.solver"]
+    assert solver["flops"] == flops and solver["m"] == ROWS and solver["bound"] == "compute"
+
+    # The DiT is a CUDA graph replayed in the solver's call: the hooks see no DiT call. The
+    # old estimate took the solver's Linear weights at its input's 4 rows: M = 4, memory.
+    graphed = _run(model, reference, replay=True)
+    assert "Dit" not in {c.cls for c in graphed.calls}
+    rows, table = _table(graphed)
+    row = rows["Solver@m.solver"]
+    assert row["reference_calls"] == 1 and row["flops"] == flops
+    assert row["weight_elems"] == solver["weight_elems"]
+    assert row["m"] == ROWS and row["bound"] == "compute"
+    assert rows["Tts@m"]["reference_calls"] == 1 and rows["Tts@m"]["work_known"]
+    text = ceilings.markdown(table, min_share=0)
+    assert "| `Solver` `m.solver` ‡ |" in text and "‡: the hooks did not see inside" in text
+
+    # Without the unmodified model's work: unknown, never "M = 4, memory bound".
+    rows, table = _table(_run(model, None, replay=True))
+    row = rows["Solver@m.solver"]
+    assert row["unknown_calls"] == 1 and not row["work_known"]
+    assert row["flops_total"] is None and row["m"] is None and "bound" not in row
+    assert all(v is None for v in [*row["floors"].values(), *row["saves_ms"].values()])
+    assert sorted(table["unknown_work"]) == ["Solver@m.solver", "Tts@m"]  # the root holds it
+    assert table["e2e"]["exact"]["counted"] == ["Vae@m.vae"]  # the solver keeps its time
+    text = ceilings.markdown(table, min_share=0)
+    cells = next(x for x in text.splitlines() if x.startswith("| `Solver`")).split(" | ")
+    assert cells[4] == "?" and cells[7:10] == ["?", "?", "?"] and cells[10:15] == ["?"] * 5
+    assert "the 2 rows with unknown work (`?`) at their time" in text
+    assert "?: work unknown" in text
+
+
+def test_a_replaced_kernel_takes_the_reference_or_is_estimated():
+    torch.manual_seed(0)
+    model = Tts()
+    reference = _run(model).work_reference()
+    model.solver.hide = functools.partial(dit_math, model.solver.dit)  # reads no weights
+    rows, _ = _table(_run(model, reference))
+    row = rows["Solver@m.solver"]
+    assert row["reference_calls"] == 1 and row["m"] == ROWS and row["bound"] == "compute"
+    # no reference (the first analyze): the module's Linear weights at its input's rows (†)
+    rows, table = _table(_run(model))
+    row = rows["Solver@m.solver"]
+    assert row["estimated_calls"] == 1 and row["m"] == 4 and row["work_known"]
+    assert "| `Solver` `m.solver` † |" in ceilings.markdown(table, min_share=0)
+
+
+def test_a_compiled_module_moved_by_a_transform_keeps_its_conv_work():
+    torch.manual_seed(0)
+    model = Tts()
+    eager = _run(model)
+    reference = eager.work_reference()
+    vae = _table(eager)[0]["Vae@m.vae"]
+    assert vae["flops"] == {"float32": 2 * 2 * (2 * 8 * 7) * (4 * 3)}  # conv + transposed
+    model.vae = Scope(torch.compile(model.vae, backend="eager"))
+    with torch.inference_mode():
+        model.vae(torch.ones(2, 4, 9))  # compiled before the profile
+
+    timer = _run(model, reference)
+    assert timer.compiled == ["m.vae.inner"]
+    rows, table = _table(timer)
+    # the wrapper at the old qualname, the compiled module by the identity of `_orig_mod`
+    for target in ("Scope@m.vae", "OptimizedModule@m.vae.inner"):
+        assert rows[target]["flops"] == vae["flops"] and rows[target]["reference_calls"] == 1
+        assert rows[target]["floors"] == vae["floors"] and rows[target]["bound"] == vae["bound"]
+    assert not table["unknown_work"]
+
+    rows, table = _table(_run(model))  # without a reference: unknown, not "0 FLOP"
+    assert not rows["OptimizedModule@m.vae.inner"]["work_known"]
+    assert sorted(table["unknown_work"]) == ["OptimizedModule@m.vae.inner", "Scope@m.vae", "Tts@m"]
+
+
+TRANSFORM = """import torch
+from torch import nn
+
+
+class Scope(nn.Module):
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x):
+        return self.inner(x)
+
+
+def apply(workload):
+    for layer in workload.model.layers:
+        layer.mlp = Scope(torch.compile(layer.mlp, backend="eager"))
+"""
+
+
+def test_reprofile_takes_the_work_of_the_unmodified_model(tmp_path, monkeypatch, capsys):
+    """``worker analyze --out-dir --transform``: one hooked pass on the model before the
+    transform is applied gives the MLPs that the transform compiles their work."""
+    tests = Path(__file__).parent
+    monkeypatch.syspath_prepend(str(tests))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(toolchain, "setup", lambda *a, **k: None)
+    monkeypatch.setattr(roofline, "current_peaks", lambda: PEAKS)
+    kernel_view = {"gpu_busy_ms": 1.0, "kernel_launches": 1, "kernels": [], "aten_ops": []}
+    monkeypatch.setattr(profiler, "guarded_kernel_profile", lambda *a, **k: kernel_view)
+    monkeypatch.setattr(profiler, "summarize", lambda p, ms, **kw: "# Profile summary\n")
+    spec = WorkloadSpec(
+        repo_id="toy/decoder",
+        modality="llm",
+        device="cpu",
+        dtype="float32",
+        harness=str(tests / "toy_decoder.py"),
+    )
+    root, out = tmp_path / "run", tmp_path / "round"
+    write_json(root / "run.json", {"workload": spec.to_dict()})
+    transform = tmp_path / "compile_mlp.py"
+    transform.write_text(TRANSFORM)
+
+    argv = ["analyze", "--run-dir", root, "--iters", 1, "--out-dir", out, "--transform", transform]
+    assert worker.main([str(a) for a in argv]) == 0, capsys.readouterr()
+    profile = read_json(out / "profile" / "profile.json")
+    assert profile["work_reference"]["calls"] > 0 and profile["work_reference"]["seconds"] >= 0
+    assert profile["module_gaps"]["compiled"] == [f"model.layers.{i}.mlp.inner" for i in (0, 1)]
+    work = {(c["cls"], w["group"]): w for c in profile["classes"] for w in c["work"]}
+    # 3 greedy steps over 8, 9 and 10 positions: 27 rows through gate_up (32 -> 128) and
+    # down (64 -> 32) of each of the 2 layers
+    flops = {"float32": 2 * 2 * 27 * (32 * 128 + 64 * 32)}
+    for key in (("OptimizedModule", "model.layers.*.mlp.inner"), ("Scope", "model.layers.*.mlp")):
+        assert work[key]["flops"] == flops and work[key]["reference_calls"] == 6
+    table = read_json(out / "profile" / "ceilings.json")
+    assert table["rows"] and not table["unknown_work"]
+    assert "‡" in (out / "profile" / "ceilings.md").read_text()
+
+
+class GraphedDit:
+    """Captures the DiT in a CUDA graph on its first call, then replays it (as VoxCPM's
+    ``graph_inductor_cfm_solver`` transform does with the LocDiT)."""
+
+    def __init__(self, dit: Dit) -> None:
+        self.dit = dit
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.graph is None:
+            self.static = x.clone()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                self.dit(self.static)  # warm-up outside the capture
+            torch.cuda.current_stream().wait_stream(side)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.out = self.dit(self.static)
+        self.static.copy_(x)
+        self.graph.replay()
+        return self.out.clone()
+
+
+class TtsWorkload(Workload):
+    modality = Modality.TTS
+
+    def load(self) -> None:
+        torch.manual_seed(0)
+        self.model = Tts().cuda().eval()
+
+    def roots(self) -> dict[str, nn.Module]:
+        return {"m": self.model}
+
+    def make_inputs(self) -> Any:
+        return torch.ones(4, D, device="cuda"), torch.ones(2, 4, 9, device="cuda")
+
+    def run(self, inputs: Any) -> Any:
+        return [t.cpu() for t in self.model(*inputs)]
+
+    def compare(self, reference: Any, candidate: Any) -> Comparison:
+        return Comparison(
+            all(torch.allclose(a, b) for a, b in zip(reference, candidate, strict=True))
+        )
+
+
+@pytest.mark.gpu
+def test_reprofile_of_a_solver_that_replays_a_cuda_graph():
+    w = TtsWorkload(WorkloadSpec(repo_id="toy/tts", modality="tts"))
+    w.load()
+    inputs = w.make_inputs()
+    work = profiler.work_reference(w, inputs)  # the unmodified model, untimed
+    assert work.info()["calls"] == 1 + 1 + 3 * (1 + 2) + 1 + 2  # Tts, solver, DiT, vae
+    w.model.solver.hide = GraphedDit(w.model.solver.dit)  # the optimisation
+    with torch.inference_mode():
+        w.run(inputs)  # captured before the profile
+    profile = profiler.profile_workload(w, inputs, work=work)
+    assert profile["module_gaps"]["graph_replays"] == {"m.solver": STEPS}
+    assert profile["work_reference"]["calls"] == work.info()["calls"]
+    rows = {r["target"]: r for r in ceilings.build(profile, TOY_PEAKS, 1.0)["rows"]}
+    solver = rows["Solver@m.solver"]
+    assert solver["reference_calls"] == 1 and solver["calls"] == 1
+    assert solver["flops"] == {"float32": 2 * ROWS * 2 * D * D * STEPS}
+    assert solver["m"] == ROWS and solver["bound"] == "compute"
