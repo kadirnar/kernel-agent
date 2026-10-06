@@ -58,7 +58,14 @@ GLOBAL_TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
 #: without signal keep the exact checks. Calibrated on FP8 (e4m3, per output channel)
 #: weight-only nn.Linear GEMVs / GEMMs, MLPs and the LocDiT estimator of VoxCPM2 on real
 #: inputs: cosine >= 0.9985, relative L2 error <= 0.055, norm within 0.7 %, every element
-#: within 0.47 of its bound below (README, "Quality modes").
+#: within 0.47 of its bound below (README, "Quality modes"). FP8 W8A8 (``fp8_w8a8``: e4m3
+#: weights per output channel x e4m3 activations per token, fp32 accumulation) fits the
+#: same bounds on real inputs of the compute-bound GEMMs it is for: the VoxCPM2 LocDiT
+#: layer at M = 352 and its MLP / q_proj alone reach cosine >= 0.9997, relative L2 error
+#: <= 0.021, norm within 0.35 %, every element within 0.23 of its bound (fake quant, and on
+#: the GPU with torch._scaled_mm); an LM decode layer and its MLP <= 0.015. Only the LM's
+#: q_proj alone at M = 1 (activation crest ~30) fails, on the norm (2.4 %): memory bound,
+#: fp8_weights' job (README, "FP8 W8A8").
 EXACT_TIER = "exact"
 NEAR_LOSSLESS_TIER = "near-lossless"
 #: ``near-lossless-fp4``: the near-lossless checks with the wider bounds of block-scaled FP4
@@ -67,11 +74,12 @@ NEAR_LOSSLESS_FP4_TIER = "near-lossless-fp4"
 TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER, NEAR_LOSSLESS_FP4_TIER)
 #: ``"precision"`` of a target spec that ``--quality near-lossless`` captures in the
 #: near-lossless tier: ``fp8_weights`` (FP8 weight-only storage, per-channel scales, bf16
-#: activations; agent/knowledge/low_precision.md) or ``reduced`` (another numerics-changing
-#: kernel); ``fp4_weights`` (block-scaled FP4 weights, bf16 activations) in the
-#: near-lossless-fp4 tier (:data:`PRECISION_TIERS`). Anything else (``exact``, none) is the
-#: exact tier.
-REDUCED_PRECISIONS = ("fp8_weights", "reduced", "fp4_weights")
+#: activations; agent/knowledge/low_precision.md), ``fp8_w8a8`` (FP8 tensor-core math:
+#: e4m3 weights per output channel and activations per token, fp32 accumulation; for
+#: compute-bound GEMMs) or ``reduced`` (another numerics-changing kernel); ``fp4_weights``
+#: (block-scaled FP4 weights, bf16 activations) in the near-lossless-fp4 tier
+#: (:data:`PRECISION_TIERS`). Anything else (``exact``, none) is the exact tier.
+REDUCED_PRECISIONS = ("fp8_weights", "reduced", "fp4_weights", "fp8_w8a8")
 #: The tier of a reduced precision other than the near-lossless tier.
 PRECISION_TIERS = {"fp4_weights": NEAR_LOSSLESS_FP4_TIER}
 PRECISIONS = (EXACT_TIER, *REDUCED_PRECISIONS)

@@ -2,15 +2,17 @@
 
 Verified examples: `examples/cuda_fp8_gemv.py` (decode GEMV, M <= 4) and
 `examples/cuda_fp8_skinny_gemm.py` (bf16 tensor cores, M <= 32; groups of 32
-tokens beyond, slower than cuBLAS bf16 from M ~ 64); FP4:
-`examples/cuda_fp4_gemv.py` (NVFP4 decode GEMV, M <= 4; "FP4 weights" below).
-Helpers:
-`kernel_agent.kernels.quant` (`quantize_fp8`, `dequantize_fp8`, `fp8_error`;
-`quantize_fp4`, `dequantize_fp4`, `fp4_error`).
+tokens beyond, slower than cuBLAS bf16 from M ~ 64) for `fp8_weights`; FP4:
+`examples/cuda_fp4_gemv.py` (NVFP4 decode GEMV, M <= 4; "FP4 weights" below);
+W8A8: `examples/triton_fp8_w8a8_gemm.py` (e4m3 tensor cores, compute-bound
+GEMMs; "FP8 W8A8" below). Helpers: `kernel_agent.kernels.quant` (`quantize_fp8`,
+`dequantize_fp8`, `fp8_error`; `quantize_fp4`, `dequantize_fp4`, `fp4_error`;
+`quantize_fp8_activations`, `fp8_w8a8_linear`, `fp8_w8a8_error`).
 
 ## When it is allowed
 
-Only for a target whose spec says `"precision": "fp8_weights"`, which the planner
+Only for a target whose spec says `"precision": "fp8_weights"` (or `"fp8_w8a8"`,
+below), which the planner
 may set in a `--quality near-lossless` run (an exact run refuses such targets).
 The target is then captured in the **near-lossless tolerance tier**
 (`kernels/compare.py`): instead of per-element (atol, rtol), every output tensor
@@ -32,8 +34,8 @@ RMS + 0.25 x |reference| ("FP4 weights" below); FP4 fails the FP8 tier.
   symmetric, `scale = amax(|row|) / 448`, codes `round(w / scale)` in e4m3
   (round to nearest even, clamped to ±448). The scale is constant along k, so it
   is applied once per output: `y[m, n] = scale[n] * sum_k x[m, k] q[n, k] + bias[n]`.
-* **Activations stay bf16.** Never quantise activations (that is W8A8, a
-  different precision class that `fp8_weights` does not allow).
+* **Activations stay bf16.** Never quantise activations in an `fp8_weights`
+  target (that is W8A8, the `fp8_w8a8` class below, for compute-bound GEMMs).
 * **Accumulate in fp32**; apply scale and bias in fp32 and round to bf16 once.
 * **Report the numerical error** in `NOTES.md`: the weight report of
   `fp8_error(weight, q, scale)` (`rel_l2`, `worst_channel_rel_l2`, `underflow`,
@@ -100,14 +102,14 @@ a power-of-two (e8m0) scale per 32.
 
 * `mma.sync` bf16/f16 (weight-only after upcast: the examples).
 * `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` runs on plain `sm_120`
-  (exact results), but both operands are FP8: W8A8, not weight-only.
+  (exact results), but both operands are FP8: W8A8 (`fp8_w8a8`), not weight-only.
 * Block-scaled MMA (`mma.sync ... .kind::mxf4 / mxf4nvf4 / mxf8f6f4 .block_scale`,
   FP4/FP6/FP8 with ue8m0 / ue4m3 scales) needs the arch-specific target:
   `extra_cuda_cflags=["-gencode=arch=compute_120a,code=sm_120a"]` (ptxas rejects
   it for `sm_120`). No WGMMA, no tcgen05 / TMEM on sm_120.
 * `torch._scaled_mm`: FP8 row-wise scales and NVFP4 (`float4_e2m1fn_x2` with
   e4m3 block scales, 128-row padded scale layout) both work, but they quantise
-  the activations too (W8A8 / W4A4).
+  the activations too (W8A8 / W4A4; usage and limits under "FP8 W8A8").
 
 ## Measured (RTX 5070 Ti, DRAM 767 GB/s copy peak, L2 48 MB)
 
@@ -131,8 +133,8 @@ L2, as in the model, where every layer's weights evict the others'.
 Batched decode (`-o batch_size=N`, `workloads/voxcpm_batch.py`): the LM GEMMs
 have M = N and stay weight-bandwidth bound, so FP8 weights pay as at M = 1;
 the LocDiT runs CFG at M = 2N x 11 (176 at N = 8), where cuBLAS bf16 already
-reaches ~74 TFLOP/s: compute bound, weight-only FP8 does not help (keep it bf16;
-faster FP8 math would need FP8 activations, which `fp8_weights` does not allow).
+reaches ~74 TFLOP/s: compute bound, weight-only FP8 does not help (faster FP8
+math needs FP8 activations: `fp8_w8a8`, below).
 
 Whole MLPs against the VoxCPM2 run's fused bf16 MLP kernel: base LM decode MLP
 92.1 -> 48.8 us (1.89x), LocDiT MLP 33.7 -> 22.8 us (1.48x), with an FP8 MLP
@@ -148,7 +150,134 @@ slower next to your FP8 weights than alone, and the reference-timing check then
 reports an `integrity_violation` (rare): evaluate again before you suspect the
 kernel. `pct_of_sol` of a `fp8_weights` target counts the weights at 1 byte (+
 4 bytes of scale per channel). Judge FP8 by achieved GB/s, by `pct_of_sol` and
-end to end.
+end to end. For a `fp8_w8a8` target the GEMMs on its weights also count at the
+measured FP8 tensor-core peak (`float8_e4m3fn` in the GPU peaks), so its
+`pct_of_sol` is against FP8 math, not bf16.
+
+## FP8 W8A8 (`precision: fp8_w8a8`): compute-bound GEMMs
+
+For a target whose spec says `"precision": "fp8_w8a8"`: GEMMs with hundreds of
+rows per call, where bf16 tensor cores are the limit and the weight bytes are
+not (e.g. the VoxCPM2 LocDiT at batch 16 under CFG: M = 2 x 16 x 11 = 352, 80
+TFLOP per run, cuBLAS bf16 at ~70 % of its 99 TFLOP/s). FP8 tensor cores run
+e4m3 x e4m3 at two to three times the bf16 rate, but both operands must be FP8
+(peaks below, "The FP8 peak on sm_120"). The
+recipe below is the one the systems agent of the VoxCPM2 throughput run found
+(`runs/openbmb--VoxCPM2/20261006-004718`, transforms `fp8_locdit_mlp`,
+`fp8_locdit_attn_proj`, `triton_fp8_locdit_gemm`; ledger exp 40-47), verified
+in `examples/triton_fp8_w8a8_gemm.py`.
+
+The contract:
+
+* **Weights** as for `fp8_weights`: quantised once in `build()` (`quantize_fp8`),
+  e4m3, one fp32 scale per output channel, no bf16 copy kept.
+* **Activations per token, every call**: `scale = amax(|row|) / 448` of each row
+  of `x.reshape(-1, K)`, codes `round(x / scale)` in e4m3 (round to nearest
+  even, clamp to ±448 first). `quantize_fp8_activations` is the reference math.
+  Never a static (offline-calibrated) or per-tensor scale: one outlier token
+  would set the scale of every token. Fuse the quantisation into the op that
+  produces `x` (RMSNorm, `silu(gate) * up`, the attention output's transpose)
+  or into the GEMM's prologue; a separate pass reads and writes `x` once more
+  (the run let Inductor fuse it into the producers).
+* **Math**: e4m3 x e4m3 products, fp32 accumulation, epilogue
+  `y[m, n] = sx[m] * sw[n] * acc[m, n] + bias[n]` in fp32, one rounding to bf16.
+  Norms, softmax / attention math, RoPE and residual adds stay as in eager.
+* **Report** `fp8_w8a8_error(weight, q, scale, x)` on captured activations
+  (weight error, `activation_rel_l2`, `activation_crest`, the output's relative
+  L2 / cosine / norm ratio) and the evaluator's per-case `min_cosine` /
+  `max_rel_l2` in `NOTES.md`.
+* **Fallback / reference**: `fp8_w8a8_linear(x, q, scale, bias)`
+  (`torch._scaled_mm` where it applies, else the same math in fp32).
+
+Accuracy against the bf16 module, every `nn.Linear` W8A8 (fake quant with the
+numerics above, on real VoxCPM2 capture inputs; on the GPU, `_scaled_mm` and the
+example give the same numbers for the LocDiT layer; the near-lossless tier allows
+cosine >= 0.996, relative L2 <= 0.08, norm ±2 %, element ratio <= 1):
+
+| module (rows per call) | rel L2 | min cosine | norm change | element ratio | tier |
+|---|---|---|---|---|---|
+| LocDiT decoder layer (352; outputs: hidden, k, v) | 0.020 | 0.99979 | 0.24 % | 0.19 | pass |
+| LocDiT MLP alone (352) | 0.009 | 0.99997 | 0.25 % | 0.15 | pass |
+| LocDiT q_proj alone (352) | 0.008 | 0.99994 | 0.15 % | 0.11 | pass |
+| LocDiT decoder layer (22, batch 1) | 0.021 | 0.99979 | 0.24 % | 0.16 | pass |
+| LM decoder layer, decode (1) | 0.006 | 0.99998 | 0.03 % | 0.04 | pass |
+| LM MLP alone, decode (1) | 0.014 | 0.99990 | 0.37 % | 0.11 | pass |
+| LM q_proj alone, decode (1; activation crest ~30) | 0.041 | 0.99917 | 2.4 % | 0.38 | **fail** (norm) |
+
+FP8 weight-only on the same modules: 0.015 (LocDiT layer), 0.007 (MLP), 0.006
+(q_proj). Broken scales fail every module: weight scales x 1.05 (norm +5 %), a
+neighbour channel's scale (relative L2 0.89), the first token's scale for every
+token (relative L2 0.96). Per-tensor activation scales happen to pass on these
+inputs (0.021) but break on an outlier token: use per-token scales.
+
+**Outliers.** A token's crest factor (amax / RMS) decides how many e4m3 steps
+the bulk of its row gets: 23-50 on the LocDiT GEMM inputs, ~30 on the LM's
+attention input; a per-token quantised activation has relative L2 0.015-0.03.
+Where an output fails the tier (the LM q_proj above: memory bound at decode
+anyway) keep that GEMM weight-only (`fp8_weights`) or bf16. If a compute-bound
+GEMM fails, move a per-input-channel factor from the activations into the
+weights (SmoothQuant) before quantising; not needed on VoxCPM2.
+
+**`torch._scaled_mm`** (cuBLASLt, sm_120, torch 2.14):
+`torch._scaled_mm(x_q, w_q.t(), scale_a=x_s[:, None], scale_b=w_s[None, :],
+out_dtype=torch.bfloat16)`: `x_q` [M, K] e4m3 row-major, the weight [N, K] as
+stored passed transposed (column-major [K, N], the layout cuBLASLt needs for
+the second FP8 operand; a row-major one is refused: `b.stride(0) == 1`), fp32
+scales [M, 1] and [1, N] (a [N] scale is refused). K and N multiples of 16
+(else a RuntimeError), any M (1, 11, 353 work). `bias=` (bf16) and
+`out_dtype=` bf16 / fp16 / fp32 work. Its result equals the fp32 math of
+`fp8_w8a8_linear`'s fallback up to the bf16 rounding of the output. At M = 352
+(graph-timed) it runs gate|up [1024 -> 8192] in 41 us vs 68 us bf16, down
+[4096 -> 1024] 27 vs 39, q|k|v [1024 -> 2560] 15.5 vs 25.5, o_proj
+[2048 -> 1024] 15.1 vs 22.5.
+
+**When a custom e4m3 GEMM beats cuBLASLt.** Its sm_120 FP8 kernels use large
+tiles, so at M = 352 an N = 1024 GEMM has 24 output tiles for 70 SMs. A plain
+Triton e4m3 GEMM (`tl.dot` on `tl.float8e4nv` operands from
+`torch.float8_e4m3fn` tensors, fp32 accumulator, both scales in the epilogue)
+with one tile config per weight shape, picked by timing 12 L2-cold weights in a
+CUDA graph, ran gate|up in 36.3 vs 41.2 us, q|k|v 14.4 vs 15.6, o_proj 14.0 vs
+15.1, down 26.5 vs 27.0 (the example's `CONFIGS`; end to end ~4 % of the run).
+Write one when the GEMM is a large share and the output tiles of the library
+kernel do not fill the SMs a few times over; otherwise `_scaled_mm` is the
+baseline to beat. `x.to(tl.float8e4nv)` rounds to nearest even; clamp to ±448
+before it. CUDA C++: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` on
+plain sm_120. The example's quantisation + GEMM in a CUDA graph (warm L2,
+M = 352): gate|up 36.1 us (cuBLAS bf16 68.2, `_scaled_mm` alone 41.3), q|k|v
+15.1 (25.5 / 15.5), o_proj 15.5 (22.5 / 15.1), down 28.0 (38.9 / 26.6); its
+output is bit-identical to `_scaled_mm`'s.
+
+**The FP8 peak on sm_120** (RTX 5070 Ti, dense, fp32 accumulation, 8192^3; each
+exact against the fp32 product of the same e4m3 values): cuBLASLt's FP8 GEMM
+with scalar (tensor-wise) scales, an `nvjet_sm120_qqtst_mma_*` TMA kernel,
+reaches 338 TFLOP/s, the `float8_e4m3fn` peak of the roofline; row-wise scales
+in torch 2.14 (a CUTLASS 3.x kernel) reach 195, Triton 3.8's `tl.dot` on e4m3
+(`mma.sync` m16n8k32) 183-195 over six tile configs; bf16 99. At M = 352 the
+tensor-wise kernel runs gate|up in 28.9 us, down 17.5, q|k|v 10.7, o_proj 13.2
+(204 / 169 / 172 / 112 TFLOP/s), well ahead of the example and of row-wise
+`_scaled_mm`. It computes the unscaled product: apply `sx[m] * sw[n]` where the
+output is read next (the `silu(gate) * up`, the residual add: Inductor fuses
+it under torch.compile, a fused custom kernel does it in registers). As separate
+torch ops on an fp32 output the scales cost more than they save (gate|up
+52.6 us); in bf16 the product of e4m3 codes is exact enough (one more bf16
+rounding, 2^-9, next to FP8's ~3 %). This is the next step past the example's
+Triton GEMM, which runs at ~55 % of the FP8 peak.
+
+**Eager timing.** The module evaluator times eager calls. The example's host
+time per call (two Triton launches and three allocations, ~47 us; ~89 us through
+the `torch.library.custom_op` dispatcher, which is why it calls the launcher
+directly when not compiling) is above its GPU time at M = 352, so it measures
+0.95x against cuBLAS bf16 there, 1.79x at M = 704. Under torch.compile / CUDA
+graphs, as in the model, host time does not count. For an eager-timed target,
+launch less per call: fuse the activation quantisation into its producer, or
+put several GEMMs (a whole MLP or layer) behind one C++ launcher (`load_inline`,
+~19 us per call).
+
+End to end in that run (batch 16, near-lossless, every step within the
+perceptual gate): W8A8 `_scaled_mm` on the LocDiT MLP took it from 11.36 to 9.74
+ms per audio second (3.32x -> 3.87x vs eager), on q|k|v and o_proj to 9.03
+(4.17x), the Triton GEMM to 8.73 (4.31x), while the exact-tier kernel arm on the
+same layer stayed at 3.01x module speedup.
 
 ## FP4 weights (`fp4_weights`)
 
