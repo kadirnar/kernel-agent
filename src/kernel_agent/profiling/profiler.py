@@ -27,7 +27,9 @@ round has them): a ``torch.compile``'d module is timed as one call (hooks inside
 it would make Dynamo recompile it and compile the bookkeeping), a module that
 replays a CUDA graph has no child calls, and calls made while a graph is being
 captured are not timed. :meth:`ModuleTimer.gaps` lists them; their kernels are
-in the kernel view.
+in the kernel view. Their work comes from the same calls of the unmodified model
+(:func:`work_reference`, a hooked pass before an improve round's items are applied),
+or is unknown.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import functools
 import inspect
 import sys
 import time
+import weakref
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -99,11 +102,14 @@ class _Call:
     phase: str = "prefill"
     # Work of this call alone (_input_work / _output_work; class_stats adds its children's):
     rows: int = 0  # of the first tensor argument: numel / last dim
+    shape: tuple[int, ...] = ()  # of the first tensor argument (the WorkReference key)
     io_bytes: int = 0  # the first tensor argument + the first tensor of the output
     flops: int = 0  # nn.Linear / convolution FLOPs, at ``dtype``
     dtype: str = ""
     weight_elems: int = 0  # weights (and bias) it reads
     weight_bytes: int = 0
+    #: The hooks did not see inside: a compiled module, or a CUDA graph replayed in the call.
+    opaque: bool = False
 
 
 @dataclass
@@ -183,6 +189,7 @@ def _input_work(call: _Call, module: nn.Module, x: torch.Tensor | None) -> None:
         return
     call.io_bytes = x.numel() * x.element_size()
     call.dtype = str(x.dtype).removeprefix("torch.")
+    call.shape = tuple(x.shape)
     floating = x.is_floating_point() and x.dim() > 0
     call.rows = x.numel() // x.shape[-1] if floating and x.shape[-1] else x.numel()
     weights = _weights(module) if isinstance(module, nn.Linear) else []
@@ -224,7 +231,10 @@ class ModuleTimer:
     or inside code Dynamo traces are skipped, a post-hook without its pre-hook and
     a call whose start/end cannot be paired are counted (:meth:`gaps`) and left
     untimed. While the hooks are installed Dynamo compiles nothing new: compiled
-    code whose guards they break runs eagerly (``eager_on_recompile``)."""
+    code whose guards they break runs eagerly (``eager_on_recompile``).
+
+    ``reference``: the work of the unmodified model's calls (:func:`work_reference`),
+    for the calls whose insides the hooks do not see (:meth:`_subtree_work`)."""
 
     def __init__(
         self,
@@ -232,10 +242,12 @@ class ModuleTimer:
         methods: dict[type, list[str]] | None = None,
         *,
         cuda: bool | None = None,
+        reference: WorkReference | None = None,
     ) -> None:
         self.roots = roots
         self.methods = discover_entrypoints(roots) if methods is None else methods
         self.cuda = torch.cuda.is_available() if cuda is None else cuda
+        self.reference = reference
         self.calls: list[_Call] = []
         #: Open calls: (index in ``calls``, id of the module, method).
         self._stack: list[tuple[int, int, str]] = []
@@ -243,6 +255,7 @@ class ModuleTimer:
         self._ctx: contextlib.ExitStack | None = None
         #: ``torch.compile``'d modules (qualnames): timed as one call, inside not hooked.
         self.compiled: list[str] = []
+        self._compiled_ids: set[int] = set()
         #: CUDA-graph replays per qualname of the module call that replayed them.
         self.replays: collections.Counter[str] = collections.Counter()
         #: ``capture``: calls during a CUDA-graph capture; ``unmatched_post``: post-hooks
@@ -271,13 +284,14 @@ class ModuleTimer:
                     continue
                 if _compiled(module) is not None:
                     self.compiled.append(full)
+                    self._compiled_ids.add(id(module))
                 self._names[id(module)] = (root_name, full)
                 modules.append(module)
         with contextlib.ExitStack() as stack:
             if "torch._dynamo" in sys.modules:  # something may be compiled
                 stack.enter_context(torch.compiler.set_stance("eager_on_recompile"))
             register = getattr(torch.cuda.graphs, "register_graph_replay_start_hook", None)
-            if self.cuda and register is not None:
+            if torch.cuda.is_available() and register is not None:  # untimed passes too
                 stack.callback(register(self._replay).remove)
             stack.enter_context(instrument(modules, self.methods, self._pre, self._post))
             self._ctx = stack.pop_all()
@@ -311,7 +325,9 @@ class ModuleTimer:
 
     def _replay(self, graph: Any) -> None:
         if self._stack:
-            self.replays[self.calls[self._stack[-1][0]].qualname] += 1
+            call = self.calls[self._stack[-1][0]]
+            call.opaque = True  # the graph's work ran without module calls
+            self.replays[call.qualname] += 1
 
     def _pre(
         self, module: nn.Module, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -332,6 +348,7 @@ class ModuleTimer:
             start,
             method=method,
             phase=call_phase(method, args, kwargs),
+            opaque=id(module) in self._compiled_ids,  # its insides are not hooked
         )
         with contextlib.suppress(Exception):  # the work estimate never breaks a profile
             _input_work(call, module, _first_tensor((*args, *kwargs.values())))
@@ -372,11 +389,7 @@ class ModuleTimer:
         self.untimed = sum(t is None for t in times)
         inclusive = [t or 0.0 for t in times]
 
-        modules: dict[str, nn.Module] = {}
-        for root_name, root_module in self.roots.items():
-            for qualname, module in root_module.named_modules():
-                full = f"{root_name}.{qualname}" if qualname else root_name
-                modules.setdefault(full, module)
+        modules = self._modules()
         work = self._subtree_work(modules)
 
         groups: dict[tuple[str, str], dict[str, Any]] = {}
@@ -485,13 +498,29 @@ class ModuleTimer:
         stats.sort(key=lambda s: -s.inclusive_ms)
         return stats
 
+    def _modules(self) -> dict[str, nn.Module]:
+        """Every module of the roots by qualname (the first one of a shared module)."""
+        modules: dict[str, nn.Module] = {}
+        for root_name, root_module in self.roots.items():
+            for qualname, module in root_module.named_modules():
+                full = f"{root_name}.{qualname}" if qualname else root_name
+                modules.setdefault(full, module)
+        return modules
+
     def _subtree_work(self, modules: dict[str, nn.Module]) -> list[_Work]:
         """Per call: its own work (``nn.Linear`` / convolution) plus that of every call inside
-        it. A call that saw no weights at all gets an estimate from its module's
-        ``nn.Linear`` weights at its input's rows (``estimated``): a compiled module or a
-        CUDA-graph replay hides its insides from the hooks, and a replaced kernel may not
-        call its Linear children."""
-        static: dict[str, tuple[int, int, int, str]] = {}
+        it.
+
+        Some calls hide their insides from the hooks: a compiled module or a call that
+        replays a CUDA graph (``opaque``), and a call that reads no weights although its
+        module holds ``nn.Linear`` / convolution layers (a replaced kernel, ``F.linear`` on a
+        child's weight). Such a call, and one with such a call inside, takes the work of the
+        same call in the unmodified model (``self.reference``, :class:`WorkReference`). Without
+        one, the work of an opaque call is ``unknown`` (a CUDA graph or compiled module may run
+        its layers at other row counts, or more often, than its input suggests: the LocDiT of
+        a CFM solver, #106), and that of the other kind is estimated from its module's
+        ``nn.Linear`` weights at its input's rows (``estimated``)."""
+        static: dict[str, tuple[int, int, int, str, bool]] = {}
         out: list[_Work] = [_Work()] * len(self.calls)
         for i in range(len(self.calls) - 1, -1, -1):  # a call's children come after it
             call = self.calls[i]
@@ -499,16 +528,43 @@ class ModuleTimer:
             w.weight_elems, w.weight_bytes = call.weight_elems, call.weight_bytes
             for c in call.children:
                 w.add(out[c])
-            if not w.weight_elems and call.rows and call.qualname in modules:
+            module = modules.get(call.qualname)
+            bypassed = False
+            if not w.weight_elems and not call.opaque and module is not None:
                 if call.qualname not in static:
-                    static[call.qualname] = _linear_weights(modules[call.qualname])
-                matmul, w.weight_elems, w.weight_bytes, dtype = static[call.qualname]
+                    static[call.qualname] = _layer_weights(module)
+                bypassed = static[call.qualname][1] > 0 or static[call.qualname][4]
+            if call.opaque or bypassed or w.unknown or w.estimated:
+                ref = self.reference.get(call, module) if self.reference else None
+                if ref is not None:
+                    out[i] = ref
+                    continue
+            if call.opaque:
+                w.unknown = True
+            elif bypassed and call.rows:
+                matmul, elems, nbytes, dtype, _ = static[call.qualname]
                 if matmul:
                     dtype = call.dtype if "float" in call.dtype else dtype  # ids: the weights'
                     w.flops = {dtype: 2 * call.rows * matmul}
-                    w.estimated = True
+                    w.weight_elems, w.weight_bytes, w.estimated = elems, nbytes, True
             out[i] = w
         return out
+
+    def work_reference(self) -> WorkReference:
+        """The work of the calls of this run (:meth:`_subtree_work`) per (qualname, phase,
+        method, input shape), and where each module was: the reference for a later profile
+        of the same workload whose optimisations hide their insides from the hooks."""
+        modules = self._modules()
+        calls: dict[tuple[str, str, str, tuple[int, ...]], tuple[int, _Work]] = {}
+        for call, w in zip(self.calls, self._subtree_work(modules), strict=True):
+            if w.unknown or w.estimated:  # only what the hooks saw
+                continue
+            key = (call.qualname, call.phase, call.method, call.shape)
+            n, total = calls.get(key) or (0, _Work())
+            total.add(w)
+            calls[key] = (n + 1, total)
+        names = {id(m): (weakref.ref(m), q) for q, m in reversed(list(modules.items()))}
+        return WorkReference(calls, names)
 
     def gaps(self) -> dict[str, Any]:
         """What the module view does not time (empty when it timed everything); after
@@ -533,7 +589,10 @@ class _Work:
     flops: dict[str, int] = field(default_factory=dict)  # per dtype
     weight_elems: int = 0
     weight_bytes: int = 0
-    estimated: bool = False  # some of it estimated from module weights (_subtree_work)
+    # Where some of it comes from (ModuleTimer._subtree_work):
+    estimated: bool = False  # module weights at the input's rows
+    reference: bool = False  # the same call of the unmodified model (WorkReference)
+    unknown: bool = False  # hidden from the hooks, no reference: the total is incomplete
 
     def add(self, other: _Work) -> None:
         for dtype, n in other.flops.items():
@@ -541,21 +600,84 @@ class _Work:
         self.weight_elems += other.weight_elems
         self.weight_bytes += other.weight_bytes
         self.estimated |= other.estimated
+        self.reference |= other.reference
+        self.unknown |= other.unknown
 
 
-def _linear_weights(module: nn.Module) -> tuple[int, int, int, str]:
+@dataclass
+class WorkReference:
+    """The work of an unmodified model's calls (:func:`work_reference`; issue #106).
+
+    An optimised model hides work from the hooks (a compiled module, a CUDA-graph replay, a
+    replaced kernel), but that work is a property of the math, not of its implementation:
+    the same call of the unmodified model did it. ``calls``: (qualname, phase, method, shape
+    of the first tensor argument) -> (calls, their summed work); ``names``: id of each
+    module -> (weak reference, its qualname then), which finds a module that a transform
+    moved or wrapped (``torch.compile`` keeps it as ``_orig_mod``)."""
+
+    calls: dict[tuple[str, str, str, tuple[int, ...]], tuple[int, _Work]]
+    names: dict[int, tuple[weakref.ref[nn.Module], str]] = field(default_factory=dict)
+    seconds: float = 0.0  # what the hooked pass took
+
+    def get(self, call: _Call, module: nn.Module | None) -> _Work | None:
+        """The work of ``call`` per call in the unmodified model (``reference`` set), at its
+        qualname then or now; None when the unmodified model made no such call."""
+        qualnames = []
+        for m in (_compiled(module), module) if module is not None else ():
+            entry = self.names.get(id(m)) if m is not None else None
+            if entry is not None and entry[0]() is m:  # not a new module at a reused id
+                qualnames.append(entry[1])
+        for qualname in [*qualnames, call.qualname]:
+            hit = self.calls.get((qualname, call.phase, call.method, call.shape))
+            if hit is not None:
+                n, total = hit
+                return _Work(
+                    {dtype: round(f / n) for dtype, f in total.flops.items()},
+                    round(total.weight_elems / n),
+                    round(total.weight_bytes / n),
+                    reference=True,
+                )
+        return None
+
+    def info(self) -> dict[str, Any]:
+        """``profile.json`` → ``work_reference``."""
+        return {
+            "source": "the unmodified model (one hooked pass before the round's items)",
+            "calls": sum(n for n, _ in self.calls.values()),
+            "keys": len(self.calls),
+            "seconds": self.seconds,
+        }
+
+
+def work_reference(workload: Workload, inputs: Any) -> WorkReference:
+    """The work of every module call of ``workload`` as loaded (the unmodified model,
+    before an improve round's items are applied): one hooked run, untimed (#106)."""
+    start = time.perf_counter()
+    roots = workload.roots()
+    methods = discover_entrypoints(roots, workload_entrypoints(workload))
+    with torch.inference_mode(), ModuleTimer(roots, methods, cuda=False) as timer:
+        workload.run(inputs)
+        synchronize()
+    reference = timer.work_reference()
+    reference.seconds = round(time.perf_counter() - start, 2)
+    return reference
+
+
+def _layer_weights(module: nn.Module) -> tuple[int, int, int, str, bool]:
     """(matmul weight elements, elements with bias, bytes, dtype) of the ``nn.Linear``
-    layers in ``module``."""
+    layers in ``module``, and whether it holds a convolution."""
     matmul = elems = nbytes = 0
     dtype = ""
+    conv = False
     for sub in module.modules():
+        conv |= isinstance(sub, _CONV)
         weights = _weights(sub) if isinstance(sub, nn.Linear) else []
         if weights and weights[0].dim() == 2:
             matmul += weights[0].numel()
             elems += sum(t.numel() for t in weights)
             nbytes += sum(t.numel() * t.element_size() for t in weights)
             dtype = dtype or str(weights[0].dtype).removeprefix("torch.")
-    return matmul, elems, nbytes, dtype
+    return matmul, elems, nbytes, dtype, conv
 
 
 def _new_work() -> dict[str, Any]:
@@ -568,6 +690,8 @@ def _new_work() -> dict[str, Any]:
         "weight_bytes": 0,
         "io_bytes": 0,
         "estimated": 0,
+        "reference": 0,
+        "unknown": 0,
         "sigs": collections.Counter(),
     }
 
@@ -581,6 +705,8 @@ def _add_work(acc: dict[str, Any], call: _Call, work: _Work, ms: float) -> None:
     acc["weight_bytes"] += work.weight_bytes
     acc["io_bytes"] += call.io_bytes
     acc["estimated"] += work.estimated
+    acc["reference"] += work.reference
+    acc["unknown"] += work.unknown
     acc["sigs"][call.signature] += ms
 
 
@@ -588,7 +714,10 @@ def _work_entry(group: str, phase: str, acc: dict[str, Any]) -> dict[str, Any]:
     """One ``ClassStat.work`` entry: the calls of one instance group in one phase, totals
     per run. ``flops`` per dtype and ``weight_*`` (read once per call) count the
     ``nn.Linear`` and convolution calls inside; ``io_bytes`` the first input and output of
-    each call; ``estimated_calls`` those estimated from module weights (_subtree_work)."""
+    each call. Calls whose insides the hooks did not see (ModuleTimer._subtree_work):
+    ``reference_calls`` took the work of the unmodified model's call, ``unknown_calls`` have
+    none (their totals are incomplete), ``estimated_calls`` are estimated from module
+    weights."""
     top = acc["sigs"].most_common(1)
     entry = {
         "group": group,
@@ -602,8 +731,9 @@ def _work_entry(group: str, phase: str, acc: dict[str, Any]) -> dict[str, Any]:
         "io_bytes": acc["io_bytes"],
         "signature": top[0][0] if top else "",
     }
-    if acc["estimated"]:
-        entry["estimated_calls"] = acc["estimated"]
+    for name in ("estimated", "reference", "unknown"):
+        if acc[name]:
+            entry[f"{name}_calls"] = acc[name]
     return entry
 
 
@@ -810,16 +940,21 @@ def kernel_profile(
 
 
 def profile_workload(
-    workload: Workload, inputs: Any, reference_ms: float | None = None
+    workload: Workload,
+    inputs: Any,
+    reference_ms: float | None = None,
+    *,
+    work: WorkReference | None = None,
 ) -> dict[str, Any]:
     """Module view + kernel view (:func:`guarded_kernel_profile`; ``reference_ms``: the
     end-to-end time of the profiled window, measured without the profiler). Assumes the
-    workload is warmed up."""
+    workload is warmed up. ``work``: the unmodified model's (:func:`work_reference`), for
+    the calls of an optimised model whose insides the hooks do not see."""
     roots = workload.roots()
     methods = discover_entrypoints(roots, workload_entrypoints(workload))
     synchronize()
     start = time.perf_counter()
-    with torch.inference_mode(), ModuleTimer(roots, methods) as timer:
+    with torch.inference_mode(), ModuleTimer(roots, methods, reference=work) as timer:
         workload.run(inputs)
         synchronize()
     hooked_ms = (time.perf_counter() - start) * 1000
@@ -830,6 +965,7 @@ def profile_workload(
         "module_calls": len(timer.calls),
         "entrypoints": describe(methods),
         "module_gaps": timer.gaps(),
+        **({"work_reference": work.info()} if work is not None else {}),
         "classes": [asdict(c) for c in classes],
         "kernel_view": kernel_view,
     }
