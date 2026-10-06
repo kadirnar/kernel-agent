@@ -89,6 +89,8 @@ def write_dashboard(run: RunDir) -> Path:
 
     comp = s["compiled_ms"]  # strong baseline (strong_baseline.py)
     proj = s["projection"]  # projection.py: nested targets counted once
+    # "from a + b; not counted (nested): c", or "not projected (why): d"
+    counted = proj.headline().removeprefix("projected ") if proj and proj.shown else ""
     compiled = f"torch.compile {_ms(comp)} ({base / comp:.2f}×)" if comp and base else ""
     vs_comp = f" · {comp / measured:.2f}× vs. compiled" if comp and measured else ""
     tiles = [
@@ -104,7 +106,7 @@ def write_dashboard(run: RunDir) -> Path:
             "projected from kernels",
             _ms(s["projected_ms"]),
             (f"{base / s['projected_ms']:.2f}×" if base and s["projected_ms"] else "")
-            + (f" · from {_e(proj.describe())}" if proj and proj.used else ""),
+            + (f" · {_e(counted)}" if counted else ""),
         ),
         (
             "evaluations",
@@ -139,7 +141,7 @@ def write_dashboard(run: RunDir) -> Path:
             str(t["keeps"]),
             str(t["failures"]),
             _x(t["best_speedup"]),
-            _ms(t["est_saved_ms"]),
+            _ms(t["saved_ms"]),  # in the metric's ms (per audio s for metric=throughput)
             _e(t["best_backend"] or ""),
             _e(t["last_hypothesis"]),
         ]
@@ -154,7 +156,7 @@ def write_dashboard(run: RunDir) -> Path:
             _status(r["status"]),
             _x(r["speedup"]),
             _ms(r["new_ms"], 3) if r["target"] != ledger.E2E else _ms(r["new_ms"]),
-            _ms(r["est_saved_ms"]),
+            _ms(s["units"].of_row(r)),  # a kernel's estimate in the metric's ms, as e2e rows
             _e(ledger.labelled(r)),
         ]
         for r in reversed(s["rows"][-30:])

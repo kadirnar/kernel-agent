@@ -9,7 +9,7 @@ from synthetic_run import BASELINE_MS, make_run
 
 from kernel_agent import charts, ledger, projection, watch
 from kernel_agent.status import render
-from kernel_agent.workspace import RunDir, write_json
+from kernel_agent.workspace import RunDir, read_json, write_json
 
 
 def cls(name, groups=None, *, instances=None, example=None, phases=None):
@@ -364,12 +364,13 @@ def _texts(run):
     from matplotlib.figure import Figure
 
     rows = ledger.rows(run)
+    baseline = read_json(run.baseline_json)
     with matplotlib.rc_context(charts._RC):
         fig = Figure(figsize=(10.0, 5.6), dpi=charts.DPI)
         FigureCanvasAgg(fig)
         ax = fig.add_subplot()
         start = ledger.start_time(run, rows)
-        charts._draw_run(ax, run, {"median_ms": 1000.0}, 1000.0, rows, start)
+        charts._draw_run(ax, run, baseline, baseline["median_ms"], rows, start)
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
         return {t.get_text(): t.get_window_extent(renderer) for t in ax.texts if t.get_visible()}
@@ -464,3 +465,136 @@ def test_amdahl_never_exceeds_the_baseline(tmp_path):
     assert [(s.target, s.part) for s in slices] == [("layer_decode", 1.0), ("layer_prefill", 1.0)]
     assert [s.ms for s in slices] == pytest.approx([500.0, 500.0])
     assert sum(s.after_ms for s in slices) == pytest.approx(750.0)
+
+
+# ------------------------------------------------------------------ units (#114)
+
+#: metric=throughput: 40 ms of wall time per second of audio, one batched run of 6 s
+#: makes 150 s of audio
+THROUGHPUT = {
+    "metric": "throughput",
+    "median_ms": 40.0,
+    "metric_detail": {"throughput": 25.0, "audio_s": 150.0, "run_ms": 6000.0, "requests": 16},
+}
+
+
+def _metric_run(tmp_path, baseline, saved, *, classes=None, specs=None):
+    """A run timed with ``baseline``'s metric whose targets each kept a kernel; ``saved``:
+    target → its est. saved ms per run of the workload."""
+    run = RunDir(tmp_path / "run")
+    run.root.mkdir(parents=True)
+    write_json(run.run_json, {"card": {"repo_id": "org/model"}, "created": "2026-10-05 09:00:00"})
+    write_json(run.baseline_json, baseline)
+    write_json(run.profile_dir / "profile.json", {"classes": classes or [LAYER, ATTN, MLP]})
+    for target, s in (specs or SPECS).items():
+        write_json(run.target(target) / "spec.json", s)
+    for minute, (target, ms) in enumerate(saved.items(), start=10):
+        row = {"time": f"2026-10-05 09:{minute:02d}:00", "target": target, "status": "keep"}
+        ledger.append(run, {**row, "correct": True, "speedup": 2.0, "est_saved_ms": ms})
+    return run
+
+
+def _capture(calls, instances=4):
+    """A spec's ``capture``: ``calls`` per run of the captured instance, ``instances``
+    instances calling ``forward`` (the estimate covers calls × instances)."""
+    cases = [{"method": "forward", "count": calls}, {"method": "forward", "count": 0}]
+    return {"cases": cases, "method_instances": {"forward": instances}}
+
+
+def test_throughput_projects_kernel_savings_per_second_of_audio(tmp_path):
+    """Issue #114: with metric=throughput the baseline is ms per second of generated audio,
+    a kernel's est. saved ms is per batched run: 300 + 150 ms per 6 s run that makes 150 s
+    of audio save 3 ms per audio s (40 → 37 ms), not 450 ms (40 → 0)."""
+    from kernel_agent.dashboard import write_dashboard
+
+    run = _metric_run(tmp_path, THROUGHPUT, {"attn": 300.0, "mlp": 150.0})
+    tree, rows, units = projection.tree(run), ledger.rows(run), projection.units_of(run)
+    assert units.factor("attn") == pytest.approx(1 / 150)
+    assert projection.series(tree, 40.0, rows)[-1][1].projected_ms == 0.0  # the units mixed
+    steps = projection.series(tree, 40.0, rows, units)
+    assert [p.projected_ms for _, p in steps] == pytest.approx([38.0, 37.0])
+
+    s = ledger.summary(run)
+    assert s["projected_ms"] == pytest.approx(37.0)
+    targets = {t["id"]: t for t in s["targets"]}
+    assert targets["attn"]["est_saved_ms"] == 300.0  # per run, as evaluated
+    assert targets["attn"]["saved_ms"] == pytest.approx(2.0)
+    assert targets["mlp"]["saved_ms"] == pytest.approx(1.0)
+    assert targets["layer"]["saved_ms"] is None
+    assert [s["units"].of_row(r) for r in rows] == pytest.approx([2.0, 1.0])
+    text = render(run, width=200)
+    assert "projected 37.0 ms (1.08x)" in text
+    assert "2.0 ms" in text and "300.0 ms" not in text
+
+    state = watch.state(run)["summary"]
+    assert state["projected_ms"] == pytest.approx(37.0)
+    assert state["saved_factors"]["attn"] == pytest.approx(1 / 150)
+    assert {t["id"]: t["saved_ms"] for t in state["targets"]}["mlp"] == pytest.approx(1.0)
+    assert state["projection"]["steps"] == {str(r["exp"]): p.projected_ms for r, p in steps}
+    html = write_dashboard(run).read_text()
+    assert "37.0 ms" in html and "300.0 ms" not in html
+    if charts.available():
+        assert "projected 37.0 ms" in _texts(run)
+
+
+def test_window_is_the_share_of_the_calls_inside_the_first_audio_window():
+    """metric=ttfa: the capture (and so the estimate) covers a full streamed run, the
+    profile only the window up to the first audio chunk."""
+    work = [
+        {"group": "model.enc.layers.*", "phase": "prefill", "calls": 12},
+        {"group": "model.dec.layers.*", "phase": "prefill", "calls": 30},
+        {"group": "model.dec.layers.*", "phase": "decode", "calls": 18},
+    ]
+    phases = {"prefill": {"calls": 42}, "decode": {"calls": 18}}
+    layer = {"cls": "Layer", "calls": 60, "phases": phases, "work": work}
+    profiles = [{"classes": [layer, {"cls": "Other", "calls": 1}]}]
+    whole = {"module_class": "Layer", "capture": _capture(100, 6)}  # 600 calls per run
+    assert projection.window(whole, profiles) == pytest.approx(60 / 600)
+    assert projection.window({**whole, "phase": "decode"}, profiles) == pytest.approx(18 / 600)
+    enc = {**whole, "qualname_regex": r"enc\.", "capture": _capture(50, 2)}  # 100 calls
+    assert projection.window(enc, profiles) == pytest.approx(12 / 100)
+    dec = {**whole, "qualname_regex": r"dec\.", "phase": "decode"}
+    assert projection.window(dec, profiles) == pytest.approx(18 / 600)
+    # a region: the calls of its parent class (at most all of the estimate)
+    region = {"kind": "region", "parent_class": "Layer", "capture": _capture(30, 1)}
+    assert projection.window(region, profiles) == 1.0
+    # no call before the first audio: a class the window's profile never saw
+    assert projection.window({"module_class": "Late", "capture": _capture(10)}, profiles) == 0.0
+    # unknown: no capture, no calls per instance group for a regex, no profile
+    assert projection.window({"module_class": "Layer"}, profiles) is None
+    no_work = [{"classes": [{**layer, "work": []}]}]
+    assert projection.window(enc, no_work) is None
+    assert projection.window(whole, no_work) == pytest.approx(60 / 600)
+    assert projection.window(whole, [{}]) is None
+
+
+def test_ttfa_projects_the_calls_inside_the_first_audio_window(tmp_path):
+    """Issue #114: with metric=ttfa only a kernel's calls before the first audio chunk count
+    (8 of the 160 calls of a streamed run here); a target whose share is unknown is not
+    projected, and the views say so."""
+    attn_work = [{"group": "model.layers.*.attn", "phase": "prefill", "calls": 8}]
+    classes = [{**LAYER, "calls": 8}, {**ATTN, "calls": 8, "work": attn_work}, {**MLP, "calls": 8}]
+    specs = {
+        "attn": spec("Attn", qualname_regex="layers", capture=_capture(40)),
+        "mlp": spec("MLP", qualname_regex="layers", capture=_capture(40)),  # no work entries
+    }
+    ttfa = {"metric": "ttfa", "median_ms": 100.0}
+    run = _metric_run(tmp_path, ttfa, {"attn": 400.0, "mlp": 200.0}, classes=classes, specs=specs)
+    assert projection.units_of(run).windows == pytest.approx({"attn": 0.05})
+    s = ledger.summary(run)
+    assert s["projected_ms"] == pytest.approx(80.0)  # 100 − 400 × 8 / 160
+    why = "its calls inside the first-audio window are unknown"
+    assert s["projection"].unknown == ("mlp",)
+    assert s["projection"].describe() == f"attn; not projected ({why}): mlp"
+    assert f"projected from attn; not projected ({why}): mlp" in render(run, width=200)
+    assert watch.state(run)["summary"]["saved_factors"] == {"attn": 0.05, "mlp": None}
+
+    # no share known: no projected value, only what is not projected
+    write_json(run.target("attn") / "spec.json", spec("Attn", qualname_regex="layers"))
+    s = ledger.summary(run)
+    assert s["projected_ms"] is None and s["projection"].unknown == ("attn", "mlp")
+    text = render(run, width=200)
+    assert f"\nnot projected ({why}): attn, mlp\n" in text and "projected from" not in text
+    state = watch.state(run)["summary"]
+    assert state["projected_ms"] is None
+    assert state["projection"]["label"] == f"not projected ({why}): attn, mlp"

@@ -578,11 +578,11 @@ def _draw_run(
     end = max(end, 1.0)
 
     # projected: baseline − Σ est. saved of each target's best kept candidate (or its
-    # re-evaluation), nested targets counted once (projection.py)
+    # re-evaluation) in the metric's ms, nested targets counted once (projection.py)
     tree = projection.tree(run)
     last = projection.project(tree, {}, base_ms)
     px, py = [0.0], [base_ms]
-    for r, last in projection.series(tree, base_ms, rows):
+    for r, last in projection.series(tree, base_ms, rows, projection.units_of(run)):
         px.append(minutes(ledger.epoch(r["time"])))
         py.append(last.projected_ms)
     e2e = [(t, r) for t, r in timed if r["target"] == E2E]
@@ -738,8 +738,8 @@ def _draw_run(
         f"{n_kernel} kernel evaluations, {len(e2e)} end-to-end runs  ·  "
         f"projected from the best kernels: {py[-1]:,.1f} ms ({base_ms / max(py[-1], 1e-9):.2f}×)"
     )
-    if last.used:  # which targets the projection counts
-        subtitle += "\n" + _short(f"projected from {last.describe()}", 120)
+    if last.shown:  # which targets the projection counts (and leaves out as unknown)
+        subtitle += "\n" + _short(last.headline(), 120)
     _header(ax, f"{repo}: {headline}", subtitle, raise_pt=14 if spans else 0)
     handles = [
         Line2D([], [], color=PROJECTED_COLOR, lw=2, label="projected (kernels)"),
@@ -840,7 +840,7 @@ def amdahl_slices(
     shares = target_shares(run)
     rows = ledger.rows(run) if rows is None else rows
     tree = projection.tree(run)
-    steps = projection.series(tree, base_ms, rows)
+    steps = projection.series(tree, base_ms, rows, projection.units_of(run))
     proj = steps[-1][1] if steps else projection.project(tree, {}, base_ms)
     holders = tree.holders()  # target → the targets that hold some of its instances
 

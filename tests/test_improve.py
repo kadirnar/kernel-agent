@@ -10,7 +10,7 @@ import struct
 
 import pytest
 
-from kernel_agent import charts, cli, dryrun, improve, ledger, orchestrator, scheduler
+from kernel_agent import charts, cli, dryrun, improve, ledger, orchestrator, scheduler, truth
 from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.config import OptimizeConfig
@@ -250,6 +250,13 @@ def test_open_ideas_and_digest_are_bounded(tmp_path):
     assert "idea 39" in digest and "idea 24" not in digest  # the last 15 rows only
     assert "- tile 64" in digest
     assert len(digest) < improve.NOTES_CHARS + 6000  # NOTES.md is cut to its tail
+    assert f"costs about {arm.remaining_ms:.1f} ms per model run now" in digest
+    # the scheduler's ms are the metric's (#114): per second of audio for metric=throughput
+    baseline = read_json(run.baseline_json)
+    truth.writable(run.baseline_json)
+    write_json(run.baseline_json, {**baseline, "metric": "throughput"})
+    digest = kernel_digest(run, arm, 7, 4, Policy())
+    assert f"{arm.remaining_ms:.1f} ms per second of generated audio now" in digest
 
 
 # ------------------------------------------------------------------ the loop (dry run)

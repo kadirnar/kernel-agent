@@ -435,6 +435,15 @@ def test_improve_estimates_a_region_from_its_parent_then_its_evaluations(tmp_pat
     append_jsonl(run.results_file(TID), {"cases": timed})
     assert scheduler._region_ref_ms(run, TID, spec, profiles) == pytest.approx(6.0)
     assert scheduler._region_ref_ms(run, "rms", {"module_class": "Layer"}, profiles) == 0.0
+    # issue #114: the timed cases are ms per run; with metric=throughput every other arm is
+    # in ms per second of audio (the profile share × the baseline), so the region is too
+    detail = {"audio_s": 150.0, "run_ms": 6000.0}
+    baseline = {"metric": "throughput", "median_ms": 40.0, "metric_detail": detail}
+    write_json(run.baseline_json, baseline)
+    assert scheduler._region_ref_ms(run, TID, spec, profiles) == pytest.approx(6.0 / 150.0)
+    # ttfa without its first-audio share (no capture cases): the parent's time, as before
+    write_json(run.baseline_json, {"metric": "ttfa", "median_ms": 100.0})
+    assert scheduler._region_ref_ms(run, TID, spec, profiles) == 50.0
 
 
 # ------------------------------------------------------------------ GPU: transformers' Llama layer

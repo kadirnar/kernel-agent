@@ -23,6 +23,10 @@ The value is ``median_ms`` everywhere (``baseline.json``, ``e2e`` results, A/B r
 the integration): the optimiser minimises it and every speedup divides it.
 ``baseline.json`` records the ``metric``; reports, charts, ``status`` and ``watch``
 name it. A workload lists the metrics it can time in ``Workload.metrics``.
+
+A module-level estimate is in ms per run of the workload (a kernel's ``est_saved_ms``:
+its gain per call × its calls per run): :func:`from_run` puts it in the metric's ms
+wherever it meets the metric (the projections, ``status``, the charts, the report).
 """
 
 from __future__ import annotations
@@ -139,6 +143,57 @@ def profile_window(timing: dict[str, Any]) -> tuple[float, str, str]:
     if metric.name == THROUGHPUT and isinstance(run_ms, int | float):
         return float(run_ms), "batched run (every request)", "per batched run"
     return float(timing.get("median_ms") or 0.0), metric.title.lower(), metric.per
+
+
+def run_factor(baseline: dict[str, Any] | None) -> float | None:
+    """The metric's ms per ms of one run of the workload, for :func:`from_run`.
+
+    ``latency``: 1. ``throughput``: a batched run makes ``audio_s`` seconds of audio
+    (``metric_detail``), so a run's ms is ``1 / audio_s`` ms per second of audio (else
+    ``median_ms / run_ms``). None for ``ttfa`` (only a module's calls inside the
+    first-audio window count: a share of its own, ``window``) and when ``baseline.json``
+    lacks the details."""
+    metric = of(baseline)
+    if metric.name == LATENCY:
+        return 1.0
+    if metric.name != THROUGHPUT:
+        return None
+    detail = (baseline or {}).get("metric_detail") or {}
+    audio_s, run_ms = detail.get("audio_s"), detail.get("run_ms")
+    if isinstance(audio_s, int | float) and audio_s > 0:
+        return 1.0 / float(audio_s)
+    value = (baseline or {}).get("median_ms")
+    if isinstance(run_ms, int | float) and run_ms > 0 and isinstance(value, int | float):
+        return float(value) / float(run_ms)
+    return None
+
+
+def from_run(
+    ms: float | None, baseline: dict[str, Any] | None, window: float | None = None
+) -> float | None:
+    """A module-level estimate, ``ms`` per run of the workload (a kernel's ``est_saved_ms``:
+    its gain per call × its calls per run), in the metric's ms: × :func:`run_factor`
+    (``throughput``: per second of generated audio). ``ttfa``: the estimate covers the
+    calls of a full streamed run, of which only those inside the first-audio window
+    count; ``window`` is the estimate's share for them (the gain per call × the calls in
+    the window, :func:`kernel_agent.projection.units`). None when unknown (no ``window``,
+    no ``audio_s``): such an estimate is not projected."""
+    if ms is None:
+        return None
+    if of(baseline).name == TTFA:
+        return None if window is None else ms * window
+    factor = run_factor(baseline)
+    return None if factor is None else ms * factor
+
+
+def unknown_why(baseline: dict[str, Any] | None) -> str:
+    """Why :func:`from_run` has no value for a module-level estimate of this run."""
+    metric = of(baseline)
+    if metric.name == TTFA:
+        return "its calls inside the first-audio window are unknown"
+    if metric.name == THROUGHPUT:
+        return "baseline.json has no seconds of audio per run"
+    return f"no conversion to {metric.label}"
 
 
 def describe(baseline: dict[str, Any] | None) -> str | None:

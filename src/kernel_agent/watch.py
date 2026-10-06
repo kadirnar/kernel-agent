@@ -303,6 +303,10 @@ class Watcher:
             tree = projection.tree(run, ids)
         except Exception:  # the same: every target counts in full
             tree = projection.Tree()
+        try:  # est. saved ms per run → the metric's ms
+            units = projection.units_of(run, ids)
+        except Exception:  # the same: a baseline alone
+            units = projection.Units(_json(run.baseline_json) or {})
         self.files = {
             "run": _json(run.run_json),
             "baseline": _json(run.baseline_json),
@@ -313,6 +317,7 @@ class Watcher:
             "specs": {t: _json(run.target(t) / "spec.json") for t in ids},
             "shares": shares,
             "tree": tree,
+            "units": units,
         }
         return True
 
@@ -397,11 +402,14 @@ class Watcher:
         last = max(stamps, default=None)
         end = now if running else last
 
-        targets = self._targets()
-        # nested targets counted once (projection.py), after every kept kernel for the chart
+        units = files.get("units") or projection.Units(baseline)
+        targets = self._targets(units)
+        # nested targets counted once (projection.py), after every kept kernel for the chart,
+        # each kernel's est. saved ms per run in the metric's ms
         tree = files.get("tree") or projection.Tree()
-        proj = projection.project(tree, {t["id"]: t["est_saved_ms"] for t in targets}, base_ms or 0)
-        projected = projection.series(tree, base_ms, rows) if base_ms else []
+        saved = {t["id"]: t["est_saved_ms"] for t in targets}
+        proj = projection.project(tree, saved, base_ms or 0, units)
+        projected = projection.series(tree, base_ms, rows, units) if base_ms else []
         e2e = [r for r in rows if r["target"] == E2E]
         kept_e2e = [r for r in e2e if r["status"] == KEEP]
         integration = files.get("integration") or {}
@@ -468,7 +476,12 @@ class Watcher:
                 },
                 # what every ms measures (-o metric=, objective.py): headings, axes
                 "metric": objective.as_dict(objective.of(baseline)),
-                "projected_ms": proj.projected_ms if base_ms else None,
+                # a kernel row's est. saved ms per run × its factor = the metric's ms (None:
+                # unknown); e2e rows are in the metric already
+                "saved_factors": {t["id"]: units.factor(t["id"]) for t in targets},
+                "projected_ms": proj.projected_ms  # as ledger.summary
+                if base_ms and (proj.used or not proj.unknown)
+                else None,
                 "projection": {
                     **proj.as_dict(),
                     "steps": {str(r["exp"]): p.projected_ms for r, p in projected},
@@ -504,7 +517,7 @@ class Watcher:
             }
         )
 
-    def _targets(self) -> list[dict[str, Any]]:
+    def _targets(self, units: projection.Units) -> list[dict[str, Any]]:
         files, rows = self.files, self.rows
         ids = list(files.get("targets") or [])
         ids += sorted({r["target"] for r in rows} - {E2E} - set(ids))
@@ -530,7 +543,8 @@ class Watcher:
                     "best_speedup": best["speedup"] if best else None,
                     "best_snapshot": best["snapshot"] if best else None,
                     "best_backend": best["backend"] if best else None,
-                    "est_saved_ms": best["est_saved_ms"] if best else None,
+                    "est_saved_ms": best["est_saved_ms"] if best else None,  # per run
+                    "saved_ms": units(target_id, best["est_saved_ms"]) if best else None,
                     "last_hypothesis": trows[-1]["hypothesis"] if trows else "",
                 }
             )

@@ -40,20 +40,29 @@ def _flat_metrics(metrics: Any, prefix: str = "") -> dict[str, Any]:
     return flat
 
 
-def _projection_lines(projection: list[dict[str, Any]]) -> list[str]:
-    """Projected (baseline − Σ est. saved ms) vs measured latency of each accepted set."""
-    if not projection:
+def _projection_lines(
+    entries: list[dict[str, Any]], run: RunDir, baseline: dict[str, Any], base_ms: Any
+) -> list[str]:
+    """Projected (baseline − Σ est. saved ms) vs measured latency of each accepted set; an
+    ``integration.json`` from before #114 has its kernels' savings converted to the metric's
+    ms here (:func:`projection.in_metric`)."""
+    if not entries:
         return []
+    metric = objective.of(baseline)
+    base = ledger._num(base_ms) or ledger._num(baseline.get("median_ms"))
+    if base is not None and any("est_saved_unit" not in p for p in entries):
+        tree, units = projection.tree(run), projection.units_of(run)
+        entries = [projection.in_metric(p, tree, units, base) for p in entries]
     lines = [
         "",
-        "Projected (baseline − Σ est. saved ms: a kernel's module-level estimate, nested "
-        "kernels counted once, a transform's gain alone) vs measured end-to-end latency of "
-        "every accepted set:",
+        f"Projected (baseline − Σ est. saved ms {metric.per}: a kernel's module-level "
+        "estimate, nested kernels counted once, a transform's gain alone) vs measured "
+        f"{metric.label} of every accepted set:",
         "",
         "| accepted set | projected ms | measured ms | measured / projected |",
         "|---|---|---|---|",
     ]
-    for p in projection:
+    for p in entries:
         names = " + ".join(f"`{ledger.item_label(i)}`" for i in p.get("items", []))
         saved = p.get("est_saved_ms") or {}
         unknown = [ledger.item_label(i) for i, v in saved.items() if v is None]
@@ -172,12 +181,15 @@ def write_report(run: RunDir) -> Path:
         "",
     ]
 
+    units = projection.units_of(run)  # est. saved ms per run → the metric's ms
+    # another metric: the estimate in its ms too (throughput: per second of audio)
+    other = f" est. saved ms {metric.per} |" if metric.name != objective.LATENCY else ""
     lines += [
         "## Kernel targets",
         "",
         "| target | class | backends | evaluations | best speedup (module) "
-        "| est. saved ms/run | best file |",
-        "|---|---|---|---|---|---|---|",
+        f"| est. saved ms/run |{other} best file |",
+        "|---|---|---|---|---|---|---|" + ("---|" if other else ""),
     ]
     saved: dict[str, float | None] = {}
     for target_id in run.target_ids():
@@ -185,11 +197,12 @@ def write_report(run: RunDir) -> Path:
         records = read_jsonl(run.results_file(target_id))
         best = best_for_target(run, target_id)
         saved[target_id] = ledger._num((best or {}).get("est_saved_ms_per_run"))
+        mine = f" {_fmt(units(target_id, saved[target_id]))} |" if other else ""
         lines.append(
             f"| `{target_id}` | `{spec.get('module_class')}` | "
             f"{', '.join(spec.get('backends', []))} | "
             f"{len(records)} | {_fmt(best and best.get('speedup'))} | "
-            f"{_fmt(best and best.get('est_saved_ms_per_run'))} | "
+            f"{_fmt(best and best.get('est_saved_ms_per_run'))} |{mine} "
             f"{best['snapshot'] if best else '—'} |"
         )
         if best:
@@ -202,18 +215,20 @@ def write_report(run: RunDir) -> Path:
                 lines.append(
                     f"|  ↳ `{case.get('signature', '')[:60]}` ×{case.get('calls_per_run')} | | | | "
                     f"{_fmt(case.get('speedup'))} ({_fmt(case.get('ref_ms'), 4)} → "
-                    f"{_fmt(case.get('new_ms'), 4)} ms{sol}) | | |"
+                    f"{_fmt(case.get('new_ms'), 4)} ms{sol}) | | |" + (" |" if other else "")
                 )
     lines.append("")
-    proj = projection.of_run(run, saved, ledger._num(baseline.get("median_ms")))
+    proj = projection.of_run(run, saved, ledger._num(baseline.get("median_ms")), units)
     if proj and proj.used:
         lines += [
             f"Projected from the best kernels: **{proj.projected_ms:.1f} ms** "
             f"({_x(proj.baseline_ms / max(proj.projected_ms, 1e-9))} vs eager) = baseline − "
-            f"est. saved ms of {proj.describe()}. Nested targets count once: per instance the "
-            "better of the parent's kernel and the sum of its children's.",
+            f"est. saved ms {metric.per} of {proj.describe()}. Nested targets count once: per "
+            "instance the better of the parent's kernel and the sum of its children's.",
             "",
         ]
+    elif proj and proj.unknown:
+        lines += [f"Kernels {proj.describe()}.", ""]  # "not projected (why): a, b"
     for target_id in run.target_ids():
         lines += _chart(run, run.target(target_id) / "progress.png", f"{target_id} progress")
     transforms = read_jsonl(run.results_file())
@@ -270,7 +285,9 @@ def write_report(run: RunDir) -> Path:
                 f"* {tried}: passed={h.get('passed')} "
                 f"speedup={h.get('speedup')} {h.get('reason') or ''}{verdict}"
             )
-        lines += _projection_lines(integration.get("projection") or [])
+        lines += _projection_lines(
+            integration.get("projection") or [], run, baseline, integration.get("baseline_ms")
+        )
         if reference:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))

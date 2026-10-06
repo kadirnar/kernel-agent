@@ -6,14 +6,17 @@ rebuilt from the ledger, the profile(s) and the slice log before every
 decision, so the scheduler keeps no state of its own and a restarted loop
 decides exactly as an uninterrupted one would.
 
-Expected gain (Amdahl), in ms per run of the whole model::
+Expected gain (Amdahl), in the metric's ms (``-o metric=``, :mod:`kernel_agent.objective`:
+per run for the latency, per second of generated audio for ``throughput``)::
 
     expected = remaining_ms × headroom × decay ** stale
 
 * ``remaining_ms``: what the arm still costs. Kernel targets: their share of the
-  profiled time × the baseline ms ÷ their best module speedup so far. Systems:
-  the end-to-end time of its best run so far (transforms, on top of kernels or
-  not; a run is credited only for beating the best run with the same kernels).
+  profiled time × the baseline ms ÷ their best module speedup so far (a region target:
+  its timed reference cases, ms per run converted to the metric's ms,
+  ``projection.Units``). Systems: the end-to-end time of its best run so far
+  (transforms, on top of kernels or not; a run is credited only for beating the best
+  run with the same kernels).
 * ``headroom``: the share of ``remaining_ms`` that could still go. ``1 −
   pct_of_sol`` when the best result carries a trustworthy speed-of-light
   estimate (``pct_of_sol``, :mod:`kernel_agent.kernels.roofline`), else ``1 − 1 / further`` where
@@ -61,7 +64,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, truth
+from kernel_agent import ledger, projection, truth
 from kernel_agent.budget import (
     PLATEAU,
     PRIOR_HYPOTHESIS,
@@ -249,20 +252,26 @@ def _region_ref_ms(
     run: RunDir, target_id: str, spec: dict[str, Any], profiles: list[dict[str, Any]]
 ) -> float:
     """A region target's ``Region_<id>`` class is in no profile (``kernel_agent/region.py``):
-    its reference time per run from the timed cases of its newest timed evaluation, else
-    the time of its parent class (an upper bound) until it has one."""
+    its reference time from the timed cases of its newest timed evaluation, in ms per run
+    of the workload, converted to the metric's ms like every arm's (``projection.Units``:
+    per second of audio for ``metric=throughput``), else the time of its parent class (an
+    upper bound) until it has one or when it has no value in the metric."""
     if spec.get("kind") != "region":
         return 0.0
     users = (spec.get("capture") or {}).get("method_instances") or {}
     for rec in reversed(read_jsonl(run.results_file(target_id))):
         timed = [c for c in rec.get("cases") or [] if c.get("ref_ms") is not None]
         if timed:
-            return sum(
+            per_run = sum(
                 float(c["ref_ms"])
                 * float(c.get("calls_per_run") or 0)
                 * float(users.get(c.get("method") or "forward", 1))
                 for c in timed
             )
+            ms = projection.units_of(run, [target_id])(target_id, per_run)
+            if ms is not None:
+                return ms
+            break
     return _ref_ms(target_id, {**spec, "module_class": spec.get("parent_class")}, profiles)
 
 

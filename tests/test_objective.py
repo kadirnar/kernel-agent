@@ -11,7 +11,7 @@ import torch
 from synthetic_run import make_run
 from torch import nn
 
-from kernel_agent import objective, watch
+from kernel_agent import ledger, objective, watch
 from kernel_agent.integrate import ab
 from kernel_agent.report import write_report
 from kernel_agent.status import render
@@ -191,6 +191,33 @@ def test_throughput_is_wall_time_per_second_of_audio():
     assert objective.profile_window({"median_ms": 5.0}) == (5.0, "end-to-end latency", "per run")
 
 
+def test_a_per_run_estimate_in_the_metric():
+    """Issue #114: a module-level estimate is ms per run of the workload. With
+    metric=throughput the metric is ms per second of generated audio: a batched run of
+    5,784 ms that makes 153.6 s of audio is 37.66 ms per audio s, and a kernel that saves
+    316 ms per run saves 316 / 153.6 = 2.06 ms of it (not 316)."""
+    throughput = {
+        "metric": "throughput",
+        "median_ms": 37.659,
+        "metric_detail": {"throughput": 26.55, "audio_s": 153.6, "run_ms": 5784.4},
+    }
+    assert objective.from_run(316.0, throughput) == pytest.approx(316.0 / 153.6)
+    assert objective.run_factor(throughput) == pytest.approx(37.659 / 5784.4, rel=1e-3)
+    no_audio = {**throughput, "metric_detail": {"run_ms": 5784.4}}  # median / run_ms
+    assert objective.from_run(316.0, no_audio) == pytest.approx(316.0 * 37.659 / 5784.4)
+    bare = {"metric": "throughput", "median_ms": 37.659}
+    assert objective.from_run(316.0, bare) is None
+    assert objective.unknown_why(bare) == "baseline.json has no seconds of audio per run"
+    # the latency: as it is (a run from before metrics too)
+    assert objective.from_run(316.0, {"median_ms": 1532.4}) == 316.0
+    assert objective.from_run(None, throughput) is None
+    # ttfa: only the share inside the first-audio window counts (projection.window)
+    ttfa = {"metric": "ttfa", "median_ms": 97.7}
+    assert objective.run_factor(ttfa) is None and objective.from_run(316.0, ttfa) is None
+    assert objective.from_run(316.0, ttfa, window=0.05) == pytest.approx(15.8)
+    assert "first-audio window" in objective.unknown_why(ttfa)
+
+
 def test_objective_text():
     baseline = {
         "metric": "ttfa",
@@ -246,6 +273,12 @@ def test_reports_name_throughput(ttfa_run, tmp_path):
     assert "throughput 14.40 s of audio per second (8 requests" in text
     s = watch.state(run)["summary"]
     assert s["metric"]["per"] == "per second of generated audio"
+    # issue #114: a kernel's est. saved ms per run is ÷ 76.8 s of audio per run here
+    summary = ledger.summary(run)
+    per_run = sum(t["est_saved_ms"] or 0.0 for t in summary["targets"])
+    assert per_run > 0 and summary["projection"].saved_ms == pytest.approx(per_run / 76.8)
+    assert s["projected_ms"] == summary["projected_ms"] > 0.9 * baseline["median_ms"]
     pytest.importorskip("matplotlib")
     report = write_report(run).read_text()
     assert "| | time per audio s (ms) | vs eager | vs compiled | quality |" in report
+    assert "| est. saved ms/run | est. saved ms per second of generated audio |" in report
