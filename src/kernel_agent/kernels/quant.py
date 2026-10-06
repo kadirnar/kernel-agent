@@ -25,6 +25,17 @@ near-lossless tier, :data:`kernel_agent.kernels.compare.NEAR_LOSSLESS_FP4_TIER`)
   elements of a row: ``nvfp4`` (default) one e4m3 scale per 16 and one fp32 scale per
   tensor, ``mxfp4`` (OCP MX) one power-of-two e8m0 scale per 32.
 * :func:`dequantize_fp4`, :func:`fp4_error`: as for FP8 (``agent/examples/cuda_fp4_gemv.py``).
+
+A target whose spec says ``"precision": "fp8_w8a8"`` (FP8 tensor-core math, for
+compute-bound GEMMs) also quantises its activations, per token and per call:
+
+* :func:`quantize_fp8_activations`: e4m3 codes and one fp32 scale per token (row of
+  ``x.reshape(-1, in_features)``), the math a kernel computes on the fly.
+* :func:`fp8_w8a8_linear`: ``x @ Wᵀ (+ bias)`` with W8A8 numerics, through
+  ``torch._scaled_mm`` (cuBLASLt FP8 tensor cores) where it applies: the fallback path of
+  a W8A8 kernel and its reference while debugging.
+* :func:`fp8_w8a8_error`: :func:`fp8_error` plus the activations' quantisation error and
+  the W8A8 layer output's error (``agent/examples/triton_fp8_w8a8_gemm.py``).
 """
 
 from __future__ import annotations
@@ -274,3 +285,101 @@ def fp4_error(
             "after": codes.numel() + scales.numel() * scales.element_size() + 4,
         },
     }
+
+
+def quantize_fp8_activations(
+    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(q, scale)`` of activations ``x [..., in]``, per token: ``q`` in ``dtype``
+    (``[tokens, in]``, contiguous) and ``scale`` (fp32 ``[tokens]``) with
+    ``x.reshape(-1, in) ≈ q * scale[:, None]``.
+
+    Dynamic: computed for every call from the row's ``amax / 448`` (e4m3), in fp32, round to
+    nearest even; a row of zeros gets scale 1. The reference math of the per-token
+    quantisation a W8A8 kernel does in its prologue (or fuses into the producer of ``x``)."""
+    if dtype not in FP8_MAX:
+        raise ValueError(f"unsupported FP8 dtype {dtype}")
+    a = x.detach().reshape(-1, x.shape[-1]).float()
+    amax = a.abs().amax(dim=1)
+    scale = torch.where(amax > 0, amax / FP8_MAX[dtype], torch.ones_like(amax))
+    q = (a / scale[:, None]).clamp(-FP8_MAX[dtype], FP8_MAX[dtype]).to(dtype)
+    return q.contiguous(), scale.contiguous()
+
+
+def _scaled_mm_ok(x: torch.Tensor, q: torch.Tensor) -> bool:
+    """Whether ``torch._scaled_mm`` takes these operands (FP8 row-wise scales: CUDA, sm_89+,
+    bf16 out, ``in`` and ``out`` features multiples of 16)."""
+    if not (x.is_cuda and q.is_cuda and x.dtype == torch.bfloat16):
+        return False
+    if q.dtype != torch.float8_e4m3fn or q.shape[0] % 16 or q.shape[1] % 16:
+        return False
+    return torch.cuda.get_device_capability(x.device) >= (8, 9)
+
+
+def fp8_w8a8_linear(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ Wᵀ + bias`` with FP8 W8A8 numerics, in ``x``'s dtype and shape ``[..., out]``.
+
+    ``(q, scale)``: the weight from :func:`quantize_fp8` (e4m3, one scale per output
+    channel); ``x`` is quantised per token (:func:`quantize_fp8_activations`), the products
+    accumulate in fp32 and both scales apply once per output. Through ``torch._scaled_mm``
+    (cuBLASLt FP8 tensor cores) for bf16 CUDA inputs whose feature counts are multiples of
+    16; otherwise the same math in fp32 (slow: a fallback and a reference)."""
+    xq, xs = quantize_fp8_activations(x, q.dtype)
+    if _scaled_mm_ok(x, q):
+        y = torch._scaled_mm(
+            xq,
+            q.t(),  # column-major [in, out]: cuBLASLt's layout for the second operand
+            scale_a=xs[:, None],
+            scale_b=scale.float()[None, :],
+            bias=None if bias is None else bias.to(torch.bfloat16),
+            out_dtype=torch.bfloat16,
+        )
+    else:
+        y = (xq.float() * xs[:, None]) @ (q.float() * scale.float()[:, None]).T
+        if bias is not None:
+            y = y + bias.float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], q.shape[0])
+
+
+def fp8_w8a8_error(
+    weight: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, x: torch.Tensor
+) -> dict[str, Any]:
+    """Numerical error of a W8A8 layer: :func:`fp8_error` of the weight, plus
+
+    * ``activation_rel_l2``: ``‖x − x̂‖ / ‖x‖`` of the per-token quantised activations;
+      ``activation_crest``: the largest ``amax / RMS`` of a token (outlier channels set the
+      token's scale and squeeze the rest of the row: ~30 on VoxCPM2's LM attention input);
+      ``activation_underflow``: share of the non-zero activations that became 0;
+    * ``output_rel_l2``, ``output_cosine`` and ``output_norm_ratio`` of the W8A8 output
+      against ``x @ Wᵀ`` in fp32: the module-level error the near-lossless tier bounds
+      (cosine >= 0.996, relative L2 <= 0.08, norm within ±2 %)."""
+    report = fp8_error(weight, q, scale)
+    w = weight.detach().float()
+    a = x.detach().float().reshape(-1, w.shape[1]).to(w.device)
+    xq, xs = quantize_fp8_activations(a, q.dtype)
+    a_hat = xq.float() * xs[:, None]
+    a_norm = float(a.norm())
+    rms = a.pow(2).mean(dim=1).sqrt()
+    crest = a.abs().amax(dim=1) / rms.clamp_min(1e-30)
+    nonzero = a != 0
+    ref = a @ w.T
+    new = a_hat @ dequantize_fp8(q, scale, torch.float32).to(w.device).T
+    ref_norm, new_norm = float(ref.norm()), float(new.norm())
+    cos = float((ref.flatten() @ new.flatten()) / (ref_norm * new_norm)) if ref_norm else 1.0
+    report.update(
+        activations="e4m3 per token",
+        activation_rel_l2=_sig(float((a - a_hat).norm()) / a_norm if a_norm > 0 else 0.0),
+        activation_crest=_sig(float(crest[rms > 0].max()) if bool((rms > 0).any()) else 0.0),
+        activation_underflow=_sig(
+            float((nonzero & (a_hat == 0)).sum()) / max(int(nonzero.sum()), 1)
+        ),
+        output_rel_l2=_sig(float((ref - new).norm()) / ref_norm if ref_norm else 0.0),
+        output_cosine=round(cos, 6),
+        output_norm_ratio=round(new_norm / ref_norm, 5) if ref_norm else 1.0,
+    )
+    return report

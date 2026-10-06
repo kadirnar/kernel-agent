@@ -1915,8 +1915,8 @@ def _scope(target: dict[str, Any]) -> str | None:
 
 def _precision(target: dict[str, Any], quality: str) -> str | None:
     """Normalise a planned target's ``precision`` / ``precision_why`` in place; returns why
-    the target is refused, or None. A reduced precision (``fp8_weights``, ``reduced``:
-    ``kernels.compare.REDUCED_PRECISIONS``) needs ``--quality near-lossless``."""
+    the target is refused, or None. A reduced precision (``fp8_weights``, ``fp8_w8a8``,
+    ``reduced``: ``kernels.compare.REDUCED_PRECISIONS``) needs ``--quality near-lossless``."""
     from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, PRECISIONS, REDUCED_PRECISIONS
 
     precision = target.pop("precision", None) or "exact"

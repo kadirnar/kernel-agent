@@ -210,8 +210,8 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   the stop logits, margins reported). Options set with `-o` win. A candidate
   below the floor is rejected without running the gate.
 * **Module tolerance tier.** A target whose spec allows reduced precision
-  (`"precision": "fp8_weights"` or `"reduced"` in the plan, see "Low-precision
-  weights" below) is captured with the `near-lossless` tier of
+  (`"precision": "fp8_weights"`, `"fp8_w8a8"` or `"reduced"` in the plan, see
+  "Low-precision weights" below) is captured with the `near-lossless` tier of
   `kernels/compare.py`, recorded in its sealed capture (an edited `spec.json`
   cannot change it, and a candidate that changes `compare.TIER` is an
   integrity violation): instead of
@@ -301,8 +301,9 @@ mode:
 * **Planner.** In a `--quality near-lossless` run the planner prompt allows
   `"precision": "fp8_weights"` on a target whose time goes into streaming
   weights (`nn.Linear`, MLP or attention projections at a few rows per call),
-  with a one-line `precision_why`; `"reduced"` is for another numerics-changing
-  idea. Norms, attention math, compute-bound GEMMs and output / stop heads stay
+  with a one-line `precision_why`; `"fp8_w8a8"` on a target whose GEMMs are
+  compute bound (see "FP8 W8A8" below); `"reduced"` is for another
+  numerics-changing idea. Norms, attention math and output / stop heads stay
   exact. In an exact run the prompt forbids it and the orchestrator drops a
   planned target with a reduced precision (`plan: dropping <id>: precision
   'fp8_weights' needs --quality near-lossless`), in `plan` and in `improve`'s
@@ -323,7 +324,9 @@ mode:
   on sm_89+ GPUs.
 * **Speed of light.** For a `fp8_weights` target the 2-D weights count at one
   byte per element plus 4 bytes of scale per output channel, so `pct_of_sol`
-  measures the FP8 kernel against the bytes it must stream.
+  measures the FP8 kernel against the bytes it must stream. For a `fp8_w8a8`
+  target the GEMMs on those weights also count at the FP8 tensor-core peak
+  (measured with `torch._scaled_mm`, `float8_e4m3fn` in the GPU peaks).
 * **Library.** Entries record their precision; an FP8 kernel is only reused
   for a target of that precision, an exact one for any target.
 
@@ -406,6 +409,75 @@ the same time (host overhead and latency, not bandwidth): judge FP4 streamed
 and end to end. On VoxCPM2, NVFP4 everywhere passes the perceptual gate but
 misses the teacher-forcing floor by 0.002; NVFP4 in both LMs with the LocDiT
 in FP8 passes every check ("Quality modes").
+
+#### FP8 W8A8 (`fp8_w8a8`): compute-bound GEMMs
+
+Weight-only FP8 does nothing for GEMMs with hundreds of rows per call: the
+weights are not the bottleneck, the bf16 tensor cores are. FP8 tensor cores run
+e4m3 x e4m3 at two to three times the bf16 rate (RTX 5070 Ti, dense, fp32
+accumulation: 338 TFLOP/s for cuBLASLt's FP8 GEMM with scalar scales, ~195 with
+row-wise scales or Triton's `tl.dot` on e4m3, 99 bf16), but both operands must
+be FP8. In the
+VoxCPM2 throughput run (`runs/openbmb--VoxCPM2/20261006-004718`, batch 16,
+near-lossless) the exact-tier `dit_layer` kernel arm stayed at 3.01x module
+speedup for four slices, while the systems agent's W8A8 transforms on the same
+LocDiT GEMMs (M = 352) took the run from 11.36 to 8.73 ms per audio second
+(3.32x -> 4.31x vs eager, ledger exp 40-45), all within the perceptual gate.
+`"precision": "fp8_w8a8"` makes that a precision class kernels can target:
+
+* **Planner.** In a near-lossless run the policy sends compute-bound GEMMs
+  (~64+ rows per call on large weights) to `fp8_w8a8`, with a `precision_why`
+  that names the FLOP-bound number; few rows per call stay `fp8_weights`.
+* **Contract** (engineer prompt, `knowledge/low_precision.md` → "FP8 W8A8"):
+  weights quantised once in `build()` (e4m3, one scale per output channel),
+  activations per token on every call (`amax / 448`, dynamic; never a static
+  or per-tensor scale), e4m3 x e4m3 with fp32 accumulation, both scales and the
+  bias in the epilogue, one rounding to bf16; report
+  `quant.fp8_w8a8_error(weight, q, scale, x)`. `quant.fp8_w8a8_linear` is the
+  reference / fallback (`torch._scaled_mm` where it applies: K and N multiples
+  of 16, the weight passed column-major, scales [M, 1] and [1, N]).
+* **Verified example** `examples/triton_fp8_w8a8_gemm.py`: the run's recipe as
+  a Triton kernel (per-token quantisation kernel + e4m3 `tl.dot` GEMM with one
+  tile config per weight shape, a `custom_op` for torch.compile / CUDA
+  graphs). Quantisation included, in a CUDA graph at M = 352: gate|up
+  [1024 -> 8192] 36.1 us vs 68.2 (cuBLAS bf16) and 41.3 (`_scaled_mm` alone),
+  q|k|v 15.1 vs 25.5, o_proj 15.5 vs 22.5, down 28.0 vs 38.9; output
+  bit-identical to `_scaled_mm`. Timed eagerly by the module evaluator its two
+  Triton launches (~47 us of host time) hide the gain at M = 352 (0.95x); at
+  M = 704 it measures 1.79x. `doctor --smoke` runs it (sm_89+): near-lossless
+  pass, exact tier reject.
+* **Beyond the example.** cuBLASLt's FP8 kernel for scalar scales (an
+  `nvjet_sm120` TMA kernel) is faster at M = 352 than both: gate|up 28.9 us,
+  down 17.5, q|k|v 10.7, o_proj 13.2 (row-wise `_scaled_mm`, a CUTLASS kernel
+  in torch 2.14: 40.7 / 26.8 / 15.5 / 15.5). Its unscaled product needs the
+  per-token and per-channel scales afterwards: as separate torch ops they cost
+  more than they save (gate|up 52.6 us), fused into the consumer (the SiLU-mul,
+  the residual add; Inductor under torch.compile) or into a GEMM epilogue on
+  that MMA they are the next step (`low_precision.md`).
+* **Speed of light.** See above: the GEMMs on the target's weights count at
+  the FP8 peak (338 TFLOP/s here, so the example's GEMMs sit near 50 % of it).
+  Without an FP8 peak (`tflops_unavailable`) W8A8 cases are flagged
+  `sol_unreliable` with a `sol_note`: no `stop` advice from a bf16 ceiling.
+
+Tier calibration: W8A8 fits the near-lossless tier unchanged on the GEMMs it
+is for (no separate bound). Every `nn.Linear` of a module W8A8, against the
+bf16 module, on real VoxCPM2 capture inputs (fake quant on the CPU; on the GPU
+`_scaled_mm` and the example reproduce the LocDiT layer's numbers):
+
+| module (rows per call) | rel L2 | min cosine | norm change | element ratio | tier |
+|---|---|---|---|---|---|
+| LocDiT decoder layer (352; hidden, k, v) | 0.020 | 0.99979 | 0.24 % | 0.19 | pass |
+| LocDiT MLP alone (352) | 0.009 | 0.99997 | 0.25 % | 0.15 | pass |
+| LocDiT q_proj alone (352) | 0.008 | 0.99994 | 0.15 % | 0.11 | pass |
+| LM decoder layer, decode (1) | 0.006 | 0.99998 | 0.03 % | 0.04 | pass |
+| LM MLP alone, decode (1) | 0.014 | 0.99990 | 0.37 % | 0.11 | pass |
+| LM q_proj alone, decode (1; activation crest ~30) | 0.041 | 0.99917 | 2.4 % | 0.38 | fail (norm) |
+| LocDiT layer, weight scales x 1.05 | 0.164 | 0.99979 | 16 % | 1.37 | fail |
+| LocDiT layer, a neighbour channel's weight scale | 0.895 | 0.776 | 86 % | 7.0 | fail |
+| LocDiT layer, the first token's scale for every token | 0.957 | 0.511 | 91 % | 9.2 | fail |
+
+The only real-input failure is a memory-bound GEMM at decode whose activation
+outliers squeeze the rest of the token: `fp8_weights` territory anyway.
 
 ### What "faster" means
 
@@ -931,7 +1003,10 @@ hardware limit (`kernel_agent/kernels/roofline.py`).
 * A `fp8_weights` target (its capture's `precision`, see "Low-precision
   weights") counts its 2-D weights at one byte per element plus one fp32
   scale per output channel (`roofline.WEIGHT_BITS`), the bytes its kernels must
-  stream.
+  stream. A `fp8_w8a8` target counts them the same way, and the FLOPs of every op
+  that reads one of those weights at the FP8 peak (`roofline.MATH_DTYPE`; other
+  FLOPs, e.g. attention, stay at their dtype's). Without an FP8 peak such
+  cases are flagged `sol_unreliable`, with a `sol_note`.
 * `new_ms < 0.9 × sol_ms` is faster than the hardware allows. That case and the
   result get `suspicious_faster_than_sol`, which is a warning and not a
   rejection. If the reference itself beats 0.9 × `sol_ms`, the estimate is wrong
@@ -1732,7 +1807,9 @@ and `low_precision.md` go to the engineer of an `fp8_weights` target (see
 near-lossless tier and against the exact tier, which must reject them. The FP4
 example (`cuda_fp4_gemv.py`) goes to an `fp4_weights` target; the smoke test
 runs it in the near-lossless-fp4 tier and against the FP8 tier, which must
-reject it.
+reject it. The W8A8 example (`triton_fp8_w8a8_gemm.py`) goes to an
+`fp8_w8a8` target; the smoke test runs it in the near-lossless tier and against
+the exact tier.
 
 **No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
 (`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a

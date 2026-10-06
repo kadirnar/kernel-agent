@@ -29,6 +29,12 @@ implausible and flagged ``suspicious_faster_than_sol``; when the *reference*
 already beats 0.9 × sol_ms, the estimate is wrong and the case is flagged
 ``sol_unreliable`` instead.
 
+Reduced precision (the capture's ``precision``): the weights of an ``fp8_weights`` or
+``fp8_w8a8`` target count at one byte per element (:data:`WEIGHT_BITS`), and the GEMMs on
+the weights of an ``fp8_w8a8`` target at the measured FP8 peak (:data:`MATH_DTYPE`); without
+an FP8 peak (none measured on this GPU, or a cache older than :data:`PEAKS_VERSION`) such
+cases are flagged ``sol_unreliable`` with a ``sol_note``.
+
 Limitations: bytes are what the reference touches.  Reads through gather ops
 (embedding, index, index_select, gather) count the gathered rows, and SDPA counts
 only the key/value positions some query attends to, but other masked or
@@ -62,7 +68,7 @@ MASKED = -1e4  # additive attention-mask values at or below this mask the positi
 #: the 2-D floating-point parameters the reference reads count at this width plus one fp32
 #: scale per output channel (row), so ``pct_of_sol`` of an FP8 kernel is measured against
 #: the bytes it must stream, not the bf16 weights it replaced.
-WEIGHT_BITS = {"fp8_weights": 8, "fp4_weights": 4}
+WEIGHT_BITS = {"fp8_weights": 8, "fp4_weights": 4, "fp8_w8a8": 8}
 #: ... or, for block-scaled formats, plus one 1-byte scale per this many elements and one
 #: fp32 scale per tensor (``fp4_weights``: NVFP4, an e4m3 scale per 16).
 WEIGHT_SCALE_BLOCK = {"fp4_weights": 16}
@@ -71,6 +77,9 @@ FP8, FP4 = "float8_e4m3fn", "float4_e2m1fn_x2"
 #: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks. :func:`ensure_peaks` measures an
 #: older cache again (once per process at most); until then it stays in use.
 PEAKS_VERSION = 2
+#: The tensor-core math of a reduced-precision target: the FLOPs of every op that reads one
+#: of its narrowed weights count at this dtype's peak (W8A8: FP8), not at the reference's.
+MATH_DTYPE = {"fp8_w8a8": FP8}
 _MiB = 1024**2
 
 # Ops that look at a tensor argument's metadata only (no data read).
@@ -512,8 +521,14 @@ def attention_density(mask: Any, is_causal: bool, lq: int, lk: int) -> tuple[flo
     return pairs, int(needed.count_nonzero()) / max(needed.numel(), 1)
 
 
-def _tracker(counter: Any, external: dict[tuple[str, int], int]) -> Any:
-    """Dispatch mode that records which external bytes each op reads or writes."""
+def _tracker(
+    counter: Any,
+    external: dict[tuple[str, int], int],
+    narrow_math: tuple[set[tuple[str, int]], str] | None = None,
+) -> Any:
+    """Dispatch mode that records which external bytes each op reads or writes.
+    ``narrow_math``: ``(weight storage keys, dtype name)``: the FLOPs of ops that read one
+    of those weights count as that dtype's (:data:`MATH_DTYPE`)."""
     import torch
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_leaves
@@ -568,7 +583,9 @@ def _tracker(counter: Any, external: dict[tuple[str, int], int]) -> Any:
             out = func(*args, **kwargs)
             inputs = [t for t in tree_leaves((args, kwargs)) if isinstance(t, torch.Tensor)]
             delta = counter.get_total_flops() - before
-            if delta:
+            if delta and narrow_math and any(_key(t) in narrow_math[0] for t in inputs):
+                self.flops[narrow_math[1]] += delta  # a GEMM on a narrowed weight (W8A8)
+            elif delta:
                 floating = [t for t in inputs if t.is_floating_point()] or inputs
                 self.flops[_dtype_name(floating[0].dtype) if floating else "unknown"] += delta
             if name in _NO_READ:
@@ -640,8 +657,9 @@ def count_case(
     precision: str | None = None,
 ) -> CaseCost:
     """FLOPs (per dtype) and minimum bytes of one reference call (inputs are not mutated).
-    ``precision`` (``fp8_weights``, ``fp4_weights``): the weights count at their reduced
-    width (:data:`WEIGHT_BITS`, :data:`WEIGHT_SCALE_BLOCK`)."""
+    ``precision`` (``fp8_weights``, ``fp4_weights``, ``fp8_w8a8``): the weights count at
+    their reduced width (:data:`WEIGHT_BITS`, :data:`WEIGHT_SCALE_BLOCK`), and the GEMMs on
+    them at the FP8 peak for ``fp8_w8a8`` (:data:`MATH_DTYPE`)."""
     import torch
     from torch.utils.flop_counter import FlopCounterMode
 
@@ -655,7 +673,8 @@ def count_case(
     narrow = _weight_shares(module, precision)
     fn = module if method in (None, "forward") else getattr(module, method)
     with torch.inference_mode(), FlopCounterMode(display=False) as counter:
-        tracker = _tracker(counter, external)
+        dtype = MATH_DTYPE.get(precision or "")
+        tracker = _tracker(counter, external, (set(narrow), dtype) if dtype else None)
         with tracker:
             out = fn(*a, **k)
     if any(t.is_cuda for t in before.values()) or any(p.is_cuda for p in _module_tensors(module)):
@@ -700,9 +719,12 @@ def count_case(
 
 
 def sol_time(cost: CaseCost, peaks: dict[str, Any], *, hot_l2: bool = True) -> dict[str, Any]:
-    """Speed-of-light time (ms) and bound of one case."""
+    """Speed-of-light time (ms) and bound of one case. FP8 FLOPs without a measured FP8 peak
+    count at the fastest peak, and ``peak_missing`` says so: the estimate is then too slow,
+    not a ceiling."""
     tflops = {k: float(v) for k, v in (peaks.get("tflops") or {}).items() if v}
     fastest = max(tflops.values(), default=0.0)
+    missing = bool(cost.flops.get(FP8)) and FP8 not in tflops
     compute_ms = sum(
         f / (tflops.get(dtype) or fastest) / 1e9
         for dtype, f in cost.flops.items()
@@ -718,7 +740,8 @@ def sol_time(cost: CaseCost, peaks: dict[str, Any], *, hot_l2: bool = True) -> d
     bound = "compute" if compute_ms > memory_ms else "memory"
     if sol_ms < floor_ms:
         bound = "launch"  # one launch from Python costs more than the work
-    return {"sol_ms": sol_ms, "bound": bound, "l2_resident": l2}
+    found = {"sol_ms": sol_ms, "bound": bound, "l2_resident": l2}
+    return found | ({"peak_missing": FP8} if missing else {})
 
 
 def _sig(value: float, digits: int = 4) -> float:
@@ -753,11 +776,19 @@ def apply_sol(
         )
         if sol["l2_resident"]:
             report["l2_resident"] = True
+        if sol.get("peak_missing"):  # no stop advice from a ceiling that is not one
+            result["sol_note"] = (
+                f"no {sol['peak_missing']} peak in the GPU peaks (`tflops_unavailable` says "
+                "why): its FLOPs count at the fastest measured one, not a ceiling"
+            )
         new_ms, ref_ms = report.get("new_ms"), report.get("ref_ms")
         if not new_ms:
             continue
         report["pct_of_sol"] = _pct(sol_ms, new_ms)
-        if ref_ms is not None and ref_ms < SUSPICIOUS_RATIO * sol_ms:
+        if sol.get("peak_missing"):
+            report["sol_unreliable"] = True
+            unreliable = True
+        elif ref_ms is not None and ref_ms < SUSPICIOUS_RATIO * sol_ms:
             report["sol_unreliable"] = True  # the reference beats it: the estimate is wrong
             unreliable = True
         elif new_ms < SUSPICIOUS_RATIO * sol_ms:

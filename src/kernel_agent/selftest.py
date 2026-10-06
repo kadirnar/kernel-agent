@@ -1,6 +1,6 @@
 """Backend smoke test: run every bundled example kernel through the evaluator (the FP8
-weight-only examples in the near-lossless tier, and their rejection by the exact tier; the
-FP4 one in the near-lossless-fp4 tier, and its rejection by the FP8 tier)."""
+weight-only and W8A8 examples in the near-lossless tier, and their rejection by the exact
+tier; the FP4 one in the near-lossless-fp4 tier, and its rejection by the FP8 tier)."""
 
 from __future__ import annotations
 
@@ -55,6 +55,13 @@ FP8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     # (correctness only: 0 calls per run) 64 rows, two token groups
     "cuda_fp8_skinny_gemm.py": (1024, 4096, [((2, 11), 40), ((32,), 1), ((4, 16), 0)]),
 }
+#: The FP8 W8A8 examples (``precision: fp8_w8a8``), as :data:`FP8_EXAMPLES`: the VoxCPM2
+#: LocDiT's merged gate|up projection under CFG at batch 32 (2 x 32 x 11 = 704 rows, compute
+#: bound) and, correctness only, at batch 16 (352 rows; timed eagerly, the example's host
+#: time, two Triton launches, would hide its gain there: 0.95x, in a CUDA graph 1.9x).
+W8A8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "triton_fp8_w8a8_gemm.py": (1024, 8192, [((64, 11), 540), ((32, 11), 0)]),
+}
 
 
 #: The FP4 weight-only examples (``precision: fp4_weights``) on the GEMV's shapes above; a
@@ -97,15 +104,25 @@ def fp8_supported(tc: object) -> bool:
     return bool(backends.get("cuda")) and gpu is not None and tuple(gpu.capability) >= (8, 9)
 
 
-def smoke_fp8(tmp: Path, verbose: bool = False) -> bool:
-    """Every FP8 example passes the evaluator in the near-lossless tier, and the exact tier
-    (a quick check) rejects it."""
+def w8a8_supported(tc: object) -> bool:
+    """Whether the W8A8 examples can run: the ``triton`` backend on sm_89 or newer (e4m3
+    tensor cores)."""
+    gpu = getattr(tc, "gpu", None)
+    backends = getattr(tc, "backends", {}) or {}
+    return bool(backends.get("triton")) and gpu is not None and tuple(gpu.capability) >= (8, 9)
+
+
+def smoke_fp8(tmp: Path, verbose: bool = False, *, precision: str = "fp8_weights") -> bool:
+    """Every FP8 example of ``precision`` (:data:`FP8_EXAMPLES`, :data:`W8A8_EXAMPLES`)
+    passes the evaluator in the near-lossless tier, and the exact tier (a quick check)
+    rejects it."""
     from kernel_agent.kernels.evaluate import run_evaluation
 
     ok = True
-    for name, (k, n, calls) in FP8_EXAMPLES.items():
+    examples = W8A8_EXAMPLES if precision == "fp8_w8a8" else FP8_EXAMPLES
+    for name, (k, n, calls) in examples.items():
         near = make_linear_capture(
-            tmp / f"{name}.near.pt", k, n, calls, tier="near-lossless", precision="fp8_weights"
+            tmp / f"{name}.near.pt", k, n, calls, tier="near-lossless", precision=precision
         )
         exact = make_linear_capture(tmp / f"{name}.exact.pt", k, n, calls)
         result = run_evaluation(near, EXAMPLES_DIR / name)
@@ -184,4 +201,6 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
         if fp8_supported(tc) and (backends is None or "cuda" in backends):
             ok &= smoke_fp8(Path(tmp), verbose)
             ok &= smoke_fp4(Path(tmp), verbose)
+        if w8a8_supported(tc) and (backends is None or "triton" in backends):
+            ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8")
     return ok

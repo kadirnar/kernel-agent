@@ -155,12 +155,13 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
-                    # fp8_weights / reduced / fp4_weights (kernels.compare.PRECISIONS):
-                    # --quality near-lossless captures the target with a near-lossless
-                    # tolerance tier; an exact run refuses it. Default exact.
+                    # fp8_weights / reduced / fp4_weights / fp8_w8a8
+                    # (kernels.compare.PRECISIONS): --quality near-lossless captures the
+                    # target with a near-lossless tolerance tier; an exact run refuses it.
+                    # Default exact.
                     "precision": {
                         "type": "string",
-                        "enum": ["exact", "fp8_weights", "reduced", "fp4_weights"],
+                        "enum": ["exact", "fp8_weights", "reduced", "fp4_weights", "fp8_w8a8"],
                     },
                     "precision_why": {"type": "string"},
                     # other starting points for parallel workers (workers.py)
@@ -218,18 +219,26 @@ bound by streaming weights (its *FP4 w* floor well below its *FP8 w* floor);
 its `precision_why` names that evidence. FP4 on every layer can fail end to end
 where FP8 passes (VoxCPM2: FP4 in both LMs passes, the LocDiT is better kept in
 FP8): give FP4 to the largest weight streams first, as separate targets.
+For a target whose time goes into compute-bound GEMMs (~64+ rows per call on
+large weights, e.g. a DiT at batch 8 under CFG: bf16 tensor cores near their
+peak, the *Ceilings* table's *W8A8* floor well below its *FP8 w* one, so FP8
+weights alone buy nothing) set `precision: "fp8_w8a8"`: weights (per output
+channel) and activations (per token, every call) in e4m3 on the FP8 tensor
+cores, fp32 accumulation. Its `precision_why` names the FLOP-bound number (e.g.
+"LocDiT GEMMs at M=352: 80 TFLOP per run = 0.81 s at 99 bf16 TFLOP/s, compute
+bound"). Few rows per call stay `fp8_weights` (memory bound: quantising the
+activations saves nothing there and their outlier channels cost accuracy).
 `precision: "reduced"` (also
 with `precision_why`) is for another numerics-changing idea. Leave `precision`
 unset (exact) where lower precision buys nothing or risks the output: norms,
-softmax and attention math, element-wise ops, compute-bound GEMMs (~64+ rows
-per call, e.g. a DiT at batch 8 under CFG), and the output / stop heads of
+softmax and attention math, element-wise ops, and the output / stop heads of
 autoregressive models.
 """
     return """
 # Precision (`--quality exact`)
 This run keeps full precision: do not set `precision` (a target with
-`fp8_weights` or `reduced` is refused); every kernel must match eager within
-rounding noise.
+`fp8_weights`, `fp4_weights`, `fp8_w8a8` or `reduced` is refused); every kernel
+must match eager within rounding noise.
 """
 
 
@@ -464,6 +473,22 @@ def _precision_block(precision: str | None, target: dict[str, Any]) -> str:
 * report the numerical error in `NOTES.md`: `fp4_error(weight, codes, scales,
   tensor_scale)` of the weights and the evaluator's per-case `min_cosine` /
   `max_rel_l2`. FP4 moves outputs ~4x more than FP8: the perceptual gate decides."""
+    elif precision == "fp8_w8a8":
+        contract = """FP8 W8A8 (FP8 tensor-core math):
+* quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
+  quantize_fp8, fp8_w8a8_linear, fp8_w8a8_error`): e4m3 codes, one fp32 scale per
+  output channel; keep no bf16 copy of a quantised weight;
+* quantise the activations per token on every call (dynamic: `scale = amax(|row|) /
+  448`, e4m3 codes), in the GEMM's prologue or fused into the op that produces
+  them (RMSNorm, `silu(gate) * up`); never one static scale for all tokens;
+* e4m3 x e4m3 products on the tensor cores, accumulate in fp32, apply both scales
+  (and the bias) once per output in the epilogue, round to bf16 once; norms,
+  softmax / attention math and residual adds stay in bf16 / fp32 as in eager;
+* verified example: `triton_fp8_w8a8_gemm.py` (Triton e4m3 GEMM with per-shape
+  tiles, M = 352); fallback and reference: `fp8_w8a8_linear` (`torch._scaled_mm`);
+  guide: "FP8 W8A8" in "Low-precision weights" below;
+* report the numerical error in `NOTES.md`: `fp8_w8a8_error(weight, q, scale, x)`
+  on captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     else:
         contract = """Reduced precision: keep the change to the numerics as small as the speedup
 allows, and report the numerical error (the evaluator's per-case `min_cosine` /
