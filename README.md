@@ -14,7 +14,7 @@ benchmark harness for it first.
 
 ```bash
 uv sync --extra all
-uv run kernel-agent doctor --smoke      # check GPU, compilers, all 5 backends (+ FP8 examples)
+uv run kernel-agent doctor --smoke      # check GPU, compilers, all 5 backends (+ FP8 / FP4 examples)
 uv run kernel-agent optimize https://huggingface.co/Qwen/Qwen3-0.6B
 ```
 
@@ -218,7 +218,11 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   per-element (atol, rtol), cosine >= 0.996, relative L2 error <= 0.08, the
   norm within ±2 % (rounding noise is unbiased, a wrong scale is not) and every
   element within 0.5 × RMS + 0.125 × |reference| (a corrupted row fails).
-  Other targets keep the exact tier.
+  `"precision": "fp4_weights"` (block-scaled FP4 weights, about four times
+  FP8's error) is captured with the `near-lossless-fp4` tier instead: the
+  same checks with cosine >= 0.96, relative L2 error <= 0.28, the norm within
+  ±4 % and every element within 1.25 × RMS + 0.25 × |reference| (calibration
+  below). Other targets keep the exact tier.
 * Without a perceptual baseline (the workload declares no samples, or
   `analyze` ran in exact mode) a near-lossless run keeps the exact checks;
   `metrics.perceptual.skipped` says why.
@@ -248,6 +252,37 @@ it in 140 of 147 calls, weights × 1.05 in 142 and a dropped output channel
 to the tensor's RMS, within FP8 noise at module level and left to the
 end-to-end checks.
 
+FP4 weights (`fp4_weights`), calibrated the same way (fake quant: the weights
+quantised to block-scaled FP4 and back to bf16, `kernels/quant.py`; the same 8
+samples and teacher forcing, FP8 measured again in the same session):
+
+| variant | error-rate increase | speaker similarity (mean / worst) | MOS change | teacher forcing (mean / min step cosine) | near-lossless |
+|---|---|---|---|---|---|
+| FP8 (343 `nn.Linear`) | 0.000 | 0.988 / 0.966 | +0.04 | 0.987 / 0.650 | pass |
+| NVFP4 (all 343) | 0.000 | 0.978 / 0.957 | −0.09 | 0.948 / 0.571 | fail: teacher forcing 0.948 < 0.95 (the gate itself passes) |
+| MXFP4 (all 343) | 0.000 | 0.973 / 0.953 | −0.27 | 0.913 / 0.525 | fail: teacher forcing |
+| NVFP4 in both LMs (252, 89 % of the weights), LocDiT FP8 | 0.000 | 0.982 / 0.959 | −0.01 | 0.975 / 0.584 | pass |
+| NVFP4 in the LMs' MLPs (108, 71 %), the rest FP8 | 0.000 | 0.989 / 0.966 | +0.02 | 0.977 / 0.723 | pass |
+
+So on VoxCPM2, NVFP4 weights everywhere pass the perceptual gate (within the
+noise of eager with other seeds: 0.972 / 0.961) but miss the sanity floor's
+teacher forcing by 0.002; NVFP4 in both LMs with the LocDiT in FP8 passes every
+check. Every variant transcribes with WER 0 and stops on time (31 patches on
+the natural-length input). Module tier, NVFP4 weights on real inputs: the 147
+`nn.Linear` calls reach cosine >= 0.978, relative L2 <= 0.21 (a 256-wide decode
+output; mean 0.055) and a norm within 2.1 %; MLPs <= 0.13, the LocDiT estimator
+<= 0.16: all pass the near-lossless-fp4 tier (17 of the calls, 7 of the 18 MLP
+calls and all 3 LocDiT calls fail the FP8 tier). Nibble-swapped codes and
+weights × 1.05 fail it in 139 of the 147 calls, block scales shifted by one
+block in 85, int4 per tensor in 86, a dropped output channel in 34 (FP4 noise
+hides the rest at module level); MLPs and the LocDiT with swapped nibbles or
+int4 fail every call. MXFP4 with the OCP reference scale (`2^(floor(log2
+amax) - 2)`) saturates block maxima and shrinks real outputs by up to 13 %
+(it failed the tier in 20 of the 147 calls and in all 18 MLP calls), so
+`quantize_fp4(fmt="mxfp4")` takes the smallest power-of-two scale that keeps
+the block within ±6 (the MXFP4 row above); it still fails the FP4 tier in 3 of
+the 147 calls, 4 of the 18 MLP calls and 1 of the 3 LocDiT calls: prefer NVFP4.
+
 Cost on the RTX 5070 Ti: `analyze` takes 34 s longer (the 8 eager samples
 17.8 s, scoring 16.5 s). Each `e2e` (and each paired A/B of the integration)
 of a candidate that passes the sanity floor takes about 11 s of scoring
@@ -257,7 +292,7 @@ speed, about 2.5 s for a candidate 7× faster, so +29 s and +14 s on top of the
 ~67 s of an eager-speed `e2e`. A candidate below the floor costs nothing extra.
 Peak memory is the candidate model plus Whisper-large-v3 in fp16 (3.1 GB).
 
-### Low-precision weights (FP8)
+### Low-precision weights (FP8, FP4)
 
 Decode GEMVs and skinny GEMMs stream their weights once per call, so storing
 the weights in FP8 halves their time. The precision policy follows the quality
@@ -341,9 +376,36 @@ GEMM, 0.046 per MLP (gate, up and down in FP8). On sm_120 with this toolchain
 (nvcc 13.4) `mma.sync` with e4m3 x e4m3 inputs works (W8A8, not weight-only),
 block-scaled FP4 MMA needs `-gencode=arch=compute_120a,code=sm_120a`, and
 torch's `_scaled_mm` runs FP8 row-wise and NVFP4 (both quantise activations).
-NVFP4 weights (e2m1, e4m3 scale per 16) have ~0.10 relative L2 error on
-Gaussian rows, above the module tier's 0.08: there is no `nvfp4_weights`
-precision yet.
+
+**FP4 weights.** `"precision": "fp4_weights"` stores the weights in NVFP4:
+e2m1 codes (two per byte), one e4m3 scale per 16 weights of a row and one fp32
+scale per tensor, 4.5 bits per weight (`kernels/quant.py`: `quantize_fp4`,
+`dequantize_fp4`, `fp4_error`; `fmt="mxfp4"`: a power-of-two scale per 32,
+less accurate), activations bf16. Its relative L2 error is 0.095 on VoxCPM2's
+weights (FP8 0.026), above the near-lossless tier's 0.08, so it has its own
+`near-lossless-fp4` tier ("Quality modes"). The planner may use it in a
+`--quality near-lossless` run only for memory-bound decode GEMVs / skinny
+GEMMs where `fp8_weights` is already in use or the ceilings table shows the
+target still bound by streaming weights; the engineer gets the FP4 contract, the FP4
+section of `low_precision.md` and `examples/cuda_fp4_gemv.py` (M <= 4:
+codes dequantised in registers with a few integer ops, fp32 accumulation per
+16-weight block); `pct_of_sol` counts 4 bits per weight plus the scales; the
+library reuses an FP4 kernel only for an `fp4_weights` target. Streamed on the
+RTX 5070 Ti:
+
+| GEMV | cuBLAS bf16 | FP8 example | FP4 example | vs bf16 / FP8 |
+|---|---|---|---|---|
+| [1, 2048] x [2048, 6144] (base LM gate / up) | 32.3 us | 16.2 us | 9.0 us (784 GB/s) | 3.6x / 1.8x |
+| [1, 2048] x [2048, 12288] (gate + up merged) | 62.8 us | 30.8 us | 16.3 us (868 GB/s) | 3.9x / 1.9x |
+| [1, 6144] x [6144, 2048] (base LM down) | 31.5 us | 16.3 us | 9.7 us | 3.2x / 1.7x |
+| [1, 2048] x [2048, 2048] (LM q / o) | 11.9 us | 6.3 us | 3.9 us | 3.1x / 1.6x |
+| [4, 2048] x [2048, 6144] | 31.5 us | 17.9 us | 19.9 us (ALU bound) | 1.6x / 0.9x |
+
+With a warm L2, as the module evaluator times, FP4 and FP8 GEMVs take about
+the same time (host overhead and latency, not bandwidth): judge FP4 streamed
+and end to end. On VoxCPM2, NVFP4 everywhere passes the perceptual gate but
+misses the teacher-forcing floor by 0.002; NVFP4 in both LMs with the LocDiT
+in FP8 passes every check ("Quality modes").
 
 ### What "faster" means
 
@@ -1544,8 +1606,9 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
   the target's entrypoints (`forward_step`, ...), was verified on the
   target's dtypes and has a precision the target allows (`entry.json` →
   `precision`: an `fp8_weights` kernel serves only an `fp8_weights` target, an
-  `exact` one any target). Shapes may differ, because kernels read their sizes from the
-  module. Up to 3 matches are tried, closest shapes first. Each one is copied
+  `fp4_weights` one only an `fp4_weights` target, an `exact` one any target).
+  Shapes may differ, because kernels read their sizes from the module. Up to 3
+  matches are tried, closest shapes first. Each one is copied
   to `candidates/prior_<entry-id>.py` and evaluated through the normal
   truth-verified path (`capture_sha256`, snapshot, `results.jsonl`). Its ledger
   row has the hypothesis `prior winner from <repo> (library entry <id>, 1.50x
@@ -1618,7 +1681,10 @@ playbook in `src/kernel_agent/agent/knowledge/`. Both are fed to the agents.
 The FP8 weight-only examples (`cuda_fp8_gemv.py`, `cuda_fp8_skinny_gemm.py`)
 and `low_precision.md` go to the engineer of an `fp8_weights` target (see
 "Low-precision weights"); `doctor --smoke` also runs them (sm_89+), in the
-near-lossless tier and against the exact tier, which must reject them.
+near-lossless tier and against the exact tier, which must reject them. The FP4
+example (`cuda_fp4_gemv.py`) goes to an `fp4_weights` target; the smoke test
+runs it in the near-lossless-fp4 tier and against the FP8 tier, which must
+reject it.
 
 **No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
 (`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a

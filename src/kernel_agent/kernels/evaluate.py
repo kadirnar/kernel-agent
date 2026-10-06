@@ -183,12 +183,12 @@ def _short_tb(limit: int = 4000) -> str:
 
 
 def capture_precision(capture: dict[str, Any]) -> str | None:
-    """The reduced precision of a capture in the near-lossless tier (``fp8_weights``: the
+    """The reduced precision of a capture in a near-lossless tier (``fp8_weights``: the
     speed of light counts its weights at 8 bits, :mod:`kernels.roofline`), else None."""
-    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, tier_of
+    from kernel_agent.kernels.compare import EXACT_TIER, tier_of
 
     precision = capture.get("precision")
-    return str(precision) if precision and tier_of(capture) == NEAR_LOSSLESS_TIER else None
+    return str(precision) if precision and tier_of(capture) != EXACT_TIER else None
 
 
 def _kernel_table(fn: Any, args: Any, kwargs: Any, top: int = 15) -> list[dict[str, Any]]:

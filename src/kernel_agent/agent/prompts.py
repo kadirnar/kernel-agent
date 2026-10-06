@@ -155,10 +155,13 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
-                    # fp8_weights / reduced (kernels.compare.PRECISIONS): --quality
-                    # near-lossless captures the target with the near-lossless tolerance
-                    # tier; an exact run refuses it. Default exact.
-                    "precision": {"type": "string", "enum": ["exact", "fp8_weights", "reduced"]},
+                    # fp8_weights / reduced / fp4_weights (kernels.compare.PRECISIONS):
+                    # --quality near-lossless captures the target with a near-lossless
+                    # tolerance tier; an exact run refuses it. Default exact.
+                    "precision": {
+                        "type": "string",
+                        "enum": ["exact", "fp8_weights", "reduced", "fp4_weights"],
+                    },
                     "precision_why": {"type": "string"},
                     # other starting points for parallel workers (workers.py)
                     "alternatives": {
@@ -207,6 +210,14 @@ decode GEMVs, 40 % of the run, memory bound: FP8 halves the bytes"). Its
 kernels then store the weights in FP8 e4m3 with one scale per output channel
 (activations stay bf16), the target is checked in the near-lossless tolerance
 tier, and every end-to-end evaluation in the run's perceptual gate.
+`precision: "fp4_weights"` (block-scaled FP4 weights, NVFP4: 4.5 bits per
+weight, about 4x FP8's error, its own looser tolerance tier) only for
+memory-bound decode GEMVs / skinny GEMMs where `fp8_weights` is already in use
+(a previous round, the library) or the *Ceilings* table shows the target still
+bound by streaming weights (its *FP4 w* floor well below its *FP8 w* floor);
+its `precision_why` names that evidence. FP4 on every layer can fail end to end
+where FP8 passes (VoxCPM2: FP4 in both LMs passes, the LocDiT is better kept in
+FP8): give FP4 to the largest weight streams first, as separate targets.
 `precision: "reduced"` (also
 with `precision_why`) is for another numerics-changing idea. Leave `precision`
 unset (exact) where lower precision buys nothing or risks the output: norms,
@@ -413,10 +424,10 @@ check with a fallback.
 def reduced_precision(target: dict[str, Any], capture_info: dict[str, Any]) -> str | None:
     """The reduced precision a target may use: its spec's ``precision`` when its capture is
     in the near-lossless tier (``--quality near-lossless``), else None."""
-    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, REDUCED_PRECISIONS
+    from kernel_agent.kernels.compare import EXACT_TIER, REDUCED_PRECISIONS, tier_of
 
     precision = target.get("precision")
-    if precision in REDUCED_PRECISIONS and capture_info.get("tier") == NEAR_LOSSLESS_TIER:
+    if precision in REDUCED_PRECISIONS and tier_of(capture_info) != EXACT_TIER:
         return str(precision)
     return None
 
@@ -438,6 +449,21 @@ def _precision_block(precision: str | None, target: dict[str, Any]) -> str:
   weights" below;
 * report the numerical error in `NOTES.md`: `fp8_error(weight, q, scale)` of the
   weights and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
+    elif precision == "fp4_weights":
+        contract = """FP4 weight-only (NVFP4):
+* quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
+  quantize_fp4, fp4_error`): e2m1 codes, two per byte (even k in the low nibble),
+  one e4m3 scale per 16 consecutive weights of a row and one fp32 scale per
+  tensor (`fmt="mxfp4"`: a power-of-two scale per 32, less accurate); keep no
+  bf16 copy (a quarter of the bytes is the point);
+* activations stay bf16 (never quantise them: that is W4A4), accumulate in fp32:
+  scale each block's partial sum by its block scale (or dequantise in registers),
+  the tensor scale and bias once per output in the epilogue, round to bf16 once;
+* verified example: `cuda_fp4_gemv.py` (decode GEMV, M <= 4); guide:
+  "Low-precision weights" below;
+* report the numerical error in `NOTES.md`: `fp4_error(weight, codes, scales,
+  tensor_scale)` of the weights and the evaluator's per-case `min_cosine` /
+  `max_rel_l2`. FP4 moves outputs ~4x more than FP8: the perceptual gate decides."""
     else:
         contract = """Reduced precision: keep the change to the numerics as small as the speedup
 allows, and report the numerical error (the evaluator's per-case `min_cosine` /
@@ -445,13 +471,28 @@ allows, and report the numerical error (the evaluator's per-case `min_cosine` /
     return f"""
 # Precision: `{precision}`
 This target may change numerics{why}.
-The evaluator checks it in the near-lossless tolerance tier: per output tensor
-cosine >= 0.996, relative L2 error <= 0.08, norm within ±2 %, every element
-within 0.5 x RMS + 0.125 x |reference| (the exact tier would reject FP8
-weights). End to end, the run's perceptual gate decides. This replaces the "no
+The evaluator checks it in {_tier_bounds(precision)} (the exact tier would reject
+low-precision weights). End to end, the run's perceptual gate decides. This replaces the "no
 fp8/int8" rule below for this target only.
 {contract}
 """
+
+
+def _tier_bounds(precision: str) -> str:
+    """The tolerance tier of a reduced precision and its bounds (kernels/compare.py)."""
+    from kernel_agent.kernels.compare import (
+        NEAR_LOSSLESS_BOUNDS,
+        NEAR_LOSSLESS_TIER,
+        PRECISION_TIERS,
+    )
+
+    tier = PRECISION_TIERS.get(precision, NEAR_LOSSLESS_TIER)
+    cosine, rel_l2, norm, (a, r) = NEAR_LOSSLESS_BOUNDS[tier]
+    return (
+        f"the {tier} tolerance tier: per output tensor\ncosine >= {cosine:g}, relative "
+        f"L2 error <= {rel_l2:g}, norm within ±{norm * 100:g} %, every element\nwithin "
+        f"{a:g} x RMS + {r:g} x |reference|"
+    )
 
 
 def engineer_prompt(
