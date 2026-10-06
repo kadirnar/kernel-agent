@@ -988,7 +988,9 @@ All limits are off by default (`kernel_agent/budget.py`).
   transform agent starts, the elapsed time and the sum of `costs.json` are
   checked. Once the budget is spent, the remaining agents are skipped, but
   integrate and report always run on whatever results exist. 15 % of
-  `--max-hours` (`--budget-reserve`) is kept for them. Each agent's own USD cap
+  `--max-hours` (`--budget-reserve`) is kept for them, in `improve` the
+  estimated final integration when that is longer (see "kernel-agent improve").
+  Each agent's own USD cap
   (`--budget`) is lowered to what is left of `--max-usd`. Time counts from the
   start of the current `optimize`/`resume` process; USD counts the whole run.
   On a Claude subscription (`--auth subscription`, see "Authentication and
@@ -1293,8 +1295,28 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   evaluations in a row without a new best, across slices; `--sol-stop 0.9` of
   the speed of light; `--target-hours 2` spent in its slices; the module
   `--speedup-goal 2` reached. `0` turns a rule off. An arm whose last two slices
-  made no evaluation stops too. The loop ends when the budget is spent or every
-  arm has stopped, or after 3 agent sessions in a row failed.
+  made no evaluation stops too; a slice that ran out of time does not count (see
+  "Time budget" below). The loop ends when the budget is spent or every arm has
+  stopped, or after 3 agent sessions in a row failed.
+* **Time budget** (`--max-hours`). The final integration needs time too, and
+  `improve` keeps it from the agents: its expected duration is the number of
+  A/B measurements (each item alone, the systems agent's best combination, each
+  item added to it; a re-integration measures only new or changed items alone,
+  by file sha256, and the combination steps) × the median `eval_s` of the
+  run's integration rows (else twice that of an end-to-end evaluation, else
+  4 min). It is estimated before every slice and after every evaluation (one may
+  add an item), and kept when it is longer than `--budget-reserve`: no session
+  runs into it (the evaluation advice says `stop`). A slice starts only when the
+  time left for agents covers the agent's warm-up (4 min), one evaluation of
+  that arm (the median `eval_s` of its evaluations, else 1 min for a kernel and
+  2 min end to end) and the 2-min wrap-up; else the next arm that fits gets it,
+  and when none fits the loop stops and goes to the final integration, logging
+  why (`time left 75.4 min < one slice of rmsnorm (6.7 min: warm-up, one
+  evaluation, wrap-up) + 72 min kept for the final integration (25 A/B
+  measurements × 2.9 min)`). A slice that made no evaluation with less than
+  twice that time left (`budget_short` in `improve.json`) counts neither as idle
+  nor as stale for its arm; the arm gets its next slice only with twice the
+  time.
 * **Research on plateaus** (`kernel_agent/research.py`, auto-gpu-kernel's
   research subagent). When a kernel target has plateaued, i.e. 4 evaluations in
   a row without a new best (the advice turns `consider_stopping`), `--patience`

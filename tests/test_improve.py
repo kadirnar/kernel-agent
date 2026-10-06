@@ -11,6 +11,7 @@ import struct
 import pytest
 
 from kernel_agent import charts, cli, dryrun, improve, ledger, orchestrator, scheduler
+from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.improve import ImproveConfig, Improver, kernel_digest, open_ideas
@@ -426,6 +427,79 @@ def test_idle_arms_stop(tmp_path):
     assert arms["attn"].idle == 2 and "no evaluation" in arms["attn"].stop
     interrupted = [*idle, {"arm": "attn", "status": "interrupted", "evals": 0}]
     assert next(a for a in build_arms(orch.run, Policy(), interrupted) if a.id == "attn").idle == 0
+    # slices the time budget cut short count neither as idle nor as stale (issue #100)
+    short = [{**s, "budget_short": True} for s in idle]
+    attn = next(a for a in build_arms(orch.run, Policy(), short) if a.id == "attn")
+    assert (attn.idle, attn.stale, attn.stop, attn.short) == (0, 0, None, True)
+    attn = next(a for a in build_arms(orch.run, Policy(), [*short, idle[0]]) if a.id == "attn")
+    assert (attn.idle, attn.stale, attn.stop, attn.short) == (1, 1, None, False)
+
+
+# ------------------------------------------------------------------ time (issue #100)
+
+
+def test_slice_seconds():
+    kernel = Arm("a", KERNEL, ref_ms=1.0, rows=[{"eval_s": s} for s in (10.0, 30.0, None, 20.0)])
+    extra = scheduler.WARMUP_SECONDS + scheduler.WRAP_UP_SECONDS
+    assert scheduler.slice_seconds(kernel) == pytest.approx(extra + 20.0)  # the median
+    assert scheduler.slice_seconds(Arm("s", SYSTEMS, ref_ms=1.0)) == pytest.approx(
+        extra + scheduler.EVAL_SECONDS[SYSTEMS]  # none timed yet
+    )
+
+
+def test_integration_estimate_covers_the_measured_integration(tmp_path):
+    orch, world = make(tmp_path)
+    improver = Improver(orch, ImproveConfig(), require_capture=False, live_charts=False)
+    run = orch.run
+    with world.installed():
+        assert improver._integration_estimate() == (0, scheduler.AB_SECONDS)  # nothing yet
+        for k in range(4):
+            arms = improver._pickable()
+            asyncio.run(improver._slice(pick(arms), arms))
+            if k % 2 == 0:
+                continue
+            steps, each = improver._integration_estimate()
+            before = len(ledger.rows(run))
+            asyncio.run(orch.integrate(reuse=True))
+            measured = len(ledger.rows(run)) - before
+            assert steps >= measured > 0  # the first measures everything, the second reuses
+        steps, each = improver._integration_estimate()
+    assert steps == 0  # nothing changed since: a re-integration reuses every measurement
+    integrated = [r["eval_s"] for r in ledger.rows(run) if r["backend"] == "integrate"]
+    assert min(integrated) <= each <= max(integrated) and each > 100  # simulated A/B time
+
+
+def test_little_time_left_goes_to_the_final_integration(tmp_path):
+    orch, world = make(tmp_path, max_hours=5.0)  # simulated hours
+    _, reason = loop(orch, world, integrate_every=0)
+    state = read_json(orch.run.root / "improve.json")
+    assert reason.startswith("time left") and "< one slice of" in reason
+    assert "kept for the final integration (" in reason and "A/B measurements" in reason
+    slices = state["slices"]
+    assert all(s["limit_s"] >= s["need_s"] for s in slices if "limit_s" in s)
+    assert any("limit_s" in s for s in slices)  # the last ones ran on what the budget left
+    assert [i["why"] for i in state["integrations"]] == ["final integration"]
+    # the final integration fits in the time the loop kept for it
+    assert state["finished"]["at"] - world.clock.t0 <= 5.0 * 3600
+
+
+def test_a_slice_out_of_time_does_not_stop_its_arm(tmp_path):
+    orch, world = make(tmp_path)
+    # 10 min for agents: enough for one slice of any arm (7-8 min), not for twice that
+    orch.budget.max_hours = 600 / 3600 / (1 - orch.budget.reserve)
+
+    async def decline(name, *, result=None, **_):  # too little time to write a candidate
+        world.clock.advance(30)
+        return result or AgentResult(name=name)
+
+    world.run_agent = decline
+    improver, reason = loop(orch, world)
+    slices = read_json(orch.run.root / "improve.json")["slices"]
+    assert slices and all(s["budget_short"] and s["evals"] == 0 for s in slices)
+    assert len({s["arm"] for s in slices}) == len(slices)  # no arm twice: it needs 2x now
+    arms = {a.id: a for a in improver.arms()}
+    assert all(arms[s["arm"]].stop is None and arms[s["arm"]].short for s in slices)
+    assert reason.startswith("time left") and "kept for integrate + report" in reason
 
 
 def test_recover_a_slice_left_running(tmp_path):

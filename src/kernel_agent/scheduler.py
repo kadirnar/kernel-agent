@@ -43,19 +43,33 @@ has stopped (:mod:`kernel_agent.improve`).
 A kernel arm that has plateaued (:func:`plateau`) gets a research session
 before the patience rule stops it (:mod:`kernel_agent.research`); a plan it
 wrote restarts the arm's count of evaluations without a new best.
+
+Time (issue #100): a slice of an arm needs the agent's warm-up, one evaluation
+of the arm and the wrap-up (:func:`slice_seconds`), and the run's time budget
+keeps the final integration's expected duration (:func:`integration_estimate`).
+A slice that made no evaluation in a session the time budget cut short
+(``budget_short`` in its record) counts neither as idle nor as stale.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
+import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger
-from kernel_agent.budget import PLATEAU, PRIOR_HYPOTHESIS, SOL_STOP_PCT, Standing, improves
+from kernel_agent import ledger, truth
+from kernel_agent.budget import (
+    PLATEAU,
+    PRIOR_HYPOTHESIS,
+    SOL_STOP_PCT,
+    WRAP_UP_SECONDS,
+    Standing,
+    improves,
+)
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
@@ -64,6 +78,12 @@ KERNEL = "kernel"
 MIN_FURTHER = 1.1  # without a SOL estimate, assume at least 10 % more is always possible
 IDLE_SLICES = 2  # an arm whose last slices made no evaluation at all is stopped
 FAIL_STREAK = 3  # failed evaluations in a row that call for a research session
+# An agent reads its digest and NOTES.md and writes a candidate before its first evaluation:
+# median 142-328 s from slice start to the first evaluation in three VoxCPM2 runs.
+WARMUP_SECONDS = 240.0
+EVAL_SECONDS = {KERNEL: 60.0, SYSTEMS: 120.0}  # one evaluation of an arm with none timed yet
+AB_SECONDS = 2 * EVAL_SECONDS[SYSTEMS]  # one A/B of the integration: A and B end to end
+SHORT_SLICE = 2.0  # a session with less than this × slice_seconds was cut short by the budget
 
 
 @dataclass(frozen=True)
@@ -97,6 +117,7 @@ class Arm:
     fails: int = 0  # failed evaluations in a row (since the last research plan)
     stale: int = 0  # slices since the last slice that found a new best
     idle: int = 0  # finished slices in a row without a single evaluation
+    short: bool = False  # its last slice made no evaluation in a session the budget cut short
     hours: float = 0.0  # time spent in this arm's improve slices
     expected_ms: float = 0.0
     index: float = 0.0  # UCB index
@@ -418,11 +439,13 @@ def build_arms(
     for arm in arms:
         mine = [s for s in slices if s.get("arm") == arm.id]
         arm.hours = sum(float(s.get("seconds") or 0.0) for s in mine) / 3600
-        for s in reversed(mine):
+        arm.short = bool(mine and mine[-1].get("budget_short"))
+        tried = [s for s in mine if not s.get("budget_short")]  # out of time: says nothing
+        for s in reversed(tried):
             if s.get("improved"):
                 break
             arm.stale += 1
-        for s in reversed(mine):
+        for s in reversed(tried):
             if s.get("evals") or s.get("status") == "interrupted":
                 break
             arm.idle += 1
@@ -482,3 +505,85 @@ def rank(arms: list[Arm], policy: Policy) -> list[Arm]:
 def pick(arms: list[Arm]) -> Arm | None:
     """The live arm with the highest score (arms as returned by :func:`build_arms`)."""
     return next((a for a in arms if a.stop is None), None)
+
+
+# ------------------------------------------------------------------ time
+
+
+def median_eval_s(rows: Iterable[dict[str, Any]]) -> float | None:
+    """Median ``eval_s`` of ledger rows (None: none was timed)."""
+    times = [float(r["eval_s"]) for r in rows if r.get("eval_s")]
+    return statistics.median(times) if times else None
+
+
+def slice_seconds(arm: Arm) -> float:
+    """Time one slice of ``arm`` needs: the agent's warm-up, one evaluation of the arm (the
+    median ``eval_s`` of its evaluations, else :data:`EVAL_SECONDS`) and the wrap-up after
+    it (the evaluation advice says ``stop`` with less than ``WRAP_UP_SECONDS`` left)."""
+    return WARMUP_SECONDS + (median_eval_s(arm.rows) or EVAL_SECONDS[arm.kind]) + WRAP_UP_SECONDS
+
+
+def integration_estimate(
+    run: RunDir, rows: list[dict[str, Any]], arms: list[Arm], min_speedup: float
+) -> tuple[int, float]:
+    """(A/B measurements, seconds per measurement) of an integration of everything so far.
+
+    Its items (as ``Orchestrator._integration_items`` takes them, without the digest
+    checks): every kernel target whose best reaches ``min_speedup`` and the version of
+    the fastest passing end-to-end run of every transform idea faster than the baseline.
+    It measures each alone, then the systems agent's fastest combination of them (the
+    seed; none: the fastest item alone), then adds each item outside the seed in turn.
+    A re-integration reuses what the last one measured with the same content
+    (:mod:`kernel_agent.integrate.reuse`; here: the sha256 of each item's file): it
+    measures only the new and changed items alone, but the combination steps again
+    (they follow the order of the gains alone), and nothing when no item changed. One
+    measurement takes the median ``eval_s`` of the run's integration rows, else twice
+    that of an end-to-end evaluation (an A/B runs A and B), else :data:`AB_SECONDS`."""
+    items = {  # label -> item
+        a.id: f"{a.id}={run.history_dir(a.id) / a.best_snapshot}"
+        for a in arms
+        if a.kind == KERNEL and a.best >= min_speedup and a.best_snapshot
+    }
+    passing = [
+        rec
+        for rec in read_jsonl(run.results_file())
+        if rec.get("passed") and float(rec.get("speedup") or 0.0) > 1.0
+    ]
+    for rec in sorted(passing, key=lambda r: float(r["speedup"])):  # the fastest one last
+        for name in rec.get("transforms") or []:
+            items[ledger.snapshot_stem(name)] = str(run.history_dir() / Path(name).name)
+    combos = [
+        (float(rec["speedup"]), parts)
+        for rec in passing
+        if (parts := len(rec.get("transforms") or []) + len(rec.get("kernels") or [])) > 1
+    ]
+    seed = max(combos)[1] if combos else 1
+    last = read_json(run.root / "integration.json", {}) or {}
+    reusable = [h for h in last.get("history") or [] if h.get("reuse_key")]  # issue #93
+    alone = _changed(items, reusable) if reusable else len(items)
+    steps = alone + bool(combos) + max(len(items) - seed, 0) if alone else 0
+    measured = [r for r in rows if r["target"] == ledger.E2E and r["backend"] == "integrate"]
+    each = median_eval_s(measured)
+    if each is None and (one := median_eval_s(systems_rows(rows))) is not None:
+        each = 2 * one
+    return steps, each or AB_SECONDS
+
+
+def _changed(items: dict[str, str], history: list[dict[str, Any]]) -> int:
+    """How many of ``items`` (label → item) no step of an integration's ``history`` holds
+    with the same content (the sha256 of the item's file: a kernel's ``target=path``)."""
+    hashes: dict[str, str | None] = {}
+
+    def content(item: str) -> tuple[str, str | None]:
+        if item not in hashes:
+            target, sep, rest = item.partition("=")
+            path = Path(rest if sep and "/" not in target else item)
+            hashes[item] = truth.sha256_file(path) if path.is_file() else None
+        return ledger.item_label(item), hashes[item]
+
+    before = {
+        content(item)
+        for h in history
+        for item in [*h.get("items", []), *(h.get("ab") or {}).get("a_items", [])]
+    }
+    return sum(content(item) not in before for item in items.values())

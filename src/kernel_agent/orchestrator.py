@@ -1202,7 +1202,7 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """One integration measurement (``e2e`` / ``e2e_ab`` of ``combo``) and its ledger row
         (none when an A/B could not run in-process: nothing was measured)."""
-        start = time.perf_counter()
+        start = ledger.clock()  # simulated in a dry run, like the worker's measurements
         r = self._worker(command, *cli, *self.truth.worker_args())
         if command == "e2e_ab" and r.get("status") in abtest.FALLBACK:
             return r
@@ -1215,7 +1215,7 @@ class Orchestrator:
             hypothesis="integration: "
             + " + ".join(names)
             + (" alone" if len(names) == 1 and not note else note),
-            eval_s=round(time.perf_counter() - start, 1),
+            eval_s=round(ledger.clock() - start, 1),  # improve.py's integration estimate
         )
         gpu = r.get("gpu") or (r.get("ab") or {}).get("gpu")
         if message := telemetry.warning(gpu):
