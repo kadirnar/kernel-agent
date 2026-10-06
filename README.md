@@ -872,6 +872,55 @@ If another snapshot of the target now ranks first, that one is re-checked and
 integrated instead. The standalone `kernel-agent recheck` command still fails on
 a disagreement.
 
+### Out-of-bounds accesses: memcheck
+
+A kernel can read past a buffer and still pass every check above: the extra
+elements are masked out of its result. PyTorch's caching allocator keeps the
+memory after a tensor mapped, so nothing faults until it is released (an
+`empty_cache()`, the other state of an A/B) and the read lands on an unmapped
+page: `CUDA error: an illegal memory access`, far from the kernel that caused it.
+
+Every kernel that passes the integration's re-check therefore runs once more
+under `compute-sanitizer --tool memcheck` (`kernels/memcheck.py`) before it is
+accepted, in a process of its own with `PYTORCH_NO_CUDA_MEMORY_CACHING=1` (every
+tensor is its own `cudaMalloc`, so the sanitizer knows its exact bounds): every
+captured case, plus one odd-size variant of each. The variant takes the sizes that
+differ between the captured cases (batch, sequence length) one smaller, which
+leaves a partial tile at the end of every tiled loop; a variant the reference
+cannot run is dropped, and the candidate may refuse one (an exception is not a
+memory error). A memory error refuses the kernel with status `memcheck`; the
+sanitizer's first report goes to `integration.json` → `recheck` → `memcheck`
+(with `seconds`, the error count and the variants), the report, a `memcheck` event
+per run, and the target's next engineer prompt (`## Refused by the
+integration`). A missing or failing sanitizer is recorded with its reason
+(`skipped`, `error`, `timeout`) and the kernel kept; a re-integration runs such a
+memcheck again, and reuses a decided one.
+
+Issue #115's VAE decoder kernel (`vae_decoder__reduced` 004, Triton, accepted at
+7.88×) is clean on its captured cases alone (`[16, 64, 240]`, `[16, 64, 32]`,
+`[8, 64, 32]`: every row count a whole tile; 7 s) and fails on their variants
+(`[15, 64, 239]`, `[15, 64, 31]`, `[7, 64, 31]`: 23808 memory errors, 61 s): the
+SampleRateCondition epilogue loads its per-batch scale and bias at row `rm // T`
+without the row mask, so the padding rows of a partial last tile index past the
+`[B, C]` tensors. With the caching allocator and an `empty_cache()` before each
+call, partial-tile shapes end in an illegal memory access (call 46 of 50,
+`B=15, T=37`, every time); whole tiles never do (60 calls), nor do partial tiles
+without `empty_cache()`. Clamping the row (`tl.minimum(rm, M - 1) // T`) makes it
+clean under memcheck and in that loop.
+
+`compute-sanitizer` needs `TreeLauncherSubreaper` and its injection libraries next
+to the binary. The `nvidia-cuda-sanitizer-api` pip wheel ships the binary without
+them, so it launches nothing ("Target application terminated before first
+instrumented API call", even for `/bin/echo`). `toolchain.find_sanitizer` takes the
+first complete install from `KERNEL_AGENT_COMPUTE_SANITIZER`, `CUDA_HOME`, `PATH`,
+`/usr/local/cuda`, `/opt/cuda`, `~/.cache/kernel-agent/compute-sanitizer/` and the
+pip wheels, and says why it passed over the others. `kernel-agent doctor
+--fetch-sanitizer` installs NVIDIA's redistributable archive for the driver's CUDA
+version there (sha256 from NVIDIA's manifest). `kernel-agent doctor` prints the
+sanitizer it uses and runs a self-test: a deliberate one-block overrun of a Triton
+kernel must be reported, an in-bounds kernel must not (2 s).
+`kernel-agent memcheck capture.pt candidate.py` runs one candidate.
+
 ### Ground truth the agents cannot quietly change
 
 Agents have a Bash tool, so file permissions alone cannot protect what the
@@ -2046,6 +2095,9 @@ kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--co
 kernel-agent recheck capture.pt candidate.py [--seeds 3] [--seed S] [--speedup X] [--no-evaluate]
                                        fresh inputs, reference and candidate in separate
                                        processes (see "Independent re-check of winners")
+kernel-agent memcheck capture.pt candidate.py [--no-variants] [--timeout 900]
+                                       the captured cases (+ odd-size variants) under
+                                       compute-sanitizer memcheck (see "Out-of-bounds accesses")
 kernel-agent bench-suite [--kernelbench-level 1] [--n 20 | --problems 1,19,36] [--evaluations 4]
   [--dry-run] [--kernelbench-dir DIR | --kernelbench-ref main] [--max-input-mb 16]
   [--max-usd U] [--agent-minutes 30] [--program FILE]   KernelBench fast_p (see above)
@@ -2053,7 +2105,7 @@ kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
 kernel-agent library list|show <id>|prune [--older-than DAYS]|path   cross-run kernel library
-kernel-agent doctor [--smoke] [--remeasure-peaks]
+kernel-agent doctor [--smoke] [--remeasure-peaks] [--fetch-sanitizer]
 kernel-agent install-claude-code <project-dir>
 ```
 

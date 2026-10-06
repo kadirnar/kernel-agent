@@ -248,6 +248,9 @@ def write_report(run: RunDir) -> Path:
                 + recheck.describe(r)
                 + ("" if r.get("passed") else " — refused")
             )
+            if r.get("status") == "memcheck" and (r.get("memcheck") or {}).get("report"):
+                lines += ["", "  ```", *[f"  {x}" for x in r["memcheck"]["report"].splitlines()]]
+                lines += ["  ```"]
         for h in integration.get("history", []):
             ab = h.get("ab") or {}
             verdict = ""

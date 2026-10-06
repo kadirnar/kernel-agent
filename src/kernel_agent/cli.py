@@ -48,12 +48,40 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
     from kernel_agent.gpulock import describe
 
     print(describe())  # the GPU lock pool (nvidia-smi, CUDA_VISIBLE_DEVICES, KERNEL_AGENT_GPUS)
+    if not _doctor_sanitizer(ns, gpu=tc.gpu is not None):
+        return 1
     if ns.smoke:
         from kernel_agent.selftest import smoke_backends
 
         ok = smoke_backends(verbose=True)
         return 0 if ok else 1
     return 0
+
+
+def _doctor_sanitizer(ns: argparse.Namespace, *, gpu: bool) -> bool:
+    """``compute-sanitizer`` (the integration's memcheck, kernels/memcheck.py): where it is
+    (``--fetch-sanitizer``: install NVIDIA's first) and, with a GPU, the self-test that it
+    reports a deliberate out-of-bounds read. False: a fetch or the self-test failed."""
+    from kernel_agent import toolchain
+
+    if ns.fetch_sanitizer:
+        try:
+            print(f"installed {toolchain.fetch_sanitizer()}")
+        except Exception as exc:
+            print(f"compute-sanitizer: fetch failed: {exc}")
+            return False
+    tool = toolchain.sanitizer()
+    print(tool.describe())
+    for why in tool.rejected if tool.path else tool.rejected[1:]:  # [0]: in the reason
+        print(f"  not usable: {why}")
+    if not tool.path or not gpu:
+        return True
+    from kernel_agent.kernels.memcheck import selftest
+
+    check = selftest(tool)
+    verdict = "ok" if check.get("ok") else "FAILED"
+    print(f"memcheck self-test: {verdict} ({check.get('seconds')} s): {check.get('reason')}")
+    return bool(check.get("ok"))
 
 
 def _seeds(raw: str) -> int | str | None:
@@ -252,6 +280,19 @@ def cmd_recheck(ns: argparse.Namespace) -> int:
     print(json.dumps(result, indent=2, default=str))
     print(f"recheck: {describe(result)}")
     return 0 if result.get("passed") else 1
+
+
+def cmd_memcheck(ns: argparse.Namespace) -> int:
+    from kernel_agent.kernels.memcheck import STATUS, describe, run_memcheck
+
+    result = run_memcheck(
+        Path(ns.capture), Path(ns.candidate), timeout=ns.timeout, variants=not ns.no_variants
+    )
+    print(json.dumps(result, indent=2, default=str))
+    if result.get("report"):
+        print(result["report"])
+    print(describe(result))
+    return 1 if result.get("status") == STATUS else 0
 
 
 def cmd_install_claude_code(ns: argparse.Namespace) -> int:
@@ -453,6 +494,12 @@ def main(argv: list[str] | None = None) -> int:
         "--remeasure-peaks", action="store_true", help="measure the roofline peaks again"
     )
     p.add_argument("--no-peaks", action="store_true", help="do not measure missing peaks")
+    p.add_argument(
+        "--fetch-sanitizer",
+        action="store_true",
+        help="install compute-sanitizer from NVIDIA's CUDA redistributables (the pip wheel "
+        "cannot launch anything)",
+    )
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("optimize", help="full pipeline: profile, plan, write kernels, integrate")
@@ -563,6 +610,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-evaluate", action="store_true", help="no evaluator verdict to compare")
     p.add_argument("--timeout", type=float, default=600.0, help="seconds per subprocess")
     p.set_defaults(func=cmd_recheck)
+
+    p = sub.add_parser(
+        "memcheck",
+        help="run a candidate on a capture's cases under compute-sanitizer memcheck",
+    )
+    p.add_argument("capture")
+    p.add_argument("candidate")
+    p.add_argument("--no-variants", action="store_true", help="the captured shapes only")
+    p.add_argument("--timeout", type=float, default=900.0, help="seconds")
+    p.set_defaults(func=cmd_memcheck)
 
     p = sub.add_parser(
         "install-claude-code", help="add /optimize-model + kernel-engineer subagent to a project"

@@ -176,6 +176,29 @@ def _footer(notes: str) -> list[str]:
     ]
 
 
+def refusals(run: RunDir, target_id: str) -> list[str]:
+    """``## Refused by the integration``: this target's snapshots the last integration's
+    re-check refused (``integration.json``), with the reason and, for memory errors under
+    memcheck (kernels/memcheck.py), the sanitizer's first report."""
+    data = read_json(run.root / "integration.json", {}) or {}
+    refused = [r for r in data.get("recheck") or [] if r.get("target") == target_id]
+    refused = [r for r in refused if not r.get("passed")]
+    if not refused:
+        return []
+    lines = [
+        "",
+        "## Refused by the integration",
+        "These snapshots passed the evaluator but not the integration's re-check; fix the "
+        "cause before you build on one of them.",
+    ]
+    for r in refused:
+        why = str(r.get("reason") or "")[:600]
+        lines.append(f"* `history/{r.get('snapshot')}` ({r.get('status')}): {why}")
+        if report := (r.get("memcheck") or {}).get("report"):
+            lines += ["  ```", *[f"  {x}" for x in report.splitlines()], "  ```"]
+    return lines
+
+
 def kernel_digest(
     run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy, worker: int | None = None
 ) -> str:
@@ -191,6 +214,7 @@ def kernel_digest(
         )
     else:
         lines.append("* no correct candidate faster than the reference yet")
+    lines += refusals(run, arm.id)
     rows = arm.rows[-LAST_ROWS:]
     if rows:
         lines += ["", f"## Last {len(rows)} evaluations (oldest first; `keep` = new best)", ""]
