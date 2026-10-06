@@ -4,6 +4,7 @@
 
     until the budget is spent or every arm has stopped:
         pick the arm with the best score            (scheduler.py: Amdahl × UCB, stop rules)
+            that has time for a slice, the final integration's time kept   (issue #100)
         it has plateaued: first a clean-context research session that writes its
             plan.md (research.py; at most one per --research-every slices of the arm)
         run one slice: a fresh agent session with --slice evaluations, seeded with
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import math
 import re
 import time
 from collections.abc import Iterator
@@ -47,13 +49,16 @@ from kernel_agent.dashboard import refresh
 from kernel_agent.research import rows_table
 from kernel_agent.scheduler import (
     KERNEL,
+    SHORT_SLICE,
     SYSTEMS,
     Arm,
     Policy,
     build_arms,
+    integration_estimate,
     pick,
     plateau,
     rank,
+    slice_seconds,
     snapshot_record,
 )
 from kernel_agent.workspace import RunDir, read_json, write_json
@@ -300,6 +305,7 @@ class Improver:
         self.state.setdefault("research", [])  # improve.json from before research sessions
         self.require_capture = require_capture  # dry runs have no captures
         self.live_charts = live_charts
+        self.kept = ""  # what the time budget keeps for the final integration (last logged)
 
     # -------------------------------------------------------- helpers
 
@@ -369,6 +375,65 @@ class Improver:
         refresh(self.run)
         slices_chart(self.run)
 
+    # -------------------------------------------------------- time (issue #100)
+
+    def _integration_estimate(self) -> tuple[int, float]:
+        rows = ledger.rows(self.run)
+        return integration_estimate(self.run, rows, self.arms(rows), self.orch.cfg.min_speedup)
+
+    def _keep_time(self) -> None:
+        """Keep the final integration's expected duration out of the agents' time
+        (``Budget.final_reserve_s``, :func:`~kernel_agent.scheduler.integration_estimate`),
+        estimated again after every evaluation (an evaluation may add an item): no session
+        runs into it (the evaluation advice says ``stop``), and no slice starts in it."""
+        budget = self.orch.budget
+        if budget.max_hours is None:
+            return
+        steps, each = self._integration_estimate()
+        budget.final_reserve_s = steps * each
+        budget.estimate_reserve = lambda: math.prod(self._integration_estimate())
+        what = f"integrate + report ({budget.reserve:.0%} of --max-hours)"
+        if budget.final_reserve_s > budget.max_hours * 3600 * budget.reserve:
+            what = f"the final integration ({steps} A/B measurements × {each / 60:.1f} min)"
+        if (kept := f"{budget.reserve_s() / 60:.0f} min kept for {what}") != self.kept:
+            log(kept)
+            self.kept = kept
+
+    def _in_time(self, arms: list[Arm]) -> tuple[Arm | None, str]:
+        """The best live arm with time left for one slice
+        (:func:`~kernel_agent.scheduler.slice_seconds`, ``SHORT_SLICE`` × that when its last
+        slice ran out of time without an evaluation), or None and why there is none."""
+        live = [a for a in arms if a.stop is None]
+        left = self.orch.budget.agent_seconds_left()
+        if left is None:
+            return live[0], ""
+        need = {a.id: slice_seconds(a) * (SHORT_SLICE if a.short else 1.0) for a in live}
+        arm = next((a for a in live if need[a.id] <= left), None)
+        if arm is not None and arm is not live[0]:
+            log(
+                f"{live[0].id}: a slice needs {need[live[0].id] / 60:.1f} min, "
+                f"{max(left, 0) / 60:.1f} min left; {arm.id} instead"
+            )
+        if arm is not None:
+            return arm, ""
+        least = min(live, key=lambda a: need[a.id])
+        total = max(self.orch.budget.seconds_left() or 0.0, 0.0)
+        return None, (
+            f"time left {total / 60:.1f} min < one slice of {least.id} "
+            f"({need[least.id] / 60:.1f} min: warm-up, one evaluation, wrap-up) + {self.kept}"
+        )
+
+    def _session_time(self, arm: Arm) -> dict[str, Any]:
+        """``limit_s`` (the time the run's budget leaves a slice's session, when less than
+        ``--agent-minutes``) and ``need_s`` (:func:`~kernel_agent.scheduler.slice_seconds`)
+        for its record: with less than ``SHORT_SLICE`` × ``need_s`` and no evaluation the
+        slice ran out of time (``budget_short``) and is not counted against the arm."""
+        budget = self.orch.budget
+        left = budget.agent_seconds_left()
+        if left is None or (budget.agent_minutes is not None and budget.agent_minutes * 60 <= left):
+            return {}
+        return {"limit_s": round(max(left, 0.0)), "need_s": round(slice_seconds(arm))}
+
     # -------------------------------------------------------- main
 
     async def improve(self) -> str:
@@ -393,6 +458,7 @@ class Improver:
     async def _loop(self) -> str:
         done = failed = 0
         while True:
+            self._keep_time()
             if reason := self.orch.budget.exhausted():
                 return reason
             if self.icfg.max_slices is not None and done >= self.icfg.max_slices:
@@ -406,6 +472,9 @@ class Improver:
                 return (
                     "every arm has stopped (" + "; ".join(f"{a.id}: {a.stop}" for a in arms) + ")"
                 )
+            arm, short = self._in_time(arms)  # no slice without time for one evaluation
+            if arm is None:
+                return short
             if (why := self.research_due(arm)) is not None:
                 await self._research(arm, why)
                 continue  # its plan restarts the arm's patience; the next slice reads it
@@ -447,6 +516,7 @@ class Improver:
             "exp_before": len(ledger.rows(self.run)),
             "best_before": arm.best,
             **{k: info[k] for k in ("remaining_ms", "headroom", "expected_ms", "index", "score")},
+            **self._session_time(arm),
         }
         self.state["slices"].append(rec)
         self.save()
@@ -589,6 +659,13 @@ class Improver:
         )
         if usd is not None:
             rec["usd"] = round(usd, 4)
+        short = "limit_s" in rec and rec["limit_s"] < SHORT_SLICE * rec["need_s"]
+        if short and not new and status in ("done", "timed_out"):
+            rec["budget_short"] = True  # out of time: not counted against the arm (scheduler)
+            log(
+                f"slice {rec['n']}: no evaluation with {rec['limit_s'] / 60:.1f} min of the time "
+                f"budget left: not counted against {rec['arm']}"
+            )
         self.save()
         ledger.event(
             self.run,

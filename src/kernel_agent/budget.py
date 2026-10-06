@@ -4,9 +4,11 @@
   agent starts, :meth:`Budget.exhausted` checks the elapsed time and the sum of
   ``costs.json``; once the budget is spent the remaining agents are skipped, but
   integrate + report always run on whatever exists (``reserve`` of the time
-  budget is kept for them). ``max_sessions`` limits the agent sessions this
-  process starts the same way, and a usage limit that resets only after the time
-  budget ends (``blocked``, :mod:`kernel_agent.agent.auth`) stops new agents too.
+  budget is kept for them, or the improve loop's estimate of its final
+  integration, ``final_reserve_s``, when that is longer). ``max_sessions``
+  limits the agent sessions this process starts the same way, and a usage limit
+  that resets only after the time budget ends (``blocked``,
+  :mod:`kernel_agent.agent.auth`) stops new agents too.
 * ``agent_minutes`` limits one agent session: the orchestrator wraps
   ``run_agent`` in ``asyncio.timeout`` (see :meth:`Budget.start_agent`), and
   each agent's ``max_budget_usd`` is lowered to the USD that is left.
@@ -23,9 +25,10 @@ USD is the sum of ``costs.json``, so it covers the whole run.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -175,6 +178,9 @@ class Budget:
     restarted: dict[str, int] = field(default_factory=dict)
     sessions: int = 0  # agent sessions started by this process (a resumed one counts once)
     blocked: str | None = None  # why no agent can run any more (a usage limit, auth.py)
+    final_reserve_s: float = 0.0  # time the improve loop keeps for its final integration
+    # re-estimates final_reserve_s after every evaluation (one may add an integration item)
+    estimate_reserve: Callable[[], float] | None = None
 
     @classmethod
     def from_config(cls, run: RunDir, cfg: OptimizeConfig) -> Budget:
@@ -202,11 +208,19 @@ class Budget:
     def usd_left(self) -> float | None:
         return None if self.max_usd is None else self.max_usd - self.spent_usd()
 
+    def seconds_left(self) -> float | None:
+        """Time left of ``max_hours`` (None: no time limit)."""
+        return None if self.max_hours is None else self.max_hours * 3600 - self.elapsed_s()
+
+    def reserve_s(self) -> float:
+        """Seconds of ``max_hours`` kept for integrate + report: ``reserve`` of it, or the
+        improve loop's estimate of its final integration (``final_reserve_s``) if longer."""
+        return max((self.max_hours or 0.0) * 3600 * self.reserve, self.final_reserve_s)
+
     def agent_seconds_left(self) -> float | None:
-        """Time left for agents; ``reserve`` of ``max_hours`` is kept for integrate + report."""
-        if self.max_hours is None:
-            return None
-        return self.max_hours * 3600 * (1 - self.reserve) - self.elapsed_s()
+        """Time left for agents; :meth:`reserve_s` is kept for integrate + report."""
+        left = self.seconds_left()
+        return None if left is None else left - self.reserve_s()
 
     def exhausted(self) -> str | None:
         """Why no further kernel/transform agent may start, or None."""
@@ -216,9 +230,12 @@ class Budget:
             return f"session budget spent ({self.sessions} of {self.max_sessions} agent sessions)"
         left = self.agent_seconds_left()
         if self.max_hours is not None and left is not None and left < MIN_AGENT_SECONDS:
+            kept = f"{self.reserve:.0%}"
+            if self.final_reserve_s > self.max_hours * 3600 * self.reserve:
+                kept = f"{self.final_reserve_s / 60:.0f} min"
             return (
                 f"time budget spent ({self.elapsed_s() / 60:.1f} of "
-                f"{self.max_hours * 60:.0f} min used, {self.reserve:.0%} kept for "
+                f"{self.max_hours * 60:.0f} min used, {kept} kept for "
                 "integrate + report)"
             )
         usd = self.usd_left()
@@ -317,6 +334,9 @@ class Budget:
         more further work cannot pay off, so the advice is ``stop``.
         """
         used = self.evals[agent] = self.evals.get(agent, 0) + 1
+        if self.estimate_reserve is not None:
+            with contextlib.suppress(Exception):  # advice only: never fails an evaluation
+                self.final_reserve_s = self.estimate_reserve()
         minutes = self.minutes_left(agent)
         records = read_jsonl(results)
         streak = non_improving_streak(records, ok_key=ok_key)

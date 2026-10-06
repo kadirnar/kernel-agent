@@ -151,6 +151,29 @@ def test_budget_limits(tmp_path):
     assert "USD budget spent" in (Budget(run, max_usd=4.0).exhausted() or "")
 
 
+def test_final_integration_reserve(tmp_path):
+    """The improve loop's estimate of its final integration is kept from the agents when it
+    is longer than ``reserve`` of the time budget, and estimated again after every
+    evaluation (issue #100)."""
+    run = RunDir.create(tmp_path, "org/m")
+    budget = Budget(run, max_hours=2.0, final_reserve_s=600.0)  # less than 15 % (18 min)
+    assert budget.reserve_s() == pytest.approx(0.15 * 2 * 3600)
+    budget.final_reserve_s = 3600.0
+    assert budget.reserve_s() == 3600.0
+    assert budget.agent_seconds_left() == pytest.approx(3600.0, abs=5)
+    assert budget.start_agent("kernel-t") == pytest.approx(3600.0, abs=5)  # sessions too
+    budget.started -= 3600 - 60
+    assert "60 min kept for integrate + report" in (budget.exhausted() or "")
+
+    results = run.root / "results.jsonl"
+    append_jsonl(results, {"correct": True, "speedup": 1.5})
+    budget = Budget(run, max_hours=2.0, estimate_reserve=lambda: 2 * 3600 - 60)
+    budget.start_agent("kernel-t")
+    fb = budget.feedback("kernel-t", results, None)  # it added an item: no time left
+    assert budget.final_reserve_s == 2 * 3600 - 60
+    assert fb["advice"] == "stop" and "time is up" in fb["advice_reason"]
+
+
 def test_timeout_result_reports_compile_time():
     late = _timeout_result(300, f"warn\n{COMPILE_MARKER}42.5\nmore\n".encode())
     assert late["status"] == "timeout" and late["compile_s"] == 42.5
