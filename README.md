@@ -620,6 +620,22 @@ measures everything again; a changed file only the steps that hold it.
 `integration.json` → `reuse` counts the `reused` and the `measured` steps (also
 in the log, and in `improve.json` → `integrations` → `reused`).
 
+An `integration.json` written before content keys (#93) has no `reuse_key`s.
+Its measurements get the keys they would have had where the run proves what
+they ran with (`reuse.migrate`, #108): the evaluator schema from its `recheck`
+records; the baseline from its `baseline_ms` (`analyze` seals the latency,
+`baseline.json` and the baseline outputs together); the quality mode from its
+records' `metrics`; `--ab-rounds` from its paired A/B records; and for each
+item, a snapshot that is still the file a verified record evaluated and that
+loads nothing else. A `kernel_agent` module it imports may have changed with
+kernel-agent since, and its content at the time is not recorded. Everything
+else is measured again. The log (and the improve loop's estimate of its final
+integration) says what was migrated: `integration.json predates content keys
+(#93): 18 of 24 measurements migrated (evaluator schema 2 from its re-checks,
+baseline 37.66 ms, 8 A/B rounds, the same snapshots); 6 not: fp8_lm_attn_proj,
+fp8_lm_mlp: loads kernel_agent/agent/examples/cuda_fp8_skinny_gemm.py,
+kernel_agent/kernels/quant.py, whose content then is not recorded`.
+
 ### Anti-gaming guards
 
 The candidate runs inside the evaluator's process, so it could patch the
@@ -1114,7 +1130,8 @@ All limits are off by default (`kernel_agent/budget.py`).
   checked. Once the budget is spent, the remaining agents are skipped, but
   integrate and report always run on whatever results exist. 15 % of
   `--max-hours` (`--budget-reserve`) is kept for them, in `improve` the
-  estimated final integration when that is longer (see "kernel-agent improve").
+  estimated final integration when that is longer, at most a third of
+  `--max-hours` (see "kernel-agent improve").
   Each agent's own USD cap
   (`--budget`) is lowered to what is left of `--max-usd`. Time counts from the
   start of the current `optimize`/`resume` process; USD counts the whole run.
@@ -1434,12 +1451,25 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
 * **Time budget** (`--max-hours`). The final integration needs time too, and
   `improve` keeps it from the agents: its expected duration is the number of
   A/B measurements (each item alone, the systems agent's best combination, each
-  item added to it; a re-integration measures only new or changed items alone,
-  by file sha256, and the combination steps) × the median `eval_s` of the
-  run's integration rows (else twice that of an end-to-end evaluation, else
-  4 min). It is estimated before every slice and after every evaluation (one may
-  add an item), and kept when it is longer than `--budget-reserve`: no session
-  runs into it (the evaluation advice says `stop`). A slice starts only when the
+  item added to it; a re-integration measures alone only the items that are new
+  or changed since the last integration, by file sha256, counting what was
+  migrated from a file from before content keys, plus the combination steps) ×
+  the median `eval_s` of the run's integration rows (else twice that of an
+  end-to-end evaluation, else 4 min). It is estimated before every slice and
+  after every evaluation (one may add an item), and kept when it is longer than
+  `--budget-reserve`, but at most a third of `--max-hours`
+  (`--integration-reserve auto`): no session runs into it (the evaluation advice
+  says `stop`). The agents keep at least two thirds of every invocation. A
+  longer final integration runs past `--max-hours`; the integration itself uses
+  the GPU alone, with no agent sessions and no subscription usage. Both the
+  reserve line (`60 min kept
+  for the final integration (33% of --max-hours; estimated 113 min: 30 A/B
+  measurements × 3.8 min, so it may run 53 min past --max-hours)`) and the start
+  of the final integration say so. `--integration-reserve 45` keeps 45 min
+  instead of the estimate, and `0` keeps none (only `--budget-reserve`). Why a
+  third: in round 2 of a VoxCPM2 run (`--max-hours 3`), a re-integration that
+  reuses needed 12 A/B × 3.8 min = 45 min, which fits under the cap of 60. A full
+  one needed 113 min and left the agents 56 of 180 min. A slice starts only when the
   time left for agents covers the agent's warm-up (4 min), one evaluation of
   that arm (the median `eval_s` of its evaluations, else 1 min for a kernel and
   2 min end to end) and the 2-min wrap-up; else the next arm that fits gets it,
@@ -1927,6 +1957,8 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
   --integrate-every 4 --patience 5 --sol-stop 0.9 --target-hours 2 --speedup-goal 2
   --max-slices N --dry-run [--seed 0]  continuous loop (see "kernel-agent improve");
                                        --integrate-every 0: only the final integration
+  --integration-reserve auto|MINUTES   time kept for the final integration (auto: its
+                                       estimate, at most a third of --max-hours; 0: none)
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]

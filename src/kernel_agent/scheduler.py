@@ -84,6 +84,13 @@ WARMUP_SECONDS = 240.0
 EVAL_SECONDS = {KERNEL: 60.0, SYSTEMS: 120.0}  # one evaluation of an arm with none timed yet
 AB_SECONDS = 2 * EVAL_SECONDS[SYSTEMS]  # one A/B of the integration: A and B end to end
 SHORT_SLICE = 2.0  # a session with less than this × slice_seconds was cut short by the budget
+# The time budget keeps at most this share of --max-hours for the final integration
+# (``--integration-reserve auto``, issue #108): the agents keep two thirds of every
+# invocation, and a longer final integration runs past --max-hours (on the GPU alone, no
+# agent sessions). A re-integration that reuses (#93, #108) fits: in round 2 of the VoxCPM2
+# run 20261006-004718 it was 12 A/B × 3.8 = 45 min of a 3 h invocation's 60, while the
+# 113 min of a full one (30 A/B) left the agents 56 min of 180.
+INTEGRATION_SHARE = 1 / 3
 
 
 @dataclass(frozen=True)
@@ -535,26 +542,29 @@ def slice_seconds(arm: Arm) -> float:
 
 
 def integration_estimate(
-    run: RunDir, rows: list[dict[str, Any]], arms: list[Arm], min_speedup: float
+    run: RunDir,
+    rows: list[dict[str, Any]],
+    kernels: dict[str, str],
+    reusable: list[dict[str, Any]],
 ) -> tuple[int, float]:
     """(A/B measurements, seconds per measurement) of an integration of everything so far.
 
     Its items (as ``Orchestrator._integration_items`` takes them, without the digest
-    checks): every kernel target whose best reaches ``min_speedup`` and the version of
-    the fastest passing end-to-end run of every transform idea faster than the baseline.
-    It measures each alone, then the systems agent's fastest combination of them (the
-    seed; none: the fastest item alone), then adds each item outside the seed in turn.
-    A re-integration reuses what the last one measured with the same content
-    (:mod:`kernel_agent.integrate.reuse`; here: the sha256 of each item's file): it
-    measures only the new and changed items alone, but the combination steps again
-    (they follow the order of the gains alone), and nothing when no item changed. One
-    measurement takes the median ``eval_s`` of the run's integration rows, else twice
-    that of an end-to-end evaluation (an A/B runs A and B), else :data:`AB_SECONDS`."""
-    items = {  # label -> item
-        a.id: f"{a.id}={run.history_dir(a.id) / a.best_snapshot}"
-        for a in arms
-        if a.kind == KERNEL and a.best >= min_speedup and a.best_snapshot
-    }
+    checks of the transforms): the ``kernels`` (target → ``target=path`` of the kernel the
+    integration takes, ``Orchestrator._kernel_best``) and the version of the fastest
+    passing end-to-end run of every transform idea faster than the baseline. It measures
+    each alone, then the systems agent's fastest combination of them (the seed; none: the
+    fastest item alone), then adds each item outside the seed in turn. A re-integration
+    reuses what the last one measured with the same content
+    (:mod:`kernel_agent.integrate.reuse`; here: the sha256 of each item's file, against
+    the ``reusable`` history entries of the last integration, ``Orchestrator.reusable``:
+    those with a ``reuse_key``, or those a migration keyed in a file from before content
+    keys, #108): it measures only the new and changed items alone, but the combination
+    steps again (they follow the order of the gains alone), and nothing when no item
+    changed. One measurement takes the median ``eval_s`` of the run's integration rows,
+    else twice that of an end-to-end evaluation (an A/B runs A and B), else
+    :data:`AB_SECONDS`."""
+    items = dict(kernels)  # label -> item
     passing = [
         rec
         for rec in read_jsonl(run.results_file())
@@ -569,8 +579,6 @@ def integration_estimate(
         if (parts := len(rec.get("transforms") or []) + len(rec.get("kernels") or [])) > 1
     ]
     seed = max(combos)[1] if combos else 1
-    last = read_json(run.root / "integration.json", {}) or {}
-    reusable = [h for h in last.get("history") or [] if h.get("reuse_key")]  # issue #93
     alone = _changed(items, reusable) if reusable else len(items)
     steps = alone + bool(combos) + max(len(items) - seed, 0) if alone else 0
     measured = [r for r in rows if r["target"] == ledger.E2E and r["backend"] == "integrate"]

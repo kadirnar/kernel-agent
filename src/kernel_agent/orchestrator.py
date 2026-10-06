@@ -753,13 +753,13 @@ class Orchestrator:
         history: list[dict[str, Any]] = []
         integration = self.run.root / "integration.json"
         previous = self.truth.load_json(integration) if reuse else {}
-        known = (previous or {}).get("history", [])
         # by content, not by snapshot name: every evaluation snapshots its files anew (#93)
         keys = reuse_cache.Keys(self.run, self._reuse_context(base_ms))
+        known, migrated = self._reusable(previous or {}, keys)  # a pre-#93 file: migrated
+        if migrated:
+            log(f"integrate: {migrated}")
         paired = {  # a crash or timeout can be transient (another process, OOM): measure again
-            h["reuse_key"]: h
-            for h in known
-            if h.get("ab") and h.get("reuse_key") and h.get("status") not in _TRANSIENT
+            h["reuse_key"]: h for h in known if h.get("ab") and h.get("status") not in _TRANSIENT
         }
         counts = {"reused": 0, "measured": 0}
         irreversible = set((previous or {}).get("irreversible") or [])  # not undone in-process
@@ -940,6 +940,46 @@ class Orchestrator:
             "worker_args": self.truth.worker_args(),
             "ab_rounds": self.cfg.ab_rounds,
         }
+
+    def reusable(self) -> tuple[list[dict[str, Any]], str]:
+        """What a re-integration now could take from the last integration
+        (:meth:`_reusable`; the improve loop's estimate of its final integration)."""
+        previous = self.truth.load_json(self.run.root / "integration.json") or {}
+        if not previous.get("history"):
+            return [], ""
+        keys = reuse_cache.Keys(self.run, self._reuse_context(self.truth.baseline_ms()))
+        return self._reusable(previous, keys)
+
+    def _reusable(
+        self, previous: dict[str, Any], keys: reuse_cache.Keys
+    ) -> tuple[list[dict[str, Any]], str]:
+        """The history entries of the integration ``previous`` with a ``reuse_key``, and the
+        log line of a migration ("" when none). A file from before content keys (#93) has
+        none: its entries get the key their step has now (``keys``) where the run proves
+        what they ran with (:func:`reuse.migrate <kernel_agent.integrate.reuse.migrate>`)."""
+        history = previous.get("history") or []
+        if not history or any(h.get("reuse_key") for h in history):
+            return [h for h in history if h.get("reuse_key")], ""
+        transforms = {  # snapshots the integration measured: verified against their records
+            snap[0] for _, snaps in self._e2e_records() for snap in snaps if snap is not None
+        }
+
+        def verified(arg: str) -> bool:
+            if reuse_cache.as_item(arg)[0] == "transform":
+                return arg in transforms
+            kernel = self._kernel_snapshot(arg)
+            return kernel is not None and Path(kernel[1]) == Path(arg.partition("=")[2])
+
+        migration = reuse_cache.migrate(
+            previous,
+            keys,
+            schema=evaluate.EVALUATOR_SCHEMA,
+            baseline_ms=self.truth.baseline_ms(),
+            ab_rounds=self.cfg.ab_rounds,
+            perceptual=self.truth.quality == "near-lossless",
+            verified=verified,
+        )
+        return migration.entries, migration.note()
 
     def _recheck_kernels(
         self,
