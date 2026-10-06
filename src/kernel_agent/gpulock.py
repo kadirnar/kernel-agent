@@ -8,7 +8,10 @@ with the fewest waiters in this process, and yields its index. It is re-entrant
 within a thread and keeps that GPU. A child process started while the lock is held
 gets ``KERNEL_AGENT_LOCK_HELD=1`` through :func:`child_env`, so it does not wait for
 its own parent, and, when more than one GPU is visible, ``CUDA_VISIBLE_DEVICES`` of
-the locked GPU, so it runs where its parent locked.
+the locked GPU, so it runs where its parent locked. It also dies with its parent
+(``interrupt.die_with_parent``). A run that is stopping (Ctrl-C, :mod:`kernel_agent.interrupt`)
+takes no lock and starts no child: a waiter stops waiting, and work that held the lock
+when the stop came raises ``Interrupted`` as it lets it go (it was cut short: not a result).
 
 The pool is what ``nvidia-smi`` lists (the parent never initialises CUDA to find
 it), restricted to an inherited ``CUDA_VISIBLE_DEVICES`` (indices or ``GPU-`` UUIDs);
@@ -37,11 +40,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from kernel_agent import interrupt
 from kernel_agent.toolchain import CACHE_DIR
 
 ENV = "KERNEL_AGENT_LOCK_HELD"
 GPUS_ENV = "KERNEL_AGENT_GPUS"  # the pool as nvidia-smi indices, e.g. "0,2"
 INDEX_ENV = "KERNEL_AGENT_GPU"  # a pinned child: the GPU its parent locked
+WAIT_S = 0.25  # a waiter checks this often whether the run is stopping
 
 _guard = threading.Lock()
 _thread_locks: dict[str, threading.Lock] = {}
@@ -141,13 +146,19 @@ def _held_gpus() -> dict[str, int]:
 
 def _take(path: Path, lock: threading.Lock, *, wait: bool) -> IO[str] | None:
     """``path`` open and flocked, with ``lock`` held; None if either is busy and not
-    ``wait``."""
-    if not lock.acquire(blocking=wait):
+    ``wait``. A wait ends with ``interrupt.Interrupted`` when the run is stopping."""
+    if wait:
+        while not lock.acquire(timeout=WAIT_S):
+            interrupt.check()
+    elif not lock.acquire(blocking=False):
         return None
     try:
         fh = open(path, "w")  # noqa: SIM115 - closed by the caller when it unlocks
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if wait:
+                _flock_wait(fh)
+            else:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BaseException:
             fh.close()
             raise
@@ -158,6 +169,34 @@ def _take(path: Path, lock: threading.Lock, *, wait: bool) -> IO[str] | None:
         lock.release()
         raise
     return fh
+
+
+def _flock_wait(fh: IO[str]) -> None:
+    """``LOCK_EX`` on ``fh``, waited for until the run is stopping (``Interrupted``).
+
+    The blocking ``flock`` runs in a daemon thread on a duplicate of the descriptor, so
+    waiters get the lock in the kernel's order (no polling against other processes'
+    blocking waits) and an abandoned wait neither blocks the exit nor keeps the lock:
+    the thread closes its duplicate, and with ``fh`` closed by the caller, a lock it
+    gets late is free again."""
+    fd = os.dup(fh.fileno())
+    done = threading.Event()
+    error: list[OSError] = []
+
+    def wait() -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            error.append(exc)
+        finally:
+            os.close(fd)
+            done.set()
+
+    threading.Thread(target=wait, name="gpu-lock-wait", daemon=True).start()
+    while not done.wait(WAIT_S):
+        interrupt.check()
+    if error:
+        raise error[0]
 
 
 def _acquire(name: str, gpus: tuple[GPU, ...]) -> tuple[int, threading.Lock, IO[str]]:
@@ -190,13 +229,18 @@ def _inherited_index() -> int:
 
 @contextlib.contextmanager
 def gpu_lock(name: str = "gpu") -> Iterator[int]:
-    """Hold one GPU of the pool exclusively; yields its (``nvidia-smi``) index."""
+    """Hold one GPU of the pool exclusively; yields its (``nvidia-smi``) index. Raises
+    ``interrupt.Interrupted`` when the run is stopping: before it takes the GPU, and as
+    the work under it ends (whatever it measured was cut short by the stop)."""
+    interrupt.check()
     held = _held_gpus()
     if name in held:
         yield held[name]  # this thread already holds it: the same GPU
+        interrupt.check()
         return
     if os.environ.get(ENV) == "1":
         yield _inherited_index()  # our parent process holds it
+        interrupt.check()
         return
     index, thread_lock, fh = _acquire(name, pool().gpus)
     held[name] = index
@@ -207,6 +251,7 @@ def gpu_lock(name: str = "gpu") -> Iterator[int]:
         fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
         thread_lock.release()
+    interrupt.check()
 
 
 def pinned(index: int) -> dict[str, str]:
@@ -223,8 +268,11 @@ def pinned(index: int) -> dict[str, str]:
 
 def child_env() -> dict[str, str]:
     """Environment for a subprocess started while this thread holds the GPU lock: it
-    does not wait for the lock and runs on the locked GPU."""
+    does not wait for the lock, runs on the locked GPU and dies with this process
+    (``interrupt.die_with_parent``). A stopping run starts none (``Interrupted``)."""
+    interrupt.check()
     env = dict(os.environ)
+    env[interrupt.PARENT_ENV] = str(os.getpid())
     held = _held_gpus()
     if held or os.environ.get(ENV) == "1":
         env[ENV] = "1"

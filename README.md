@@ -1251,9 +1251,17 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
 
 * **Start or continue.** With a Hugging Face URL it runs analyze, plan and
   capture first. With a run directory it continues that run, including one made
-  by `optimize`. Ctrl-C leaves the run consistent: run the same command again
-  and it continues. A slice that was running is recorded as `interrupted`
-  together with the evaluations it made. `--max-hours`, `--max-usd` and
+  by `optimize`. Ctrl-C (or SIGTERM) stops the run at once and leaves it
+  consistent: no agent session, evaluation or worker starts any more; the
+  running worker and evaluator subprocesses and Claude Code sessions, with
+  their children, get SIGTERM and 10 s later SIGKILL; a measurement cut short
+  is not recorded; `improve.json` says what was interrupted (`interrupted`:
+  the slice, research session or integration) and the command exits with 130.
+  A second Ctrl-C exits at once. Workers also die with the run when it is
+  killed outright (Linux `PR_SET_PDEATHSIG`), so nothing keeps the GPU
+  (`kernel_agent/interrupt.py`). Run the same command again and it continues.
+  A slice that was running is recorded as `interrupted` together with the
+  evaluations it made. `--max-hours`, `--max-usd` and
   `--max-sessions` are the budget of this invocation: hours from now, USD on
   top of what the run has spent already, and agent sessions from now. Without
   them the loop runs until every target has stopped. `--agent-minutes` caps
