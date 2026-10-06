@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import functools
 import inspect
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -674,15 +676,18 @@ def guarded_kernel_profile(
     """:func:`kernel_profile` measured like a timing and sanity-checked.
 
     Under the GPU lock (``gpulock.gpu_lock``: a no-op in a worker whose parent holds it),
-    each attempt runs the workload once unprofiled (warm-up), spins the GPU to full clocks
-    (``bench.ensure_clocks``, the clock guard of ``time_call``), profiles KERNEL_RUNS runs
-    and probes the clocks again, with GPU telemetry and the other processes on the GPU
-    around them. Runs that fail :func:`kernel_problems` against ``reference_ms`` (the
-    end-to-end time of the profiled window) are profiled once more; if they fail again the
-    view says ``reliable: false`` and why (``unreliable``). The view returned is the run
-    with the least GPU kernel time of the last attempt; ``attempts`` keeps every attempt
-    (GPU kernel time per run, clock probes before / after, ``gpu`` telemetry,
-    ``other_gpu_processes``). Without CUDA: one attempt, no lock and no clock guard."""
+    each attempt runs the workload once unprofiled (warm-up), then profiles KERNEL_RUNS
+    runs, each after spinning the GPU to full clocks (``bench.ensure_clocks``, the clock
+    guard of ``time_call``: the GPU idles while the profiler parses the previous run, a
+    minute for eager VoxCPM2), with GPU telemetry right before and right after each run
+    (only the latter counts as a load sample: ``nvidia-smi``'s clocks lag by a second or
+    so) and the other processes on the GPU. Runs that fail :func:`kernel_problems` against
+    ``reference_ms`` (the end-to-end time of the profiled window) are profiled once more;
+    if they fail again the view says ``reliable: false`` and why (``unreliable``). The view
+    returned is the run with the least GPU kernel time of the last attempt, with its share
+    of ``reference_ms`` (``busy_share``); ``attempts`` keeps every attempt (GPU kernel time
+    and clock probe per run, ``gpu`` telemetry, ``other_gpu_processes``). Without CUDA: one
+    attempt, no lock and no clock guard."""
     cuda = torch.cuda.is_available()
     attempts: list[dict[str, Any]] = []
     views: list[dict[str, Any]] = []
@@ -693,15 +698,16 @@ def guarded_kernel_profile(
                 workload.run(inputs)  # warm-up: caches, allocator, lazy init
             synchronize()
             monitor = telemetry.Monitor() if cuda else None
-            clocks = [_clock(ensure=True)] if cuda else []
-            if monitor is not None:
-                monitor.sample("before")
             others = monitor.processes() if monitor is not None else []
-            views = [kernel_profile(workload, inputs) for _ in range(KERNEL_RUNS)]
-            if cuda:
-                clocks.append(_clock(ensure=False))
-            if monitor is not None:
-                monitor.sample("after")
+            clocks: list[float | None] = []
+            views = []
+            for _ in range(KERNEL_RUNS):
+                if cuda:
+                    clocks.append(_full_clocks())
+                if monitor is not None:  # before the work: not a load sample
+                    monitor.sample("before", loaded=False)
+                after = functools.partial(monitor.sample, "after") if monitor else None
+                views.append(kernel_profile(workload, inputs, after=after))
             busy = [v["gpu_busy_ms"] for v in views]
             problems = kernel_problems(busy, reference_ms)
             attempts.append(
@@ -718,6 +724,7 @@ def guarded_kernel_profile(
     view = min(views, key=lambda v: v["gpu_busy_ms"])
     view.update(
         reference_ms=round(reference_ms, 2) if reference_ms else None,
+        busy_share=round(view["gpu_busy_ms"] / reference_ms, 3) if reference_ms else None,
         reliable=not problems,
         **({"unreliable": problems} if problems else {}),
         attempts=attempts,
@@ -725,14 +732,14 @@ def guarded_kernel_profile(
     return view
 
 
-def _clock(*, ensure: bool) -> float | None:
-    """The DRAM clock probe of ``kernels.bench`` (about 1: full clocks), after spinning the
-    GPU to full clocks first with ``ensure``."""
+def _full_clocks() -> float | None:
+    """Spin the GPU to full clocks (``bench.ensure_clocks``); its last DRAM clock probe
+    (about 1: full clocks; None: no probe)."""
     from kernel_agent.kernels import bench
 
     try:
-        state = bench.ensure_clocks() if ensure else bench.clock_state()
-    except Exception:  # no roofline peaks, out of memory: the profile goes on unguarded
+        state = bench.ensure_clocks()
+    except Exception:  # out of memory for the probe: the profile goes on unguarded
         return None
     return round(state, 3) if state is not None else None
 
@@ -748,7 +755,16 @@ def kernel_view_problems(kv: dict[str, Any], window_ms: float | None) -> list[st
     return []
 
 
-def kernel_profile(workload: Workload, inputs: Any, top: int = 40) -> dict[str, Any]:
+def kernel_profile(
+    workload: Workload,
+    inputs: Any,
+    top: int = 40,
+    *,
+    after: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    """One profiled run. ``wall_ms`` ends when its GPU work does, before the profiler stops
+    (which parses every event: longer than the run itself for eager VoxCPM2); ``after`` is
+    called then (GPU telemetry while the clocks are still up)."""
     from torch.profiler import ProfilerActivity, profile
 
     synchronize()
@@ -759,7 +775,9 @@ def kernel_profile(workload: Workload, inputs: Any, top: int = 40) -> dict[str, 
     ):
         workload.run(inputs)
         synchronize()
-    wall_ms = (time.perf_counter() - start) * 1000
+        wall_ms = (time.perf_counter() - start) * 1000
+        if after is not None:
+            after()
 
     kernels: list[dict[str, Any]] = []
     ops: list[dict[str, Any]] = []
@@ -934,9 +952,9 @@ def _guard_notes(kv: dict[str, Any]) -> list[str]:
     )
     if clocks:
         probes = " / ".join("n/a" if c is None else f"{c:.2f}" for c in clocks)
-        note += f", DRAM clock probe {probes} before / after (1 = full clocks)"
+        note += f", DRAM clock probe before each run {probes} (1 = full clocks)"
     if (sm := (last.get("gpu") or {}).get("sm_mhz")) and len(sm) == 3:
-        note += f", SM clock {sm[0]}-{sm[2]} MHz"
+        note += f", SM clock {sm[0]}-{sm[2]} MHz at the end of the runs"
     if len(attempts) > 1:
         note += f"; profiled {len(attempts)} times (the first failed its sanity check)"
     if others := last.get("other_gpu_processes") or []:

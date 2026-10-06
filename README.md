@@ -429,15 +429,20 @@ metric.
 The kernel view of `analyze`'s profile (`torch.profiler`: kernel times,
 launches and the GPU busy share behind "launch/CPU bound" or "GPU bound" in
 `profile/summary.md`) is measured the same way: under the GPU lock, after a
-warm-up run and the same clock guard, as two profiled runs. Their GPU kernel
-time must stay within 105 % of the time the profiled window takes without the
-profiler, and within 20 % of each other. Otherwise the view is profiled once
-more; if it fails again, `summary.md` marks it unreliable and draws no
-conclusion from it, and the scheduler ignores its busy share. `profile.json`
-keeps every attempt: the kernel time per run, the clock probes before and
-after, GPU telemetry and the other processes on the GPU. A process computing
-outside the lock inflates every kernel: a re-profile reported 202 % of the
-end-to-end latency while another process held 13 GB of the GPU.
+warm-up run, as two profiled runs, each started at full clocks by the same
+clock guard. The GPU idles while the profiler parses a run, about a minute
+for eager VoxCPM2. Their GPU kernel time must stay within 105 % of the time
+the profiled window takes without the profiler, and within 20 % of each
+other. Otherwise the view is profiled once more; if it fails again,
+`summary.md` marks it unreliable and draws no conclusion from it, and the
+scheduler ignores its busy share. The busy share the scheduler uses is the
+kernel time over that unprofiled time (`busy_share`). The old fraction of the
+profiled run's wall time also counted the profiler's own parsing: 0.13
+instead of 0.47 for eager VoxCPM2. `profile.json` keeps every attempt: the
+kernel time and clock probe per run, GPU telemetry and the other processes on
+the GPU. A process computing outside the lock inflates every kernel: a
+re-profile reported 202 % of the end-to-end latency while another process
+held 13 GB of the GPU.
 
 `-o metric=` chooses what a run optimises (`kernel_agent/objective.py`):
 `latency` (the default), `ttfa`, the time to first audio of a streaming TTS

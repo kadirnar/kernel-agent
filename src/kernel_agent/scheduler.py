@@ -256,11 +256,16 @@ def _region_ref_ms(
 
 
 def gpu_busy(run: RunDir) -> float | None:
-    """The profile's GPU busy fraction (None: none, or a kernel view marked unreliable)."""
+    """The profile's GPU busy share: kernel time per run without the profiler (``busy_share``;
+    a profile from before it: of the profiled run, ``gpu_busy_fraction``). None: none, or a
+    kernel view marked unreliable."""
     profile = read_json(run.profile_dir / "profile.json", {}) or {}
     view = profile.get("kernel_view") or {}
-    busy = ledger._num(view.get("gpu_busy_fraction"))
-    return busy if busy and 0.0 < busy <= 1.0 and view.get("reliable") is not False else None
+    if view.get("reliable") is False:
+        return None
+    share = ledger._num(view.get("busy_share"))
+    busy = min(share, 1.0) if share else ledger._num(view.get("gpu_busy_fraction"))
+    return busy if busy and 0.0 < busy <= 1.0 else None
 
 
 def systems_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

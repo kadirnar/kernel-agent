@@ -246,13 +246,15 @@ def guarded(monkeypatch, tmp_path):
     gpulock.pool.cache_clear()
     busy: list[float] = []
     log: list[str] = []
+    probes = iter([0.97, 0.95, 0.99, 0.98])
 
-    def clock(*, ensure: bool) -> float:
-        log.append("ensure_clocks" if ensure else "clock_state")
-        return 0.97 if ensure else 0.95
+    def full_clocks() -> float:
+        log.append("ensure_clocks")
+        return next(probes)
 
     class Monitor:
         def sample(self, label: str = "", *, loaded: bool = True) -> None:
+            assert loaded == (label == "after")  # only right after a run is under load
             log.append(f"sample {label}")
 
         def processes(self) -> list[dict[str, Any]]:
@@ -261,13 +263,14 @@ def guarded(monkeypatch, tmp_path):
         def summary(self) -> dict[str, Any]:
             return {"sm_mhz": [2700, 2880, 2902], "throttled": False}
 
-    def kernel_profile(workload: Any, inputs: Any) -> dict[str, Any]:
+    def kernel_profile(workload: Any, inputs: Any, *, after: Any = None) -> dict[str, Any]:
         assert "gpu" in gpulock._held_gpus()  # profiled under the GPU lock
         log.append("profile")
+        after()  # right after the run, before the profiler stops
         ms = busy.pop(0)
         return {**KERNEL_VIEW, "gpu_busy_ms": ms, "wall_ms": ms + 50.0}
 
-    monkeypatch.setattr(profiler, "_clock", clock)
+    monkeypatch.setattr(profiler, "_full_clocks", full_clocks)
     monkeypatch.setattr(profiler.telemetry, "Monitor", Monitor)
     monkeypatch.setattr(profiler, "kernel_profile", kernel_profile)
     yield busy, log
@@ -279,18 +282,11 @@ def test_the_kernel_view_is_locked_warmed_up_clock_guarded_and_checked(guarded):
     busy, log = guarded
     busy += [524.0, 520.4]
     view = profiler.guarded_kernel_profile(Counted(log), None, reference_ms=E2E_MS)
-    assert log == [
-        "run",  # warm-up
-        "ensure_clocks",  # the clock guard of time_call
-        "sample before",
-        "profile",
-        "profile",
-        "clock_state",
-        "sample after",
-    ]
+    run = ["ensure_clocks", "sample before", "profile", "sample after"]
+    assert log == ["run", *run, *run]  # a warm-up, then the clock guard before every run
     assert view["reliable"] and "unreliable" not in view
     assert view["gpu_busy_ms"] == 520.4  # the run with the least kernel time
-    assert view["reference_ms"] == E2E_MS
+    assert view["reference_ms"] == E2E_MS and view["busy_share"] == 0.995
     (attempt,) = view["attempts"]
     assert attempt["gpu_busy_ms"] == [524.0, 520.4] and attempt["clock"] == [0.97, 0.95]
     assert attempt["other_gpu_processes"] == [{"pid": 4242, "used_mib": 12928, "name": "python"}]
@@ -301,7 +297,7 @@ def test_a_suspicious_kernel_view_is_profiled_once_more(guarded):
     busy, log = guarded
     busy += [1056.3, 1058.0, 512.0, 509.5]
     view = profiler.guarded_kernel_profile(Counted(log), None, reference_ms=E2E_MS)
-    assert log.count("run") == 2 and log.count("ensure_clocks") == 2
+    assert log.count("run") == 2 and log.count("ensure_clocks") == 4
     assert view["reliable"] and view["gpu_busy_ms"] == 509.5
     first, second = view["attempts"]
     assert "202%" in first["problems"][0] and "problems" not in second
@@ -324,7 +320,8 @@ def test_a_kernel_view_that_fails_twice_is_marked_unreliable(guarded):
     assert "GPU bound: faster kernels" not in text and "LAUNCH/CPU BOUND" not in text
     assert "profiled 2 times (the first failed its sanity check)" in text
     assert "other processes on the GPU: python 4242 (12928 MiB)" in text
-    assert "DRAM clock probe 0.97 / 0.95 before / after" in text and "SM clock 2700-2902" in text
+    assert "DRAM clock probe before each run 0.99 / 0.98" in text
+    assert "SM clock 2700-2902 MHz at the end of the runs" in text
 
 
 def test_summary_conclusions_follow_the_check():
@@ -351,13 +348,19 @@ def test_the_scheduler_ignores_an_unreliable_busy_fraction(tmp_path):
     view = {"gpu_busy_fraction": 0.8, "reliable": False}
     write_json(run.profile_dir / "profile.json", {"kernel_view": view})
     assert gpu_busy(run) is None
+    # the share of the run without the profiler, not of the slower profiled run
+    view = {"gpu_busy_fraction": 0.131, "busy_share": 0.471, "reliable": True}
+    write_json(run.profile_dir / "profile.json", {"kernel_view": view})
+    assert gpu_busy(run) == 0.471
+    write_json(run.profile_dir / "profile.json", {"kernel_view": {**view, "busy_share": 1.03}})
+    assert gpu_busy(run) == 1.0
 
 
 def test_without_cuda_one_unguarded_attempt(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     log: list[str] = []
     views = iter([{**KERNEL_VIEW, "gpu_busy_ms": 3.0}, {**KERNEL_VIEW, "gpu_busy_ms": 9.0}])
-    monkeypatch.setattr(profiler, "kernel_profile", lambda w, i: next(views))
+    monkeypatch.setattr(profiler, "kernel_profile", lambda w, i, after: next(views))
     view = profiler.guarded_kernel_profile(Counted(log), None, reference_ms=None)
     assert log == ["run"] and view["gpu_busy_ms"] == 3.0
     assert view["reliable"] is False  # 200 % apart, and no second attempt
