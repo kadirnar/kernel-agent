@@ -16,14 +16,19 @@ recorded too but is not the reference: boards often never reach it under load (a
 RTX 5070 Ti boosts to ~2.9 of its 3.1 GHz). The paired A/B design keeps throttling
 out of the comparison, but the absolute latencies of a throttled measurement are
 pessimistic and separate-process numbers noisy.
+
+:meth:`Monitor.processes` lists the other processes with a context on the GPU: one
+that computes meanwhile (outside kernel-agent's GPU lock) slows every kernel timed.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import statistics
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 #: NVML clock-event reasons recorded with a sample (``nvmlClocksEventReason*``).
@@ -40,6 +45,7 @@ SLOWDOWN = frozenset({"hw_slowdown", "sw_thermal", "hw_thermal", "hw_power_brake
 CLOCK_DROP = 0.9
 _QUERY = "clocks.sm,clocks.max.sm,clocks.mem,temperature.gpu,power.draw,clocks_event_reasons.active"
 _FORMAT = "csv,noheader,nounits"
+_APPS = "pid,used_memory,process_name"
 
 
 def _bus_id() -> str | None:
@@ -60,7 +66,7 @@ def reasons(mask: int) -> list[str]:
 
 
 def _mhz(value: str) -> int | None:
-    """An ``nvidia-smi`` clock (None: ``[N/A]``)."""
+    """An ``nvidia-smi`` clock or MiB (None: ``[N/A]``)."""
     try:
         return int(float(value))
     except ValueError:
@@ -142,6 +148,52 @@ class Monitor:
         self.samples.append(sample)
         return sample
 
+    def processes(self) -> list[dict[str, Any]]:
+        """The other processes on this GPU, most memory first: ``pid``, ``used_mib`` and
+        ``name`` (this process left out; [] without a backend or when it fails)."""
+        if self.backend is None:
+            return []
+        try:
+            procs = self._processes()
+        except Exception:
+            return []
+        procs = [p for p in procs if p["pid"] != os.getpid()]
+        return sorted(procs, key=lambda p: -(p["used_mib"] or 0))
+
+    def _processes(self) -> list[dict[str, Any]]:
+        if self.backend == "nvml":
+            nvml, h = self._nvml, self._handle
+            out = []
+            for proc in nvml.nvmlDeviceGetComputeRunningProcesses(h):
+                used = getattr(proc, "usedGpuMemory", None)
+                out.append(
+                    {
+                        "pid": int(proc.pid),
+                        "used_mib": round(used / 2**20) if isinstance(used, int) else None,
+                        "name": _process_name(int(proc.pid)),
+                    }
+                )
+            return out
+        text = subprocess.run(
+            [
+                "nvidia-smi",
+                "-i",
+                str(self._bus),
+                f"--query-compute-apps={_APPS}",
+                f"--format={_FORMAT}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+        out = []
+        for line in text.strip().splitlines():
+            pid, used, name = (v.strip() for v in line.split(",", 2))
+            if pid.isdigit():
+                out.append({"pid": int(pid), "used_mib": _mhz(used), "name": Path(name).name})
+        return out
+
     def summary(self) -> dict[str, Any]:
         """Ranges over the samples (``{}``: none), the clock-event reasons seen and whether
         the GPU slowed down (``throttle``: the :data:`SLOWDOWN` reasons and ``clock_drop``
@@ -175,6 +227,13 @@ class Monitor:
             "throttled_samples": len(slowed),
             "throttled": bool(slowed),
         }
+
+
+def _process_name(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip() or None
+    except OSError:
+        return None
 
 
 def warning(summary: dict[str, Any] | None) -> str | None:
