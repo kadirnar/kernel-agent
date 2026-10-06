@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel_agent import gpulock
+from kernel_agent import gpulock, interrupt
 
 NVIDIA_SMI = gpulock._nvidia_smi  # before the fixture fakes it
 POOL_ENV = (
@@ -20,6 +20,11 @@ POOL_ENV = (
     "CUDA_VISIBLE_DEVICES",
     "CUDA_DEVICE_ORDER",
 )
+
+
+def parent():
+    """What every child environment gains: its parent, to die with it (interrupt.py)."""
+    return {interrupt.PARENT_ENV: str(os.getpid())}
 
 
 def fake_gpus(monkeypatch, n, name="NVIDIA Fake GPU"):
@@ -117,7 +122,7 @@ def test_child_process_flag_skips_locking(monkeypatch, lock_dir):
         fcntl.flock(fh, fcntl.LOCK_EX)  # held by the "parent"
         with gpulock.gpu_lock() as gpu:  # the child must not wait for it
             assert gpu == 0
-            assert gpulock.child_env() == dict(os.environ)  # its children: the same
+            assert gpulock.child_env() == dict(os.environ) | parent()  # its children: the same
     monkeypatch.setenv(gpulock.INDEX_ENV, "2")  # a pinned child: the GPU its parent locked
     with gpulock.gpu_lock() as gpu:
         assert gpu == 2
@@ -213,7 +218,7 @@ def test_single_gpu_keeps_the_plain_lock_file_and_environment(lock_dir, foreign,
     assert got == [0]
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
-    expected = dict(os.environ) | {gpulock.ENV: "1"}
+    expected = dict(os.environ) | {gpulock.ENV: "1"} | parent()
     with gpulock.gpu_lock():
         assert gpulock.child_env() == expected  # only the flag, as before the pool
     assert sorted(p.name for p in lock_dir.iterdir()) == ["gpu.lock"]
@@ -419,7 +424,7 @@ def test_one_gpu_results_say_gpu_0_and_children_see_the_usual_environment(monkey
     monkeypatch.setattr(evaluate, "ensure_peaks", lambda: None)
     result = evaluate.run_evaluation(tmp_path / "c.pt", tmp_path / "k.py")
     assert result["status"] == "crash" and result["gpu_index"] == 0
-    assert envs == [dict(os.environ) | {gpulock.ENV: "1"}]
+    assert envs == [dict(os.environ) | {gpulock.ENV: "1"} | parent()]
 
 
 @pytest.mark.gpu

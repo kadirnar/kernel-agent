@@ -23,6 +23,7 @@ from typing import Any
 from kernel_agent import (
     abtest,
     hub,
+    interrupt,
     ledger,
     library,
     objective,
@@ -190,7 +191,8 @@ class Orchestrator:
         ``config`` overrides fields of the run's config for this session (e.g. the model),
         ``mcp_server`` (in ``kwargs``) replaces the run's tools (a worker's, ``workers.py``).
         A session stopped at a usage limit is resumed once the limit resets
-        (:meth:`_wait_for_limit`)."""
+        (:meth:`_wait_for_limit`). A run that is stopping (Ctrl-C) starts none."""
+        interrupt.check()
         server = kwargs.pop("mcp_server", None) or self.server
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run

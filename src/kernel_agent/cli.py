@@ -160,6 +160,7 @@ def cmd_resume(ns: argparse.Namespace) -> int:
 
 
 def cmd_improve(ns: argparse.Namespace) -> int:
+    from kernel_agent import interrupt
     from kernel_agent.improve import ImproveConfig, improve
     from kernel_agent.scheduler import Policy
 
@@ -176,10 +177,10 @@ def cmd_improve(ns: argparse.Namespace) -> int:
             speedup_goal=ns.speedup_goal or None,
         ),
     )
-    try:
-        run = asyncio.run(improve(ns.model, _config(ns), icfg, dry_run=ns.dry_run, seed=ns.seed))
+    try:  # Ctrl-C / SIGTERM: stop the run's work and processes, record it, exit 130
+        run = interrupt.run(improve(ns.model, _config(ns), icfg, dry_run=ns.dry_run, seed=ns.seed))
     except KeyboardInterrupt:
-        return 130
+        return interrupt.EXIT_CODE
     print(f"\nreport: {run.report}\nrun directory: {run.root}")
     return 0
 

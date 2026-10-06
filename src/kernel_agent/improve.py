@@ -26,7 +26,9 @@ State: ``improve.json`` in the run directory (slices, research sessions,
 integrations, rounds and why the loop stopped). Everything else is read from the
 ledger, so a restart after Ctrl-C or a crash continues where the loop stopped; a
 slice that was running is recorded as ``interrupted`` together with the
-evaluations it made.
+evaluations it made. Ctrl-C or SIGTERM (``kernel_agent.interrupt``) also records
+what the loop was doing in ``interrupted`` (moved to ``interruptions`` by the
+restart).
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import ledger, research, workers
+from kernel_agent import interrupt, ledger, research, workers
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
@@ -306,6 +308,7 @@ class Improver:
         self.require_capture = require_capture  # dry runs have no captures
         self.live_charts = live_charts
         self.kept = ""  # what the time budget keeps for the final integration (last logged)
+        self.doing: str | None = None  # what the loop is busy with (``_doing``)
 
     # -------------------------------------------------------- helpers
 
@@ -374,6 +377,27 @@ class Improver:
     def _charts(self) -> None:
         refresh(self.run)
         slices_chart(self.run)
+
+    @contextmanager
+    def _doing(self, what: str) -> Iterator[None]:
+        """``what`` the loop is busy with, for the ``interrupted`` record (kept when the
+        body raises: that is what was interrupted)."""
+        outer, self.doing = self.doing, what
+        yield
+        self.doing = outer
+
+    def _interrupted(self) -> None:
+        """Ctrl-C, SIGTERM or a cancellation: ``interrupted`` in ``improve.json`` says what
+        was running (the slice / research session records say it too)."""
+        rec: dict[str, Any] = {
+            "at": _ts(),
+            "during": self.doing or "scheduling",
+            "signal": interrupt.signal_name(),
+        }
+        self.state["interrupted"] = rec
+        self.save()
+        ledger.event(self.run, "interrupted", **rec)
+        log(f"interrupted during {rec['during']}")
 
     # -------------------------------------------------------- time (issue #100)
 
@@ -450,6 +474,8 @@ class Improver:
             log(f"stopping: {reason}")
             await self._finish(reason)
         except BaseException as exc:  # Ctrl-C too: the state and the event log stay consistent
+            if isinstance(exc, KeyboardInterrupt | asyncio.CancelledError):
+                self._interrupted()
             ledger.event(self.run, "phase_failed", phase="improve", error=repr(exc)[:300])
             raise
         ledger.event(self.run, "phase_done", phase="improve")
@@ -458,6 +484,7 @@ class Improver:
     async def _loop(self) -> str:
         done = failed = 0
         while True:
+            interrupt.check()
             self._keep_time()
             if reason := self.orch.budget.exhausted():
                 return reason
@@ -476,9 +503,11 @@ class Improver:
             if arm is None:
                 return short
             if (why := self.research_due(arm)) is not None:
-                await self._research(arm, why)
+                with self._doing(f"research session of {arm.id}"):
+                    await self._research(arm, why)
                 continue  # its plan restarts the arm's patience; the next slice reads it
-            rec = await self._slice(arm, arms)
+            with self._doing(f"slice {len(self.state['slices']) + 1} ({arm.id})"):
+                rec = await self._slice(arm, arms)
             done += 1
             failed = failed + 1 if rec["status"] == "failed" else 0
             if failed >= MAX_FAILED_SLICES:
@@ -555,6 +584,9 @@ class Improver:
                     )
                 ]
         except Exception as exc:  # an SDK / CLI failure must not end an unattended loop
+            if interrupt.requested():  # it failed because the stop ended its processes
+                self._close(rec, "interrupted")
+                raise interrupt.Interrupted from exc
             log(f"slice {n}: agent session failed: {exc!r}")
             rec["error"] = repr(exc)[:500]
             self._close(rec, "failed")
@@ -562,6 +594,9 @@ class Improver:
         except BaseException:  # Ctrl-C, cancellation
             self._close(rec, "interrupted")
             raise
+        if interrupt.requested():  # sessions ended by the stop: not a finished slice
+            self._close(rec, "interrupted")
+            raise interrupt.Interrupted
         status = "done"
         if any(r.is_error for r in results) or rec.get("error"):
             status = "error"
@@ -712,6 +747,9 @@ class Improver:
             usd = result.cost_usd
             status = "timed_out" if result.timed_out else "error" if result.is_error else "done"
         except Exception as exc:  # like a failed slice: the loop goes on without a plan
+            if interrupt.requested():
+                self._close_research(rec, "interrupted", plan=False)
+                raise interrupt.Interrupted from exc
             log(f"research: {arm.id}: agent session failed: {exc!r}")
             rec["error"] = repr(exc)[:500]
             status = "failed"
@@ -747,7 +785,12 @@ class Improver:
 
     def _recover(self) -> None:
         """Close slices and research sessions left ``running`` by a process that did not
-        exit cleanly (an interrupted research session counts as one without a plan)."""
+        exit cleanly (an interrupted research session counts as one without a plan); the
+        last invocation's ``interrupted`` record goes to ``interruptions``."""
+        if last := self.state.pop("interrupted", None):
+            log(f"the last invocation was interrupted during {last['during']}; continuing")
+            self.state.setdefault("interruptions", []).append(last)
+            self.save()
         for res in self.state["research"]:
             if res.get("status") == "running":
                 self._close_research(res, "interrupted", plan=False, ended=res["started"])
@@ -772,7 +815,8 @@ class Improver:
         exp_before = len(ledger.rows(self.run))
         log(f"re-integrating: {why}")
         ledger.event(self.run, "reintegrate", why=why)
-        await self.orch.integrate(reuse=True)
+        with self._doing(f"integration ({why})"):
+            await self.orch.integrate(reuse=True)
         data = self.orch.truth.load_json(self.run.root / "integration.json") or {}
         final = data.get("final") or {}
         speedup = float(final["speedup"]) if final.get("passed") and final.get("speedup") else 1.0
@@ -823,7 +867,8 @@ class Improver:
         names = ", ".join(ledger.item_label(i["item"]) for i in accepted)
         log(f"round {n}: re-profiling the optimised model ({names or 'nothing applied'})")
         ledger.event(self.run, "reprofile", round=n, items=[i["item"] for i in accepted])
-        info = await asyncio.to_thread(self.orch.reprofile, round_dir, accepted)
+        with self._doing(f"re-profile for round {n}"):
+            info = await asyncio.to_thread(self.orch.reprofile, round_dir, accepted)
         if "error" in info or not info.get("median_ms"):
             log(f"round {n}: re-profile failed:\n{str(info.get('error'))[-800:]}")
             ledger.event(self.run, "round_failed", round=n, error=str(info.get("error"))[:300])
@@ -835,8 +880,9 @@ class Improver:
                 rec = snapshot_record(self.run, target_id, path) or {}
                 applied[target_id] = float(rec.get("speedup") or 1.0)
         context = rounds_context(self.run, self.state, n, accepted, arms)
-        new = await self.orch.replan(round_dir, context, label=f"planner#round{n}")
-        captured = await self.orch.capture_targets(new) if new else []
+        with self._doing(f"re-plan for round {n}"):
+            new = await self.orch.replan(round_dir, context, label=f"planner#round{n}")
+            captured = await self.orch.capture_targets(new) if new else []
         self.state["rounds"].append(
             {
                 "n": n,
@@ -1044,7 +1090,7 @@ def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
 def _interrupt_note(run: RunDir) -> Iterator[None]:
     try:
         yield
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         log(f"interrupted; `kernel-agent improve {run.root}` continues this run")
         raise
 
