@@ -31,7 +31,9 @@ The re-check fails (``passed`` False) when the candidate is wrong on any fresh i
 the evaluator's disagree (``disagrees``, :func:`speedups_agree`: faster or slower).
 ``agrees`` says whether correctness and speedup match the evaluator's verdict. The
 integration keeps a correct kernel whose speedups disagree as a warning
-(:func:`speed_warning`) and lets its end-to-end A/B decide.
+(:func:`speed_warning`) and lets its end-to-end A/B decide. A kernel that passes then runs
+once under ``compute-sanitizer`` memcheck (:mod:`kernels.memcheck`, ``memcheck`` in the
+record); memory errors refuse it with status ``memcheck``.
 
 Subprocesses::
 
@@ -642,6 +644,10 @@ def describe(result: dict[str, Any]) -> str:
             + f"): not refused, ranked by the conservative {result.get('conservative_speedup')}x,"
             " the end-to-end A/B decides"
         )
+    if (check := result.get("memcheck")) and result.get("passed"):  # kernels/memcheck.py
+        from kernel_agent.kernels.memcheck import describe as memcheck_line
+
+        text += f"; {memcheck_line(check)}"
     if not result.get("passed"):
         text = f"FAILED ({status}): {result.get('reason') or ''}".strip()
     return prefix + text

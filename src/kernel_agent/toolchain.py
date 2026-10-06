@@ -301,6 +301,192 @@ def setup(apply_env: bool = True) -> Toolchain:
     )
 
 
+# ------------------------------------------------------------------ compute-sanitizer
+
+#: The path of a ``compute-sanitizer`` to use (it wins over every other place).
+SANITIZER_ENV = "KERNEL_AGENT_COMPUTE_SANITIZER"
+#: What ``compute-sanitizer`` launches its target through and injects into it: they must be
+#: next to the binary. The ``nvidia-cuda-sanitizer-api`` pip wheel ships the binary without
+#: ``TreeLauncherSubreaper`` (and its libraries in ``lib/``), so every target ends with
+#: "Target application terminated before first instrumented API call" (issue #115).
+SANITIZER_PARTS = (
+    "TreeLauncherSubreaper",
+    "libTreeLauncherTargetInjection.so",
+    "libInterceptorInjectionTarget.so",
+)
+#: NVIDIA's redistributable archives (``doctor --fetch-sanitizer``, :func:`fetch_sanitizer`).
+REDIST_URL = "https://developer.download.nvidia.com/compute/cuda/redist/"
+
+
+@dataclass
+class Sanitizer:
+    """A ``compute-sanitizer`` that can launch a target (``path``), or why there is none."""
+
+    path: str | None
+    version: str | None = None
+    reason: str | None = None  # why none is usable (``path`` None)
+    rejected: list[str] = field(default_factory=list)  # installs found but unusable, and why
+
+    def describe(self) -> str:
+        if self.path:
+            return f"compute-sanitizer {self.version or '?'} ({self.path})"
+        return f"compute-sanitizer unavailable: {self.reason}"
+
+
+def _sanitizer_dir(binary: Path) -> Path:
+    """The directory of the real binary: a toolkit's ``bin/compute-sanitizer`` is a script
+    that runs ``../compute-sanitizer/compute-sanitizer``."""
+    real = binary.resolve()
+    beside = real.parent.parent / "compute-sanitizer"
+    if real.parent.name == "bin" and (beside / "compute-sanitizer").is_file():
+        return beside
+    return real.parent
+
+
+def _natural(path: Path) -> list[Any]:
+    """Sort key: version numbers in a path compare as numbers (13.10 after 13.4)."""
+    return [(int(x), "") if x.isdigit() else (-1, x) for x in re.split(r"(\d+)", str(path))]
+
+
+def _sanitizer_places() -> list[Path]:
+    """Every ``compute-sanitizer`` to consider, in order: :data:`SANITIZER_ENV`,
+    ``CUDA_HOME``, ``PATH``, the usual toolkit prefixes, :func:`fetch_sanitizer`'s cache, the
+    pip wheels."""
+    places: list[Path] = []
+    if override := os.environ.get(SANITIZER_ENV):
+        places.append(Path(override).expanduser())
+    homes = [os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH")]
+    for home in [*homes, "/usr/local/cuda", "/opt/cuda"]:
+        if home:
+            places += [Path(home) / "compute-sanitizer" / "compute-sanitizer"]
+            places += [Path(home) / "bin" / "compute-sanitizer"]
+    if found := shutil.which("compute-sanitizer"):
+        places.append(Path(found))
+    fetched = (CACHE_DIR / "compute-sanitizer").glob("*/compute-sanitizer/compute-sanitizer")
+    places += sorted(fetched, key=_natural, reverse=True)  # the newest archive first
+    spec = importlib.util.find_spec("nvidia")
+    wheels = (spec.submodule_search_locations or []) if spec is not None else []
+    for base in wheels:
+        places += sorted(Path(base).glob("*/bin/compute-sanitizer"), reverse=True)
+        places += sorted(Path(base).glob("*/compute-sanitizer/compute-sanitizer"), reverse=True)
+    return list(dict.fromkeys(places))
+
+
+def _sanitizer_version(binary: Path) -> str | None:
+    try:
+        out = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r"Version (\S+)", out.stdout)
+    return match.group(1) if match else None
+
+
+def find_sanitizer(places: list[Path] | None = None) -> Sanitizer:
+    """The first complete ``compute-sanitizer`` of ``places`` (default:
+    :func:`_sanitizer_places`): an executable that has :data:`SANITIZER_PARTS` beside it
+    and reports a version. Installs without them are listed in ``rejected``."""
+    rejected: list[str] = []
+    for binary in _sanitizer_places() if places is None else places:
+        if not binary.is_file():
+            continue
+        if not os.access(binary, os.X_OK):
+            rejected.append(f"{binary}: not executable")
+            continue
+        folder = _sanitizer_dir(binary)
+        if missing := [p for p in SANITIZER_PARTS if not (folder / p).exists()]:
+            rejected.append(
+                f"{binary}: incomplete, no {', '.join(missing)} in {folder} (the pip wheel's "
+                "layout: no target ever starts)"
+            )
+            continue
+        if (version := _sanitizer_version(folder / "compute-sanitizer")) is None:
+            rejected.append(f"{binary}: does not run (`--version`)")
+            continue
+        return Sanitizer(str(folder / "compute-sanitizer"), version, rejected=rejected)
+    reason = rejected[0] if rejected else "not found (CUDA_HOME, PATH, pip wheels)"
+    if len(rejected) > 1:
+        reason += f" (+{len(rejected) - 1} more)"
+    hint = f"; `kernel-agent doctor --fetch-sanitizer` installs NVIDIA's, or set {SANITIZER_ENV}"
+    return Sanitizer(None, reason=reason + hint, rejected=rejected)
+
+
+_found: list[Sanitizer] = []
+
+
+def sanitizer() -> Sanitizer:
+    """:func:`find_sanitizer`, once per process once it found one (until then it looks
+    again each time: a long run sees one ``doctor --fetch-sanitizer`` installed meanwhile)."""
+    if not _found or not _found[0].path:
+        _found[:] = [find_sanitizer()]
+    return _found[0]
+
+
+def driver_cuda_version() -> tuple[int, int] | None:
+    """The CUDA version the driver supports (``cuDriverGetVersion``; no CUDA context)."""
+    import ctypes
+
+    try:
+        lib = ctypes.CDLL("libcuda.so.1")
+        value = ctypes.c_int()
+        if lib.cuDriverGetVersion(ctypes.byref(value)) != 0:
+            return None
+    except (OSError, AttributeError):
+        return None
+    return value.value // 1000, value.value % 1000 // 10
+
+
+def _fetch(url: str, timeout: float = 120.0) -> bytes:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        data: bytes = response.read()
+    return data
+
+
+def fetch_sanitizer(
+    cuda: tuple[int, int] | None = None, fetch: Any = _fetch, log: Any = print
+) -> Path:
+    """Install ``compute-sanitizer`` from NVIDIA's CUDA redistributables into
+    ``CACHE_DIR/compute-sanitizer/`` (where :func:`find_sanitizer` looks) and return it:
+    the newest release for ``cuda`` (default: the driver's CUDA version) or older, its
+    archive checked against the manifest's sha256."""
+    import io
+    import platform
+    import tarfile
+
+    want = cuda or driver_cuda_version()
+    if want is None:
+        raise RuntimeError("no CUDA driver: cannot tell which compute-sanitizer fits it")
+    index = fetch(REDIST_URL).decode("utf-8", "replace")
+    found = {
+        tuple(int(x) for x in m.groups()): m.group(0)
+        for m in re.finditer(r"redistrib_(\d+)\.(\d+)\.(\d+)\.json", index)
+    }
+    fits = sorted(v for v in found if v[:2] <= want)
+    if not fits:
+        raise RuntimeError(f"no CUDA redistributable for CUDA {want[0]}.{want[1]} or older")
+    manifest = json.loads(fetch(REDIST_URL + found[fits[-1]]))
+    arch = {"x86_64": "linux-x86_64", "aarch64": "linux-sbsa"}.get(platform.machine())
+    entry = (manifest.get("cuda_sanitizer_api") or {}).get(arch or "")
+    if not entry:
+        raise RuntimeError(f"{found[fits[-1]]} has no cuda_sanitizer_api for {arch}")
+    log(f"downloading {entry['relative_path']} ({int(entry.get('size', 0)) / 1e6:.0f} MB)")
+    data = fetch(REDIST_URL + entry["relative_path"])
+    if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+        raise RuntimeError(f"{entry['relative_path']}: sha256 mismatch")
+    root = CACHE_DIR / "compute-sanitizer"
+    root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:xz") as tar:
+        top = {Path(name).parts[0] for name in tar.getnames()}
+        tar.extractall(root, filter="data")
+    binaries = [root / t / "compute-sanitizer" / "compute-sanitizer" for t in sorted(top)]
+    binary = next((p for p in binaries if p.is_file()), None)
+    if binary is None:
+        raise RuntimeError(f"{entry['relative_path']}: no compute-sanitizer/compute-sanitizer")
+    _found.clear()
+    return binary
+
+
 def cuda_include_dirs() -> list[str]:
     """Header directories for runtime compilation (NVRTC needs ``cuda_bf16.h`` etc.)."""
     dirs: list[str] = []

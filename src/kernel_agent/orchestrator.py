@@ -54,7 +54,7 @@ from kernel_agent.dashboard import refresh
 from kernel_agent.integrate import owners as owners_mod
 from kernel_agent.integrate import reuse as reuse_cache
 from kernel_agent.integrate.export import export_optimized
-from kernel_agent.kernels import evaluate, recheck
+from kernel_agent.kernels import evaluate, memcheck, recheck
 from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
@@ -94,6 +94,9 @@ class Orchestrator:
         # Its re-evaluation of a stale or disagreeing record (kernels/evaluate.py
         # run_evaluation); None = the real one.
         self.reevaluator: Callable[..., dict[str, Any]] | None = None
+        # The memcheck of a kernel that passed its re-check (kernels/memcheck.py); None = the
+        # real one, which a simulated run skips.
+        self.memchecker: Callable[..., dict[str, Any]] | None = None
         # (target, snapshot name) -> the conservative speedup of a kernel whose re-check
         # disagrees with its record (recheck.speed_warning): what ranks and projects it.
         self.speed_caps: dict[tuple[str, str], float] = {}
@@ -1035,10 +1038,12 @@ class Orchestrator:
         considers (each target's best, the kernels of the measured combination and the
         ``versions`` a re-integration tries as swaps): fresh inputs of the captured shapes
         against a freshly computed reference, reference and kernel timed in processes of
-        their own. A kernel that fails it is refused (a log line and a ``recheck_failed``
+        their own. A kernel that passes it runs once under memcheck (:meth:`_memcheck`).
+        A kernel that fails either is refused (a log line and a ``recheck_failed``
         event with the reason; a refused version is a record with ``passed: false``), and
         so is a combination with it. A re-integration reuses the result of the same
-        snapshot (``previous``).
+        snapshot (``previous``), and runs a memcheck that did not decide (skipped, failed)
+        again.
 
         A correct kernel whose speedup disagrees with its record (``speed_disagrees``) is a
         warning (a log line and a ``recheck_speed_disagrees`` event), not a refusal: it is
@@ -1066,6 +1071,8 @@ class Orchestrator:
             sha = (rec or {}).get("snapshot_sha256")
             hit = known.get((arg, sha)) if sha else None
             result = dict(hit) if hit is not None else self._recheck_one(target_id, snap, rec)
+            if memcheck.pending(result):  # passed, and no memcheck verdict yet
+                result = self._memcheck(target_id, snap, result)
             checked[arg] = result
             records.append(
                 {
@@ -1130,6 +1137,42 @@ class Orchestrator:
                 log(f"integrate: no seed from exp {exp}: one of its kernels failed the recheck")
                 composite = None
         return items, composite, records
+
+    def _memcheck(self, target_id: str, snap: Path, result: dict[str, Any]) -> dict[str, Any]:
+        """A kernel snapshot that passed its re-check (``result``) once on its target's
+        captured cases and their odd-size variants under ``compute-sanitizer --tool
+        memcheck`` (``kernels/memcheck.py``; ``memcheck`` in the record: status, seconds,
+        the sanitizer's first report). Memory errors refuse it (status ``memcheck``); a
+        sanitizer that is missing or fails is recorded with its reason, and the kernel kept.
+        A ``memcheck`` ledger event records each run."""
+        if self.memchecker is None and self.simulated:  # nothing runs: no log line, no event
+            return {**result, "memcheck": {"status": "skipped", "reason": "simulated run"}}
+        capture = self.run.capture_file(target_id)
+        if not capture.exists():
+            check = {"status": "skipped", "reason": f"no capture file {capture}"}
+        else:
+            try:
+                check = (self.memchecker or memcheck.run_memcheck)(
+                    capture,
+                    snap,
+                    capture_sha256=self.truth.verify(capture),
+                    timeout=2 * self.budget.eval_timeout_s,
+                )
+            except Exception as exc:  # the check broke: recorded, the kernel is kept
+                check = {"status": "error", "reason": repr(exc)[:500]}
+        log(f"integrate: memcheck {target_id} ({snap.name}): {memcheck.describe(check)}")
+        ledger.event(
+            self.run,
+            "memcheck",
+            target=target_id,
+            snapshot=snap.name,
+            status=check.get("status"),
+            seconds=check.get("seconds"),
+            errors=check.get("errors"),
+            reason=str(check.get("reason") or "")[:500],
+        )
+        result = {**result, "memcheck": check}
+        return memcheck.refuse(result, check) if check.get("status") == memcheck.STATUS else result
 
     def _recheck_one(
         self, target_id: str, snap: Path, rec: dict[str, Any] | None
