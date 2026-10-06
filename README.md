@@ -104,7 +104,8 @@ same time.
   in place (same addresses, a normal draw from each tensor's own mean and std,
   KV-cache contents included) and from a random mix of uniform, Laplace and
   log-normal draws, each compared with the reference called live on the same
-  inputs (`incorrect_perturbed`). Integer and boolean tensors (ids, positions,
+  inputs (`incorrect_perturbed`; a near-lossless tier uses its bounds for
+  redrawn inputs, "Quality modes"). Integer and boolean tensors (ids, positions,
   masks) and additive masks are kept. So a candidate must recompute every call
   for any input of the captured shapes: outputs cached by address, shape or
   call count, skipped work and reads of unused cache slots are rejected.
@@ -223,19 +224,20 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   same checks with cosine >= 0.96, relative L2 error <= 0.28, the norm within
   ±4 % and every element within 1.25 × RMS + 0.25 × |reference| (calibration
   below). Other targets keep the exact tier.
-* **Redrawn inputs.** The evaluator's perturbed-input check and the
-  integration's re-check compare a candidate with the reference on inputs
-  redrawn from each tensor's own mean and std. Those have no outlier channels,
-  so a weight row that writes a massive activation carries its many times larger
-  rounding error into a channel whose values are now small (calibration
-  below). There the tiers use their own bounds (`compare.PERTURBED_BOUNDS`), and
-  the RMS in the element bound is the larger of the tensor's and the element's
-  channel's (the last dimension, over at least 16 rows): `near-lossless` every
-  element within 0.75 × RMS + 0.125 × |reference| (cosine, relative L2 and norm
-  as above); `near-lossless-fp4` cosine >= 0.94, relative L2 error <= 0.40, the
-  norm within ±12 % and every element within 2.5 × RMS + 0.25 × |reference|. A
-  tensor without signal gets the larger of the exact tolerance and the tier's
-  element bound at RMS = atol.
+* **Redrawn inputs.** The evaluator's perturbed-input and timed-output checks
+  and the integration's re-check compare a candidate with the reference on
+  inputs redrawn from each tensor's own mean and std. Those have no outlier
+  channels, so a weight row that writes a massive activation carries its many
+  times larger rounding error into a channel whose values now spread around
+  zero (calibration below). There the tiers use their own bounds
+  (`compare.PERTURBED_BOUNDS`), and the RMS in the element bound is the larger
+  of the tensor's and the element's channel's (the last dimension, over at
+  least 16 rows): `near-lossless` cosine >= 0.996, relative L2 error <= 0.08,
+  the norm within ±3 % and every element within 0.75 × RMS + 0.125 ×
+  |reference|; `near-lossless-fp4` cosine >= 0.94, relative L2 error <= 0.40,
+  the norm within ±12 % and every element within 2.5 × RMS + 0.25 ×
+  |reference|. A tensor without signal gets the larger of the exact tolerance
+  and the tier's element bound at RMS = atol.
 * Without a perceptual baseline (the workload declares no samples, or
   `analyze` ran in exact mode) a near-lossless run keeps the exact checks;
   `metrics.perceptual.skipped` says why.
@@ -306,7 +308,7 @@ on real inputs), keeps that many times the rounding error of the other channels
 while its values now spread around zero instead of staying massive. Calibrated
 with each precision's reference math (fake quant as above; W8A8 through
 `quant.fp8_w8a8_linear`, on the GPU `torch._scaled_mm`) on real captures,
-50-100 seeds of both redraws per case; failed draws (worst element ratio) with
+30-100 seeds of both redraws per case; failed draws (worst element ratio) with
 the bounds of captured inputs and with the bounds for redrawn inputs:
 
 | module (rows per call) | precision | captured inputs: min cosine / max rel L2 / max element ratio | redrawn, old bounds | redrawn, new bounds |
@@ -321,28 +323,33 @@ the bounds of captured inputs and with the bounds for redrawn inputs:
 | LocDiT down_proj (352, 176) | W8A8 / FP8 / NVFP4 | 0.99999 / 0.008 / 0.09 (W8A8) | 72 / 5 / 73 of 120 | 0 / 0 / 0 |
 | base LM decode layer (1, KV cache) | W8A8 / FP8 / NVFP4 | 0.99952 / 0.031 / 0.27 (W8A8) | 24 / 0 / 8 of 600 | 1 / 0 / 0 of 600 |
 | base LM down_proj GEMV (1) | W8A8 / FP8 / NVFP4 | 0.99995 / 0.012 / 0.09 (W8A8) | 1 / 0 / 2 of 180 | 0 / 0 / 0 |
-GPU_ROWS_PLACEHOLDER
+| GPU: LocDiT layer, `torch._scaled_mm` reference (352, 176) | W8A8 | 0.99979 / 0.020 / 0.19 | 101 of 200 (2.04) | 0 of 200 (0.47) |
+| GPU: the exp 100 kernel (`_scaled_mm` GEMMs in one C++ layer) | W8A8 | 0.99979 / 0.020 / 0.19 | 101 of 200 (2.51) | 0 of 200 (0.47) |
+| GPU: the exp 101 kernel (down_proj kept bf16) | W8A8 | 0.99979 / 0.020 / 0.19 | 88 of 200 (2.39) | 0 of 200 (0.47) |
 
-The other LocDiT and LM Linears pass both ways. So on redrawn inputs (the
-evaluator's perturbed-input check and the integration's re-check) the RMS in
-the element bound is the larger of the tensor's and the element's channel's: a
-GEMM's rounding error scales with its output channel's weight row, and the
-channel's spread measures that. Decode outputs (one row) have no channel
-statistics: the LM down_proj GEMV needs 0.43 x RMS with FP8 weights, 0.60 with
-W8A8 and 2.06 with NVFP4, hence 0.75 and 2.5. The norm of the LocDiT attention's
-output moves by up to 1.9 % with W8A8 (rows 497 and 247 hold 12 % of the o_proj
-weight energy, so their noise does not average out): ±3 %. NVFP4's V-cache slot
-of an LM decode step (256 values near the signal threshold, relative L2 0.20 on
-real inputs) reaches 0.33 and +9.7 % on redrawn ones, and failed the exact
-tolerance of a tensor without signal in 6 of 598 draws: the FP4 bounds and the
-no-signal floor above. The one remaining failure is W8A8 at M = 1 (the norm of a
-KV-cache slot, 3.2 %), which fails real decode inputs as well (`fp8_weights` is
-the decode precision). Broken weights still fail the captured cases (unchanged)
-and every redrawn draw of the LocDiT layer: weight scales x 1.05, a neighbour
-channel's scale, the first token's activation scale, a zeroed output channel,
-swapped FP4 nibbles, shifted FP4 block scales (FP4's x 1.05 and int4 per tensor
-only on the captured cases); activation scales cached from the first call pass
-the captured cases and fail 24 of 32 redrawn draws.
+So the run's two kernels were correct: on the same draws they fail as often as
+`_scaled_mm` itself, and the evaluator with the new bounds passes them (`ok`,
+3.34x and 3.16x module speedup). The other LocDiT and LM Linears pass both
+ways. On redrawn inputs (the evaluator's perturbed-input check, its timed-output
+check and the integration's re-check) the RMS in the element bound is therefore
+the larger of the tensor's and the element's channel's: a GEMM's rounding error
+scales with its output channel's weight row, and the channel's spread measures
+that. Decode outputs (one row) have no channel statistics: the LM down_proj
+GEMV needs 0.43 x RMS with FP8 weights, 0.60 with W8A8 and 2.06 with NVFP4,
+hence 0.75 and 2.5. The norm of the LocDiT attention's output moves by up to
+1.9 % with W8A8 (rows 497 and 247 hold 12 % of the o_proj weight energy, so
+their noise does not average out): ±3 %. NVFP4's V-cache slot of an LM decode
+step (256 values near the signal threshold, relative L2 0.20 on real inputs)
+reaches 0.33 and +9.7 % on redrawn ones, and failed the exact tolerance of a
+tensor without signal in 6 of 598 draws: the FP4 bounds and the no-signal floor
+above. The one remaining failure is W8A8 at M = 1 (the norm of a KV-cache slot,
+3.2 %), which fails real decode inputs as well (`fp8_weights` is the decode
+precision). Broken weights still fail the captured cases (unchanged) and every
+redrawn draw of the LocDiT layer: weight scales x 1.05, a neighbour channel's
+scale, the first token's activation scale, a zeroed output channel (FP8 and
+W8A8), swapped FP4 nibbles, shifted FP4 block scales (FP4's x 1.05 and int4 per
+tensor only the captured cases); activation scales cached from the first call
+pass the captured cases and fail 24 of 32 redrawn draws.
 
 Cost on the RTX 5070 Ti: `analyze` takes 34 s longer (the 8 eager samples
 17.8 s, scoring 16.5 s). Each `e2e` (and each paired A/B of the integration)

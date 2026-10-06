@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from kernel_agent.agent import prompts
-from kernel_agent.kernels import compare, verify
+from kernel_agent.kernels import bench, compare, verify
 from kernel_agent.kernels.evaluate import evaluate
 from kernel_agent.kernels.recheck import compare_entries
 from kernel_agent.profiling.capture import capture_calls
@@ -242,7 +242,7 @@ def test_a_tensor_without_signal_gets_the_tier_element_bound_on_redrawn_inputs()
     assert not compare.compare_tensors("v", ref, new + 1.0, tier=fp4, perturbed=True)["ok"]
 
 
-def test_recheck_compares_redrawn_inputs_with_the_redrawn_bounds():
+def test_recheck_and_the_timed_output_check_use_the_redrawn_bounds(monkeypatch):
     ref, noise, error = _wide_channel()
     new = ref + noise + error
     expected = [{"output": {"output": ref}, "pre": {}, "args": {}, "kwargs": {}}]
@@ -250,6 +250,15 @@ def test_recheck_compares_redrawn_inputs_with_the_redrawn_bounds():
     tier = compare.NEAR_LOSSLESS_TIER
     assert compare_entries(expected, saved, [(0, 0)], tier=tier) == [[]]
     assert not compare.compare_tensors("output", ref, new, tier=tier)["ok"]
+
+    # the kept timed call runs on redrawn inputs (bench._perturbed_copy)
+    monkeypatch.setattr(compare, "TIER", tier)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    x = torch.zeros(1)
+    kept = {"iteration": 3, "pre": ((x,), {}), "post": ((x,), {}), "output": new}
+    assert bench.check_timed_output(lambda x: ref, kept) == {"iteration": 3, "failures": []}
+    kept["output"] = new + 1.0
+    assert bench.check_timed_output(lambda x: ref, kept)["failures"]
 
 
 def test_engineer_prompt_states_the_redrawn_bounds():

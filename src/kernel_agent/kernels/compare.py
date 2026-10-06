@@ -121,7 +121,8 @@ NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]]
     ),
 }
 #: Redrawn inputs (``perturbed``: the evaluator's perturbed-input check,
-#: :mod:`kernel_agent.kernels.verify`, and the integration's re-check,
+#: :mod:`kernel_agent.kernels.verify`, its timed-output check,
+#: :func:`kernel_agent.kernels.bench.check_timed_output`, and the integration's re-check,
 #: :mod:`kernel_agent.kernels.recheck`, compare the candidate with the reference called on
 #: inputs redrawn from each tensor's own mean and std) have no outlier channels, so bounds
 #: calibrated on real inputs do not carry over (#109). A weight row that writes a massive
