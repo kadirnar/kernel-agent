@@ -1442,6 +1442,29 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   `## research`, events `research_start` / `research_done`, `costs.json` as
   `research-<target>#<slice>`). They are recorded in `improve.json` →
   `research`, shown as diamonds in `improve.png` and listed in `report.md`.
+* **Precision pivots** (`kernel_agent/pivot.py`, `--quality near-lossless`
+  only). A target's precision is fixed when it is planned and captured. When the
+  evidence shows its remaining gain lies in another precision tier (VoxCPM2,
+  `runs/openbmb--VoxCPM2/20261006-004718`: the exact-tier `dit_layer` arm stayed
+  at 3.01x for 4 slices while W8A8 FP8 on the same GEMMs, as transforms, took
+  the run from 3.3x to 4.7x), the target can move: the research session may
+  also write `targets/<id>/pivot.json`, and a round's re-plan may list
+  `pivots` in its plan, each `{"target", "precision", "precision_why"[,
+  "approach"]}`. The research evidence of a near-lossless run lists the fastest
+  passing end-to-end transforms for that purpose. A pivot needs a reduced
+  precision other than the target's own (`fp8_weights`, `fp8_w8a8`,
+  `fp4_weights`, `reduced`), a `precision_why` with numbers in it, and a module
+  target (not a region target); it is tried once per target and precision. The
+  orchestrator then writes `targets/<id>__<precision>/spec.json` (`pivot_of`:
+  the original id; the research plan is copied along) and captures it afresh in
+  the new tier, so the scheduler sees a new arm while the old arm keeps its
+  history and its exact results stay comparable. Integration treats the two
+  as versions of one item: one of them is accepted and the version swap
+  measures the other in its place. Events `pivot` / `pivot_refused` /
+  `pivot_failed`; `improve.json` → `research[].pivot`; the improve section of
+  `report.md`, the dashboard's target table and `kernel-agent status` show
+  each arm's precision. The engineer of the new arm is pointed at the old
+  arm's kernels, notes and plan.
 * **Re-integration.** After every `--integrate-every 4` kept results, the
   integration of `optimize` measures the combination end to end
   (`--integrate-every 0`: only the final integration, and the one a new round
@@ -1478,7 +1501,9 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   `idea_id`, retries an idea once after a failed attempt and starts from the
   directions of a research plan. The simulated research agent writes `plan.md`
   from the ledger, so plateaus exercise the research trigger and its cap (the
-  simulated outcomes do not depend on the plan). The CUDA graph the systems
+  simulated outcomes do not depend on the plan); in a `--quality near-lossless`
+  dry run it also proposes `fp8_weights` for the plateaued MLP target, whose
+  `mlp__fp8_weights` arm then reaches a higher ceiling. The CUDA graph the systems
   agent finds is incompatible with the MLP kernel, and round 2 finds a new
   target. Time is simulated too, so `--max-hours` counts simulated hours. The
   images below come from `kernel-agent improve Qwen/Qwen3-0.6B --dry-run
@@ -1935,6 +1960,8 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/candidates/    files the agent writes
   targets/<id>/workers/<k>/   --seeds-per-target: a worker's candidates/ + NOTES.md (+ links)
   targets/<id>/plan.md        improve: the research plan of a plateaued target
+  targets/<id>/pivot.json     near-lossless: its proposal to move to another precision; the
+                              new target is targets/<id>__<precision>/ (pivot_of: <id>)
   targets/<id>/rewrite.py     region target: the refactor agent's rewrite (+ parent/: its
                               parent's capture_inputs.pt, reference_source.py, profile)
   targets/<id>/history/ results.jsonl   the agent's copies (never read back)

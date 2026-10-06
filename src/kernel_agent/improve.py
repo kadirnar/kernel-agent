@@ -44,7 +44,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import interrupt, ledger, research, workers
+from kernel_agent import interrupt, ledger, pivot, research, workers
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
@@ -249,9 +249,16 @@ def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Poli
 
 
 def rounds_context(
-    run: RunDir, state: dict[str, Any], n: int, accepted: list[dict[str, Any]], arms: list[Arm]
+    run: RunDir,
+    state: dict[str, Any],
+    n: int,
+    accepted: list[dict[str, Any]],
+    arms: list[Arm],
+    *,
+    quality: str = "exact",
 ) -> str:
-    """Planner context for round ``n``: what earlier rounds did and which targets exist."""
+    """Planner context for round ``n``: what earlier rounds did and which targets exist (and,
+    in a near-lossless run, how to move one of them to another precision: ``pivot.py``)."""
     base = (read_json(run.baseline_json, {}) or {}).get("median_ms")
     lines = [
         "",
@@ -272,9 +279,11 @@ def rounds_context(
     lines += ["", "## Existing targets (do not propose these module classes again)"]
     for arm in arms:
         if arm.kind == KERNEL:
+            spec = read_json(run.target(arm.id) / "spec.json", {}) or {}
+            tier = f" [{pivot.label(spec)}]" if spec.get("precision") else ""
             lines.append(
-                f"* `{arm.id}` (`{arm.module_class}`): best {arm.best:.2f}x after {arm.evals} "
-                f"evaluations; {arm.stop or 'still open'}"
+                f"* `{arm.id}` (`{arm.module_class}`){tier}: best {arm.best:.2f}x after "
+                f"{arm.evals} evaluations; {arm.stop or 'still open'}"
             )
     lines += [
         "",
@@ -282,6 +291,17 @@ def rounds_context(
         "above. An empty `targets` list is a valid answer when nothing new is worth a kernel. "
         "New transform ideas are passed on to the systems agent.",
     ]
+    if quality == "near-lossless":
+        lines += [
+            "",
+            "## Precision pivots",
+            "To move an existing target to another precision tier (its precision was fixed "
+            'when it was planned), list it under `pivots` instead: `{"target": id, '
+            '"precision": ..., "precision_why": ...}`, the `precision_why` with the numbers '
+            "behind it (its bound and ceiling, a passing transform that already uses that "
+            "precision on its modules). kernel-agent captures it again in that tier as a new "
+            "target `<id>__<precision>`; the old one keeps its results.",
+        ]
     return "\n".join(lines)
 
 
@@ -721,10 +741,14 @@ class Improver:
         """A research session for a plateaued arm (``Orchestrator.research``) and its record.
 
         ``plan`` in the record: whether the session wrote a new ``plan.md``; only
-        then does the arm's count of evaluations without a new best restart."""
+        then does the arm's count of evaluations without a new best restart. ``pivot``:
+        what became of a precision pivot it proposed (``pivot.json``, ``pivot.py``): the
+        new target, or why it was refused."""
         n = len(self.state["slices"])
         plan = research.plan_path(self.run, arm.id)
         before = plan.read_bytes() if plan.is_file() else None
+        proposal = pivot.proposal_path(self.run, arm.id)
+        proposed = proposal.read_bytes() if proposal.is_file() else None
         rec: dict[str, Any] = {
             "n": len(self.state["research"]) + 1,
             "arm": arm.id,
@@ -758,6 +782,10 @@ class Improver:
             raise
         wrote = plan.is_file() and plan.read_bytes() != before
         self._close_research(rec, status, plan=wrote, usd=usd)
+        if proposal.is_file() and proposal.read_bytes() != proposed:  # a new arm in its tier
+            found = pivot.read_proposal(proposal) or {}
+            rec["pivot"] = await self.orch.pivot(arm.id, found, source=rec["label"])
+            self.save()
         return rec
 
     def _close_research(
@@ -879,10 +907,12 @@ class Improver:
                 target_id, _, path = item["item"].partition("=")
                 rec = snapshot_record(self.run, target_id, path) or {}
                 applied[target_id] = float(rec.get("speedup") or 1.0)
-        context = rounds_context(self.run, self.state, n, accepted, arms)
+        quality = self.orch.cfg.quality
+        context = rounds_context(self.run, self.state, n, accepted, arms, quality=quality)
         with self._doing(f"re-plan for round {n}"):
             new = await self.orch.replan(round_dir, context, label=f"planner#round{n}")
             captured = await self.orch.capture_targets(new) if new else []
+            captured += await self._pivots(round_dir, n)
         self.state["rounds"].append(
             {
                 "n": n,
@@ -899,6 +929,23 @@ class Improver:
         ledger.event(self.run, "round_start", round=n, targets=captured)
         log(f"round {n}: {info['median_ms']:.1f} ms; new targets: {captured or 'none'}")
         return bool(captured)
+
+    async def _pivots(self, round_dir: Path, n: int) -> list[str]:
+        """The precision pivots the round's re-plan proposed (``pivots`` in its
+        ``plan.json``, ``pivot.py``): the ids of the new targets captured."""
+        plan = read_json(round_dir / "plan.json", {}) or {}
+        moved = []
+        for proposal in plan.get("pivots") or []:
+            if not isinstance(proposal, dict) or not proposal.get("target"):
+                continue
+            target_id = str(proposal["target"])
+            if target_id not in self.run.target_ids():
+                log(f"round {n}: pivot of unknown target {target_id!r} ignored")
+                continue
+            done = await self.orch.pivot(target_id, proposal, source=f"planner#round{n}")
+            if done.get("target"):
+                moved.append(str(done["target"]))
+        return moved
 
 
 # ------------------------------------------------------------------ report + chart
@@ -919,14 +966,16 @@ def report_lines(run: RunDir) -> list[str]:
         f"{len(state.get('integrations', []))} re-integrations, {len(state['rounds'])} round(s)",
         f"* stopped: {finished.get('reason', 'not finished (interrupted or running)')}",
         "",
-        "| arm | slices | evaluations | slices with a new best | best |",
-        "|---|---|---|---|---|",
+        "| arm | precision | slices | evaluations | slices with a new best | best |",
+        "|---|---|---|---|---|---|",
     ]
     for arm in dict.fromkeys(s["arm"] for s in slices):
         mine = [s for s in slices if s["arm"] == arm]
         best = max(float(s.get("best_after") or s.get("best_before") or 1.0) for s in mine)
+        spec = read_json(run.target(arm) / "spec.json", {}) or {}
+        tier = pivot.label(spec) if arm != SYSTEMS else "—"
         lines.append(
-            f"| `{arm}` | {len(mine)} | {sum(s.get('evals') or 0 for s in mine)} | "
+            f"| `{arm}` | {tier} | {len(mine)} | {sum(s.get('evals') or 0 for s in mine)} | "
             f"{sum(bool(s.get('improved')) for s in mine)} | {best:.3f}x |"
         )
     integrations = state.get("integrations", [])
@@ -937,6 +986,10 @@ def report_lines(run: RunDir) -> list[str]:
         lines += ["", "Research sessions on plateaued targets (`targets/<id>/plan.md`):", ""]
         for r in sessions:
             outcome = "wrote a plan" if r.get("plan") else f"no plan ({r.get('status')})"
+            if moved := (r.get("pivot") or {}).get("target"):
+                outcome += f", precision pivot to `{moved}`"
+            elif refused := (r.get("pivot") or {}).get("refused"):
+                outcome += f", precision pivot refused ({refused})"
             later = [s for s in slices if s["arm"] == r["arm"] and s["n"] > r["after_slice"]]
             best = max([float(r.get("best") or 1.0), *(s.get("best_after") or 0 for s in later)])
             lines.append(

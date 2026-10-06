@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import ledger, program, truth, workers
+from kernel_agent import ledger, pivot, program, truth, workers
 from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
 from kernel_agent.budget import Budget
@@ -94,6 +94,8 @@ class SimTarget:
     backends: tuple[str, ...]
     hypotheses: tuple[str, ...]
     round: int = 1  # the round whose plan has it
+    # the precision its research session proposes in a near-lossless run (pivot.py)
+    pivot: str | None = None
 
 
 TARGETS = (
@@ -134,6 +136,7 @@ TARGETS = (
             "unroll the K loop by 4",
             "overlap the gate/up GEMV with the SiLU",
         ),
+        pivot="fp8_weights",  # M=1 decode GEMVs: bound by streaming the bf16 weights
     ),
     SimTarget(
         "rmsnorm",
@@ -194,9 +197,15 @@ def _rng(seed: int, *key: Any) -> random.Random:
 
 
 def sim_target(spec: dict[str, Any]) -> SimTarget:
-    """The simulated behaviour of a target (made up from its id when it is not in TARGETS)."""
+    """The simulated behaviour of a target (made up from its id when it is not in TARGETS).
+    A precision pivot (``pivot_of``) of a target gets 1.6x its ceiling (FP8 weights)."""
     for sim in TARGETS:
         if sim.cls == spec.get("module_class"):
+            if spec.get("pivot_of"):
+                faster = None if sim.sol_at is None else round(sim.sol_at * 1.9, 3)
+                return dataclasses.replace(
+                    sim, ceiling=round(sim.ceiling * 1.6, 3), sol_at=faster, pivot=None
+                )
             return sim
     rng = _rng(0, "target", spec.get("id"))
     return SimTarget(
@@ -592,7 +601,17 @@ class World:
             return
         spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
         rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
-        plan.write_text(_plan_md(target_id, sim_target(spec), rows))
+        sim = sim_target(spec)
+        plan.write_text(_plan_md(target_id, sim, rows))
+        proposal = pivot.proposal_path(self.run, target_id)
+        allowed = proposal.resolve() in {p.resolve() for p in writable}
+        if allowed and sim.pivot and not spec.get("precision") and not proposal.exists():
+            best = max((r["speedup"] or 0.0 for r in rows if r["correct"]), default=1.0)
+            why = (
+                f"{sim.cls} decode is M=1 GEMVs that stream the bf16 weights: memory bound, "
+                f"best {best:.2f}x of a {sim.ceiling:.1f}x ceiling at bf16; FP8 halves the bytes"
+            )
+            write_json(proposal, {"precision": sim.pivot, "precision_why": why})
 
     def _plan(self, cwd: Path) -> dict[str, Any]:
         profile = read_json(cwd / "profile" / "profile.json", {}) or {}
@@ -738,8 +757,13 @@ class World:
         return baseline
 
     def _capture(self, target_id: str) -> dict[str, Any]:
+        from kernel_agent.kernels.compare import EXACT_TIER, tier_for
+
         spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
         info = _capture_info(sim_target(spec))
+        tier = tier_for(self.orch.cfg.quality, spec.get("precision"))
+        if tier != EXACT_TIER:  # as worker capture: the tier and precision of the target
+            info.update(tier=tier, precision=spec["precision"])
         _write_target(self.run, {**spec, "capture": info})
         self.clock.advance(45)
         return info

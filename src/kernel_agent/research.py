@@ -30,6 +30,7 @@ from kernel_agent.workspace import RunDir
 PLAN_FILE = "plan.md"
 PLAN_CHARS = 6000  # of plan.md in a slice digest
 LEDGER_ROWS = 40  # ledger rows of the target shown to the research session
+TRANSFORM_ROWS = 5  # passing end-to-end transform evaluations shown (near-lossless runs)
 
 
 def plan_path(run: RunDir, target_id: str) -> Path:
@@ -137,6 +138,39 @@ def _best(run: RunDir, target_id: str, keeper: Truth | None) -> list[str]:
         cells.append(str(c.get("bound") or ""))
         lines.append("| " + " | ".join(cells) + " |")
     return lines
+
+
+def transforms_section(run: RunDir, top: int = TRANSFORM_ROWS) -> str:
+    """``## End-to-end transforms`` of a near-lossless run's research evidence: the fastest
+    passing transform evaluations (a transform that already uses another precision on
+    the target's modules is evidence for a precision pivot, ``pivot.py``)."""
+    rows = [
+        r
+        for r in ledger.rows(run)
+        if r["target"] == ledger.E2E
+        and "transform" in r["backend"]
+        and r["correct"]
+        and r["speedup"] is not None
+    ]
+    rows.sort(key=lambda r: -float(r["speedup"]))
+    if not rows:
+        return ""
+    lines = [
+        "",
+        "",
+        f"## End-to-end transforms: the {min(top, len(rows))} fastest passing evaluations",
+        "(model-level changes the systems agent measured; `transforms/` holds the files)",
+        "",
+        "| exp | speedup | transforms | hypothesis |",
+        "|---|---|---|---|",
+    ]
+    for r in rows[:top]:
+        names = ", ".join(ledger.snapshot_stem(s) for s in str(r["snapshot"]).split("+"))
+        lines.append(
+            f"| {r['exp']} | {float(r['speedup']):.3f}x | {_cell(names, 300)} | "
+            f"{_cell(r['hypothesis'], 300)} |"
+        )
+    return "\n".join(lines)
 
 
 def evidence(run: RunDir, target_id: str, reason: str, keeper: Truth | None = None) -> str:

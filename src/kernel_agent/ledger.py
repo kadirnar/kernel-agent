@@ -607,6 +607,9 @@ def summary(run: RunDir) -> dict[str, Any]:
                 "id": target_id,
                 "module_class": spec.get("module_class"),
                 "backends": spec.get("backends", []),
+                # exact | fp8_w8a8 (pivot of <id>) | ...: the arm's tier (pivot.py)
+                "precision": str(spec.get("precision") or "exact"),
+                "pivot_of": spec.get("pivot_of"),
                 "evals": len(trows),
                 "keeps": len(kept),
                 "failures": sum(r["status"] in FAILURES for r in trows),

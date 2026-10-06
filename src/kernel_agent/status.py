@@ -97,6 +97,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         [
             t["id"],
             str(t["module_class"] or "")
+            + (f" [{t['precision']}]" if t.get("precision", "exact") != "exact" else "")
             + (f" ({len(t['workers'])} workers)" if len(t.get("workers") or []) > 1 else ""),
             str(t["evals"]),
             str(t["keeps"]),

@@ -1579,16 +1579,20 @@ class Orchestrator:
         """A clean-context research session on a plateaued target (``research.py``).
 
         Read-only tools plus ``best_result``; it may write ``targets/<id>/plan.md``
-        and nothing else (``run_agent(writable=...)``)."""
+        and, in a near-lossless run, a precision pivot proposal ``pivot.json``
+        (``pivot.py``), nothing else (``run_agent(writable=...)``)."""
+        from kernel_agent import pivot
+
         target_dir = self.run.target(target_id)
         spec = read_json(target_dir / "spec.json")
         plan = research.plan_path(self.run, target_id)
+        near = self.cfg.quality == "near-lossless"
+        proposal = pivot.proposal_path(self.run, target_id) if near else None
+        evidence = research.evidence(self.run, target_id, reason, self.truth)
+        if near:
+            evidence += research.transforms_section(self.run)
         system = prompts.research_prompt(
-            spec,
-            spec.get("capture", {}),
-            research.evidence(self.run, target_id, reason, self.truth),
-            plan,
-            self.tc.summary(),
+            spec, spec.get("capture", {}), evidence, plan, self.tc.summary(), pivot=proposal
         )
         return await self._agent(
             f"research-{target_id}",
@@ -1602,8 +1606,42 @@ class Orchestrator:
             mcp_tools=tool_names("best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
             tools=[*READ_TOOLS, "Write"],
-            writable=[plan],
+            writable=[plan] + ([proposal] if proposal else []),
         )
+
+    async def pivot(
+        self, target_id: str, proposal: dict[str, Any], *, source: str
+    ) -> dict[str, Any]:
+        """Move a target to another precision tier (``pivot.py``): check the proposal,
+        write the spec of the new target ``<id>__<precision>`` and capture it in its tier.
+        Returns ``{"target": new id}``, or ``{"refused": why}``; the old target is left as
+        it is. ``source``: who proposed it (a research session, a round's re-plan)."""
+        from kernel_agent import pivot
+
+        spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
+        taken = pivot.taken(self.run)
+        problem = pivot.check(spec, proposal, quality=self.cfg.quality, taken=taken)
+        if problem is not None:
+            log(f"pivot: {target_id}: not moved to {proposal.get('precision')!r} ({problem})")
+            ledger.event(self.run, "pivot_refused", target=target_id, why=problem, source=source)
+            return {"refused": problem}
+        new = pivot.pivot_spec(spec, proposal)
+        log(f"pivot: {target_id} -> {new['id']} ({source}): {new['precision_why'][:200]}")
+        if not await self.capture_targets([new]):
+            ledger.event(self.run, "pivot_failed", target=target_id, new=new["id"], source=source)
+            return {"refused": f"the capture of {new['id']} failed"}
+        plan = research.plan_path(self.run, target_id)
+        if plan.is_file():  # the diagnosis behind the pivot, for the new arm's first slice
+            (self.run.target(new["id"]) / research.PLAN_FILE).write_text(plan.read_text())
+        ledger.event(
+            self.run,
+            "pivot",
+            target=target_id,
+            new=new["id"],
+            precision=new["precision"],
+            source=source,
+        )
+        return {"target": new["id"]}
 
     def reprofile(self, out_dir: Path, accepted: list[dict[str, Any]]) -> dict[str, Any]:
         """Baseline + profile of the model with ``accepted`` integration items applied.
@@ -1794,10 +1832,13 @@ class Orchestrator:
 
 def _item_key(item: tuple[str, str]) -> str:
     """What an integration item optimises (its kernel target or its transform's idea):
-    one version of each can be accepted."""
+    one version of each can be accepted. A target's precision pivots (``pivot.py``)
+    optimise the same modules: their kernels are versions of the original target's."""
+    from kernel_agent.pivot import family
+
     kind, arg = item
     if kind == "kernel":
-        return f"kernel {arg.partition('=')[0]}"
+        return f"kernel {family(arg.partition('=')[0])}"
     return f"transform {ledger.snapshot_stem(arg)}"
 
 
