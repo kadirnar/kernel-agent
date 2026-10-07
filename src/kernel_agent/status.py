@@ -6,7 +6,7 @@ import shutil
 import textwrap
 from typing import Any
 
-from kernel_agent import ledger, objective, projection, strong_baseline
+from kernel_agent import backends, ledger, objective, projection, strong_baseline
 from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
@@ -151,6 +151,8 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         lines += _table(headers, rows, {2, 3, 4, 5, 6, 7}, width)
     else:
         lines.append("no evaluations yet")
+    if per_backend := backends.status_lines(run, s["rows"]):  # by source, priors left out
+        lines += ["", *(line[:width] for line in per_backend)]
 
     recent = s["rows"][-last:]
     if recent:

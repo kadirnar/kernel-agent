@@ -7,6 +7,7 @@ from typing import Any
 
 from kernel_agent import (
     abtest,
+    backends,
     ledger,
     library,
     objective,
@@ -450,6 +451,7 @@ def write_report(run: RunDir) -> Path:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))
     lines += report_lines(run)  # `kernel-agent improve` slices, re-integrations, rounds
+    lines += backends.report_lines(run)  # evaluations per backend (by source) and target
     lines += library.report_lines(run)  # prior winners reused, entries stored, lessons
     lines += web.report_lines(run.root)  # pages the agents fetched (issue #125)
     if costs:

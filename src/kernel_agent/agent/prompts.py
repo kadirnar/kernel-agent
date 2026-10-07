@@ -391,7 +391,12 @@ def planner_prompt(
     toolchain: str,
     quality: str = "exact",
     precisions: Iterable[str] | None = None,
+    backend_record: str = "",
 ) -> str:
+    """``backend_record``: which backend won which target class in earlier runs on this GPU
+    (:func:`kernel_agent.backends.track_record_note`)."""
+    from kernel_agent import backends as backend_policy
+
     base = {k: baseline.get(k) for k in ("workload", "median_ms", "peak_mem_gb", "deterministic")}
     if "compiled_ms" in baseline:  # the strong baseline (strong_baseline.py)
         base["compiled_ms"] = baseline["compiled_ms"]
@@ -460,9 +465,8 @@ model. Specialist agents will then write custom kernels for each target you pick
    run at M = 352, floor 0.81 s at bf16 vs 3.9 s now").
 3. For each target give `approach` (the concrete fusion/algorithm idea, which
    kernels it removes, expected speedup) and an ordered list of `backends` from:
-   {", ".join(backends)}. Put the backend most suited to the op first
-   (e.g. load_inline CUDA or CuTe for launch-bound micro-ops, Triton/TileLang for
-   tiled GEMM/attention fusions). Usually list 2. For the hottest targets add
+   {", ".join(backends)}. Put the backend most suited to the target class first
+   (the policy below). Usually list 2. For the hottest targets add
    1-2 `alternatives` (`approach` + `backends`): a genuinely different
    algorithm or fusion boundary, not a retuning. A target may get parallel
    workers, each starting from one of them.
@@ -471,9 +475,21 @@ model. Specialist agents will then write custom kernels for each target you pick
    when the profile shows launch/CPU-bound behaviour or redundant work.
 5. Ids are short snake_case.
 {precision_policy(quality, precisions)}
+{backend_policy.policy_text(backends)}
+{backend_record}
 Return the plan as structured output.
 
 {_env_block(python, toolchain)}"""
+
+
+def _backend_class_block(
+    target: dict[str, Any], capture_info: dict[str, Any], backends: list[str]
+) -> str:
+    """The target's class in the backend policy (kernel_agent/backends.py) and its row."""
+    from kernel_agent import backends as backend_policy
+
+    spec = {**target, "capture": capture_info}
+    return "\n" + backend_policy.engineer_note(spec, backends) + "\n"
 
 
 def _entrypoints_block(capture_info: dict[str, Any], cls: str) -> str:
@@ -804,7 +820,7 @@ Start with the first. When it is correct and fast, try the next one only if
 you expect it to beat the current best (different algorithm, lower launch
 overhead). Verified examples of every backend are in `{EXAMPLES_DIR}` — copy
 their structure.
-
+{_backend_class_block(target, capture_info, backends)}
 # Tools
 * `evaluate_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py",
   hypothesis="...", idea_id="<slug>", expected_speedup=1.4,
