@@ -1,4 +1,4 @@
-"""Declared concurrency for kernel candidates and transforms (#147, docs/PARALLEL.md §7.2).
+"""Declared concurrency for kernel candidates and transforms (#147, docs/PARALLEL.md §6.2).
 
 Overlap is legal when it is visible to the evaluator:
 

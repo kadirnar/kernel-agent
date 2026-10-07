@@ -981,7 +981,7 @@ the re-check below is that second opinion for every winner.
 
 ### Declared concurrency: streams, PDL, SM partitions
 
-Overlap is legal when the evaluator can see it (#147, docs/PARALLEL.md §7):
+Overlap is legal when the evaluator can see it (#147, docs/PARALLEL.md §6):
 all GPU work is launched from the calling thread, every stream is joined
 before the call or `run()` returns, and side streams are named through
 `kernel_agent.concurrency` (`cc`), so results record them:

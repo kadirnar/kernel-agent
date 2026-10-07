@@ -523,12 +523,8 @@ def _concurrency_check(ns: argparse.Namespace, workload: Any, inputs: Any) -> di
     items = [*listed("transform"), *listed("b_transform")]
     items += [k.partition("=")[2] for k in [*listed("kernel"), *listed("b_kernel")]]
     dirs = sorted({Path(p).resolve().parent for p in items if p})
-    devices = getattr(workload, "devices", None)  # a workload spread over several GPUs
-    indices = [d.index for d in devices or [] if getattr(d, "index", None) is not None]
     device = getattr(workload, "device", None) or "cpu"  # no device: nothing to profile
-    return e2e_activity.check(
-        workload.run, inputs, device=torch.device(device), devices=indices, dirs=dirs
-    )
+    return e2e_activity.check(workload.run, inputs, device=torch.device(device), dirs=dirs)
 
 
 def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:

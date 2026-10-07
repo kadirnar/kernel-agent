@@ -1,4 +1,4 @@
-"""End-to-end hidden-work check: one profiled run of the workload (#147, docs/PARALLEL.md §7.2).
+"""End-to-end hidden-work check: one profiled run of the workload (#147, docs/PARALLEL.md §6.2).
 
 The end-to-end timing (``workloads.base.timed_run``) brackets ``workload.run`` with
 device-wide synchronisations, so every stream of the device is timed. What it cannot see is
@@ -392,14 +392,13 @@ def check(
     inputs: Any,
     *,
     device: torch.device | int | None = None,
-    devices: Iterable[int] | None = None,
     dirs: Iterable[Path] = (),
     settle_s: float = SETTLE_S,
 ) -> dict[str, Any]:
     """The verdict of one profiled ``run(inputs)`` (:func:`analyse`), plus ``streams``: the
-    declared streams used. ``device``: the workload's device; ``devices``: every GPU it may
-    use (default: that one); ``dirs``: where the evaluated transforms and kernels live. A
-    run that raises under the profiler fails; a profiler that cannot start skips."""
+    declared streams used. ``device``: the workload's device (the only GPU it may use);
+    ``dirs``: where the evaluated transforms and kernels live. A run that raises under the
+    profiler fails; a profiler that cannot start skips."""
     from kernel_agent import concurrency
 
     if isinstance(device, torch.device) and device.type != "cuda":
@@ -408,7 +407,7 @@ def check(
         return {"passed": True, "reason": "", "skipped": "no CUDA device"}
     index = device.index if isinstance(device, torch.device) else device
     index = torch.cuda.current_device() if index is None else int(index)
-    allowed = {index, *(devices or ())}
+    allowed = {index}
     try:
         evts, state = profiled_run(run, inputs, device=index, settle_s=settle_s)
     except ProfilerUnavailable as exc:
