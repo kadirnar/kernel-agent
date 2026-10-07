@@ -82,7 +82,7 @@ GEMMs: 12 distinct weight copies (L2-cold) called back to back inside one CUDA
 graph, median of 15 replays, minimum over 3 interleaved rounds, GPU warmed first;
 spreads ≤ 1.5 %. Inputs random, e4m3 per-row/per-column scales; every Triton result
 is bit-identical (relative error 0.0) to the cuBLASLt result with the same scales.
-Scripts (scratchpad of this issue, not committed): `bench_fp8.py` (all columns
+Scripts (as run, in [`docs/research-scripts/triton-sm120/`](research-scripts/triton-sm120/)): `bench_fp8.py` (all columns
 below except TMA `tl.dot_scaled`), `bench_mx.py` (TMA `tl.dot_scaled`, warp
 specialisation; one round after warm-up), `const_scale.py`, `mma_rate.cu`,
 `sass_check.py`, `nvjet_name.py`.
