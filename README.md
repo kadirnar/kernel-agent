@@ -635,9 +635,9 @@ scheduler's region arms) it is converted first by one helper,
   is not projected, and the views say so (`not projected (its calls inside the
   first-audio window are unknown): ...`).
 
-The scheduler's kernel arms already use the profile's share × the baseline, which
-is in the metric's ms, and the ceilings table stays in the profiled window's own
-unit (per batched run for `throughput`).
+The ceilings table stays in the profiled window's own unit (per batched run for
+`throughput`). The improve scheduler converts its rows by the round's baseline ÷
+that window, and the time per run of an arm's best kernel by the helper above.
 
 ### Integration: paired A/B with undo handles
 
@@ -1298,7 +1298,9 @@ re-profile makes a new one for its re-plan.
 * **End to end**, per precision: the run with every class at its floor, nested
   classes counted once (the non-overlapping set of `projection.py`).
 * The planner ranks targets by ceiling × share (*saves ms*) and names each
-  target's bound with its number.
+  target's bound with its number. The improve scheduler takes each kernel arm's
+  expected gain from the table of the newest (re-profiled) run, at the arm's
+  precision (see "Scheduler" under `improve`).
 * Approximate: attention scores, KV-cache reads and element-wise math are not
   counted, weights stream from DRAM on every call, fp32 convolutions are held
   to the fp32 peak (cuDNN may use TF32). `python -m kernel_agent.profiling.ceilings
@@ -1625,8 +1627,28 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   continues (see "Authentication and safety"); `--auth` on a run directory
   replaces the run's mode unless it is `auto`.
 * **Scheduler.** Every kernel target is an arm, and so is the systems agent
-  (model-level transforms). The expected gain of an arm, in ms per model run,
-  is `remaining_ms × headroom × 0.7^k`:
+  (model-level transforms). The expected gain of an arm, in the metric's ms
+  (per model run for the latency), is `remaining_ms × headroom × 0.7^k`. A
+  kernel arm takes it from the ceilings table (see "Ceilings for the planner")
+  of the newest profile: in an improve round, the re-profile of the optimised
+  model, not the first analyze's eager profile:
+  * `now`: the time of the rows that hold the target's instance groups (its
+    `qualname` / `qualname_regex` / `phase`). The module at the group's qualname,
+    also when a transform wrapped it in place (`_TF32Scope` around VoxCPM2's VAE
+    decoder). When the optimised model hides the group inside a compiled or
+    CUDA-graphed parent (the LocDiT layers inside `UnifiedCFM`), the parent's
+    rows in every phase: the part of them the group took in an older table that
+    saw both (the analyze profile), with the group's own floor, else all of them
+    (an upper bound, said so). A group whose calls no case of the capture covers
+    (#119) is left out.
+  * `remaining_ms`: `now`, or the arm's best kernel per run when that is faster
+    (not integrated yet: Σ its new ms per call × the calls each case stands for).
+  * `headroom`: `1 − floor / remaining_ms`, the rows' floor at the arm's
+    precision: exact, FP8 w, W8A8 (`fp8_w8a8`), FP4 w, or bf16 math and weights
+    (`reduced`). A precision pivot's arm takes the floor of its new precision.
+
+  Without a table, a row that holds it or a floor (an older run, a region
+  target, unknown work, a peak not measured), Amdahl as before:
   * `remaining_ms`: the target's share of the profiled time × the baseline ms
     ÷ its best module speedup. For the systems agent it is the end-to-end time
     of its best run. A transform-only run is a new best when it beats the best
@@ -1636,9 +1658,24 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   * `headroom`: `1 − pct_of_sol` of the best result when the evaluator reports
     a speed-of-light estimate. Otherwise `1 − 1/further`, where `further =
     max(2 ÷ best, 1.1)` is the speedup still assumed possible. For the systems
-    agent, `further` starts at 1 ÷ the GPU-busy share of the profile (at least
-    1.25).
+    agent, `further` starts at the largest of the end-to-end speedup the newest
+    ceilings table allows (its end-to-end line, at the lowest floor of the
+    precisions the run's `--quality` allows), 1 ÷ the GPU-busy share of the
+    profile and 1.25. Transforms and kernels may reach for the same floor; the
+    UCB index below tells which of them pays.
   * `k`: slices of this arm in a row that found no new best.
+
+  The slice log, `improve.json` (`slices[].why`) and the `slice_start` event
+  name the components of the score, for example (VoxCPM2 round 2, ms per second
+  of audio): `slice 28: dit_layer__fp8_w8a8 (best 3.05x, expected gain 2.44 ms,
+  score 3.99: share 66.7% of 7.73 ms: now 792.7 ms per batched run (inside
+  UnifiedCFM model.feat_decoder; inside VoxCPMLocEnc model.feat_encoder
+  (decode+prefill), an upper bound), W8A8 floor 257.6 ms → 3.48 ms × 0.7 (1
+  stale) × index 1.63; others: vae_decoder__reduced 0.33, loc_enc_decode
+  0.198)`. Before, that run's arms all showed "expected gain 0.1 ms, score 0":
+  the class share of the re-profile left the CUDA-graphed LocDiT out, and
+  `loc_enc_decode` took three slices before the arm with the headroom (whose
+  kernel then went 3.05x → 6.24x, and the integration accepted it).
 
   The arm with the highest `expected gain × UCB index` gets the next slice. The
   index is the arm's observed gain per evaluation (ms saved by its kept results
@@ -1766,10 +1803,10 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   break run eagerly rather than recompile. `profile/summary.md` lists these
   regions and the module calls that replay CUDA graphs (`module_gaps` in
   `profile.json`); their kernels are in the kernel view.
-* **Files.** `improve.json` holds the slices (arm, scores, evaluations,
-  outcome), the research sessions, the re-integrations, the rounds and why the
-  loop stopped. `improve.png` is drawn from it, and `report.md` gets an
-  "Improve loop" section.
+* **Files.** `improve.json` holds the slices (arm, scores and their components,
+  evaluations, outcome), the research sessions, the re-integrations, the rounds
+  and why the loop stopped. `improve.png` is drawn from it, and `report.md` gets
+  an "Improve loop" section.
 * **Dry run.** `--dry-run` replaces Claude and the GPU with a simulated
   Qwen3-0.6B decode workload (`kernel_agent/dryrun.py`). Targets approach a
   hidden ceiling with noise, failures and plateaus. Some report a speed-of-light

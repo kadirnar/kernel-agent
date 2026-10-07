@@ -6,10 +6,28 @@ rebuilt from the ledger, the profile(s) and the slice log before every
 decision, so the scheduler keeps no state of its own and a restarted loop
 decides exactly as an uninterrupted one would.
 
-Expected gain (Amdahl), in the metric's ms (``-o metric=``, :mod:`kernel_agent.objective`:
+Expected gain, in the metric's ms (``-o metric=``, :mod:`kernel_agent.objective`:
 per run for the latency, per second of generated audio for ``throughput``)::
 
     expected = remaining_ms × headroom × decay ** stale
+
+A kernel target's comes from the ceilings table of the newest profile (issue #122:
+an improve round's re-profile of the optimised model, ``profiling/ceilings.py``), whose
+ms per profiled window × the round's baseline ÷ that window are the metric's
+(:class:`Ceiling`, :func:`arm_ceiling`):
+
+* ``now``: the time of the rows that hold the target's instance groups in that run.
+  The module at a group's qualname; when the optimised model hides it inside a
+  compiled or graph-replayed parent (the LocDiT layers inside VoxCPM2's CUDA-graphed
+  ``UnifiedCFM``), that parent's rows: the part of them the group took in an older
+  table that saw both (the analyze profile), else all of them (an upper bound).
+* ``remaining_ms``: ``now``, or the target's best kernel per run when that is faster
+  (not integrated yet: Σ its new ms × the calls each case stands for).
+* ``headroom``: ``1 − floor / remaining_ms``, the floor of those rows at the target's
+  precision (``ceilings.TARGET_PRECISIONS``; a precision pivot's arm: its new one).
+
+Without a table, a row or a floor (a region target, unknown work, a peak not measured),
+and for the systems agent (Amdahl):
 
 * ``remaining_ms``: what the arm still costs. Kernel targets: their share of the
   profiled time × the baseline ms ÷ their best module speedup so far (a region target:
@@ -22,8 +40,13 @@ per run for the latency, per second of generated audio for ``throughput``)::
   estimate (``pct_of_sol``, :mod:`kernel_agent.kernels.roofline`), else ``1 − 1 / further`` where
   ``further = max(estimate / best, MIN_FURTHER)`` is the speedup still expected
   (``estimate``: the module speedup assumed reachable, :attr:`Policy.estimate`;
-  for systems the GPU-idle share of the profile or :attr:`Policy.systems_estimate`).
+  for systems the end-to-end speedup the newest ceilings table allows at the run's
+  precisions, the GPU-idle share of the profile or :attr:`Policy.systems_estimate`,
+  whichever is largest).
 * ``stale``: consecutive slices of this arm that found no new best.
+
+:meth:`Arm.why` says how an arm's score came about (the slice log, ``improve.json``):
+``share 66.8% of 7.73 ms: now 793 ms per batched run (...), W8A8 floor 258 ms → 3.48 ms``.
 
 A kernel arm's rows are its benchmark evaluations (``ledger.measured``: quick
 checks and duplicates count for nothing) of all its workers (``workers.py``). The
@@ -75,6 +98,7 @@ from kernel_agent.budget import (
 )
 from kernel_agent.kernels import weights
 from kernel_agent.kernels.roofline import sol_signal
+from kernel_agent.profiling import ceilings
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 SYSTEMS = "systems"  # pseudo-target: the systems agent's slices
@@ -112,11 +136,53 @@ class Policy:
     systems: bool = True  # schedule systems-agent slices
 
 
+@dataclass(frozen=True)
+class Ceiling:
+    """A kernel arm's place in the newest ceilings table (issue #122): the time of the rows
+    that hold its instances and their floor at its precision, ms per profiled window
+    (``per``: per batched run for ``throughput``); ``factor`` converts them to the metric's
+    ms (the round's baseline ÷ the window)."""
+
+    now: float
+    floor: float
+    precision: str  # the floor's label: W8A8, FP8 w, ...
+    factor: float
+    window_ms: float
+    per: str
+    rows: str  # the rows that hold its instances
+    upper: bool = False  # all of a parent's rows (no table split them): an upper bound
+    kernel_ms: float | None = None  # its best kernel per run, in the metric's ms
+
+    @property
+    def remaining_ms(self) -> float:
+        """Its modules now in the metric's ms, or its best kernel when that is faster."""
+        now = self.now * self.factor
+        return min(now, self.kernel_ms) if self.kernel_ms is not None else now
+
+    @property
+    def headroom(self) -> float:
+        left = self.remaining_ms
+        return min(max(1.0 - self.floor * self.factor / left, 0.0), 1.0) if left > 0 else 0.0
+
+    def describe(self) -> str:
+        """``share 66.8% of 7.73 ms: now 793 ms per batched run (…), W8A8 floor 258 ms``."""
+        run = self.window_ms * self.factor
+        text = (
+            f"share {self.now / self.window_ms:.1%} of {run:.3g} ms: now {self.now:,.4g} ms "
+            f"{self.per} ({self.rows}{', an upper bound' if self.upper else ''})"
+        )
+        if self.kernel_ms is not None and self.kernel_ms < self.now * self.factor:
+            text += f", its best kernel {self.kernel_ms / self.factor:,.4g} ms"
+        return text + f", {self.precision} floor {self.floor:,.4g} ms"
+
+
 @dataclass
 class Arm:
     id: str
     kind: str  # KERNEL | SYSTEMS
-    ref_ms: float  # what the arm costs per run at 1.0× (kernels: share × baseline)
+    # what the arm costs per run at 1.0× (kernels: its ceiling's now × the speedup of its
+    # kernel applied in that profile, else its class's share × the baseline)
+    ref_ms: float
     module_class: str | None = None
     best: float = 1.0  # best kept speedup (module for kernels, end to end for systems)
     best_snapshot: str | None = None
@@ -135,6 +201,9 @@ class Arm:
     score: float = 0.0
     stop: str | None = None
     rows: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    ceiling: Ceiling | None = None  # kernels: from the newest ceilings table (issue #122)
+    basis: str = ""  # systems: where its estimate comes from
+    damp: float = 1.0  # decay ** stale (:func:`rank`)
 
     @property
     def agent(self) -> str:
@@ -142,14 +211,40 @@ class Arm:
 
     @property
     def remaining_ms(self) -> float:
+        if self.ceiling is not None:
+            return self.ceiling.remaining_ms
         return self.ref_ms / max(self.best, 1e-9)
 
     @property
     def headroom(self) -> float:
+        if self.ceiling is not None:
+            return self.ceiling.headroom
         if self.sol is not None:
             return min(max(1.0 - self.sol, 0.0), 1.0)
         further = max(self.estimate / max(self.best, 1e-9), MIN_FURTHER)
         return 1.0 - 1.0 / further
+
+    def why(self) -> str:
+        """How its score came about: the expected gain's components, the decay and the
+        UCB index (the slice log, ``improve.json``)."""
+        gain = self.remaining_ms * self.headroom
+        if self.ceiling is not None:
+            text = self.ceiling.describe()
+        else:
+            if self.kind == SYSTEMS:
+                text = f"end to end {self.remaining_ms:.3g} ms at its best {self.best:.2f}x"
+            else:
+                text = (
+                    f"Amdahl: {self.ref_ms:.3g} ms at 1.0x ÷ its best {self.best:.2f}x = "
+                    f"{self.remaining_ms:.3g} ms"
+                )
+            text += f", headroom {self.headroom:.0%} " + (
+                f"(at {self.sol:.0%} of the speed of light)"
+                if self.sol is not None
+                else f"(estimate {self.estimate:.3g}x{self.basis})"
+            )
+        stale = f" × {self.damp:.2g} ({self.stale} stale)" if self.damp < 1.0 else ""
+        return f"{text} → {gain:.3g} ms{stale} × index {self.index:.2f}"
 
     @property
     def rate(self) -> float:
@@ -171,6 +266,7 @@ class Arm:
             "index": round(self.index, 3),
             "score": round(self.score, 3),
             "stop": self.stop,
+            "why": self.why(),
         }
 
 
@@ -202,7 +298,8 @@ def sol_fraction(record: dict[str, Any] | None) -> float | None:
 
 
 def _profiles(run: RunDir, rounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Profiles newest first: ``{shares, baseline_ms, applied}`` per round (round 1 = the run's)."""
+    """Profiles newest first: ``{shares, baseline_ms, applied, profile, ceilings}`` per round
+    (round 1 = the run's; ``ceilings``: the table next to the profile, None without one)."""
     out = []
     for rnd in reversed(rounds):
         path = run.root / str(rnd.get("profile") or "")
@@ -213,6 +310,8 @@ def _profiles(run: RunDir, rounds: list[dict[str, Any]]) -> list[dict[str, Any]]
                     "shares": class_shares(profile),
                     "baseline_ms": float(rnd["baseline_ms"]),
                     "applied": rnd.get("applied") or {},
+                    "profile": profile,
+                    "ceilings": read_json(path.parent / "ceilings.json", None),
                 }
             )
     base = read_json(run.baseline_json, {}) or {}
@@ -223,6 +322,8 @@ def _profiles(run: RunDir, rounds: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "shares": class_shares(profile),
                 "baseline_ms": float(base["median_ms"]),
                 "applied": {},
+                "profile": profile,
+                "ceilings": read_json(run.profile_dir / "ceilings.json", None),
             }
         )
     return out
@@ -235,40 +336,179 @@ def _ref_ms(target_id: str, spec: dict[str, Any], profiles: list[dict[str, Any]]
     so a class whose kernel was applied there ran ``applied`` × faster (the kernel of
     the target or of another precision of it, ``pivot.py``: one of them is applied).
     """
-    from kernel_agent.pivot import family
-
     cls = spec.get("module_class")
     for prof in profiles:
         if cls in prof["shares"]:
             share, instances = prof["shares"][cls]
             if spec.get("qualname") and instances > 1:
                 share /= instances  # restricted to one instance of the class
-            mine = [v for t, v in prof["applied"].items() if family(t) == family(target_id)]
-            applied = float(mine[0] or 1.0) if mine else 1.0
-            return share * prof["baseline_ms"] * applied
+            return share * prof["baseline_ms"] * _applied(target_id, prof)
     return 0.0
+
+
+def _applied(target_id: str, prof: dict[str, Any]) -> float:
+    """The speedup of the target's kernel (or of another precision of it, ``pivot.py``: one
+    of them is applied) in a re-profiled model (1.0: none)."""
+    from kernel_agent.pivot import family
+
+    mine = [v for t, v in prof["applied"].items() if family(t) == family(target_id)]
+    return float(mine[0] or 1.0) if mine else 1.0
+
+
+def _per_run(
+    run: RunDir, target_id: str, spec: dict[str, Any], record: dict[str, Any] | None, key: str
+) -> float | None:
+    """Σ ``key`` (``ref_ms`` / ``new_ms``) of an evaluation's timed cases × the calls each
+    stands for (as the evaluator, ``kernels/weights.py``): ms per run of the workload,
+    converted to the metric's ms (``projection.Units``: per second of audio for
+    ``metric=throughput``). None: no timed case, or no value in the metric."""
+    users = (spec.get("capture") or {}).get("method_instances") or {}
+    timed = [c for c in (record or {}).get("cases") or [] if c.get(key) is not None]
+    if not timed:
+        return None
+    per_run = sum(float(c[key]) * weights.case_weight(c, users) for c in timed)
+    return projection.units_of(run, [target_id])(target_id, per_run)
 
 
 def _region_ref_ms(
     run: RunDir, target_id: str, spec: dict[str, Any], profiles: list[dict[str, Any]]
 ) -> float:
     """A region target's ``Region_<id>`` class is in no profile (``kernel_agent/region.py``):
-    its reference time from the timed cases of its newest timed evaluation, in ms per run
-    of the workload, converted to the metric's ms like every arm's (``projection.Units``:
-    per second of audio for ``metric=throughput``), else the time of its parent class (an
-    upper bound) until it has one or when it has no value in the metric."""
+    its reference time from the timed cases of its newest timed evaluation (:func:`_per_run`),
+    else the time of its parent class (an upper bound) until it has one or when it has no
+    value in the metric."""
     if spec.get("kind") != "region":
         return 0.0
-    users = (spec.get("capture") or {}).get("method_instances") or {}
     for rec in reversed(read_jsonl(run.results_file(target_id))):
-        timed = [c for c in rec.get("cases") or [] if c.get("ref_ms") is not None]
-        if timed:  # × the calls each case stands for, as the evaluator (kernels/weights.py)
-            per_run = sum(float(c["ref_ms"]) * weights.case_weight(c, users) for c in timed)
-            ms = projection.units_of(run, [target_id])(target_id, per_run)
-            if ms is not None:
+        if any(c.get("ref_ms") is not None for c in rec.get("cases") or []):
+            if (ms := _per_run(run, target_id, spec, rec, "ref_ms")) is not None:
                 return ms
             break
     return _ref_ms(target_id, {**spec, "module_class": spec.get("parent_class")}, profiles)
+
+
+def arm_ceiling(
+    spec: dict[str, Any], groups: list[projection.Group], profiles: list[dict[str, Any]]
+) -> Ceiling | None:
+    """A kernel arm's :class:`Ceiling` in the newest profile's ceilings table (issue #122),
+    or None (Amdahl, :func:`_ref_ms`): no table there, a region target, no row that holds
+    its instance groups, or a floor that is unknown (unknown work, a peak not measured).
+
+    ``groups``: its instance groups (``projection.build``: folded qualnames, its ``qualname``
+    / ``qualname_regex`` / ``phase``); a group whose calls no case stands for (the
+    ``instance_groups`` of a capture since #119) is left out, a target scoped to one of a
+    group's instances (``inside``) takes that share of it. The rows of a group:
+    :func:`ceilings.holding`. When the optimised model hides a group inside a parent, the
+    group takes the part of the parent's time it took in the oldest table that has both
+    (:func:`_split`: the analyze profile), with its own floor there (the work is the math,
+    the same in every round); without one, the parent's rows in full (``upper``)."""
+    newest = profiles[0] if profiles else {}
+    table = newest.get("ceilings") or {}
+    window = float(table.get("baseline_ms") or 0.0)
+    if spec.get("kind") == "region" or not table.get("rows") or window <= 0:
+        return None
+    precision = ceilings.target_precision(spec.get("precision"))
+    cls, phase = spec.get("module_class"), spec.get("phase") or None
+    parts: dict[Any, tuple[float, float, str]] = {}
+    upper = False
+    for group in groups:
+        if not group.pattern or group.share <= 0:
+            continue
+        rows, inside = ceilings.holding(table, group.pattern, cls, phase)
+        if not rows:
+            continue
+        now = sum(float(r.get("now_ms") or 0.0) for r in rows)
+        floor = ceilings.floor_ms(rows, precision, table.get("peaks"))
+        key: Any = tuple(sorted((str(r.get("target")), str(r.get("phase"))) for r in rows))
+        name = _row_names(rows)
+        if inside:
+            split = _split(group.pattern, cls, phase, rows, precision, profiles[1:])
+            if split is None:
+                upper = True
+            else:
+                part, floor = split
+                now, key, name = now * part, group.pattern, f"{part:.0%} of {name}"
+            name = f"inside {name}"
+        if floor is None:
+            return None
+        if group.inside < 1.0:
+            now, floor, name = now * group.inside, floor * group.inside, f"1 instance: {name}"
+        parts[key] = (now, floor, name)
+    if not parts:
+        return None
+    held = sorted(parts.values(), key=lambda p: -p[0])
+    return Ceiling(
+        now=sum(p[0] for p in held),
+        floor=sum(p[1] for p in held),
+        precision=precision.label,
+        factor=float(newest["baseline_ms"]) / window,
+        window_ms=window,
+        per=str(table.get("per") or "per run"),
+        rows="; ".join(p[2] for p in held),
+        upper=upper,
+    )
+
+
+def _split(
+    pattern: str,
+    cls: str | None,
+    phase: str | None,
+    parent: list[dict[str, Any]],
+    precision: ceilings.Precision,
+    older: list[dict[str, Any]],
+) -> tuple[float, float] | None:
+    """(the part of the ``parent`` rows' time that the hidden instance group ``pattern``
+    took, its own floor at ``precision``) from the oldest of the ``older`` profiles' ceilings
+    tables that has its own rows and those of the parent's groups; None: none has."""
+    outer = {r.get("group") for r in parent}
+    for prof in reversed(older):  # the oldest first: the split of the unmodified model
+        table = prof.get("ceilings") or {}
+        own, inside = ceilings.holding(table, pattern, cls, phase)
+        whole = sum(
+            float(r.get("now_ms") or 0.0)
+            for r in table.get("rows") or []
+            if r.get("group") in outer
+        )
+        floor = ceilings.floor_ms(own, precision, table.get("peaks"))
+        if own and not inside and whole > 0 and floor is not None:
+            return min(sum(float(r.get("now_ms") or 0.0) for r in own) / whole, 1.0), floor
+    return None
+
+
+def _row_names(rows: list[dict[str, Any]]) -> str:
+    """``UnifiedCFM model.feat_decoder``; the phases of a group with rows in several."""
+    phases: dict[str, list[str]] = {}
+    for r in rows:
+        phases.setdefault(f"{r.get('cls')} {r.get('group')}", []).append(str(r.get("phase")))
+    return ", ".join(
+        name + (f" ({'+'.join(ps)})" if len(ps) > 1 else "") for name, ps in phases.items()
+    )
+
+
+def _e2e_estimate(
+    run: RunDir, profiles: list[dict[str, Any]], base_ms: float
+) -> tuple[float, str] | None:
+    """Systems: the end-to-end speedup over the baseline (``base_ms``, the metric's ms) the
+    newest ceilings table allows (its end-to-end line: every row at its floor, nested rows
+    counted once, the time outside them unchanged), at the lowest floor of the precisions
+    the run's quality allows (exact; ``near-lossless``: FP8 / W8A8 / FP4 weights too), and
+    a note on it."""
+    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER
+
+    newest = profiles[0] if profiles else {}
+    table = newest.get("ceilings") or {}
+    e2e, window = table.get("e2e") or {}, float(table.get("baseline_ms") or 0.0)
+    names = ["exact"]
+    if (run.load().get("config") or {}).get("quality") == NEAR_LOSSLESS_TIER:
+        names += ["fp8_weights", "w8a8", "fp4_weights"]
+    floors = {n: float(e2e[n]["floor_ms"]) for n in names if (e2e.get(n) or {}).get("floor_ms")}
+    if not floors or window <= 0 or base_ms <= 0:
+        return None
+    name = min(floors, key=lambda n: floors[n])
+    label = ((table.get("precisions") or {}).get(name) or {}).get("label", name)
+    speedup = base_ms / (floors[name] * float(newest["baseline_ms"]) / window)
+    per = table.get("per") or "per run"
+    return speedup, f": {label} floors ≥ {floors[name]:,.4g} of {window:,.4g} ms {per}"
 
 
 def gpu_busy(run: RunDir) -> float | None:
@@ -436,27 +676,49 @@ def build_arms(
     rows = ledger.rows(run) if rows is None else rows
     profiles = _profiles(run, rounds or [])
     base_ms = profiles[-1]["baseline_ms"] if profiles else 0.0
+    ids = run.target_ids() if targets is None else targets
+    specs = {t: read_json(run.target(t) / "spec.json", {}) or {} for t in ids}
+    groups: dict[str, list[projection.Group]] = {}  # the instance groups of each target
+    for group in projection.build(specs, [p["profile"] for p in reversed(profiles)]).groups:
+        groups.setdefault(group.target, []).append(group)
     arms: list[Arm] = []
-    for target_id in run.target_ids() if targets is None else targets:
-        spec = read_json(run.target(target_id) / "spec.json", {}) or {}
+    for target_id in ids:
+        spec = specs[target_id]
         estimate = ledger._num(spec.get("expected_speedup")) or policy.estimate
         target_rows = [r for r in rows if r["target"] == target_id]
+        ceiling = arm_ceiling(spec, groups.get(target_id, []), profiles)
+        if ceiling is not None:  # its modules in the re-profiled run, at 1.0x of its kernel
+            ref_ms = ceiling.now * ceiling.factor * _applied(target_id, profiles[0])
+        else:
+            ref_ms = _ref_ms(target_id, spec, profiles)
+            ref_ms = ref_ms or _region_ref_ms(run, target_id, spec, profiles)
         arm = Arm(
             target_id,
             KERNEL,
-            _ref_ms(target_id, spec, profiles) or _region_ref_ms(run, target_id, spec, profiles),
+            ref_ms,
             module_class=spec.get("module_class"),
             estimate=estimate,
             rows=ledger.measured(target_rows),
         )
         plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
         _kernel_history(arm, target_rows, max(plans, default=None))
-        arm.sol = sol_fraction(snapshot_record(run, target_id, arm.best_snapshot))
+        record = snapshot_record(run, target_id, arm.best_snapshot)
+        arm.sol = sol_fraction(record)
+        if ceiling is not None and record is not None:  # its best kernel, if faster than now
+            ceiling = dataclasses.replace(
+                ceiling, kernel_ms=_per_run(run, target_id, spec, record, "new_ms")
+            )
+        arm.ceiling = ceiling
         arms.append(arm)
     if policy.systems:
         busy = gpu_busy(run)
         estimate = max(policy.systems_estimate, 1.0 / busy if busy else 0.0)
-        arm = Arm(SYSTEMS, SYSTEMS, base_ms, estimate=estimate, rows=systems_rows(rows))
+        basis = f": 1 ÷ the GPU busy share {busy:.0%}" if busy and 1.0 / busy == estimate else ""
+        if (e2e := _e2e_estimate(run, profiles, base_ms)) is not None and e2e[0] > estimate:
+            estimate, basis = e2e
+        arm = Arm(
+            SYSTEMS, SYSTEMS, base_ms, estimate=estimate, rows=systems_rows(rows), basis=basis
+        )
         _systems_history(arm, e2e_kernels(rows, read_jsonl(run.results_file())))
         arms.append(arm)
     for arm in arms:
@@ -518,7 +780,8 @@ def rank(arms: list[Arm], policy: Policy) -> list[Arm]:
     total = sum(a.evals for a in arms)
     top = max((a.rate for a in arms), default=0.0)
     for arm in arms:
-        arm.expected_ms = arm.remaining_ms * arm.headroom * policy.decay**arm.stale
+        arm.damp = policy.decay**arm.stale
+        arm.expected_ms = arm.remaining_ms * arm.headroom * arm.damp
         exploit = arm.rate / top if top > 0 else 0.0
         arm.index = exploit + policy.explore * math.sqrt(2 * math.log(total + 2) / (arm.evals + 1))
         arm.score = arm.expected_ms * arm.index
