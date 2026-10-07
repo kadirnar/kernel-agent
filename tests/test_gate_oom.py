@@ -458,7 +458,7 @@ def test_a_real_cuda_oom_in_the_gate_and_as_memory_freed_before_it(tmp_path, mon
         *keeper.worker_args(),
     )
     assert r["status"] == "ok" and r["passed"], r
-    assert r["ab"]["released_gb"] == pytest.approx(0.25, abs=0.01)  # A's 256 MiB
+    assert r["ab"]["released_gb"] >= 0.24  # at least A's 256 MiB (allocator blocks add to it)
     found = [s["cuda_mib"] for s in r["metrics"]["perceptual"]["per_sample"]]
     assert max(found) < held + 64, (held, found)  # the scorers do not see A's memory
 

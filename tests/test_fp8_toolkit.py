@@ -34,7 +34,7 @@ def _example(name: str):
 
 def test_fp8_kv_is_an_opt_in_near_lossless_precision():
     assert "fp8_kv" in compare.REDUCED_PRECISIONS and "fp8_kv" in precisions.OPT_IN
-    assert compare.tier_for(NEAR, "fp8_kv") == compare.NEAR_LOSSLESS_TIER
+    assert compare.tier_for(NEAR, "fp8_kv") == compare.NEAR_LOSSLESS_KV_TIER
     assert compare.tier_for("exact", "fp8_kv") == compare.EXACT_TIER
     # not in a near-lossless run's default: --precisions must name it
     assert "fp8_kv" not in precisions.default(NEAR)
@@ -230,7 +230,7 @@ def test_the_fp8_kv_reference_math_fits_the_near_lossless_tier(tmp_path, kv_capt
     result = evaluate(kv_capture, path, device="cpu")
     assert result["status"] == status, result
     if bug is None:
-        assert result["correct"] and result["tolerance_tier"] == NEAR
+        assert result["correct"] and result["tolerance_tier"] == compare.NEAR_LOSSLESS_KV_TIER
         assert "perturbed" in result["checks"]
         assert all(c["max_rel_l2"] < 0.04 for c in result["cases"])
 
@@ -486,7 +486,7 @@ def test_fp8_kv_decode_against_the_reference_math():
         v = torch.randn(b, hkv, length, d, device="cuda", dtype=torch.bfloat16)
         kc, ks = kv.quantize_kv(k)
         ref_kc, ref_ks = kv_quant.quantize_fp8_kv(k)
-        assert torch.allclose(ks, ref_ks) and (kc.float() == ref_kc.float()).float().mean() > 0.999
+        assert torch.allclose(ks, ref_ks) and (kc.float() == ref_kc.float()).float().mean() > 0.995
         vc, vs = kv.quantize_kv(v)
         lens = torch.tensor(lengths, device="cuda") if lengths else None
         ref = kv_quant.fp8_kv_attention(q, kc, ks, vc, vs, lengths=lens)

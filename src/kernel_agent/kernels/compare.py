@@ -82,7 +82,12 @@ NEAR_LOSSLESS_TIER = "near-lossless"
 #: ``near-lossless-fp4``: the near-lossless checks with the wider bounds of block-scaled FP4
 #: weights (``fp4_weights``, :data:`NEAR_LOSSLESS_BOUNDS`).
 NEAR_LOSSLESS_FP4_TIER = "near-lossless-fp4"
-TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER, NEAR_LOSSLESS_FP4_TIER)
+#: ``near-lossless-kv``: an FP8 KV cache (``fp8_kv``): the near-lossless bounds on captured
+#: inputs, wider ones on redrawn and scaled inputs (:data:`PERTURBED_BOUNDS`): scaling q and
+#: k by f scales the attention logits by f², and e4m3 K's relative rounding error moves a
+#: sharper softmax further.
+NEAR_LOSSLESS_KV_TIER = "near-lossless-kv"
+TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER, NEAR_LOSSLESS_FP4_TIER, NEAR_LOSSLESS_KV_TIER)
 #: ``"precision"`` of a target spec that ``--quality near-lossless`` captures in the
 #: near-lossless tier: ``fp8_weights`` (FP8 weight-only storage, per-channel scales, bf16
 #: activations; agent/knowledge/low_precision.md), ``fp8_w8a8`` (FP8 tensor-core math:
@@ -92,12 +97,12 @@ TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER, NEAR_LOSSLESS_FP4_TIER)
 #: (another numerics-changing kernel); ``fp4_weights`` (block-scaled FP4 weights, bf16
 #: activations) in the near-lossless-fp4 tier (:data:`PRECISION_TIERS`). ``fp8_kv``: an FP8
 #: (e4m3) KV cache, one scale per token and KV head, bf16 weights and math
-#: (kernels/kv_quant.py); opt-in (``precisions.OPT_IN``), in the near-lossless tier: e4m3 K / V
+#: (kernels/kv_quant.py); opt-in (``precisions.OPT_IN``), in the near-lossless-kv tier: e4m3 K / V
 #: moved a decoder layer's output by <= 0.0011 relative L2 on real captures (docs/FP8.md §5).
 #: Anything else (``exact``, none) is the exact tier.
 REDUCED_PRECISIONS = ("fp8_weights", "reduced", "fp4_weights", "fp8_w8a8", "fp8_mx", "fp8_kv")
 #: The tier of a reduced precision other than the near-lossless tier.
-PRECISION_TIERS = {"fp4_weights": NEAR_LOSSLESS_FP4_TIER}
+PRECISION_TIERS = {"fp4_weights": NEAR_LOSSLESS_FP4_TIER, "fp8_kv": NEAR_LOSSLESS_KV_TIER}
 PRECISIONS = (EXACT_TIER, *REDUCED_PRECISIONS)
 NEAR_LOSSLESS_MIN_COSINE = 0.996
 NEAR_LOSSLESS_MAX_REL_L2 = 0.08
@@ -132,6 +137,12 @@ NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]]
         NEAR_LOSSLESS_FP4_MAX_REL_L2,
         NEAR_LOSSLESS_FP4_MAX_NORM_CHANGE,
         NEAR_LOSSLESS_FP4_ELEMENT,
+    ),
+    NEAR_LOSSLESS_KV_TIER: (
+        NEAR_LOSSLESS_MIN_COSINE,
+        NEAR_LOSSLESS_MAX_REL_L2,
+        NEAR_LOSSLESS_MAX_NORM_CHANGE,
+        NEAR_LOSSLESS_ELEMENT,
     ),
 }
 #: Redrawn inputs (``perturbed``: the evaluator's perturbed-input check,
@@ -183,9 +194,18 @@ CHANNEL_MIN_ROWS = 16
 #: check), swapped FP4 nibbles, block scales shifted by one block; FP4's x 1.05 and int4 per
 #: tensor fail only on captured inputs. Activation scales cached from the first call pass
 #: the captured cases and fail 24 of 32 redrawn draws (a candidate gets four).
+#:
+#: * ``near-lossless-kv`` (``fp8_kv``): the reference math (``kv_quant.fp8_kv_attention``,
+#:   per-token e4m3 K / V) of a decode step (GQA, head dim 64-128, 77-4096 cached tokens,
+#:   12 seeds x 4 shapes) on inputs x 3 reaches cosine >= 0.9922, relative L2 <= 0.125,
+#:   norm within 1.0 %, element ``a`` (at r = 0.125) <= 1.84 at 0.75 (x 0.01, x -1:
+#:   <= 0.040 relative L2). Broken caches fail at x 3 on every draw: scales from the
+#:   captured inputs (static: cosine <= 0.34), the first token's scale for every token
+#:   (cosine <= 0.961, element 4.6), V scales x 1.05 (norm 5.2 %, also at x 0.01 and x -1).
 PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.03, (0.75, 0.125)),
     NEAR_LOSSLESS_FP4_TIER: (0.94, 0.40, 0.12, (2.5, 0.25)),
+    NEAR_LOSSLESS_KV_TIER: (0.985, 0.16, 0.03, (1.5, 0.125)),
 }
 #: The tier of this process's comparisons when a call passes none. The evaluator sets it
 #: from the capture before the candidate is imported, so the integrity snapshot

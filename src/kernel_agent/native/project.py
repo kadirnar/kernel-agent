@@ -168,6 +168,16 @@ def _rel_ok(path: str) -> bool:
     return all(p not in ("", ".", "..") for p in parts)
 
 
+def _old_std(build: Mapping[str, Any]) -> str:
+    """A ``-std=c++NN`` (or ``--std``) flag of ``build`` older than C++20, or ""."""
+    for key in ("cflags", "cuda_cflags"):
+        for flag in build.get(key) or []:
+            m = re.fullmatch(r"--?std=(?:c|gnu)\+\+(\d+)", str(flag))
+            if m and int(m.group(1)) in (98, 3, 11, 14, 17):
+                return f"build.{key} {flag}"
+    return ""
+
+
 def _strings(table: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:
     value = table.get(key, [])
     if isinstance(value, str):
@@ -239,6 +249,11 @@ def parse_manifest(
     for path in (*includes, *outputs):
         if not _rel_ok(path):
             raise ProjectError(f"{path!r} must be a relative path inside the project")
+    if backend == "torch_extension" and (old := _old_std(build)):
+        raise ProjectError(  # torch's headers need the standard torch compiles them with
+            f"build: {old} is older than torch's C++ standard (-std=c++20): leave -std to "
+            "torch's extension builder (g++ rejects ATen's headers under C++17)"
+        )
     if backend == "torch_extension" and not sources:
         raise ProjectError("build.sources is empty: a torch_extension needs its .cu / .cpp files")
     if backend == "command" and (not command or not outputs):
