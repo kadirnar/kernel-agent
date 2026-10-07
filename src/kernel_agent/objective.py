@@ -120,7 +120,9 @@ def detail_text(detail: dict[str, Any] | None) -> str:
             f"{detail.get('audio_s') or 0:,.2f} s of audio in {detail.get('run_ms') or 0:,.0f} ms)"
         )
         if detail.get("request_ms") is not None:
-            parts.append(f"latency per request {detail['request_ms']:,.0f} ms")
+            worst = detail.get("request_ms_max")
+            most = f" (median; max {worst:,.0f} ms)" if worst is not None else ""
+            parts.append(f"latency per request {detail['request_ms']:,.0f} ms{most}")
         return "; ".join(parts)
     if detail.get("chunk_ms") is not None:
         rtf = f", RTF {detail['rtf']:.3f}" if detail.get("rtf") is not None else ""

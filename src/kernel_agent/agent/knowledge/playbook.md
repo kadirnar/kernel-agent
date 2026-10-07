@@ -101,6 +101,11 @@ These change *how* the model runs, not the math, and often beat any kernel:
 * Fusing linear layers that share an input (QKV, gate/up) — done in `build()`.
 * Avoid recomputation (cache encoder output, cross-attention K/V).
 * Exact speculative / lookahead decoding keeps greedy outputs identical.
+* Host syncs in a generation loop (the profile's "Host synchronisation" table: `.item()` /
+  `.cpu()` of a stop flag, `torch.tensor(..., device=...)` per step, pageable copies, with
+  call sites): read flags asynchronously (`Workload.async_flags()`), build constants once,
+  pin and copy without blocking; a post-processing stage (vocoder, VAE, detokeniser) on a
+  joined side stream (`serving.SideStage`). The systems agent's guide: `systems.md`.
 Quality gates still apply end to end; anything that changes outputs beyond the
 workload's tolerance is rejected.
 

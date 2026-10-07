@@ -1290,6 +1290,81 @@ sends only that phase's calls of the captured entrypoints to the kernel. The
 other calls keep the reference, so a `prefill` and a `decode` target on the
 same class combine. `optimized/apply.py` applies them the same way.
 
+### Host synchronisation in the profile
+
+A generation loop that reads a device value on the host every step (`.item()`
+of a stop token, `.cpu()` of a finished mask), builds a tensor with
+`torch.tensor([...], device=...)` per call or copies from pageable host memory
+makes the host wait until the GPU has drained; the GPU then idles while the
+host launches the next step. The kernel view shows the idle time, not the line
+that caused it. `analyze` therefore runs the workload once more under a
+recording `TorchFunctionMode` (`profiling/host_sync.py`; nothing in the run
+changes) and lists every such call by call site, model agnostic: the first
+frame outside torch (the workload's loop, the model's package, a transform),
+the source line, calls per run and the host time spent in it, classified as a
+device value read on the host, a blocking device-to-host copy, a blocking or
+pageable host-to-device copy, a tensor built on the host for the device, or a
+data-dependent output size. `profile/summary.md` gets a *Host synchronisation
+(transform opportunities)* table with the fix for each kind (async flag read,
+build the constant once, pinned non-blocking copy, static shapes), so the
+planner and the systems agent see them (`agent/knowledge/systems.md` describes
+the patterns). A CUDA-graph replay makes no Python calls, so what it captured
+is not listed; a `torch.compile`d region may trace or graph-break around the
+mode. If the scanned run fails under the mode, the summary says so and keeps
+what was recorded.
+
+For example, the serialization points that docs/PARALLEL.md (§3.3, §4.2) found
+by hand in VoxCPM2 are of these kinds: the stop flag read with `.cpu().item()`
+once per patch and the positions built with `torch.tensor([...], device=...)`
+twice per patch in VoxCPM's `_inference` (the model's package), and the
+AudioVAE's `torch.tensor([sample_rate], device=...)` on every decode call.
+
+### Serving: async stop checks, a pipelined post stage, continuous batching
+
+`kernel_agent/workloads/serving.py` holds generic helpers for any
+autoregressive or generative workload (or harness):
+
+* `Workload.async_flags()` (`AsyncFlags`): a loop's per-step flags (stop tokens,
+  a finished mask) copied to pinned memory without blocking, with an event;
+  `flags.read(ticket)` after the rest of the step is queued (or a step later)
+  waits for that copy only. The values are those of `.cpu()`, so a loop that
+  reads them in the same step stays bit-identical. The VoxCPM2 batched loop is
+  the first user: it computes the stop flags at the top of the patch (they
+  depend on the LM hidden state only) and reads them after the LocDiT and LocEnc
+  are queued (measured in docs/PARALLEL.md §3.3 on the optimised batch-16 set:
+  identical latents, GPU busy 93.1 → 96.0 %, 937 → 923 ms per batched run).
+* `SideStage`: a post-processing stage (vocoder, VAE, detokeniser) on a side
+  stream, joined before `run()` returns (`submit` forks after the work queued
+  so far, `join` makes the caller's stream wait); results come back through
+  `HostCopy` (pinned, non-blocking, ready / wait). A plain torch stream until
+  `kernel_agent.concurrency` (#147) declares named streams; inline without CUDA.
+* `serve(model, requests, continuous=..., max_steps=...)`: a request queue over a
+  workload's batch slots. The workload exposes its batched loop as a
+  `SlotModel` (`admit` prefills requests into slots, `step` produces every
+  slot's next output and sends its stop flags, `advance` feeds them back,
+  `finish` returns a request's post-stage job). Static batching admits a new
+  batch when every slot's request has stopped; **continuous batching** refills
+  a slot as soon as its request stops. Requests that stop together are
+  post-processed together, on the `SideStage` when pipelined; each request is
+  marked when its output reached the host (`Workload.mark_ready`, no
+  device-wide sync), so `metric_detail` reports the per-request latency
+  (`request_ms` median, `request_ms_mean`, `request_ms_max`; also for every
+  `metric=throughput` run). `per_request` regroups per-step batch records
+  (what a teacher-forcing hook saw) per request.
+
+The opt-in is a workload option, `-o serving=static|continuous` with
+`-o requests=N` and `-o pipeline=true` (`Workload.serving()`); without it a
+workload runs its default fixed-length benchmark unchanged, and a workload that
+does not implement it (`supports_serving`, false for the built-in ones today)
+rejects it before the run starts. A schedule is part
+of the benchmark (baseline and candidates run the same one), so it is a
+workload option, not a transform. `tests/voxcpm_slots.py` is a complete
+`SlotModel` for VoxCPM2's batched loop (per-slot KV rows and positions, every
+request its own noise): under continuous batching on two slots, every request
+is still VoxCPM's own batch-1 `generate` of its text and seed (CPU test);
+docs/PARALLEL.md §5 estimates up to 1.31× throughput at natural length for
+its default texts, nothing at fixed length.
+
 ### Calls behind a kernel's estimate
 
 The evaluator times the cases of one captured instance. A kernel's estimated
@@ -1716,7 +1791,9 @@ draws after `torch.manual_seed(seed + b)` (the batched run serves the
 `torch.randn((batch, ...))` call of `feat_decoder.forward` row by row). Stop
 flags are per request: in the fixed-length benchmark every request generates
 `patches` patches; with the stop head live (natural-length run, perceptual
-samples) each request stops on its own.
+samples) each request stops on its own. The stop flags are computed at the
+top of each patch and read asynchronously (`Workload.async_flags()`, see
+"Serving"): the same values, so the same stops and latents.
 
 * **Batching is exact.** At N = 1 the batched loop is bit-identical to VoxCPM's
   `generate` (teacher-forced cosine 1.0 on every step; on the CPU test model
@@ -2447,6 +2524,8 @@ kernel-agent optimize <hf-url> [options]
                                        any: metric=latency|ttfa|throughput (what the run optimises;
                                             ttfa: VoxCPM / streaming harnesses, throughput: VoxCPM
                                             batches / batch harnesses), steady_chunks=8
+                                       serving workloads: serving=static|continuous, requests=N,
+                                            pipeline=true (see "Serving")
                                        VoxCPM: text, patches, timesteps, cfg, seed, compile,
                                                min_step_cosine, min_mean_step_cosine, min_spec_cosine,
                                                natural_text, natural_max_patches,
@@ -2926,6 +3005,14 @@ output length, as the VoxCPM batch does. `Workload.metric_value` is the
 extension point for further metrics; `Workload.self_check(inputs, reference)`
 (optional) records an `analyze`-time check that the workload's own run is
 faithful to the model (`baseline.json` `self_check`).
+
+Generation loops can read their stop flags with `self.async_flags()` instead of
+`.cpu()` / `.item()`, and a harness with a batched loop can serve a request
+queue (`-o serving=static|continuous`, `requests`, `pipeline`): set
+`supports_serving = True` (other workloads reject the option), expose the loop
+as a `SlotModel` and call `kernel_agent.workloads.serving.serve` from `run`
+when `self.serving()` is set, marking each request with `self.mark_ready(...)`
+in `on_ready` (see "Serving" above and `tests/voxcpm_slots.py`).
 
 To opt in to the perceptual gate of `--quality near-lossless` (see "Quality
 modes"), implement `perceptual_samples()` (option overrides of a few short

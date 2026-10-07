@@ -23,6 +23,7 @@ def create_workload(spec: WorkloadSpec) -> Workload:
     cannot time the requested metric (``-o metric=``)."""
     workload = _create(spec)
     workload.check_metric()
+    workload.check_serving()
     return workload
 
 
@@ -40,6 +41,7 @@ def validate_metric(spec: WorkloadSpec) -> None:
         objective.check(metric.name, tuple(objective.METRICS), "a harness")
         return
     workload.check_metric()
+    workload.check_serving()
 
 
 def _create(spec: WorkloadSpec) -> Workload:

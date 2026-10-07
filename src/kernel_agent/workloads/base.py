@@ -15,6 +15,12 @@ What a run optimises is the workload's *metric* (``-o metric=``,
 first audio chunk of a streaming run for ``metric=ttfa``, the wall time per second of
 generated audio for ``metric=throughput``. :func:`measure` returns its value as
 ``median_ms`` (lower is better for every metric).
+
+Generation loops get generic serving hooks (:mod:`.serving`): :meth:`Workload.async_flags`
+(stop flags read on the host without draining the GPU), :meth:`Workload.serving` (the
+``-o serving=static|continuous`` opt-in for a request queue with continuous batching and a
+pipelined post stage) and :meth:`Workload.mark_ready` (a request's latency without a
+device-wide synchronize).
 """
 
 from __future__ import annotations
@@ -26,13 +32,16 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 from torch import nn
 
 from kernel_agent import objective
 from kernel_agent.hub import Modality
+
+if TYPE_CHECKING:
+    from kernel_agent.workloads.serving import AsyncFlags, ServingOptions
 
 DTYPES = {
     "float16": torch.float16,
@@ -103,6 +112,9 @@ class Workload(ABC):
     #: :mod:`kernel_agent.objective`). A streaming workload that calls :meth:`mark_chunk`
     #: for every output chunk can add ``"ttfa"``.
     metrics: ClassVar[tuple[str, ...]] = (objective.LATENCY,)
+    #: The workload runs a request queue under ``-o serving=static|continuous``
+    #: (:mod:`.serving`); the others reject the option (:meth:`check_serving`).
+    supports_serving: ClassVar[bool] = False
     #: ``--quality near-lossless`` with the perceptual gate (:mod:`.perceptual`): option
     #: overrides of the end-to-end checks, a looser *sanity floor* (teacher-forcing
     #: thresholds that numerics-changing variants such as FP8 weights pass and broken
@@ -247,6 +259,44 @@ class Workload(ABC):
         synchronize()
         self.chunk_marks.append((time.perf_counter(), audio_ms))
 
+    def mark_ready(self, audio_ms: float | None = None) -> None:
+        """:meth:`mark_chunk` for an output the caller has already waited for on its own
+        (the event of its host copy, :class:`~kernel_agent.workloads.serving.HostCopy`): no
+        device-wide synchronize, so a request is marked when *its* output arrived, not when
+        the work queued after it (the next requests, a post stage on a side stream)
+        finished."""
+        self.chunk_marks.append((time.perf_counter(), audio_ms))
+
+    def async_flags(self, depth: int = 2) -> AsyncFlags:
+        """A reader of a generation loop's per-step device flags (stop tokens, a finished
+        mask; :class:`~kernel_agent.workloads.serving.AsyncFlags`): ``ticket =
+        flags.send(stop)`` as soon as they exist copies them to pinned memory without
+        blocking, ``flags.read(ticket)`` after the rest of the step is queued (or a step
+        later) waits for that copy only. Same values as ``stop.cpu()``, without the GPU
+        idling while the host catches up."""
+        from kernel_agent.workloads.serving import AsyncFlags
+
+        return AsyncFlags(depth)
+
+    def serving(self) -> ServingOptions | None:
+        """The serving opt-in of this run's options (``-o serving=static|continuous``,
+        ``requests``, ``pipeline``; :func:`~kernel_agent.workloads.serving.serving_options`),
+        None for the default benchmark. A workload that supports it runs its request queue
+        through :func:`~kernel_agent.workloads.serving.serve`."""
+        from kernel_agent.workloads.serving import serving_options
+
+        return serving_options(self.options)
+
+    def check_serving(self) -> None:
+        """``ValueError`` for a malformed serving opt-in, or one this workload does not
+        implement (``supports_serving``): never run the default benchmark in its place."""
+        if self.serving() is not None and not type(self).supports_serving:
+            raise ValueError(
+                f"{type(self).__name__} does not implement -o serving=static|continuous "
+                "(a request queue over its batch slots, kernel_agent.workloads.serving); "
+                "a harness opts in with `supports_serving = True`"
+            )
+
     def metric_value(self, start: float, end: float) -> tuple[float, dict[str, Any]]:
         """``(value in ms, per-run details)`` of the metric for one run of :meth:`run`
         that started at ``start`` and ended at ``end`` (``time.perf_counter()``, both
@@ -260,8 +310,8 @@ class Workload(ABC):
         (:meth:`output_seconds`), i.e. ``1000 / throughput`` ms, so that lower is better
         and a speedup is the throughput ratio; the details hold the ``throughput`` (audio
         seconds per wall second), ``audio_s``, ``run_ms`` and the median latency of the
-        requests (``request_ms``: each marked when its output was ready). The extension
-        point for new metrics."""
+        requests (``request_ms``: each marked when its output was ready; also
+        ``request_ms_mean`` and ``request_ms_max``). The extension point for new metrics."""
         total = (end - start) * 1000
         metric = self.metric
         if metric == objective.LATENCY:
@@ -279,6 +329,8 @@ class Workload(ABC):
                 "run_ms": total,
                 "requests": len(self.chunk_marks),
                 "request_ms": statistics.median(done),
+                "request_ms_mean": statistics.fmean(done),
+                "request_ms_max": max(done),
             }
         if metric != objective.TTFA:
             raise NotImplementedError(f"metric={metric} is not implemented")

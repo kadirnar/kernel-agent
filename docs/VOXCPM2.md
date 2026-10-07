@@ -90,6 +90,24 @@ on the Claude Code subscription.
 | round 2, re-integrated with #112 and #115 | 7.25 | 138 | 5.20× | 2.62× |
 | **round 3** | **6.03** | **166** | **6.24×** | **3.15×** |
 
+Since #149 the batched loop reads its per-request stop flags asynchronously
+(copied to pinned memory at the top of the patch, read once the LocDiT and LocEnc
+are queued; [PARALLEL.md](PARALLEL.md) §3.3 measured 937 → 923 ms per batched
+run on the round-3 set with identical latents). The numbers in this table were
+measured before it. A run's baselines are recorded per run: `analyze` measures
+the eager baseline in its worker and the compiled one in a fresh process
+(`baseline.json` `median_ms`, `compiled_ms`) with the code of that run, so the
+next run gets the faster loop in both baselines automatically; an existing run
+directory keeps the baselines it recorded (re-run `analyze` in a new run to
+compare). The same change adds a host-sync table to the profile, by call site
+(VoxCPM's per-patch stop flag `.cpu().item()` and position tensors, the
+AudioVAE's per-call `torch.tensor([sample_rate], device=...)` are the kinds it
+lists; not yet run on this model's GPU profile) and generic continuous batching
+(README "Serving"), tested on this model's batched loop as a `SlotModel`
+(`tests/voxcpm_slots.py`: every request of a continuous batch is still VoxCPM's
+batch-1 `generate`); the built-in batch workload does not opt in to
+`-o serving=` yet.
+
 For scale: a single eager request makes 9.6 s of audio in 5,476 ms (1.75 s of
 audio per second, the latency table above), so the batched, optimised model
 produces about 95× as much audio per second. Every final set passed the gate:
