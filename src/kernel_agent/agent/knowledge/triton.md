@@ -159,7 +159,18 @@ weights).
   TMA); 4096^3 190 -> 214 TFLOP/s (227 TMA). Check the PTX once:
   `kernel[grid](...).asm["ptx"]` must contain `block_scale`; without it Triton
   emulates through bf16 (much slower; gemlite notes that constant unit scales broke
-  the SM120 lowering in Triton 3.7, they work in 3.8).
+  the SM120 lowering in Triton 3.7, they work in 3.8). The check needs no GPU:
+  `triton.compile(ASTSource(fn=kernel, signature=..., constexprs=...),
+  target=GPUTarget("cuda", 120, 32))` and read `.asm["ptx"]` (`gemm_ptx` /
+  `block_scale_mma` in `examples/triton_fp8_w8a8_gemm.py`, whose GEMM uses this
+  recipe; it keeps `tl.dot` below sm_100). Under `TRITON_INTERPRET=1` (Triton 3.8)
+  `tl.dot` on bf16 operands, fp32 -> bf16 casts (truncated) and fp32 -> e4m3 casts
+  (no carry into the exponent) are wrong: check numerics of such kernels on a GPU.
+* Quantise in the producer: an RMSNorm / SiLU-mul row program that already holds the
+  row writes e4m3 + its per-token scale (or 1 x 32 ue8m0 MXFP8 scales) for +0.1 us
+  instead of a separate pass (+1.3 us at [352, 1024]): `examples/triton_fp8_producers.py`.
+  Use `tl.math.div_rn` for the scale and the codes when they must equal torch's
+  (Triton 3.8 lowers `/` on fp32 to `div.full.f32`, an approximate division).
 * cuBLASLt tensor-wise FP8 (`torch._scaled_mm` with scalar scales, an
   `nvjet_sm120_qqtst_*` kernel) is still faster on a plain GEMM (gate|up 30.2 us).
   A Triton FP8 GEMM pays when it fuses work cuBLASLt cannot (row-wise scales,

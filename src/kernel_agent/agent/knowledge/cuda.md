@@ -45,6 +45,21 @@ Verified example: `examples/nvrtc_rmsnorm.py`.
 | sm_100a | B200/GB200 | `tcgen05` MMA + TMEM, 2-CTA | TMA |
 | sm_120 | RTX 50xx (consumer Blackwell) | `mma.sync` incl. FP8 and block-scaled FP4/FP6/FP8 (`mma.sync...kind::mxf8f6f4`); **no WGMMA, no tcgen05/TMEM** | TMA + `cp.async`, ~99 KB SMEM per block |
 
+FP8 GEMMs from C++ (sm_89+): call cuBLASLt directly (`cublasLtMatmul` with the
+descriptors, layouts and algorithm cached per shape; `-lcublasLt`): ~6 us of host time
+per call against ~19 for `at::_scaled_mm` from C++ (ATen's checks and a fresh output).
+Example to copy: `examples/cuda_cublaslt_fp8.py` (written from measured code,
+not yet run on a GPU): tensor-wise (`SCALAR_32F`, unit scales: the unscaled product, scales
+applied by a small epilogue or by the consumer) and MXFP8 (`VEC32_UE8M0`, ue8m0 scales
+per 32 along K in the 128 x 4 blocked layout; sm_100+ / sm_120) modes, split-K as a
+strided batch over K slices, the heuristic's algorithms timed once, several GEMMs on
+one input behind one pybind call. On sm_120 cuBLASLt has no row-wise (`OUTER_VEC_32F`)
+or DeepSeek blockwise (`VEC128_32F`, `BLK128x128_32F`) scale mode. In hand-written
+kernels, compute-bound FP8 needs the block-scaled MMA (`mma.sync ...
+kind::mxf8f6f4.block_scale`, `sm_120a`, 416 TFLOP/s; unit ue8m0 scales 127 when the
+real scales are per tensor / row): plain `mma.sync ... e4m3.e4m3.f32` runs at half
+that rate on GeForce.
+
 General rules: coalesced 128-bit global loads, avoid SMEM bank conflicts
 (swizzle / padding), keep occupancy reasonable (registers ≤ 128/thread for
 memory-bound kernels), use warp shuffles for reductions, `__launch_bounds__`.

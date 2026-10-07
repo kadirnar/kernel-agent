@@ -5,9 +5,10 @@ lists the precisions (a target's ``precision`` in ``spec.json``,
 :data:`kernel_agent.kernels.compare.PRECISIONS`) the run's targets may have; ``exact`` is
 always one of them. Without the option, and in a run whose ``run.json`` has none (made
 before it), the run's ``--quality`` decides (:func:`default`): ``exact`` allows ``exact``
-only, ``near-lossless`` every reduced precision but the 4-bit ones (:data:`FOUR_BIT`),
-which are opt-in (``--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights``); the
-8-bit classes (``fp8_weights``, ``fp8_w8a8``, MXFP8 ``fp8_mx``) are allowed by default. A run
+only, ``near-lossless`` every reduced precision but the opt-in ones (:data:`OPT_IN`: the
+4-bit ones, :data:`FOUR_BIT`, and ``fp8_kv``), which ``--precisions`` must name
+(``--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights``); the 8-bit classes
+(``fp8_weights``, ``fp8_w8a8``, MXFP8 ``fp8_mx``) are allowed by default. A run
 continued with ``--precisions`` (``improve``, ``resume``, ``integrate``) records the new
 list in its ``run.json``.
 
@@ -28,6 +29,10 @@ from typing import Any
 
 #: The 4-bit precisions: allowed only when ``--precisions`` names them.
 FOUR_BIT = ("fp4_weights",)
+#: Every precision allowed only when ``--precisions`` names it: the 4-bit ones and ``fp8_kv``
+#: (an FP8 KV cache: it pays only where the cache is a large share of a decode step's bytes,
+#: long contexts; on short caches it is slower, docs/FP8.md §5).
+OPT_IN = (*FOUR_BIT, "fp8_kv")
 
 
 def names() -> tuple[str, ...]:
@@ -39,12 +44,12 @@ def names() -> tuple[str, ...]:
 
 def default(quality: str | None) -> tuple[str, ...]:
     """The precisions a run of ``quality`` allows without ``--precisions``: ``exact`` only,
-    or (``near-lossless``) every precision but the 4-bit ones."""
+    or (``near-lossless``) every precision but the opt-in ones (:data:`OPT_IN`)."""
     from kernel_agent.kernels.compare import EXACT_TIER, NEAR_LOSSLESS_TIER
 
     if quality != NEAR_LOSSLESS_TIER:
         return (EXACT_TIER,)
-    return tuple(p for p in names() if p not in FOUR_BIT)
+    return tuple(p for p in names() if p not in OPT_IN)
 
 
 def parse(raw: str | Iterable[str]) -> list[str]:
@@ -127,6 +132,8 @@ def refusal(precision: str | None, allowed: Iterable[str]) -> str | None:
     if name in allowed:
         return None
     opt_in = " (4-bit precisions are opt-in)" if name in FOUR_BIT else ""
+    if name in OPT_IN and not opt_in:
+        opt_in = f" ({name} is opt-in: --precisions must name it)"
     return (
         f"precision {name!r} is not allowed in this run{opt_in}: --precisions {','.join(allowed)}"
     )

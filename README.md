@@ -279,7 +279,8 @@ the target precisions it allows; `exact` is always one of them. `--quality exact
 allows `exact` only. `--quality near-lossless` allows `fp8_weights`, `fp8_w8a8`,
 `fp8_mx` (MXFP8, 8-bit) and `reduced` by default, but **not** the 4-bit
 `fp4_weights`: 4-bit is opt-in
-(`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights`). The list is
+(`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights`). So is `fp8_kv`
+(an FP8 KV cache, "FP8 toolkit" below): it pays only on long caches. The list is
 recorded in `run.json` → `config.precisions`; a run whose `run.json` has none
 (made before the option) gets the default, so its FP4 targets stay out.
 `--precisions` on a run that exists (`improve <run_dir>`, `resume`,
@@ -596,9 +597,10 @@ LocDiT GEMMs (M = 352) took the run from 11.36 to 8.73 ms per audio second
   reference / fallback (`torch._scaled_mm` where it applies: K and N multiples
   of 16, the weight passed column-major, scales [M, 1] and [1, N]).
 * **Verified example** `examples/triton_fp8_w8a8_gemm.py`: the run's recipe as
-  a Triton kernel (per-token quantisation kernel + e4m3 `tl.dot` GEMM with one
+  a Triton kernel (per-token quantisation kernel + e4m3 GEMM with one
   tile config per weight shape, a `custom_op` for torch.compile / CUDA
-  graphs). Quantisation included, in a CUDA graph at M = 352: gate|up
+  graphs; now on `tl.dot_scaled`, "FP8 toolkit" below; the numbers here are
+  the `tl.dot` version's). Quantisation included, in a CUDA graph at M = 352: gate|up
   [1024 -> 8192] 36.1 us vs 68.2 (cuBLAS bf16) and 41.3 (`_scaled_mm` alone),
   q|k|v 15.1 vs 25.5, o_proj 15.5 vs 22.5, down 28.0 vs 38.9; output
   bit-identical to `_scaled_mm`. Timed eagerly by the module evaluator its two
@@ -688,6 +690,36 @@ rule MXFP8 has per-token W8A8's error (DiT layer at M = 352: relative L2 0.0205,
 norm 0.92 %, element ratio 0.17; 30 redrawn draws pass), so it shares the
 near-lossless bounds; the CPU tests calibrate its reference math on captured and
 redrawn inputs with the other precisions (`tests/test_perturbed_calibration.py`).
+
+#### FP8 toolkit: direct cuBLASLt, FP8-emitting producers, `fp8_kv`
+
+From docs/FP8.md (#132) and docs/RESEARCH-TRITON.md §5.3 (#135); examples written
+from the measured research code, not yet run on a GPU (`doctor --smoke` and
+`pytest -m gpu tests/test_fp8_toolkit.py` check them):
+
+* `examples/cuda_cublaslt_fp8.py`: FP8 GEMMs straight through cuBLASLt with
+  descriptors, layouts and the algorithm cached per shape (6.1 us of host time per
+  call against 18-20 for `torch._scaled_mm`), tensor-wise (`fp8_w8a8`) and MXFP8
+  (`fp8_mx`: `VEC32_UE8M0`, its ceil scale rule from the exponent bits, scales written
+  straight into the 128 x 4 blocked layout) modes, split-K as a strided batch, several
+  GEMMs on one input behind one call, graph-capturable.
+* `examples/triton_fp8_producers.py`: RMSNorm and `silu(gate) * up` writing e4m3 +
+  per-token (or `fp8_mx`'s MXFP8) scales in their epilogue (+0.1 us instead of +1.3 us
+  for a separate pass), and a gated MLP whose SiLU-mul feeds `down_proj` in e4m3.
+* `examples/triton_fp8_w8a8_gemm.py` now multiplies with `tl.dot_scaled` and unit
+  ue8m0 scales on sm_100+ / sm_120 (the block-scaled MMA, `QMMA.SF`: 416 vs 208
+  TFLOP/s for `tl.dot`'s `QMMA.F32`; bit-identical); `doctor --smoke` compiles it and
+  requires `block_scale` in its PTX.
+* **`fp8_kv`** (opt-in precision, near-lossless tier): the KV cache in e4m3 with one
+  scale per token and KV head, written on append (`kernels/kv_quant.py`:
+  `quantize_fp8_kv`, `Fp8KVCache`, `fp8_kv_attention`, `kv_cache_share`), read by
+  `examples/triton_fp8_kv_decode.py` (split-KV decode attention). It pays only where
+  the cache is a large share of a decode step's bytes on the model at hand (the
+  ceilings table's *KV GB* in decode rows, or `kv_cache_share`): a simple e4m3 decode
+  kernel ran 0.90x of bf16 at 77 cached
+  tokens and 1.2-1.3x from 512 to 8k (docs/FP8.md §5). Its reference math passes the
+  tier on captured and redrawn decode-attention inputs; a V scale off by 5 % or one
+  token's scale for all fail (`tests/test_fp8_toolkit.py`).
 
 ### What "faster" means
 

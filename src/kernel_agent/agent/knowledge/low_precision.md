@@ -9,12 +9,16 @@ GEMMs; "FP8 W8A8" below); MXFP8 W8A8 (`fp8_mx`): `examples/triton_mxfp8_gemm.py`
 ("MXFP8 W8A8" below). Helpers: `kernel_agent.kernels.quant` (`quantize_fp8`,
 `dequantize_fp8`, `fp8_error`; `quantize_fp4`, `dequantize_fp4`, `fp4_error`;
 `quantize_fp8_activations`, `fp8_w8a8_linear`, `fp8_w8a8_error`; `quantize_mxfp8`,
-`mxfp8_linear`, `mxfp8_error`).
+`mxfp8_linear`, `mxfp8_error`). FP8 toolkit (written from measured research code, not
+yet run on a GPU): `cuda_cublaslt_fp8.py` (direct cuBLASLt FP8 GEMMs, tensor-wise and
+MXFP8), `triton_fp8_producers.py` (RMSNorm / SiLU-mul emitting e4m3 + scales),
+`triton_fp8_kv_decode.py` (split-KV decode attention over an e4m3 KV cache, `fp8_kv`;
+helpers in `kernel_agent.kernels.kv_quant`: "FP8 KV cache" below).
 
 ## When it is allowed
 
 Only for a target whose spec says `"precision": "fp8_weights"` (or `"fp8_w8a8"`,
-`"fp8_mx"`, below), which the planner
+`"fp8_mx"`, `"fp8_kv"`, below), which the planner
 may set in a `--quality near-lossless` run (an exact run refuses such targets).
 The target is then captured in the **near-lossless tolerance tier**
 (`kernels/compare.py`): instead of per-element (atol, rtol), every output tensor
@@ -291,10 +295,16 @@ output is read next (the `silu(gate) * up`, the residual add: Inductor fuses
 it under torch.compile, a fused custom kernel does it in registers). As separate
 torch ops on an fp32 output the scales cost more than they save (gate|up
 52.6 us); in bf16 the product of e4m3 codes is exact enough (one more bf16
-rounding, 2^-9, next to FP8's ~3 %). The example's Triton GEMM (`tl.dot`, ~55 % of
-the FP8 peak) runs on `QMMA.F32`, capped at 208 TFLOP/s; `tl.dot_scaled` with unit
-ue8m0 scales (127) runs on `QMMA.SF`, bit-identical and 4-16 % faster at M = 352
-(docs/RESEARCH-TRITON.md §1.2).
+rounding, 2^-9, next to FP8's ~3 %). Plain e4m3 `tl.dot` (~55 % of the FP8 peak)
+runs on `QMMA.F32`, capped at 208 TFLOP/s; `tl.dot_scaled` with unit ue8m0 scales
+(127) runs on `QMMA.SF` (416), bit-identical and 4-16 % faster at M = 352
+(docs/RESEARCH-TRITON.md §1.2). The example's GEMM uses `tl.dot_scaled` on sm_100+ /
+sm_120 (constant `tl.full((BM, BK // 32), 127, tl.uint8)` scales, row / column scales
+in the epilogue) and `tl.dot` on sm_89 / sm_90, where Triton would emulate the
+block-scaled form through bf16; check the lowering once per Triton version: the
+compiled kernel's PTX must contain `mma ... kind::mxf8f6f4.block_scale`
+(`gemm_ptx(capability)` + `block_scale_mma(ptx)` in the example; compiling needs no
+GPU).
 
 **Eager timing.** The module evaluator times eager calls. The example's host
 time per call (two Triton launches and three allocations, ~47 us; ~89 us through
@@ -304,7 +314,10 @@ directly when not compiling) is above its GPU time at M = 352, so it measures
 graphs, as in the model, host time does not count. For an eager-timed target,
 launch less per call: fuse the activation quantisation into its producer, or
 put several GEMMs (a whole MLP or layer) behind one C++ launcher (`load_inline`,
-~19 us per call).
+~19 us per call). For the GEMMs themselves call cuBLASLt directly with cached
+descriptors and algorithm: `examples/cuda_cublaslt_fp8.py` (6.1 us of host time per
+GEMM, 5.5 each with several behind one call, against 18-20 for `torch._scaled_mm`
+and 19 for `at::_scaled_mm` from C++, which spends it in ATen's checks).
 
 End to end in that run (batch 16, near-lossless, every step within the
 perceptual gate): W8A8 `_scaled_mm` on the LocDiT MLP took it from 11.36 to 9.74
@@ -358,7 +371,12 @@ is unchanged; these are the measured alternatives (RTX 5070 Ti, cuBLASLt 13.1, t
   out) -> 1.48 us (e4m3 + per-token scale) vs 2.67 us with a separate quantisation
   pass; silu(gate) * up [352, 4096] 3.34 -> 3.03 us (half the bytes written) vs 5.50
   separate. Applying the tensor-wise GEMM's s_x * s_w in that kernel costs +2.7 us
-  (5.74 us); an MXFP8 GEMM's output is already scaled.
+  (5.74 us); an MXFP8 GEMM's output is already scaled. Example:
+  `examples/triton_fp8_producers.py` (`rmsnorm_fp8`, `silu_mul_fp8`: e4m3 + per-token
+  scales, or MXFP8 1 x 32 ue8m0 scales with `fp8_mx`'s rule, row-major for
+  `tl.dot_scaled` / blocked for cuBLASLt; a gated MLP whose SiLU-mul feeds `down_proj` in
+  e4m3). Never a separate
+  quantisation pass after a producer you control.
 * **Host time per eager call**: `torch._scaled_mm` 18-20 us, `F.scaled_mm` MXFP8 27,
   `at::_scaled_mm` from C++ 19, a direct `cublasLtMatmul` with cached descriptors and
   algorithm 6.1 (5.5 each for several behind one C++ call). Under CUDA graphs it does
@@ -369,7 +387,8 @@ is unchanged; these are the measured alternatives (RTX 5070 Ti, cuBLASLt 13.1, t
   KV cache holds <= ~77 tokens (2.6 % of a batch-16 decode step's bytes); a decode
   kernel over e4m3 K/V is slower than bf16 at 77 tokens and 1.3x faster only from
   ~2k tokens. A static K/V scale from one text is exceeded by another in ~50 % of
-  the layers. FlashAttention-3's FP8 path is Hopper only.
+  the layers. FlashAttention-3's FP8 path is Hopper only. For long contexts: the
+  opt-in `fp8_kv` class below.
 
 ## MXFP8 W8A8 (`precision: fp8_mx`)
 
@@ -454,6 +473,43 @@ alternative when a producer cannot see a whole row.
 
 **Host time**: `F.scaled_mm` (MXFP8) costs ~27 us per eager call, a direct
 `cublasLtMatmul` with cached descriptors ~6 us; inside CUDA graphs neither counts.
+
+## FP8 KV cache (`fp8_kv`, opt-in)
+
+For a target whose spec says `"precision": "fp8_kv"`: decode attention whose time
+goes into reading the KV cache. Not in a near-lossless run's default precisions
+(`--precisions ...,fp8_kv`): it pays only where the cache is a large share of what a
+decode step reads, which depends on the model and the workload, so measure it on the
+model at hand: the *Ceilings* table's *KV GB* of the decode rows against their weight
+bytes, or `kv_quant.kv_cache_share(batch=, tokens=, layers=, kv_heads=, head_dim=,
+other_bytes=)` from the model's config and the workload's context lengths
+(`other_bytes`: the weights and activations a step streams). Thousands of cached
+tokens at a real batch, not tens.
+
+* **Storage**: K and V in e4m3 with one fp32 scale per (token, KV head): `amax(|row|)
+  / 448` over the head dimension, written once when tokens are appended
+  (`kv_quant.Fp8KVCache.append`, `quantize_fp8_kv`); never re-quantise the cache per
+  step, never a static (calibrated) per-tensor scale (one text's scale was exceeded by
+  another's in ~50 % of a model's layers; vLLM / FlashInfer use per-tensor scales).
+* **Math**: Q, the fp32 softmax and the output as in eager; fold the K scale into the
+  scores (`(q · codes) * k_scale * sm_scale`: bf16 x e4m3 products are exact in fp32)
+  and the V scale into P (rounded to bf16 for the P·V MMA, as FlashAttention rounds P).
+  Reference / fallback: `kv_quant.fp8_kv_attention` (grouped-query heads, per-sequence
+  lengths). Report `kv_quant.fp8_kv_error(k, v)`.
+* **Accuracy** (docs/FP8.md §5, real captures): e4m3 K / V per token and head change a
+  decoder layer's output by <= 0.0009 relative L2 (the op itself 0.006-0.015), far
+  inside the near-lossless tier (0.08); broken scales (V scale x 1.05, one token's
+  scale for all) fail it.
+* **Speed** (RTX 5070 Ti, Triton, batch 16, 16 query / 2 KV heads, head dim 128): one
+  program per (sequence, KV head) reading e4m3 K / V ran 0.90x of bf16 at 77 cached
+  tokens (latency bound: the conversion costs more than the bytes save), 1.21x at 512,
+  1.29x at 2048, 1.31x at 8192 (~550 GB/s of codes: 32 programs on 70 SMs). Split the
+  cache over programs (flash-decoding) to approach the 2x of half the bytes:
+  `examples/triton_fp8_kv_decode.py` (splits for ~4 programs per SM, fp32 partials
+  merged by a second kernel; not measured yet).
+* **Ceilings**: decode rows count the KV-cache reads (*KV GB*) in their floors: the
+  share to compare with the weight bytes. There is no `fp8_kv` floor column (it would
+  halve the KV bytes); the target's floor is its exact one.
 
 ## FP4 weights (`fp4_weights`)
 

@@ -166,7 +166,7 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
-                    # fp8_weights / reduced / fp4_weights / fp8_w8a8 / fp8_mx
+                    # fp8_weights / reduced / fp4_weights / fp8_w8a8 / fp8_mx / fp8_kv
                     # (kernels.compare.PRECISIONS): --quality near-lossless captures the
                     # target with a near-lossless tolerance tier; an exact run refuses it.
                     # Default exact.
@@ -179,6 +179,7 @@ PLAN_SCHEMA: dict[str, Any] = {
                             "fp4_weights",
                             "fp8_w8a8",
                             "fp8_mx",
+                            "fp8_kv",
                         ],
                     },
                     "precision_why": {"type": "string"},
@@ -318,7 +319,7 @@ def _near_lossless_policy(allowed: tuple[str, ...], four_bit: tuple[str, ...]) -
             "(where shown) are out of reach."
         )
     lines.append(_POLICY["intro"])
-    for name in ("fp8_weights", "fp4_weights", "fp8_w8a8", "fp8_mx", "reduced"):
+    for name in ("fp8_weights", "fp4_weights", "fp8_w8a8", "fp8_mx", "reduced", "fp8_kv"):
         if name in allowed:
             lines.append(_POLICY[name])
     if "fp8_w8a8" in allowed or "fp8_mx" in allowed:
@@ -380,6 +381,16 @@ evaluation measures both), finer scales (MXFP8, 1 x 128 groups) keep the bulk's
 precision; per-tensor scales do not.""",
     "reduced": """`precision: "reduced"` (also
 with `precision_why`) is for another numerics-changing idea.""",
+    "fp8_kv": """`precision: "fp8_kv"` (an FP8 e4m3 KV cache, one scale per
+token and KV head; weights and GEMMs unchanged) only for a decode-attention target whose
+time goes into reading the KV cache: at the workload's context lengths and batch the cache
+must be a large share of the bytes a decode step streams (thousands of cached tokens, not
+tens: the *Ceilings* table's *KV GB* of the decode rows against their weight bytes, or
+`kernel_agent.kernels.kv_quant.kv_cache_share` on the model's own shapes). Its
+`precision_why` names that share (e.g. "8k-token contexts
+at batch 8: the KV cache is 60 % of a decode step's bytes"). On short caches it is slower:
+the conversion costs more than the bytes save (docs/FP8.md: 0.90x at 77 cached tokens,
+1.2-1.3x from 512 to 8k with a simple kernel).""",
     "exact": """Leave `precision`
 unset (exact) where lower precision buys nothing or risks the output: norms,
 softmax and attention math, element-wise ops, and the output / stop heads of
@@ -697,7 +708,10 @@ def _precision_block(
   softmax / attention math and residual adds stay in bf16 / fp32 as in eager;
 * verified example: `triton_fp8_w8a8_gemm.py` (Triton e4m3 GEMM with per-shape
   tiles, M = 352); fallback and reference: `fp8_w8a8_linear` (`torch._scaled_mm`);
-  guide: "FP8 W8A8" in "Low-precision weights" below;
+  guide: "FP8 W8A8" in "Low-precision weights" below; FP8 toolkit examples:
+  `cuda_cublaslt_fp8.py` (cuBLASLt FP8 GEMMs with cached plans: ~6 us of host time
+  per GEMM instead of ~19 for `_scaled_mm`), `triton_fp8_producers.py` (RMSNorm /
+  `silu(gate) * up` writing e4m3 + scales in their epilogue);
 * report the numerical error in `NOTES.md`: `fp8_w8a8_error(weight, q, scale, x)`
   on captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     elif precision == "fp8_mx":
@@ -727,6 +741,21 @@ def _precision_block(
   "Low-precision weights" below;
 * report the numerical error in `NOTES.md`: `mxfp8_error(weight, q, scales, x)` on
   captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
+    elif precision == "fp8_kv":
+        contract = """FP8 KV cache:
+* store K and V in e4m3 with one fp32 scale per (token, KV head), `scale = amax(|row|) /
+  448` over the head dimension, written once when tokens are appended (`from
+  kernel_agent.kernels.kv_quant import quantize_fp8_kv, Fp8KVCache, fp8_kv_attention,
+  fp8_kv_error, kv_cache_share`); never re-quantise the whole cache per step, never a
+  static (calibrated) scale;
+* the attention reads codes + scales: dequantise in registers, or fold the K scale into
+  the scores and the V scale into P; Q, the fp32 softmax and the output stay as in eager;
+  weights and GEMMs stay bf16;
+* example: `triton_fp8_kv_decode.py` (split-KV decode attention over e4m3 K / V, grouped
+  query heads, per-sequence lengths); reference and fallback: `fp8_kv_attention`;
+* time it at the workload's real context lengths (on short caches e4m3 K / V is slower)
+  and report `fp8_kv_error(k, v)` on captured K / V and the evaluator's per-case
+  `min_cosine` / `max_rel_l2` in `NOTES.md`."""
     else:
         contract = """Reduced precision: keep the change to the numerics as small as the speedup
 allows, and report the numerical error (the evaluator's per-case `min_cosine` /
