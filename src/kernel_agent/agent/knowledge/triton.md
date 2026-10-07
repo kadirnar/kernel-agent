@@ -67,18 +67,38 @@ Notes
   input dtype *before* multiplying by the weight).
 * Autotune only on shapes that vary; `key=[...]`. Autotuning runs on first
   call (cost paid during warm-up). Avoid autotune when shapes change every call.
+* Tuned-config cache (`kernel_agent.kernels.tuned`): `@triton.autotune` tunes
+  again in every process (each evaluation, sweep config, re-check and A/B is
+  one). `tuned.best_config(op, {"M": m, "N": n, "K": k, "dtype": "bf16"},
+  candidates, bench, exact=["N", "K"], default=...)` returns the stored config of
+  this GPU, library versions (torch, CUDA, driver, Triton / CUTLASS / cuBLAS by
+  `backend=`) and shape bucket (dims rounded up to a power of two except `exact`),
+  else times the candidates with `bench(config) -> ms` (`tuned.time_ms(fn)`),
+  stores the fastest in `~/.cache/kernel-agent/tuned-configs.sqlite` and returns
+  it; an upgrade invalidates the entry; it never times while a CUDA graph is
+  captured. Memoise the result per shape in your module (no lookup per call),
+  name the op after the kernel's source digest (an edited kernel tunes again),
+  and keep every candidate correct: the evaluator checks the one picked.
+  `python -m kernel_agent.kernels.tuned` lists the entries. Also for cuBLASLt
+  algorithm indices and CUTLASS configs chosen from C++ (`backend="cublaslt"`).
 * Launch overhead is ~30-40 us of Python per call. For decode-time micro-ops,
   fuse more per kernel; for elementwise chains do everything in one kernel.
   When the module evaluator times eager calls, several Triton launches per call
   can make the candidate host bound: the VoxCPM2 `dit_layer` (cuBLAS GEMMs + 5
   Triton glue kernels) measured 2.21x with ~216 us host vs ~167 us GPU per call;
   the same math behind one `load_inline` C++ entry measured 2.70x. Launch less,
-  or launch the `CompiledKernel` that the first `kernel[grid](...)` returns as
-  `k[grid](*runtime_args)` (Triton 3.8 `compiler.py`: it calls `run` directly,
-  skipping the JIT's binding and specialisation; constexpr arguments are baked
-  in, so compare with the normal launch once; Unsloth's `triton_launch.py` does
-  the same), or move the launches into C++. Under CUDA graphs / torch.compile
-  host time does not count.
+  or launch through `kernel_agent.kernels.triton_launch.CachedLaunch`: wrap the
+  kernel once (`_k = CachedLaunch(_kernel)`), call `_k[grid](...)` exactly like
+  `_kernel[grid](...)`; from the second call of a specialisation it calls the cached
+  `CompiledKernel`'s C launcher directly, skipping the JIT's binding and
+  specialisation (Unsloth's `triton_launch.py`, FlagGems' `LibEntry`). Plain
+  `@triton.jit` kernels only (no `@triton.autotune` / `@triton.heuristics`); use
+  the plain `kernel[grid]` when `torch.compiler.is_compiling()` (Dynamo traces it).
+  `examples/triton_cheap_launch.py` (a pre-norm gated MLP block, 2 Triton
+  launches + 2 GEMMs per call, `build(..., fast_launch=False)` for the JIT path to
+  compare with `sweep_candidate`). The other route: Triton AOT
+  (`python -m triton.tools.compile` + `triton.tools.link`) called from one
+  `load_inline` entry. Under CUDA graphs / torch.compile host time does not count.
 * Persistent kernels: `grid = (num_SMs,)` and loop over tiles inside.
 * Debug: `TRITON_INTERPRET=1` runs kernels on CPU (slow) for logic bugs.
 * Matmul with tiny M (decode GEMV): use a split-K or row-per-program design with
@@ -164,7 +184,11 @@ weights).
   FlashAttention 35 us (128-row tiles mostly padding). It was routed from
   `F.scaled_dot_product_attention` by a `torch.overrides.TorchFunctionMode`
   entered inside the module's forward, into a `torch.library.custom_op`, which
-  traces under `torch.compile(fullgraph=True)`.
+  traces under `torch.compile(fullgraph=True)`. `examples/triton_short_attention.py`
+  is the general version: query / key length <= 32, any head counts, GQA ratio and
+  head dim (padded to a power of two), causal / boolean / additive masks, fp16 /
+  bf16, `sdpa(...)` drop-in, `ShortAttentionMode` routing, cached eager launch,
+  `num_warps` from the tuned-config cache.
 
 ## When Triton is the right backend (VoxCPM2 ledgers, docs/RESEARCH-TRITON.md §4-5)
 

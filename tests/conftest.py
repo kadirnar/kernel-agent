@@ -38,6 +38,18 @@ def _private_library(tmp_path_factory):
         os.environ["KERNEL_AGENT_LIBRARY"] = old
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _private_tuned_configs(tmp_path_factory):
+    """Tests never read or write the user's tuned-config cache (kernels/tuned.py)."""
+    old = os.environ.get("KERNEL_AGENT_TUNED_DB")
+    os.environ["KERNEL_AGENT_TUNED_DB"] = str(tmp_path_factory.mktemp("tuned") / "tuned.sqlite")
+    yield
+    if old is None:
+        os.environ.pop("KERNEL_AGENT_TUNED_DB", None)
+    else:
+        os.environ["KERNEL_AGENT_TUNED_DB"] = old
+
+
 @pytest.fixture(autouse=True)
 def _gpu_lock_for_gpu_tests(request):
     """`gpu` tests hold kernel-agent's GPU lock (of the GPU this process uses, see

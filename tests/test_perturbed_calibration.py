@@ -49,6 +49,7 @@ class Linear(torch.nn.Module):
             self.s = self.s.roll(1)
         self.w = quant.dequantize_fp8(self.q, self.s, w.dtype)
         self.cache = {{}}
+        self.static = None
 
     def forward(self, x):
         if PRECISION == "fp8_mx":
@@ -64,6 +65,12 @@ class Linear(torch.nn.Module):
             xs = self.cache.setdefault(tuple(x.shape), xs)
             a = x.detach().reshape(-1, x.shape[-1]).float()
             xq = (a / xs[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+        elif BUG == "static activation scale":  # calibrated on the first call, 2x headroom
+            if self.static is None:
+                self.static = float(x.detach().abs().max()) * 2 / 448
+            a = x.detach().reshape(-1, x.shape[-1]).float()
+            xs = torch.full((a.shape[0],), self.static, device=x.device)
+            xq = (a / self.static).clamp(-448, 448).to(torch.float8_e4m3fn)
         y = (xq.float() * xs[:, None]) @ (self.q.float() * self.s[:, None]).T
         return y.to(x.dtype).reshape(*x.shape[:-1], -1)
 
@@ -224,6 +231,32 @@ def test_a_saturating_mxfp8_scale_rule_is_rejected_with_its_reason(tmp_path, wri
     report = evaluate(capture, good, device="cpu")["scale_rule"]
     assert report["ok"] and report["checked"] and report["stress"]["saturated"] == 0
     assert report["stress"]["worst_ratio"] <= 448 and report["outliers"]["channel_ratio"] > 5
+
+
+def test_a_static_activation_scale_fails_the_scaled_check(tmp_path, writer, monkeypatch):
+    """An activation scale calibrated on the first call with 2x headroom passes the captured
+    inputs and most redrawn draws (no outlier channel there), and always saturates on the
+    captured inputs x 3 (#148; x 0.01 pushes small values into e4m3's subnormals and often
+    fails too): the scales must follow the input."""
+    capture, tier = _capture(tmp_path, writer, "fp8_w8a8")
+    path, build = _candidate(tmp_path, "fp8_w8a8", "static activation scale")
+    result = evaluate(capture, path, device="cpu")
+    assert result["status"] == "incorrect_perturbed", result
+
+    mlp, inputs = writer
+    candidate = build(mlp)
+    monkeypatch.setattr(compare, "TIER", tier)  # as the evaluator sets it from the capture
+    for x in inputs:
+        with torch.inference_mode():
+            out = mlp(x)
+        case = {"output": out, "post_args": (x.clone(),), "post_kwargs": {}}
+        failed = verify.reverify_case(
+            mlp, candidate, case, ((x,), {}), torch.Generator().manual_seed(0), lambda: None
+        )
+        checks = [f["check"] for f in failed]
+        assert "scaled_x3" in checks and "sign_flipped" not in checks  # e4m3 is symmetric
+    redrawn = _redrawn(writer, build, tier, perturbed=True, seeds=10)
+    assert sum(not r["ok"] for r in redrawn) <= len(redrawn) // 4  # what the redraws miss
 
 
 def _wide_channel() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

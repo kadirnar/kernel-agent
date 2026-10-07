@@ -13,12 +13,23 @@
      mean and std, so an output cached by input address, shape or call count no
      longer matches;
   3. ``perturbed_mixed``: a fresh copy redrawn from a random mix of uniform,
-     Laplace and (standardised) log-normal distributions.
+     Laplace and (standardised) log-normal distributions;
+  4. ``scaled_x3``, ``scaled_x0.01``, ``sign_flipped`` (:data:`SCALED`): fresh copies
+     of the captured inputs with every floating-point tensor multiplied by 3, 0.01 and
+     −1 (KernelBench-Verified caught a "374x" kernel that only worked on positive
+     inputs this way; docs/RESEARCH-TRITON.md §3.3). Value-conditional shortcuts,
+     constants calibrated on the captured values (an FP8 activation scale: ×3
+     saturates it, the scales must follow the input), absolute epsilons and overflow
+     handling show up here. Compared with ``input_scale`` (:func:`kernels.compare.
+     compare_tensors`): the absolute tolerance grows with ×3, the signal threshold
+     shrinks with ×0.01. A check whose reference output turns non-finite (overflow)
+     where the captured one is finite is skipped and recorded (``skipped``).
 
   Perturbed draws are compared with the reference called live on copies of the
   same inputs (outputs, in-place side effects and aliasing), a reduced-precision
   tier with its bounds for redrawn inputs (:data:`kernels.compare.PERTURBED_BOUNDS`:
-  redrawn inputs have no outlier channels).  The candidate
+  redrawn inputs have no outlier channels; the scaled checks too: a sign flip moves a
+  massive activation to other channels).  The candidate
   always runs first and its output is copied right away, so it cannot return
   memory that the reference's call just freed.
 
@@ -41,6 +52,8 @@ from kernel_agent.kernels.compare import compare_side_effects, compare_structure
 
 MASKED = -1e4  # additive masks use values at or below this: never redrawn
 MIX = ("uniform", "laplace", "lognormal")
+#: (check, factor) of the scaled checks: the captured floating-point inputs times the factor.
+SCALED = (("scaled_x3", 3.0), ("scaled_x0.01", 0.01), ("sign_flipped", -1.0))
 
 
 # ------------------------------------------------------------------ aliasing
@@ -164,12 +177,29 @@ def perturb_(value: Any, gen: torch.Generator, kind: str) -> int:
     return done
 
 
+def scale_(value: Any, factor: float) -> int:
+    """Multiply the floating-point tensors inside ``value`` by ``factor`` in place (the
+    tensors :func:`perturb_` would redraw: no additive masks, no non-finite tensors).
+    Returns the number of tensors scaled."""
+    done = 0
+    with torch.inference_mode():
+        for t in flatten(value).values():
+            if not isinstance(t, torch.Tensor) or not _perturbable(t):
+                continue
+            t.mul_(factor)
+            done += 1
+    return done
+
+
 # ------------------------------------------------------------------ re-verification
 
 CHECKS = {
     "fresh_addresses": "captured inputs at fresh addresses",
     "perturbed_same_addresses": "inputs redrawn in place (same addresses as the previous call)",
     "perturbed_mixed": "inputs redrawn from uniform/Laplace/log-normal at fresh addresses",
+    "scaled_x3": "the captured floating-point inputs x 3",
+    "scaled_x0.01": "the captured floating-point inputs x 0.01",
+    "sign_flipped": "the captured floating-point inputs x -1 (signs flipped)",
 }
 
 
@@ -187,22 +217,39 @@ def _call(fn: Callable[..., Any], args: Any, kwargs: Any, sync: Callable[[], Non
     return _snapshot(out)
 
 
+def _finite(value: Any) -> bool:
+    """Whether every floating-point tensor inside ``value`` is finite."""
+    return all(
+        bool(torch.isfinite(t).all())
+        for t in flatten(value).values()
+        if isinstance(t, torch.Tensor) and t.is_floating_point() and t.numel()
+    )
+
+
 def _against_reference(
     ref_fn: Callable[..., Any],
     new_fn: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     sync: Callable[[], None],
-) -> list[dict[str, Any]]:
+    *,
+    input_scale: float = 1.0,
+    finite: bool = False,
+) -> list[dict[str, Any]] | None:
     """Call the candidate on ``args``/``kwargs`` (mutated in place, like the model
-    would), then the reference on copies of the same pre-call inputs; compare."""
+    would), then the reference on copies of the same pre-call inputs; compare (with
+    ``input_scale``, :func:`kernels.compare.compare_tensors`). ``finite``: None (skip)
+    when the reference's output or post-call state is not finite."""
     pre_args, pre_kwargs = copy.deepcopy(args), copy.deepcopy(kwargs)
     out = _call(new_fn, args, kwargs, sync)
     ref_args, ref_kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
     expected = _call(ref_fn, ref_args, ref_kwargs, sync)
-    checks = compare_structures(expected, out, "output", perturbed=True)
-    checks += compare_side_effects(pre_args, ref_args, args, "args", perturbed=True)
-    checks += compare_side_effects(pre_kwargs, ref_kwargs, kwargs, "kwargs", perturbed=True)
+    if finite and not _finite((expected, ref_args, ref_kwargs)):
+        return None
+    kw: dict[str, Any] = {"perturbed": True, "input_scale": input_scale}
+    checks = compare_structures(expected, out, "output", **kw)
+    checks += compare_side_effects(pre_args, ref_args, args, "args", **kw)
+    checks += compare_side_effects(pre_kwargs, ref_kwargs, kwargs, "kwargs", **kw)
     return checks
 
 
@@ -213,17 +260,22 @@ def reverify_case(
     pristine: tuple[tuple[Any, ...], dict[str, Any]],
     gen: torch.Generator,
     sync: Callable[[], None],
+    record: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run the three re-verification checks of one case; returns the failed ones as
-    ``{"check": name, "what": description, "failures": [...]}``."""
+    """Run the re-verification checks of one case (:data:`CHECKS`); returns the failed
+    ones as ``{"check": name, "what": description, "failures": [...]}``. ``record``
+    collects the scaled checks that ran (``ran``: check -> count) and were skipped
+    (``skipped``: ``{"check", "why"}``)."""
     failed = []
+    record = record if record is not None else {}
+    ran, skipped = record.setdefault("ran", {}), record.setdefault("skipped", [])
     pre_args, pre_kwargs = pristine
     args, kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
     out = _call(new_fn, args, kwargs, sync)
     checks = compare_structures(case["output"], out, "output")
     checks += compare_side_effects(pre_args, case["post_args"], args, "args")
     checks += compare_side_effects(pre_kwargs, case["post_kwargs"], kwargs, "kwargs")
-    runs = [("fresh_addresses", checks)]
+    runs: list[tuple[str, list[dict[str, Any]] | None]] = [("fresh_addresses", checks)]
 
     perturb_((args, kwargs), gen, "normal")  # the objects the previous call just saw
     runs.append(
@@ -233,8 +285,22 @@ def reverify_case(
     args, kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
     perturb_((args, kwargs), gen, "mix")
     runs.append(("perturbed_mixed", _against_reference(ref_fn, new_fn, args, kwargs, sync)))
-    for name, checks in runs:
-        bad = [c for c in checks if not c.get("ok")]
+
+    captured_finite = _finite(case["output"])  # else non-finite positions are compared
+    for name, factor in SCALED:
+        args, kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
+        if not scale_((args, kwargs), factor):
+            continue  # no floating-point inputs: nothing to scale
+        scaled = _against_reference(
+            ref_fn, new_fn, args, kwargs, sync, input_scale=factor, finite=captured_finite
+        )
+        if scaled is None:
+            skipped.append({"check": name, "why": "the reference's output is not finite"})
+            continue
+        ran[name] = ran.get(name, 0) + 1
+        runs.append((name, scaled))
+    for name, found in runs:
+        bad = [c for c in found or [] if not c.get("ok")]
         if bad:
             failed.append({"check": name, "what": CHECKS[name], "failures": bad[:5]})
     return failed

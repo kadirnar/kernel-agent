@@ -316,6 +316,7 @@ def write_report(run: RunDir) -> Path:
     ]
     saved: dict[str, float | None] = {}
     counted: list[str] = []  # the calls behind each estimate (kernels/weights.py)
+    memory: list[str] = []  # best kernels whose per-call peak memory warns (#148)
     allowed = precisions.of_config(data.get("config"))
     refused: list[str] = []  # at a precision the run does not allow: not integrated
     for target_id in run.target_ids():
@@ -331,6 +332,8 @@ def write_report(run: RunDir) -> Path:
             saved[target_id] = est
         if best and est is not None and not mark and (note := _calls(target_id, spec, best)):
             counted.append(note)
+        if best and (warning := (best.get("peak_memory") or {}).get("warning")):
+            memory.append(f"`{target_id}`: {warning}")
         mine = f" {_fmt(units(target_id, est))} |" if other else ""
         lines.append(
             f"| `{target_id}`{mark} | `{spec.get('module_class')}` | "
@@ -362,6 +365,9 @@ def write_report(run: RunDir) -> Path:
             "neither projected nor integrated.",
             "",
         ]
+    if memory:
+        lines += ["Peak GPU memory above the reference's (a warning, not a failure):", ""]
+        lines += [f"* {m}" for m in memory] + [""]
     if counted:
         lines += [
             "Calls behind the estimates (a case's gain per call × the calls of the target's "
