@@ -60,6 +60,11 @@ from torch.overrides import TorchFunctionMode
 from kernel_agent.kernels import tuned
 from kernel_agent.kernels.triton_launch import CachedLaunch
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_80+"
+ARCHS_WHY = "bf16 tl.dot (Triton has no MMA below sm_80)"
+
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)
 #: Longest query / key sequence the single tile takes (registers: 32 x 256 per tile).

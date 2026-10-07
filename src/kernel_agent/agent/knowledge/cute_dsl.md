@@ -1,5 +1,10 @@
 # CuTe DSL backend (`nvidia-cutlass-dsl`, `import cutlass.cute as cute`)
 
+The examples below target sm_120 (their `ARCHS`); on Hopper the peak MMA is the warpgroup
+one (`cute.nvgpu.warpgroup`, wgmma) and on datacenter Blackwell `cute.nvgpu.tcgen05`
+(CUTLASS's CuTe DSL `cute/hopper/` and `cute/blackwell/` examples: `sources.md`), with ~227 KB of
+shared memory per block instead of 99.
+
 When to use it (backend policy, docs/RESEARCH-TRITON.md §5.1): **compute-bound FP8 GEMMs
 on sm_120** (W8A8, M ≳ 128 rows), because CuTe DSL exposes the block-scaled tensor-core
 MMA that runs at full rate with fp32 accumulation, with an epilogue you write yourself;

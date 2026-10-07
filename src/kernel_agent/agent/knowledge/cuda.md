@@ -41,8 +41,8 @@ Verified example: `examples/nvrtc_rmsnorm.py`.
 | Arch | GPUs | Tensor-core path | Async copy |
 |---|---|---|---|
 | sm_80/86/89 | A100, RTX 30xx/40xx | `mma.sync` (bf16/fp16/tf32/int8, fp8 on sm_89) | `cp.async` |
-| sm_90a | H100/H200 | WGMMA (warpgroup), `mma.sync` | TMA + mbarrier, clusters |
-| sm_100a | B200/GB200 | `tcgen05` MMA + TMEM, 2-CTA | TMA |
+| sm_90a | H100/H200 | WGMMA (warpgroup) for the peak; `mma.sync` ~2/3 of it | TMA + mbarrier, clusters |
+| sm_100a | B200/GB200 | `tcgen05` MMA + TMEM, 2-CTA, block-scaled; no WGMMA | TMA |
 | sm_120 | RTX 50xx (consumer Blackwell) | `mma.sync` incl. FP8 and block-scaled FP4/FP6/FP8 (`mma.sync...kind::mxf8f6f4`); **no WGMMA, no tcgen05/TMEM** | TMA + `cp.async`, ~99 KB SMEM per block |
 
 FP8 GEMMs from C++ (sm_89+): call cuBLASLt directly (`cublasLtMatmul` with the
@@ -54,11 +54,14 @@ applied by a small epilogue or by the consumer) and MXFP8 (`VEC32_UE8M0`, ue8m0 
 per 32 along K in the 128 x 4 blocked layout; sm_100+ / sm_120) modes, split-K as a
 strided batch over K slices, the heuristic's algorithms timed once, several GEMMs on
 one input behind one pybind call. On sm_120 cuBLASLt has no row-wise (`OUTER_VEC_32F`)
-or DeepSeek blockwise (`VEC128_32F`, `BLK128x128_32F`) scale mode. In hand-written
-kernels, compute-bound FP8 needs the block-scaled MMA (`mma.sync ...
-kind::mxf8f6f4.block_scale`, `sm_120a`, 416 TFLOP/s; unit ue8m0 scales 127 when the
-real scales are per tensor / row): plain `mma.sync ... e4m3.e4m3.f32` runs at half
-that rate on GeForce.
+or DeepSeek blockwise (`VEC128_32F`, `BLK128x128_32F`) scale mode (they are sm_90 only).
+In hand-written kernels, the instruction that reaches the FP8 peak depends on the GPU
+(the prompt's "This GPU" section): on sm_120 the block-scaled MMA (`mma.sync ...
+kind::mxf8f6f4.block_scale`, `sm_120a`, 416 TFLOP/s on an RTX 5070 Ti; unit ue8m0 scales
+127 when the real scales are per tensor / row), since plain `mma.sync ...
+e4m3.e4m3.f32` runs at half that rate on GeForce; on sm_89 plain e4m3 `mma.sync`; on
+sm_90 `wgmma` and on sm_100 `tcgen05.mma` (e4m3 `mma.sync` is emulated through fp16
+there).
 
 General rules: coalesced 128-bit global loads, avoid SMEM bank conflicts
 (swizzle / padding), keep occupancy reasonable (registers ≤ 128/thread for

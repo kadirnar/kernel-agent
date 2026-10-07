@@ -118,7 +118,10 @@ class Orchestrator:
             raise SystemExit(f"program file not found: {cfg.program}")
         if problem := precisions.check(cfg.quality, cfg.precisions):
             raise SystemExit(problem)
-        cfg.precisions = list(precisions.allowed(cfg.quality, cfg.precisions))  # run.json
+        cap = getattr(tc.gpu, "capability", None)  # run.json: what this GPU allows too (#165)
+        for name, why in precisions.gpu_refused(cfg.quality, cfg.precisions, cap).items():
+            log(f"precision {name}: not on this GPU: {why}")
+        cfg.precisions = list(precisions.allowed(cfg.quality, cfg.precisions, cap))
         log(auth.preflight(cfg.auth))  # --auth: a login / API key exists (presence only)
         log(f"resolving {cfg.model_ref}")
         card = hub.resolve(cfg.model_ref, token=cfg.hf_token, modality=cfg.modality)
@@ -169,7 +172,8 @@ class Orchestrator:
             quality = data["config"].get("quality")
             if problem := precisions.check(quality, wanted):
                 raise SystemExit(problem)
-            data["config"]["precisions"] = list(precisions.allowed(quality, wanted))
+            cap = getattr(getattr(toolchain.setup(), "gpu", None), "capability", None)  # #165
+            data["config"]["precisions"] = list(precisions.allowed(quality, wanted, cap))
             write_json(run.run_json, data)
             log(f"precisions: {precisions.describe(data['config']['precisions'])} (run.json)")
         cfg = OptimizeConfig.from_dict({**data["config"], **overrides})
@@ -190,14 +194,21 @@ class Orchestrator:
         write_json(self.run.run_json, data)
 
     def allowed_precisions(self) -> tuple[str, ...]:
-        """The target precisions this run allows (``--precisions``, ``precisions.py``)."""
-        return precisions.allowed(self.cfg.quality, self.cfg.precisions)
+        """The target precisions this run allows (``--precisions``, ``precisions.py``) on
+        its GPU (#165)."""
+        return precisions.allowed(self.cfg.quality, self.cfg.precisions, self._capability())
+
+    def _capability(self) -> tuple[int, int] | None:
+        """The compute capability of this machine's GPU (None: none detected)."""
+        cap = getattr(getattr(getattr(self, "tc", None), "gpu", None), "capability", None)
+        return (int(cap[0]), int(cap[1])) if cap else None
 
     def _refused(self, target_id: str) -> str | None:
         """Why the kernels of a target may not be used in this run (its precision is not
-        allowed, ``precisions.py``), or None."""
+        allowed, or this GPU cannot run it: ``precisions.py``), or None."""
         spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
-        return precisions.refusal(precisions.of_spec(spec), self.allowed_precisions())
+        allowed = self.allowed_precisions()
+        return precisions.refusal(precisions.of_spec(spec), allowed, self._capability())
 
     def _available_backends(self) -> list[str]:
         avail = [b for b in self.cfg.backends if self.tc.backends.get(b)]
@@ -449,7 +460,8 @@ class Orchestrator:
         parent class, see ``region.py``); returns the captured ids."""
         kept = []
         for t in targets:
-            if why := precisions.refusal(t.get("precision"), self.allowed_precisions()):
+            allowed, cap = self.allowed_precisions(), self._capability()
+            if why := precisions.refusal(t.get("precision"), allowed, cap):
                 log(f"capture: {t['id']} refused: {why}")  # planned before the run's list
                 ledger.event(self.run, "capture_refused", target=t["id"], why=why)
                 continue

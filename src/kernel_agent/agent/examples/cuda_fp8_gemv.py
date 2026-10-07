@@ -29,6 +29,14 @@ from torch.utils.cpp_extension import load_inline
 
 from kernel_agent.kernels.quant import fp8_error, quantize_fp8
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_80+"
+ARCHS_WHY = (
+    "bf16 activations; e4m3 weights converted in registers (hardware cvt from sm_89, "
+    "CUDA's software conversion before)"
+)
+
 CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <cuda_bf16.h>

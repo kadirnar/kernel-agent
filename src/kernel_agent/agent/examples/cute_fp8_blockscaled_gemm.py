@@ -75,6 +75,14 @@ try:  # an on-disk cache of the compiled kernels across evaluations (kernel_agen
 except ImportError:  # pragma: no cover - outside kernel-agent
     compile_cached = None
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_12x"
+ARCHS_WHY = (
+    "block-scaled mma.sync (MmaMXF8Op, kind::mxf8f6f4.block_scale) exists on sm_120a / "
+    "sm_121a only; sm_100 has the tcgen05 form"
+)
+
 _NS = re.sub(r"\W", "_", __name__)
 TILE = (128, 128, 128)  # the FP8 tile of the upstream example (M, N, K)
 EPI_TILE = (64, 32)  # bf16 epilogue sub-tile: 4 smem stages of 64x32 leave room for 2 AB stages

@@ -16,6 +16,12 @@ habit:
 * :func:`target_class` puts a target in one row of :data:`POLICY` from its module family,
   precision and captured shapes (rows ``M`` of the dominant case, sequence length);
   :func:`policy_text` is the planner's table, :func:`engineer_note` the target's row.
+  Both follow the GPU (issue #165, :class:`kernel_agent.gpu_arch.Facts`): the rows that
+  differ by architecture (:data:`ARCH_POLICY`: compute-bound FP8 on Ada, Hopper and
+  datacenter Blackwell; on GeForce Blackwell with this GPU's measured FP8 instruction
+  rates) replace :data:`POLICY`'s, whose evidence was measured on an RTX 5070 Ti (sm_120);
+  a class whose precision the GPU cannot run is left out, and :data:`ARCH_RULES` adds what
+  each family needs for the tensor-core peak.
 * :func:`outcomes` / :func:`by_backend` tabulate a run's kernel evaluations per target and
   backend (library priors excluded, a re-evaluation replaces its snapshot's numbers);
   :func:`report_lines` and :func:`status_lines` show them in ``report.md`` and ``status``.
@@ -38,6 +44,7 @@ from typing import Any
 
 from kernel_agent import ledger
 from kernel_agent.budget import PRIOR_HYPOTHESIS
+from kernel_agent.gpu_arch import Facts
 from kernel_agent.workspace import RunDir, read_json
 
 #: What a candidate's source *runs*, per backend (first column of RESEARCH-TRITON §4.1).
@@ -82,6 +89,12 @@ class TargetClass:
     never: str = ""  # what not to do for this class
 
 
+#: What a GeForce Blackwell FP8 GEMM kernel must beat (measured on an RTX 5070 Ti).
+_GEFORCE_FP8_BASELINE = (
+    "the baseline to beat is cuBLASLt tensor-wise (nvjet; RTX 5070 Ti: 325 TFLOP/s at 4096³, "
+    "gate|up 30.2 us at M = 352) with the scales applied by the consumer"
+)
+
 POLICY: tuple[TargetClass, ...] = (
     TargetClass(
         "fp8_gemm",
@@ -92,9 +105,7 @@ POLICY: tuple[TargetClass, ...] = (
         "scales are per token / channel); Triton `tl.dot_scaled` with unit scales for a "
         "quick win",
         "`QMMA.F32` (plain e4m3 `mma.sync`) is capped at 208 TFLOP/s on sm_120, `QMMA.SF` "
-        "runs 416 with the same fp32 accumulation; the baseline to beat is cuBLASLt "
-        "tensor-wise (nvjet, 325 TFLOP/s at 4096³, gate|up 30.2 us at M = 352) with the "
-        "scales applied by the consumer",
+        "runs 416 with the same fp32 accumulation (RTX 5070 Ti); " + _GEFORCE_FP8_BASELINE,
         "direct cuBLASLt from C++ (descriptors cached, top-8 algorithms timed), the scales "
         "and glue in one fused kernel",
         ("cute", "triton", "cuda"),
@@ -132,7 +143,7 @@ POLICY: tuple[TargetClass, ...] = (
         "decoder_layer",
         "Fused decoder layer (norm, RoPE, attention, GEMMs)",
         "timed eagerly: CUDA C++ behind one launcher; inside CUDA graphs: Inductor glue + "
-        "library or block-scaled GEMMs",
+        "library or (on GPUs with them) block-scaled GEMMs",
         "host time decides an eager-timed layer: 2.21x with 5 Triton launches vs 2.70x for "
         "the same math behind one C++ launcher",
         "CuTe DSL persistent layer from `examples/cute_fp8_decoder_block.py` (one launch per "
@@ -171,10 +182,158 @@ _SIG = re.compile(r"\[([0-9, ]*)\]")
 #: Precisions whose GEMMs run on FP8 tensor cores (both operands e4m3): W8A8 with per-token /
 #: per-channel scales and MXFP8 (one ue8m0 scale per 32 K-elements, ``fp8_mx``).
 _FP8 = ("fp8_w8a8", "fp8_mx")
+_FP8_LABEL = "Compute-bound FP8 GEMM (W8A8, M ≳ 128 rows)"
+
+#: :data:`POLICY` rows that differ by architecture family (``gpu_arch.Family.key``): they
+#: replace the row of the same id on that family. :data:`POLICY`'s rows were measured on an
+#: RTX 5070 Ti (GeForce Blackwell); these follow the families' documented instructions
+#: (``knowledge/gpus.md`` and its sources), and the GeForce Blackwell FP8 row the GPU's own
+#: measured rates (:func:`_geforce_fp8`).
+ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
+    "ada": {
+        "fp8_gemm": TargetClass(
+            "fp8_gemm",
+            _FP8_LABEL,
+            "plain FP8 `mma.sync` (QMMA, the only FP8 tensor-core instruction on sm_89): Triton "
+            "`tl.dot` on e4m3 (`examples/triton_fp8_w8a8_gemm.py` takes this path below "
+            "sm_100) or direct cuBLASLt tensor-wise (`examples/cuda_cublaslt_fp8.py`), the "
+            "per-token / per-channel scales in the epilogue",
+            "Ada has no block-scaled MMA: the plain e4m3 instruction is its full FP8 rate "
+            "(the *Ceilings* table's W8A8 peak and the toolchain's measured `QMMA.F32` rate)",
+            "CUTLASS's sm_89 FP8 GEMMs (blockwise scales: `examples/94_ada_fp8_blockwise`) "
+            "from C++; `torch._scaled_mm` as the reference",
+            ("triton", "cuda", "cute"),
+            "never `tl.dot_scaled` / MXFP8 on sm_89 (no block-scaled MMA: Triton emulates it "
+            "through bf16)",
+        ),
+    },
+    "hopper": {
+        "fp8_gemm": TargetClass(
+            "fp8_gemm",
+            _FP8_LABEL,
+            "`wgmma` on e4m3 (TMA loads, warp-specialised producer / consumer warpgroups, "
+            "persistent tiles): Triton `tl.dot` on e4m3 (it emits wgmma on sm_90), cuBLASLt "
+            "as the baseline (`torch._scaled_mm`, `examples/cuda_cublaslt_fp8.py`), CuTe DSL "
+            "/ CUTLASS sm_90 GEMMs (`cute.nvgpu.warpgroup`) when the epilogue fuses scales, "
+            "bias or quantisation",
+            "Hopper's FP8 peak (2x bf16) is reached by `wgmma` only: e4m3 `mma.sync` is "
+            "emulated through fp16 HMMA on sm_90, bf16 `mma.sync` reaches ~2/3 of the wgmma "
+            "peak, and there is no block-scaled MMA",
+            "DeepSeek-style blockwise FP8 (1 x 128 activation, 128 x 128 weight scales, "
+            "partial sums promoted to fp32 every 128 along K) with CUTLASS sm_90 blockwise "
+            "GEMMs",
+            ("triton", "cuda", "cute"),
+            "never a `mma.sync` kernel for a compute-bound GEMM on sm_90 (below the wgmma "
+            "rate); never `tl.dot_scaled` / MXFP8 (no block-scaled MMA: emulated)",
+        ),
+    },
+    "blackwell": {
+        "fp8_gemm": TargetClass(
+            "fp8_gemm",
+            _FP8_LABEL,
+            "`tcgen05.mma` (TMEM accumulators, TMA, 2-CTA pairs): cuBLASLt tensor-wise or "
+            "MXFP8 as the baseline (`torch._scaled_mm`, `F.scaled_mm` BlockWise1x32, "
+            "`examples/cuda_cublaslt_fp8.py`), Triton `tl.dot` on e4m3 (`tcgen05.mma "
+            "kind::f8f6f4`: `examples/triton_fp8_w8a8_gemm.py` takes this path here), CuTe "
+            "DSL Blackwell GEMMs (`cute.nvgpu.tcgen05`) when the epilogue fuses scales, bias "
+            "or quantisation",
+            "datacenter Blackwell reaches its FP8 peak (plain and block-scaled) through "
+            "`tcgen05.mma` only: e4m3 `mma.sync` is emulated through fp16 HMMA on sm_100, "
+            "`mma.sync` saturates near a quarter of the B200 peak, `wgmma` does not exist",
+            "MXFP8 (`fp8_mx`) where the run allows it: block scales at the same MMA rate",
+            ("triton", "cuda", "cute"),
+            "never a `mma.sync` kernel for a compute-bound GEMM on sm_100 (the sm_120 CuTe "
+            "example's `MmaMXF8Op` and the CUDA FP8 examples use it)",
+        ),
+    },
+}
+#: What each family needs for the tensor-core peak, and its Triton notes (policy_text /
+#: engineer_note lines; GeForce Blackwell's were measured on an RTX 5070 Ti).
+ARCH_RULES: dict[str, tuple[str, ...]] = {
+    "pre_ampere": (
+        "No bf16 tensor cores before sm_80 (fp16 is the tensor-core dtype) and Triton's "
+        "`tl.dot` runs on FMA units below sm_80: keep GEMMs in cuBLAS or CUDA C++ fp16 "
+        "`mma.sync`, use Triton for memory-bound glue.",
+    ),
+    "ampere": (
+        "No FP8 tensor cores (sm_80 / sm_86): `fp8_weights`, `fp4_weights` and `fp8_kv` "
+        "targets dequantise to bf16 in registers (software e4m3 conversion: CUDA C++, or "
+        "Triton on `uint8` codes); W8A8 / MXFP8 do not exist here.",
+        "No TMA, clusters or PDL: `cp.async` multi-stage pipelines (Triton `num_stages`).",
+    ),
+    "ada": (
+        "Triton FP8: `tl.dot` on e4m3 (QMMA, the full FP8 rate on sm_89); `tl.dot_scaled` is "
+        "emulated through bf16 here.",
+        "No TMA, clusters or PDL on sm_89: `cp.async` pipelines.",
+    ),
+    "hopper": (
+        "Compute-bound GEMM-like work (GEMMs, attention, convolutions as GEMMs) needs `wgmma` "
+        "for the tensor-core peak: Triton `tl.dot` (wgmma on sm_90), CuTe DSL "
+        "`cute.nvgpu.warpgroup`, CUTLASS sm_90 kernels or cuBLAS; a hand-written `mma.sync` "
+        "kernel stops below it.",
+        "Triton on sm_90: `tl.dot` on e4m3 for FP8; sweep TMA descriptors and "
+        "`warp_specialize=True` (Hopper is what they were built for).",
+    ),
+    "blackwell": (
+        "Compute-bound GEMM-like work needs `tcgen05.mma` for the tensor-core peak: Triton "
+        "`tl.dot` (tcgen05 on sm_100), CuTe DSL `cute.nvgpu.tcgen05`, CUTLASS sm_100 "
+        "kernels or cuBLAS(Lt); a hand-written `mma.sync` kernel stops below it, and "
+        "`wgmma` does not exist on sm_100.",
+        "Triton FP8 on sm_100: `tl.dot` on e4m3 (`tcgen05.mma kind::f8f6f4`, full rate); "
+        "`tl.dot_scaled` only with 128-row tiles (64-row tiles fall back to `kind::f16`, an "
+        "upcast: check the PTX, Triton 3.8).",
+        "Shared memory is ~227 KB per block: deeper pipelines and larger tiles than the "
+        "sm_120 examples (99 KB) use.",
+    ),
+    "blackwell_geforce": (
+        "Triton FP8: start from `tl.dot_scaled` with unit ue8m0 scales (`QMMA.SF`); never "
+        "`warp_specialize` on sm_120 (slower, and it fails to compile `tl.dot_scaled`; "
+        "measured on an RTX 5070 Ti).",
+    ),
+}
 
 
-def policy(class_id: str) -> TargetClass:
-    return _BY_ID.get(class_id, _BY_ID["other"])
+def _geforce_fp8(facts: Facts | None) -> TargetClass | None:
+    """GeForce Blackwell's FP8 row with this GPU's measured instruction rates (None: not
+    measured, :data:`POLICY`'s row with the RTX 5070 Ti numbers stays)."""
+    from kernel_agent.kernels.mma_peaks import FP8_F32, FP8_SF
+
+    mma = facts.mma if facts is not None else {}
+    f32, sf = mma.get(FP8_F32), mma.get(FP8_SF)
+    if not f32 or not sf:
+        return None
+    row = _BY_ID["fp8_gemm"]
+    measured = (
+        f"measured on this GPU: `QMMA.F32` (plain e4m3 `mma.sync`) {f32:.0f} TFLOP/s, "
+        f"`QMMA.SF` {sf:.0f} with the same fp32 accumulation"
+    )
+    if sf >= 1.3 * f32:
+        why = f"{measured}; {_GEFORCE_FP8_BASELINE}"
+        return TargetClass(row.id, row.label, row.first, why, row.second, row.order, row.never)
+    return TargetClass(
+        row.id,
+        row.label,
+        row.first + "; plain e4m3 `mma.sync` is as fast on this GPU",
+        f"{measured}: both run at the same rate here, either path; {_GEFORCE_FP8_BASELINE}",
+        row.second,
+        row.order,
+    )
+
+
+def policy(class_id: str, facts: Facts | None = None) -> TargetClass:
+    """The policy row of ``class_id`` for the GPU of ``facts`` (None: :data:`POLICY`'s)."""
+    fam = facts.family if facts is not None else None
+    row = None
+    if fam is not None and class_id == "fp8_gemm" and fam.key == "blackwell_geforce":
+        row = _geforce_fp8(facts)  # this GPU's measured FP8 instruction rates
+    elif fam is not None:
+        row = ARCH_POLICY.get(fam.key, {}).get(class_id)
+    return row or _BY_ID.get(class_id, _BY_ID["other"])
+
+
+def _fp8_runs(facts: Facts | None) -> bool:
+    """Whether the GPU of ``facts`` has FP8 tensor cores (unknown GPU: assume so)."""
+    return facts is None or facts.family is None or facts.has("fp8_tc")
 
 
 def _shape(signature: str) -> tuple[int, ...]:
@@ -227,52 +386,71 @@ def target_class(spec: dict[str, Any]) -> str:
     return "other"
 
 
-def suggested_order(class_id: str, available: Iterable[str]) -> list[str]:
-    """The class's backend order restricted to ``available`` (then the rest)."""
+def suggested_order(
+    class_id: str, available: Iterable[str], facts: Facts | None = None
+) -> list[str]:
+    """The class's backend order (on the GPU of ``facts``) restricted to ``available``
+    (then the rest)."""
     avail = list(dict.fromkeys(available))
-    ordered = [b for b in policy(class_id).order if b in avail]
+    ordered = [b for b in policy(class_id, facts).order if b in avail]
     return ordered + [b for b in avail if b not in ordered]
 
 
-def policy_text(available: Iterable[str] | None = None) -> str:
-    """The planner's backend policy: the class table and the rules that go with it."""
+def policy_text(available: Iterable[str] | None = None, facts: Facts | None = None) -> str:
+    """The planner's backend policy for the GPU of ``facts`` (None: unknown, the sm_120
+    table): the class table and the rules that go with it."""
     avail = set(available) if available is not None else None
+    fam = facts.family if facts is not None else None
+    where = (
+        "measured on sm_120 / RTX 5070 Ti, docs/RESEARCH-TRITON.md §5.1"
+        if fam is None
+        else f"for this GPU, {facts.label if facts else ''}; rows not specific to "
+        f"{fam.name} were measured on an RTX 5070 Ti (sm_120), docs/RESEARCH-TRITON.md §5.1"
+    )
     lines = [
-        "**Backend policy by target class** (measured on sm_120 / RTX 5070 Ti, "
-        "docs/RESEARCH-TRITON.md §5.1). Classify each target, then order its `backends` "
-        "like this (backends not available here are skipped):",
+        f"**Backend policy by target class** ({where}). Classify each target, then order "
+        "its `backends` like this (backends not available here are skipped):",
         "",
         "| target class | first backend | why (evidence) | second |",
         "|---|---|---|---|",
     ]
-    for c in POLICY:
-        if c.id == "other":
+    for base in POLICY:
+        c = policy(base.id, facts)
+        if c.id == "other" or (c.id == "fp8_gemm" and not _fp8_runs(facts)):
             continue
         if avail is not None and c.order and not set(c.order) & avail:
             continue
         lines.append(f"| {c.label} | {c.first} | {c.why} | {c.second} |")
-    lines += [
-        "",
-        "* Compute-bound FP8 GEMMs (W8A8 `fp8_w8a8` or MXFP8 `fp8_mx`, M ≳ 128): "
-        + policy("fp8_gemm").never
-        + ". The same block-scaled MMA runs real MXFP8 scales (`fp8_mx`).",
+    lines.append("")
+    if _fp8_runs(facts) and (never := policy("fp8_gemm", facts).never):
+        block = facts is None or facts.has("block_scaled")
+        lines.append(
+            "* Compute-bound FP8 GEMMs (W8A8 `fp8_w8a8`"
+            + (" or MXFP8 `fp8_mx`" if block else "")
+            + f", M ≳ 128): {never}."
+            + (" The same block-scaled MMA runs real MXFP8 scales (`fp8_mx`)." if block else "")
+        )
+    lines.append(
         "* An eager-timed target with ≥ 3 kernel launches per call: one C++ launcher "
-        "(host time, not GPU time, decides there).",
-        "* Triton FP8: start from `tl.dot_scaled` with unit ue8m0 scales; never "
-        "`warp_specialize` on sm_120 (slower, and it fails to compile `tl.dot_scaled`).",
-        "* TileLang has no evidence either way on this GPU: list it, not first.",
-    ]
+        "(host time, not GPU time, decides there)."
+    )
+    lines += [f"* {rule}" for rule in ARCH_RULES.get(fam.key if fam else "blackwell_geforce", ())]
+    lines.append("* TileLang has no evidence either way on this GPU: list it, not first.")
     return "\n".join(lines)
 
 
-def engineer_note(target: dict[str, Any], backends: Iterable[str] = ()) -> str:
-    """Engineer-prompt lines: the target's class and its policy row (and, for a fused FP8
-    layer, the FP8 GEMM row for the GEMMs inside it)."""
+def engineer_note(
+    target: dict[str, Any], backends: Iterable[str] = (), facts: Facts | None = None
+) -> str:
+    """Engineer-prompt lines for the GPU of ``facts`` (None: unknown, the sm_120 rows): the
+    target's class and its policy row (and, for a fused FP8 layer, the FP8 GEMM row for the
+    GEMMs inside it)."""
     from kernel_agent import precisions
 
     planned = list(backends)
+    fam = facts.family if facts is not None else None
     cid = target_class(target)
-    c = policy(cid)
+    c = policy(cid, facts)
     lines = [f"Target class: **{c.label}** (backend policy, docs/RESEARCH-TRITON.md §5.1)."]
     if cid != "other":
         lines += [f"* first: {c.first}", f"* why: {c.why}", f"* second: {c.second}"]
@@ -281,19 +459,20 @@ def engineer_note(target: dict[str, Any], backends: Iterable[str] = ()) -> str:
     rows = rows_of(dominant_shape(target))
     fp8 = precisions.of_spec(target) in _FP8
     if cid != "fp8_gemm" and fp8 and (rows or 0) >= 128:
-        gemm = policy("fp8_gemm")
-        lines.append(f"* The GEMMs inside (M = {rows}): {gemm.first}. {gemm.never}.")
-    if fp8 and "triton" in planned:
-        lines.append(
-            "* Triton FP8: start from `tl.dot_scaled` with unit ue8m0 scales (`QMMA.SF`); "
-            "never `warp_specialize` on sm_120."
-        )
+        gemm = policy("fp8_gemm", facts)
+        never = f" {gemm.never}." if gemm.never else ""
+        lines.append(f"* The GEMMs inside (M = {rows}): {gemm.first}.{never}")
+    rules = ARCH_RULES.get(fam.key if fam else "blackwell_geforce", ())
+    if fp8 and "triton" in planned:  # the family's Triton FP8 rule
+        lines += [f"* {r}" for r in rules if r.startswith("Triton")]
+    if fam is not None:  # what this family needs for the tensor-core peak
+        lines += [f"* {r}" for r in rules if not r.startswith("Triton")]
     lines.append(
         "* The module evaluator times eagerly: host time per launch counts (CUDA C++ "
-        "`load_inline` ~19 us, CuTe DSL TVM-FFI ~25 us, Triton ~43 us); with ≥ 3 launches "
-        "per call, put them behind one C++ launcher."
+        "`load_inline` ~19 us, CuTe DSL TVM-FFI ~25 us, Triton ~43 us on the development "
+        "machine); with ≥ 3 launches per call, put them behind one C++ launcher."
     )
-    order = suggested_order(cid, planned)
+    order = suggested_order(cid, planned, facts)
     if c.order and planned and order[0] != planned[0]:
         lines.append(
             f"* The plan lists `{planned[0]}` first; the policy for this class would start "

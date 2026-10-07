@@ -201,14 +201,18 @@ def _step_text(step: dict[str, Any]) -> str:
     return f"+ {names(added) or 'nothing'}" + (f" instead of {names(removed)}" if removed else "")
 
 
-def _quality_lines(data: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
+def _quality_lines(
+    data: dict[str, Any], baseline: dict[str, Any], gpu: dict[str, Any] | None = None
+) -> list[str]:
     """The quality mode, eager's perceptual scores next to it and the precisions the run
-    allows (``near-lossless``)."""
+    allows (``near-lossless``; with ``toolchain.json``'s ``gpu``, those it cannot run)."""
     mode = (data.get("config") or {}).get("quality") or "exact"
     if mode == "exact":
         return []
     allowed = precisions.of_config(data.get("config"))
-    line = f"* precisions allowed: {precisions.describe(allowed)} (`--precisions`)"
+    cap = (gpu or {}).get("capability")
+    cap = (int(cap[0]), int(cap[1])) if isinstance(cap, list | tuple) and len(cap) >= 2 else None
+    line = f"* precisions allowed: {precisions.describe(allowed, cap)} (`--precisions`)"
     info = baseline.get("perceptual") or {}
     if info.get("status") != "ok":
         why = info.get("reason") or info.get("status") or "analyze predates it"
@@ -250,7 +254,7 @@ def write_report(run: RunDir) -> Path:
         f"* GPU: {gpu.get('name')} ({gpu.get('arch')}), torch {tc.get('torch_version')}",
         f"* workload: `{baseline.get('workload')}`",
         *([f"* {line}"] if (line := objective.describe(baseline)) else []),
-        *_quality_lines(data, baseline),
+        *_quality_lines(data, baseline, gpu),
         "",
         "## Result",
         "",

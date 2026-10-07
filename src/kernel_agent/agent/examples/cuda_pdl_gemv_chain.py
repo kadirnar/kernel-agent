@@ -33,6 +33,11 @@ from torch.utils.cpp_extension import load_inline
 
 from kernel_agent import concurrency
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_90+"
+ARCHS_WHY = "programmatic dependent launch (griddepcontrol)"
+
 CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <cuda_bf16.h>

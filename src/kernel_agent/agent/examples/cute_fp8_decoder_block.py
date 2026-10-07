@@ -59,6 +59,11 @@ try:  # an on-disk cache of the compiled kernels across evaluations (kernel_agen
 except ImportError:  # pragma: no cover - outside kernel-agent
     compile_cached = None
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_89+"
+ARCHS_WHY = "e4m3 -> f16 conversion in the CuTe DSL kernel"
+
 THREADS = 256
 WARPS = THREADS // 32
 COLS_PER_WARP = 2  # output channels a warp owns for the whole K loop

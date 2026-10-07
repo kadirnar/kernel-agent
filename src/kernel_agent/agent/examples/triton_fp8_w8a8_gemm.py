@@ -16,16 +16,17 @@ The recipe is the one the systems agent of the VoxCPM2 throughput run found
   ``silu(gate) * up`` before the GEMM): the run let Inductor fuse it there.
 * ``_gemm_kernel``: e4m3 x e4m3 with fp32 accumulation, both scales (and the bias)
   applied once per output in the epilogue, one rounding to bf16. A plain tile loop,
-  grouped along M for L2 reuse of the weight tiles. On sm_100+ / sm_120 the product is
+  grouped along M for L2 reuse of the weight tiles. On sm_120 / sm_121 the product is
   ``tl.dot_scaled`` with constant unit ue8m0 scales (127 = 2^0, one per 32 along K): it
   lowers to the block-scaled MMA (PTX ``mma.sync ... kind::mxf8f6f4.block_scale``, SASS
   ``QMMA.SF``, 416 TFLOP/s on sm_120 against 208 for the plain e4m3 ``QMMA.F32`` of
   ``tl.dot``) and its result is bit-identical to ``tl.dot`` (docs/RESEARCH-TRITON.md §1.2:
   gate|up 33.3 vs 36.4 us at M = 352, output equal to row-wise ``torch._scaled_mm``'s). On
   sm_89 / sm_90 (no block-scaled MMA: Triton would emulate it through bf16) the kernel
-  keeps ``tl.dot``. :func:`gemm_ptx` compiles the kernel for a GPU (no launch, no GPU
-  needed) and :func:`block_scale_mma` checks its PTX; ``doctor --smoke`` requires the
-  block-scaled MMA on sm_100+.
+  keeps ``tl.dot`` (QMMA on sm_89, ``wgmma`` on sm_90), and on sm_100 too (``tcgen05.mma
+  kind::f8f6f4``, full rate there: :func:`block_scale_capable`). :func:`gemm_ptx` compiles
+  the kernel for a GPU (no launch, no GPU needed) and :func:`block_scale_mma` checks its
+  PTX; ``doctor --smoke`` requires the block-scaled MMA on sm_12x.
 * One tile config per weight shape ``(N, K)`` at M = 352 (RTX 5070 Ti, CUDA graph, L2-cold
   weights): the best ``tl.dot_scaled`` tiles measured in docs/RESEARCH-TRITON.md §1.2 and
   docs/FP8.md (``gemm_dit352*.out``); cuBLASLt's sm_120 FP8 kernels (``torch._scaled_mm``)
@@ -70,6 +71,11 @@ from torch import nn
 
 from kernel_agent.kernels.quant import fp8_error, fp8_w8a8_linear, quantize_fp8
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_89+"
+ARCHS_WHY = "e4m3 tensor cores (tl.dot on e4m3; tl.dot_scaled on sm_12x)"
+
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)
 
@@ -85,9 +91,13 @@ DEFAULT = (64, 64, 128, 4, 3)
 
 
 def block_scale_capable(capability: tuple[int, int]) -> bool:
-    """Whether Triton lowers ``tl.dot_scaled`` on e4m3 to a native block-scaled MMA on a GPU of
-    ``capability`` (sm_100+ and sm_120; Hopper and Ada emulate it through bf16)."""
-    return tuple(capability) >= (10, 0)
+    """Whether the GEMM uses ``tl.dot_scaled`` on a GPU of ``capability``: GeForce Blackwell
+    (sm_12x), where it lowers to the full-rate block-scaled ``mma.sync`` and plain e4m3 runs
+    at half rate. Hopper and Ada emulate it through bf16; on sm_100 plain ``tl.dot`` is
+    already full-rate ``tcgen05.mma kind::f8f6f4``, and ``tl.dot_scaled`` at this example's
+    64-row tiles falls back to ``kind::f16`` (Triton 3.8, compiled for sm_100 on the CPU;
+    128-row tiles reach ``kind::mxf8f6f4.block_scale``)."""
+    return int(capability[0]) == 12
 
 
 def block_scale_mma(ptx: str) -> bool:

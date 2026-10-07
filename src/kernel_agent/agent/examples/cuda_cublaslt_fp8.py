@@ -75,6 +75,11 @@ from kernel_agent.kernels.quant import (
     swizzle_mx_scales,
 )
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_89+"
+ARCHS_WHY = "cuBLASLt FP8 GEMMs (tensor-wise: sm_89+; the MXFP8 mode needs sm_100+)"
+
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)
 
