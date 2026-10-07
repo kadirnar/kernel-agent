@@ -703,7 +703,7 @@ length with PR 9. Streams, partitions and pipelining are each ≤ 1 % for one re
 
 ## Appendix: script excerpts
 
-The scripts ran from a scratch directory (not committed): `common.py` (load, apply the
+The scripts, as run, are in [`docs/research-scripts/parallel-voxcpm2/`](research-scripts/parallel-voxcpm2/): `common.py` (load, apply the
 optimised set, stage ranges, profiled run), `analyze.py` (attribution and tables),
 `prof.py` (driver), `bench_streams.py` (§4.1–4.3, batch 1), `bench_b16_pipeline.py` (§3.3,
 §4.3), `bench_graph_ms.py` (§4.4), `bench_green.py`, `bench_green2.py`, `green_sync.py` and
