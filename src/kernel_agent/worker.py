@@ -8,8 +8,9 @@ orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
     python -m kernel_agent.worker e2e_ab  --run-dir R [A: --kernel ... --transform ...]
                                           [B: --b-kernel ... --b-transform ...] [--rounds K]
 
-A step that runs out of GPU memory has status ``oom`` (``abtest.OOM``); the integration
-measures it again in separate processes with ``--expandable-segments``.
+A step that runs out of GPU memory has status ``oom`` (``abtest.OOM``), also when a check
+that catches its own errors ran out (the perceptual gate, say: no quality verdict); the
+integration measures it again in separate processes with ``--expandable-segments``.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -374,11 +376,14 @@ def _judge(
     output: Any,
     median_ms: float,
     truth_files: tuple[bytes, ...],
+    before_scoring: Callable[[], None] | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """(baseline ms, quality verdict) of a timed candidate output: ``status`` ok with
-    ``passed`` / ``reason`` / ``metrics``, or ``runtime_error`` when a check crashed.
-    ``--quality near-lossless`` with a perceptual baseline: the checks of :func:`_checks`
-    with the workload's sanity floor, then the perceptual gate (workloads/perceptual.py)."""
+    ``passed`` / ``reason`` / ``metrics``, ``runtime_error`` when a check crashed, or
+    ``oom`` when one ran out of GPU memory (no verdict). ``--quality near-lossless`` with a
+    perceptual baseline: the checks of :func:`_checks` with the workload's sanity floor,
+    then the perceptual gate (workloads/perceptual.py; ``before_scoring`` runs after its
+    samples, the model's last run)."""
     import torch
 
     from kernel_agent.workloads import perceptual
@@ -390,6 +395,7 @@ def _judge(
         reference = torch.load(io.BytesIO(perceptual_bytes), weights_only=False)
     with perceptual.judging(workload, mode, reference) as gate:
         base_ms, verdict = _checks(ns, workload, inputs, output, median_ms, tuple(files))
+    verdict = _out_of_memory(verdict)
     if verdict["status"] != "ok":
         return base_ms, verdict
     result: dict[str, Any] | None
@@ -398,13 +404,34 @@ def _judge(
     elif not verdict["passed"]:  # rejected already: spare the gate's runs
         result = {"passed": False, "reason": "", "skipped": "the other checks failed"}
     else:
-        result = perceptual.check(workload, reference)
+        result = perceptual.check(workload, reference, before_scoring=before_scoring)
     if result is not None:
         verdict["metrics"]["perceptual"] = result
         verdict["passed"] = verdict["passed"] and result["passed"]
         reasons = [verdict["reason"], result["reason"] and f"perceptual: {result['reason']}"]
         verdict["reason"] = "; ".join(r for r in reasons if r)
-    return base_ms, verdict
+    return base_ms, _out_of_memory(verdict)
+
+
+def _out_of_memory(verdict: dict[str, Any]) -> dict[str, Any]:
+    """``verdict`` as status ``oom`` when one of the checks that catch their own errors (the
+    held-out input, the natural-length run, the perceptual gate: ``abtest.CHECKS``) ran out
+    of GPU memory: what else the process held (two states of an A/B, the gate's scoring
+    models next to them), not a quality verdict. Such a check's record says so (``oom``,
+    ``passed`` None); the integration measures the step again in separate processes (#137)."""
+    from kernel_agent import abtest
+
+    if verdict.get("status") != "ok":
+        return verdict
+    found = abtest.checks_out_of_memory(verdict.get("metrics"))
+    if not found:
+        return verdict
+    metrics = dict(verdict["metrics"])
+    for key, line in found.items():
+        reason = f"out of GPU memory, not judged: {line}"
+        metrics[key] = {**metrics[key], "passed": None, "oom": True, "reason": reason}
+    reason = abtest.checks_reason(found)
+    return {**verdict, "status": abtest.OOM, "passed": False, "reason": reason, "metrics": metrics}
 
 
 def _checks(
@@ -466,10 +493,12 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     """Paired A/B (``abtest.py``): the model loaded once, A (``--kernel`` / ``--transform``)
     and B (``--b-kernel`` / ``--b-transform``) built on it with undo handles
     (``integrate/ab.py``), warmed up, then alternated for ``--rounds`` timed rounds; B's
-    quality is checked once, as in ``e2e``. Status ``irreversible`` / ``undo_failed``:
-    the states cannot be switched in-process, measure them in separate processes; so does
-    ``oom`` (both states did not fit in one process). A failure reports what each state
-    applied so far (``patches``, ``ab.a_patches``: the modules each item touched)."""
+    quality is checked once, as in ``e2e``; A's state is freed before the perceptual gate's
+    scoring models load (``ab.released_gb``).
+    Status ``irreversible`` / ``undo_failed``: the states cannot be switched in-process,
+    measure them in separate processes; so does ``oom`` (out of GPU memory anywhere in the
+    step, the perceptual gate included). A failure reports what each state applied so far
+    (``patches``, ``ab.a_patches``: the modules each item touched)."""
     import torch
 
     from kernel_agent import abtest, telemetry
@@ -538,8 +567,20 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     if rounds.failed == "B":
         return failed("runtime_error", None, rounds.error or "")
     session.to(b)
+    released: list[int] = []
+
+    def free_a() -> None:
+        """After the gate's samples, the model's last run: keep B for good and free A's state
+        (and the original modules the states replaced), so the gate's scoring models load next
+        to one state, as in a fresh `e2e` process of B (#137). Not before B's checks: a model
+        whose memory moved under it can turn an out-of-bounds read that cached memory
+        absorbs into an illegal address (#112; an FP8 swap of VoxCPM2 did, #137)."""
+        held = _allocated()
+        session.keep(b, a)
+        released.append(held - _allocated())
+
     b_ms = ab.median(rounds.b_ms)
-    base_ms, verdict = _judge(ns, workload, inputs, rounds.output, b_ms, truth_files)
+    base_ms, verdict = _judge(ns, workload, inputs, rounds.output, b_ms, truth_files, free_a)
     gpu = monitor.summary()
     if message := telemetry.warning(gpu):
         print(f"e2e_ab: WARNING {message}", file=sys.stderr, flush=True)
@@ -559,10 +600,18 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         **rounds.ab(),
         "warmup": max(ns.warmup + 1, 2),
         "shared_kernels": bool(b.shared),
+        **({"released_gb": round(released[0] / 1024**3, 3)} if released else {}),  # free_a
         "a_patches": a.report.__dict__,
         **({"gpu": gpu} if gpu else {}),
     }
     return result
+
+
+def _allocated() -> int:
+    """Bytes of GPU memory the tensors of this process hold (0 without CUDA)."""
+    import torch
+
+    return torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
 
 
 def _irreversible(bad: list[tuple[list[str], str]]) -> dict[str, Any]:

@@ -740,11 +740,12 @@ class Orchestrator:
         inside, as a LocEnc kernel and a CUDA graph of the LocEnc do) is also
         tried in their place, after its addition: B = A with those items removed
         and it in their place (``kind: replace``). Sets that cannot be undone
-        in-process, or did not fit in one process together (``oom``), are
-        measured in two processes back to back instead (``abtest.SEPARATE_ITERS``
-        runs each, A measured again; after an ``oom`` with
-        ``--expandable-segments``); a step that still runs out of memory is
-        recorded as ``oom``, which a re-integration measures again.
+        in-process, or did not fit in one process together (``oom``: out of GPU
+        memory anywhere in the step, the quality checks and the perceptual gate
+        included, never a quality verdict), are measured in two processes back to
+        back instead (``abtest.SEPARATE_ITERS`` runs each, A measured again; after
+        an ``oom`` with ``--expandable-segments``); a step that still runs out of
+        memory is recorded as ``oom``, which a re-integration measures again.
         ``integration.json`` keeps each step's ``ab`` record (a swap's with
         ``kind: swap``, ``old`` and ``new``), the ``projection`` (baseline −
         Σ est. saved ms, nested kernels and items of overlapping modules counted
@@ -781,7 +782,7 @@ class Orchestrator:
         if migrated:
             log(f"integrate: {migrated}")
         paired = {  # a crash or timeout can be transient (another process, OOM): measure again
-            h["reuse_key"]: h for h in known if h.get("ab") and h.get("status") not in _TRANSIENT
+            h["reuse_key"]: h for h in known if h.get("ab") and not _transient(h)
         }
         counts = {"reused": 0, "measured": 0}
         irreversible = set((previous or {}).get("irreversible") or [])  # not undone in-process
@@ -2141,6 +2142,14 @@ def _alone(base_ms: float, history: list[dict[str, Any]]) -> dict[str, float]:
 #: Statuses of an integration measurement a re-integration measures again, not reuses
 #: (``oom``: what else the process held, not the items).
 _TRANSIENT = ("crash", "error", "harness_error", "timeout", abtest.OOM)
+
+
+def _transient(entry: dict[str, Any]) -> bool:
+    """Whether a re-integration measures an ``integration.json`` history entry again: a
+    :data:`_TRANSIENT` status, or out of GPU memory anywhere (``abtest.step_out_of_memory``:
+    also a check that a kernel-agent before #137 recorded as failed, ``perceptual: the
+    perceptual gate failed: OutOfMemoryError: ...``)."""
+    return entry.get("status") in _TRANSIENT or abtest.step_out_of_memory(entry) is not None
 
 
 def _few(names: list[str], n: int = 3) -> str:

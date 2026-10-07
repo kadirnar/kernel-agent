@@ -322,10 +322,12 @@ def write_report(run: RunDir) -> Path:
             "|---|---|---|---|---|",
         ]
         for rec in transforms:
+            note = rec.get("reason") or rec.get("status") or ""
+            if (oom := abtest.step_out_of_memory(rec)) is not None:  # no quality verdict (#137)
+                note = f"not measurable: {oom}"
             lines.append(
                 f"| {', '.join(rec.get('transforms', []))} | {rec.get('passed')} | "
-                f"{_fmt(rec.get('median_ms'), 1)} | {_fmt(rec.get('speedup'))} | "
-                f"{(rec.get('reason') or rec.get('status') or '')[:80]} |"
+                f"{_fmt(rec.get('median_ms'), 1)} | {_fmt(rec.get('speedup'))} | {note[:80]} |"
             )
     if integration:
         lines += ["", "## Integration", ""]
@@ -358,6 +360,11 @@ def write_report(run: RunDir) -> Path:
                     )
                 else:  # an item alone, against the unmodified model
                     verdict += " vs the unmodified model"
+            if abtest.out_of_memory(ab.get("fallback")):  # the in-process A/B did not fit
+                verdict += " (retried in separate processes: out of GPU memory in one)"
+            outcome = f"passed={h.get('passed')} speedup={h.get('speedup')} {h.get('reason') or ''}"
+            if (oom := abtest.step_out_of_memory(h)) is not None:  # no quality verdict (#137)
+                outcome = f"**not measurable**: {oom} (a re-integration measures it again)"
             tried = f"tried {len(h['items'])} item(s)"
             if h.get("kind") == "swap":  # another version of an accepted item
                 old, new = str(h.get("old")), str(h.get("new"))
@@ -365,10 +372,7 @@ def write_report(run: RunDir) -> Path:
             elif h.get("kind") == "replace":  # in the place of the items it overlaps
                 olds = ", ".join(f"`{ledger.item_label(o)}`" for o in h.get("old") or [])
                 tried = f"`{ledger.item_label(str(h.get('new')))}` instead of {olds}"
-            lines.append(
-                f"* {tried}: passed={h.get('passed')} "
-                f"speedup={h.get('speedup')} {h.get('reason') or ''}{verdict}"
-            )
+            lines.append(f"* {tried}: {outcome}{verdict}")
         lines += _projection_lines(integration, run, baseline)
         if reference:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))

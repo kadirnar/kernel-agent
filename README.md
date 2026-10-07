@@ -199,7 +199,11 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   `min_speaker_similarity_worst`, `max_mos_drop`). Details are in
   `metrics.perceptual`; the report shows them next to the latency. The scoring
   models load in the worker process only when the gate runs, one at a time,
-  and are freed afterwards. Baseline and candidate samples run through
+  and are freed afterwards; in the paired A/B of the integration they load next
+  to B alone (A's state is freed once B's samples are generated). A gate,
+  held-out or stop-check run that runs out of GPU memory is no verdict: the
+  step has status `oom` (see "Integration: paired A/B") and the check's record
+  says `"oom": true`. Baseline and candidate samples run through
   `Workload.run` under the run's metric, so the gate judges the audio of the
   code path the objective times: with `-o metric=ttfa` VoxCPM's streaming path
   (`generate_streaming`, the whole streamed audio with its chunk-wise AudioVAE
@@ -669,7 +673,12 @@ B = A with one item replaced by another version of it (see below):
   every run timed. A state whose warm-up output is bit-reproducible must
   reproduce it in every round, which catches a switch that did not restore it.
 * B is accepted when it passes the quality checks (teacher forcing, held-out
-  input and memoisation probe, run once in state B as in `e2e`), wins at least
+  input and memoisation probe, the perceptual gate in near-lossless mode, run
+  once in state B as in `e2e`; after B's last run, the gate's samples, the
+  model stays in B and what only the undo handles held is freed before the
+  gate's scoring models load: A's modules, CUDA graph pools and caches and the
+  original modules, `ab.released_gb`. Not earlier: B's memory moving under it
+  can turn an out-of-bounds read into an illegal address, #112), wins at least
   `--ab-min-win-rate 0.8` of the rounds **and** the lower bound of the
   bootstrap 95 % confidence interval of its gain `1 − ΣB / ΣA` is above
   `--ab-min-gain 0.01` (`abtest.py`).
@@ -685,15 +694,22 @@ B = A with one item replaced by another version of it (see below):
   cannot see; it is then applied again (plus a warm-up run) to re-enter its
   state.
 * An A/B that runs out of GPU memory has status `oom` (`torch.OutOfMemoryError`
-  or a CUDA out-of-memory error anywhere in the step): each state applies its
-  transforms afresh, so both states' FP8 weight copies, CUDA graph pools and
-  compiled code are alive in one process (a 17-transform composite plus one
-  kernel did not fit in 16 GB). The step is measured in two processes instead,
+  or a CUDA out-of-memory error anywhere in the step: the timed runs, teacher
+  forcing, and the checks that catch their own errors, the held-out run, the
+  stop check's natural-length run and the perceptual gate with its scoring
+  models): each state applies its transforms afresh, so both states' FP8
+  weight copies, CUDA graph pools and compiled code are alive in one process
+  (a 17-transform composite plus one kernel did not fit in 16 GB; Whisper-
+  large-v3 next to two FP8 VoxCPM2 states neither). The step is measured in two processes instead,
   each with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (`worker
   --expandable-segments`), and a later step whose states both hold what ran
   out of memory goes to two processes at once. Only a step that still runs out
   of memory there is recorded as `oom`, a ledger status of its own (the
   environment, not the items' code), and a re-integration measures it again.
+  An `oom` is never a quality verdict: `report.md` shows the step as **not
+  measurable**, and a re-integration with reuse measures it again, also one
+  that an older kernel-agent recorded as `perceptual: the perceptual gate
+  failed: OutOfMemoryError` (#137).
 * GPU clocks (with the board's maximum SM clock), temperature, power and
   clock-event reasons are sampled around every timed run through NVML
   (`pynvml`, when installed) or `nvidia-smi` (`ab.gpu`, `gpu` of `e2e`). A

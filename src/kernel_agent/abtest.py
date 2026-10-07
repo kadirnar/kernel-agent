@@ -13,8 +13,9 @@ the systems agent's measured combination) in one process (``worker e2e_ab``,
   ``min_gain`` (1 %).
 
 When a state cannot be undone in-process, or A and B do not fit in one process
-together (:data:`OOM`), A and B are measured in two processes back to back
-with :data:`SEPARATE_ITERS` timed runs each (A measured again in the same
+together (:data:`OOM`: out of GPU memory anywhere in the step, the timed runs, the
+quality checks or the perceptual gate), A and B are measured in two processes back
+to back with :data:`SEPARATE_ITERS` timed runs each (A measured again in the same
 session): the win rate is then the share of (A run, B run) pairs that B wins,
 the gain ``1 - median(B) / median(A)``, and its interval comes from resampling
 both sets of runs.
@@ -45,17 +46,55 @@ FALLBACK = ("irreversible", "undo_failed", "crash", "error", OOM)
 _OOM = re.compile(
     r"OutOfMemoryError|CUDA out of memory|CUDA error: out of memory|CUBLAS_STATUS_ALLOC_FAILED"
 )
+#: The checks of an ``e2e`` verdict that catch their own errors, a failed run being their
+#: verdict (``metrics.<key>``: workloads/holdout.py, stopping.py, perceptual.py). Out of GPU
+#: memory in one is no verdict either: the step is ``oom`` (#137).
+CHECKS = {
+    "holdout": "the held-out input",
+    "natural_length": "the natural-length run",
+    "perceptual": "the perceptual gate",
+}
 
 
 def out_of_memory(error: object) -> str | None:
-    """The line of ``error`` (an exception, a traceback) that says the GPU ran out of
-    memory; None when it is another error."""
+    """The line of ``error`` (an exception, a traceback, or a record whose ``error`` or
+    ``reason`` holds one: a check of an ``e2e`` verdict, an integration step) that says the
+    GPU ran out of memory; None when it is another error."""
+    if isinstance(error, dict):
+        return out_of_memory(error.get("error")) or out_of_memory(error.get("reason"))
     if isinstance(error, BaseException):
         error = f"{type(error).__name__}: {error}"
     for line in reversed(str(error or "").splitlines()):
         if _OOM.search(line):
             return line.strip()[:300]
     return None
+
+
+def checks_out_of_memory(metrics: object) -> dict[str, str]:
+    """``{key: line}`` of the :data:`CHECKS` in an ``e2e`` verdict's ``metrics`` that ran
+    out of GPU memory (an older kernel-agent recorded that as their failure)."""
+    if not isinstance(metrics, dict):
+        return {}
+    found = {key: out_of_memory(metrics.get(key)) for key in CHECKS}
+    return {key: line for key, line in found.items() if line is not None}
+
+
+def checks_reason(found: dict[str, str]) -> str:
+    """The reason of a step whose checks ran out of GPU memory (:func:`checks_out_of_memory`)."""
+    return "; ".join(f"out of GPU memory in {CHECKS[key]}: {line}" for key, line in found.items())
+
+
+def step_out_of_memory(step: dict[str, Any]) -> str | None:
+    """Why an integration step (an ``e2e`` / ``e2e_ab`` result, an ``integration.json``
+    history entry) has no verdict because it ran out of GPU memory: status :data:`OOM`, a
+    check that a kernel-agent before #137 recorded as failed instead, or A of its
+    separate-process A/B (``ab.why``); None when it did not."""
+    if step.get("status") == OOM:
+        return str(step.get("reason") or "out of GPU memory")
+    if found := checks_out_of_memory(step.get("metrics")):
+        return checks_reason(found)
+    why = (step.get("ab") or {}).get("why")
+    return str(why) if out_of_memory(why) else None
 
 
 def _quantile(values: list[float], q: float) -> float:
