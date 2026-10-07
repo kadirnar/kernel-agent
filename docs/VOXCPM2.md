@@ -1,4 +1,4 @@
-# VoxCPM2 on an RTX 5070 Ti: 10.5× lower latency, 6.2× higher throughput with kernel-agent
+# VoxCPM2 on an RTX 5070 Ti: 11.3× lower latency, 6.2× higher throughput with kernel-agent
 
 The motivating case for the roadmap ([ROADMAP.md](ROADMAP.md), tracking issue
 [#24](https://github.com/kadirnar/kernel-agent/issues/24)): make
@@ -72,6 +72,48 @@ fixed). Still open: the round-2 re-profile of the FP8-optimised model fails
 (#86), so this run stopped after one round.
 
 ![round 3 integration](images/voxcpm2-round3-integration.png)
+
+## Round 4: native engines (11.27×)
+
+The wave-5 library (CuTe DSL backend, native engines #134, concurrency #147, timeline
+#146, stateful captures #162; all model-agnostic) continued the round-3 run for one
+4-hour `kernel-agent improve --native on` invocation on 2026-10-08, no hand guidance
+(the library's `program.md` template). Every module arm had plateaued, so the scheduler
+gave all slices to the new **native** arm, which rewrites whole stages or loop
+iterations as multi-file CUDA / C++ projects:
+
+| configuration | latency per run | vs eager | vs VoxCPM `torch.compile` |
+|---|---|---|---|
+| eager | 5,476 ms | 1.00× | 0.69× |
+| round 3 (FP8 weights, near-lossless) | 522.2 ms | 10.49× | 7.20× |
+| native LM engine (interim integration) | 511.7 ms | 10.70× | 7.35× |
+| **round 4 (native loop body, final integration)** | **486.0 ms** | **11.27×** | **7.74×** |
+
+Perceptual gate passed: WER 0 (eager 0), speaker similarity 0.987, UTMOS 3.29 (eager
+3.26); teacher forcing over all 60 patches passed.
+
+What the native agent built, in four slices (its runs: 520 → 515 → 499 → 488 ms):
+
+* a **stack engine** for both LMs: each decode step runs every decoder layer and the
+  final norm of the base LM (28 layers) and the residual LM (8 layers) in one
+  cooperative launch, replacing the per-layer FP8 kernel and its 1.7 GB of duplicate
+  FP8 weight copies;
+* a **persisting L2 window** (30 MB) holding the LocDiT layers' FP8 QKV weights and row
+  scales across the 9 solver steps of a patch;
+* a **loop-body group**: the two stack engines plus the LocDiT solve and the ~20-node
+  glue between the estimator calls in one CUDA graph per patch.
+
+Final set: `skip_dead_work`, `vae_channels_last`, `graph_prefill`, `loop_body`,
+`l2_persist_dit` and the FP8 `dit_layer_fp8` kernel. The paired A/B integration also
+tried each native piece in place of the items it overlaps; the loop body won every
+comparison (the old FP8 LM kernel in its place: −45 %).
+
+Found and fixed during the run: the native stage capture of the residual LM was
+unverifiable (module state captured from another variant, #162, fixed in #163), and the
+loop stopped with ~1.5 h of budget left once the native plan's stages had beaten the
+bar (#164, #166).
+
+![round 4 integration](images/voxcpm2-native-integration.png)
 
 ## Throughput: 16 requests at once (6.24×)
 
