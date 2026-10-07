@@ -1,4 +1,4 @@
-# VoxCPM2 on an RTX 5070 Ti: 10.5× faster with kernel-agent
+# VoxCPM2 on an RTX 5070 Ti: 10.5× lower latency, 6.2× higher throughput with kernel-agent
 
 The motivating case for the roadmap ([ROADMAP.md](ROADMAP.md), tracking issue
 [#24](https://github.com/kadirnar/kernel-agent/issues/24)): make
@@ -72,6 +72,77 @@ fixed). Still open: the round-2 re-profile of the FP8-optimised model fails
 (#86), so this run stopped after one round.
 
 ![round 3 integration](images/voxcpm2-round3-integration.png)
+
+## Throughput: 16 requests at once (6.24×)
+
+The batched workload (`-o batch_size=16 -o metric=throughput`): 16 different
+texts generated together, 60 patches each (153.6 s of audio per batched run),
+every request checked against VoxCPM2's own batch-1 generation (teacher
+forcing per request) and the near-lossless perceptual gate. The metric is wall
+time per second of generated audio (lower is better). All agent sessions ran
+on the Claude Code subscription.
+
+| configuration | ms per second of audio | seconds of audio per second | vs eager batch 16 | vs `torch.compile` |
+|---|---|---|---|---|
+| eager, batch 16 | 37.66 | 26.6 | 1.00× | 0.50× |
+| VoxCPM `optimize()` (`torch.compile`) on the batched decode step | 18.98 | 52.7 | 1.98× | 1.00× |
+| round 1 (transforms only) | 7.69 | 130 | 4.90× | 2.47× |
+| round 2, re-integrated with #112 and #115 | 7.25 | 138 | 5.20× | 2.62× |
+| **round 3** | **6.03** | **166** | **6.24×** | **3.15×** |
+
+For scale: a single eager request makes 9.6 s of audio in 5,476 ms (1.75 s of
+audio per second, the latency table above), so the batched, optimised model
+produces about 95× as much audio per second. Every final set passed the gate:
+error rate +0.000, speaker similarity 0.990–0.991 (worst sample ≥ 0.967),
+no MOS drop.
+
+![throughput integration](images/voxcpm2-throughput-integration.png)
+
+What the final set is (each step a paired A/B on top of the previous set):
+
+* **Transforms (round 1, the systems agent):** the LocDiT's 9 Euler steps per
+  patch in one CUDA graph around an Inductor-fused estimator; graphed batched
+  LM decode step (`workload.lm_step`) and LocEnc; merged LocDiT projections;
+  a fused LM decode step; the LocDiT's last layer only on the rows the
+  estimator reads; FP8 weight-only LM GEMMs; **W8A8 FP8 GEMMs for the LocDiT**
+  (e4m3 weights per channel and activations per token, a shape-tuned Triton
+  e4m3 GEMM at M = 352, split-K); a single-tile Triton attention for the
+  ≤ 16-token patches. Together 37.66 → 7.66 ms.
+* **`dit_layer__fp8_w8a8` (kernel, round 3):** the LocDiT decoder layer in W8A8
+  FP8 on the tensor cores (module 6.24×), −14.3 % on top of the transforms.
+* **`vae_decoder__reduced` (kernel, round 3):** the AudioVAE decoder in bf16
+  (module 9.64×), in place of the two VAE transforms, −8.5 %.
+
+How the library got there, and what this run made it fix:
+
+* **Round 1** found the LocDiT compute bound at M = 352 only because the
+  analysis was pasted into `program.md` by hand. The ceilings table (#90,
+  #106) now computes it: with the hand analysis removed, the round-2 planner
+  moved the stuck exact `dit_layer` target to `fp8_w8a8` on its own (#91, #96),
+  with the table's numbers as its reason (79 TFLOP per run at M = 352, compute
+  bound, a 792 ms floor in bf16 against 240 ms in W8A8).
+* **Round 2's kernels never reached the result** (4.87×): adding them to the
+  composite ran out of GPU memory in the in-process A/B, and a VAE kernel
+  clashed with the VAE transforms. #112 retries out-of-memory steps in
+  separate processes and tries a kernel *in place of* the transforms that own
+  its module.
+* **A kernel that read out of bounds was accepted** (VAE kernel 004, masked
+  stores on a partial last tile): #115 runs every kernel under
+  `compute-sanitizer` memcheck, on its captured shapes and on one-smaller
+  ones, before it is accepted; 004 was refused with 23,808 errors and the
+  round-3 kernel 008 replaced it.
+* **The first W8A8 kernels were refused although correct**: the perturbed-input
+  check had never been calibrated for reduced precision; #109 calibrated it per
+  precision (the reference W8A8 math itself failed 98 of 200 redrawn draws).
+* **Faster loops:** integration measurements are reused by content (#93; #108
+  migrates files from before it): 29 of 33 steps reused in the round-2
+  re-integration, 16 min instead of 2 h;
+  the final integration's time is reserved and capped (#100, #108), and the
+  first Ctrl-C stops a run and its processes (#94).
+
+Run directories: `runs/openbmb--VoxCPM2/20261006-004718` (rounds 1–2) and its
+copy `20261006-004718-retest2` (re-integration with the fixes, round 3).
+
 
 ## Round 2: what made it fast
 
