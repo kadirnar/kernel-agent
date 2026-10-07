@@ -928,7 +928,10 @@ timer, the comparator or the reference, or hide work from the timer
   stream when the timed stream moves on (a side stream never joined back), is
   a violation. The same pass measures `custom_kernel_share`, the share of the
   candidate's GPU time in kernels the reference does not launch, and counts
-  calls into the reference's entrypoint code (`sys.monitoring`).
+  calls into the reference's entrypoint code (`sys.monitoring`). Joined side
+  streams pass: those named through `kernel_agent.concurrency` are listed in
+  the result (`streams`), other joined streams as `undeclared_streams` (a
+  note).
 * **Outside the candidate's process** (`run_evaluation`): the candidate's
   outputs from the correctness stage are saved, then compared with the capture
   by the parent process's own comparator. The reference time of each case must
@@ -975,6 +978,45 @@ Limits: a candidate in the evaluator's process can still read the evaluator's
 memory (the nonce, the capture). A determined one could forge its saved outputs
 or its result. Full isolation would need the candidate in a separate process;
 the re-check below is that second opinion for every winner.
+
+### Declared concurrency: streams, PDL, SM partitions
+
+Overlap is legal when the evaluator can see it (#147, docs/PARALLEL.md §6):
+all GPU work is launched from the calling thread, every stream is joined
+before the call or `run()` returns, and side streams are named through
+`kernel_agent.concurrency` (`cc`), so results record them:
+
+* `with cc.fork("aux"): ...` runs the block on a named stream that first waits
+  for the caller's stream; the caller's stream waits for it on exit. Inside a
+  `torch.cuda.graph` capture the fork and the join become graph edges.
+* `h = cc.launch("aux", fn, *args)` enqueues now (on this thread) and
+  `h.result()` joins exactly that work (an event); `cc.join_all()` joins the
+  rest. Its tensors are `record_stream`'ed outside captures.
+* `cc.partition(sms=k)` makes two disjoint green-context partitions from one
+  driver split (k SMs, rounded up by the driver, and the rest), None where
+  unsupported (`cc.partition_error()` says why); `cc.sm_count()` is the SM count
+  of the current stream's partition, for persistent and cooperative grids.
+* CUDA C++ candidates include `ka_launch.cuh` (`cc.include_dir()`):
+  `ka_launch(kernel, grid, block, smem, stream, opt, args...)` is
+  `cudaLaunchKernelEx` with programmatic stream serialization (`opt.pdl`) and
+  cooperative grids (`opt.cooperative`); in the kernel, the independent loads
+  come first, then `ka_pdl_launch_dependents(); ka_pdl_wait();`.
+  `ka_sm_count(stream)` / `ka_coresident_blocks(...)` count the partition's SMs.
+  The example `agent/examples/cuda_pdl_gemv_chain.py` captures a chain of
+  dependent GEMVs in one graph with PDL edges (any hidden size 256·k ≤ 4096,
+  any depth; `kernel-agent doctor --smoke` runs it on sm_90+);
+  its kernel took a 28-layer chain from 101.2 µs (graph) to 77.7 µs (graph +
+  PDL, the DRAM floor 76.7 µs) in the research measurement.
+
+End to end, `e2e` and `e2e_ab` run one profiled run of the workload after the
+timing (`kernels/e2e_activity.py`, `metrics.concurrency`): GPU work launched
+from another thread, still running on a stream the caller's stream never waits
+for once it drained, launched after `run()` returned, or on a device the
+workload does not use fails the evaluation, as do unjoined `cc.launch`
+handles, a changed current stream and threads still running the evaluated
+transforms' or kernels' code. The result lists the declared streams
+(`streams`); the analysis of the profiler events is a pure function, tested on
+synthetic traces.
 
 ### Independent re-check of winners
 

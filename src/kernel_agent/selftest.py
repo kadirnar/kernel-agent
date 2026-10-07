@@ -1,7 +1,7 @@
 """Backend smoke test: run every bundled example kernel through the evaluator (the FP8
 weight-only, W8A8 and MXFP8 examples in the near-lossless tier, and their rejection by the
 exact tier, MXFP8 with the OCP floor scale rule by the scale-rule guard; the FP4 one in the
-near-lossless-fp4 tier, and its rejection by the FP8 tier)."""
+near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+)."""
 
 from __future__ import annotations
 
@@ -77,6 +77,77 @@ _EXAMPLES = {"fp8_w8a8": W8A8_EXAMPLES, "fp8_mx": MX_EXAMPLES}
 FP4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     "cuda_fp4_gemv.py": (2048, 12288, [((1,), 28), ((4,), 1), ((2, 11), 0)]),
 }
+
+
+class GemvChain(nn.Module):
+    """``layers`` square bias-free ``nn.Linear`` applied in sequence: a chain of dependent
+    decode GEMVs (the reference of the PDL example)."""
+
+    def __init__(self, hidden: int, layers: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(hidden, hidden, bias=False) for _ in range(layers))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+#: The PDL examples and their :class:`GemvChain`: hidden size, layers and the captured calls
+#: (rows, calls per run). 28 layers of [1024, 1024] bf16 (59 MB, more than the 48 MB L2 of
+#: an RTX 5070 Ti: streamed from DRAM), as in docs/PARALLEL.md §4.6; a 4-row call
+#: (correctness only) takes the example's fallback.
+PDL_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cuda_pdl_gemv_chain.py": (1024, 28, [((1,), 64), ((4,), 0)]),
+}
+
+
+def make_chain_capture(
+    path: Path, hidden: int, layers: int, calls: list[tuple[tuple[int, ...], int]]
+) -> Path:
+    """A bf16 :class:`GemvChain` (Gaussian weights, std ``hidden ** -0.5``: activations keep
+    their scale through the layers) and its calls."""
+    from kernel_agent.profiling.capture import capture_calls
+
+    torch.manual_seed(0)
+    module = GemvChain(hidden, layers).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        for weight in module.parameters():  # the layers' weights (no biases)
+            weight.normal_(0.0, hidden**-0.5)
+    cases: list[tuple[Any, ...]] = [
+        ((torch.randn(*shape, hidden, device="cuda", dtype=torch.bfloat16),), {}, count)
+        for shape, count in calls
+    ]
+    capture_calls(module.eval(), cases, path)
+    return path
+
+
+def pdl_supported(tc: object) -> bool:
+    """Whether the PDL examples can run: the ``cuda`` backend on sm_90 or newer
+    (``griddepcontrol``)."""
+    gpu = getattr(tc, "gpu", None)
+    backends = getattr(tc, "backends", {}) or {}
+    return bool(backends.get("cuda")) and gpu is not None and tuple(gpu.capability) >= (9, 0)
+
+
+def smoke_pdl(tmp: Path, verbose: bool = False) -> bool:
+    """Every PDL example (:data:`PDL_EXAMPLES`, ``ka_launch.cuh``) passes the evaluator."""
+    from kernel_agent.kernels.evaluate import run_evaluation
+
+    ok = True
+    for name, (hidden, layers, calls) in PDL_EXAMPLES.items():
+        capture = make_chain_capture(tmp / f"{name}.pt", hidden, layers, calls)
+        result = run_evaluation(capture, EXAMPLES_DIR / name)
+        passed = bool(result.get("correct"))
+        ok &= passed
+        if verbose:
+            detail = (
+                f"speedup {result.get('speedup')}x over {layers} eager layers"
+                if passed
+                else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+            )
+            print(f"  {name.removesuffix('.py'):22s} {'OK ' if passed else 'FAIL'} {detail}")
+    return ok
 
 
 def make_linear_capture(
@@ -244,6 +315,8 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
         if fp8_supported(tc) and (backends is None or "cuda" in backends):
             ok &= smoke_fp8(Path(tmp), verbose)
             ok &= smoke_fp4(Path(tmp), verbose)
+        if pdl_supported(tc) and (backends is None or "cuda" in backends):
+            ok &= smoke_pdl(Path(tmp), verbose)
         if w8a8_supported(tc) and (backends is None or "triton" in backends):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8")
         if mxfp8_supported(tc) and (backends is None or "triton" in backends):

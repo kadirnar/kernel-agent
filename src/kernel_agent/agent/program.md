@@ -62,8 +62,26 @@ version is saved as `logs/program-<sha12>.md`.
   that is empty) only if you check it at run time and fall back otherwise.
 * Never cache outputs across calls, never skip work because inputs repeat,
   never precompute results for the timed inputs (in `build()`, `apply()` or
-  warm-up), never hide work on side streams or threads, and never touch the
-  timing or comparison code.
+  warm-up), never leave GPU work running or launch it from other threads when
+  the call or `run()` returns, and never touch the timing or comparison code.
+
+### Concurrency
+* Overlap is allowed when it is joined and declared: launch all GPU work from
+  the calling thread, join every stream before the call or `run()` returns,
+  and name side streams with `kernel_agent.concurrency` (`cc`):
+  `with cc.fork("aux"): y = branch(x)` (the caller's stream waits on exit), or
+  `h = cc.launch("aux", fn, *args)` and `h.result()` / `cc.join_all()` before
+  returning. The evaluator rejects unjoined streams, other threads and work
+  launched after `run()` (`integrity_violation` per kernel call,
+  `metrics.concurrency` end to end); results list the streams (`streams`).
+* Streams pay only where one branch leaves the GPU partly idle: two stages that
+  each fill the GPU overlap by a few per cent at most. Two independent branches
+  captured forked into one CUDA graph (`cc.fork` inside the capture becomes
+  graph edges) hide most of the smaller one; eager two-stream issue is
+  host-bound. Measure with `evaluate_e2e` before building on it.
+* Size persistent and cooperative grids by `cc.sm_count()` (the SMs of the
+  current stream's partition, `cc.partition`), not by the device's
+  `multiProcessorCount`, which reports the whole GPU even inside a partition.
 
 ## planner
 

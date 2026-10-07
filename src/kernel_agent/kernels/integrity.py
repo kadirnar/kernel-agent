@@ -25,7 +25,9 @@ reference.  The guards (all run by :mod:`kernels.evaluate`):
   measures ``custom_kernel_share`` (GPU time in kernels the reference does not
   launch), the kernel launches per call of both, and counts calls into the
   reference's entrypoint code (:func:`count_calls`, ``sys.monitoring``), which
-  decide ``fallback`` (:func:`fallback_reason`).
+  decide ``fallback`` (:func:`fallback_reason`). Joined streams pass; those not named
+  through :mod:`kernel_agent.concurrency` are noted (``undeclared_streams``). The same
+  rules end to end: :mod:`kernel_agent.kernels.e2e_activity`.
 * Outside the candidate's process (:func:`compare_saved_outputs`,
   :func:`reference_slowdown`): ``run_evaluation`` compares the candidate's saved
   outputs with the capture itself and compares the reference timing with one
@@ -454,6 +456,8 @@ def activity_check(
     from torch.autograd.profiler import record_function
     from torch.profiler import ProfilerActivity, profile
 
+    from kernel_agent.kernels import e2e_activity
+
     out: dict[str, Any] = {"foreign_threads": [], "unjoined": [], "reference_calls": {}}
     ref_args, ref_kwargs = inputs[0]
     ref_args, ref_kwargs = copy.deepcopy(ref_args), copy.deepcopy(ref_kwargs)
@@ -471,6 +475,8 @@ def activity_check(
                     torch.cuda._sleep(1)  # the timed stream moves on
                 torch.cuda.synchronize()
             time.sleep(settle_s)  # late launches from other threads
+            torch.cuda.synchronize()
+            e2e_activity.mark_streams(record_function)  # declared streams' profiler ids
             torch.cuda.synchronize()
     out["reference_calls"] = {codes[c]: n for c, n in counts.items() if n}
 
@@ -495,6 +501,7 @@ def activity_check(
         w.name for e in within("ka::reference") for w in gpu[e.corr] if w.kind == "kernel"
     )
     new_kernels: collections.Counter[str] = collections.Counter()
+    seen: collections.Counter[int] = collections.Counter()  # GPU operations per stream
     own = total = 0
     for i in range(len(inputs)):
         mark = min((w.start for w in gpu[marks[i][0].corr]), default=None)
@@ -502,6 +509,7 @@ def activity_check(
             if launch.resource != main_thread:
                 continue
             for work in gpu[launch.corr]:
+                seen[work.resource] += 1
                 if mark is not None and work.end > mark + JOIN_SLACK_NS:
                     out["unjoined"].append(
                         f"{work.name[:80]} (stream {work.resource}) ran "
@@ -518,6 +526,11 @@ def activity_check(
         label = gpu[launch.corr][0].name[:80]
         out["foreign_threads"].append(f"{label} launched from thread {launch.resource}")
     out["custom_kernel_share"] = round(own / total, 3) if total else None
+    # joined streams other than the timed one and the declared ones (a note, not a failure)
+    timed = gpu[marks[0][0].corr][0].resource
+    out["undeclared_streams"] = e2e_activity.undeclared(
+        seen, timed, e2e_activity.stream_ids(events)
+    )
     # kernel launches per call, by name (the candidate's averaged over its calls)
     out["reference_kernels"] = dict(ref_kernels)
     out["candidate_kernels"] = {k: n / len(inputs) for k, n in new_kernels.items()}

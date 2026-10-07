@@ -922,7 +922,10 @@ check (the tool reports it). Warm-up/compile time is excluded from timing
 Quality is also checked, untimed, on a held-out input (other prompt / text /
 seed; `metrics.holdout`), so nothing may bake in the main input, and a fresh
 input timed after warm-up must not be more than 3x slower than the repeated
-runs (memoisation fails the evaluation).
+runs (memoisation fails the evaluation). One profiled run checks that `run()`
+leaves no GPU work behind (`metrics.concurrency`): side streams are fine when
+joined before it returns (declare them with `kernel_agent.concurrency`), work
+from other threads, after it returns or on another GPU fails the evaluation.
 The integration switches one loaded model between the accepted set and the
 accepted set plus your transform (a paired A/B), undoing `apply` by restoring
 every attribute, module, `.data` binding and torch flag it changed. Change

@@ -124,6 +124,8 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "kernel_launches_candidate",
             "kernels_candidate",
             "kernels_reference",
+            "streams",  # declared side streams (kernel_agent.concurrency)
+            "undeclared_streams",
             "eval_seconds",
             "compile_s",
             "compile_check",  # torch.compile compatibility (kernels/compile_check.py)

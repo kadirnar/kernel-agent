@@ -495,12 +495,36 @@ def _checks(
     if natural is not None:
         metrics["natural_length"] = natural
         reasons.append(natural["reason"] and f"natural length: {natural['reason']}")
+    concurrency = _concurrency_check(ns, workload, inputs)  # last: its profiler slows launches
+    metrics["concurrency"] = concurrency
+    reasons.append(concurrency["reason"])
     return base_ms, {
         "status": "ok",
-        "passed": verdict["passed"] and held["passed"] and (natural or {}).get("passed", True),
+        "passed": verdict["passed"]
+        and held["passed"]
+        and (natural or {}).get("passed", True)
+        and concurrency["passed"],
         "reason": "; ".join(r for r in reasons if r),
         "metrics": metrics,
+        **({"streams": s} if (s := concurrency.get("streams")) else {}),
     }
+
+
+def _concurrency_check(ns: argparse.Namespace, workload: Any, inputs: Any) -> dict[str, Any]:
+    """The end-to-end hidden-work check (``kernels/e2e_activity.py``, #147): one profiled
+    run; threads are looked for in the directories of every kernel and transform applied."""
+    import torch
+
+    from kernel_agent.kernels import e2e_activity
+
+    def listed(name: str) -> list[str]:
+        return list(getattr(ns, name, None) or [])
+
+    items = [*listed("transform"), *listed("b_transform")]
+    items += [k.partition("=")[2] for k in [*listed("kernel"), *listed("b_kernel")]]
+    dirs = sorted({Path(p).resolve().parent for p in items if p})
+    device = getattr(workload, "device", None) or "cpu"  # no device: nothing to profile
+    return e2e_activity.check(workload.run, inputs, device=torch.device(device), dirs=dirs)
 
 
 def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
