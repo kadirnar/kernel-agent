@@ -36,6 +36,21 @@ compute-bound GEMMs) also quantises its activations, per token and per call:
   a W8A8 kernel and its reference while debugging.
 * :func:`fp8_w8a8_error`: :func:`fp8_error` plus the activations' quantisation error and
   the W8A8 layer output's error (``agent/examples/triton_fp8_w8a8_gemm.py``).
+
+``"precision": "fp8_mx"`` (MXFP8 W8A8: e4m3 with one power-of-two ue8m0 scale per 32
+elements along K on both operands, the block-scaled tensor cores of sm_100 / sm_120;
+docs/FP8.md §3):
+
+* :func:`quantize_mxfp8`: codes and e8m0 scales of activations or a weight, with the
+  non-saturating scale rule ``2^ceil(log2(amax / 448))`` (:data:`MX_RULES`: the OCP
+  reference rule ``2^(floor(log2 amax) - 8)`` saturates block maxima above 448 x scale);
+  :func:`dequantize_mxfp8`; :func:`swizzle_mx_scales` / :func:`mx_scale_offset`: the 128 x
+  4 blocked scale layout of cuBLASLt (``F.scaled_mm`` with ``SWIZZLE_32_4_4``).
+* :func:`mxfp8_linear`: ``x @ Wᵀ (+ bias)`` with MXFP8 numerics, through ``F.scaled_mm``
+  ``BlockWise1x32`` where it applies (the reference); :func:`mxfp8_error`: the error report.
+* :func:`mxfp8_saturation`, :func:`mxfp8_scale_problem`: a quantiser's scales against the
+  block maxima (the evaluator's scale-rule guard, :mod:`kernel_agent.kernels.scale_guard`);
+  :func:`mxfp8_stress_input`: blocks whose maxima sit where the OCP rule saturates.
 """
 
 from __future__ import annotations
@@ -383,3 +398,300 @@ def fp8_w8a8_error(
         output_norm_ratio=round(new_norm / ref_norm, 5) if ref_norm else 1.0,
     )
     return report
+
+
+# ------------------------------------------------------------------ MXFP8 (fp8_mx)
+
+#: Elements per MXFP8 scale: one power-of-two (ue8m0) scale per 32 consecutive elements along
+#: K (OCP MX v1.0), on both GEMM operands; the tensor core applies them (``mma.sync
+#: kind::mxf8f6f4.block_scale``, cuBLASLt ``VEC32_UE8M0``).
+MX_BLOCK = 32
+#: The MXFP8 scale rules (:func:`mx_scale_exponents`). ``ceil``: ``2^ceil(log2(amax / 448))``,
+#: the smallest power of two that keeps the block within ±448 (use it). ``floor``: the OCP
+#: reference conversion ``2^(floor(log2 amax) - 8)``, which maps block maxima in [256, 512) x
+#: scale onto e4m3 and saturates those above 448 x scale: on VoxCPM2's massive activations it
+#: fails the near-lossless tier (LocDiT o_proj / down_proj norm off by 4.0 % / 2.0 %,
+#: docs/FP8.md §3.2). Kept to show what the guard rejects.
+MX_RULES = ("ceil", "floor")
+#: A block saturates when its maximum exceeds ``448 x scale`` by more than this share (the
+#: fp32 rounding of a kernel's scale computation; e4m3's own step at 448 is 32).
+MX_SATURATION_SLACK = 2.0**-10
+_E8M0_BIAS = 127
+_E4M3 = torch.float8_e4m3fn
+
+
+def mx_scale_exponents(amax: torch.Tensor, rule: str = "ceil") -> torch.Tensor:
+    """Unbiased exponents (int32, clamped to e8m0's [-127, 127]) of the power-of-two scales of
+    blocks with maxima ``amax`` (>= 0) under ``rule`` (:data:`MX_RULES`); a block of zeros
+    gets -127. Exact: computed from the fp32 exponent bits, not ``log2``."""
+    if rule not in MX_RULES:
+        raise ValueError(f"unknown MXFP8 scale rule {rule!r} (one of {', '.join(MX_RULES)})")
+    a = amax.float()
+    if rule == "floor":
+        _, exponent = torch.frexp(a)  # a = m * 2^e, m in [0.5, 1): floor(log2 a) = e - 1
+        e = exponent - 1 - 8  # e4m3's largest power of two is 2^8
+    else:
+        mantissa, exponent = torch.frexp(a / FP8_MAX[_E4M3])
+        e = exponent - (mantissa == 0.5).to(exponent.dtype)  # ceil(log2(a / 448))
+        # a / 448 rounds in fp32: the smallest e with a <= 448 * 2^e (exact in fp32)
+        e = e + (a > FP8_MAX[_E4M3] * torch.pow(2.0, e.double()).float()).to(e.dtype)
+    e = torch.where(a > 0, e, torch.full_like(e, -_E8M0_BIAS))
+    return e.clamp(-_E8M0_BIAS, _E8M0_BIAS).to(torch.int32)
+
+
+def mx_scale_values(scales: torch.Tensor) -> torch.Tensor:
+    """fp32 values of MXFP8 scales: ``float8_e8m0fnu``, ``uint8`` biased exponents (127 =
+    2^0) or floating-point values (as they are)."""
+    if scales.dtype == torch.uint8:
+        scales = scales.view(torch.float8_e8m0fnu)
+    return scales.float()
+
+
+def quantize_mxfp8(x: torch.Tensor, rule: str = "ceil") -> tuple[torch.Tensor, torch.Tensor]:
+    """``(codes, scales)`` of ``x [..., K]`` in MXFP8: ``codes`` e4m3 ``[rows, K]`` (the rows of
+    ``x.reshape(-1, K)``: activations per call, or a weight ``[N, K]`` once in ``build()``)
+    and ``scales`` ``float8_e8m0fnu`` ``[rows, K / 32]`` (unswizzled; :func:`swizzle_mx_scales`
+    for ``F.scaled_mm``), with ``x[r, k] ≈ codes[r, k] * scales[r, k // 32]``.
+
+    The scale of each block of 32 consecutive elements follows ``rule`` (:data:`MX_RULES`;
+    default ``ceil``, ``2^ceil(log2(amax / 448))``: the block maximum lands in (224, 448],
+    nothing saturates). Dynamic (every call), computed in fp32, codes round to nearest
+    even. ``K`` must be a multiple of 32."""
+    k = x.shape[-1]
+    if k % MX_BLOCK:
+        raise ValueError(f"the last dimension {k} is not a multiple of the MXFP8 block (32)")
+    a = x.detach().reshape(-1, k).float()
+    blocks = a.reshape(a.shape[0], k // MX_BLOCK, MX_BLOCK)
+    e = mx_scale_exponents(blocks.abs().amax(dim=-1), rule)
+    scales = (e + _E8M0_BIAS).to(torch.uint8).view(torch.float8_e8m0fnu)
+    step = scales.float()  # exact powers of two (2^-127 for a block of zeros)
+    limit = FP8_MAX[_E4M3]
+    codes = (blocks / step[..., None]).clamp(-limit, limit).to(_E4M3)
+    return codes.reshape(a.shape[0], k).contiguous(), scales.contiguous()
+
+
+def dequantize_mxfp8(
+    codes: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """``codes * scales`` per block of 32 (:func:`quantize_mxfp8`'s outputs) in ``dtype``,
+    ``[rows, K]`` (product in fp32, one rounding to ``dtype``)."""
+    rows, k = codes.shape
+    values = codes.float().reshape(rows, k // MX_BLOCK, MX_BLOCK)
+    step = mx_scale_values(scales).to(codes.device).reshape(rows, k // MX_BLOCK, 1)
+    return (values * step).reshape(rows, k).to(dtype)
+
+
+def mx_scale_offset(row: Any, col: Any, cols: int) -> Any:
+    """Offset of scale ``[row, col]`` (of a ``[rows, cols]`` scale matrix, ``cols = K / 32``)
+    in the swizzled layout of :func:`swizzle_mx_scales`: 128 x 4 blocks of 512 bytes, row
+    major over the blocks, inside a block row ``r`` at ``(r % 32) * 16 + (r // 32) * 4``
+    plus the column. Ints or integer tensors: a kernel that writes its scales in place."""
+    blocks_per_row = -(-cols // 4)
+    block = (row // 128) * blocks_per_row + col // 4
+    return block * 512 + (row % 32) * 16 + ((row % 128) // 32) * 4 + col % 4
+
+
+def swizzle_mx_scales(scales: torch.Tensor) -> torch.Tensor:
+    """``[rows, K / 32]`` MXFP8 scales (e8m0 or uint8) → the flat ``float8_e8m0fnu`` layout
+    cuBLASLt reads (``F.scaled_mm(..., swizzle_a=SwizzleType.SWIZZLE_32_4_4)``): rows padded to
+    a multiple of 128 and columns to 4 (padding: code 0), blocks of 128 x 4 one after the
+    other (:func:`mx_scale_offset`)."""
+    s = scales.view(torch.uint8) if scales.dtype == torch.float8_e8m0fnu else scales
+    if s.dtype != torch.uint8 or s.dim() != 2:
+        raise ValueError(f"expected [rows, K / 32] e8m0 / uint8 scales, got {s.dtype} {s.shape}")
+    rows, cols = s.shape
+    nrb, ncb = -(-rows // 128), -(-cols // 4)
+    padded = s.new_zeros(nrb * 128, ncb * 4)
+    padded[:rows, :cols] = s
+    blocks = padded.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)  # [nrb, ncb, 128, 4]
+    out = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1)  # row 32 * i + j -> (j, i)
+    return out.contiguous().view(torch.float8_e8m0fnu)
+
+
+def _mx_scaled_mm_ok(x: torch.Tensor, q: torch.Tensor) -> bool:
+    """Whether ``F.scaled_mm`` runs these operands as MXFP8 (``BlockWise1x32``): CUDA bf16
+    activations, an e4m3 weight with K a multiple of 128 (whole 128 x 4 scale blocks) and N of
+    16, a GPU with block-scaled tensor cores (sm_100+: sm_120 measured) and a torch with
+    ``F.scaled_mm``."""
+    import torch.nn.functional as F
+
+    if not (x.is_cuda and q.is_cuda and x.dtype == torch.bfloat16 and q.dtype == _E4M3):
+        return False
+    if q.shape[1] % 128 or q.shape[0] % 16 or not hasattr(F, "scaled_mm"):
+        return False
+    return torch.cuda.get_device_capability(x.device) >= (10, 0)
+
+
+def mxfp8_linear(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    scales: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    rule: str = "ceil",
+) -> torch.Tensor:
+    """``x @ Wᵀ + bias`` with MXFP8 numerics, in ``x``'s dtype and shape ``[..., out]``.
+
+    ``(q, scales)``: the weight from :func:`quantize_mxfp8` (e4m3 ``[N, K]``, e8m0 ``[N,
+    K / 32]``, unswizzled); ``x`` is quantised per block of 32 with ``rule`` on every call,
+    the products accumulate in fp32 with both block scales applied by the tensor core.
+    Through ``F.scaled_mm`` (``ScalingType.BlockWise1x32``, ``SwizzleType.SWIZZLE_32_4_4``:
+    cuBLASLt ``VEC32_UE8M0``) where it applies (bias added to its bf16 output); otherwise the
+    same math in fp32 (slow: a fallback and a reference)."""
+    xq, xs = quantize_mxfp8(x, rule)
+    if _mx_scaled_mm_ok(x, q):
+        import torch.nn.functional as F
+
+        blockwise, swizzle = F.ScalingType.BlockWise1x32, F.SwizzleType.SWIZZLE_32_4_4
+        y = F.scaled_mm(
+            xq,
+            q.t(),  # column-major [K, N]: cuBLASLt's layout for the second operand
+            scale_a=swizzle_mx_scales(xs),
+            scale_recipe_a=blockwise,
+            scale_b=swizzle_mx_scales(scales),
+            scale_recipe_b=blockwise,
+            swizzle_a=swizzle,
+            swizzle_b=swizzle,
+            output_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            y = y + bias.to(y.dtype)
+    else:
+        w = dequantize_mxfp8(q, scales, torch.float32).to(xq.device)
+        y = dequantize_mxfp8(xq, xs, torch.float32) @ w.T
+        if bias is not None:
+            y = y + bias.float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], q.shape[0])
+
+
+def mxfp8_saturation(x: torch.Tensor, scales: torch.Tensor) -> dict[str, Any]:
+    """How MXFP8 ``scales`` fit the block maxima of ``x [..., K]``: ``scales`` ``[rows, K /
+    32]`` for the rows of ``x.reshape(-1, K)`` (e8m0, uint8 biased exponents or values).
+
+    * ``blocks``; ``saturated``: blocks whose maximum exceeds ``448 x scale`` (by more than
+      :data:`MX_SATURATION_SLACK`): the quantiser clamps their largest elements; ``share``;
+    * ``worst_ratio``: the largest ``block max / scale`` (<= 448 without saturation);
+    * ``coarser``: blocks whose scale is above the ceil rule's (no saturation, one bit of
+      precision or more given away);
+    * ``not_pow2``: scales that are not powers of two (not ue8m0).
+
+    ValueError: ``scales`` of another shape."""
+    k = x.shape[-1]
+    a = x.detach().reshape(-1, k).float()
+    rows, nblocks = a.shape[0], k // MX_BLOCK
+    if k % MX_BLOCK or tuple(scales.shape) != (rows, nblocks):
+        raise ValueError(
+            f"expected scales [{rows}, {nblocks}] (rows of x, K / 32, unswizzled) for x "
+            f"{tuple(x.shape)}, got {tuple(scales.shape)}"
+        )
+    amax = a.reshape(rows, nblocks, MX_BLOCK).abs().amax(dim=-1)
+    step = mx_scale_values(scales).to(a.device).reshape(rows, nblocks)
+    mantissa, _ = torch.frexp(step)
+    not_pow2 = int(((mantissa != 0.5) & (step > 0)).sum())
+    ratio = torch.where(amax > 0, amax / step.clamp_min(1e-38), torch.zeros_like(amax))
+    limit = FP8_MAX[_E4M3] * (1 + MX_SATURATION_SLACK)
+    saturated = int(((ratio > limit) | ((step <= 0) & (amax > 0))).sum())
+    ceil = mx_scale_exponents(amax, "ceil").double()
+    coarser = int(((step.double() > torch.pow(2.0, ceil)) & (amax > 0)).sum())
+    blocks = rows * nblocks
+    return {
+        "blocks": blocks,
+        "saturated": saturated,
+        "share": _sig(saturated / blocks) if blocks else 0.0,
+        "worst_ratio": _sig(float(ratio.max())) if blocks else 0.0,
+        "coarser": coarser,
+        "not_pow2": not_pow2,
+    }
+
+
+def mxfp8_scale_problem(x: torch.Tensor, scales: torch.Tensor) -> str | None:
+    """Why ``scales`` are not a valid MXFP8 quantisation of ``x`` (:func:`mxfp8_saturation`):
+    a block maximum above ``448 x scale`` (a saturating scale rule) or scales that are not
+    powers of two; None when they are."""
+    found = mxfp8_saturation(x, scales)
+    if found["saturated"]:
+        return (
+            f"{found['saturated']} of {found['blocks']} MXFP8 blocks ({found['share']:.1%}) "
+            f"saturate: block maximum up to {found['worst_ratio']:.4g} x scale, above e4m3's "
+            "448 (their largest elements are clamped). Use the scale 2^ceil(log2(amax / 448)); "
+            "the OCP rule 2^(floor(log2 amax) - 8) saturates maxima in (448, 512) x scale"
+        )
+    if found["not_pow2"]:
+        return (
+            f"{found['not_pow2']} of {found['blocks']} MXFP8 scales are not powers of two "
+            "(ue8m0 holds an exponent only)"
+        )
+    return None
+
+
+def mxfp8_stress_input(
+    shape: tuple[int, ...] | torch.Size,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | str = "cpu",
+    seed: int = 0,
+) -> torch.Tensor:
+    """Activations of ``shape`` (``[..., K]``, K a multiple of 32) whose blocks of 32 hold
+    Gaussian values with their maximum at ±1.9 x 2^e (e from -8 to 8 across blocks): where
+    the OCP floor rule saturates every block (maximum 486 x scale) and the ceil rule none (243
+    x scale). The scale-rule guard runs a candidate's quantiser on it."""
+    k = int(shape[-1])
+    if k % MX_BLOCK:
+        raise ValueError(f"the last dimension {k} is not a multiple of the MXFP8 block (32)")
+    rows = math.prod(int(n) for n in shape[:-1])
+    gen = torch.Generator().manual_seed(seed)
+    v = torch.randn(rows, k // MX_BLOCK, MX_BLOCK, generator=gen)
+    peak = v.abs().argmax(dim=-1, keepdim=True)
+    v = v / v.abs().gather(-1, peak)  # block maximum ±1, at the largest Gaussian value
+    e = torch.arange(rows * (k // MX_BLOCK)).reshape(rows, k // MX_BLOCK, 1) % 17 - 8
+    v = v * 1.9 * torch.pow(2.0, e.float())
+    return v.reshape(*shape).to(dtype=dtype, device=device)
+
+
+def mxfp8_error(
+    weight: torch.Tensor,
+    q: torch.Tensor,
+    scales: torch.Tensor,
+    x: torch.Tensor | None = None,
+    rule: str = "ceil",
+) -> dict[str, Any]:
+    """Numerical error of an MXFP8 layer (weight ``(q, scales)`` from :func:`quantize_mxfp8`,
+    activations ``x`` quantised with ``rule``): the weight report of :func:`fp8_error`
+    (``rel_l2``, ``worst_channel_rel_l2``, ``underflow``, ``crest``), plus with ``x``
+
+    * ``activation_rel_l2`` and ``activation_saturation`` (:func:`mxfp8_saturation` of the
+      activation scales: ``share`` of saturated blocks, ``worst_ratio``);
+    * ``output_rel_l2``, ``output_cosine`` and ``output_norm_ratio`` of the MXFP8 output
+      against ``x @ Wᵀ`` in fp32: the module-level error the near-lossless tier bounds
+      (cosine >= 0.996, relative L2 <= 0.08, norm within ±2 %). With the ceil rule MXFP8
+      has per-token W8A8's error (docs/FP8.md §3.2: 0.0205 vs 0.0204 on a DiT layer)."""
+    w = weight.detach().float()
+    deq = dequantize_mxfp8(q, scales, torch.float32).to(w.device)
+    report: dict[str, Any] = {
+        "format": "mxfp8",
+        "granularity": f"e4m3 + e8m0 scale per {MX_BLOCK} along K, both operands ({rule} rule)",
+        **_error_metrics(w, deq, None),
+        "bytes": {
+            "before": weight.numel() * weight.element_size(),
+            "after": q.numel() + scales.numel(),
+        },
+    }
+    if x is None:
+        return report
+    a = x.detach().float().reshape(-1, w.shape[1]).to(w.device)
+    xq, xs = quantize_mxfp8(a, rule)
+    a_hat = dequantize_mxfp8(xq, xs, torch.float32)
+    a_norm = float(a.norm())
+    ref, new = a @ w.T, a_hat @ deq.T
+    ref_norm, new_norm = float(ref.norm()), float(new.norm())
+    cos = float((ref.flatten() @ new.flatten()) / (ref_norm * new_norm)) if ref_norm else 1.0
+    saturation = mxfp8_saturation(a, xs)
+    return {
+        **report,
+        "activations": f"e4m3 + e8m0 per {MX_BLOCK} ({rule} rule)",
+        "activation_rel_l2": _sig(float((a - a_hat).norm()) / a_norm if a_norm > 0 else 0.0),
+        "activation_saturation": {k: saturation[k] for k in ("share", "worst_ratio")},
+        "output_rel_l2": _sig(float((ref - new).norm()) / ref_norm if ref_norm else 0.0),
+        "output_cosine": round(cos, 6),
+        "output_norm_ratio": round(new_norm / ref_norm, 5) if ref_norm else 1.0,
+    }

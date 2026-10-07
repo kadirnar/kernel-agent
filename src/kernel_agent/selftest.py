@@ -1,6 +1,7 @@
 """Backend smoke test: run every bundled example kernel through the evaluator (the FP8
-weight-only and W8A8 examples in the near-lossless tier, and their rejection by the exact
-tier; the FP4 one in the near-lossless-fp4 tier, and its rejection by the FP8 tier)."""
+weight-only, W8A8 and MXFP8 examples in the near-lossless tier, and their rejection by the
+exact tier, MXFP8 with the OCP floor scale rule by the scale-rule guard; the FP4 one in the
+near-lossless-fp4 tier, and its rejection by the FP8 tier)."""
 
 from __future__ import annotations
 
@@ -62,6 +63,13 @@ FP8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
 W8A8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     "triton_fp8_w8a8_gemm.py": (1024, 8192, [((64, 11), 540), ((32, 11), 0)]),
 }
+#: The MXFP8 W8A8 examples (``precision: fp8_mx``), as :data:`W8A8_EXAMPLES` (a wide-N GEMM,
+#: where MXFP8 pays). Each also fails the scale-rule guard with the OCP floor rule (its
+#: ``RULE = "floor"``). Not run on a GPU when written (#144).
+MX_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "triton_mxfp8_gemm.py": (1024, 8192, [((64, 11), 540), ((32, 11), 0)]),
+}
+_EXAMPLES = {"fp8_w8a8": W8A8_EXAMPLES, "fp8_mx": MX_EXAMPLES}
 
 
 #: The FP4 weight-only examples (``precision: fp4_weights``) on the GEMV's shapes above; a
@@ -112,14 +120,38 @@ def w8a8_supported(tc: object) -> bool:
     return bool(backends.get("triton")) and gpu is not None and tuple(gpu.capability) >= (8, 9)
 
 
+def mxfp8_supported(tc: object) -> bool:
+    """Whether the MXFP8 examples can run: the ``triton`` backend on a GPU with block-scaled
+    tensor cores (sm_100 or newer) and a torch with ``F.scaled_mm``."""
+    gpu = getattr(tc, "gpu", None)
+    return (
+        w8a8_supported(tc)
+        and gpu is not None
+        and tuple(gpu.capability) >= (10, 0)
+        and hasattr(torch.nn.functional, "scaled_mm")
+    )
+
+
+def floor_rule_variant(tmp: Path, name: str) -> Path:
+    """A copy of the MXFP8 example ``name`` with the OCP floor scale rule (``RULE =
+    "floor"``): the evaluator's scale-rule guard must reject it."""
+    source = (EXAMPLES_DIR / name).read_text()
+    if 'RULE = "ceil"' not in source:
+        raise ValueError(f'{name} has no RULE = "ceil" line')
+    path = tmp / name.replace(".py", "_floor.py")
+    path.write_text(source.replace('RULE = "ceil"', 'RULE = "floor"', 1))
+    return path
+
+
 def smoke_fp8(tmp: Path, verbose: bool = False, *, precision: str = "fp8_weights") -> bool:
-    """Every FP8 example of ``precision`` (:data:`FP8_EXAMPLES`, :data:`W8A8_EXAMPLES`)
-    passes the evaluator in the near-lossless tier, and the exact tier (a quick check)
-    rejects it."""
+    """Every FP8 example of ``precision`` (:data:`FP8_EXAMPLES`, :data:`W8A8_EXAMPLES`,
+    :data:`MX_EXAMPLES`) passes the evaluator in the near-lossless tier, and the exact tier (a
+    quick check) rejects it; an MXFP8 example with the OCP floor scale rule fails the
+    scale-rule guard."""
     from kernel_agent.kernels.evaluate import run_evaluation
 
     ok = True
-    examples = W8A8_EXAMPLES if precision == "fp8_w8a8" else FP8_EXAMPLES
+    examples = _EXAMPLES.get(precision, FP8_EXAMPLES)
     for name, (k, n, calls) in examples.items():
         near = make_linear_capture(
             tmp / f"{name}.near.pt", k, n, calls, tier="near-lossless", precision=precision
@@ -128,6 +160,10 @@ def smoke_fp8(tmp: Path, verbose: bool = False, *, precision: str = "fp8_weights
         result = run_evaluation(near, EXAMPLES_DIR / name)
         rejected = run_evaluation(exact, EXAMPLES_DIR / name, quick=True)
         passed = bool(result.get("correct")) and rejected.get("status") == "incorrect"
+        floor: dict[str, Any] = {"stage": "scale_rule"}
+        if precision == "fp8_mx":  # the guard names a saturating scale rule
+            floor = run_evaluation(near, floor_rule_variant(tmp, name), quick=True)
+            passed &= floor.get("stage") == "scale_rule"
         ok &= passed
         if verbose:
             if passed:
@@ -135,11 +171,18 @@ def smoke_fp8(tmp: Path, verbose: bool = False, *, precision: str = "fp8_weights
                 detail = (
                     f"speedup {result.get('speedup')}x, rel L2 {cases[0].get('max_rel_l2')} "
                     f"(near-lossless), exact tier rejects it"
+                    + (
+                        ", so does the scale-rule guard its floor rule"
+                        if precision == "fp8_mx"
+                        else ""
+                    )
                 )
             elif not result.get("correct"):
                 detail = f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
-            else:
+            elif rejected.get("status") != "incorrect":
                 detail = f"the exact tier did not reject it: {rejected.get('status')}"
+            else:
+                detail = f"the floor scale rule was not rejected: {floor.get('status')}"
             print(f"  {name.removesuffix('.py'):22s} {'OK ' if passed else 'FAIL'} {detail}")
     return ok
 
@@ -203,4 +246,6 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_fp4(Path(tmp), verbose)
         if w8a8_supported(tc) and (backends is None or "triton" in backends):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8")
+        if mxfp8_supported(tc) and (backends is None or "triton" in backends):
+            ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
     return ok

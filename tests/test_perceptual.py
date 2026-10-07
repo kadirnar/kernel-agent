@@ -119,7 +119,7 @@ def test_orchestrator_passes_the_quality_mode_to_capture():
     orch.cfg = OptimizeConfig(model_ref="org/m", quality="near-lossless")
     orch._worker("capture", "--target", "t")
     orch._worker("e2e", "--iters", "1")  # e2e / e2e_ab: Truth.worker_args() carries it
-    allowed = "exact,fp8_weights,reduced,fp8_w8a8"  # and the precisions it allows (no 4-bit)
+    allowed = "exact,fp8_weights,reduced,fp8_w8a8,fp8_mx"  # the precisions it allows (no 4-bit)
     assert calls == [
         ("capture", ("--target", "t", "--quality", "near-lossless", "--precisions", allowed)),
         ("e2e", ("--iters", "1")),

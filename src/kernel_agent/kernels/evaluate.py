@@ -574,6 +574,19 @@ def _evaluate(
             rel_l2 = [c["rel_l2"] for c in checks if "rel_l2" in c]
             case_reports[-1]["max_rel_l2"] = max(rel_l2, default=0.0)
     result["cases"] = case_reports
+    if capture_precision(capture) == "fp8_mx":  # the MXFP8 scale rule (kernels/scale_guard.py)
+        from kernel_agent.kernels import scale_guard
+
+        rule = scale_guard.check(module, cases)
+        result["scale_rule"] = rule
+        if not rule["ok"]:
+            result.update(
+                status="incorrect",
+                stage="scale_rule",
+                failed_check={"check": "scale_rule", "input": rule.get("input")},
+                error=rule["error"],
+            )
+            return result
     if not all_ok:
         failed = next(i for i, r in enumerate(case_reports) if not r["ok"])
         result.update(  # the failures are in result["cases"]

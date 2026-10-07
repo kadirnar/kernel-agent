@@ -6,7 +6,8 @@ lists the precisions (a target's ``precision`` in ``spec.json``,
 always one of them. Without the option, and in a run whose ``run.json`` has none (made
 before it), the run's ``--quality`` decides (:func:`default`): ``exact`` allows ``exact``
 only, ``near-lossless`` every reduced precision but the 4-bit ones (:data:`FOUR_BIT`),
-which are opt-in (``--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights``). A run
+which are opt-in (``--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights``); the
+8-bit classes (``fp8_weights``, ``fp8_w8a8``, MXFP8 ``fp8_mx``) are allowed by default. A run
 continued with ``--precisions`` (``improve``, ``resume``, ``integrate``) records the new
 list in its ``run.json``.
 
