@@ -14,7 +14,10 @@ Two complementary views are collected:
 * **Kernel view** – ``torch.profiler`` gives the CUDA kernels and aten ops that
   actually ran, the number of launches and the GPU busy fraction.  A low busy
   fraction means the run is launch/CPU bound, which calls for fusion, CUDA
-  graphs or static caches rather than faster individual kernels.  Kernel times
+  graphs or static caches rather than faster individual kernels.  Its timeline
+  (:mod:`.timeline`) is the GPU busy time as the union over every stream (two
+  overlapping streams are not counted twice), per stream, per stage (the calls of
+  the workload's top-level modules) and the idle gaps by cause.  Kernel times
   inflate when the GPU's clocks are low or another process computes on it, so
   the kernel view is guarded like a timing (:func:`guarded_kernel_profile`):
   under the GPU lock, after a warm-up and the clock guard of ``time_call``, two
@@ -41,6 +44,7 @@ import collections
 import contextlib
 import functools
 import inspect
+import re
 import sys
 import time
 import weakref
@@ -54,7 +58,7 @@ from torch import nn
 from kernel_agent import telemetry
 from kernel_agent.gpulock import gpu_lock
 from kernel_agent.phases import call_phase
-from kernel_agent.profiling import host_sync
+from kernel_agent.profiling import host_sync, timeline
 from kernel_agent.profiling.methods import (
     describe,
     discover_entrypoints,
@@ -114,6 +118,13 @@ class _Call:
     weight_bytes: int = 0
     #: The hooks did not see inside: a compiled module, or a CUDA graph replayed in the call.
     opaque: bool = False
+    #: A decode call's KV cache (:func:`_kv_cache`): bytes per cached position of the cache
+    #: tensors passed to it, their positions, the position argument (an int or a tensor,
+    #: read after the run) and, once read, the bytes the call reads from the cache.
+    kv_slot_bytes: int = 0
+    kv_slots: int = 0
+    kv_position: Any = None
+    kv_bytes: int = 0
 
 
 @dataclass
@@ -221,6 +232,97 @@ def _output_work(
         call.flops = 2 * (x.numel() if getattr(module, "transposed", False) else out.numel()) * per
         call.weight_elems = sum(t.numel() for t in weights)
         call.weight_bytes = sum(t.numel() * t.element_size() for t in weights)
+
+
+#: Arguments of a decode call that hold its KV cache (a tensor, or a tuple / list of them),
+#: and that give the position of the step in it; matched by parameter name.
+_KV_ARGS = re.compile(
+    r"kv_caches?|past_key_values?|layer_past|(?:key|value|k|v)_caches?|caches?|kv",
+)
+_POSITION_ARGS = (
+    "position_id",
+    "position_ids",
+    "cache_position",
+    "input_pos",
+    "start_pos",
+    "pos",
+    "position",
+    "positions",
+    "offset",
+)
+
+
+_KV_PARAMS: dict[tuple[type, str], tuple[inspect.Signature, tuple[str, ...]] | None] = {}
+
+
+def _kv_params(cls: type, method: str) -> tuple[inspect.Signature, tuple[str, ...]] | None:
+    """The signature of ``cls.method`` and its KV-cache parameters (None: it has none)."""
+    key = (cls, method)
+    if key not in _KV_PARAMS:
+        try:
+            sig = inspect.signature(getattr(cls, method))
+        except (TypeError, ValueError, AttributeError):
+            _KV_PARAMS[key] = None
+        else:
+            names = tuple(n for n in sig.parameters if _KV_ARGS.fullmatch(n))
+            _KV_PARAMS[key] = (sig, names) if names else None
+    return _KV_PARAMS[key]
+
+
+def _cache_tensors(value: Any) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, tuple | list):
+        return [t for v in value for t in _cache_tensors(v)]
+    return []
+
+
+def _kv_cache(
+    call: _Call, module: nn.Module, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> None:
+    """The KV cache a decode call reads (issue #146): the tensors of its KV-cache arguments
+    (by name: ``kv_cache``, ``past_key_value``, ``layer_past``, ...) of at least 3 dims, each
+    holding ``slots`` positions along its longest non-last dim, read up to the call's
+    position argument (``position_id``, ``cache_position``, ...: the newest position), or
+    whole without one (a cache that grows holds exactly the context). A cache held by the
+    module instead of passed in is not seen; a position tensor updated in place after the
+    call counts its last value."""
+    found = _kv_params(type(module), method)
+    if found is None:
+        return
+    sig, names = found
+    try:
+        bound = sig.bind_partial(module, *args, **kwargs).arguments
+    except TypeError:
+        return
+    per_slot = slots = 0
+    for name in names:
+        for t in _cache_tensors(bound.get(name)):
+            if t.dim() < 3 or not t.numel():
+                continue
+            n = max(t.shape[:-1])
+            per_slot += t.numel() // n * t.element_size()
+            slots = max(slots, n)
+    if not per_slot:
+        return
+    call.kv_slot_bytes, call.kv_slots = per_slot, slots
+    call.kv_position = next((bound[n] for n in _POSITION_ARGS if bound.get(n) is not None), None)
+
+
+def _read_kv(call: _Call) -> None:
+    """``call.kv_bytes`` from its cache and position (after the run: may synchronise)."""
+    if not call.kv_slot_bytes or call.kv_bytes:
+        return
+    pos = call.kv_position
+    newest: int | None = None
+    with contextlib.suppress(Exception):
+        if isinstance(pos, torch.Tensor):
+            newest = int(pos.max().item()) if pos.numel() else None
+        elif isinstance(pos, int | float):
+            newest = int(pos)
+    context = call.kv_slots if newest is None or newest < 0 else min(newest + 1, call.kv_slots)
+    call.kv_bytes = call.kv_slot_bytes * context
+    call.kv_position = None  # do not keep the tensor alive
 
 
 class ModuleTimer:
@@ -356,6 +458,8 @@ class ModuleTimer:
         )
         with contextlib.suppress(Exception):  # the work estimate never breaks a profile
             _input_work(call, module, _first_tensor((*args, *kwargs.values())))
+            if call.phase == "decode":
+                _kv_cache(call, module, method, args, kwargs)
         self.calls.append(call)
         index = len(self.calls) - 1
         if parent >= 0:
@@ -390,6 +494,8 @@ class ModuleTimer:
         if self.cuda:
             synchronize()
         times = [self._elapsed_ms(call) for call in self.calls]
+        for call in self.calls:
+            _read_kv(call)
         self.untimed = sum(t is None for t in times)
         inclusive = [t or 0.0 for t in times]
 
@@ -532,6 +638,8 @@ class ModuleTimer:
             w.weight_elems, w.weight_bytes = call.weight_elems, call.weight_bytes
             for c in call.children:
                 w.add(out[c])
+            # a layer that passes its cache on to its attention reads it once
+            w.kv_bytes = max(w.kv_bytes, call.kv_bytes)
             module = modules.get(call.qualname)
             bypassed = False
             if not w.weight_elems and not call.opaque and module is not None:
@@ -559,6 +667,8 @@ class ModuleTimer:
         method, input shape), and where each module was: the reference for a later profile
         of the same workload whose optimisations hide their insides from the hooks."""
         modules = self._modules()
+        for call in self.calls:
+            _read_kv(call)
         calls: dict[tuple[str, str, str, tuple[int, ...]], tuple[int, _Work]] = {}
         for call, w in zip(self.calls, self._subtree_work(modules), strict=True):
             if w.unknown or w.estimated:  # only what the hooks saw
@@ -593,6 +703,7 @@ class _Work:
     flops: dict[str, int] = field(default_factory=dict)  # per dtype
     weight_elems: int = 0
     weight_bytes: int = 0
+    kv_bytes: int = 0  # KV cache read by decode calls (_kv_cache)
     # Where some of it comes from (ModuleTimer._subtree_work):
     estimated: bool = False  # module weights at the input's rows
     reference: bool = False  # the same call of the unmodified model (WorkReference)
@@ -603,6 +714,7 @@ class _Work:
             self.flops[dtype] = self.flops.get(dtype, 0) + n
         self.weight_elems += other.weight_elems
         self.weight_bytes += other.weight_bytes
+        self.kv_bytes += other.kv_bytes
         self.estimated |= other.estimated
         self.reference |= other.reference
         self.unknown |= other.unknown
@@ -639,6 +751,7 @@ class WorkReference:
                     {dtype: round(f / n) for dtype, f in total.flops.items()},
                     round(total.weight_elems / n),
                     round(total.weight_bytes / n),
+                    round(total.kv_bytes / n),
                     reference=True,
                 )
         return None
@@ -693,6 +806,7 @@ def _new_work() -> dict[str, Any]:
         "weight_elems": 0,
         "weight_bytes": 0,
         "io_bytes": 0,
+        "kv_bytes": 0,
         "estimated": 0,
         "reference": 0,
         "unknown": 0,
@@ -708,6 +822,7 @@ def _add_work(acc: dict[str, Any], call: _Call, work: _Work, ms: float) -> None:
     acc["weight_elems"] += work.weight_elems
     acc["weight_bytes"] += work.weight_bytes
     acc["io_bytes"] += call.io_bytes
+    acc["kv_bytes"] += work.kv_bytes
     acc["estimated"] += work.estimated
     acc["reference"] += work.reference
     acc["unknown"] += work.unknown
@@ -718,10 +833,11 @@ def _work_entry(group: str, phase: str, acc: dict[str, Any]) -> dict[str, Any]:
     """One ``ClassStat.work`` entry: the calls of one instance group in one phase, totals
     per run. ``flops`` per dtype and ``weight_*`` (read once per call) count the
     ``nn.Linear`` and convolution calls inside; ``io_bytes`` the first input and output of
-    each call. Calls whose insides the hooks did not see (ModuleTimer._subtree_work):
-    ``reference_calls`` took the work of the unmodified model's call, ``unknown_calls`` have
-    none (their totals are incomplete), ``estimated_calls`` are estimated from module
-    weights."""
+    each call; ``kv_bytes`` (decode calls only, when non-zero) the KV cache read by the calls
+    inside (:func:`_kv_cache`). Calls whose insides the hooks did not see
+    (ModuleTimer._subtree_work): ``reference_calls`` took the work of the unmodified model's
+    call, ``unknown_calls`` have none (their totals are incomplete), ``estimated_calls`` are
+    estimated from module weights."""
     top = acc["sigs"].most_common(1)
     entry = {
         "group": group,
@@ -735,6 +851,8 @@ def _work_entry(group: str, phase: str, acc: dict[str, Any]) -> dict[str, Any]:
         "io_bytes": acc["io_bytes"],
         "signature": top[0][0] if top else "",
     }
+    if acc["kv_bytes"]:
+        entry["kv_bytes"] = acc["kv_bytes"]
     for name in ("estimated", "reference", "unknown"):
         if acc[name]:
             entry[f"{name}_calls"] = acc[name]
@@ -826,7 +944,14 @@ def guarded_kernel_profile(
     attempts: list[dict[str, Any]] = []
     views: list[dict[str, Any]] = []
     problems: list[str] = []
-    with gpu_lock() if cuda else contextlib.nullcontext():
+    # Stage ranges for the timeline, installed before the warm-up: hooks can make compiled
+    # code recompile once, which must not happen in a profiled run.
+    stages = timeline.StageRanges.of(workload)
+    staged: dict[str, Any] = {"stages": stages} if stages is not None else {}
+    with (
+        gpu_lock() if cuda else contextlib.nullcontext(),
+        stages if stages is not None else contextlib.nullcontext(),
+    ):
         for _ in range(KERNEL_ATTEMPTS if cuda else 1):
             with torch.inference_mode():
                 workload.run(inputs)  # warm-up: caches, allocator, lazy init
@@ -841,7 +966,7 @@ def guarded_kernel_profile(
                 if monitor is not None:  # before the work: not a load sample
                     monitor.sample("before", loaded=False)
                 after = functools.partial(monitor.sample, "after") if monitor else None
-                views.append(kernel_profile(workload, inputs, after=after))
+                views.append(kernel_profile(workload, inputs, after=after, **staged))
             busy = [v["gpu_busy_ms"] for v in views]
             problems = kernel_problems(busy, reference_ms)
             attempts.append(
@@ -895,20 +1020,29 @@ def kernel_profile(
     top: int = 40,
     *,
     after: Callable[[], Any] | None = None,
+    stages: timeline.StageRanges | None = None,
 ) -> dict[str, Any]:
     """One profiled run. ``wall_ms`` ends when its GPU work does, before the profiler stops
     (which parses every event: longer than the run itself for eager VoxCPM2); ``after`` is
-    called then (GPU telemetry while the clocks are still up)."""
-    from torch.profiler import ProfilerActivity, profile
+    called then (GPU telemetry while the clocks are still up). ``stages``: installed stage
+    ranges (:class:`.timeline.StageRanges`) for the ``timeline``.
+
+    ``gpu_busy_ms`` is the union of the GPU work over every stream (:func:`.timeline.analyze`)
+    and ``kernel_time_ms`` the summed time of every kernel, copy and memset (they differ when
+    streams overlap); without a timeline (it failed: ``timeline_error``) both are the sum."""
+    from torch.profiler import ProfilerActivity, profile, record_function
 
     synchronize()
+    if stages is not None:
+        stages.reset()
     start = time.perf_counter()
     with (
         torch.inference_mode(),
         profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof,
     ):
-        workload.run(inputs)
-        synchronize()
+        with record_function(timeline.RUN):
+            workload.run(inputs)
+            synchronize()
         wall_ms = (time.perf_counter() - start) * 1000
         if after is not None:
             after()
@@ -932,15 +1066,42 @@ def kernel_profile(
                 ops.append({"name": evt.key, "calls": int(evt.count), "device_ms": round(ms, 4)})
     kernels.sort(key=lambda k: -k["total_ms"])
     ops.sort(key=lambda o: -o["device_ms"])
+    sms = (
+        torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        if torch.cuda.is_available()
+        else None
+    )
+    busy, extra = gpu_busy, timeline_view(prof, stages, sms)
+    if "timeline" in extra:
+        busy = float(extra["timeline"]["busy_ms"])
     return {
         "wall_ms": round(wall_ms, 2),
-        "gpu_busy_ms": round(gpu_busy, 2),
-        "gpu_busy_fraction": round(gpu_busy / wall_ms, 3) if wall_ms else 0.0,
+        "gpu_busy_ms": round(busy, 2),
+        "kernel_time_ms": round(gpu_busy, 2),
+        "gpu_busy_fraction": round(busy / wall_ms, 3) if wall_ms else 0.0,
         "kernel_launches": launches,
         "avg_kernel_us": round(1000 * gpu_busy / launches, 2) if launches else 0.0,
         "kernels": kernels[:top],
         "aten_ops": ops[:top],
+        **extra,
     }
+
+
+def timeline_view(
+    prof: Any, stages: timeline.StageRanges | None, sms: int | None = None
+) -> dict[str, Any]:
+    """``{"timeline", "overlap_ms"}`` of a finished profile (:func:`.timeline.analyze`; ``sms``:
+    the GPU's SM count, for the SM fill), or ``{"timeline_error"}``: the timeline never
+    breaks the kernel view."""
+    try:
+        tl = timeline.analyze(
+            timeline.from_profiler(prof),
+            calls=stages.calls if stages is not None else None,
+            sms=sms,
+        )
+    except Exception as exc:
+        return {"timeline_error": f"{type(exc).__name__}: {exc}"[:300]}
+    return {"overlap_ms": tl["overlap_ms"], "timeline": tl}
 
 
 def profile_workload(
@@ -998,6 +1159,7 @@ def summarize(
     measures (``objective.py``; the profile covers the same window)."""
     kv = profile["kernel_view"]
     busy = kv["gpu_busy_ms"] / baseline_ms if baseline_ms else kv["gpu_busy_fraction"]
+    tl = kv.get("timeline") or {}
     total = max((c["inclusive_ms"] for c in profile["classes"]), default=0.0) or 1.0
     unreliable = kernel_view_problems(kv, baseline_ms)
     if unreliable:
@@ -1019,8 +1181,8 @@ def summarize(
         "# Profile summary",
         "",
         f"* {metric} (no hooks): **{baseline_ms:.1f} ms**",
-        f"* GPU kernel time: {kv['gpu_busy_ms']:.1f} ms {per} = **{busy:.0%}** of the "
-        f"{metric} — {verdict}",
+        f"* GPU {'busy (union over streams)' if tl else 'kernel time'}: "
+        f"{kv['gpu_busy_ms']:.1f} ms {per} = **{busy:.0%}** of the {metric} — {verdict}",
         *_guard_notes(kv),
         f"* kernel launches: {kv['kernel_launches']} (avg {kv['avg_kernel_us']:.1f} us/kernel)",
         f"* module calls: {profile['module_calls']}",
@@ -1073,6 +1235,8 @@ def summarize(
     ]
     for o in kv["aten_ops"][:20]:
         lines.append(f"| `{o['name']}` | {o['calls']} | {o['device_ms']:.3f} |")
+    if tl:
+        lines += timeline.markdown(tl)
     lines += host_sync.summary_lines(profile.get("host_syncs"))
     lines += _roofline_note()
     return "\n".join(lines) + "\n"

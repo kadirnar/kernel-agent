@@ -126,6 +126,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "kernels_reference",
             "streams",  # declared side streams (kernel_agent.concurrency)
             "undeclared_streams",
+            "compiler_stats",  # registers, spills (kernels/ncu.py)
             "eval_seconds",
             "compile_s",
             "compile_check",  # torch.compile compatibility (kernels/compile_check.py)
@@ -469,8 +470,12 @@ def build_server(
                     "puts it next to the measured one)",
                 },
                 "profile": {
-                    "type": "boolean",
-                    "description": "include per-kernel GPU time tables",
+                    "type": ["boolean", "string"],
+                    "enum": [False, True, "ncu"],
+                    "description": "true: per-kernel GPU time tables and compiler stats "
+                    '(registers, spills); "ncu": also Nsight Compute metrics per candidate '
+                    "kernel (SM / memory throughput, occupancy, cache hit rates, warp stalls, "
+                    "memory / compute / under-utilised), when ncu can profile on this machine",
                     "default": False,
                 },
                 "compile_check": {
@@ -596,6 +601,12 @@ def build_server(
         await asyncio.to_thread(refresh, run, target_id)
         out = compact(result)
         out["ledger"] = {"exp": row["exp"], "status": row["status"]}
+        if str(args.get("profile")).lower() == "ncu" and not quick and result.get("correct"):
+            from kernel_agent.kernels import ncu  # Nsight Compute (#10): not stored
+
+            out["ncu"] = await asyncio.to_thread(
+                ncu.profile_candidate, capture, snap, capture_sha256=capture_sha256
+            )
         if quick:
             out["mode"], out["not_a_benchmark"] = dedup.QUICK, QUICK_NOTE
             return _text(out | _best_so_far(target_id) | _uncounted(budget, agent, evals_budget))

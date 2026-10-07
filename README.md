@@ -725,6 +725,39 @@ the GPU. A process computing outside the lock inflates every kernel: a
 re-profile reported 202 % of the end-to-end latency while another process
 held 13 GB of the GPU.
 
+The kernel view's GPU busy time is the *union* of the GPU work over every
+stream (`kernel_agent/profiling/timeline.py`), so two streams that overlap no
+longer add up past the wall time and mark the view unreliable; the summed
+kernel time stays in `kernel_time_ms`, the difference in `overlap_ms`.
+`summary.md`'s "Timeline" section (from `kernel_view.timeline` in
+`profile.json`) adds, for any workload:
+
+* **streams**: busy time and events per stream;
+* **stages**: every call of the workload's roots and their direct children
+  (through `forward` and the entrypoints of "Entrypoints other than
+  `forward`"; `-o stage_depth=2` goes one level deeper; a `ModuleList` is not a
+  level) is a `ka::<qualname>[.method]` profiler range. Every GPU event belongs
+  to the innermost stage around the CPU call that launched it (a CUDA-graph
+  replay's kernels to the replay's); per stage: calls, kernels, GPU and busy ms,
+  host lead (launch → GPU start), graph-launched events, SM fill and occupancy
+  when the trace has grid sizes. The hooks return at once inside code Dynamo
+  traces and are installed before the kernel view's warm-up run, so a compiled
+  region that recompiles for them does so there;
+* **idle gaps**: binned (< 2, 2–10, 10–50, 50–500, > 500 µs), and those of at
+  least 2 µs attributed to a cause and to the stages before and after: *host
+  sync* (a device-to-host copy or a synchronising call was waiting when the GPU
+  went idle: `.cpu()`, `.item()`, `synchronize()`), *pageable copy*, *host late*
+  (the next launch came after the GPU went idle), *graph launch*, *launch
+  latency*; host lead of the whole run (GPU bound when the host runs ahead). The
+  Python lines that make the host wait are in "Host synchronisation" (the
+  host-sync scan): the timeline says how much GPU time each pair of stages loses;
+* **critical path**: each stage call's tensor storages give producer → consumer
+  edges (a large floating-point input no earlier stage call saw, made by glue code
+  between stages, is assumed to depend on the call just before); the longest
+  chain by GPU busy time is the critical path, and the stage work off it could
+  overlap on another stream. State held outside the arguments (a KV cache inside
+  a module) adds no edge, so it is an estimate.
+
 `-o metric=` chooses what a run optimises (`kernel_agent/objective.py`):
 `latency` (the default), `ttfa`, the time to first audio of a streaming TTS
 run (VoxCPM, and harnesses that declare it): from the call of `workload.run`
@@ -1167,6 +1200,16 @@ pip wheels, and says why it passed over the others. `kernel-agent doctor
 version there (sha256 from NVIDIA's manifest). `kernel-agent doctor` prints the
 sanitizer it uses and runs a self-test: a deliberate one-block overrun of a Triton
 kernel must be reported, an in-bounds kernel must not (2 s).
+
+`kernel-agent doctor` also records the versions that decide what compiles (torch,
+its CUDA, the driver, Triton, cuda.core / cuda.bindings, nvcc, CuTe DSL, TileLang,
+ncu) and probes the features kernels rely on (`kernel_agent/probes.py`,
+`--no-probes` skips them): Triton lowers `tl.dot_scaled` to the block-scaled MMA
+(`block_scale` in the PTX, `QMMA.SF` in the SASS), Triton host TMA descriptors
+compile and copy a tile, a programmatic dependent launch (PDL) orders a producer
+and a consumer, and `kernel_agent.concurrency.partition` splits the SMs into two
+disjoint green contexts (SMs granted) whose streams run torch work. A probe that fails says why and never fails `doctor`; the results go to
+`~/.cache/kernel-agent/probes-<gpu>-torch<version>.json`.
 `kernel-agent memcheck capture.pt candidate.py` runs one candidate.
 
 ### Ground truth the agents cannot quietly change
@@ -1483,8 +1526,15 @@ hardware limit (`kernel_agent/kernels/roofline.py`).
   16 elements) where torch has a kernel for the GPU (otherwise
   `tflops_unavailable` says why; no ratio to bf16 is assumed), and the launch
   floor (a module call that launches one tiny kernel, timed like a candidate).
-  `kernel-agent doctor` measures and prints them (`--remeasure-peaks` measures
-  again); a cache from before the FP8 / FP4 peaks is measured again once.
+  Next to the GEMM peaks, the tensor-core *instruction* rates (`mma_tflops`,
+  `kernel_agent/kernels/mma_peaks.py`): a register-only `mma.sync` loop per
+  instruction compiled with NVRTC, bf16 `HMMA.F32`, plain e4m3 `QMMA.F32`, the
+  block-scaled `QMMA.SF` (`kind::mxf8f6f4.block_scale`, sm_120a) and e4m3 with fp16
+  accumulation (on the RTX 5070 Ti 104 / 208 / 416 / 416 TFLOP/s,
+  docs/RESEARCH-TRITON.md §1.1: a hand-written kernel on `QMMA.F32` is capped at
+  208, below cuBLASLt's 333). `kernel-agent doctor` measures and prints them
+  (`--remeasure-peaks` measures again); a cache from before the FP8 / FP4 peaks
+  or the instruction rates is measured again once.
   `toolchain.json` and the agents' prompts include them. On the RTX 5070 Ti:
   copy DRAM 767 GB/s, L2 2970 GB/s, matmul bf16/fp16/fp32 99 / 94 / 34
   TFLOP/s, FP8 333 TFLOP/s, NVFP4 641 TFLOP/s, launch floor ~16 µs.
@@ -1526,6 +1576,31 @@ hardware limit (`kernel_agent/kernels/roofline.py`).
   torch op, and backend launch paths add their own overhead on top of it
   (CUDA C++ ~19 µs, Triton ~43 µs, see Backends).
 
+### Kernel feedback: compiler stats and Nsight Compute
+
+`evaluate_candidate(..., profile=true)` adds per-kernel GPU time tables and
+`compiler_stats` (`kernel_agent/kernels/ncu.py`, no GPU work): registers, spills
+and shared memory of the candidate's Triton kernels (`n_regs`, `n_spills`), its
+NVRTC kernels (`cuda.core` kernel attributes) and its `load_inline` extensions
+(`cuobjdump --dump-resource-usage`, the `ptxas -v` numbers of the cubins), with a
+warning per kernel that spills. `profile="ncu"` also runs Nsight Compute on a
+correct candidate (CudaForge's curated metrics, KernelAgent's SOL classifier):
+`ncu --csv --page raw --replay-mode kernel` with 24 curated metrics (SM and memory
+throughput, DRAM throughput and bytes, L1 / L2 hit rates, achieved and theoretical
+occupancy, tensor-pipe activity, registers, shared memory, grid, block, waves, the
+top warp stalls) over the evaluator's `--ncu-mode` entry, which builds the
+candidate and runs its most-called case inside an NVTX range, under the GPU lock.
+Each kernel is classed *memory* or *compute* bound by the larger of its SM and
+memory throughput, or *under-utilised* when both are below 60 % of peak (with its
+waves, occupancy and top stalls); a metric this ncu does not know is dropped and
+the run repeated. Without ncu, or when the driver restricts the performance
+counters to admin users (`RmProfilingAdminOnly: 1`, ncu's `ERR_NVGPUCTRPERM`; set
+`options nvidia NVreg_RestrictProfilingToAdminUsers=0`), the result says so
+(`ncu.status: unavailable` with the fix) and the evaluation is unchanged.
+`kernel-agent doctor` says whether ncu can profile here. The ncu numbers are per
+launch with caches flushed and base clocks (ncu's defaults): compare kernels
+with each other, not with the evaluator's timings.
+
 ### Ceilings for the planner
 
 The speed of light above is per kernel evaluation, after the plan. `analyze`
@@ -1537,7 +1612,11 @@ re-profile makes a new one for its re-plan.
 
 * **Work.** The profiler records, per module call, the FLOPs and weights of the
   `nn.Linear` and convolution calls inside it (`2 × rows × in × out`, each weight
-  read once per call) and the bytes of its first input and output.
+  read once per call) and the bytes of its first input and output. A decode call
+  also counts the KV cache it is given (`kv_bytes`: the tensors of arguments
+  named like `kv_cache`, `past_key_value`, `layer_past`, read up to its position
+  argument such as `position_id` or `cache_position`, else whole; a layer that
+  passes its cache on to its attention counts it once).
   `profile.json` → `classes[].work` sums them per instance group (qualname with
   layer indices folded) and phase.
 * **Optimised models.** The model an improve round re-profiles hides work from the
@@ -1567,7 +1646,7 @@ re-profile makes a new one for its re-plan.
   Rows rank by *saves*; a row already below its exact floor (an optimised model
   that runs it at a lower precision) by its best saving at a lower precision,
   shown in brackets (`0 (W4A4 541)`).
-* **Floors** (ms per run) = max(FLOPs / peak, (weight + I/O bytes) / DRAM
+* **Floors** (ms per run) = max(FLOPs / peak, (weight + I/O + KV bytes) / DRAM
   bandwidth, calls × launch floor), per precision: *exact* (as profiled),
   *FP8 w* (one byte per weight, bf16 math), *W8A8* (FP8 tensor-core peak),
   *MXFP8* (one byte + an e8m0 scale per 32 per weight, the measured MXFP8 peak
@@ -1578,14 +1657,22 @@ re-profile makes a new one for its re-plan.
   precisions the run allows ("Allowed precisions": exact; near-lossless also
   FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with `fp4_weights` asked for), names the
   others as not shown, and ranks rows below their exact floor by those columns only.
+* **FP8 instruction.** With the instruction rates measured and W8A8 allowed, the
+  *FP8 MMA* column says what a W8A8 kernel needs to reach its floor: *SF* (the
+  block-scaled `QMMA.SF`: Triton `tl.dot_scaled`, MXFP8) when the row is compute
+  bound at the `QMMA.F32` rate, with the floor a `QMMA.F32` kernel (row-wise
+  CUTLASS, Triton `tl.dot` on e4m3, DeepSeek-style blockwise) reaches in brackets;
+  *any* when it is memory or launch bound even there. The *KV GB* column appears
+  when decode rows read a KV cache.
 * **End to end**, per precision: the run with every class at its floor, nested
   classes counted once (the non-overlapping set of `projection.py`).
 * The planner ranks targets by ceiling × share (*saves ms*) and names each
   target's bound with its number. The improve scheduler takes each kernel arm's
   expected gain from the table of the newest (re-profiled) run, at the arm's
   precision (see "Scheduler" under `improve`).
-* Approximate: attention scores, KV-cache reads and element-wise math are not
-  counted, weights stream from DRAM on every call, fp32 convolutions are held
+* Approximate: attention scores, element-wise math and KV caches a module holds
+  instead of taking them as an argument are not counted, weights stream from DRAM
+  on every call, fp32 convolutions are held
   to the fp32 peak (cuDNN may use TF32). `python -m kernel_agent.profiling.ceilings
   profile.json --baseline-ms <ms> [--peaks peaks.json]` prints the table of any
   profile made since.
@@ -2685,7 +2772,7 @@ kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, las
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
 kernel-agent library list|show <id>|prune [--older-than DAYS]|path   cross-run kernel library
 kernel-agent library import-memory DIR [--write]   Claude Code memory notes → lessons
-kernel-agent doctor [--smoke] [--remeasure-peaks] [--fetch-sanitizer]
+kernel-agent doctor [--smoke] [--remeasure-peaks] [--fetch-sanitizer] [--no-probes]
 kernel-agent install-claude-code <project-dir>
 ```
 

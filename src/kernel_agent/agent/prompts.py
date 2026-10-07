@@ -834,7 +834,9 @@ their structure.
   it builds on. Every evaluation is a row of the run's ledger, `ledger.status`
   in the result: `keep` (beats the best by more than the timing noise),
   `discard`, or the failure kind.
-  `profile=true` adds per-kernel GPU time tables for candidate and reference.
+  `profile=true` adds per-kernel GPU time tables for candidate and reference and the
+  candidate's registers / spills; `profile="ncu"` also Nsight Compute metrics per
+  kernel (memory / compute / under-utilised, occupancy, warp stalls) when available.
   `mode="quick"` only checks correctness on the smallest and the largest case
   (no timing, no speedup, not counted against your budget): use it to debug a
   candidate before you spend a full evaluation on it. A candidate whose code
