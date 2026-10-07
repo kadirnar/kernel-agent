@@ -15,7 +15,9 @@
             worker, concurrently up to --parallel, that share the slice's evaluations
         the native arm (--native, native/engine.py, issue #134), once every module arm
             has plateaued: first the capture of its current stage (teacher-forced
-            checks), then a longer systems-native session with --native-evaluations
+            checks), then a longer systems-native session with --native-evaluations;
+            once every stage of its plan beat the bar it keeps going (issue #164): a
+            re-profile of its best run says which stage has the most time left
         every --integrate-every kept results: measured re-integration
     every arm stopped: with --rounds > 1 and a real end-to-end gain in this round,
         re-profile the optimised model, re-plan with the prior rounds as context
@@ -84,6 +86,9 @@ LAST_ROWS = 15  # ledger rows of the arm in a slice digest
 NOTES_CHARS = 4000  # tail of NOTES.md in a slice digest
 IDEAS_CHARS = 2000
 MAX_FAILED_SLICES = 3  # agent sessions in a row that raised: something is broken, stop
+# a re-profile of the native arm's best run once its plan is done (issue #164): VoxCPM2's
+# round-2 re-profile took 75 s; the margin covers a model that loads slower
+NATIVE_REPROFILE_SECONDS = 300.0
 _IDEAS = re.compile(
     r"^#+[ \t]+[^\n]*\bideas?\b[^\n]*\n(.*?)(?=^#{1,6}[ \t]|\Z)", re.M | re.S | re.I
 )
@@ -336,6 +341,8 @@ def native_digest(
         lines.append(f"{i}. [{state}] {stage.describe()}{teacher}")
     if not status.plan:
         lines.append("* (no stage graph: no ceilings table; derive the stages from the profile)")
+    if status.complete:
+        lines += _after_plan(run, status, policy)
     module = [a for a in arms if a.kind == KERNEL]
     if module:
         lines += ["", "## Module arms (their kernels are your building blocks)"]
@@ -355,6 +362,44 @@ def native_digest(
         f"{policy.native_patience} the native arm is stopped.",
     ]
     return "\n".join(lines + _footer("NOTES.md"))
+
+
+def _after_plan(run: RunDir, status: native_engine.Status, policy: Policy) -> list[str]:
+    """The native digest once every stage of the plan beat the bar (issue #164): what is slow
+    now (the stage graph of the newest ceilings table), the focus, the stop rules."""
+    stop = f"{policy.sol_stop:.0%}" if policy.sol_stop else "100%"
+    lines = [
+        "",
+        "## After the staged plan",
+        "* Every stage of the plan beat the bar once: a note, not a stop. Keep improving your "
+        f"best run until {policy.native_patience} native runs in a row find no new best, "
+        f"{policy.native_hours or 0:g} h in native slices, or every stage runs at {stop} of "
+        "its floor.",
+    ]
+    if not status.graph:
+        lines.append(
+            "* (no stage graph: no ceilings table; find the slowest part with your own profile)"
+        )
+        return lines
+    lines.append(
+        f"* What is slow now, by time above the floor (`{status.table}`, the stage graph "
+        "derived again from the newest profile):"
+    )
+    for i, stage in enumerate(status.graph, 1):
+        mark = "**focus**" if status.stage is not None and stage.id == status.stage.id else ""
+        prefix = f"[{mark}] " if mark else ""
+        target = stage.target_id
+        check = (
+            f"; teacher-forced target `{target}`"
+            if target and run.capture_file(target).exists()
+            else ""
+        )
+        lines.append(f"  {i}. {prefix}{stage.describe()}{check}")
+    lines.append(
+        "* Work on the focus (name its projects after it), or on a group of these stages "
+        "fused across their boundaries (end to end) when that is where the time is."
+    )
+    return lines
 
 
 def rounds_context(
@@ -779,7 +824,10 @@ class Improver:
         try:
             if arm.kind == NATIVE:
                 evaluations = self.orch.cfg.native_evaluations or evaluations
-                stand = await self._native_stage()
+                stand = await self._native_stage(arm)
+                if note := stand.note():
+                    rec["note"] = note
+                    log(f"slice {n}: native: {note}")
                 digest = native_digest(self.run, arm, n, evaluations, self.policy, stand, arms)
                 results = [
                     await self.orch.native_slice(
@@ -827,12 +875,16 @@ class Improver:
         self._close(rec, status, usd=sum(r.cost_usd for r in results))
         return rec
 
-    async def _native_stage(self) -> native_engine.Status:
+    async def _native_stage(self, arm: Arm) -> native_engine.Status:
         """The native arm's staged plan and current stage; a stage with a module group is
         captured as its kernel target first (once), so the native session can check it
-        teacher forced (``evaluate_candidate``) before the end-to-end run."""
+        teacher forced (``evaluate_candidate``) before the end-to-end run. Once the plan is
+        done, the stage comes from a re-profile of the arm's best run
+        (:meth:`_native_reprofile`)."""
         columns = ceilings.columns(self.orch.allowed_precisions())
         status = native_engine.status(self.run, ledger.rows(self.run), columns)
+        if status.complete and await self._native_reprofile(arm):
+            status = native_engine.status(self.run, ledger.rows(self.run), columns)
         stage = status.stage
         if stage is None or stage.target_id is None:
             return status
@@ -854,6 +906,50 @@ class Improver:
             with self._doing(f"capture of native stage {stage.id}"):
                 await self.orch.capture_targets([spec])
         return status
+
+    async def _native_reprofile(self, arm: Arm) -> bool:
+        """Once every stage of the native plan beat the bar (issue #164): profile the model as
+        the arm's best run has it (its transforms and kernels, ``Orchestrator.e2e_items``)
+        into ``rounds/<n>/native/<k>/`` (``native.engine.reprofile_dir``), whose ceilings
+        table the stage graph is derived from again: the stage times moved. Once per best
+        run (``native_profiles`` in ``improve.json``, failures too); whether it wrote one."""
+        done = self.state.setdefault("native_profiles", [])
+        snapshot = arm.best_snapshot
+        if not snapshot or any(p.get("snapshot") == snapshot for p in done):
+            return False
+        left = self.orch.budget.agent_seconds_left()
+        if left is not None and left < NATIVE_REPROFILE_SECONDS + slice_seconds(arm):
+            return False  # no time for it and a slice: the newest table stands
+        k = len(done) + 1
+        out = native_engine.reprofile_dir(self.run, self.round, k)
+        rec: dict[str, Any] = {
+            "n": k,
+            "round": self.round,
+            "snapshot": snapshot,
+            "dir": str(out.relative_to(self.run.root)),
+            "started": _ts(),
+        }
+        items = self.orch.e2e_items(snapshot)
+        if not items:
+            rec["error"] = "its transforms or kernels are not verified snapshots"
+        else:
+            rec["items"] = [i["item"] for i in items]
+            log(f"native: the staged plan is done; re-profiling its best run {snapshot}")
+            ledger.event(self.run, "native_reprofile", n=k, snapshot=snapshot, items=rec["items"])
+            with self._doing(f"re-profile of the native best run ({snapshot})"):
+                info = await asyncio.to_thread(self.orch.reprofile, out, items)
+            if "error" in info or not info.get("median_ms"):
+                rec["error"] = str(info.get("error") or "no median_ms")[-500:]
+            else:
+                rec["median_ms"] = float(info["median_ms"])
+        rec["ended"] = _ts()
+        done.append(rec)
+        self.save()
+        if "error" in rec:
+            log(f"native: no re-profile of {snapshot}: {rec['error'][-300:]}")
+            return False
+        log(f"native: re-profiled {snapshot}: {rec['median_ms']:.1f} ms ({rec['dir']})")
+        return True
 
     def _team(self, arm: Arm, evaluations: int) -> list[workers.Seed]:
         """The worker sessions of a kernel slice ([]: one classic session). With

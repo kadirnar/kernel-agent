@@ -2409,7 +2409,11 @@ multi-file CUDA project, in the order of a staged plan derived from the ceilings
 table (topmost stages by time above their floor, then the loop body, then the
 loop; any model family). A stage is captured as a kernel target `native_<id>` and
 checked teacher forced on its recorded inputs, then end to end; each stage must
-beat the best module-level result end to end before the next starts. Sessions are
+beat the best module-level result end to end before the next starts. Once every
+stage has, the arm keeps going: the loop re-profiles the model as its best run has
+it (`rounds/<n>/native/<k>/`), derives the stages again from that profile and points
+the arm at the stage with the most time left above its floor, until its patience,
+its time cap or every stage at its floor stops it. Sessions are
 longer (`--native-minutes`, default 3 × `--agent-minutes`;
 `--native-evaluations 6`). Design: [docs/NATIVE.md](docs/NATIVE.md).
 

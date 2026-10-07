@@ -79,9 +79,11 @@ of stages or the whole generation loop natively. It waits while any kernel arm i
 has not plateaued (:func:`native_arm`), then competes like the others: ``remaining_ms`` is
 the run at the best module-level result end to end (``native.engine.bar``: integrations and
 the systems agent's runs), ``best`` its fastest native run over that bar, ``estimate``
-:attr:`Policy.native_estimate`; its stop rules use ``native_patience`` and ``native_hours``,
-and it stops when every stage of its staged plan has beaten the bar. Native stage targets
-(``spec.native``) are its own: they get no kernel arm.
+:attr:`Policy.native_estimate`; its stop rules use ``native_patience`` and ``native_hours``.
+Every stage of its staged plan beating the bar is a note (``Arm.note``), not a stop (issue
+#164): it then works on the stage with the most headroom left in the newest ceilings table
+and stops when every stage runs at ``sol_stop`` of its floor (``native.engine.at_floor``).
+Native stage targets (``spec.native``) are its own: they get no kernel arm.
 
 Time (issue #100): a slice of an arm needs the agent's warm-up, one evaluation
 of the arm and the wrap-up (:func:`slice_seconds`), and the run's time budget
@@ -226,6 +228,7 @@ class Arm:
     damp: float = 1.0  # decay ** stale (:func:`rank`)
     # kernels: why its precision is not one the run allows (precisions.py); it never runs
     refused: str | None = None
+    note: str | None = None  # native: its staged plan is done, and what it works on now
 
     @property
     def agent(self) -> str:
@@ -294,6 +297,7 @@ class Arm:
             "score": round(self.score, 3),
             "stop": self.stop,
             "why": self.why(),
+            **({"note": self.note} if self.note else {}),
         }
 
 
@@ -815,7 +819,9 @@ def _native_gate(
     allowed: Iterable[str] | None,
 ) -> None:
     """Hold the native arm while a kernel arm is live and has not plateaued (module kernels
-    first), and stop it once every stage of its staged plan beat the module-level bar."""
+    first). Once every stage of its staged plan beat the module-level bar, note it and keep
+    the arm live (issue #164): its patience and time cap still apply, and it stops when every
+    stage of the newest stage graph runs at ``sol_stop`` of its floor."""
     arm = next((a for a in arms if a.kind == NATIVE), None)
     if arm is None or arm.stop is not None:
         return
@@ -825,9 +831,10 @@ def _native_gate(
     if live:
         arm.stop = f"waiting: module arms still improving ({', '.join(live[:4])})"
         return
-    plan = native_engine.stages(run, ceilings.columns(allowed))
-    if plan and native_engine.current(plan, rows) is None:
-        arm.stop = "every stage of the native plan beat the best module-level result"
+    status = native_engine.status(run, rows, ceilings.columns(allowed))
+    if status.complete:
+        arm.note = status.note()
+        arm.stop = native_engine.at_floor(status.graph, policy.sol_stop)
 
 
 # ------------------------------------------------------------------ decisions

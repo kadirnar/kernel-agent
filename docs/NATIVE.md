@@ -43,7 +43,9 @@ appears only as the worked example in §10.
   the library's best kernels as building blocks; the improve loop opens the native arm only
   with `--native on` or when the plan asks for it (`--native plan`, the default), and only
   once every module arm has stopped or plateaued. Each stage must beat the best
-  module-level result end to end before the next one starts.
+  module-level result end to end before the next one starts; once every stage has, the
+  arm keeps going on the stage with the most time left above its floor in a re-profile of
+  its best run, until its patience, its time cap or the floor stops it (#164).
 
 ## 1. When module kernels plateau
 
@@ -85,7 +87,8 @@ Patterns, per model family:
 ## 3. Deriving targets from the profile: the stage graph
 
 `native.engine.stage_graph(table)` reads the newest ceilings table (`profile/ceilings.json`,
-or a round's re-profile): one row per module class at one instance group and phase, with
+a round's re-profile, or the native arm's re-profile of its best run once its plan is done,
+§9): one row per module class at one instance group and phase, with
 `now_ms`, `share`, `calls` per run, `instances` and the floor per precision.
 
 1. **Stages**: the rows with at least `MIN_SHARE` (5 %) of the run that contain other rows
@@ -245,8 +248,22 @@ A `native` session (role `native` in `program.md`):
   bar, `estimate` `Policy.native_estimate` (1.3), and its runs are recorded with the ledger
   backend `native` (no longer the systems agent's).
 * Before a native slice the loop captures the current stage's target once.
-* The arm stops when every stage of the staged plan has a native run that beat the bar, by
-  its patience or time cap, or when the budget ends.
+* An integration measurement that includes one of the arm's own items (its projects and
+  stage targets, `engine.own_items`) is the arm's result, not a module-level one: an
+  integration that accepted native items does not raise the bar (else the arm's runs would
+  stop counting as new bests after every re-integration, and its patience would run out).
+* **After the plan** (#164): every stage of the staged plan beating the bar once is a note
+  (`Arm.note`, the slice record and log), not a stop. Before the next native slice the loop
+  re-profiles the model as the arm's best run has it (its transforms and kernels, verified
+  snapshots: `Orchestrator.e2e_items`; `rounds/<n>/native/<k>/`, once per best run, a
+  minute or two), the stage graph is derived again from that table (the stage times
+  moved), and the arm works on the stage with the most time left above its floor
+  (`engine.focus`). The digest's *After the staged plan* section lists the whole graph with
+  the focus marked, so the agent may take a group scope instead when the time sits between
+  the stages.
+* The arm stops by its patience (`native_patience` runs in a row without a new best), its
+  time cap (`native_hours`), when every stage of the newest stage graph runs at `sol_stop`
+  (90 %) or more of its floor (`engine.at_floor`), or when the budget ends.
 
 ## 10. Worked example: VoxCPM2 on one RTX 5070 Ti
 
@@ -299,7 +316,9 @@ subprocess, the evaluator, sweep binding, patcher and tools accepting projects (
 candidate passes the CPU evaluation; a thread it leaves running is an integrity violation),
 the stage graph for diffusion, LLM and multi-stage loops, the planner entry, the gate, the
 native arm's scoring and stop rules, and a dry-run improve loop that reaches the native arm
-after the module arms.
+after the module arms; and (#164) the focus and floor rule after the plan, the newest-table
+order with native re-profiles, the bar without the arm's own integrated items, and a dry run
+whose plan is done early and whose arm keeps going until its patience stops it.
 
 Not run here (no GPU in this PR): the template project's `torch_extension` build with nvcc
 and its GPU evaluation (`pytest -m gpu tests/test_native_project.py`,

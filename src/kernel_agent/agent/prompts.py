@@ -1108,7 +1108,9 @@ digest) so compiler errors cost no evaluation.
 # The staged plan
 Work on the **current** stage of the digest. A stage counts only when a native end-to-end
 run of it beats the bar (the best module-level result end to end); only then start the
-next. Measure the stage alone first (its target), then end to end on top of the accepted
+next. Once every stage has, keep improving your best run on the digest's **focus** (the
+stage with the most time left above its floor in a re-profile of your best run). Measure
+the stage alone first (its target), then end to end on top of the accepted
 kernels (`kernels=[...]` from the list above).
 
 Budget: about {evaluations} evaluations; a native session is longer than a kernel session,
