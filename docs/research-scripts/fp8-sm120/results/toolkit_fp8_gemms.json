@@ -1,0 +1,578 @@
+[
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "bf16_cublas",
+  "rel_l2": 0.0,
+  "eager_us": 15.93,
+  "graph_us": 13.89,
+  "tflops": 29.0
+ },
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "torch_scaled_mm_rowwise",
+  "rel_l2": 0.0375,
+  "eager_us": 90.01,
+  "graph_us": 26.25,
+  "tflops": 15.3
+ },
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "cute_block_scaled",
+  "rel_l2": 0.0375,
+  "eager_us": 30.19,
+  "graph_us": 17.3,
+  "tflops": 23.3
+ },
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "cublaslt_tensorwise",
+  "rel_l2": 0.0376,
+  "eager_us": 32.79,
+  "graph_us": 13.28,
+  "tflops": 30.3
+ },
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "cublaslt_mxfp8",
+  "rel_l2": 0.0376,
+  "eager_us": 33.49,
+  "graph_us": 18.8,
+  "tflops": 21.4
+ },
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "triton_dot_scaled",
+  "rel_l2": 0.0375,
+  "eager_us": 52.9,
+  "graph_us": 9.74,
+  "tflops": 41.3
+ },
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "triton_mxfp8",
+  "rel_l2": 0.0376,
+  "eager_us": 107.1,
+  "graph_us": 18.03,
+  "tflops": 22.3
+ },
+ {
+  "shape": [
+   16,
+   2048,
+   6144
+  ],
+  "path": "cuda_skinny",
+  "rel_l2": 0.0266,
+  "eager_us": 14.12,
+  "graph_us": 12.82,
+  "tflops": 31.4
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "bf16_cublas",
+  "rel_l2": 0.0,
+  "eager_us": 27.56,
+  "graph_us": 25.43,
+  "tflops": 72.6
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "torch_scaled_mm_rowwise",
+  "rel_l2": 0.0374,
+  "eager_us": 89.21,
+  "graph_us": 28.48,
+  "tflops": 64.8
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "cute_block_scaled",
+  "rel_l2": 0.0374,
+  "eager_us": 31.54,
+  "graph_us": 10.13,
+  "tflops": 182.2
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "cublaslt_tensorwise",
+  "rel_l2": 0.0374,
+  "eager_us": 33.76,
+  "graph_us": 15.32,
+  "tflops": 120.5
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "cublaslt_mxfp8",
+  "rel_l2": 0.0378,
+  "eager_us": 34.63,
+  "graph_us": 11.39,
+  "tflops": 162.0
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "triton_dot_scaled",
+  "rel_l2": 0.0374,
+  "eager_us": 53.09,
+  "graph_us": 10.66,
+  "tflops": 173.1
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "triton_mxfp8",
+  "rel_l2": 0.0378,
+  "eager_us": 105.55,
+  "graph_us": 11.49,
+  "tflops": 160.6
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   2560
+  ],
+  "path": "cuda_skinny",
+  "rel_l2": 0.0265,
+  "eager_us": 33.28,
+  "graph_us": 31.86,
+  "tflops": 57.9
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "bf16_cublas",
+  "rel_l2": 0.0,
+  "eager_us": 70.87,
+  "graph_us": 69.15,
+  "tflops": 85.4
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "torch_scaled_mm_rowwise",
+  "rel_l2": 0.0374,
+  "eager_us": 93.31,
+  "graph_us": 53.94,
+  "tflops": 109.5
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "cute_block_scaled",
+  "rel_l2": 0.0374,
+  "eager_us": 30.52,
+  "graph_us": 24.93,
+  "tflops": 236.9
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "cublaslt_tensorwise",
+  "rel_l2": 0.0375,
+  "eager_us": 43.4,
+  "graph_us": 36.69,
+  "tflops": 161.0
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "cublaslt_mxfp8",
+  "rel_l2": 0.0377,
+  "eager_us": 34.99,
+  "graph_us": 26.28,
+  "tflops": 224.7
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "triton_dot_scaled",
+  "rel_l2": 0.0374,
+  "eager_us": 55.72,
+  "graph_us": 33.14,
+  "tflops": 178.2
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "triton_mxfp8",
+  "rel_l2": 0.0377,
+  "eager_us": 106.52,
+  "graph_us": 26.56,
+  "tflops": 222.3
+ },
+ {
+  "shape": [
+   352,
+   1024,
+   8192
+  ],
+  "path": "cuda_skinny",
+  "rel_l2": 0.0265,
+  "eager_us": 124.04,
+  "graph_us": 97.59,
+  "tflops": 60.5
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "bf16_cublas",
+  "rel_l2": 0.0,
+  "eager_us": 40.99,
+  "graph_us": 38.94,
+  "tflops": 75.8
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "torch_scaled_mm_rowwise",
+  "rel_l2": 0.0376,
+  "eager_us": 91.96,
+  "graph_us": 59.23,
+  "tflops": 49.9
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "cute_block_scaled",
+  "rel_l2": 0.0376,
+  "eager_us": 32.12,
+  "graph_us": 28.48,
+  "tflops": 103.7
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "cublaslt_tensorwise",
+  "rel_l2": 0.0376,
+  "eager_us": 34.95,
+  "graph_us": 20.83,
+  "tflops": 141.8
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "cublaslt_mxfp8",
+  "rel_l2": 0.0378,
+  "eager_us": 35.24,
+  "graph_us": 31.46,
+  "tflops": 93.9
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "triton_dot_scaled",
+  "rel_l2": 0.0376,
+  "eager_us": 54.28,
+  "graph_us": 18.69,
+  "tflops": 158.0
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "triton_mxfp8",
+  "rel_l2": 0.0378,
+  "eager_us": 105.93,
+  "graph_us": 32.93,
+  "tflops": 89.7
+ },
+ {
+  "shape": [
+   352,
+   4096,
+   1024
+  ],
+  "path": "cuda_skinny",
+  "rel_l2": 0.0267,
+  "eager_us": 48.08,
+  "graph_us": 46.56,
+  "tflops": 63.4
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "bf16_cublas",
+  "rel_l2": 0.0,
+  "eager_us": 718.36,
+  "graph_us": 730.71,
+  "tflops": 94.0
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "torch_scaled_mm_rowwise",
+  "rel_l2": 0.0375,
+  "eager_us": 663.63,
+  "graph_us": 652.77,
+  "tflops": 105.3
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "cute_block_scaled",
+  "rel_l2": 0.0375,
+  "eager_us": 244.53,
+  "graph_us": 259.04,
+  "tflops": 265.3
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "cublaslt_tensorwise",
+  "rel_l2": 0.0376,
+  "eager_us": 256.01,
+  "graph_us": 268.43,
+  "tflops": 256.0
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "cublaslt_mxfp8",
+  "rel_l2": 0.0378,
+  "eager_us": 262.06,
+  "graph_us": 263.04,
+  "tflops": 261.3
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "triton_dot_scaled",
+  "rel_l2": 0.0375,
+  "eager_us": 352.26,
+  "graph_us": 352.08,
+  "tflops": 195.2
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "triton_mxfp8",
+  "rel_l2": 0.0378,
+  "eager_us": 274.18,
+  "graph_us": 267.86,
+  "tflops": 256.5
+ },
+ {
+  "shape": [
+   2048,
+   4096,
+   4096
+  ],
+  "path": "cuda_skinny",
+  "rel_l2": 0.0266,
+  "eager_us": 1128.58,
+  "graph_us": 1123.38,
+  "tflops": 61.2
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "bf16_cublas",
+  "rel_l2": 0.0,
+  "eager_us": 11224.7,
+  "graph_us": 11260.97,
+  "tflops": 97.6
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "torch_scaled_mm_rowwise",
+  "rel_l2": 0.0375,
+  "eager_us": 8726.64,
+  "graph_us": 8717.91,
+  "tflops": 126.1
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "cute_block_scaled",
+  "rel_l2": 0.0375,
+  "eager_us": 5568.35,
+  "graph_us": 5586.43,
+  "tflops": 196.8
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "cublaslt_tensorwise",
+  "rel_l2": 0.0375,
+  "eager_us": 3955.56,
+  "graph_us": 3951.73,
+  "tflops": 278.2
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "cublaslt_mxfp8",
+  "rel_l2": 0.0377,
+  "eager_us": 3716.41,
+  "graph_us": 3746.01,
+  "tflops": 293.5
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "triton_dot_scaled",
+  "rel_l2": 0.0375,
+  "eager_us": 5526.4,
+  "graph_us": 5568.75,
+  "tflops": 197.4
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "triton_mxfp8",
+  "rel_l2": 0.0377,
+  "eager_us": 3756.9,
+  "graph_us": 3775.65,
+  "tflops": 291.2
+ },
+ {
+  "shape": [
+   8192,
+   8192,
+   8192
+  ],
+  "path": "cuda_skinny",
+  "rel_l2": 0.0266,
+  "eager_us": 12780.24,
+  "graph_us": 12793.12,
+  "tflops": 85.9
+ }
+]
