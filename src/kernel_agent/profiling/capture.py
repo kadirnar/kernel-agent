@@ -22,7 +22,10 @@ While recording, every call of the target's instances (not only the saved
 cases) feeds :class:`~kernel_agent.profiling.workload_stats.WorkloadStats`,
 written to ``workload_profile.md`` / ``.json`` (in the target directory). A
 target with a ``phase`` (:mod:`kernel_agent.phases`) records only that phase's
-calls as cases; ``qualname_regex`` restricts the instances it covers.
+calls as cases; ``qualname_regex`` restricts the instances it covers. Their calls
+are also counted per instance and primary input: each case's ``target_calls``
+(the calls of every instance with its primary input it stands for) and the
+``instance_groups`` weight the estimated saving (:mod:`kernel_agent.kernels.weights`).
 
 Correctness coverage beyond one call per signature:
 
@@ -59,6 +62,7 @@ from kernel_agent.profiling.methods import (
 )
 from kernel_agent.profiling.profiler import call_signature, signature_of
 from kernel_agent.profiling.workload_stats import WorkloadStats, write_profile
+from kernel_agent.projection import fold
 from kernel_agent.workloads.base import Workload, synchronize
 
 #: A storage is copied compactly only when that saves at least this many bytes.
@@ -186,6 +190,11 @@ class _Recorder:
         self.calls: collections.Counter[str] = collections.Counter()
         #: Entrypoint -> ids of the instances (``module`` and peers) that called it.
         self.callers: dict[str, set[int]] = collections.defaultdict(set)
+        #: (entrypoint, primary input) -> calls per instance id (``module`` and peers): the
+        #: calls of the target's instances each case stands for (``kernels/weights.py``).
+        self.instance_calls: dict[tuple[str, str], collections.Counter[int]] = (
+            collections.defaultdict(collections.Counter)
+        )
         #: Per open call: (key, (bucket, decode step) or None, args, kwargs), or None.
         self._pending: list[tuple[tuple[str, str], tuple[str, int] | None, Any, Any] | None] = []
         self._ctx: Any = instrument(
@@ -200,17 +209,18 @@ class _Recorder:
         if self.stats is not None:
             self.stats.observe(module, method, args, kwargs, phase)
         wanted = self.phase is None or phase == self.phase
-        if wanted:
+        # Group calls by entrypoint and primary input only: decode steps share
+        # it even though masks / cache positions grow every step.
+        key = (method, call_signature(method, args, kwargs, limit=1)) if wanted else None
+        if key is not None:
             self.callers[method].add(id(module))
+            self.instance_calls[key][id(module)] += 1
         if module is not self.module:
             return
-        if not wanted:
+        if key is None:
             self._pending.append(None)
             return
         self.calls[method] += 1
-        # Group calls by entrypoint and primary input only: decode steps share
-        # it even though masks / cache positions grow every step.
-        key = (method, call_signature(method, args, kwargs, limit=1))
         index = self._index[key]
         self._index[key] += 1
         plan = bucket_plan(self.steps.get(key, 0)) if phase == "decode" else []
@@ -286,14 +296,38 @@ class _Recorder:
 
     def recorded(self) -> list[dict[str, Any]]:
         """The cases, most-called signature first, each followed by its middle / last
-        decode-step cases; bucketed cases share their signature's calls by bucket."""
+        decode-step cases; bucketed cases share their signature's calls by bucket.
+
+        ``target_calls``: the calls of every instance with the case's entrypoint and
+        primary input that it stands for (its ``count`` × theirs ÷ the captured
+        instance's), the weight of its gain in the estimated saving (``kernels/weights.py``)."""
         out: list[dict[str, Any]] = []
         for key, case in sorted(self.cases.items(), key=lambda kv: -kv[1]["count"]):
             members = [case, *self.extra.get(key, [])]
             if any("bucket" in c for c in members):
                 _split_calls(members, total=case["count"])
+            per = self.instance_calls.get(key) or collections.Counter()
+            scale = sum(per.values()) / max(per[id(self.module)], 1)
+            for member in members:
+                member["target_calls"] = round(member["count"] * scale, 3)
             out += members
         return out
+
+    def instance_groups(self, qualnames: dict[int, str]) -> dict[str, dict[str, int]]:
+        """Instance group (qualname with layer indices folded) → its ``instances``, their
+        ``calls`` and the calls with a primary input a case has (``covered``)."""
+        groups: dict[str, dict[str, int]] = {}
+        for full in qualnames.values():
+            group = groups.setdefault(fold(full), {"instances": 0, "calls": 0, "covered": 0})
+            group["instances"] += 1
+        for key, per in self.instance_calls.items():
+            for mid, n in per.items():
+                group = groups.setdefault(
+                    fold(qualnames.get(mid, "")), {"instances": 0, "calls": 0, "covered": 0}
+                )
+                group["calls"] += n
+                group["covered"] += n if key in self.cases else 0
+        return groups
 
 
 def _split_calls(members: list[dict[str, Any]], total: int) -> None:
@@ -406,6 +440,7 @@ def _record_variant(
     for case in cases:
         case.update(
             count=0,
+            target_calls=0,
             correctness_only=True,
             variant=label,
             signature=f"{case['signature']} [correctness only: {label}]",
@@ -504,6 +539,10 @@ def capture_module(
     # Instances that call each entrypoint (VoxCPM: forward_step only on the LM
     # layers, forward on every MiniCPMAttention) – weights the estimated saving.
     method_instances = {m: len(ids) for m, ids in recorder.callers.items()}
+    # The calls of every instance group, and those a case stands for (target_calls): the
+    # weights of the estimated saving (kernels/weights.py).
+    qualnames = {id(m): q for q, m in [*candidates, (full, module)]}
+    instance_groups = recorder.instance_groups(qualnames)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -513,6 +552,7 @@ def capture_module(
             "module_path": f"{type(module).__module__}.{type(module).__qualname__}",
             "instances": len(candidates) or count_calls(roots, cls),
             "method_instances": method_instances,
+            "instance_groups": instance_groups,
             "methods": calls,
             "cases": cases,
             **({"phase": phase} if phase else {}),
@@ -526,11 +566,13 @@ def capture_module(
         # calls per run of this instance, per entrypoint (captured or not)
         "methods": calls,
         "method_instances": method_instances,
+        "instance_groups": instance_groups,
         "cases": [
             {
                 "method": c["method"],
                 "signature": c["signature"],
                 "count": c["count"],
+                "target_calls": c["target_calls"],
                 **{k: c[k] for k in ("bucket", "correctness_only") if k in c},
             }
             for c in cases

@@ -111,6 +111,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "correct",
             "speedup",
             "est_saved_ms_per_run",
+            "est_saved_calls",  # the calls it stands for (kernels/weights.py)
             "ref_ms_weighted",
             "new_ms_weighted",
             "error",
@@ -145,6 +146,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             for k in (
                 "signature",
                 "calls_per_run",
+                "target_calls",
                 "ok",
                 "max_abs_err",
                 "min_cosine",

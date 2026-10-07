@@ -73,6 +73,7 @@ from kernel_agent.budget import (
     Standing,
     improves,
 )
+from kernel_agent.kernels import weights
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
@@ -261,13 +262,8 @@ def _region_ref_ms(
     users = (spec.get("capture") or {}).get("method_instances") or {}
     for rec in reversed(read_jsonl(run.results_file(target_id))):
         timed = [c for c in rec.get("cases") or [] if c.get("ref_ms") is not None]
-        if timed:
-            per_run = sum(
-                float(c["ref_ms"])
-                * float(c.get("calls_per_run") or 0)
-                * float(users.get(c.get("method") or "forward", 1))
-                for c in timed
-            )
+        if timed:  # × the calls each case stands for, as the evaluator (kernels/weights.py)
+            per_run = sum(float(c["ref_ms"]) * weights.case_weight(c, users) for c in timed)
             ms = projection.units_of(run, [target_id])(target_id, per_run)
             if ms is not None:
                 return ms

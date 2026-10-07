@@ -608,8 +608,9 @@ A workload that cannot time the requested metric is refused before the run
 starts. For `throughput` the profile covers the whole batched run (its value is
 a rate).
 
-A kernel's estimated saving (`est_saved_ms_per_run`: its gain per call × its
-calls per run) is in ms per run of the workload, not in the metric. Wherever it
+A kernel's estimated saving (`est_saved_ms_per_run`: its gain per call × the
+calls of the target's instances its cases stand for, see "Calls behind a kernel's
+estimate") is in ms per run of the workload, not in the metric. Wherever it
 meets the metric (the projections of `integration.json`, `status`, `watch`, the
 dashboard, `progress.png`, `amdahl.png`, `report.md`, and the improve
 scheduler's region arms) it is converted first by one helper,
@@ -623,11 +624,12 @@ scheduler's region arms) it is converted first by one helper,
   323 ms itself and projected −746 ms for a set measured at 6.8 ms. With the
   conversion the projection is 12.8 ms.
 * `ttfa`: the capture times a full streamed run, so only the calls inside the
-  first-audio window count. The estimate's gain per call (its cases' calls per run ×
-  the instances calling their entrypoint, the evaluator's weights) is multiplied by
-  the calls of the target's instances in the profile, which is taken inside the
-  window: its class (a region: its parent class), its `phase`, and the instance
-  groups its `qualname_regex` matches (`classes[].work`). A class the window's
+  first-audio window count. The estimate's gain per call (over the calls its cases
+  stand for, the evaluator's weights) is multiplied by the calls of the target's
+  instances in the profile, which is taken inside the window: its class (a region:
+  its parent class), its `phase`, and the instance groups its `qualname_regex`
+  matches (`classes[].work`), times the share of the run's calls a case stands for
+  (`instance_groups` of the capture). A class the window's
   profile never saw makes no call before the first audio. Without a profile, a
   capture, or the per-group calls a regex needs, the share is unknown. Such a target
   is not projected, and the views say so (`not projected (its calls inside the
@@ -1096,6 +1098,41 @@ most of them, unless `qualname` is set). Integration keeps the instance and
 sends only that phase's calls of the captured entrypoints to the kernel. The
 other calls keep the reference, so a `prefill` and a `decode` target on the
 same class combine. `optimized/apply.py` applies them the same way.
+
+### Calls behind a kernel's estimate
+
+The evaluator times the cases of one captured instance. A kernel's estimated
+saving (`est_saved_ms_per_run`) is Σ over the timed cases of (reference −
+candidate ms per call) × the calls per run of the target's instances that the
+case stands for (`target_calls` in each case report,
+`kernel_agent/kernels/weights.py`). The capture counts every call of the
+target's instances (in its `phase`) per entrypoint and primary input. A case
+therefore stands for the calls of every instance with its primary input. Calls
+with a primary input that no case has are not counted, because no case times
+them. The capture and `spec.json` keep these counts per instance group
+(qualname with layer indices folded) in `instance_groups`: the instances, their
+calls, and the calls a case covers. Every evaluation records its basis, e.g.
+`est_saved_calls: {"basis": "instance groups", "calls": 6480, "uncovered": 732}`.
+
+On VoxCPM2 the `dit_layer` target (`MiniCPMDecoderLayer`, `qualname_regex`
+`feat_decoder\.|feat_encoder\.`) keeps a LocDiT layer: 540 calls at
+`[32, 11, 1024]`. The 12 LocDiT layers make 6,480 such calls. The 12 LocEnc
+layers make 732 calls at `[16, 5, 1024]` and `[272, 5, 1024]`, which no case
+has.
+
+A capture written before #119 has no per-instance counts. Its estimate keeps the
+*even split* (`basis: "even split"`): the captured instance's calls × the
+instances that call the case's entrypoint, here 540 × 24 = 12,960 calls for the
+7,212 of the run. On `20261006-004718-retest2` that made the integrated
+`dit_layer` kernel save 4,651 ms per run (30.3 ms per second of audio).
+Weighted by the calls its case stands for, it saves 2,325 ms per run (15.1 ms
+per second of audio). Measured alone in the integration, it saved 18.5 ms per
+second of audio.
+
+The `ttfa` window share, the improve scheduler's region arms and the projection
+tree use the same weights. The tree spreads a target's saving over its instance
+groups by the calls its cases stand for. `report.md` lists the calls behind
+each estimate under the kernel table.
 
 ### Region targets: fusions across module boundaries
 
@@ -2308,7 +2345,9 @@ with layer indices folded (`classes[].groups`, e.g.
 `model.base_lm.layers.*.self_attn: 28`). Older profiles only have one example
 qualname per class plus each target's captured instance; there the
 instances are split evenly over the known qualnames. Each target's saving is
-spread evenly over its instances. Per parent instance the projection takes
+spread over its instance groups by the calls its cases stand for (see "Calls
+behind a kernel's estimate"; evenly over its instances for a capture from
+before #119). Per parent instance the projection takes
 the better of the parent's kernel alone and the sum of what its children
 count. A parent that holds only some of a child's instances replaces only
 that share of the child. On VoxCPM2 the LocEnc holds 12 of the 60 decoder
@@ -2317,8 +2356,8 @@ and `report.md` name the set that was counted, for example `projected from
 attn_fused + rmsnorm_fused + mlp_fused; not counted (nested):
 decoder_layer_fused, locenc_fused`. A target counted only in part shows its
 share, as in `decoder_layer_fused (80%)`. Approximations: the even split
-over instances (the evaluator scales the captured instance's gain by the
-instances calling each entrypoint), and a phase-specific parent is taken
+over instances of a capture from before #119 (the evaluator scaled the
+captured instance's gain by the instances calling each entrypoint), and a phase-specific parent is taken
 to replace all of its children's saving. Two targets on the same instances
 with different `phase` add up.
 

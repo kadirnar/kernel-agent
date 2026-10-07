@@ -10,7 +10,7 @@ from kernel_agent.agent import auth
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
-from kernel_agent.kernels import recheck
+from kernel_agent.kernels import recheck, weights
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 
@@ -22,6 +22,25 @@ def _fmt(v: Any, nd: int = 3) -> str:
 
 def _x(v: float | None) -> str:
     return "—" if v is None else f"{v:.2f}x"
+
+
+def _calls(target_id: str, spec: dict[str, Any], rec: dict[str, Any]) -> str:
+    """The calls a kernel's estimate counts (``est_saved_calls``, :mod:`kernel_agent.kernels.
+    weights`): those of the target's instances its cases stand for, and the calls with a
+    primary input no case has; an even split over several instances is named ("": one
+    instance, nothing to say)."""
+    calls = rec.get("est_saved_calls") or {}
+    if calls.get("basis") == weights.INSTANCE_GROUPS:
+        rest, n = float(calls.get("uncovered") or 0), float(calls.get("calls") or 0)
+        tail = f" (not {rest:,.0f} with a primary input no case has)" if rest else ""
+        return f"`{target_id}` {n:,.0f} call{'' if n == 1 else 's'}{tail}"
+    users = (spec.get("capture") or {}).get("method_instances") or {}
+    if max((int(n or 0) for n in users.values()), default=1) <= 1:
+        return ""
+    return (
+        f"`{target_id}` even split (the captured instance's calls × the instances calling "
+        "its entrypoint: a capture without per-instance counts, before #119)"
+    )
 
 
 def _chart(run: RunDir, path: Path, alt: str) -> list[str]:
@@ -192,11 +211,14 @@ def write_report(run: RunDir) -> Path:
         "|---|---|---|---|---|---|---|" + ("---|" if other else ""),
     ]
     saved: dict[str, float | None] = {}
+    counted: list[str] = []  # the calls behind each estimate (kernels/weights.py)
     for target_id in run.target_ids():
         spec = read_json(run.target(target_id) / "spec.json", {})
         records = read_jsonl(run.results_file(target_id))
         best = best_for_target(run, target_id)
         saved[target_id] = ledger._num((best or {}).get("est_saved_ms_per_run"))
+        if best and saved[target_id] is not None and (note := _calls(target_id, spec, best)):
+            counted.append(note)
         mine = f" {_fmt(units(target_id, saved[target_id]))} |" if other else ""
         lines.append(
             f"| `{target_id}` | `{spec.get('module_class')}` | "
@@ -212,12 +234,21 @@ def write_report(run: RunDir) -> Path:
                     if case.get("pct_of_sol") is not None
                     else ""
                 )
+                calls, weight = case.get("calls_per_run"), case.get("target_calls")
+                if weight is not None and calls is not None and weight != calls:
+                    calls = f"{calls} (×{weight:,.0f} over the target's instances)"
                 lines.append(
-                    f"|  ↳ `{case.get('signature', '')[:60]}` ×{case.get('calls_per_run')} | | | | "
+                    f"|  ↳ `{case.get('signature', '')[:60]}` ×{calls} | | | | "
                     f"{_fmt(case.get('speedup'))} ({_fmt(case.get('ref_ms'), 4)} → "
                     f"{_fmt(case.get('new_ms'), 4)} ms{sol}) | | |" + (" |" if other else "")
                 )
     lines.append("")
+    if counted:
+        lines += [
+            "Calls behind the estimates (a case's gain per call × the calls of the target's "
+            "instances it stands for): " + "; ".join(counted) + ".",
+            "",
+        ]
     proj = projection.of_run(run, saved, ledger._num(baseline.get("median_ms")), units)
     if proj and proj.used:
         lines += [
