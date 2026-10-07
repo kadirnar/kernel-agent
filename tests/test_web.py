@@ -160,21 +160,23 @@ def test_run_agent_guards_and_records_the_web_tools(tmp_path, monkeypatch):
         return asyncio.run(runner.run_agent("a", **common, **kwargs))
 
     out = run_agent(OptimizeConfig(model_ref="m", web_domains=["example.org"]))
-    (matcher,) = seen[-1].hooks["PreToolUse"]
+    files_guard, matcher = seen[-1].hooks["PreToolUse"]  # the Claude files guard (#126) first
+    assert files_guard.matcher == runner.WRITE_TOOLS
     assert matcher.matcher == "WebFetch|WebSearch" and "WebFetch" in seen[-1].allowed_tools
     assert decide(matcher, "WebFetch", url="https://example.org/") == {}  # allowed
     assert [(i["url"], i["status"], i["code"]) for i in out.web] == [(DOC, "ok", 200)]
     assert out.tool_calls == {"WebFetch": 1}
 
-    plan = tmp_path / "plan.md"  # with the write guard: both hooks
+    plan = tmp_path / "plan.md"  # write guard + Claude files guard + web guard
     run_agent(OptimizeConfig(model_ref="m"), tools=["Read", "Write"], writable=[plan])
     assert [m.matcher for m in seen[-1].hooks["PreToolUse"]] == [
         runner.WRITE_TOOLS,
+        runner.WRITE_TOOLS,
         "WebFetch|WebSearch",
     ]
-    out = run_agent(OptimizeConfig(model_ref="m", allow_web=False))  # --no-web
-    assert seen[-1].hooks is None and "WebFetch" not in seen[-1].allowed_tools
-    assert out.web == []
+    out = run_agent(OptimizeConfig(model_ref="m", allow_web=False))  # --no-web: no web guard
+    assert [m.matcher for m in seen[-1].hooks["PreToolUse"]] == [runner.WRITE_TOOLS]
+    assert "WebFetch" not in seen[-1].allowed_tools and out.web == []
 
 
 def test_orchestrator_records_lookups_in_costs_sources_and_the_report(tmp_path, monkeypatch):

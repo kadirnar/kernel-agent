@@ -201,8 +201,7 @@ async def run_agent(
     result = result or AgentResult(name=name)
     lookups = web.Lookups(result.web, cfg.web_domains) if cfg.allow_web else None
     if lookups is not None:  # WebFetch to documentation domains only, every lookup recorded
-        options.hooks = options.hooks or {}
-        options.hooks.setdefault("PreToolUse", []).append(lookups.guard())
+        hooks["PreToolUse"].append(lookups.guard())
     result.is_error, result.usage_limit = False, None
     usd, turns_before, seconds = result.cost_usd, result.turns, result.seconds  # resumed: > 0
     watch = auth.LimitWatch()
