@@ -261,9 +261,10 @@ A `native` session (role `native` in `program.md`):
   (`engine.focus`). The digest's *After the staged plan* section lists the whole graph with
   the focus marked, so the agent may take a group scope instead when the time sits between
   the stages.
-* The arm stops by its patience (`native_patience` runs in a row without a new best), its
-  time cap (`native_hours`), when every stage of the newest stage graph runs at `sol_stop`
-  (90 %) or more of its floor (`engine.at_floor`), or when the budget ends.
+* The arm retires for the round (#166: its time goes to the other arms; a new round's
+  profile can bring it back) by its patience (`native_patience` runs in a row without a
+  new best), its time cap (`native_hours`), or when every stage of the newest stage graph
+  runs at `sol_stop` (90 %) or more of its floor (`engine.at_floor`); the budget ends it.
 
 ## 10. Worked example: VoxCPM2 on one RTX 5070 Ti
 

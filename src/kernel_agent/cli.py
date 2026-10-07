@@ -646,11 +646,18 @@ def main(argv: list[str] | None = None) -> int:
         help="continuous loop: slices for the targets that pay most, until budget or plateau",
         description="MODEL is a run directory to continue or a Hugging Face URL / repo id to "
         "start (analyze, plan and capture first). --max-hours / --max-usd are the budget of "
-        "this invocation; without them it runs until every target has stopped.",
+        "this invocation, and it uses all of it: when every target has stopped it starts a "
+        "new round (re-profile, re-plan); without them it runs until a round brings no gain.",
     )
     _add_run_args(p)
     p.add_argument("--slice", type=int, default=4, help="evaluations per slice (one session)")
-    p.add_argument("--rounds", type=int, default=1, help="re-profile + re-plan rounds (1 = none)")
+    p.add_argument(
+        "--rounds",
+        type=int,
+        default=None,
+        help="re-profile + re-plan rounds (default: as many as the budget allows; without "
+        "--max-hours / --max-usd / --max-sessions while each round brings a gain; 1: none)",
+    )
     p.add_argument(
         "--integrate-every",
         type=int,
@@ -666,12 +673,25 @@ def main(argv: list[str] | None = None) -> int:
         "a third of --max-hours; a longer one runs past it; 0: none)",
     )
     p.add_argument(
-        "--patience", type=int, default=5, help="stop a target after this many evals w/o a gain"
+        "--patience",
+        type=int,
+        default=5,
+        help="retire a target for the round after this many evals w/o a gain",
     )
-    p.add_argument("--sol-stop", type=float, default=0.9, help="stop at this share of SOL (0: off)")
-    p.add_argument("--target-hours", type=float, default=2.0, help="time cap per target (0: off)")
     p.add_argument(
-        "--speedup-goal", type=float, default=2.0, help="stop a target at this speedup (0: off)"
+        "--sol-stop",
+        type=float,
+        default=0.9,
+        help="retire a target for the round at this share of its recipe's roofline (0: off)",
+    )
+    p.add_argument(
+        "--target-hours", type=float, default=2.0, help="time per target and round (0: off)"
+    )
+    p.add_argument(
+        "--speedup-goal",
+        type=float,
+        default=2.0,
+        help="retire a target for the round once it gained this speedup in it (0: off)",
     )
     p.add_argument("--max-slices", type=int, help="stop after this many slices")
     p.add_argument(

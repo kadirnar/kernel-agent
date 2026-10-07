@@ -444,7 +444,7 @@ def test_dry_run_reaches_the_native_arm_after_the_module_arms(tmp_path):
     orch, world = make(tmp_path, native="on", native_evaluations=2)
     policy = Policy(patience=2, native_patience=2, target_hours=0.5)
     improver = Improver(
-        orch, ImproveConfig(policy=policy), require_capture=False, live_charts=False
+        orch, ImproveConfig(policy=policy, rounds=1), require_capture=False, live_charts=False
     )
     with world.installed():
         reason = asyncio.run(improver.improve())
@@ -487,7 +487,7 @@ def test_dry_run_keeps_improving_after_the_plan_until_patience(tmp_path):
     assert [s.id for s in engine.stages(run)] == ["body", "loop"]
     policy = Policy(patience=2, native_patience=3, target_hours=0.5)
     improver = Improver(
-        orch, ImproveConfig(policy=policy), require_capture=False, live_charts=False
+        orch, ImproveConfig(policy=policy, rounds=1), require_capture=False, live_charts=False
     )
     with world.installed():
         reason = asyncio.run(improver.improve())

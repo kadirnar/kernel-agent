@@ -16,7 +16,8 @@ this GPU (see "measured peaks" in the toolchain section), and every timed
 result reports per case `flops`, `min_bytes` (what the reference must read and
 write at least once), `sol_ms` = max(FLOPs / peak, bytes / bandwidth),
 `pct_of_sol` and `bound`. Achieved bandwidth = `min_bytes` / `new_ms`. A
-`memory` case at ≥ 80 % of SOL is done: fuse it with its neighbours instead.
+`memory` case at ≥ 80 % of SOL is at the bound of a single kernel: fuse it with its
+neighbours (fewer bytes) or lower its precision to move that bound.
 For a `launch` case the work is smaller than one launch from Python: only
 fewer launches and less host work per call help. Cases that fit in L2
 (`l2_resident`) are compared with the L2 bandwidth, because the benchmark runs

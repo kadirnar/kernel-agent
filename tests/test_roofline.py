@@ -266,11 +266,11 @@ def test_feedback_stops_near_speed_of_light(tmp_path):
     assert fb["advice"] == "continue"
     fb = budget.feedback("kernel-t", results, 10, pct_of_sol=95.2)
     assert fb["advice"] == "stop"
-    assert fb["advice_reason"] == "within 5 % of speed of light (95 % of SOL)"
+    assert fb["advice_reason"].startswith("at 95 % of this recipe's roofline (SOL)")
     fb = budget.feedback("kernel-t", results, 3, pct_of_sol=95.2)  # budget reasons come first
     assert fb["advice"] == "stop" and "evaluation budget" in fb["advice_reason"]
     note = budget.prompt_note("kernel-t", budget.agent_config(budget_cfg()), ["x__evaluate_e2e"])
-    assert "speed of light" in note
+    assert "90 % of its recipe's roofline" in note and "next ideas" in note
 
 
 def budget_cfg():

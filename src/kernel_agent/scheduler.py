@@ -60,14 +60,19 @@ its evaluations, ``N`` all evaluations), and ``score = expected × index``: the
 live arm with the highest score gets the next slice. Untried arms get the
 largest exploration bonus; arms that keep paying get more slices.
 
-Stop rules per arm (AutoKernel's move-on rules, :func:`stop_reason`): ``patience``
+Move-on rules per arm (AutoKernel's, :func:`stop_reason`): ``patience``
 consecutive evaluations without a new best (across slices), ≥ ``sol_stop`` of
-the speed of light, ``target_hours`` spent in its slices, or the module speedup
-``speedup_goal`` reached. The loop stops when the budget is spent or every arm
-has stopped (:mod:`kernel_agent.improve`). A kernel arm at a precision the run does
-not allow (``--precisions``, :mod:`kernel_agent.precisions`: 4-bit unless named) is
-stopped for good (``refused``) and has no ceiling; the systems agent's end-to-end
-estimate takes only the allowed precisions' floors.
+its recipe's roofline (a best found in this round), ``target_hours`` spent in its
+slices, or the module speedup ``speedup_goal`` reached (counted from its best at the
+start of the round). They retire an arm for the current round only (issue #166): its
+evaluations, slices and hours count from the round's start (``exp`` of the round
+record, ``improve.json``), and when every arm is retired the loop starts a new round
+(:mod:`kernel_agent.improve`), where an arm comes back once the round's profile shows it
+matters again: its expected gain there is at least ``revive_share`` of the run
+(:func:`_revival`). A kernel arm at a precision the run does not allow
+(``--precisions``, :mod:`kernel_agent.precisions`: 4-bit unless named) is stopped for
+good (``refused``) and has no ceiling; the systems agent's end-to-end estimate takes
+only the allowed precisions' floors.
 
 A kernel arm that has plateaued (:func:`plateau`) gets a research session
 before the patience rule stops it (:mod:`kernel_agent.research`); a plan it
@@ -141,10 +146,11 @@ INTEGRATION_SHARE = 1 / 3
 
 @dataclass(frozen=True)
 class Policy:
-    """Scheduler constants and per-arm stop rules (None / 0 disables a rule)."""
+    """Scheduler constants and per-arm move-on rules (None / 0 disables a rule); each
+    retires an arm for the current round (issue #166)."""
 
     patience: int = 5  # consecutive evaluations without a new best
-    sol_stop: float | None = SOL_STOP_PCT / 100  # fraction of the speed of light
+    sol_stop: float | None = SOL_STOP_PCT / 100  # fraction of its recipe's roofline
     target_hours: float | None = 2.0  # time in one arm's slices
     speedup_goal: float | None = 2.0  # module speedup of a kernel target
     decay: float = 0.7  # per consecutive slice without a new best
@@ -156,6 +162,9 @@ class Policy:
     native_estimate: float = 1.3  # speedup over the module-level bar assumed reachable
     native_patience: int = 8  # its native runs in a row without a new best
     native_hours: float | None = 6.0  # time in its slices
+    # a retired arm comes back in a new round when its expected gain in the round's profile
+    # is at least this share of the run (issue #166)
+    revive_share: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -228,6 +237,8 @@ class Arm:
     damp: float = 1.0  # decay ** stale (:func:`rank`)
     # kernels: why its precision is not one the run allows (precisions.py); it never runs
     refused: str | None = None
+    base: float = 1.0  # kernels: its best at the start of the round (the goal counts from it)
+    fresh: bool = True  # kernels: its best was found in this round (the SOL rule applies)
     note: str | None = None  # native: its staged plan is done, and what it works on now
 
     @property
@@ -572,17 +583,24 @@ def _prior(row: dict[str, Any]) -> bool:
     return str(row["hypothesis"] or "").startswith(PRIOR_HYPOTHESIS)
 
 
-def _kernel_history(arm: Arm, rows: list[dict[str, Any]], planned: int | None = None) -> None:
+def _kernel_history(
+    arm: Arm, rows: list[dict[str, Any]], planned: int | None = None, since: int | None = None
+) -> None:
     """Best, gain and streak of a kernel target from its ledger rows (``keep`` = new best;
     the library's prior winners do not extend the streak). A ``re-evaluated`` row is not
     an evaluation, but replaces its snapshot's earlier result in the best (and the gain)
     so far (:class:`~kernel_agent.budget.Standing`, the ledger's keep bar).
 
     ``planned``: the ledger size when the last research plan of the target was
-    written; the streak and the failures count only the evaluations after it.
+    written; ``since``: when the current round started (issue #166, None: round 1); the
+    streak and the failures count only the evaluations after both. ``base`` is the best
+    when the round started, ``fresh`` whether the round found a better one.
     """
     stand = Standing()
+    crossed = since is None
     for row in rows:
+        if since is not None and not crossed and (row["exp"] or 0) > since:
+            arm.base, crossed = arm.best, True
         if row["status"] == ledger.REEVALUATED:
             stand.replace(row)
         elif row["status"] in ledger.UNMEASURED:
@@ -596,10 +614,14 @@ def _kernel_history(arm: Arm, rows: list[dict[str, Any]], planned: int | None = 
             arm.gain_ms += arm.ref_ms * (1.0 / arm.best - 1.0 / new)
             arm.best = new
     arm.best_snapshot = top["snapshot"] if (top := stand.top) else None
+    if not crossed:  # nothing in this round yet
+        arm.base = arm.best
+    arm.fresh = since is None or arm.best > arm.base
+    restart = max((x for x in (planned, since) if x is not None), default=None)
     recent = [
         r
         for r in ledger.measured(rows)
-        if not _prior(r) and (planned is None or (r["exp"] or 0) > planned)
+        if not _prior(r) and (restart is None or (r["exp"] or 0) > restart)
     ]
     arm.streak = min(arm.streak, len(recent))
     for row in reversed(recent):
@@ -708,9 +730,13 @@ def build_arms(
     """Every arm with its history, stop reason and score (live arms first, best first).
 
     ``research``: the research sessions (``improve.json``); one that wrote a plan
-    (``plan``) restarts its arm's streak at its ``exp``."""
+    (``plan``) restarts its arm's streak at its ``exp``. ``rounds``: the round records; the
+    move-on rules count from the current round's start (its ``exp``, issue #166)."""
     rows = ledger.rows(run) if rows is None else rows
     profiles = _profiles(run, rounds or [])
+    current = (rounds or [{}])[-1]
+    since = int(current["exp"]) if current.get("exp") is not None else None
+    round_n = int(current.get("n") or 1)
     base_ms = profiles[-1]["baseline_ms"] if profiles else 0.0
     allowed = precisions.of_run(run)  # an arm at another precision is stopped (#131)
     ids = run.target_ids() if targets is None else targets
@@ -742,7 +768,7 @@ def build_arms(
             refused=refused,
         )
         plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
-        _kernel_history(arm, target_rows, max(plans, default=None))
+        _kernel_history(arm, target_rows, max(plans, default=None), since)
         record = snapshot_record(run, target_id, arm.best_snapshot)
         arm.sol = sol_fraction(record)
         if ceiling is not None and record is not None:  # its best kernel, if faster than now
@@ -761,12 +787,16 @@ def build_arms(
             SYSTEMS, SYSTEMS, base_ms, estimate=estimate, rows=systems_rows(rows), basis=basis
         )
         _systems_history(arm, e2e_kernels(rows, read_jsonl(run.results_file())))
+        arm.streak = _in_round(arm.streak, arm.rows, since)
         arms.append(arm)
     if policy.native:
         stage_targets = {t for t in ids if native_engine.is_stage_target(specs[t])}
-        arms.append(native_arm(run, rows, policy, stage_targets))
+        arms.append(native_arm(run, rows, policy, stage_targets, since))
     for arm in arms:
         mine = [s for s in slices if s.get("arm") == arm.id]
+        earlier = since is not None and any(int(s.get("round") or 1) < round_n for s in mine)
+        if since is not None:  # retired for a round only: its slices in this round count
+            mine = [s for s in mine if int(s.get("round") or 1) == round_n]
         arm.hours = sum(float(s.get("seconds") or 0.0) for s in mine) / 3600
         arm.short = bool(mine and mine[-1].get("budget_short"))
         tried = [s for s in mine if not s.get("budget_short")]  # out of time: says nothing
@@ -780,17 +810,45 @@ def build_arms(
             arm.idle += 1
         arm.evals = len(arm.rows)
         arm.stop = stop_reason(arm, policy)
+        if arm.stop is None and earlier and not mine:  # back in a new round only if it matters
+            arm.stop = _revival(arm, policy, profiles, round_n)
     _native_gate(run, arms, policy, rows, allowed)
     return rank(arms, policy)
 
 
+def _in_round(streak: int, rows: list[dict[str, Any]], since: int | None) -> int:
+    """A streak counted only over the ``rows`` of the current round (issue #166)."""
+    if since is None:
+        return streak
+    return min(streak, sum((r["exp"] or 0) > since for r in rows))
+
+
+def _revival(arm: Arm, policy: Policy, profiles: list[dict[str, Any]], round_n: int) -> str | None:
+    """Why an arm that worked in an earlier round stays retired in round ``round_n``
+    (issue #166): its expected gain in the round's profile (``remaining_ms × headroom``) is
+    below ``revive_share`` of the run there; None: it comes back."""
+    run_ms = float(profiles[0]["baseline_ms"]) if profiles else 0.0
+    expected = arm.remaining_ms * arm.headroom
+    if not policy.revive_share or run_ms <= 0 or expected >= policy.revive_share * run_ms:
+        return None
+    return (
+        f"retired: expected {expected:.3g} ms in the round-{round_n} profile, below "
+        f"{policy.revive_share:.0%} of its {run_ms:.4g} ms"
+    )
+
+
 def native_arm(
-    run: RunDir, rows: list[dict[str, Any]], policy: Policy, stage_targets: set[str]
+    run: RunDir,
+    rows: list[dict[str, Any]],
+    policy: Policy,
+    stage_targets: set[str],
+    since: int | None = None,
 ) -> Arm:
     """The native arm: its evaluations are its end-to-end runs (``native.engine.is_native``)
     and those of its stage targets; ``best`` is its fastest run over the module-level bar
     (``native.engine.bar``, 1.0 = at the bar), a new best when it beats the previous one
-    beyond the noise; ``ref_ms`` is the run at the bar."""
+    beyond the noise; ``ref_ms`` is the run at the bar. Its streak counts the runs of the
+    current round (``since``: its start, issue #166)."""
     level = native_engine.bar(rows)
     base = float((read_json(run.baseline_json, {}) or {}).get("median_ms") or 0.0)
     arm = Arm(NATIVE, NATIVE, base / level, estimate=policy.native_estimate)
@@ -808,6 +866,7 @@ def native_arm(
             arm.streak += 1
         arm.fails = arm.fails + 1 if row["status"] in ledger.FAILURES else 0
     arm.best = best / level
+    arm.streak = _in_round(arm.streak, runs, since)
     return arm
 
 
@@ -841,7 +900,9 @@ def _native_gate(
 
 
 def stop_reason(arm: Arm, policy: Policy) -> str | None:
-    """Why an arm gets no more slices (None: it is live)."""
+    """Why an arm gets no more slices in this round (None: it is live). Only ``refused`` is
+    for good; the others retire it for the round (issue #166): the SOL rule applies to a best
+    found in the round, the speedup goal counts from its best at the round's start."""
     if arm.refused:  # its precision is not allowed: no research session revives it
         return arm.refused
     patience = policy.native_patience if arm.kind == NATIVE else policy.patience
@@ -849,13 +910,15 @@ def stop_reason(arm: Arm, policy: Policy) -> str | None:
         return f"plateau: {arm.streak} evaluations in a row without a new best"
     if arm.idle >= IDLE_SLICES:
         return f"no evaluation in its last {arm.idle} slices"
-    if policy.sol_stop and arm.sol is not None and arm.sol >= policy.sol_stop:
-        return f"at {arm.sol:.0%} of the speed of light (stop at {policy.sol_stop:.0%})"
+    if policy.sol_stop and arm.sol is not None and arm.sol >= policy.sol_stop and arm.fresh:
+        return f"at {arm.sol:.0%} of its recipe's roofline (move on at {policy.sol_stop:.0%})"
     cap = policy.native_hours if arm.kind == NATIVE else policy.target_hours
     if cap and arm.hours >= cap:
         return f"time cap: {arm.hours:.1f} h in its slices (cap {cap:g} h)"
-    if arm.kind == KERNEL and policy.speedup_goal and arm.best >= policy.speedup_goal:
-        return f"speedup goal reached: {arm.best:.2f}x (goal {policy.speedup_goal:g}x)"
+    goal = policy.speedup_goal
+    if arm.kind == KERNEL and goal and arm.best >= goal * arm.base:
+        since = f" ({arm.best / arm.base:.2f}x this round)" if arm.base > 1.0 else ""
+        return f"speedup goal reached: {arm.best:.2f}x{since} (goal {goal:g}x)"
     return None
 
 

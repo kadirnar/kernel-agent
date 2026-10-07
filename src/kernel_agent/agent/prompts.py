@@ -85,6 +85,11 @@ COMMON_RULES = """## Rules
 * Keep everything inside your working directory. Do not edit files outside it.
 * Be economical: think, then write a full candidate, then evaluate. Do not
   evaluate trivially different variants; each evaluation should test a hypothesis.
+* Floors and ceilings (`sol_ms`, `pct_of_sol`, the *Ceilings* table) are measured bounds
+  of the current recipe at these shapes, not limits of the model: a lower precision the
+  run allows, fusion across calls or modules, another algorithm or layout and native
+  rewrites move them. Never end a session saying nothing more is possible: end it with
+  the next ideas worth testing (`## Open ideas` in your notes), most promising first.
 """
 
 
@@ -937,15 +942,18 @@ their structure.
   idea, never with one evaluation per value.
 * `best_result(target_id="{target["id"]}")`: best correct result so far, and per
   idea: tries, best speedup, bugs (failed attempts) vs slow (correct, not faster).
-You have a budget of about {evaluations} evaluations. Stop early once further
-gains are unlikely. Every timed result reports the speed of light per case:
-`sol_ms` = max(FLOPs / peak FLOP/s, `min_bytes` / peak bandwidth) with peaks
+You have a budget of about {evaluations} evaluations: spend them on distinct
+hypotheses. Every timed result reports the roofline of each case for the current
+recipe: `sol_ms` = max(FLOPs / peak FLOP/s, `min_bytes` / peak bandwidth) with peaks
 measured on this GPU, `pct_of_sol` = 100 × sol_ms / new_ms, and `bound`
 (`memory`, `compute`, or `launch` when even a perfect kernel is dominated by one
 launch: then compare `new_ms` with `launch_floor_ms` and fuse more work per
 launch). The result-level `pct_of_sol` weights the cases by calls per run; at
-≥ 90 % the advice is `stop`. `suspicious_faster_than_sol` means the measurement
-beat the hardware: make sure the kernel does all the work the reference does.
+≥ 90 % the advice is `stop`: this recipe is at its bound, and the next gain needs
+another one (fewer bytes: fusion with the neighbouring calls, a precision the run
+allows; another algorithm or layout), which you write into your open ideas.
+`suspicious_faster_than_sol` means the measurement beat the hardware: make sure
+the kernel does all the work the reference does.
 The orchestrator always keeps the best correct snapshot.
 
 {COMMON_RULES}

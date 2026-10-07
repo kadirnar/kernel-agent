@@ -19,10 +19,13 @@
             once every stage of its plan beat the bar it keeps going (issue #164): a
             re-profile of its best run says which stage has the most time left
         every --integrate-every kept results: measured re-integration
-    every arm stopped: with --rounds > 1 and a real end-to-end gain in this round,
-        re-profile the optimised model, re-plan with the prior rounds as context
-        (rounds/<n>/) and continue with the new targets
-    final integration + report
+    every arm retired for this round (issue #166: the move-on rules retire an arm for
+        a round, not for good): while --rounds allows (default: as many as the budget
+        allows) and this round brought a real end-to-end gain or a budget bounds the
+        run, re-profile the optimised model, re-plan with the prior rounds as context
+        (rounds/<n>/) and continue with the new targets and the arms the round's
+        profile shows still matter
+    final integration + report (with the budget left unused and why)
 
 Slices go through ``Orchestrator.kernel_slice`` / ``systems_slice`` and so through
 ``Orchestrator._agent``: budgets, per-agent timeouts, ``program.md`` and the event
@@ -89,6 +92,9 @@ MAX_FAILED_SLICES = 3  # agent sessions in a row that raised: something is broke
 # a re-profile of the native arm's best run once its plan is done (issue #164): VoxCPM2's
 # round-2 re-profile took 75 s; the margin covers a model that loads slower
 NATIVE_REPROFILE_SECONDS = 300.0
+# a new round (issue #166) needs a re-profile (~5 min), a re-plan (~5 min) and one slice
+# (warm-up, one kernel evaluation, wrap-up: 7 min); with less agent time left it is not started
+NEW_ROUND_SECONDS = 1020.0
 _IDEAS = re.compile(
     r"^#+[ \t]+[^\n]*\bideas?\b[^\n]*\n(.*?)(?=^#{1,6}[ \t]|\Z)", re.M | re.S | re.I
 )
@@ -101,7 +107,9 @@ def log(msg: str) -> None:
 @dataclass
 class ImproveConfig:
     slice: int = 4  # evaluations per slice (one fresh agent session)
-    rounds: int = 1  # 1 = never re-profile / re-plan
+    # re-profile + re-plan rounds: None = as many as the budget allows (issue #166; without
+    # --max-hours / --max-usd / --max-sessions: while each round brings a real gain), 1 = none
+    rounds: int | None = None
     integrate_every: int = 4  # kept results between measured re-integrations (0: final only)
     max_slices: int | None = None  # slices in this invocation (None: until budget / plateau)
     research_every: int = 3  # slices of a target between its research sessions (0: none)
@@ -185,7 +193,9 @@ def _footer(notes: str) -> list[str]:
         f"Update `{notes}`: one line per evaluation (hypothesis → result) and a "
         "`## Open ideas` section with the untried ideas worth testing next, most promising "
         "first (with `idea_id`, expected gain and ceiling where you have them). The next "
-        "session sees only that file, the ledger and a digest like this one.",
+        "session sees only that file, the ledger and a digest like this one. There is always "
+        "a next idea: a ceiling bounds a recipe, not the model (another precision, fusion "
+        "across modules, another algorithm, a native rewrite).",
     ]
 
 
@@ -220,7 +230,7 @@ def kernel_digest(
     lines = _header(n, evaluations, "`results.jsonl`, `NOTES.md` and `history/`")
     lines += ["", "## Best so far"]
     if arm.best_snapshot:
-        sol = "" if arm.sol is None else f", {arm.sol:.0%} of the speed of light"
+        sol = "" if arm.sol is None else f", {arm.sol:.0%} of its recipe's roofline"
         lines.append(
             f"* `history/{arm.best_snapshot}`: {arm.best:.3f}x module speedup{sol}. Build on "
             f'it (`parent="history/{arm.best_snapshot}"`) unless you test a different approach.'
@@ -245,7 +255,8 @@ def kernel_digest(
         f"{arm.headroom:.0%} of that can still go"
         + (f" ({arm.ceiling.describe()})." if arm.ceiling else "."),
         f"* {arm.streak} evaluations in a row without a new best; after {policy.patience} the "
-        "target is stopped, so prefer a fundamentally different idea over small variations.",
+        "target's time goes to the other arms for this round, so prefer a fundamentally "
+        "different idea over small variations.",
     ]
     return "\n".join(lines + _footer("NOTES.md"))
 
@@ -294,7 +305,7 @@ def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Poli
     lines += [
         "",
         f"* {arm.streak} evaluations in a row without a new best; after {policy.patience} the "
-        "systems agent is stopped.",
+        "systems agent's time goes to the other arms for this round.",
     ]
     return "\n".join(lines + _footer("NOTES.md"))
 
@@ -359,7 +370,7 @@ def native_digest(
     lines += [
         "",
         f"* {arm.streak} native runs in a row without a new best; after "
-        f"{policy.native_patience} the native arm is stopped.",
+        f"{policy.native_patience} the native arm's time goes to the other arms for this round.",
     ]
     return "\n".join(lines + _footer("NOTES.md"))
 
@@ -373,8 +384,8 @@ def _after_plan(run: RunDir, status: native_engine.Status, policy: Policy) -> li
         "## After the staged plan",
         "* Every stage of the plan beat the bar once: a note, not a stop. Keep improving your "
         f"best run until {policy.native_patience} native runs in a row find no new best, "
-        f"{policy.native_hours or 0:g} h in native slices, or every stage runs at {stop} of "
-        "its floor.",
+        f"{policy.native_hours or 0:g} h in native slices this round, or every stage runs at "
+        f"{stop} of its floor.",
     ]
     if not status.graph:
         lines.append(
@@ -495,6 +506,7 @@ class Improver:
         self.kept = ""  # what the time budget keeps for the final integration (last logged)
         self.migrated = ""  # the migration of a pre-#93 integration.json (last logged)
         self.doing: str | None = None  # what the loop is busy with (``_doing``)
+        self.no_round: str | None = None  # why the loop started no new round (_next_round)
 
     # -------------------------------------------------------- helpers
 
@@ -536,7 +548,11 @@ class Improver:
         """
         every = self.icfg.research_every
         why = plateau(arm, self.policy) if every > 0 else None
-        done = [r for r in self.state["research"] if r["arm"] == arm.id]
+        done = [  # of this round: a new round's profile may change what pays (issue #166)
+            r
+            for r in self.state["research"]
+            if r["arm"] == arm.id and int(r.get("round") or 1) == self.round
+        ]
         if why is None or not done:
             return why
         last = done[-1]
@@ -747,8 +763,10 @@ class Improver:
             if arm is None:
                 if await self._next_round(arms):
                     continue
-                return (
-                    "every arm has stopped (" + "; ".join(f"{a.id}: {a.stop}" for a in arms) + ")"
+                arms = self._pickable()  # a round that started with nothing to work on
+                stops = "; ".join(f"{a.id}: {a.stop}" for a in arms)
+                return f"every arm has stopped ({stops})" + (
+                    f"; no new round: {self.no_round}" if self.no_round else ""
                 )
             arm, short = self._in_time(arms)  # no slice without time for one evaluation
             if arm is None:
@@ -773,12 +791,28 @@ class Improver:
             elif self.live_charts:
                 slices_chart(self.run)
 
+    def _budget_used(self) -> dict[str, Any]:
+        """What the loop used of this invocation's budget when it stopped, and what it left
+        unused (the report says why, issue #166): agent time beyond what is kept for the
+        final integration, USD and agent sessions."""
+        budget = self.orch.budget
+        out: dict[str, Any] = {"hours": round(budget.elapsed_s() / 3600, 3)}
+        if budget.max_hours is not None:
+            left = max(budget.agent_seconds_left() or 0.0, 0.0)
+            out.update(max_hours=budget.max_hours, unused_hours=round(left / 3600, 3))
+        if budget.max_usd is not None:
+            out.update(usd=round(budget.spent_usd(), 2), max_usd=round(budget.max_usd, 2))
+        if budget.max_sessions is not None:
+            out.update(sessions=budget.sessions, max_sessions=budget.max_sessions)
+        return out
+
     async def _finish(self, reason: str) -> None:
+        used = self._budget_used()  # before the final integration, which has its own reserve
         integrated = (self.run.root / "integration.json").exists()
         if self.keeps_since_integration() or not integrated:
             self._past_budget()
             await self.reintegrate("final integration")
-        self.state["finished"] = {"reason": reason, "at": _ts()}
+        self.state["finished"] = {"reason": reason, "at": _ts(), "budget": used}
         self.save()
         self.orch._mark("improve", reason=reason, slices=len(self.state["slices"]))
         slices_chart(self.run)
@@ -1234,9 +1268,27 @@ class Improver:
         self._charts()
         return rec
 
+    def _bounded(self) -> bool:
+        """Whether a budget bounds this invocation (--max-hours, --max-usd, --max-sessions)."""
+        budget = self.orch.budget
+        return any(x is not None for x in (budget.max_hours, budget.max_usd, budget.max_sessions))
+
     async def _next_round(self, arms: list[Arm]) -> bool:
-        """Every arm has stopped: start round n+1 if allowed and this round paid off."""
-        if self.round >= self.icfg.rounds:
+        """Every arm has retired for this round: start round n+1 (issue #166) while
+        ``--rounds`` allows (default: no cap) and either this round paid off or a budget
+        bounds the run (then the rest of it goes to a new round, not unused); else why not
+        is ``no_round``."""
+        self.no_round = None
+        if self.icfg.rounds is not None and self.round >= self.icfg.rounds:
+            if self.icfg.rounds > 1:
+                self.no_round = f"--rounds {self.icfg.rounds} reached"
+            return False
+        left = self.orch.budget.agent_seconds_left()
+        if left is not None and left < NEW_ROUND_SECONDS:
+            self.no_round = (
+                f"{max(left, 0) / 60:.0f} min left for agents, less than a new round needs "
+                f"({NEW_ROUND_SECONDS / 60:.0f} min: re-profile, re-plan, one slice)"
+            )
             return False
         if self.keeps_since_integration() or not self.state["integrations"]:
             await self.reintegrate(f"every arm of round {self.round} has stopped")
@@ -1244,8 +1296,14 @@ class Improver:
         start = float(self.state["rounds"][-1].get("speedup") or 1.0)
         measured = {"passed": True, "speedup": last["speedup"], "timing_spread": last.get("spread")}
         if not improves(measured, start, ok_key="passed"):
-            log(f"round {self.round} brought no real end-to-end gain; no further round")
-            return False
+            if self.icfg.rounds is not None or not self._bounded():
+                self.no_round = f"round {self.round} brought no real end-to-end gain"
+                log(f"{self.no_round}; no further round")
+                return False
+            log(
+                f"round {self.round} brought no real end-to-end gain; budget is left, so "
+                f"round {self.round + 1} re-plans and revives what still matters"
+            )
         return await self._start_round(last, arms)
 
     async def _start_round(self, integration: dict[str, Any], arms: list[Arm]) -> bool:
@@ -1261,6 +1319,7 @@ class Improver:
         if "error" in info or not info.get("median_ms"):
             log(f"round {n}: re-profile failed:\n{str(info.get('error'))[-800:]}")
             ledger.event(self.run, "round_failed", round=n, error=str(info.get("error"))[:300])
+            self.no_round = f"the re-profile for round {n} failed"
             return False
         applied = {}
         for item in accepted:
@@ -1288,6 +1347,7 @@ class Improver:
             {
                 "n": n,
                 "started": _ts(),
+                "exp": len(ledger.rows(self.run)),  # the move-on rules count from here (#166)
                 "dir": f"rounds/{n}",
                 "profile": f"rounds/{n}/profile/profile.json",
                 "baseline_ms": float(info["median_ms"]),
@@ -1298,8 +1358,14 @@ class Improver:
         )
         self.save()
         ledger.event(self.run, "round_start", round=n, targets=captured)
-        log(f"round {n}: {info['median_ms']:.1f} ms; new targets: {captured or 'none'}")
-        return bool(captured)
+        live = [a.id for a in self._pickable() if a.stop is None]
+        log(
+            f"round {n}: {info['median_ms']:.1f} ms; new targets: {captured or 'none'}; "
+            f"live arms: {', '.join(live) or 'none'}"
+        )
+        if not live:
+            self.no_round = f"round {n} has no new target and no arm that still matters"
+        return bool(live)
 
     async def _pivots(self, round_dir: Path, n: int) -> list[str]:
         """The precision pivots the round's re-plan proposed (``pivots`` in its
@@ -1336,6 +1402,7 @@ def report_lines(run: RunDir) -> list[str]:
         f"* {len(slices)} slices, {sum(s.get('evals') or 0 for s in slices)} evaluations, "
         f"{len(state.get('integrations', []))} re-integrations, {len(state['rounds'])} round(s)",
         f"* stopped: {finished.get('reason', 'not finished (interrupted or running)')}",
+        *_budget_lines(finished),
         "",
         "| arm | precision | slices | evaluations | slices with a new best | best |",
         "|---|---|---|---|---|---|",
@@ -1377,6 +1444,30 @@ def report_lines(run: RunDir) -> list[str]:
                 f"best {float(r.get('best') or 1.0):.3f}x → {best:.3f}x since"
             )
     return [*lines, ""]
+
+
+def _budget_lines(finished: dict[str, Any]) -> list[str]:
+    """The budget the loop used and left unused when it stopped, and why (issue #166)."""
+    used = finished.get("budget") or {}
+    if not used:
+        return []
+    parts = []
+    if used.get("max_hours") is not None:
+        hours = float(used.get("unused_hours") or 0.0)
+        share = hours / float(used["max_hours"]) if used["max_hours"] else 0.0
+        parts.append(
+            f"{used['hours']:.2f} h of {used['max_hours']:g} h used, "
+            f"{hours * 60:.0f} min ({share:.0%}) unused"
+        )
+    else:
+        parts.append(f"{used['hours']:.2f} h (no --max-hours)")
+    if used.get("max_usd") is not None:
+        parts.append(f"${used['usd']:.2f} of ${used['max_usd']:.2f}")
+    if used.get("max_sessions") is not None:
+        parts.append(f"{used['sessions']} of {used['max_sessions']} agent sessions")
+    left = float(used.get("unused_hours") or 0.0) * 60 >= 5.0  # more than a rounding error
+    why = f"; unused because: {finished.get('reason')}" if left else ""
+    return [f"* budget: {', '.join(parts)}{why}"]
 
 
 def slices_chart(run: RunDir) -> Path | None:

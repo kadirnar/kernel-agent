@@ -402,7 +402,8 @@ def test_orchestrator_research_session(tmp_path):
     assert "## Do not try" in system and "## Retry (failed, not refuted)" in system
     # the evidence: why, the best result with its speed of light per case, ideas, rows
     assert f"* {why}. 3 evaluations so far: 1 kept, 1 failed." in system
-    assert "1.500x module speedup" in system and "% of the speed of light (memory bound)" in system
+    assert "1.500x module speedup" in system
+    assert "% of its recipe's roofline (memory bound)" in system
     assert "| `a0[1, 1, 1024]:bfloat16` | 127 |" in system
     assert "| `splitk` | 2 | 1.500x | 1.80x |" in system and "| `tile64` | 1 | 1.400x |" in system
     assert "| exp | status | speedup | % SOL | idea |" in system
