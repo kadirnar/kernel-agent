@@ -443,6 +443,7 @@ def _evaluate(
 
         toolchain.setup()
 
+    from kernel_agent import concurrency
     from kernel_agent.kernels import compare as comparator
     from kernel_agent.kernels import integrity, weights
     from kernel_agent.kernels.bench import compare_timing, time_call, wall_check
@@ -665,8 +666,8 @@ def _evaluate(
                 f"between device-wide synchronisations but its timed stream sees only "
                 f"{wall['new_event_ms']:.3f} ms: {wall['hidden_ms']:.3f} ms of GPU work runs "
                 "on streams or threads the timed stream never waits for. Join side streams "
-                "back before returning (`torch.cuda.current_stream().wait_stream(s)`) and do "
-                "not launch work from other threads.",
+                "back before returning (`with kernel_agent.concurrency.fork(name):` joins on "
+                "exit) and do not launch work from other threads.",
                 case=i,
                 **{k: round(v, 4) for k, v in wall.items()},
             )
@@ -729,6 +730,10 @@ def _evaluate(
         return result
     share = activity.get("custom_kernel_share")
     result["custom_kernel_share"] = share
+    if streams := concurrency.used():  # named side streams (kernel_agent.concurrency)
+        result["streams"] = streams
+    if activity.get("undeclared_streams"):  # joined, but not named: a note
+        result["undeclared_streams"] = activity["undeclared_streams"]
     if "reference_kernels" in activity:  # per call of the dominant case
         result["kernel_launches_reference"] = sum(activity["reference_kernels"].values())
         result["kernel_launches_candidate"] = round(sum(activity["candidate_kernels"].values()), 2)
@@ -745,7 +750,7 @@ def _evaluate(
                 f"case {main} ({cases[main]['signature']}): {what}: "
                 + "; ".join(activity[key][:3])
                 + ". Launch all work from the calling thread and join side streams back "
-                "before returning.",
+                "before returning (`with kernel_agent.concurrency.fork(name):`).",
                 case=main,
                 details=activity[key],
             )
