@@ -132,7 +132,7 @@ def _best(run: RunDir, target_id: str, keeper: Truth | None) -> list[str]:
         return ["* no correct candidate faster than the reference yet"]
     sol = ""
     if best.get("pct_of_sol") is not None:
-        sol = f", {best['pct_of_sol']:.0f} % of the speed of light ({best.get('bound')} bound)"
+        sol = f", {best['pct_of_sol']:.0f} % of its recipe's roofline ({best.get('bound')} bound)"
     lines = [
         f"* `{best['snapshot']}` (exp {best.get('exp')}): {float(best['speedup']):.3f}x module "
         f"speedup{sol}"

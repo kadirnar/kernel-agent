@@ -2004,6 +2004,22 @@ class Orchestrator:
             cli += ["--kernel" if item["kind"] == "kernel" else "--transform", item["item"]]
         return self._worker("analyze", *cli)
 
+    def e2e_items(self, snapshot: str) -> list[dict[str, Any]] | None:
+        """The items of the newest passing ``evaluate_e2e`` record of a ledger ``snapshot``
+        (its transforms and kernels) as :meth:`reprofile` takes them (the native arm's best
+        run, issue #164); None: no such record, or a file that is not a verified snapshot."""
+        for rec, snaps in reversed(self._e2e_records()):
+            measured = ledger.e2e_snapshot(rec.get("transforms") or [], rec.get("kernels") or [])
+            if measured != snapshot:
+                continue
+            kernels = [self._kernel_snapshot(k) for k in rec.get("kernels") or []]
+            if None in snaps or None in kernels:
+                return None
+            return [{"kind": "transform", "item": s[0]} for s in snaps if s] + [
+                {"kind": "kernel", "item": f"{k[0]}={k[1]}"} for k in kernels if k
+            ]
+        return None
+
     async def replan(self, round_dir: Path, context: str, label: str) -> list[dict[str, Any]]:
         """Planner session on the re-profile in ``round_dir``; returns the new targets.
 

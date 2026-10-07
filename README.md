@@ -1586,7 +1586,9 @@ the import path; a candidate can subclass the region class with
 ### Speed of light
 
 Every timed `evaluate_candidate` result says how close each case is to the
-hardware limit (`kernel_agent/kernels/roofline.py`).
+hardware roofline of its recipe (`kernel_agent/kernels/roofline.py`): the bound
+of that kernel at those shapes and that precision, which fusion, another
+precision or another algorithm moves.
 
 * **Peaks** are measured on the GPU once per GPU model and torch version, in a
   subprocess under the GPU lock (never inside a timed evaluation), and cached
@@ -1822,8 +1824,12 @@ All limits are off by default (`kernel_agent/budget.py`).
   in a row that did not beat the best result by more than max(1 %, 2 × timing
   spread), or `stop` when the evaluation, time or USD budget is spent. A
   correct kernel result whose weighted `pct_of_sol` is at least 90 % also gets
-  `stop` ("within X % of speed of light"), unless it is flagged
-  `suspicious_faster_than_sol` or `sol_unreliable` (see "Speed of light").
+  `stop` ("at X % of this recipe's roofline (SOL): the next gain needs another
+  recipe"), unless it is flagged `suspicious_faster_than_sol` or `sol_unreliable`
+  (see "Speed of light"). The prompts present floors and ceilings as bounds of
+  the current recipe (its precision, its module boundaries, its algorithm), not
+  of the model, and an agent ends a session with its next ideas, never with a
+  claim that nothing more is possible (issue #166).
 * Timeouts and budget stops are recorded under `run.json` → `phases.<phase>`
   (`timed_out`, `budget_skipped`, `usage_limit`, `usage_limit_stop`), in
   `events.jsonl` and in `report.md`.
@@ -2107,15 +2113,16 @@ something up or where, so the engineers found API facts by trial and error
 ### kernel-agent improve: the continuous loop
 
 ```bash
-kernel-agent improve <run_dir | hf-url> [--max-hours 6] [--max-usd 60] [--slice 4] [--rounds 2]
+kernel-agent improve <run_dir | hf-url> [--max-hours 6] [--max-usd 60] [--slice 4] [--rounds R]
 kernel-agent improve Qwen/Qwen3-0.6B --dry-run     # simulated: no GPU, no Claude
 ```
 
 `optimize` gives each target one agent session with a fixed evaluation
 budget. `improve` keeps going, like autoresearch: it gives short sessions
 ("slices") to whichever target pays most, keeps or discards every result in
-the ledger, re-integrates end to end as results come in, and stops only when
-the budget is spent or every target has stopped (`kernel_agent/improve.py`,
+the ledger, re-integrates end to end as results come in, and uses the whole
+budget: when every target has retired for the round it re-profiles the optimised
+model and starts a new round (`kernel_agent/improve.py`,
 `kernel_agent/scheduler.py`).
 
 * **Start or continue.** With a Hugging Face URL it runs analyze, plan and
@@ -2132,8 +2139,15 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   A slice that was running is recorded as `interrupted` together with the
   evaluations it made. `--max-hours`, `--max-usd` and
   `--max-sessions` are the budget of this invocation: hours from now, USD on
-  top of what the run has spent already, and agent sessions from now. Without
-  them the loop runs until every target has stopped. `--agent-minutes` caps
+  top of what the run has spent already, and agent sessions from now. The loop
+  uses all of it (new rounds, see "Rounds"); without them it runs until a round
+  brings no real end-to-end gain. `report.md` says how much of the budget was
+  left unused when the loop stopped (agent time beyond what the final
+  integration keeps), and why. A `--dry-run --max-hours 12` run: `--rounds 1`
+  stops after round 1 with `6.69 h of 12 h used, 210 min (29%) unused; unused
+  because: every arm has stopped (...)` at 1.99x; the default starts rounds 2
+  and 3 and ends with `10.18 h of 12 h used, 1 min (0%) unused` at 2.04x.
+  `--agent-minutes` caps
   each slice. A slice that hits a Claude usage limit waits for the reset and
   continues (see "Authentication and safety"); `--auth` on a run directory
   replaces the run's mode unless it is `auto`.
@@ -2207,13 +2221,20 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   and its open ideas current for the next session. Slices run through the same
   code as `optimize` agents (budgets, timeouts, `program.md`, events). Their
   cost is in `costs.json` as `kernel-<target>#<slice>` and `systems#<slice>`.
-* **Stop rules per arm** (AutoKernel's move-on rules): `--patience 5`
-  evaluations in a row without a new best, across slices; `--sol-stop 0.9` of
-  the speed of light; `--target-hours 2` spent in its slices; the module
-  `--speedup-goal 2` reached. `0` turns a rule off. An arm whose last two slices
-  made no evaluation stops too; a slice that ran out of time does not count (see
-  "Time budget" below). The loop ends when the budget is spent or every arm has
-  stopped, or after 3 agent sessions in a row failed.
+* **Move-on rules per arm** (AutoKernel's): `--patience 5` evaluations in a
+  row without a new best, across slices; `--sol-stop 0.9` of its recipe's
+  roofline (a best found in this round); `--target-hours 2` spent in its slices;
+  `--speedup-goal 2` gained in this round. `0` turns a rule off. An arm whose
+  last two slices made no evaluation retires too; a slice that ran out of time
+  does not count (see "Time budget" below). Each rule retires the arm for the
+  current round only, and gives its time to the others: its evaluations, slices
+  and hours count from the round's start. When every arm has retired, the loop
+  starts a new round (see "Rounds"), where an arm comes back when the round's
+  profile shows it still matters: an expected gain of at least 2 % of the run
+  (`retired: expected 14.4 ms in the round-2 profile, below 2% of its 1532 ms`
+  otherwise). Only an arm at a precision the run does not allow stops for good.
+  The loop ends when the budget is spent, when no new round can start, or after
+  3 agent sessions in a row failed.
 * **Time budget** (`--max-hours`). The final integration needs time too, and
   `improve` keeps it from the agents: its expected duration is the number of
   A/B measurements (each item alone, the systems agent's best combination, each
@@ -2305,12 +2326,19 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   accepted set even when the systems agent combined an older one (version
   swaps, see the integration waterfall below). Every measurement is a ledger row, so the progress chart shows
   the measured latency going down. `optimized/` is re-exported each time.
-* **Rounds.** With `--rounds R` above 1, once every arm of a round has stopped
-  and the round brought a real end-to-end gain, the optimised model (the
-  accepted integration applied) is profiled again into `rounds/<n>/`
-  (`worker analyze --out-dir D --kernel ... --transform ...`). The planner then
-  proposes new targets, with the earlier rounds and the existing targets as
-  context, and the loop continues with them. A target whose module was replaced
+* **Rounds** (issue #166: never leave budget unused). Once every arm of a round
+  has retired, the optimised model (the accepted integration applied) is
+  profiled again into `rounds/<n>/` (`worker analyze --out-dir D --kernel ...
+  --transform ...`). The planner then proposes new targets, with the earlier
+  rounds and the existing targets as context, and the loop continues with them
+  and with the arms the new profile shows still matter (research sessions are
+  due again in a new round). A new round starts when the round brought a real
+  end-to-end gain, or, under a budget (`--max-hours`, `--max-usd`,
+  `--max-sessions`), whenever enough of it is left for a re-profile, a re-plan
+  and one slice (17 min), so the budget goes to new attempts instead of being
+  left unused. `--rounds R` caps the rounds (`--rounds 1`: none, the loop ends
+  when every arm of round 1 has retired). A round with no new target and no
+  arm that still matters ends the loop. A target whose module was replaced
   in the re-profile keeps the share it had in the first profile. The module
   view of an optimised model times a `torch.compile`d module as one call (its
   submodules are not hooked: hooks would make Dynamo recompile it), skips calls
@@ -2409,7 +2437,11 @@ multi-file CUDA project, in the order of a staged plan derived from the ceilings
 table (topmost stages by time above their floor, then the loop body, then the
 loop; any model family). A stage is captured as a kernel target `native_<id>` and
 checked teacher forced on its recorded inputs, then end to end; each stage must
-beat the best module-level result end to end before the next starts. Sessions are
+beat the best module-level result end to end before the next starts. Once every
+stage has, the arm keeps going: the loop re-profiles the model as its best run has
+it (`rounds/<n>/native/<k>/`), derives the stages again from that profile and points
+the arm at the stage with the most time left above its floor, until its patience,
+its time cap or every stage at its floor stops it. Sessions are
 longer (`--native-minutes`, default 3 × `--agent-minutes`;
 `--native-evaluations 6`). Design: [docs/NATIVE.md](docs/NATIVE.md).
 
@@ -2850,7 +2882,9 @@ kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
 kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4] [--rounds R]
   --integrate-every 4 --patience 5 --sol-stop 0.9 --target-hours 2 --speedup-goal 2
   --max-slices N --dry-run [--seed 0]  continuous loop (see "kernel-agent improve");
-                                       --integrate-every 0: only the final integration
+                                       --integrate-every 0: only the final integration;
+                                       --rounds: as many as the budget allows unless given;
+                                       the move-on rules retire a target for one round
   --integration-reserve auto|MINUTES   time kept for the final integration (auto: its
                                        estimate, at most a third of --max-hours; 0: none)
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]

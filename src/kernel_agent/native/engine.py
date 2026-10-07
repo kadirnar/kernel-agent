@@ -22,8 +22,8 @@ kernel or a few. Scopes:
 
 **Stage graph** (:func:`stage_graph`), from the newest ceilings table (``profiling/
 ceilings.py``: module class at one instance group and phase, ms now, floors per precision,
-calls per run): the stages are the topmost non-leaf rows with at least :data:`MIN_SHARE` of
-the run, each with its pattern (:func:`pattern`):
+calls per run; :func:`newest_table_path`): the stages are the topmost non-leaf rows with at
+least :data:`MIN_SHARE` of the run, each with its pattern (:func:`pattern`):
 
 * ``solver``: a non-leaf row inside it is called k ≥ 2 times per stage call and holds most of
   its time (diffusion / flow-matching samplers, iterative refinement);
@@ -45,6 +45,13 @@ module-level result end to end (:func:`bar`: integrations and the systems agent'
 stage is done when a native end-to-end run of it beats that bar (:func:`current`), and only
 then does the next stage start. Its end-to-end runs are recorded with backend ``native``
 (:func:`e2e_backend`).
+
+**After the plan** (issue #164): every stage beating the bar once is a note, not a stop. The
+improve loop re-profiles the model of the arm's best run (:func:`reprofile_dir`, the newest
+table from then on), the stage graph is derived again from it, and the arm works on the
+stage with the most time left above its floor (:func:`focus`; a group scope is the agent's
+alternative) under its stop rules: its patience, its time cap, and every stage at the floor
+(:func:`at_floor`).
 
 Design: ``docs/NATIVE.md``.
 """
@@ -318,18 +325,37 @@ def plan_entry(run: RunDir) -> dict[str, Any] | None:
     return None
 
 
-def newest_table(run: RunDir) -> dict[str, Any] | None:
-    """The newest ceilings table: a round's re-profile, else the analyze profile's."""
-    rounds = sorted(
-        (run.root / "rounds").glob("*/profile/ceilings.json"),
-        key=lambda p: int(p.parent.parent.name) if p.parent.parent.name.isdigit() else 0,
-        reverse=True,
-    )
-    for path in [*rounds, run.profile_dir / "ceilings.json"]:
+def reprofile_dir(run: RunDir, round_n: int, k: int) -> Path:
+    """Where the improve loop re-profiles the model of the native arm's best run once its
+    staged plan is done (``rounds/<n>/native/<k>/``: ``baseline.json``, ``profile/``)."""
+    return run.root / "rounds" / str(round_n) / DIR / str(k)
+
+
+def _int(text: str) -> int:
+    return int(text) if text.isdigit() else 0
+
+
+def newest_table_path(run: RunDir) -> Path | None:
+    """The newest ceilings table with rows: the native arm's newest re-profile of a round
+    (:func:`reprofile_dir`), the round's own re-profile, else the analyze profile's; a
+    round's native re-profiles are newer than its own."""
+    found = [((1, 0), run.profile_dir / "ceilings.json")]
+    for path in (run.root / "rounds").glob("*/profile/ceilings.json"):
+        found.append(((_int(path.parent.parent.name), 0), path))
+    for path in (run.root / "rounds").glob(f"*/{DIR}/*/profile/ceilings.json"):
+        k, round_dir = path.parent.parent, path.parent.parent.parent.parent
+        found.append(((_int(round_dir.name), _int(k.name)), path))
+    for _, path in sorted(found, key=lambda kp: kp[0], reverse=True):
         table = read_json(path, None)
         if isinstance(table, dict) and table.get("rows"):
-            return table
+            return path
     return None
+
+
+def newest_table(run: RunDir) -> dict[str, Any] | None:
+    """The newest ceilings table (:func:`newest_table_path`)."""
+    path = newest_table_path(run)
+    return read_json(path, None) if path is not None else None
 
 
 def _num(value: Any) -> float | None:
@@ -491,14 +517,39 @@ def _improves(row: Mapping[str, Any], best: float) -> bool:
     return improves(rec, best, ok_key="passed")
 
 
+def _parts(row: Mapping[str, Any]) -> list[str]:
+    return [p for p in str(row.get("snapshot") or "").split("+") if p]
+
+
+def own_items(rows: Iterable[Mapping[str, Any]]) -> set[str]:
+    """The labels (``ledger.item_label``, as an integration row names its items) of the
+    native arm's own items: its stage targets and the transforms that only its runs measured
+    (its projects; not the module kernels and the systems agent's transforms it runs on)."""
+    native: set[str] = set()
+    other: set[str] = set()
+    for row in rows:
+        if row.get("target") != ledger.E2E or row.get("backend") == "integrate":
+            continue
+        for part in _parts(row):
+            if part.endswith(".py"):  # a transform snapshot
+                (native if is_native(row) else other).add(ledger.snapshot_stem(part))
+            elif part.startswith(TARGET_PREFIX):  # a stage target
+                native.add(part)
+    return native - other
+
+
 def bar(rows: Iterable[Mapping[str, Any]]) -> float:
     """The best module-level result end to end: the fastest passing end-to-end run that is
-    not the native arm's (integrations, the systems agent's), at least 1.0."""
+    not the native arm's (integrations, the systems agent's), at least 1.0. An integration
+    measurement with one of the arm's own items (:func:`own_items`) is the arm's too, so an
+    integration that accepted them does not raise the bar its runs are measured against."""
+    rows = list(rows)
+    own = own_items(rows)
     speeds = [
         float(r["speedup"])
         for r in rows
         if r.get("target") == ledger.E2E and r.get("correct") and r.get("speedup")
-        if not is_native(r)
+        if not is_native(r) and not (r.get("backend") == "integrate" and own & set(_parts(r)))
     ]
     return max([1.0, *speeds])
 
@@ -537,6 +588,34 @@ def current(plan: Sequence[Stage], rows: Iterable[Mapping[str, Any]]) -> Stage |
     return next((s for s in plan if s.id not in finished), None)
 
 
+def focus(graph: Sequence[Stage]) -> Stage | None:
+    """After the staged plan (issue #164): the stage of a stage graph (the newest ceilings
+    table's, :func:`stage_graph`) with the most time left above its floor, else its group or
+    loop with the most; None: no target has measured headroom (no floor, or at it)."""
+    for scopes in (("stage",), SCOPES):
+        left = [s for s in graph if s.scope in scopes and s.headroom_ms > 0]
+        if left:
+            return max(left, key=lambda s: s.headroom_ms)
+    return None
+
+
+def at_floor(graph: Sequence[Stage], stop: float | None) -> str | None:
+    """Why the native arm stops after its staged plan: every stage of the stage graph runs at
+    ``stop`` (``Policy.sol_stop``) or more of its floor (None: one has headroom left, a floor
+    is unknown, or there is no stage)."""
+    stages = [s for s in graph if s.scope == "stage"]
+    fractions = [s.of_floor for s in stages]
+    if not stop or not stages or any(f is None for f in fractions):
+        return None
+    lowest = min(f for f in fractions if f is not None)
+    if lowest < stop:
+        return None
+    return (
+        f"at the floor: every stage of the newest profile runs at {lowest:.0%} or more of its "
+        f"floor (stop at {stop:.0%})"
+    )
+
+
 # ------------------------------------------------------------------ prompts
 
 
@@ -562,17 +641,55 @@ def building_blocks(
 
 @dataclass
 class Status:
-    """Where the native arm stands (for a slice digest)."""
+    """Where the native arm stands (for a slice digest and the scheduler)."""
 
     plan: list[Stage] = field(default_factory=list)
     bar: float = 1.0
     finished: dict[str, float] = field(default_factory=dict)
+    # the current stage of the plan; once the plan is done, the focus (:func:`focus`)
     stage: Stage | None = None
+    # the stage graph of the newest ceilings table (what is slow now), and where it is from
+    graph: list[Stage] = field(default_factory=list)
+    table: str = ""
+
+    @property
+    def complete(self) -> bool:
+        """Every stage of the plan beat the bar once: a note, not a stop (issue #164)."""
+        return bool(self.plan) and all(s.id in self.finished for s in self.plan)
+
+    def note(self) -> str | None:
+        """The note of a done plan: what the arm works on now (None: the plan is not done)."""
+        if not self.complete:
+            return None
+        text = "the staged plan is done (every stage beat the best module-level result once)"
+        where = f" ({self.table})" if self.table else ""
+        if not self.graph:
+            return text + "; no ceilings table: no measured headroom per stage"
+        if self.stage is None:
+            return text + f"; no stage has measured headroom left{where}"
+        return text + (
+            f"; now {self.stage.id} ({self.stage.scope}), the most time left above its floor: "
+            f"{self.stage.headroom_ms:,.4g} ms{where}"
+        )
 
 
-def status(run: RunDir, rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> Status:
-    plan = stages(run, columns)
-    return Status(plan, bar(rows), done(plan, rows), current(plan, rows))
+def status(
+    run: RunDir, rows: Sequence[Mapping[str, Any]], columns: Sequence[str] | None = None
+) -> Status:
+    """The staged plan (:func:`stages`), its finished stages and its current stage; once
+    every stage is done, the stage graph of the newest ceilings table (a re-profile of the
+    native arm's best run, :func:`reprofile_dir`) says what to work on next (:func:`focus`)."""
+    path = newest_table_path(run)
+    graph = stage_graph(read_json(path, None) if path else None, columns=columns)
+    entry = plan_entry(run)
+    plan = (planned(entry, graph) if entry else []) or graph
+    finished = done(plan, rows)
+    stage = next((s for s in plan if s.id not in finished), None)
+    table = str(path.relative_to(run.root)) if path is not None else ""
+    out = Status(plan, bar(rows), finished, stage, graph, table)
+    if out.complete:
+        out.stage = focus(graph)
+    return out
 
 
 def native_dir(run: RunDir) -> Path:

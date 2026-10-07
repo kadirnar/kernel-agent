@@ -41,6 +41,12 @@ best run); only then does the next stage start. Name every project directory aft
 stage (`<stage id>/`, manifest `name = "<stage id>"` or `<stage id>_<variant>`): the
 ledger finds a stage's runs by that name.
 
+Every stage beating the bar once does not end the work. The digest's **After the staged
+plan** section then lists the stages of a re-profile of your best run (the stage times
+moved) by their time above the floor and marks the **focus**: the stage with the most time
+left. Keep improving your best run there, or on a group of stages fused across their
+boundaries when the time sits between them.
+
 ## Interface to the PyTorch model
 
 * **Weights are shared.** Read the reference modules' parameters and buffers; convert them

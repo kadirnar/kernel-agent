@@ -98,7 +98,7 @@ def test_stop_rules():
     policy = Policy(patience=5, sol_stop=0.9, target_hours=2.0, speedup_goal=2.0)
     assert stop_reason(Arm("a", KERNEL, 100.0, streak=4), policy) is None
     assert "plateau" in stop_reason(Arm("a", KERNEL, 100.0, streak=5), policy)
-    assert "speed of light" in stop_reason(Arm("a", KERNEL, 100.0, sol=0.91), policy)
+    assert "roofline" in stop_reason(Arm("a", KERNEL, 100.0, sol=0.91), policy)
     assert "time cap" in stop_reason(Arm("a", KERNEL, 100.0, hours=2.1), policy)
     assert "goal" in stop_reason(Arm("a", KERNEL, 100.0, best=2.05), policy)
     assert stop_reason(Arm(SYSTEMS, SYSTEMS, 100.0, best=2.05), policy) is None  # no module goal
@@ -152,13 +152,67 @@ def test_build_arms_from_ledger(tmp_path):
     assert attn.gain_ms == pytest.approx(attn.ref_ms * (1 - 1 / 1.5))
     assert attn.stale == 2 and attn.hours == pytest.approx(4200 / 3600)
     assert attn.sol is None and attn.best_snapshot.startswith("003_")
-    assert arms["mlp"].sol == pytest.approx(0.93) and "speed of light" in arms["mlp"].stop
+    assert arms["mlp"].sol == pytest.approx(0.93) and "roofline" in arms["mlp"].stop
     assert arms["rmsnorm"].evals == 0 and arms["rmsnorm"].stop is None
     systems = arms[SYSTEMS]  # the integration row is not the systems agent's
     assert systems.evals == 1 and systems.best == pytest.approx(1.25, rel=1e-3)
     assert systems.estimate == pytest.approx(1 / dryrun.GPU_BUSY)  # launch bound: idle GPU
     no_systems = build_arms(run, Policy(systems=False), [])
     assert SYSTEMS not in {a.id for a in no_systems}
+
+
+def test_move_on_rules_retire_an_arm_for_one_round(tmp_path):
+    """Issue #166: patience, the SOL rule, the speedup goal and the time cap retire an arm for
+    the round; in a new round (its record's ``exp``) it is back when the round's profile
+    shows it still matters, else it stays retired."""
+    orch, _ = make(tmp_path)
+    run = orch.run
+
+    def evaluate(target, outcome, pct=None):
+        src = run.target(target) / "candidates" / "v.py"
+        src.write_text(f"import torch  # {outcome}\n")
+        snap = snapshot(run, src, target)
+        record_candidate(run, target, src, snap, _kernel(outcome, pct=pct), hypothesis="h")
+
+    for outcome in (1.5, 1.4, 1.45, 1.3, 1.2, 1.1):  # a best, then 5 without a new one
+        evaluate("attn", outcome)
+    evaluate("mlp", 2.1, pct=93.0)  # the goal and the SOL rule
+    slices = [
+        {"n": 1, "arm": "attn", "round": 1, "seconds": 7300, "evals": 6, "improved": True},
+        {"n": 2, "arm": "mlp", "round": 1, "seconds": 600, "evals": 1, "improved": True},
+    ]
+    round1 = [{"n": 1, "speedup": 1.0}]
+    arms = {a.id: a for a in build_arms(run, Policy(), slices, rounds=round1)}
+    assert arms["attn"].stop == "plateau: 5 evaluations in a row without a new best"
+    assert "93% of its recipe's roofline" in arms["mlp"].stop and arms["mlp"].fresh
+    assert arms["attn"].hours == pytest.approx(7300 / 3600)
+
+    round2 = [*round1, {"n": 2, "exp": len(ledger.rows(run)), "speedup": 1.4}]
+    arms = {a.id: a for a in build_arms(run, Policy(), slices, rounds=round2)}
+    attn, mlp = arms["attn"], arms["mlp"]
+    assert attn.stop is None and attn.streak == 0 and attn.hours == 0.0  # back in round 2
+    assert attn.best == 1.5 and attn.base == 1.5 and not attn.fresh
+    # mlp's SOL stop was round 1's; at 93 % of its roofline it is not worth a slice now
+    # (7 % of its 206 ms left: 14 ms < 2 % of the run), unless any gain revives an arm
+    assert mlp.stop.startswith("retired: expected 14.4 ms in the round-2 profile, below 2%")
+    revived = {a.id: a for a in build_arms(run, Policy(revive_share=0), slices, rounds=round2)}
+    assert revived["mlp"].stop is None and revived["mlp"].base == pytest.approx(2.1)
+    assert arms["rmsnorm"].stop is None  # no slice in round 1: never retired
+
+    # in round 2 the rules count again from its start: the goal from the round's 1.5x
+    slices.append({"n": 3, "arm": "attn", "round": 2, "seconds": 600, "evals": 1})
+
+    def attn_arm():
+        return next(a for a in build_arms(run, Policy(), slices, rounds=round2) if a.id == "attn")
+
+    evaluate("attn", 2.4)
+    assert attn_arm().stop is None and attn_arm().fresh  # past round 1's goal: 1.6x in round 2
+    evaluate("attn", 3.1)
+    attn = attn_arm()
+    assert attn.fresh and attn.stop == "speedup goal reached: 3.10x (2.07x this round) (goal 2x)"
+    for _ in range(5):
+        evaluate("attn", 1.0)
+    assert attn_arm().stop == "plateau: 5 evaluations in a row without a new best"
 
 
 def test_systems_arm_credits_transforms_on_top_of_kernels(tmp_path):
@@ -287,8 +341,13 @@ def test_dry_run_end_to_end(tmp_path, monkeypatch):
     assert sum(s["evals"] for s in slices) == sum(r["backend"] != "integrate" for r in rows)
     arms = {a.id: a for a in improver.arms()}
     assert all(a.stop for a in arms.values())
-    assert any("speed of light" in a.stop for a in arms.values())
     assert any("plateau" in a.stop for a in arms.values())
+    # the move-on rules retire an arm for a round (#166): an arm retired in round 1 (the
+    # SOL rule, the goal) comes back in round 2 when its profile shows it still matters
+    # (attn: its goal counts from its round-1 best), else it stays retired
+    assert any(a.stop.startswith("retired: expected") for a in arms.values())
+    assert {s["arm"] for s in slices if s["round"] == 2} >= {"attn", "rope"}
+    assert "attn" in {s["arm"] for s in slices if s["round"] == 1}
 
     # re-integration every 4 kept results, measured end to end
     integrations = state["integrations"]
@@ -331,6 +390,53 @@ def test_dry_run_end_to_end(tmp_path, monkeypatch):
             assert data[:8] == b"\x89PNG\r\n\x1a\n"
             assert struct.unpack(">II", data[16:24])[0] > 800
         assert "improve.png" in report
+
+
+def test_dry_run_uses_the_whole_budget_with_new_rounds(tmp_path):
+    """Issue #166: every arm retires early in round 1; with budget left the loop starts new
+    rounds (re-profile, re-plan, the arms that still matter) instead of ending, and the
+    report shows the budget left unused (about none) and why; ``--rounds 1`` keeps the old
+    behaviour."""
+    orch, world = make(tmp_path / "budget", max_hours=30.0)
+    _, reason = loop(orch, world)
+    state = read_json(orch.run.root / "improve.json")
+    assert len(state["rounds"]) > 2 and reason.startswith("time left")  # the budget ended it
+    assert all(r["exp"] > 0 for r in state["rounds"][1:])
+    assert {s["round"] for s in state["slices"]} == {r["n"] for r in state["rounds"]}
+    used = state["finished"]["budget"]
+    assert used["max_hours"] == 30.0 and used["unused_hours"] < 0.25
+    report = orch.run.report.read_text()
+    assert "* budget: " in report and "h of 30 h used" in report
+
+    orch, world = make(tmp_path / "one", max_hours=30.0)
+    _, reason = loop(orch, world, rounds=1)
+    state = read_json(orch.run.root / "improve.json")
+    assert [r["n"] for r in state["rounds"]] == [1]
+    assert reason.startswith("every arm has stopped") and "no new round" not in reason
+    assert state["finished"]["budget"]["unused_hours"] > 10
+    assert "unused because: every arm has stopped" in orch.run.report.read_text()
+
+    # no budget: new rounds while each one brings a real end-to-end gain
+    orch, world = make(tmp_path / "unbounded")
+    _, reason = loop(orch, world)
+    assert reason.endswith("; no new round: round 2 brought no real end-to-end gain")
+
+
+def test_budget_lines():
+    assert improve._budget_lines({"reason": "x"}) == []
+    done = {"reason": "every arm has stopped (a: plateau)"}
+    used = {"hours": 2.5, "max_hours": 4.0, "unused_hours": 1.5, "usd": 12.3, "max_usd": 60.0}
+    assert improve._budget_lines({**done, "budget": used}) == [
+        "* budget: 2.50 h of 4 h used, 90 min (38%) unused, $12.30 of $60.00; unused "
+        "because: every arm has stopped (a: plateau)"
+    ]
+    used = {"hours": 4.0, "max_hours": 4.0, "unused_hours": 0.0, "sessions": 9, "max_sessions": 9}
+    assert improve._budget_lines({**done, "budget": used}) == [
+        "* budget: 4.00 h of 4 h used, 0 min (0%) unused, 9 of 9 agent sessions"
+    ]
+    assert improve._budget_lines({**done, "budget": {"hours": 1.0}}) == [
+        "* budget: 1.00 h (no --max-hours)"
+    ]
 
 
 def test_dry_run_is_reproducible(tmp_path):
@@ -605,6 +711,8 @@ def test_cli_improve(monkeypatch, tmp_path):
     assert icfg.slice == 6 and icfg.rounds == 2 and icfg.integrate_every == 4
     assert icfg.policy.speedup_goal is None and icfg.policy.target_hours == 1.5
     assert icfg.policy.patience == 5 and icfg.policy.sol_stop == 0.9
+    assert cli.main(["improve", "runs/x", "--dry-run"]) == 0
+    assert seen[1][2].rounds is None  # as many rounds as the budget allows (#166)
 
 
 def test_cli_dry_run(tmp_path, capsys):

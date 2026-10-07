@@ -13,7 +13,8 @@ retries an idea once after a failed attempt and starts from the plan's
 directions; the research agent writes its plan from the ledger (the outcomes do
 not depend on either).
 The simulated worker runs the integration's end-to-end measurements, the
-re-profile of a round and the capture of new targets.
+re-profile of a round or of the native arm's best run (with the run's ceilings table,
+if it has one, scaled to the optimised model) and the capture of new targets.
 
 The model is a Qwen3-0.6B decode workload (1532 ms baseline, launch bound).
 Each kernel target has a hidden ceiling that it approaches in noisy,
@@ -607,15 +608,16 @@ class World:
 
     def _native(self) -> int:
         """A simulated systems-native session: per evaluation a multi-file project of the
-        current stage (``loop`` without a staged plan), snapshotted as its bundle like a
-        real one, measured end to end around the module-level bar."""
+        current stage (once the plan is done: its focus; ``loop`` without either),
+        snapshotted as its bundle like a real one, measured end to end around the
+        module-level bar."""
         used = 0
         while True:
             rows = ledger.rows(self.run)
             k = sum(native_engine.is_native(r) for r in rows)
             rng = _rng(self.seed, "native", k)
             level = native_engine.bar(rows)
-            stage = native_engine.current(native_engine.stages(self.run), rows)
+            stage = native_engine.status(self.run, rows).stage
             name = stage.id if stage is not None else "loop"
             self.clock.advance(rng.uniform(600, 1200))  # writing and compiling a project
             project = native_engine.native_dir(self.run) / name
@@ -820,6 +822,9 @@ class World:
         write_json(out.baseline_json, baseline)
         write_json(out.profile_dir / "profile.json", profile)
         (out.profile_dir / "summary.md").write_text(_summary(profile, ms))
+        table = read_json(self.run.profile_dir / "ceilings.json", None)
+        if isinstance(table, dict) and table.get("rows"):  # every row as fast as the run now
+            write_json(out.profile_dir / "ceilings.json", _scaled(table, ms / BASELINE_MS))
         return baseline
 
     def _capture(self, target_id: str) -> dict[str, Any]:
@@ -833,6 +838,15 @@ class World:
         _write_target(self.run, {**spec, "capture": info})
         self.clock.advance(45)
         return info
+
+
+def _scaled(table: dict[str, Any], factor: float) -> dict[str, Any]:
+    """A ceilings table with every row's time × ``factor`` (the floors are the work's: kept)."""
+    rows = [
+        {**r, "now_ms": round(float(r["now_ms"]) * factor, 3)} if r.get("now_ms") else r
+        for r in table.get("rows") or []
+    ]
+    return {**table, "rows": rows}
 
 
 # ------------------------------------------------------------------ results

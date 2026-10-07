@@ -5,6 +5,7 @@ gate and the improve loop's native slices, the planner's ``native`` entry and th
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 from pathlib import Path
 
@@ -184,6 +185,108 @@ def test_each_stage_must_beat_the_module_level_bar_before_the_next():
     rows.append(e2e("native_vae", 3.8))  # the stage's kernel target in a native run
     assert engine.current(plan, rows) is None
     assert engine.bar(rows) == 3.2  # native runs never raise the bar
+    # ... nor an integration that measured the arm's own items (its projects, its stage
+    # targets); the module kernels it ran on top of are not its own
+    assert engine.own_items(rows) == {"sampler", "sampler_v2", "native_vae"}
+    rows.append(e2e("tweak+sampler_v2", 3.9, backend="integrate"))
+    rows.append(e2e("native_vae+attn", 3.9, backend="integrate"))
+    assert engine.bar(rows) == 3.2 and engine.current(plan, rows) is None
+    rows.append(e2e("tweak+attn", 3.4, backend="integrate"))
+    assert engine.bar(rows) == 3.4
+
+
+#: The diffusion pipeline re-profiled after native engines of both stages: the sampler is
+#: near its floor now, the vae has the most time left above its own.
+MOVED = {
+    **DIFFUSION,
+    "rows": [
+        row("Sampler", "pipe.sampler", 230, floor=200),
+        row("Net", "pipe.sampler.net", 220, calls=30, floor=200),
+        row("Decoder", "pipe.vae", 200, floor=150),
+        row("Conv2d", "pipe.vae.conv_in", 150),
+        row("Encoder", "pipe.text_encoder", 40, floor=10),
+        row("Linear", "pipe.text_encoder.fc", 39),
+    ],
+}
+#: ... and every stage within 10 % of its floor.
+AT_FLOOR = {
+    **DIFFUSION,
+    "rows": [
+        row("Sampler", "pipe.sampler", 210, floor=200),
+        row("Net", "pipe.sampler.net", 205, calls=30, floor=200),
+        row("Decoder", "pipe.vae", 160, floor=150),
+        row("Conv2d", "pipe.vae.conv_in", 150),
+    ],
+}
+
+
+def test_after_the_plan_the_stage_with_the_most_headroom_left():
+    """Issue #164: once every stage beat the bar, the arm works on the stage of the newest
+    stage graph with the most time above its floor, and stops only when every stage is at
+    its floor."""
+    assert engine.focus(engine.stage_graph(DIFFUSION)).id == "sampler"  # 500 ms; the vae 50
+    moved = engine.stage_graph(MOVED)
+    assert [s.id for s in moved] == ["vae", "sampler"]
+    assert engine.focus(moved).id == "vae" and engine.at_floor(moved, 0.9) is None
+    floor = engine.stage_graph(AT_FLOOR)
+    assert engine.focus(floor).id == "sampler"  # still 10 ms above it
+    assert engine.at_floor(floor, 0.9) == (
+        "at the floor: every stage of the newest profile runs at 94% or more of its floor "
+        "(stop at 90%)"
+    )
+    assert engine.at_floor(floor, 0.95) is None and engine.at_floor(floor, None) is None
+    unknown = [dataclasses.replace(floor[0], floor_ms=None), floor[1]]
+    assert engine.at_floor(unknown, 0.9) is None  # a floor not known: no floor stop
+    assert engine.focus([]) is None and engine.at_floor([], 0.9) is None
+    # the stages of an LLM decode loop at their floors, the loop above it: the loop
+    loop = engine.Stage("loop", "loop", members=("model",), now_ms=500, floor_ms=300)
+    model = engine.Stage("model", "stage", group="m.model", now_ms=300, floor_ms=300)
+    assert engine.focus([model, loop]) is loop
+
+
+def test_the_newest_table_is_the_newest_reprofile(tmp_path):
+    run = RunDir(tmp_path)
+    assert engine.newest_table_path(run) is None and engine.newest_table(run) is None
+    write_json(run.profile_dir / "ceilings.json", DIFFUSION)
+    assert engine.newest_table_path(run) == run.profile_dir / "ceilings.json"
+    native = engine.reprofile_dir(run, 1, 1) / "profile" / "ceilings.json"
+    assert native == tmp_path / "rounds/1/native/1/profile/ceilings.json"
+    write_json(native, MOVED)  # the native arm's re-profile in round 1: newer than analyze's
+    assert engine.newest_table_path(run) == native and engine.newest_table(run) == MOVED
+    round2 = tmp_path / "rounds/2/profile/ceilings.json"
+    write_json(round2, LLM)  # a later round's re-profile is newer still
+    assert engine.newest_table_path(run) == round2
+    write_json(engine.reprofile_dir(run, 2, 2) / "profile" / "ceilings.json", MOVED)
+    write_json(engine.reprofile_dir(run, 2, 10) / "profile" / "ceilings.json", AT_FLOOR)
+    write_json(engine.reprofile_dir(run, 2, 11) / "profile" / "ceilings.json", {"rows": []})
+    assert engine.newest_table(run) == AT_FLOOR  # by number; a table without rows is skipped
+
+
+def test_status_after_the_plan_works_on_what_is_slow_now(tmp_path):
+    orch, _ = make(tmp_path)
+    run = orch.run
+    write_json(run.profile_dir / "ceilings.json", DIFFUSION)
+    ledger.record_e2e(
+        run, dryrun._e2e_result(BASE / 2.0), backend="integrate", snapshot="x", hypothesis=""
+    )
+    status = engine.status(run, ledger.rows(run))
+    assert not status.complete and status.stage.id == "sampler" and status.note() is None
+    assert status.table == "profile/ceilings.json"
+    assert [s.id for s in status.graph] == ["sampler", "vae"]
+    native_run(run, "sampler", 2.4)
+    native_run(run, "vae", 2.5)
+    status = engine.status(run, ledger.rows(run))
+    assert status.complete and status.finished == {"sampler": 2.4, "vae": 2.5}
+    assert status.stage.id == "sampler"  # the most headroom left in the newest table
+    write_json(engine.reprofile_dir(run, 1, 1) / "profile" / "ceilings.json", MOVED)
+    status = engine.status(run, ledger.rows(run))
+    assert status.complete and status.stage.id == "vae"  # derived again from the re-profile
+    assert status.table == "rounds/1/native/1/profile/ceilings.json"
+    assert status.note() == (
+        "the staged plan is done (every stage beat the best module-level result once); now "
+        "vae (stage), the most time left above its floor: 50 ms "
+        "(rounds/1/native/1/profile/ceilings.json)"
+    )
 
 
 def test_building_blocks_list_this_run_and_the_library(tmp_path, monkeypatch):
@@ -254,7 +357,7 @@ def test_stage_targets_belong_to_the_native_arm(tmp_path):
     assert "attn" not in ids and NATIVE in ids
 
 
-def test_the_plan_opens_the_native_arm_and_its_stages_stop_it(tmp_path):
+def test_the_plan_opens_the_native_arm_and_a_done_plan_is_a_note(tmp_path):
     orch, _ = make(tmp_path)
     run = orch.run
     improver = Improver(orch, ImproveConfig(), require_capture=False, live_charts=False)
@@ -269,14 +372,79 @@ def test_the_plan_opens_the_native_arm_and_its_stages_stop_it(tmp_path):
     )
     native_run(run, "loop", 2.5)
     arm = next(a for a in build_arms(run, Policy(native=True), [], targets=[]) if a.id == NATIVE)
-    assert arm.stop == "every stage of the native plan beat the best module-level result"
+    assert arm.stop is None  # every stage beat the bar once: a note, not a stop (#164)
+    assert arm.note.startswith("the staged plan is done") and "no ceilings table" in arm.note
+    assert arm.summary()["note"] == arm.note
+
+
+def native_arm(run: RunDir, policy: Policy | None = None, slices=()):
+    arms = build_arms(run, policy or Policy(native=True), list(slices), targets=[])
+    return next(a for a in arms if a.id == NATIVE)
+
+
+def test_a_done_plan_keeps_the_native_arm_live_under_its_stop_rules(tmp_path):
+    """Issue #164: every stage beating the bar once is a note; the arm stops by its patience,
+    its time cap, or every stage at its floor in the newest ceilings table."""
+    orch, _ = make(tmp_path)
+    run = orch.run
+    write_json(run.profile_dir / "ceilings.json", DIFFUSION)
+    ledger.record_e2e(
+        run, dryrun._e2e_result(BASE / 2.0), backend="integrate", snapshot="x", hypothesis=""
+    )
+    native_run(run, "sampler", 2.4)
+    assert native_arm(run).note is None  # the vae is next
+    native_run(run, "vae", 2.5)
+    arm = native_arm(run)
+    assert arm.stop is None and "now sampler (stage)" in arm.note
+    native_run(run, "sampler_v2", 2.45)  # no new best
+    assert native_arm(run).stop is None
+    patience = native_arm(run, Policy(native=True, native_patience=1))
+    assert patience.stop == "plateau: 1 evaluations in a row without a new best"
+    cap = native_arm(run, Policy(native=True, native_hours=1.0), [{"arm": NATIVE, "seconds": 3600}])
+    assert cap.stop.startswith("time cap: 1.0 h")
+    write_json(engine.reprofile_dir(run, 1, 1) / "profile" / "ceilings.json", AT_FLOOR)
+    floor = native_arm(run)
+    assert floor.stop.startswith("at the floor: every stage of the newest profile runs at 94%")
+    assert native_arm(run, Policy(native=True, sol_stop=None)).stop is None
+
+
+def test_the_native_best_run_is_reprofiled_once_the_plan_is_done(tmp_path):
+    orch, world = make(tmp_path)
+    run = orch.run
+    write_json(run.profile_dir / "ceilings.json", DIFFUSION)
+    ledger.record_e2e(
+        run, dryrun._e2e_result(BASE / 2.0), backend="integrate", snapshot="x", hypothesis=""
+    )
+    improver = Improver(orch, ImproveConfig(), require_capture=False, live_charts=False)
+    native_run(run, "sampler", 2.4)
+    with world.installed():
+        status = asyncio.run(improver._native_stage(native_arm(run)))
+        assert not status.complete and status.stage.id == "vae"
+        assert "native_profiles" not in read_json(run.root / "improve.json", {})
+        best = native_run(run, "vae", 2.5)
+        arm = native_arm(run)
+        assert arm.best_snapshot == best.name
+        assert orch.e2e_items(best.name) == [
+            {"kind": "transform", "item": str(run.history_dir() / best.name)}
+        ]
+        status = asyncio.run(improver._native_stage(arm))
+        assert asyncio.run(improver._native_reprofile(arm)) is False  # once per best run
+    profiles = read_json(run.root / "improve.json")["native_profiles"]
+    assert len(profiles) == 1 and profiles[0]["snapshot"] == best.name
+    assert profiles[0]["dir"] == "rounds/1/native/1" and "error" not in profiles[0]
+    assert profiles[0]["median_ms"] == pytest.approx(BASE / 2.5, rel=0.01)
+    assert status.table == "rounds/1/native/1/profile/ceilings.json"  # the stage graph from it
+    table = read_json(run.root / status.table)
+    assert table["rows"][0]["now_ms"] == pytest.approx(700 / 2.5, rel=0.01)
+    assert status.complete and status.stage.id == "sampler"
+    assert orch.e2e_items("nothing.py") is None
 
 
 def test_dry_run_reaches_the_native_arm_after_the_module_arms(tmp_path):
     orch, world = make(tmp_path, native="on", native_evaluations=2)
     policy = Policy(patience=2, native_patience=2, target_hours=0.5)
     improver = Improver(
-        orch, ImproveConfig(policy=policy), require_capture=False, live_charts=False
+        orch, ImproveConfig(policy=policy, rounds=1), require_capture=False, live_charts=False
     )
     with world.installed():
         reason = asyncio.run(improver.improve())
@@ -299,6 +467,55 @@ def test_dry_run_reaches_the_native_arm_after_the_module_arms(tmp_path):
     assert any(label.startswith("native#") for label in costs)
 
 
+#: A layer stack called once per token that holds most of the run: the staged plan is the
+#: stage, then the loop (two native runs over the bar).
+BODY = {
+    "columns": ["exact"],
+    "rows": [
+        row("Body", "m.body", 700, calls=128, share=0.7, floor=150, phase="decode"),
+        row("Layer", "m.body.layers.*", 680, calls=128 * 28, instances=28, phase="decode"),
+    ],
+}
+
+
+def test_dry_run_keeps_improving_after_the_plan_until_patience(tmp_path):
+    """Issue #164: a plan done early does not stop the native arm: it works on the stage with
+    the most headroom left in a re-profile of its best run until its patience stops it."""
+    orch, world = make(tmp_path, native="on", native_evaluations=2)
+    run = orch.run
+    write_json(run.profile_dir / "ceilings.json", BODY)
+    assert [s.id for s in engine.stages(run)] == ["body", "loop"]
+    policy = Policy(patience=2, native_patience=3, target_hours=0.5)
+    improver = Improver(
+        orch, ImproveConfig(policy=policy, rounds=1), require_capture=False, live_charts=False
+    )
+    with world.installed():
+        reason = asyncio.run(improver.improve())
+    assert reason.startswith("every arm has stopped")
+    assert re.search(r"native: plateau: \d+ evaluations in a row without a new best", reason)
+    rows = ledger.rows(run)
+    native = [r for r in rows if engine.is_native(r)]
+    plan = engine.stages(run)
+
+    def complete(exp: int) -> bool:
+        return engine.current(plan, [r for r in rows if r["exp"] <= exp]) is None
+
+    done_at = next(r["exp"] for r in native if complete(r["exp"]))
+    after = [r for r in native if r["exp"] > done_at]
+    assert after and all(r["snapshot"].split("_")[1] == "body" for r in after)  # the focus
+    state = read_json(run.root / "improve.json")
+    profiles = state["native_profiles"]
+    assert profiles and "error" not in profiles[0] and profiles[0]["dir"] == "rounds/1/native/1"
+    assert engine.newest_table_path(run).is_relative_to(run.root / profiles[-1]["dir"])
+    notes = [s for s in state["slices"] if s.get("note")]
+    assert notes and all(s["arm"] == NATIVE for s in notes)
+    assert "now body (stage)" in notes[-1]["note"]
+    sessions = [s["system"] for s in world.sessions if s["name"] == "native"]
+    later = [text for text in sessions if "## After the staged plan" in text]
+    assert later and "[**focus**] **body**" in later[-1]
+    assert "rounds/1/native/" in later[-1]
+
+
 def test_native_digest(tmp_path):
     orch, _ = make(tmp_path)
     run = orch.run
@@ -309,6 +526,21 @@ def test_native_digest(tmp_path):
     text = native_digest(run, arm, 7, 6, Policy(), status, arms)
     assert "# Improve slice 7" in text and "[**current**] **sampler**" in text
     assert "2. [later] **vae**" in text and "## Module arms" in text
+    assert "## After the staged plan" not in text
+    ledger.record_e2e(
+        run, dryrun._e2e_result(BASE / 2.0), backend="integrate", snapshot="x", hypothesis=""
+    )
+    native_run(run, "sampler", 2.4)
+    native_run(run, "vae", 2.5)
+    write_json(engine.reprofile_dir(run, 1, 1) / "profile" / "ceilings.json", MOVED)
+    status = engine.status(run, ledger.rows(run), ["exact"])
+    text = native_digest(run, arm, 8, 6, Policy(), status, arms)
+    # the plan, derived again from the re-profile: the vae has the most time above its floor
+    assert "1. [done, 2.500x] **vae**" in text and "2. [done, 2.400x] **sampler**" in text
+    assert "## After the staged plan" in text and "a note, not a stop" in text
+    assert "`rounds/1/native/1/profile/ceilings.json`" in text
+    assert "  1. [**focus**] **vae**" in text and "  2. **sampler**" in text
+    assert "8 native runs in a row find no new best, 6 h in native slices" in text
 
 
 # ------------------------------------------------------------------ config, prompts, budget
