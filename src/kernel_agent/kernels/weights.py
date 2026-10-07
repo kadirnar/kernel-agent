@@ -62,6 +62,17 @@ def basis(capture: Mapping[str, Any]) -> str:
     return INSTANCE_GROUPS if known else EVEN_SPLIT
 
 
+def even_split(capture: Mapping[str, Any]) -> bool:
+    """Whether a capture's estimate splits the calls evenly over several instances: a
+    capture from before #119 (no per-instance counts) of a target whose entrypoint more than
+    one instance calls (with one instance the even split is exact)."""
+    if not capture.get("cases") or basis(capture) != EVEN_SPLIT:
+        return False
+    users = capture.get("method_instances") or {}
+    most = max((int(n or 0) for n in users.values()), default=int(capture.get("instances") or 1))
+    return most > 1
+
+
 def _groups(capture: Mapping[str, Any]) -> dict[str, tuple[float, float]]:
     """Instance group → (calls, covered calls); {} for an even split."""
     groups = capture.get("instance_groups")

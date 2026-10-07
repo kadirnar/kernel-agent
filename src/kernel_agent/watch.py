@@ -307,12 +307,18 @@ class Watcher:
             units = projection.units_of(run, ids)
         except Exception:  # the same: a baseline alone
             units = projection.Units(_json(run.baseline_json) or {})
+        baseline, integration = _json(run.baseline_json), _json(run.root / "integration.json")
+        try:  # the integration's projection of its last accepted set (#121), the one shown
+            sets = projection.accepted_sets(run, integration, _num(baseline.get("median_ms")))
+        except Exception:  # an integration.json in an unexpected shape: the kernels'
+            sets = []
         self.files = {
             "run": _json(run.run_json),
-            "baseline": _json(run.baseline_json),
+            "baseline": baseline,
             "toolchain": _json(run.toolchain_json),
             "costs": _json(run.root / "costs.json"),
-            "integration": _json(run.root / "integration.json"),
+            "integration": integration,
+            "last_set": sets[-1] if sets else None,
             "targets": ids,
             "specs": {t: _json(run.target(t) / "spec.json") for t in ids},
             "shares": shares,
@@ -410,6 +416,8 @@ class Watcher:
         saved = {t["id"]: t["est_saved_ms"] for t in targets}
         proj = projection.project(tree, saved, base_ms or 0, units)
         projected = projection.series(tree, base_ms, rows, units) if base_ms else []
+        # the integration's last accepted set's where the run has one (#121), as ledger.summary
+        shown = projection.shown(proj if base_ms else None, files.get("last_set"))
         e2e = [r for r in rows if r["target"] == E2E]
         kept_e2e = [r for r in e2e if r["status"] == KEEP]
         integration = files.get("integration") or {}
@@ -479,10 +487,9 @@ class Watcher:
                 # a kernel row's est. saved ms per run × its factor = the metric's ms (None:
                 # unknown); e2e rows are in the metric already
                 "saved_factors": {t["id"]: units.factor(t["id"]) for t in targets},
-                "projected_ms": proj.projected_ms  # as ledger.summary
-                if base_ms and (proj.used or not proj.unknown)
-                else None,
-                "projection": {
+                "projected_ms": shown.ms,  # as ledger.summary; None: not projectable (#128)
+                "projected_note": shown.note(),  # what it is of, or why it is not projectable
+                "projection": {  # the best kernels'; a step not projectable is null
                     **proj.as_dict(),
                     "steps": {str(r["exp"]): p.projected_ms for r, p in projected},
                 }

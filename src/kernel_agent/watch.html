@@ -664,6 +664,9 @@ td.nowrap { white-space: nowrap; }
     const m = sm.measured, proj = sm.projected_ms, c = sm.counts, total = sm.costs.total_usd;
     const nAgents = Object.keys(sm.costs.agents).length;
     const keptKernel = sm.targets.some((t) => t.keeps > 0);
+    // what the projection is of (the integration's last accepted set, else the best kernels:
+    // projection.Shown), or why it is not projectable (null: no ratio then, #128)
+    const note = sm.projected_note || "";
     let state = "not running";
     if (run.running) state = run.idle_s > 900 ? `running · no new data for ${fmt.dur(run.idle_s)}` : `running · ${run.phase}`;
     else if (run.phase_failed) state = `stopped: ${run.phase_failed} failed`;
@@ -675,13 +678,10 @@ td.nowrap { white-space: nowrap; }
       [`Best end-to-end${tag}`, m ? fmt.ms(m.ms) : "—",
         m ? `${fmt.x(m.speedup)} vs eager${comp ? ` · ${fmt.x(comp / m.ms)} vs compiled` : ""} · ${m.label}`
           : "no passing end-to-end run yet"],
-      ["Projected from kernels", keptKernel ? fmt.ms(proj) : "—",
-        keptKernel && proj && base
-          ? `${fmt.x(base / proj)} if the best kernels add up` +
-            (sm.projection && sm.projection.label ? ` · from ${sm.projection.label}` : "")
-          : keptKernel && sm.projection && sm.projection.label
-            ? sm.projection.label  // every saving unknown in the metric (projection.py)
-            : "no kept kernel yet"],
+      ["Projected", proj != null && (keptKernel || note) ? fmt.ms(proj) : "—",
+        proj != null && base && (keptKernel || note)
+          ? fmt.x(base / proj) + (note ? ` · ${note}` : "")
+          : note || "no kept kernel yet"],
       ["Evaluations", String(c.evaluations), `${c.keeps} kept · ${c.failures} failed · ${c.e2e} end-to-end`],
       ["Elapsed", fmt.dur(elapsedNow()), state, "elapsed"],
       ["Agent cost", fmt.usd(total),
@@ -723,18 +723,19 @@ td.nowrap { white-space: nowrap; }
     const tEnd = timeExtent(), tMax = tEnd * 1.03;
     const proj = [{ t: 0, ms: base, row: null }], measured = [], failed = [];
     // the projection after each kept (or re-evaluated) kernel, nested targets counted once
-    // (projection.py)
+    // (projection.py); null where the savings exceed the baseline: not projectable (#128)
     const steps = (sm.projection && sm.projection.steps) || {};
     for (const r of S.rows) {
       const t = minutesOf(r.ts);
       if (t == null) continue;
       if (r.target !== "e2e") {
-        if (steps[r.exp] != null) proj.push({ t, ms: steps[r.exp], row: r });
+        if (r.exp in steps) proj.push({ t, ms: steps[r.exp], row: r });
       } else if ((r.status === "keep" || r.status === "discard") && r.new_ms) measured.push({ t, row: r });
       else if (FAILURES.includes(r.status)) failed.push({ t, row: r });
     }
+    const shown = proj.filter((p) => p.ms != null);
     const comp = sm.baseline.compiled_ms;
-    const values = [base, ...proj.map((p) => p.ms), ...measured.map((m) => m.row.new_ms)];
+    const values = [base, ...shown.map((p) => p.ms), ...measured.map((m) => m.row.new_ms)];
     if (comp) values.push(comp);
     let lo = Math.min(...values), hi = Math.max(...values);
     const span = Math.max(hi - lo, 0.05 * hi);
@@ -773,14 +774,21 @@ td.nowrap { white-space: nowrap; }
         label(left ? x - 3 : x + 3, f.y0 - 5, "now", left ? "end" : "start", "tick"));
     }
     const lineEnd = sm.run.running ? minutesOf(nowTs()) : tEnd;
-    let d = `M${xs(0)},${ys(base)}`;
-    for (const p of proj.slice(1)) d += `H${xs(p.t)}V${ys(p.ms)}`;
+    // a step line that stops where a step is not projectable (and starts again after it)
+    let d = `M${xs(0)},${ys(base)}`, y = base;
+    for (const p of proj.slice(1)) {
+      if (y != null) d += `H${xs(p.t)}`;
+      if (p.ms != null) d += y != null ? `V${ys(p.ms)}` : `M${xs(p.t)},${ys(p.ms)}`;
+      y = p.ms;
+    }
     const last = proj[proj.length - 1];
-    d += `H${xs(Math.max(lineEnd, last.t))}`;
+    if (y != null) d += `H${xs(Math.max(lineEnd, last.t))}`;
     g.append(svg("path", { class: "projected", d }));
-    proj.slice(1).forEach((p) => g.append(dot(xs(p.t), ys(p.ms), 3, "projected-dot")));
-    if (proj.length > 1) {
-      g.append(label(xs(Math.max(lineEnd, last.t)), ys(last.ms) - 6, `projected ${fmt.ms(last.ms)}`, "end", "strong"));
+    shown.slice(1).forEach((p) => g.append(dot(xs(p.t), ys(p.ms), 3, "projected-dot")));
+    if (proj.length > 1) {  // at the end of the line: its last projectable value
+      const end = shown[shown.length - 1], stop = proj[proj.indexOf(end) + 1];
+      const text = `projected ${fmt.ms(end.ms)}` + (last.ms == null ? ", then not projectable" : "");
+      g.append(label(xs(stop ? stop.t : Math.max(lineEnd, last.t)), ys(end.ms) - 6, text, "end", "strong"));
     }
     measured.filter((m) => m.row.status === "discard").forEach((m) => g.append(diamond(xs(m.t), ys(m.row.new_ms), 5.5, "discard")));
     measured.filter((m) => m.row.status === "keep").forEach((m) => g.append(diamond(xs(m.t), ys(m.row.new_ms), 6.5, "keep")));
@@ -797,7 +805,7 @@ td.nowrap { white-space: nowrap; }
     }
 
     const points = [];
-    for (const p of proj.slice(1)) {
+    for (const p of shown.slice(1)) {
       const r = p.row;
       points.push({ x: xs(p.t), y: ys(p.ms), r: 6, open: openFor(r), tip: () => tipContent(
         `projected ${fmt.ms(p.ms)}`,
