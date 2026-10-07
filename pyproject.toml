@@ -52,8 +52,8 @@ build-backend = "uv_build"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# verbatim copies of agent-written transforms (test fixtures)
-extend-exclude = ["tests/voxcpm_transforms"]
+# verbatim copies of agent-written transforms (test fixtures); one-off research benchmarks
+extend-exclude = ["tests/voxcpm_transforms", "docs/research-scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
