@@ -1,0 +1,4 @@
+==PROF== Connected to process 61802 (/usr/bin/python3.12)
+==ERROR== Failed to find metric regex:^sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active$
+==ERROR== An error occurred while trying to profile.
+==PROF== Disconnected from process 61802

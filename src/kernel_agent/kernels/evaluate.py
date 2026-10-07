@@ -849,6 +849,10 @@ def _evaluate(
             result["kernels_reference"] = _kernel_table(entrypoint(reference, m), a, k)
         except Exception as exc:
             result["profile_error"] = str(exc)[:500]
+        from kernel_agent.kernels.ncu import compiler_stats  # registers, spills (no GPU work)
+
+        if stats := compiler_stats(module, candidate):
+            result["compiler_stats"] = stats
     if not _intact(result, guard, candidate_path, "at the end"):
         return result
     result["eval_seconds"] = round(time.perf_counter() - t0, 1)
@@ -1152,9 +1156,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reference-timing", action="store_true", help="only time the reference (no candidate)"
     )
+    parser.add_argument(
+        "--ncu-mode", action="store_true", help="run the candidate for ncu only (kernels/ncu.py)"
+    )
+    parser.add_argument("--ncu-calls", type=int, default=3, help="--ncu-mode: profiled calls")
     ns = parser.parse_args(argv)
     if ns.candidate is None and not ns.reference_timing:
         parser.error("a candidate is required")
+    if ns.ncu_mode:  # under ncu, no checks or timing (kernels/ncu.py profile_candidate)
+        from kernel_agent.kernels.ncu import ncu_entry
+
+        return ncu_entry(
+            ns.capture, ns.candidate, capture_sha256=ns.capture_sha256, calls=ns.ncu_calls
+        )
     # Read before the candidate is imported; it never sees the nonce in its environment.
     tag = (sys.stdin.readline().strip() + "@@") if ns.nonce_stdin else ""
     try:

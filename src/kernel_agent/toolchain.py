@@ -142,6 +142,10 @@ def format_peaks(peaks: dict[str, Any]) -> str:
         )
     if peaks.get("launch_floor_us"):
         parts.append(f"launch floor {peaks['launch_floor_us']:.1f} us")
+    if peaks.get("mma_tflops"):  # tensor-core instruction rates (kernels/mma_peaks.py)
+        from kernel_agent.kernels.mma_peaks import describe
+
+        parts.append(describe(peaks["mma_tflops"]))
     return ", ".join(parts)
 
 

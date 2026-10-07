@@ -12,10 +12,12 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
 
 * **work**: FLOPs (per dtype) and weights of the ``nn.Linear`` and convolution calls
   inside the row's calls (``2 × rows × in × out``; each weight read once per call),
-  plus each call's first input and output (``io_bytes``). ``M`` = FLOPs / (2 × weight
-  elements), the rows per weight read: a bf16 GEMM turns compute bound near
+  plus each call's first input and output (``io_bytes``) and, in decode rows, the KV
+  cache the calls read (``kv_bytes``: the cache tensors passed to them up to their
+  position, :func:`~kernel_agent.profiling.profiler._kv_cache`). ``M`` = FLOPs / (2 ×
+  weight elements), the rows per weight read: a bf16 GEMM turns compute bound near
   ``M = peak FLOP/s / DRAM bandwidth``.
-* **floor** per precision: ``max(FLOPs / peak, (weight + io bytes) / DRAM bandwidth,
+* **floor** per precision: ``max(FLOPs / peak, (weight + io + KV bytes) / DRAM bandwidth,
   calls × launch floor)``, peaks measured on this GPU (:mod:`kernel_agent.kernels.roofline`):
 
   - ``exact``: as profiled, each dtype at its own peak;
@@ -33,6 +35,14 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   the run allows (``--precisions``, :mod:`kernel_agent.precisions`: exact; near-lossless
   FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with 4-bit allowed), and only they rank a row.
 * **bound**: the term that sets the exact floor (``compute``, ``memory`` or ``launch``).
+* **FP8 instruction** (``fp8_mma``, with the tensor-core instruction rates measured,
+  :mod:`kernel_agent.kernels.mma_peaks`): the W8A8 floor assumes the FP8 GEMM peak, which
+  only the full-rate instructions reach on GeForce Blackwell; a kernel on the plain
+  ``QMMA.F32`` (e4m3 ``mma.sync`` with fp32 accumulation: row-wise CUTLASS, Triton
+  ``tl.dot``, DeepSeek-style blockwise) runs at half of it. ``needs`` is ``QMMA.SF`` (the
+  block-scaled instruction: Triton ``tl.dot_scaled``, MXFP8) when the row's W8A8 floor at
+  the ``QMMA.F32`` rate is compute bound and above the W8A8 floor (``f32_floor_ms``), else
+  ``any``.
 * **now**: hooked inclusive ms scaled to the unhooked run (× baseline / hooked wall
   ms); **saves** = now − floor. Rows rank by the exact one; a row already below its exact
   floor (an optimised model that runs it at a lower precision) by its best lower-precision
@@ -50,8 +60,9 @@ and stays at its time in the end-to-end line, never "0 FLOP, memory bound". A ca
 reads none of its module's weights (``F.linear`` on a child's weight) is estimated from
 its module's ``nn.Linear`` weights at its input's rows (``estimated_calls``, †).
 
-Approximations: attention scores, KV-cache reads and element-wise math are not
-counted (the floors of attention-heavy rows are too low); weights stream from DRAM
+Approximations: attention scores and element-wise math are not counted (the floors of
+attention-heavy rows are too low), nor KV caches a module holds instead of taking them as
+an argument; weights stream from DRAM
 on every call (no L2 reuse); fp32 convolutions are held to the fp32 peak (cuDNN may
 use TF32); ‡ rows have the math and dtypes of the unmodified model (a transform that
 merges or trims layers, or lowers the precision, makes them approximate).
@@ -72,6 +83,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import projection
+from kernel_agent.kernels.mma_peaks import FP8_F32, FP8_SF
 from kernel_agent.kernels.roofline import FP4, FP8, MXFP8
 
 
@@ -154,6 +166,7 @@ def entries(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "weight_elems": 0,
                     "weight_bytes": 0,
                     "io_bytes": 0,
+                    "kv_bytes": 0,
                     "estimated_calls": 0,
                     "reference_calls": 0,
                     "unknown_calls": 0,
@@ -163,7 +176,14 @@ def entries(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
             row["leaves"].append(leaf if key[1] != group else "")
             if w.get("inclusive_ms", 0.0) > row.get("_top_ms", -1.0):
                 row["signature"], row["_top_ms"] = w.get("signature", ""), w.get("inclusive_ms", 0)
-            for name in ("instances", "calls", "weight_elems", "weight_bytes", "io_bytes"):
+            for name in (
+                "instances",
+                "calls",
+                "weight_elems",
+                "weight_bytes",
+                "io_bytes",
+                "kv_bytes",
+            ):
                 row[name] += int(w.get(name) or 0)
             for name in ("estimated_calls", "reference_calls", "unknown_calls"):
                 row[name] += int(w.get(name) or 0)
@@ -213,7 +233,7 @@ def floor(
         if precision.weight_bytes is None
         else row["weight_elems"] * precision.weight_bytes
     )
-    memory = (weights + row["io_bytes"]) / float(peaks["dram_gbps"]) / 1e6
+    memory = (weights + row["io_bytes"] + row.get("kv_bytes", 0)) / float(peaks["dram_gbps"]) / 1e6
     launch = row["calls"] * float(peaks.get("launch_floor_us") or 0.0) / 1000
     ms = max(compute, memory, launch)
     bound = (
@@ -230,6 +250,27 @@ def floor(
 
 def _sig(value: float, digits: int = 4) -> float:
     return float(f"{value:.{digits}g}")
+
+
+#: A W8A8 floor at the ``QMMA.F32`` rate at least this much above the floor at the FP8 GEMM
+#: peak: the row needs a full-rate instruction to reach its floor.
+F32_MARGIN = 1.05
+
+
+def fp8_instruction(row: Mapping[str, Any], peaks: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Which FP8 tensor-core instruction a W8A8 kernel for ``row`` needs to reach its floor
+    (module docstring); None without the instruction rates or the FP8 peak."""
+    rate = ((peaks.get("mma_tflops") or {}) if peaks else {}).get(FP8_F32)
+    w8a8 = floor(row, PRECISIONS["w8a8"], peaks)
+    if not rate or w8a8 is None:
+        return None
+    capped = {**peaks, "tflops": {**(peaks.get("tflops") or {}), FP8: rate}}
+    f32 = floor(row, PRECISIONS["w8a8"], capped)
+    if f32 is None:
+        return None
+    if f32["bound"] == "compute" and f32["ms"] > F32_MARGIN * w8a8["ms"]:
+        return {"needs": "QMMA.SF", "f32_floor_ms": _sig(f32["ms"])}
+    return {"needs": "any"}
 
 
 def build(
@@ -271,6 +312,8 @@ def build(
             row["saves_ms"][name] = _sig(max(now - f["ms"], 0.0)) if f else None
             if name == "exact" and f:
                 row["bound"] = f["bound"]
+        if usable and known and peaks is not None and (mma := fp8_instruction(row, peaks)):
+            row["fp8_mma"] = mma
         exact = row["floors"]["exact"]
         lower = {k: v for k, v in row["saves_ms"].items() if k != "exact" and k in shown and v}
         if exact is not None and now < exact and lower:
@@ -296,7 +339,14 @@ def build(
         if not usable
         else {
             k: peaks[k]
-            for k in ("gpu", "dram_gbps", "launch_floor_us", "tflops", "tflops_unavailable")
+            for k in (
+                "gpu",
+                "dram_gbps",
+                "launch_floor_us",
+                "tflops",
+                "tflops_unavailable",
+                "mma_tflops",
+            )
             if peaks is not None and k in peaks
         },
         "precisions": precisions,
@@ -442,6 +492,9 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
     cols = [c for c in table.get("columns") or list(PRECISIONS) if c in precisions]
     hidden = [precisions[c]["label"] for c in precisions if c not in cols]
     shown = [r for r in table["rows"] if r["share"] >= min_share][:top]
+    kv = any(r.get("kv_bytes") for r in shown)
+    mma = (peaks or {}).get("mma_tflops") or {}
+    fp8_col = "w8a8" in cols and any("fp8_mma" in r for r in shown)
     lines = ["", "## Ceilings: floors at the observed shapes", ""]
     if peaks is None:
         lines += [
@@ -473,7 +526,7 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             "Work = the FLOPs and weights of the `nn.Linear` / convolution calls inside each "
             "call, plus its first input and output; *M* = FLOPs / (2 × weight elements), the "
             f"rows per weight read (a bf16 GEMM turns compute bound near M ≈ {ridge:.0f}). "
-            f"Floor ({per}, ms) = max(FLOPs / peak, (weight + I/O bytes) / "
+            f"Floor ({per}, ms) = max(FLOPs / peak, (weight + I/O{' + KV' if kv else ''} bytes) / "
             f"{float(peaks['dram_gbps']):.0f} GB/s, calls × "
             f"{float(peaks.get('launch_floor_us') or 0):.1f} us launch floor) per precision: "
             f"{', '.join(legend)}. *now* = the hooked time "
@@ -483,11 +536,30 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             "already runs below its exact floor).",
             "",
         ]
+        if fp8_col:
+            lines += [
+                "*FP8 MMA*: the tensor-core instruction a W8A8 kernel needs to reach its floor. "
+                f"Plain `QMMA.F32` (e4m3 `mma.sync`, fp32 accumulation: row-wise CUTLASS / "
+                f"`_scaled_mm` row-wise, Triton `tl.dot`, DeepSeek-style blockwise) runs at "
+                f"{mma.get(FP8_F32, 0):.0f} TFLOP/s here, block-scaled `QMMA.SF` (Triton "
+                f"`tl.dot_scaled`, MXFP8) at {_rate(mma.get(FP8_SF))}: *SF* = only a full-rate "
+                "kernel reaches the W8A8 floor (in brackets: the floor of a `QMMA.F32` kernel), "
+                "*any* = memory or launch bound even at the `QMMA.F32` rate.",
+                "",
+            ]
     lines += [
-        "| target | phase | inst | calls | M | now ms | share | TFLOP | weights GB | bound | "
+        "| target | phase | inst | calls | M | now ms | share | TFLOP | weights GB | "
+        + ("KV GB | " if kv else "")
+        + "bound | "
         + " | ".join(precisions[c]["label"] for c in cols)
+        + (" | FP8 MMA" if fp8_col else "")
         + " | saves ms |",
-        "|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(cols) + "---|",
+        "|---|---|---|---|---|---|---|---|---|"
+        + ("---|" if kv else "")
+        + "---|"
+        + "---|" * len(cols)
+        + ("---|" if fp8_col else "")
+        + "---|",
     ]
     for r in shown:
         marks = {"†": r["estimated_calls"], "‡": r.get("reference_calls")}
@@ -501,8 +573,10 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             f"| `{r['cls']}` `{r['group']}`{mark} | {r['phase']} | {r['instances']} | "
             f"{r['calls']} | {m if known else '?'} | {_ms(r['now_ms'])} | "
             f"{r['share']:.1%} | {tflop} | {weights} | "
-            f"{r.get('bound', '?')} | "
+            + (f"{r.get('kv_bytes', 0) / 1e9:.3g} | " if kv else "")
+            + f"{r.get('bound', '?')} | "
             + "".join(f"{_ms(f.get(c))} | " for c in cols)
+            + (f"{_fp8_cell(r.get('fp8_mma'))} | " if fp8_col else "")
             + f"{_saves(r, precisions)} |"
         )
     e2e = table.get("e2e") or {}
@@ -526,8 +600,15 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
         ]
     lines += [
         "",
-        "Approximate: attention scores, KV-cache reads and element-wise math are not counted "
-        "(floors of attention-heavy rows are low); weights stream from DRAM on every call; "
+        "Approximate: attention scores and element-wise math are not counted (floors of "
+        "attention-heavy rows are low)"
+        + (
+            "; KV-cache reads are counted in decode rows (the cache arguments up to their "
+            "position), not caches a module holds itself"
+            if kv
+            else ", nor KV-cache reads"
+        )
+        + "; weights stream from DRAM on every call; "
         "fp32 convolutions are held to the fp32 peak (cuDNN may use TF32)."
         + (
             " ‡: the hooks did not see inside some calls (compiled, CUDA graph or replaced "
@@ -552,6 +633,18 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
         ),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _rate(tflops: float | None) -> str:
+    return f"{tflops:.0f} TFLOP/s" if tflops else "an unmeasured rate"
+
+
+def _fp8_cell(mma: Mapping[str, Any] | None) -> str:
+    if not mma:
+        return ""
+    if mma["needs"] == "QMMA.SF":
+        return f"SF ({_ms(mma.get('f32_floor_ms'))})"
+    return "any"
 
 
 def write(

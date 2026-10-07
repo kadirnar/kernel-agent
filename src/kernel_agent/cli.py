@@ -52,6 +52,7 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
     from kernel_agent.gpulock import describe
 
     print(describe())  # the GPU lock pool (nvidia-smi, CUDA_VISIBLE_DEVICES, KERNEL_AGENT_GPUS)
+    _doctor_probes(ns, gpu=tc.gpu is not None)
     if not _doctor_sanitizer(ns, gpu=tc.gpu is not None):
         return 1
     if ns.smoke:
@@ -60,6 +61,19 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
         ok = smoke_backends(verbose=True)
         return 0 if ok else 1
     return 0
+
+
+def _doctor_probes(ns: argparse.Namespace, *, gpu: bool) -> None:
+    """Nsight Compute for ``profile="ncu"`` (kernels/ncu.py), the versions and the feature
+    probes (probes.py: ``tl.dot_scaled`` → block-scaled MMA, TMA, PDL, green contexts);
+    informative, never a failure."""
+    from kernel_agent import probes
+    from kernel_agent.kernels import ncu
+
+    print(ncu.describe(ncu.availability()))
+    if ns.no_probes:
+        return
+    print(probes.describe(probes.run(gpu)))
 
 
 def _doctor_sanitizer(ns: argparse.Namespace, *, gpu: bool) -> bool:
@@ -565,6 +579,11 @@ def main(argv: list[str] | None = None) -> int:
         "--remeasure-peaks", action="store_true", help="measure the roofline peaks again"
     )
     p.add_argument("--no-peaks", action="store_true", help="do not measure missing peaks")
+    p.add_argument(
+        "--no-probes",
+        action="store_true",
+        help="skip the feature probes (tl.dot_scaled lowering, TMA, PDL, green contexts)",
+    )
     p.add_argument(
         "--fetch-sanitizer",
         action="store_true",

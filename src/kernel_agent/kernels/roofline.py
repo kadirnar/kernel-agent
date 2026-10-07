@@ -5,7 +5,9 @@
   of a few large shapes; FP8 e4m3 via ``torch._scaled_mm`` and NVFP4 where torch
   has a kernel for the GPU, else ``tflops_unavailable`` says why) and the launch
   floor (median time of a module call that
-  launches one tiny kernel, timed like a candidate).  :func:`ensure_peaks`
+  launches one tiny kernel, timed like a candidate), and the tensor-core
+  instruction rates (``mma_tflops``, :mod:`.mma_peaks`: plain FP8 ``QMMA.F32``
+  vs block-scaled ``QMMA.SF`` vs bf16).  :func:`ensure_peaks`
   measures them once per GPU + torch version in a subprocess under the GPU lock
   and caches them in ``<cache>/peaks-<gpu>-torch<version>.json``; they are never
   measured inside a timed evaluation.
@@ -80,9 +82,10 @@ FP8, FP4 = "float8_e4m3fn", "float4_e2m1fn_x2"
 #: ... and MXFP8 (e4m3 with an e8m0 scale per 32 along K on both operands: the block-scaled
 #: MMA, ``kind::mxf8f6f4.block_scale``, sm_100 / sm_120; cuBLASLt ``VEC32_UE8M0``).
 MXFP8 = "mxfp8"
-#: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks, 3 the MXFP8 one. :func:`ensure_peaks`
-#: measures an older cache again (once per process at most); until then it stays in use.
-PEAKS_VERSION = 3
+#: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks, 3 the MXFP8 one, 4 the
+#: tensor-core instruction rates (``mma_tflops``). :func:`ensure_peaks` measures an older
+#: cache again (once per process at most); until then it stays in use.
+PEAKS_VERSION = 4
 #: The tensor-core math of a reduced-precision target: the FLOPs of every op that reads one
 #: of its narrowed weights count at this dtype's peak (W8A8: FP8), not at the reference's.
 MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8}
@@ -362,6 +365,20 @@ def measure_peaks() -> dict[str, Any]:
     x = torch.zeros(1, device="cuda")
     floor = min(time_call(_OneKernel(), (x,), {}, target_ms=50.0)["median_ms"] for _ in range(3))
     peaks["launch_floor_us"] = round(floor * 1000, 2)
+
+    # Tensor-core instruction rates (which instruction a kernel needs, mma_peaks.py): last,
+    # so that a failure there cannot spoil the peaks above.
+    try:
+        from kernel_agent.kernels import mma_peaks
+
+        rates, missing = mma_peaks.measure()
+    except Exception as exc:  # no cuda.core / NVRTC, or the GPU rejected a kernel
+        peaks["mma_unavailable"] = {"all": f"{type(exc).__name__}: {exc}"[:200]}
+    else:
+        if rates:
+            peaks["mma_tflops"] = rates
+        if missing:
+            peaks["mma_unavailable"] = missing
     return peaks
 
 

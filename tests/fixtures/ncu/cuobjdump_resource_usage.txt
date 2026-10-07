@@ -1,0 +1,15 @@
+
+Fatbin elf code:
+================
+arch = sm_120
+code version = [1,8]
+host = linux
+compile_size = 64bit
+
+Resource usage:
+ Common:
+  GLOBAL:0
+ Function _Z14fp8_gemv_kernelILi4EEvPKhPK13__nv_bfloat16PS2_PKfS7_ii:
+  REG:40 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:424 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z14rmsnorm_kernelPK13__nv_bfloat16S1_PS_if:
+  REG:255 STACK:96 SHARED:1024 LOCAL:96 CONSTANT[0]:396 TEXTURE:0 SURFACE:0 SAMPLER:0
