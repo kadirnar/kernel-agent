@@ -444,7 +444,7 @@ def _evaluate(
         toolchain.setup()
 
     from kernel_agent.kernels import compare as comparator
-    from kernel_agent.kernels import integrity
+    from kernel_agent.kernels import integrity, weights
     from kernel_agent.kernels.bench import compare_timing, time_call, wall_check
     from kernel_agent.kernels.compare import compare_side_effects, compare_structures
     from kernel_agent.kernels.verify import alias_errors
@@ -621,6 +621,8 @@ def _evaluate(
     saved = 0.0
     ref_total = 0.0
     new_total = 0.0
+    covered = 0.0  # calls per run of the target's instances the timed cases stand for
+    users = capture.get("method_instances") or {}
     for i, (report, case) in enumerate(zip(case_reports, cases, strict=True)):
         method = case["method"]
         if not case["count"]:  # correctness-only case (another workload setting): not timed
@@ -690,9 +692,12 @@ def _evaluate(
         n = case["count"]
         ref_total += n * ref_t["median_ms"]
         new_total += n * new_t["median_ms"]
-        # times the instances that call this entrypoint (all instances for old captures)
-        users = capture.get("method_instances", {}).get(method, capture.get("instances", 1))
-        saved += n * (ref_t["median_ms"] - new_t["median_ms"]) * users
+        # × the calls of the target's instances it stands for: those with its primary input
+        # (instance groups), or an older capture's even split (kernels/weights.py)
+        weight = weights.case_weight(case, users, int(capture.get("instances") or 1))
+        report["target_calls"] = round(weight, 3)
+        covered += weight
+        saved += (ref_t["median_ms"] - new_t["median_ms"]) * weight
 
     if not _intact(result, guard, candidate_path, "after timing"):
         return result
@@ -743,6 +748,7 @@ def _evaluate(
         correct=True,
         speedup=round(ref_total / max(new_total, 1e-9), 3),
         est_saved_ms_per_run=round(saved, 3),
+        est_saved_calls=weights.summary(capture, covered),  # basis: instance groups / even split
         ref_ms_weighted=round(ref_total, 4),
         new_ms_weighted=round(new_total, 4),
     )

@@ -32,11 +32,16 @@ in the folded pattern, with ``*`` also read as ``0``) and ``phase`` (that phase'
 groups, when the profile has them). A region target (``kind: region``,
 :mod:`kernel_agent.region`) lies inside the instances of its ``parent_class``.
 
+A target's saving is spread over its groups by the calls its cases stand for in each
+(the capture's ``instance_groups``, :mod:`kernel_agent.kernels.weights`): VoxCPM2's
+LocEnc layers run shapes no case of a LocDiT layer's capture has, so the LocDiT group
+holds all of that saving. Captures from before #119: evenly over the instances.
+
 Approximations:
 
-* a target's saving is spread evenly over its instances. The evaluator scales the
-  captured instance's gain per call by the instances that call each entrypoint,
-  so instances that only run other shapes get a share too;
+* a capture from before #119 spreads a target's saving evenly over its instances.
+  Its estimate scaled the captured instance's gain per call by the instances that call
+  each entrypoint (the even split), so instances that only run other shapes get a share;
 * two targets on the same instances with different ``phase`` add up; a
   phase-specific parent still replaces all of a child's saving inside it;
 * a region overlaps none of its parent's other children;
@@ -60,6 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger, objective
+from kernel_agent.kernels import weights
 from kernel_agent.workspace import RunDir, read_json
 
 _INDEX = re.compile(r"\.\d+(?=\.|$)")
@@ -351,22 +357,23 @@ def window(spec: Mapping[str, Any], profiles: Sequence[Mapping[str, Any]]) -> fl
     """``metric=ttfa``: the share of a target's est. saved ms per run inside the first-audio
     window, or None when the profiles cannot tell.
 
-    The estimate covers the calls of a full streamed run (the capture runs it whole): its
-    cases' calls per run × the instances that call their entrypoint, as the evaluator
-    weights them. The profiles are taken inside the window (``Workload.metric_window``):
+    The estimate covers the calls of a full streamed run (the capture runs it whole): the
+    calls its cases stand for, as the evaluator weights them (:mod:`kernel_agent.kernels.
+    weights`). The profiles are taken inside the window (``Workload.metric_window``):
     the calls of the target's class there (a region: of its parent class), in its
     ``phase``; with a ``qualname_regex``, of the instance groups it matches
     (``classes[].work``; None without them). A class that no profile saw makes no call
-    before the first audio. The share = calls in the window ÷ calls covered (at most 1):
-    the estimate's gain per call × the calls inside the window."""
+    before the first audio. Of these, the share of the run's calls that a case stands for
+    counts (``coverage``: the instance groups of a capture since #119). The share = calls
+    in the window ÷ calls covered (at most 1): the estimate's gain per call × the calls
+    inside the window."""
     capture = spec.get("capture") or {}
-    users = capture.get("method_instances") or {}
-    covered = sum(
-        float(c.get("count") or 0) * float(users.get(str(c.get("method") or "forward")) or 1)
-        for c in capture.get("cases") or []
-    )
+    covered = sum(weights.weights(capture))
     calls = _window_calls(spec, profiles)
-    return None if covered <= 0 or calls is None else min(calls / covered, 1.0)
+    if covered <= 0 or calls is None:
+        return None
+    coverage = weights.coverage(capture)
+    return min(calls * (1.0 if coverage is None else coverage) / covered, 1.0)
 
 
 def _window_calls(spec: Mapping[str, Any], profiles: Sequence[Mapping[str, Any]]) -> float | None:
@@ -447,12 +454,25 @@ def build(specs: Mapping[str, Mapping[str, Any]], profiles: Sequence[Mapping[str
         region = spec.get("kind") == "region" and spec.get("parent_class")
         cls = str(spec.get("parent_class") if region else spec.get("module_class"))
         instances = _scoped(spec, _instances(classes.get(cls, []), captured.get(cls, set()), phase))
-        total = sum(n for n, _ in instances.values())
-        for pattern, (n, inside) in instances.items():
+        for pattern, (share, inside) in _shares(spec, instances, bool(region)).items():
             if region and pattern:
                 pattern = f"{pattern}.[{target_id}]"  # inside each parent instance
-            groups.append(Group(target_id, pattern, n / total, phase, inside))
+            groups.append(Group(target_id, pattern, share, phase, inside))
     return of_groups(groups)
+
+
+def _shares(
+    spec: Mapping[str, Any], instances: dict[str, tuple[float, float]], region: bool
+) -> dict[str, tuple[float, float]]:
+    """Pattern → (share of the target's saving, ``inside``): by the calls its cases stand
+    for in each instance group (the capture's ``instance_groups``, #119), else by
+    instances."""
+    calls = {} if region else weights.group_calls(spec.get("capture") or {})
+    total = sum(calls.get(p, 0.0) for p in instances)
+    if total > 0:
+        return {p: (calls.get(p, 0.0) / total, inside) for p, (_, inside) in instances.items()}
+    total = sum(n for n, _ in instances.values())
+    return {p: (n / total, inside) for p, (n, inside) in instances.items()}
 
 
 def of_groups(groups: Iterable[Group]) -> Tree:

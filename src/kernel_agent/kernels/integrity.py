@@ -197,6 +197,7 @@ class Snapshot:
         import kernel_agent.kernels.compare as compare
         import kernel_agent.kernels.evaluate as evaluate
         import kernel_agent.kernels.verify as verify
+        import kernel_agent.kernels.weights as weights
         import kernel_agent.profiling.methods as methods
         import kernel_agent.workloads.base as base
 
@@ -216,6 +217,7 @@ class Snapshot:
             _watch("kernel_agent.kernels.bench", bench, constants=True),
             _watch("kernel_agent.kernels.verify", verify, constants=True),
             _watch("kernel_agent.kernels.evaluate", evaluate, constants=True),
+            _watch("kernel_agent.kernels.weights", weights, constants=True),
             _watch("kernel_agent.kernels.integrity", sys.modules[__name__], constants=True),
             _watch("kernel_agent.profiling.methods", methods),
             _watch("kernel_agent.workloads.base", base),
