@@ -392,7 +392,8 @@ def test_orchestrator_research_session(tmp_path):
     ((name, kw),) = calls
     plan = run.target("attn") / "plan.md"
     assert name == "research-attn" and kw["cwd"] == run.target("attn")
-    assert kw["tools"] == ["Read", "Glob", "Grep", "Write"] and kw["writable"] == [plan]
+    dossier = run.target("attn") / "research.md"  # the web tools on: it may update it
+    assert kw["tools"] == ["Read", "Glob", "Grep", "Write"] and kw["writable"] == [plan, dossier]
     assert kw["mcp_tools"] == ["mcp__ka__best_result"] and why in kw["prompt"]
     system = kw["system_append"]
     for text in ("# Diagnose: pathology checklist", "Repetition loop", "Correctness wall"):

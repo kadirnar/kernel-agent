@@ -7,6 +7,8 @@
             that has time for a slice, the final integration's time kept   (issue #100)
         it has plateaued: first a clean-context research session that writes its
             plan.md (research.py; at most one per --research-every slices of the arm)
+        a kernel arm's first slice: first a short dossier session that writes its
+            research.md from the documentation (web on, not --no-dossier; issue #125)
         run one slice: a fresh agent session with --slice evaluations, seeded with
             a digest (last ledger rows, ideas, best snapshot, plan.md, NOTES.md); a
             target with workers (--seeds-per-target, workers.py) gets one session per
@@ -420,6 +422,18 @@ class Improver:
         )
         return why if since >= every else None
 
+    def dossier_due(self, arm: Arm) -> bool:
+        """Whether ``arm`` gets a dossier session before its first slice (issue #125): a
+        kernel arm with no slice, no ``research.md`` and no dossier session yet, in a run
+        with the web tools and dossiers on (``Orchestrator.dossier``)."""
+        cfg = self.orch.cfg
+        if arm.kind != KERNEL or not (cfg.allow_web and cfg.dossier):
+            return False
+        if research.dossier_path(self.run, arm.id).is_file():
+            return False
+        earlier = [*self.state["slices"], *self.state.get("dossiers", [])]
+        return not any(s["arm"] == arm.id for s in earlier)
+
     def _pickable(self) -> list[Arm]:
         """The arms, ranked; an arm stopped by its plateau waits for its research session."""
         arms = self.arms()
@@ -616,6 +630,10 @@ class Improver:
                 with self._doing(f"research session of {arm.id}"):
                     await self._research(arm, why)
                 continue  # its plan restarts the arm's patience; the next slice reads it
+            if self.dossier_due(arm):
+                with self._doing(f"dossier of {arm.id}"):
+                    await self._dossier(arm)
+                continue  # the time it took counts: pick again
             with self._doing(f"slice {len(self.state['slices']) + 1} ({arm.id})"):
                 rec = await self._slice(arm, arms)
             done += 1
@@ -881,6 +899,37 @@ class Improver:
             self.save()
         return rec
 
+    async def _dossier(self, arm: Arm) -> dict[str, Any]:
+        """The dossier session of a kernel arm before its first slice and its record
+        (``improve.json`` → ``dossiers``; ``file``: it wrote ``research.md``)."""
+        rec: dict[str, Any] = {
+            "arm": arm.id,
+            "label": f"dossier-{arm.id}",
+            "status": "running",
+            "started": _ts(),
+        }
+        self.state.setdefault("dossiers", []).append(rec)
+        self.save()
+        try:
+            result = await self.orch.dossier(arm.id, label=rec["label"])
+        except BaseException:  # Ctrl-C, cancellation (Orchestrator.dossier keeps the rest)
+            rec.update(status="interrupted", ended=_ts())
+            self.save()
+            raise
+        status = "failed" if result is None else "done"
+        if result is not None and (result.timed_out or result.is_error):
+            status = "timed_out" if result.timed_out else "error"
+        ended = _ts()
+        rec.update(status=status, ended=ended, seconds=round(ended - rec["started"], 1))
+        rec["file"] = research.dossier_path(self.run, arm.id).is_file()
+        if result is not None:
+            rec["usd"] = round(result.cost_usd, 4)
+        self.save()
+        ledger.event(self.run, "dossier_done", arm=arm.id, status=status, file=rec["file"])
+        where = f"targets/{arm.id}/{research.DOSSIER_FILE}" if rec["file"] else "no dossier"
+        log(f"dossier: {arm.id} {status} in {rec['seconds'] / 60:.1f} min; {where}")
+        return rec
+
     def _close_research(
         self,
         rec: dict[str, Any],
@@ -915,6 +964,10 @@ class Improver:
         for res in self.state["research"]:
             if res.get("status") == "running":
                 self._close_research(res, "interrupted", plan=False, ended=res["started"])
+        for rec in self.state.get("dossiers", []):  # not run again (Improver.dossier_due)
+            if rec.get("status") == "running":
+                rec.update(status="interrupted", ended=rec["started"])
+                self.save()
         for rec in self.state["slices"]:
             if rec.get("status") != "running":
                 continue
@@ -1077,6 +1130,15 @@ def report_lines(run: RunDir) -> list[str]:
     integrations = state.get("integrations", [])
     if integrations:
         lines += ["", "Re-integrations: " + ", ".join(f"{i['speedup']:.3f}x" for i in integrations)]
+    if dossiers := state.get("dossiers") or []:
+        done = ", ".join(
+            f"`{d['arm']}` ("
+            + ("wrote it" if d.get("file") else f"none: {d.get('status')}")
+            + (f", {d['seconds'] / 60:.1f} min" if d.get("seconds") is not None else "")
+            + ")"
+            for d in dossiers
+        )
+        lines += ["", f"Research dossiers (`targets/<id>/research.md`, issue #125): {done}"]
     sessions = state.get("research") or []
     if sessions:
         lines += ["", "Research sessions on plateaued targets (`targets/<id>/plan.md`):", ""]
@@ -1280,7 +1342,12 @@ async def improve(
                 for k in ("agent_minutes", "program", "budget_usd_per_agent")
                 if getattr(cfg, k) is not None
             },
-            **{k: False for k in ("use_library", "librarian") if not getattr(cfg, k)},
+            **{
+                k: False
+                for k in ("use_library", "librarian", "allow_web", "dossier")
+                if not getattr(cfg, k)
+            },
+            **({"web_domains": cfg.web_domains} if cfg.web_domains else {}),
             **({"seeds_per_target": cfg.seeds_per_target} if cfg.seeds_per_target else {}),
             **({"reseed_workers": True} if cfg.reseed_workers else {}),
             **({"parallel": cfg.parallel} if cfg.parallel > 1 else {}),

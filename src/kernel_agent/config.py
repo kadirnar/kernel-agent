@@ -54,6 +54,10 @@ class OptimizeConfig:
     budget_usd_per_agent: float | None = None
     permission_mode: str = "bypassPermissions"
     allow_web: bool = True
+    #: Documentation lookups (agent/web.py, issue #125): extra hosts WebFetch may reach on
+    #: top of web.DOMAINS, and the research dossier of a target before its first session.
+    web_domains: list[str] = field(default_factory=list)
+    dossier: bool = True
     #: How sessions authenticate (kernel_agent/agent/auth.py): "subscription" (the Claude
     #: Code login only), "api" (an API key / cloud provider only) or "auto" (either).
     auth: str = "auto"

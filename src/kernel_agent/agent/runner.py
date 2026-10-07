@@ -26,7 +26,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookEvent
 
-from kernel_agent.agent import auth
+from kernel_agent.agent import auth, web
 from kernel_agent.config import OptimizeConfig
 
 BASE_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite"]
@@ -54,6 +54,7 @@ class AgentResult:
     timed_out: bool = False
     api_key_source: str | None = None  # the init message's; "none" = no API key in use
     usage_limit: auth.UsageLimit | None = None  # the session stopped at a usage limit
+    web: list[dict[str, Any]] = field(default_factory=list)  # WebFetch / WebSearch (web.py)
 
 
 def _log(msg: str) -> None:
@@ -198,6 +199,10 @@ async def run_agent(
         options.resume = resume
 
     result = result or AgentResult(name=name)
+    lookups = web.Lookups(result.web, cfg.web_domains) if cfg.allow_web else None
+    if lookups is not None:  # WebFetch to documentation domains only, every lookup recorded
+        options.hooks = options.hooks or {}
+        options.hooks.setdefault("PreToolUse", []).append(lookups.guard())
     result.is_error, result.usage_limit = False, None
     usd, turns_before, seconds = result.cost_usd, result.turns, result.seconds  # resumed: > 0
     watch = auth.LimitWatch()
@@ -214,6 +219,8 @@ async def run_agent(
                 async for message in stream:
                     _write(log, message)
                     watch.see(message)
+                    if lookups is not None:
+                        lookups.see(message)
                     if isinstance(message, AssistantMessage):
                         result.session_id = result.session_id or message.session_id
                         if message.parent_tool_use_id is None:

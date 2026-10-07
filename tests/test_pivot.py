@@ -140,12 +140,13 @@ def test_research_session_may_propose_a_pivot_in_near_lossless_runs(tmp_path):
         asyncio.run(orch.research("mlp", reason="4 evaluations in a row", label="research-mlp#3"))
         (kw,) = calls
         proposal = pivot.proposal_path(orch.run, "mlp")
+        dossier = research.dossier_path(orch.run, "mlp")  # the web tools on (issue #125)
         system = kw["system_append"]
         if quality == "exact":
-            assert kw["writable"] == [research.plan_path(orch.run, "mlp")]
+            assert kw["writable"] == [research.plan_path(orch.run, "mlp"), dossier]
             assert "# Precision pivot" not in system and "pivot.json" not in system
             continue
-        assert kw["writable"] == [research.plan_path(orch.run, "mlp"), proposal]
+        assert kw["writable"] == [research.plan_path(orch.run, "mlp"), proposal, dossier]
         assert "# Precision pivot (optional)" in system and str(proposal) in system
         assert "`fp8_w8a8`" in system and "`fp8_weights`" in system  # the other tiers
         assert "mlp__<precision>" in system and "(and `pivot.json` above)" in system

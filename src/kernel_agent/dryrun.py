@@ -2,10 +2,11 @@
 
 No GPU and no Claude. The simulated agents write the files a real run has
 (candidates, snapshots, ``NOTES.md`` with open ideas, transforms, a research
-``plan.md``) and record every evaluation through the same code as the evaluation
-tools (``record_candidate`` with an ``idea_id``, ``record_e2e_result``), so the
-ledger, the budget advice, the research trigger, the charts, the dashboard and
-the report are exercised end to end, with workers per target too
+``plan.md``, a research dossier ``research.md``) and record every evaluation
+through the same code as the evaluation tools (``record_candidate`` with an
+``idea_id``, ``record_e2e_result``), so the ledger, the budget advice, the research
+trigger, the charts, the dashboard and the report are exercised end to end, with
+workers per target too
 (``--seeds-per-target``: a worker session writes to its own directory and follows
 the evaluation budget of its ``# Worker`` section). The simulated engineer
 retries an idea once after a failed attempt and starts from the plan's
@@ -464,6 +465,9 @@ class World:
             self._research(name.removeprefix("research-"), writable or [])
             self.clock.advance(rng.uniform(240, 480))
             result.cost_usd = 0.6 * rng.uniform(0.8, 1.2)
+        elif name.startswith("dossier-"):  # no web in a dry run: a dossier from the spec
+            self._dossier(name.removeprefix("dossier-"), writable or [])
+            result.cost_usd = 0.15 * rng.uniform(0.8, 1.2)
         result.tool_calls = {"evaluate": evals} if evals else {}
         result.turns = 4 + 5 * evals
         result.seconds = self.clock.now() - start
@@ -612,6 +616,18 @@ class World:
                 f"best {best:.2f}x of a {sim.ceiling:.1f}x ceiling at bf16; FP8 halves the bytes"
             )
             write_json(proposal, {"precision": sim.pivot, "precision_why": why})
+
+    def _dossier(self, target_id: str, writable: list[Path]) -> None:
+        """A dossier session: ``research.md`` from the target's spec, if it may write it."""
+        path = self.run.target(target_id) / "research.md"
+        if path.resolve() not in {p.resolve() for p in writable}:
+            return
+        sim = sim_target(read_json(self.run.target(target_id) / "spec.json", {}) or {})
+        path.write_text(
+            f"# Dossier: `{target_id}`\n\n## Findings\n"
+            f"* {sim.cls}: fuse the module into one kernel (simulated, no lookup)\n\n"
+            f"## Ideas\n1. `{target_id}_fused`: one launch per call\n"
+        )
 
     def _plan(self, cwd: Path) -> dict[str, Any]:
         profile = read_json(cwd / "profile" / "profile.json", {}) or {}

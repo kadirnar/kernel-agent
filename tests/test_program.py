@@ -197,7 +197,7 @@ class FakeToolchain:
 def test_agents_see_mid_run_edits(tmp_path, monkeypatch):
     monkeypatch.setattr(orchestrator.toolchain, "setup", FakeToolchain)
     run = make_run(tmp_path)
-    cfg = OptimizeConfig(model_ref="org/m", runs_dir=tmp_path, backends=["triton"])
+    cfg = OptimizeConfig(model_ref="org/m", runs_dir=tmp_path, backends=["triton"], dossier=False)
     phases = {p: {"done": True} for p in ("analyze", "plan", "capture")}
     write_json(run.run_json, {"card": CARD, "config": cfg.to_dict(), "phases": phases})
     for tid in ("t1", "t2"):

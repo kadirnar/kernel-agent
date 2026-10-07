@@ -14,6 +14,11 @@ digest includes the plan, and the plan restarts the target's patience count.
 
 This module builds what the research session is shown (:func:`evidence`) and the
 ledger and idea tables it shares with the slice digests (:mod:`kernel_agent.improve`).
+
+With the web tools on, a short ``dossier-<target>`` session runs before a target's first
+engineer session (``Orchestrator.dossier``, issue #125): it looks up the documentation,
+reference code and papers for the target and writes ``targets/<id>/research.md``
+(findings with their sources, ideas); the research sessions may update it.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger, truth
+from kernel_agent.agent.prompts import DOSSIER_FILE
 from kernel_agent.agent.tools import best_for_target, idea_rows
 from kernel_agent.truth import TamperError, Truth
 from kernel_agent.workers import all_notes
@@ -35,6 +41,12 @@ TRANSFORM_ROWS = 5  # passing end-to-end transform evaluations shown (near-lossl
 
 def plan_path(run: RunDir, target_id: str) -> Path:
     return run.target(target_id) / PLAN_FILE
+
+
+def dossier_path(run: RunDir, target_id: str) -> Path:
+    """``targets/<id>/research.md``: the target's research dossier, written before its
+    first engineer session and updated by its research sessions (issue #125)."""
+    return run.target(target_id) / DOSSIER_FILE
 
 
 def _cell(text: Any, limit: int = 200) -> str:

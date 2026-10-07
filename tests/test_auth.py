@@ -447,6 +447,7 @@ def sim(tmp_path, monkeypatch):
     monkeypatch.setattr(charts, "available", lambda: False)
 
     def make(**cfg):
+        cfg = {"dossier": False, **cfg}  # sessions counted: no dossier (test_web.py)
         config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path, **cfg)
         orch = orchestrator.Orchestrator(dryrun.create_run(config), config)
         return orch, dryrun.World(orch)

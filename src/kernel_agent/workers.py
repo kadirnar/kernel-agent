@@ -53,6 +53,7 @@ SHARED = (
     "results.jsonl",
     "quick.jsonl",
     "plan.md",
+    "research.md",
 )
 RESEED_TOP = 2  # snapshots a second round starts from
 
@@ -282,8 +283,9 @@ def prompt_note(target_id: str, seed: Seed, team: list[Seed]) -> str:
     lines += [
         f"* Your working directory is `workers/{seed.worker}/` of the target: your own "
         "`candidates/` and `NOTES.md`. `spec.json`, `reference_source.py`, "
-        "`workload_profile.md`, `capture_inputs.pt`, `history/`, `results.jsonl` and "
-        "`plan.md` are links to the target's shared files (read-only for you).",
+        "`workload_profile.md`, `capture_inputs.pt`, `history/`, `results.jsonl`, "
+        "`plan.md` and `research.md` are links to the target's shared files (read-only for "
+        "you).",
         f"* Your evaluation budget in this session: {seed.evaluations} evaluations (the "
         'target\'s budget is split across its workers). `mode="quick"` checks are free.',
     ]
