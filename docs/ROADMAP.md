@@ -70,6 +70,12 @@ wave 1 (parallel):  #1 forward_step   #2 teacher forcing + VoxCPM   #3 ledger/ch
 wave 2 (parallel):  #5 truth files    #6 strict compare             #12 strong baseline #9 roofline
 wave 3:             #24 VoxCPM run    #7 anti-gaming   #8 coverage   #13 improve loop    #11 A/B
 wave 4+:            #14 #15 #16 #17 #18 #19 #20 #21 #10 #22 #23
+wave 4 (cont.):     #86 #67 #93 #90 #92 #100 #94 #95 #91 #96 #106-#122 #125 #126 #128 #131 #137
+wave 5 (research):  #135 Triton  #132 FP8  #136 parallelisation (docs/RESEARCH-TRITON.md, FP8.md, PARALLEL.md)
+wave 5 (library):   #133 CuTe DSL  #134 native engines  #144 fp8_mx  #145 FP8 toolkit
+                    #146 timeline + #10 ncu  #147 concurrency  #148 evaluator  #149 serving
+                    (#150 multi-GPU dropped: single-GPU optimisation only)
+wave 5 (verified):  #160 first GPU run of wave 5 and its fixes
 ```
 
 Each wave is implemented by parallel agents in separate git worktrees, one PR

@@ -595,3 +595,38 @@ Proposed follow-up issues (not opened):
   e4m3 K/V with per-token-head or margin-calibrated per-tensor scales (static K/V
   scales from one text are exceeded by another in ~50 % of layers); target: ≥ 1.8x
   over bf16 at ≥ 4k tokens of context, where the naive kernel reached 1.31x.
+
+## 10. Measured: the toolkit's FP8 GEMM paths (after #144, #145, #133)
+
+The examples the agents start from, on the RTX 5070 Ti (torch 2.14.1, Triton 3.8, CuTe DSL
+4.8, cuBLASLt 13.4), each wrapping a bf16 `nn.Linear` with Gaussian weights; one call per
+shape `M x K x N`, median of 15 x 10 calls, inside a CUDA graph of 20 calls (`graph`, GPU
+time) and eagerly (`eager`, with host time). Every path is W8A8 (e4m3 activations per token
+or MXFP8 per 32, e4m3 weights per channel or per 32): relative L2 vs bf16 0.037 everywhere
+(the FP8 weight-only skinny GEMV: 0.027). Script:
+[`research-scripts/fp8-sm120/toolkit_fp8_gemms.py`](research-scripts/fp8-sm120/toolkit_fp8_gemms.py),
+raw numbers in `results/toolkit_fp8_gemms.json`.
+
+| M x K x N | bf16 cuBLAS | `_scaled_mm` row-wise | CuTe block-scaled (#133) | cuBLASLt tensor-wise (#145) | cuBLASLt MXFP8 (#145) | Triton `tl.dot_scaled` (#145) | Triton MXFP8 (#144) |
+|---|---|---|---|---|---|---|---|
+| 16 x 2048 x 6144 | 13.9 | 26.3 | 17.3 | 13.3 | 18.8 | **9.7** | 18.0 |
+| 352 x 1024 x 2560 | 25.4 | 28.5 | **10.1** (182 TFLOP/s) | 15.3 | 11.4 | 10.7 | 11.5 |
+| 352 x 1024 x 8192 | 69.2 | 53.9 | **24.9** (237) | 36.7 | 26.3 | 33.1 | 26.6 |
+| 352 x 4096 x 1024 | 38.9 | 59.2 | 28.5 | 20.8 | 31.5 | **18.7** (158) | 32.9 |
+| 2048 x 4096 x 4096 | 731 | 653 | **259** (265) | 268 | 263 | 352 | 268 |
+| 8192 x 8192 x 8192 | 11261 | 8718 | 5586 | 3952 | **3746** (294) | 5569 | 3776 |
+
+(µs per call, graph-timed.) What it says for the backend policy (`backends.py`):
+
+* Mid-size compute-bound GEMMs with wide N (M in the hundreds to thousands): the CuTe DSL
+  block-scaled kernel is the fastest (2.8x bf16 at 352 x 1024 x 8192), cuBLASLt MXFP8 next.
+* N = 1024 at M = 352 leaves SMs idle for single-pass tiles: split-K wins, here Triton
+  `tl.dot_scaled` and cuBLASLt tensor-wise (its split-K algorithms); the CuTe kernel has no
+  split-K yet (§9 follow-up B).
+* Very large square GEMMs: cuBLASLt (MXFP8 294 TFLOP/s, tensor-wise 278); the CuTe kernel's
+  tile schedule falls to 197 there.
+* Decode (M = 16): the GEMM is a weight stream; `tl.dot_scaled` with BM = 16 is the fastest
+  W8A8 path, and FP8 weight-only GEMVs are the right class anyway (§3).
+* Eager host time is large for every FP8 path (CuTe ~20 µs, cuBLASLt ~18 µs, Triton ~40 µs
+  per call over the graph time): eager-timed targets need one launcher per module or graphs
+  (§7).
