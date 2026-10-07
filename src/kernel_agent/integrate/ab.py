@@ -11,11 +11,15 @@ transforms, in order) with undo handles (:mod:`kernel_agent.integrate.undo`):
 :meth:`Session.to` switches the model between states: it undoes the applied
 handles the target state does not share (newest first) and redoes its own,
 with the lazily-built state of each intact (no warm-up needed), or applies a
-transform again when it defines its own ``undo()``.
+transform again when it defines its own ``undo()``. After B's last run (the
+perceptual gate's samples) :meth:`Session.keep` leaves the model in B for good
+and frees what only the handles held (A's state) before the gate's scoring
+models load.
 """
 
 from __future__ import annotations
 
+import gc
 import statistics
 import traceback
 from collections.abc import Callable
@@ -116,6 +120,19 @@ class Session:
                 handle.redo()
             self.applied.append(handle)
         return again
+
+    def keep(self, state: State, *others: State) -> None:
+        """Make ``state`` the model's state for good and forget the undo handles of it and
+        of ``others``: what only they held is freed (the other states' modules, captured CUDA
+        graphs with their memory pools and caches, the original modules the states
+        replaced), as in a fresh ``e2e`` process of ``state``. No switch is possible after."""
+        self.to(state)
+        for s in (state, *others):
+            s.handles.clear()
+            s.items.clear()
+        self.applied.clear()
+        self.built = None
+        gc.collect()
 
     def _reapply(self, state: State, old: Undo) -> Undo:
         """Apply a transform with its own ``undo()`` again; its new handle replaces ``old``."""
