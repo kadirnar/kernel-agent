@@ -417,6 +417,7 @@ def make_orchestrator(tmp_path, monkeypatch, **cfg):
         backends=["triton", "cuda"],
         use_library=False,
         librarian=False,
+        dossier=False,
         **cfg,
     )
     phases = {p: {"done": True} for p in ("analyze", "plan", "capture")}

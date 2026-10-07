@@ -38,7 +38,7 @@ from kernel_agent import (
     truth,
     workers,
 )
-from kernel_agent.agent import auth, prompts
+from kernel_agent.agent import auth, prompts, web
 from kernel_agent.agent.runner import READ_TOOLS, AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import (
     best_for_target,
@@ -64,6 +64,9 @@ from kernel_agent.workloads.quality import probe_messages
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"]
+#: The dossier session (``Orchestrator.dossier``): cheap, so it delays a target's first
+#: engineer session by a few minutes at most.
+DOSSIER_CONFIG = {"effort": "low", "max_turns_per_agent": 20}
 
 
 def log(msg: str) -> None:
@@ -206,6 +209,8 @@ class Orchestrator:
         cfg = self.budget.agent_config(dataclasses.replace(self.cfg, **(config or {})))
         kwargs["system_append"] += self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
         kwargs["system_append"] += prog.prompt_note(name)
+        if cfg.allow_web:  # when to look things up, where, citations (issue #125)
+            kwargs["system_append"] += prompts.web_note(name, web.domains(cfg.web_domains))
         waits = 0
         while True:
             timer = asyncio.timeout(timeout)
@@ -267,8 +272,10 @@ class Orchestrator:
             **({"timed_out": True} if result.timed_out else {}),
             **({"usage_limit_waits": waits} if waits else {}),
             **({"usage_limit": result.usage_limit.to_dict()} if result.usage_limit else {}),
+            **({"web": web.summary(result.web)} if result.web else {}),
         }
         write_json(self.run.root / "costs.json", costs)
+        web.record(self.run.root, label or name, result.web)  # research/sources.jsonl
         return result
 
     async def _wait_for_limit(self, name: str, result: AgentResult, waits: int) -> bool:
@@ -497,6 +504,7 @@ class Orchestrator:
                 if reason := self._prior_suffices(target_id):
                     log(f"kernels: {target_id}: no agent session needed: {reason}")
                     return
+                await self.dossier(target_id)  # research.md first (web on, issue #125)
                 first, _ = workers.rounds(self.cfg.evaluations_per_target, self.cfg.reseed_workers)
                 team = self.kernel_seeds(target_id, first)
                 if not team:  # one engineer session in the target directory
@@ -1746,8 +1754,15 @@ class Orchestrator:
         evidence = research.evidence(self.run, target_id, reason, self.truth)
         if near:
             evidence += research.transforms_section(self.run)
+        dossier = research.dossier_path(self.run, target_id) if self.cfg.allow_web else None
         system = prompts.research_prompt(
-            spec, spec.get("capture", {}), evidence, plan, self.tc.summary(), pivot=proposal
+            spec,
+            spec.get("capture", {}),
+            evidence,
+            plan,
+            self.tc.summary(),
+            pivot=proposal,
+            dossier=dossier,
         )
         return await self._agent(
             f"research-{target_id}",
@@ -1761,8 +1776,51 @@ class Orchestrator:
             mcp_tools=tool_names("best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
             tools=[*READ_TOOLS, "Write"],
-            writable=[plan] + ([proposal] if proposal else []),
+            writable=[plan] + ([proposal] if proposal else []) + ([dossier] if dossier else []),
         )
+
+    async def dossier(self, target_id: str, *, label: str | None = None) -> AgentResult | None:
+        """The research dossier of a target before its first engineer session (issue #125).
+
+        A short ``dossier-<id>`` session (effort and turns capped, read-only tools, the web
+        tools) looks up the documentation, reference code and papers for the target and
+        writes ``targets/<id>/research.md``, nothing else. None (no session) with
+        ``--no-web`` / ``--no-dossier``, when the file exists or the budget is spent, and
+        when the session failed: a dossier is a bonus, never a reason to stop a target."""
+        path = research.dossier_path(self.run, target_id)
+        if not (self.cfg.allow_web and self.cfg.dossier) or path.is_file():
+            return None
+        if reason := self.budget.exhausted():
+            log(f"dossier: {target_id}: skipped: {reason}")
+            return None
+        target_dir = self.run.target(target_id)
+        spec = read_json(target_dir / "spec.json")
+        log(f"dossier: {target_id}: documentation and reference code before its first session")
+        try:
+            return await self._agent(
+                f"dossier-{target_id}",
+                label,
+                config=DOSSIER_CONFIG,
+                prompt=(
+                    f"Look up what the sources say about making target `{target_id}` fast and "
+                    f"write the dossier to {path}."
+                ),
+                system_append=prompts.dossier_prompt(
+                    spec, spec.get("capture", {}), path, self.tc.summary()
+                ),
+                cwd=target_dir,
+                mcp_tools=[],
+                add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+                tools=[*READ_TOOLS, "Write"],
+                writable=[path],
+            )
+        except auth.AuthError:  # the wrong billing stops the run, as in any session
+            raise
+        except Exception as exc:
+            if interrupt.requested():
+                raise interrupt.Interrupted from exc
+            log(f"dossier: {target_id}: agent session failed: {exc!r}")
+            return None
 
     async def pivot(
         self, target_id: str, proposal: dict[str, Any], *, source: str

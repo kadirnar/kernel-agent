@@ -28,13 +28,14 @@ def test_every_session_runs_without_auto_memory_and_connectors(tmp_path, monkeyp
     assert options.env["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
     assert options.env["X"] == "1"  # the caller's environment is kept
     assert options.setting_sources == []  # no user/project settings, hooks or CLAUDE.md
-    assert [m.matcher for m in options.hooks["PreToolUse"]] == [runner.WRITE_TOOLS]
+    web_guard = "WebFetch|WebSearch"  # the WebFetch allowlist of the web tools (#125)
+    assert [m.matcher for m in options.hooks["PreToolUse"]] == [runner.WRITE_TOOLS, web_guard]
 
     # a restricted session keeps its write guard, and gets the Claude files guard too
     _, seen = run_stream(
         tmp_path, monkeypatch, [_init(), _result()], writable=[tmp_path / "plan.json"]
     )
-    assert len(seen["options"].hooks["PreToolUse"]) == 2
+    assert len(seen["options"].hooks["PreToolUse"]) == 3  # + the write guard
 
 
 def _decision(matcher, cwd: Path, path: str, tool: str = "Write") -> str | None:
@@ -122,7 +123,7 @@ def test_claude_code_gets_the_switches_through_the_real_sdk(tmp_path, monkeypatc
     assert seen["env"] == runner.SESSION_ENV
     assert "--setting-sources=" in seen["argv"]
     matchers = seen["hooks"]["PreToolUse"]
-    assert [m["matcher"] for m in matchers] == [runner.WRITE_TOOLS]
+    assert [m["matcher"] for m in matchers] == [runner.WRITE_TOOLS, "WebFetch|WebSearch"]
 
 
 # ------------------------------------------------------------------ import-memory

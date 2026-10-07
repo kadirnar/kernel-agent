@@ -129,6 +129,8 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         budget_usd_per_agent=ns.budget,
         permission_mode=ns.permission_mode,
         allow_web=not ns.no_web,
+        web_domains=ns.web_domain or [],
+        dossier=not ns.no_dossier,
         auth=ns.auth,
         max_hours=ns.max_hours,
         max_usd=ns.max_usd,
@@ -417,6 +419,18 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         choices=["bypassPermissions", "acceptEdits", "default"],
     )
     p.add_argument("--no-web", action="store_true", help="disable WebFetch/WebSearch for agents")
+    p.add_argument(
+        "--web-domain",
+        action="append",
+        metavar="HOST",
+        help="also let WebFetch reach this host and its subdomains (repeatable; the "
+        "default list: documentation, code and paper sites, agent/web.py)",
+    )
+    p.add_argument(
+        "--no-dossier",
+        action="store_true",
+        help="no research dossier session (research.md) before a target's first session",
+    )
     _add_auth_arg(p)
     p.add_argument("--max-hours", type=float, help="wall-clock budget for the whole run")
     p.add_argument(

@@ -244,6 +244,7 @@ def make_orchestrator(tmp_path, monkeypatch, calls, *, sleep=0.0, costs=None, **
     """Synthetic run (analyze/plan/capture done, targets t1 + t2) with a fake run_agent."""
     monkeypatch.setattr(orchestrator.toolchain, "setup", FakeToolchain)
     run = RunDir.create(tmp_path, "org/m")
+    budget = {"dossier": False, **budget}  # sessions counted: no dossier (test_web.py)
     cfg = OptimizeConfig(model_ref="org/m", runs_dir=tmp_path, backends=["triton"], **budget)
     phases = {p: {"done": True} for p in ("analyze", "plan", "capture")}
     write_json(
