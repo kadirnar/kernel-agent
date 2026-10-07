@@ -2118,12 +2118,31 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
   the library is off. `run.json` → `library` records the priors tried, the
   entries stored and the librarian's files, and `report.md` has a "Kernel
   library" section.
+* **Claude Code memory.** The agent sessions run without Claude Code's auto
+  memory (see "Authentication and safety"), so what a run learns ends up in
+  `NOTES.md`, the ledger and these lessons, not in your own
+  `~/.claude/projects/<project>/memory/`. Earlier versions let sessions
+  write notes there. `library import-memory DIR` turns such notes into
+  lessons rules: a note's `description` (its one-line summary) becomes a rule
+  of `lessons/<backend>.md` when its name or description names a backend
+  (Triton, CUDA/cuBLASLt, ...), else of `lessons/<module_family>.md` when its
+  name names a family. Without `--write` it only prints what it would add,
+  with notes skipped and why, and existing rules that look alike (`~ similar
+  to:`). `--note NAME` (repeatable) selects notes, `--to NAME` sets the
+  lessons file, and `--runs DIR` keeps only notes that agent sessions of the
+  runs under DIR wrote (a Write or Edit of the note in `logs/agent-*.jsonl`,
+  or its `originSessionId`; notes Claude Code saved in the background leave no
+  such trace, so select those with `--note`). Notes of type `user` are skipped
+  unless selected, and `MEMORY.md`, the index, is never imported. The memory
+  files are only read: delete them yourself if you no longer want them.
 
 ```bash
 kernel-agent library list [--arch sm_120] [--module-class LlamaRMSNorm]
 kernel-agent library show <id or prefix>       # metadata, integrity, cases, runs, notes
 kernel-agent library prune [--older-than DAYS] [--dry-run]   # broken (and old) entries
 kernel-agent library path
+kernel-agent library import-memory ~/.claude/projects/<project>/memory \
+    [--note NAME]... [--to NAME] [--runs runs/] [--write]   # memory notes → lessons
 ```
 
 ## Backends
@@ -2229,6 +2248,7 @@ kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
 kernel-agent library list|show <id>|prune [--older-than DAYS]|path   cross-run kernel library
+kernel-agent library import-memory DIR [--write]   Claude Code memory notes → lessons
 kernel-agent doctor [--smoke] [--remeasure-peaks] [--fetch-sanitizer]
 kernel-agent install-claude-code <project-dir>
 ```
@@ -2686,6 +2706,31 @@ By default the agents run with `bypassPermissions` inside the run directory,
 because they need to compile and run code without prompts. Use
 `--permission-mode acceptEdits` for a stricter setup. Agents never install or
 change torch/CUDA packages.
+
+**Nothing of yours in, nothing of the run out.** A session depends only on
+kernel-agent's prompts, `program.md` and the run directory, so it behaves the
+same on every machine (`kernel_agent/agent/runner.py`):
+
+* `setting_sources=[]`: no user or project `settings.json`, hooks, skills,
+  `~/.claude/CLAUDE.md` or project `CLAUDE.md` are loaded.
+* `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`: no Claude Code auto memory. Without it
+  every session loads the repository's
+  `~/.claude/projects/<project>/memory/MEMORY.md` into its system prompt (the
+  directory is per git repository, so a run under your checkout shares your
+  own) and saves notes there. Those notes then reach your own sessions and
+  later runs without review. Lessons belong in the library instead ("Kernel
+  library and lessons"; `library import-memory` imports old notes).
+* `ENABLE_CLAUDEAI_MCP_SERVERS=false`: with a subscription login, Claude Code
+  would also load your claude.ai connectors, whose tools act on your account.
+* A PreToolUse hook denies Write/Edit of `CLAUDE.md`, `CLAUDE.local.md` and
+  `AGENTS.md` anywhere, and of anything under `~/.claude` (or
+  `$CLAUDE_CONFIG_DIR`). With auto memory off, a session asked to remember
+  something wrote the repository's `CLAUDE.md` instead, which your own
+  sessions would load. The agents' Bash tool is not covered.
+
+Claude Code still keeps each session's transcript under
+`~/.claude/projects/` (the usage-limit resume needs it), and it reads
+`~/.claude.json` and managed policy settings regardless of these options.
 
 ## Development
 
