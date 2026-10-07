@@ -107,6 +107,16 @@ def _integration_reserve(raw: str) -> float | None:
     return minutes
 
 
+def _precisions(raw: str) -> list[str]:
+    """``--precisions``: a comma list of target precisions (``exact`` is always added)."""
+    from kernel_agent import precisions
+
+    try:
+        return precisions.parse(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def _config(ns: argparse.Namespace) -> OptimizeConfig:
     return OptimizeConfig(
         model_ref=ns.model,
@@ -145,6 +155,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         ab_min_gain=ns.ab_min_gain,
         recheck=not ns.no_recheck,
         quality=ns.quality,
+        precisions=ns.precisions,
         use_library=not ns.no_library,
         librarian=not ns.no_librarian,
         librarian_model=ns.librarian_model,
@@ -186,6 +197,8 @@ def cmd_resume(ns: argparse.Namespace) -> int:
         overrides["program"] = ns.program
     if ns.auth:
         overrides["auth"] = ns.auth
+    if ns.precisions:  # recorded in run.json (precisions.py)
+        overrides["precisions"] = ns.precisions
     orch = Orchestrator.resume(Path(ns.run_dir), overrides)
     if ns.redo:
         data = orch.run.load()
@@ -199,6 +212,32 @@ def cmd_resume(ns: argparse.Namespace) -> int:
         write_json(orch.run.run_json, data)
     run = asyncio.run(orch.run_all(until=ns.until))
     print(run.report.read_text() if run.report.exists() else "")
+    return 0
+
+
+def cmd_integrate(ns: argparse.Namespace) -> int:
+    """Integrate a run again (the measurements of unchanged content reused, as the improve
+    loop's re-integrations) and rewrite its report; no agent session."""
+    from kernel_agent import interrupt
+    from kernel_agent.orchestrator import Orchestrator
+    from kernel_agent.report import write_report
+
+    overrides = {"precisions": ns.precisions} if ns.precisions else {}
+    orch = Orchestrator.resume(Path(ns.run_dir), overrides)  # --precisions: into run.json
+    if orch.simulated:
+        raise SystemExit(f"{ns.run_dir} is a dry-run run (improve --dry-run integrates it)")
+
+    async def integrate() -> Path:
+        await orch.integrate(reuse=not ns.no_reuse)
+        path = write_report(orch.run)
+        orch._mark("report")
+        return path
+
+    try:
+        report = interrupt.run(integrate())
+    except KeyboardInterrupt:
+        return interrupt.EXIT_CODE
+    print(f"\nreport: {report}\nrun directory: {orch.run.root}")
     return 0
 
 
@@ -492,7 +531,21 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         "optimisations (FP8 weights, ...) pass a perceptual gate instead (WER, speaker "
         "similarity, MOS for TTS; workloads/perceptual.py)",
     )
+    _add_precisions_arg(p)
     p.add_argument("--verbose", "-v", action="store_true")
+
+
+def _add_precisions_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--precisions",
+        type=_precisions,
+        metavar="P,P,...",
+        help="target precisions the run allows, recorded in run.json (exact is always "
+        "allowed): exact, fp8_weights, fp8_w8a8, reduced, fp4_weights (needs --quality "
+        "near-lossless). Default: exact; near-lossless: all but the 4-bit fp4_weights, which "
+        "is opt-in. Given to a run that exists (improve, resume, integrate), it replaces "
+        "the run's list",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -537,7 +590,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--claude-model")
     p.add_argument("--program", metavar="FILE", help="replace the run's program.md with FILE")
     _add_auth_arg(p, default=None)  # None: the run's
+    _add_precisions_arg(p)
     p.set_defaults(func=cmd_resume)
+
+    p = sub.add_parser(
+        "integrate",
+        help="integrate a run again (unchanged measurements reused) and rewrite its report",
+    )
+    p.add_argument("run_dir")
+    p.add_argument("--no-reuse", action="store_true", help="measure every A/B again")
+    _add_precisions_arg(p)
+    p.set_defaults(func=cmd_integrate)
 
     p = sub.add_parser(
         "improve",

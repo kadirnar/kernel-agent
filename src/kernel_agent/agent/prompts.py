@@ -18,9 +18,11 @@ where (``knowledge/sources.md``), how to cite, and that pages are untrusted data
 
 from __future__ import annotations
 
+import copy
 import functools
 import importlib.util
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -221,29 +223,93 @@ PLAN_SCHEMA: dict[str, Any] = {
 }
 
 
-def precision_policy(quality: str) -> str:
-    """The planner's precision rules for the run's ``--quality`` mode."""
+def plan_schema(precisions: Iterable[str] | None = None) -> dict[str, Any]:
+    """:data:`PLAN_SCHEMA` offering only the target precisions a run allows (``--precisions``,
+    ``kernel_agent/precisions.py``; None: every one): the enum of a target's ``precision``,
+    and of a pivot's (its reduced ones; no ``pivots`` without one)."""
+    schema = copy.deepcopy(PLAN_SCHEMA)
+    if precisions is None:
+        return schema
+    allowed = ["exact", *(p for p in precisions if p != "exact")]
+    props = schema["properties"]
+    props["targets"]["items"]["properties"]["precision"]["enum"] = allowed
+    if allowed[1:]:
+        props["pivots"]["items"]["properties"]["precision"]["enum"] = allowed[1:]
+    else:
+        props.pop("pivots")
+    return schema
+
+
+def precision_policy(quality: str, precisions: Iterable[str] | None = None) -> str:
+    """The planner's precision rules for the run's ``--quality`` mode and the precisions it
+    allows (``--precisions``; None: the quality mode's default, without the 4-bit ones)."""
+    from kernel_agent import precisions as allowed_precisions
+
     if quality == "near-lossless":
-        return """
-# Precision (`--quality near-lossless`)
-Numerics-changing optimisations are allowed where the perceptual quality stays
-within the noise of eager. For a target whose time goes into streaming weights
+        allowed = tuple(allowed_precisions.default(quality) if precisions is None else precisions)
+        return _near_lossless_policy(allowed, allowed_precisions.FOUR_BIT)
+    return """
+# Precision (`--quality exact`)
+This run keeps full precision: do not set `precision` (a target with
+`fp8_weights`, `fp4_weights`, `fp8_w8a8` or `reduced` is refused); every kernel
+must match eager within rounding noise.
+"""
+
+
+def _near_lossless_policy(allowed: tuple[str, ...], four_bit: tuple[str, ...]) -> str:
+    """The near-lossless precision policy: a paragraph per precision in ``allowed``."""
+    names = ", ".join(f"`{p}`" for p in allowed)
+    refused = [p for p in ("fp8_weights", "fp8_w8a8", "reduced", *four_bit) if p not in allowed]
+    lines = [
+        "",
+        "# Precision (`--quality near-lossless`)",
+        f"This run allows the precisions {names} (`--precisions`)"
+        + (
+            f"; {', '.join(f'`{p}`' for p in refused)} "
+            + ("is" if len(refused) == 1 else "are")
+            + " not allowed: a target with "
+            + ("it" if len(refused) == 1 else "one of them")
+            + " is refused"
+            if refused
+            else ""
+        )
+        + ".",
+    ]
+    if any(p in refused for p in four_bit):
+        lines.append(
+            "No 4-bit weights or activations (FP4, NVFP4, MXFP4, int4) anywhere, also not in a "
+            "`reduced` target or an approach; the *Ceilings* table's *FP4 w* / *W4A4* floors "
+            "(where shown) are out of reach."
+        )
+    lines.append(_POLICY["intro"])
+    for name in ("fp8_weights", "fp4_weights", "fp8_w8a8", "reduced"):
+        if name in allowed:
+            lines.append(_POLICY[name])
+    lines.append(_POLICY["exact"])
+    return "\n".join(lines) + "\n"
+
+
+#: The paragraphs of the near-lossless precision policy, per allowed precision.
+_POLICY = {
+    "intro": """Numerics-changing optimisations are allowed where the perceptual quality stays
+within the noise of eager.""",
+    "fp8_weights": """For a target whose time goes into streaming weights
 (decode GEMVs and skinny GEMMs: `nn.Linear` layers, MLP or attention projections
 at a few rows per call, memory or launch bound) set `precision: "fp8_weights"`
 and a one-line `precision_why` with the number that justifies it (e.g. "M=1
 decode GEMVs, 40 % of the run, memory bound: FP8 halves the bytes"). Its
 kernels then store the weights in FP8 e4m3 with one scale per output channel
 (activations stay bf16), the target is checked in the near-lossless tolerance
-tier, and every end-to-end evaluation in the run's perceptual gate.
-`precision: "fp4_weights"` (block-scaled FP4 weights, NVFP4: 4.5 bits per
+tier, and every end-to-end evaluation in the run's perceptual gate.""",
+    "fp4_weights": """`precision: "fp4_weights"` (block-scaled FP4 weights, NVFP4: 4.5 bits per
 weight, about 4x FP8's error, its own looser tolerance tier) only for
 memory-bound decode GEMVs / skinny GEMMs where `fp8_weights` is already in use
 (a previous round, the library) or the *Ceilings* table shows the target still
 bound by streaming weights (its *FP4 w* floor well below its *FP8 w* floor);
 its `precision_why` names that evidence. FP4 on every layer can fail end to end
 where FP8 passes (VoxCPM2: FP4 in both LMs passes, the LocDiT is better kept in
-FP8): give FP4 to the largest weight streams first, as separate targets.
-For a target whose time goes into compute-bound GEMMs (~64+ rows per call on
+FP8): give FP4 to the largest weight streams first, as separate targets.""",
+    "fp8_w8a8": """For a target whose time goes into compute-bound GEMMs (~64+ rows per call on
 large weights, e.g. a DiT at batch 8 under CFG: bf16 tensor cores near their
 peak, the *Ceilings* table's *W8A8* floor well below its *FP8 w* one, so FP8
 weights alone buy nothing) set `precision: "fp8_w8a8"`: weights (per output
@@ -251,19 +317,35 @@ channel) and activations (per token, every call) in e4m3 on the FP8 tensor
 cores, fp32 accumulation. Its `precision_why` names the FLOP-bound number (e.g.
 "LocDiT GEMMs at M=352: 80 TFLOP per run = 0.81 s at 99 bf16 TFLOP/s, compute
 bound"). Few rows per call stay `fp8_weights` (memory bound: quantising the
-activations saves nothing there and their outlier channels cost accuracy).
-`precision: "reduced"` (also
-with `precision_why`) is for another numerics-changing idea. Leave `precision`
+activations saves nothing there and their outlier channels cost accuracy).""",
+    "reduced": """`precision: "reduced"` (also
+with `precision_why`) is for another numerics-changing idea.""",
+    "exact": """Leave `precision`
 unset (exact) where lower precision buys nothing or risks the output: norms,
 softmax and attention math, element-wise ops, and the output / stop heads of
-autoregressive models.
-"""
-    return """
-# Precision (`--quality exact`)
-This run keeps full precision: do not set `precision` (a target with
-`fp8_weights`, `fp4_weights`, `fp8_w8a8` or `reduced` is refused); every kernel
-must match eager within rounding noise.
-"""
+autoregressive models.""",
+}
+
+
+def precision_note(quality: str, precisions: Iterable[str]) -> str:
+    """The precisions of a near-lossless run for the systems agent, whose transforms no
+    precision check sees ("" in an exact run: its checks reject any numerics change)."""
+    from kernel_agent import precisions as allowed_precisions
+
+    if quality != "near-lossless":
+        return ""
+    allowed = tuple(precisions)
+    no_four = [p for p in allowed_precisions.FOUR_BIT if p not in allowed]
+    return (
+        f"\n\n# Precision\nThis run allows the precisions {', '.join(f'`{p}`' for p in allowed)} "
+        "(`--precisions`); the perceptual gate judges every numerics change."
+        + (
+            " No 4-bit weights or activations (FP4, NVFP4, MXFP4, int4) in any transform."
+            if no_four
+            else ""
+        )
+        + "\n"
+    )
 
 
 def planner_prompt(
@@ -275,6 +357,7 @@ def planner_prompt(
     python: str,
     toolchain: str,
     quality: str = "exact",
+    precisions: Iterable[str] | None = None,
 ) -> str:
     base = {k: baseline.get(k) for k in ("workload", "median_ms", "peak_mem_gb", "deterministic")}
     if "compiled_ms" in baseline:  # the strong baseline (strong_baseline.py)
@@ -338,10 +421,10 @@ model. Specialist agents will then write custom kernels for each target you pick
    instances). Use a region only when the fusion removes a real round trip
    through memory or launches that no module target covers.
    **Ceilings.** When the profile has a *Ceilings* table, rank targets by
-   ceiling × share (its *saves ms*, and the FP8 / FP4 floors where precision
-   may change), not by share alone, and name each target's bound with its
-   number in `why` (e.g. "compute bound: 80 TFLOP per run at M = 352, floor
-   0.81 s at bf16 vs 3.9 s now").
+   ceiling × share (its *saves ms*, and the floors of the precisions this run
+   allows where precision may change), not by share alone, and name each
+   target's bound with its number in `why` (e.g. "compute bound: 80 TFLOP per
+   run at M = 352, floor 0.81 s at bf16 vs 3.9 s now").
 3. For each target give `approach` (the concrete fusion/algorithm idea, which
    kernels it removes, expected speedup) and an ordered list of `backends` from:
    {", ".join(backends)}. Put the backend most suited to the op first
@@ -354,7 +437,7 @@ model. Specialist agents will then write custom kernels for each target you pick
    + CUDA graphs, merged projections, precomputed tables, removing host syncs)
    when the profile shows launch/CPU-bound behaviour or redundant work.
 5. Ids are short snake_case.
-{precision_policy(quality)}
+{precision_policy(quality, precisions)}
 Return the plan as structured output.
 
 {_env_block(python, toolchain)}"""
@@ -472,10 +555,24 @@ def reduced_precision(target: dict[str, Any], capture_info: dict[str, Any]) -> s
     return None
 
 
-def _precision_block(precision: str | None, target: dict[str, Any]) -> str:
-    """The reduced-precision contract of the engineer prompt (empty for exact targets)."""
+def _precision_block(
+    precision: str | None, target: dict[str, Any], precisions: Iterable[str] | None = None
+) -> str:
+    """The reduced-precision contract of the engineer prompt (empty for exact targets);
+    ``precisions``: the ones the run allows (None: near-lossless's default, no 4-bit)."""
+    from kernel_agent import precisions as allowed_precisions
+
     if precision is None:
         return ""
+    allowed = allowed_precisions.default("near-lossless") if precisions is None else precisions
+    four_bit = allowed_precisions.FOUR_BIT
+    no_four = precision not in four_bit and any(p not in tuple(allowed) for p in four_bit)
+    no_four_note = (
+        "\nNo 4-bit weights or activations (FP4, NVFP4, MXFP4, int4): this run does not allow "
+        "them (`--precisions`); skip the FP4 parts of the guide.\n"
+        if no_four
+        else ""
+    )
     why = f" (planner: {target['precision_why']})" if target.get("precision_why") else ""
     if precision == "fp8_weights":
         contract = """FP8 weight-only:
@@ -531,7 +628,7 @@ The evaluator checks it in {_tier_bounds(precision)} (the exact tier would rejec
 low-precision weights). End to end, the run's perceptual gate decides. This replaces the "no
 fp8/int8" rule below for this target only.
 {contract}
-"""
+{no_four_note}"""
 
 
 def _tier_bounds(precision: str) -> str:
@@ -564,6 +661,7 @@ def engineer_prompt(
     toolchain: str,
     evaluations: int,
     class_stats: dict[str, Any] | None,
+    precisions: Iterable[str] | None = None,
 ) -> str:
     guides = []
     for b in dict.fromkeys(BACKEND_GUIDES[b] for b in backends if b in BACKEND_GUIDES):
@@ -639,7 +737,7 @@ instances' configuration generically (read sizes from the module). Expose tuning
 parameters (block sizes, `num_warps`, `num_stages`, vector widths) as keyword
 arguments with defaults, `def build(reference, BLOCK=1024, num_warps=4)`, and
 tune them with `sweep_candidate`.
-{entrypoints}{_precision_block(precision, target)}
+{entrypoints}{_precision_block(precision, target, precisions)}
 # Backends (in priority order)
 {backend_list}
 Start with the first. When it is correct and fast, try the next one only if
@@ -795,9 +893,11 @@ def research_prompt(
     *,
     pivot: Path | None = None,
     dossier: Path | None = None,
+    precisions: Iterable[str] | None = None,
 ) -> str:
     """The research agent of a plateaued target: read-only, writes ``plan`` (``plan.md``)
-    and, with ``pivot`` (near-lossless runs), may propose a precision pivot there; with
+    and, with ``pivot`` (near-lossless runs), may propose a precision pivot there, to one of
+    the reduced ``precisions`` the run allows (None: near-lossless's default, no 4-bit); with
     ``dossier`` (the web tools on) it may also update the target's ``research.md``."""
     cases = "\n".join(
         f"  * `{c['signature']}` — {c['count']} calls per run per instance"
@@ -868,7 +968,7 @@ bandwidth, compute or launch floor, from `sol_ms` and the profile) times the
 share of calls they cover. Recommend a pivot when the current design's ceiling
 is below another's, even if that one has no good number yet. An idea whose
 attempts all failed is untested, not refuted.
-{_pivot_block(target, pivot)}
+{_pivot_block(target, pivot, precisions)}
 # Write `{plan}`
 This file{" (and `pivot.json` above)" if pivot else ""} only{_besides(dossier)}: the \
 session cannot write anything else. Layout:
@@ -911,23 +1011,43 @@ def _besides(dossier: Path | None) -> str:
     return f", besides `{dossier.name}` (see # Documentation)" if dossier else ""
 
 
-def _pivot_block(target: dict[str, Any], pivot: Path | None) -> str:
-    """The precision pivot section of a research prompt (``pivot.py``; empty without one)."""
+def _pivot_block(
+    target: dict[str, Any], pivot: Path | None, precisions: Iterable[str] | None = None
+) -> str:
+    """The precision pivot section of a research prompt (``pivot.py``; empty without one):
+    to one of the reduced ``precisions`` the run allows (None: near-lossless's default)."""
+    from kernel_agent import precisions as allowed_precisions
+
     if pivot is None:
         return ""
-    from kernel_agent.kernels.compare import REDUCED_PRECISIONS
-
+    allowed = allowed_precisions.default("near-lossless") if precisions is None else precisions
     current = target.get("precision") or "exact"
-    others = ", ".join(f"`{p}`" for p in REDUCED_PRECISIONS if p != current)
+    choices = [p for p in allowed_precisions.reduced(allowed) if p != current]
+    if not choices:
+        return ""
+    others = ", ".join(f"`{p}`" for p in choices)
+    bounds = []
+    if "fp8_w8a8" in choices:
+        bounds.append("compute bound at the bf16 peak (W8A8: twice the FLOP rate, `fp8_w8a8`)")
+    streams = [f"`{p}`" for p in ("fp8_weights", "fp4_weights") if p in choices]
+    if streams:
+        bounds.append(f"bound by streaming weights ({', '.join(streams)})")
+    why = f"the module's GEMMs are {' or '.join(bounds)}, " if bounds else ""
+    four_bit = [p for p in allowed_precisions.FOUR_BIT if p not in tuple(allowed)]
+    no_four = (
+        f" 4-bit precisions ({', '.join(f'`{p}`' for p in four_bit)}) are not allowed in this "
+        "run (`--precisions`): never propose them."
+        if four_bit
+        else ""
+    )
     return f"""
 # Precision pivot (optional)
-This run allows reduced precision (`--quality near-lossless`) and this target is
-`{current}`. Its precision was fixed when it was planned. If the evidence shows
-that the remaining gain lies in another precision tier, propose a pivot: the
-module's GEMMs are compute bound at the bf16 peak (W8A8: twice the FLOP rate,
-`fp8_w8a8`) or bound by streaming weights (`fp8_weights`, `fp4_weights`), the
-current design sits near its ceiling at this precision, or a passing end-to-end
-transform above already uses that precision on these modules. Write `{pivot}`:
+This run allows reduced precision (`--quality near-lossless`: {others} besides
+this target's) and this target is `{current}`. Its precision was fixed when it was
+planned.{no_four} If the evidence shows that the remaining gain lies in another
+precision tier, propose a pivot: {why}the current design sits near its ceiling at
+this precision, or a passing end-to-end transform above already uses that precision
+on these modules. Write `{pivot}`:
 ```json
 {{"precision": "<one of {others}>",
  "precision_why": "<the numbers: bound, ceiling, the transform's exp and gain>",

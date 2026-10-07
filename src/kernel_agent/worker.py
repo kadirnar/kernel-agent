@@ -27,7 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import truth
+from kernel_agent import precisions, truth
 from kernel_agent.gpulock import child_env, gpu_lock
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -139,8 +139,11 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
             profile = profile_workload(workload, inputs, reference_ms=window_ms, work=work)
         write_json(out.profile_dir / "profile.json", profile)
-        # Floors per class at bf16 / FP8 / FP4 (profile/ceilings.json + .md; issue #90).
-        table = ceilings.write(out.profile_dir, profile, current_peaks(), window_ms, per=per)
+        # Floors per class at bf16 / FP8 / FP4 (profile/ceilings.json + .md; issue #90); the
+        # markdown shows the precisions the run allows (precisions.py, issue #131).
+        table = ceilings.write(
+            out.profile_dir, profile, current_peaks(), window_ms, per=per, allowed=_allowed(ns, run)
+        )
         summary = (
             summarize(profile, window_ms, metric=what, per=per)
             + ceilings.markdown(table)
@@ -233,6 +236,9 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     target_dir = run.target(ns.target)
     spec = read_json(target_dir / "spec.json")
+    reduced = tier_for(_quality(ns, run), spec.get("precision")) != EXACT_TIER
+    if reduced and (why := precisions.refusal(spec.get("precision"), _allowed(ns, run))):
+        raise ValueError(f"capture of {ns.target} refused: {why}")  # e.g. 4-bit, not asked for
     workload = _workload(run)
     cls, out, capture = spec["module_class"], target_dir, run.capture_file(ns.target)
     scope = {k: spec.get(k) for k in ("qualname", "qualname_regex", "phase")}
@@ -367,6 +373,14 @@ def _quality(ns: argparse.Namespace, run: RunDir | None = None) -> str:
     if run is None and getattr(ns, "run_dir", None) is not None:
         run = RunDir(Path(ns.run_dir).resolve())
     return mode_of(((run.load() if run else {}).get("config") or {}).get("quality"))
+
+
+def _allowed(ns: argparse.Namespace, run: RunDir) -> tuple[str, ...]:
+    """The target precisions the run allows (``precisions.py``): ``--precisions`` (the
+    orchestrator's, from its memory), else ``run.json``'s, in the run's quality mode."""
+    raw = getattr(ns, "precisions", None)
+    listed = raw.split(",") if raw else (run.load().get("config") or {}).get("precisions")
+    return precisions.allowed(_quality(ns, run), listed)
 
 
 def _judge(
@@ -688,6 +702,9 @@ def main(argv: list[str] | None = None) -> int:
         "--verify", action="append", help="e2e: REL=SHA256, refuse a run file without it"
     )
     parser.add_argument("--quality", help="exact | near-lossless (default: run.json's)")
+    parser.add_argument(
+        "--precisions", help="P,P,...: the precisions the run allows (default: run.json's)"
+    )
     parser.add_argument(
         "--expandable-segments",
         action="store_true",

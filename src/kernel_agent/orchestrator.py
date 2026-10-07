@@ -27,6 +27,7 @@ from kernel_agent import (
     ledger,
     library,
     objective,
+    precisions,
     program,
     projection,
     region,
@@ -114,6 +115,9 @@ class Orchestrator:
             raise SystemExit("no CUDA GPU detected; kernel-agent needs one")
         if cfg.program and not Path(cfg.program).expanduser().is_file():
             raise SystemExit(f"program file not found: {cfg.program}")
+        if problem := precisions.check(cfg.quality, cfg.precisions):
+            raise SystemExit(problem)
+        cfg.precisions = list(precisions.allowed(cfg.quality, cfg.precisions))  # run.json
         log(auth.preflight(cfg.auth))  # --auth: a login / API key exists (presence only)
         log(f"resolving {cfg.model_ref}")
         card = hub.resolve(cfg.model_ref, token=cfg.hf_token, modality=cfg.modality)
@@ -159,7 +163,15 @@ class Orchestrator:
     def resume(cls, root: Path, overrides: dict[str, Any] | None = None) -> Orchestrator:
         run = RunDir(root.resolve())
         data = run.load()
-        cfg = OptimizeConfig.from_dict({**data["config"], **(overrides or {})})
+        overrides = dict(overrides or {})
+        if (wanted := overrides.pop("precisions", None)) is not None:  # recorded in run.json
+            quality = data["config"].get("quality")
+            if problem := precisions.check(quality, wanted):
+                raise SystemExit(problem)
+            data["config"]["precisions"] = list(precisions.allowed(quality, wanted))
+            write_json(run.run_json, data)
+            log(f"precisions: {precisions.describe(data['config']['precisions'])} (run.json)")
+        cfg = OptimizeConfig.from_dict({**data["config"], **overrides})
         if "dry_run" not in data:  # simulated runs have no agents
             log(auth.preflight(cfg.auth))
         program.install(run, (overrides or {}).get("program"))  # keeps the run's edited copy
@@ -176,6 +188,16 @@ class Orchestrator:
         phase.update(done=True, at=time.strftime("%H:%M:%S"), **info)
         write_json(self.run.run_json, data)
 
+    def allowed_precisions(self) -> tuple[str, ...]:
+        """The target precisions this run allows (``--precisions``, ``precisions.py``)."""
+        return precisions.allowed(self.cfg.quality, self.cfg.precisions)
+
+    def _refused(self, target_id: str) -> str | None:
+        """Why the kernels of a target may not be used in this run (its precision is not
+        allowed, ``precisions.py``), or None."""
+        spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
+        return precisions.refusal(precisions.of_spec(spec), self.allowed_precisions())
+
     def _available_backends(self) -> list[str]:
         avail = [b for b in self.cfg.backends if self.tc.backends.get(b)]
         if not avail:
@@ -184,7 +206,8 @@ class Orchestrator:
 
     def _worker(self, command: str, *args: str) -> dict[str, Any]:
         if command == "capture":  # a target's tolerance tier follows the run's quality mode
-            args = (*args, "--quality", self.cfg.quality)
+            allowed = ",".join(self.allowed_precisions())  # and its precision must be allowed
+            args = (*args, "--quality", self.cfg.quality, "--precisions", allowed)
         return (self.worker or call_worker)(self.run, command, *args)
 
     async def _agent(
@@ -367,10 +390,11 @@ class Orchestrator:
                 self.python,
                 self.tc.summary(),
                 quality=self.cfg.quality,
+                precisions=self.allowed_precisions(),
             ),
             cwd=self.run.root,
             mcp_tools=[],
-            output_format={"type": "json_schema", "schema": prompts.PLAN_SCHEMA},
+            output_format={"type": "json_schema", "schema": self._plan_schema()},
         )
         plan = result.structured
         if not isinstance(plan, dict):
@@ -382,7 +406,9 @@ class Orchestrator:
         targets = []
         for t in plan["targets"][: self.cfg.max_targets]:
             if problem := (
-                region.validate(t, known) or _scope(t) or _precision(t, self.cfg.quality)
+                region.validate(t, known)
+                or _scope(t)
+                or _precision(t, self.cfg.quality, self.allowed_precisions())
             ):
                 log(f"plan: dropping {t['id']}: {problem}")
                 continue
@@ -399,6 +425,10 @@ class Orchestrator:
         for t in plan.get("transforms", []):
             log(f"plan: transform {t['id']}: {t['idea'][:120]}")
         self._mark("plan", targets=[t["id"] for t in targets])
+
+    def _plan_schema(self) -> dict[str, Any]:
+        """The planner's output schema: its precisions are the ones the run allows."""
+        return prompts.plan_schema(self.allowed_precisions())
 
     async def capture(self) -> None:
         plan = read_json(self.run.plan_json, {})
@@ -417,6 +447,10 @@ class Orchestrator:
         parent class, see ``region.py``); returns the captured ids."""
         kept = []
         for t in targets:
+            if why := precisions.refusal(t.get("precision"), self.allowed_precisions()):
+                log(f"capture: {t['id']} refused: {why}")  # planned before the run's list
+                ledger.event(self.run, "capture_refused", target=t["id"], why=why)
+                continue
             target_dir = self.run.target(t["id"])
             (target_dir / "candidates").mkdir(parents=True, exist_ok=True)
             spec = {**t}
@@ -494,6 +528,9 @@ class Orchestrator:
 
         async def one(target_id: str) -> None:
             team: list[workers.Seed] = []
+            if why := self._refused(target_id):  # captured before the run's --precisions
+                log(f"kernels: skipping {target_id}: {why}")
+                return
             async with sem:
                 if reason := self.budget.exhausted():
                     log(f"kernels: skipping {target_id}: {reason}")
@@ -518,6 +555,7 @@ class Orchestrator:
                         self.tc.summary(),
                         self.cfg.evaluations_per_target,
                         stats.get(spec["module_class"]),
+                        precisions=self.allowed_precisions(),
                     ) + self._library_note(target_id, spec)
                     (target_dir / "NOTES.md").touch()
                     await self._agent(
@@ -575,7 +613,8 @@ class Orchestrator:
                 self.tc.summary(),
                 self.cfg.transform_evaluations,
                 kernels=self._kernel_winners(),
-            ),
+            )
+            + prompts.precision_note(self.cfg.quality, self.allowed_precisions()),
             cwd=self.run.transforms_dir,
             mcp_tools=tool_names("evaluate_e2e", "run_info"),
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
@@ -627,6 +666,7 @@ class Orchestrator:
                 self.tc.summary(),
                 seed.evaluations,
                 stats.get(spec["module_class"]),
+                precisions=self.allowed_precisions(),
             )
             + self._library_note(target_id, spec)
             + workers.prompt_note(target_id, seed, team)
@@ -688,7 +728,10 @@ class Orchestrator:
         snapshot with a speed cap (``speed_caps``) ranks by it: its ``speedup`` is the
         conservative one, ``evaluator_speedup`` the record's."""
         best = None
+        allowed = self.allowed_precisions()
         for rec in ranked_for_target(self.run, target_id, self.truth):
+            if not precisions.tier_allowed(rec.get("tolerance_tier"), allowed):
+                continue  # evaluated in the tier of a precision the run does not allow
             if best is not None and rec["speedup"] <= best["speedup"]:
                 break  # ranked by the records' speedups, which a cap only lowers
             cap = self.speed_caps.get((target_id, Path(str(rec["snapshot"])).name))
@@ -701,9 +744,23 @@ class Orchestrator:
         return best if best and best["speedup"] >= self.cfg.min_speedup and ok else None
 
     def _kernel_bests(self) -> list[tuple[str, dict[str, Any]]]:
-        """(target_id, verified best record) of every kernel worth integrating."""
-        bests = [(t, self._kernel_best(t)) for t in self.run.target_ids()]
+        """(target_id, verified best record) of every kernel worth integrating (none of a
+        target at a precision the run does not allow: :meth:`skipped_targets`)."""
+        ids = [t for t in self.run.target_ids() if self._refused(t) is None]
+        bests = [(t, self._kernel_best(t)) for t in ids]
         return [(t, best) for t, best in bests if best is not None]
+
+    def skipped_targets(self) -> list[dict[str, str]]:
+        """``{"target", "precision", "reason"}`` of every target the integration leaves
+        out: its precision is not one the run allows (``--precisions``, ``precisions.py``)."""
+        skipped = []
+        for target_id in self.run.target_ids():
+            if why := self._refused(target_id):
+                spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
+                skipped.append(
+                    {"target": target_id, "precision": precisions.of_spec(spec), "reason": why}
+                )
+        return skipped
 
     def _kernel_winners(self) -> list[tuple[str, str, float]]:
         """(target_id, snapshot path, module speedup) of every kernel worth integrating,
@@ -764,8 +821,16 @@ class Orchestrator:
         Everything comes from the verified truth (``truth.py``): the baseline
         latency the orchestrator recorded, records and snapshots whose digests
         match, and a reuse cache only from an unmodified ``integration.json``.
+
+        The kernels of a target at a precision the run does not allow
+        (``--precisions``, ``precisions.py``: 4-bit unless asked for), and kernels
+        evaluated in the tolerance tier of one, are left out; ``skipped`` says which
+        targets and why (:meth:`skipped_targets`).
         """
         base_ms = self.truth.baseline_ms()
+        skipped = self.skipped_targets()  # at a precision the run does not allow
+        for s in skipped:
+            log(f"integrate: skipping {s['target']}: {s['reason']}")
         items, digests = self._integration_items()
         composite = self._integration_composite(digests)
         log(
@@ -951,6 +1016,8 @@ class Orchestrator:
             result["owners"] = found
         if rechecks:
             result["recheck"] = rechecks
+        if skipped:
+            result["skipped"] = skipped
         baseline = self.truth.load_json(self.run.baseline_json)  # its compiled_ms
         reference = self._with_reference(baseline, accepted, previous or {})
         if reference is not None:
@@ -1625,7 +1692,7 @@ class Orchestrator:
         (``target=path``, usually the agent's copy of a snapshot): the verified
         snapshot of a correct evaluation with that file name, else None."""
         target_id, _, path = item.partition("=")
-        if target_id not in self.run.target_ids():
+        if target_id not in self.run.target_ids() or self._refused(target_id):
             return None
         if not region.rewrite_ok(self.run, target_id, self.truth):  # a region: its rewrite
             return None
@@ -1695,6 +1762,7 @@ class Orchestrator:
             self.tc.summary(),
             evaluations,
             stats.get(spec["module_class"]),
+            precisions=self.allowed_precisions(),
         ) + self._library_note(target_id, spec)
         return await self._agent(
             f"kernel-{target_id}",
@@ -1723,7 +1791,7 @@ class Orchestrator:
             self.tc.summary(),
             evaluations,
             kernels=self._kernel_winners(),
-        )
+        ) + prompts.precision_note(self.cfg.quality, self.allowed_precisions())
         return await self._agent(
             "systems",
             label,
@@ -1751,7 +1819,9 @@ class Orchestrator:
         spec = read_json(target_dir / "spec.json")
         plan = research.plan_path(self.run, target_id)
         near = self.cfg.quality == "near-lossless"
-        proposal = pivot.proposal_path(self.run, target_id) if near else None
+        allowed = self.allowed_precisions()  # a pivot only to another one of them
+        others = [p for p in precisions.reduced(allowed) if p != precisions.of_spec(spec)]
+        proposal = pivot.proposal_path(self.run, target_id) if near and others else None
         evidence = research.evidence(self.run, target_id, reason, self.truth)
         if near:
             evidence += research.transforms_section(self.run)
@@ -1764,6 +1834,7 @@ class Orchestrator:
             self.tc.summary(),
             pivot=proposal,
             dossier=dossier,
+            precisions=allowed,
         )
         return await self._agent(
             f"research-{target_id}",
@@ -1834,7 +1905,10 @@ class Orchestrator:
 
         spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
         taken = pivot.taken(self.run)
-        problem = pivot.check(spec, proposal, quality=self.cfg.quality, taken=taken)
+        allowed = self.allowed_precisions()
+        problem = pivot.check(
+            spec, proposal, quality=self.cfg.quality, taken=taken, allowed=allowed
+        )
         if problem is not None:
             log(f"pivot: {target_id}: not moved to {proposal.get('precision')!r} ({problem})")
             ledger.event(self.run, "pivot_refused", target=target_id, why=problem, source=source)
@@ -1889,11 +1963,12 @@ class Orchestrator:
                 self.python,
                 self.tc.summary(),
                 quality=self.cfg.quality,
+                precisions=self.allowed_precisions(),
             )
             + context,
             cwd=round_dir,
             mcp_tools=[],
-            output_format={"type": "json_schema", "schema": prompts.PLAN_SCHEMA},
+            output_format={"type": "json_schema", "schema": self._plan_schema()},
         )
         plan = result.structured
         if not isinstance(plan, dict):
@@ -1907,8 +1982,11 @@ class Orchestrator:
         # (class, phase) pairs already targeted; None = all phases
         taken = {(s.get("module_class"), s.get("phase")) for s in specs}
         new = []
+        allowed = self.allowed_precisions()
         for t in plan.get("targets", [])[: self.cfg.max_targets]:
-            problem = region.validate(t, known) or _scope(t) or _precision(t, self.cfg.quality)
+            problem = (
+                region.validate(t, known) or _scope(t) or _precision(t, self.cfg.quality, allowed)
+            )
             cls = t.get("module_class")
             phase = t.get("phase")
             overlap = any(c == cls and (None in (p, phase) or p == phase) for c, p in taken)
@@ -1939,8 +2017,8 @@ class Orchestrator:
         if (arch := self._library_arch()) is None:
             return
         for target_id in target_ids:
-            if library.seeded(self.run, target_id) is not None:
-                continue
+            if library.seeded(self.run, target_id) is not None or self._refused(target_id):
+                continue  # seeded, or at a precision the run does not allow
             tried = await asyncio.to_thread(
                 library.seed_target,
                 self.run,
@@ -2196,10 +2274,14 @@ def _scope(target: dict[str, Any]) -> str | None:
     return None
 
 
-def _precision(target: dict[str, Any], quality: str) -> str | None:
+def _precision(
+    target: dict[str, Any], quality: str, allowed: tuple[str, ...] | None = None
+) -> str | None:
     """Normalise a planned target's ``precision`` / ``precision_why`` in place; returns why
     the target is refused, or None. A reduced precision (``fp8_weights``, ``fp8_w8a8``,
-    ``reduced``: ``kernels.compare.REDUCED_PRECISIONS``) needs ``--quality near-lossless``."""
+    ``reduced``, ``fp4_weights``: ``kernels.compare.REDUCED_PRECISIONS``) needs ``--quality
+    near-lossless`` and must be one the run allows (``allowed``; None: the default of the
+    quality mode, without the 4-bit ones: ``precisions.py``)."""
     from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, PRECISIONS, REDUCED_PRECISIONS
 
     precision = target.pop("precision", None) or "exact"
@@ -2210,6 +2292,10 @@ def _precision(target: dict[str, Any], quality: str) -> str | None:
         return None
     if quality != NEAR_LOSSLESS_TIER:
         return f"precision {precision!r} needs --quality near-lossless (this run: {quality})"
+    if problem := precisions.refusal(
+        precision, precisions.default(quality) if allowed is None else allowed
+    ):
+        return problem
     target["precision"] = precision
     if why:
         target["precision_why"] = why

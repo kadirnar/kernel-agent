@@ -47,6 +47,9 @@ class OptimizeConfig:
     #: optimisations pass when the perceptual quality stays within the noise of eager
     #: (workloads/perceptual.py).
     quality: str = "exact"
+    #: The target precisions the run allows (``--precisions``, precisions.py, issue #131);
+    #: None: the default of ``quality`` (near-lossless: every reduced precision but 4-bit).
+    precisions: list[str] | None = None
 
     claude_model: str = DEFAULT_MODEL
     effort: str | None = "high"

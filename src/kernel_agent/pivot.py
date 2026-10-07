@@ -12,9 +12,10 @@ same GEMMs, done as transforms, took the run from 3.3x to 4.7x), a pivot moves i
   ``precision_why`` backed by numbers (the bound, the ceilings table, a passing transform
   that already uses that precision).
 * **Check** (:func:`check`): ``--quality near-lossless`` only, a reduced precision
-  (:data:`kernel_agent.kernels.compare.REDUCED_PRECISIONS`) other than the target's own, a
-  ``precision_why`` with a number in it, a module target (not a region target), and no
-  earlier pivot of the target to that precision.
+  (:data:`kernel_agent.kernels.compare.REDUCED_PRECISIONS`) that the run allows
+  (``--precisions``, :mod:`kernel_agent.precisions`: no 4-bit by default) other than the
+  target's own, a ``precision_why`` with a number in it, a module target (not a region
+  target), and no earlier pivot of the target to that precision.
 * **New arm.** The orchestrator writes the spec of a new target ``<id>__<precision>``
   (:func:`pivot_spec`, ``pivot_of``: the original id) and captures it in the new tier
   (``Orchestrator.pivot``), so the scheduler sees a new arm with a fresh capture while
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -79,10 +81,18 @@ def read_proposal(path: Path) -> dict[str, Any] | None:
 
 
 def check(
-    spec: dict[str, Any], proposal: dict[str, Any], *, quality: str, taken: set[str]
+    spec: dict[str, Any],
+    proposal: dict[str, Any],
+    *,
+    quality: str,
+    taken: set[str],
+    allowed: Iterable[str] | None = None,
 ) -> str | None:
     """Why ``proposal`` cannot move the target of ``spec`` (None: it can). ``taken``: ids
-    of the run's targets (also failed captures: a pivot is tried once)."""
+    of the run's targets (also failed captures: a pivot is tried once); ``allowed``: the
+    precisions the run allows (``precisions.py``; None: the default of ``quality``, no
+    4-bit)."""
+    from kernel_agent import precisions
     from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, REDUCED_PRECISIONS
 
     if not spec.get("id"):
@@ -92,6 +102,9 @@ def check(
     precision = str(proposal.get("precision") or "")
     if precision not in REDUCED_PRECISIONS:
         return f"precision {precision!r} is not one of {', '.join(REDUCED_PRECISIONS)}"
+    allowed = precisions.default(quality) if allowed is None else tuple(allowed)
+    if problem := precisions.refusal(precision, allowed):
+        return problem
     if precision == precision_of(spec):
         return f"the target is {precision} already"
     why = str(proposal.get("precision_why") or "").strip()

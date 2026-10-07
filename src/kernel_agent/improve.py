@@ -297,10 +297,14 @@ def rounds_context(
     *,
     quality: str = "exact",
     owners: dict[str, dict[str, list[str]]] | None = None,
+    precisions: tuple[str, ...] | None = None,
 ) -> str:
     """Planner context for round ``n``: what earlier rounds did and which targets exist (and,
-    in a near-lossless run, how to move one of them to another precision: ``pivot.py``);
-    ``owners``: the modules the accepted items change (``integration.json``)."""
+    in a near-lossless run, how to move one of them to another of the ``precisions`` it
+    allows, ``pivot.py``; None: the quality mode's default, no 4-bit); ``owners``: the
+    modules the accepted items change (``integration.json``)."""
+    from kernel_agent import precisions as allowed_precisions
+
     base = (read_json(run.baseline_json, {}) or {}).get("median_ms")
     lines = [
         "",
@@ -335,13 +339,16 @@ def rounds_context(
         "above. An empty `targets` list is a valid answer when nothing new is worth a kernel. "
         "New transform ideas are passed on to the systems agent.",
     ]
-    if quality == "near-lossless":
+    allowed = allowed_precisions.default(quality) if precisions is None else precisions
+    if quality == "near-lossless" and (reduced := allowed_precisions.reduced(allowed)):
         lines += [
             "",
             "## Precision pivots",
             "To move an existing target to another precision tier (its precision was fixed "
             'when it was planned), list it under `pivots` instead: `{"target": id, '
-            '"precision": ..., "precision_why": ...}`, the `precision_why` with the numbers '
+            '"precision": ..., "precision_why": ...}`, the `precision` one of '
+            + ", ".join(f"`{p}`" for p in reduced)
+            + " (the precisions this run allows), the `precision_why` with the numbers "
             "behind it (its bound and ceiling, a passing transform that already uses that "
             "precision on its modules). kernel-agent captures it again in that tier as a new "
             "target `<id>__<precision>`; the old one keeps its results.",
@@ -1058,7 +1065,14 @@ class Improver:
         quality = self.orch.cfg.quality
         owners = integrated.get("owners")
         context = rounds_context(
-            self.run, self.state, n, accepted, arms, quality=quality, owners=owners
+            self.run,
+            self.state,
+            n,
+            accepted,
+            arms,
+            quality=quality,
+            owners=owners,
+            precisions=self.orch.allowed_precisions(),
         )
         with self._doing(f"re-plan for round {n}"):
             new = await self.orch.replan(round_dir, context, label=f"planner#round{n}")
@@ -1353,6 +1367,7 @@ async def improve(
             **({"seeds_per_target": cfg.seeds_per_target} if cfg.seeds_per_target else {}),
             **({"reseed_workers": True} if cfg.reseed_workers else {}),
             **({"parallel": cfg.parallel} if cfg.parallel > 1 else {}),
+            **({"precisions": cfg.precisions} if cfg.precisions else {}),  # into run.json
         }
         orch = Orchestrator.resume(path, overrides)
     elif dry_run:
