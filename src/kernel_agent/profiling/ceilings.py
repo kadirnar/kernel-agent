@@ -283,7 +283,7 @@ def _e2e(rows: list[dict[str, Any]], precision: str, baseline_ms: float) -> dict
         patterns[row["target"]] = row["group"]
     tree = projection.of_groups(projection.Group(t, p, 1.0) for t, p in patterns.items())
     proj = projection.project(tree, savings, baseline_ms)
-    floor_ms = proj.projected_ms
+    floor_ms = proj.projected_ms or 0.0  # floors past the baseline: no floor above 0
     return {
         "floor_ms": _sig(floor_ms),
         "speedup": round(baseline_ms / floor_ms, 2) if floor_ms > 0 else None,

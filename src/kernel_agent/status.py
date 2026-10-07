@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import shutil
+import textwrap
 from typing import Any
 
-from kernel_agent import ledger, objective, strong_baseline
+from kernel_agent import ledger, objective, projection, strong_baseline
 from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
@@ -62,8 +63,11 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
     parts = [f"baseline {_ms(base)}"]
     if comp:
         parts.append(f"compiled {_ms(comp)} ({_x(base / comp) if base else '—'})")
+    shown = s["shown"]  # projection.Shown: the integration's last accepted set, or the kernels'
     if base and s["projected_ms"]:
         parts.append(f"projected {_ms(s['projected_ms'])} ({_x(base / s['projected_ms'])})")
+    elif shown.why:  # estimates that exceed the run: the reason below, never a ratio (#128)
+        parts.append("projected: not projectable")
     best = s["best_e2e"]
     final = s["final"] or {}
     if base and final.get("passed") and final.get("median_ms"):
@@ -81,9 +85,12 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         else:
             header[-1] += "  |  " + part
     lines += header
-    if s["projection"] and s["projection"].shown:  # projection.py: nested targets counted once
-        text = s["projection"].headline()
-        lines.append(text if len(text) <= width else text[: width - 1] + "…")
+    # what the projection counts (projection.py: nested targets once, accepted sets #121) or
+    # why it is not projectable, and what a capture from before #119 means: wrapped, not cut
+    for text in (shown.note(), projection.recapture_hint(run)):
+        lines += textwrap.wrap(
+            text, width, subsequent_indent="  ", break_long_words=False, break_on_hyphens=False
+        )
     if s["reference"]:
         lines.append(
             "compiled baseline + accepted kernels: "

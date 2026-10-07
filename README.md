@@ -745,8 +745,9 @@ estimate of the new item meets the gain it measured on top of the others,
 instead of joining a sum of gains measured alone, which do not add up: in
 `runs/openbmb--VoxCPM2/20261006-004718-retest2` the final set projected
 −24.6 ms against 6.03 ms measured; it now projects 5.3 ms. A projection at or
-below 0 ms (a step estimated to save more than the set before it took) is
-`null`, with `not_additive` saying why and naming the items the step overlaps;
+below 0 ms (a step estimated to save more than the set before it took) or above
+the baseline (losses estimated past it) is `null`, with `not_additive` saying
+why and naming the items the step overlaps;
 `report.md` shows `not additive`, the step's estimated and measured gain, and
 which items are not counted. `report.md` projects a file written before #121
 (or #114, whose kernel savings are per run) again from its savings and `history`.
@@ -1162,7 +1163,13 @@ instances that call the case's entrypoint, here 540 × 24 = 12,960 calls for the
 `dit_layer` kernel save 4,651 ms per run (30.3 ms per second of audio).
 Weighted by the calls its case stands for, it saves 2,325 ms per run (15.1 ms
 per second of audio). Measured alone in the integration, it saved 18.5 ms per
-second of audio.
+second of audio. `kernel-agent status`, `report.md` and the start of
+`kernel-agent improve` name the targets whose capture splits evenly over more
+than one instance, and how to capture them again: `kernel-agent resume <run_dir>
+--redo capture --until capture` captures every target of `plan.json` again (then
+`kernel-agent improve <run_dir>` continues the run; kernels evaluated after it
+count the calls per instance group). A precision pivot or a later round's target
+is captured when it is proposed, so only a new run captures it again.
 
 The `ttfa` window share, the improve scheduler's region arms and the projection
 tree use the same weights. The tree spreads a target's saving over its instance
@@ -2526,6 +2533,24 @@ over instances of a capture from before #119 (the evaluator scaled the
 captured instance's gain by the instances calling each entrypoint), and a phase-specific parent is taken
 to replace all of its children's saving. Two targets on the same instances
 with different `phase` add up.
+
+The savings are module-level estimates against the eager model, so they can add
+up to more than the run: an estimate from before #119, or kernels whose modules
+the integration's transforms already sped up. A projection at or below 0 ms (or
+above the baseline) is *not projectable* (#128), never a ratio:
+`report.md`, `kernel-agent status`, the dashboard, `watch` and `progress.png`
+say `not projectable` and why, naming the largest items and their savings, as
+the integration does for an accepted set (`not_additive`). On
+`20261006-004718-retest2` the best kernels counted 42.6 ms per second of audio
+against a 37.7 ms baseline (`dit_layer__fp8_w8a8` 37.6 ms, `vae_decoder__reduced`
+3.0 ms, `loc_enc_decode` 2.1 ms); the report printed `0.0 ms (37659015247.39x vs
+eager)`. The step line of `progress.png` and `watch` stops where the projection
+stops being projectable (`projected 1.2 ms, then not projectable`). Where the
+run has an integration, the projection shown first (the `status` header, the
+dashboard and `watch` tiles, the `progress.png` subtitle, `report.md` above the
+kernels' own) is that of its last accepted set (see "Integration: paired A/B with
+undo handles": 5.3 ms against 6.0 ms measured on that run), with the best kernels'
+alone next to it.
 
 ![run progress](docs/images/example-progress.png)
 

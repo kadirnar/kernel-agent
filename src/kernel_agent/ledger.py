@@ -635,6 +635,9 @@ def summary(run: RunDir) -> dict[str, Any]:
     kept_e2e = [r for r in ledger_rows if r["target"] == E2E and r["status"] == KEEP]
     best_e2e = kept_e2e[-1] if kept_e2e else None  # running best end-to-end measurement
     integration = read_json(run.root / "integration.json", {}) or {}
+    # the integration's projection of its last accepted set, else the kernels' (#121, #128)
+    sets = projection.accepted_sets(run, integration, base_ms)
+    shown = projection.shown(proj, sets[-1] if sets else None)
     final = integration.get("final") or {}
     costs = read_json(run.root / "costs.json", {}) or {}
     phases = data.get("phases", {})
@@ -665,10 +668,10 @@ def summary(run: RunDir) -> dict[str, Any]:
         "baseline": baseline,
         "workload": baseline.get("workload"),
         # none when every saving is unknown in the metric (metric=ttfa without its window)
-        "projected_ms": proj.projected_ms
-        if proj and base_ms and (proj.used or not proj.unknown)
-        else None,
-        "projection": proj,
+        # or when it is not projectable (shown.why)
+        "projected_ms": shown.ms,
+        "shown": shown,  # projection.Shown: what the projection is of (its note)
+        "projection": proj,  # the best kernels'
         "units": units,  # a row's est. saved ms in the metric's (projection.Units.of_row)
         "best_e2e": best_e2e,
         "final": final or None,

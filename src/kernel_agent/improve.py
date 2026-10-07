@@ -46,7 +46,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import interrupt, ledger, objective, pivot, research, workers
+from kernel_agent import interrupt, ledger, objective, pivot, projection, research, workers
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
@@ -587,6 +587,8 @@ class Improver:
     async def improve(self) -> str:
         """Loop until the budget is spent or every arm has stopped; returns why it stopped."""
         self._recover()
+        if hint := projection.recapture_hint(self.run):  # estimates of a capture before #119
+            log(f"improve: {hint}")
         self.orch.phase = "improve"
         self.orch.budget.kernel_evals = self.orch.budget.transform_evals = self.icfg.slice
         self.state["config"] = self.icfg.to_dict()

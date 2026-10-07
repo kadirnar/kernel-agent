@@ -61,6 +61,13 @@ overlap count once (#121): the modules each item changed (``integrate/owners.py`
 kernel and the transforms of its modules, or two transforms of one module, in one group,
 and each group counts its best items that do not overlap. Every set after the first is
 projected from the set before it, as measured, minus the estimated gain of its step.
+
+A projection at or below 0 ms (savings counted past the baseline: module-level estimates
+against the eager model, of a capture from before #119 or of modules transforms already
+sped up) or above the baseline is not projectable (:func:`projectable`, #128):
+``projected_ms`` is None and ``not_additive`` names the items and their savings, never a
+ratio. A run shows the projection of the integration's last accepted set where it has one,
+else the best kernels' (:class:`Shown`).
 """
 
 from __future__ import annotations
@@ -116,6 +123,24 @@ class Tree:
         return out
 
 
+def projectable(ms: float | None, baseline_ms: float | None) -> bool:
+    """Whether a projection is shown as a time and a speedup (#128): above 0 ms and not above
+    the baseline (to the 0.001 ms projections are rounded to). Estimated savings that add up
+    to more than the run, or losses past it, are ``not_additive`` instead: never a ratio."""
+    return ms is not None and baseline_ms is not None and 0 < ms < baseline_ms + 1e-3
+
+
+def exceeds(counted: Mapping[str, float], baseline_ms: float) -> str:
+    """``not_additive``: the savings ``counted`` (item → ms) are more than the baseline; the
+    largest named with their savings (an accepted set's, #121; the best kernels', #128)."""
+    big = sorted((a for a, ms in counted.items() if ms > 0), key=lambda a: -counted[a])
+    return (
+        f"the savings counted ({sum(counted.values()):.1f} ms) are more than the "
+        f"baseline ({baseline_ms:.1f} ms); the largest: "
+        + _few([f"{ledger.item_label(a)} {counted[a]:.1f} ms" for a in big])
+    )
+
+
 @dataclass(frozen=True)
 class Projection:
     baseline_ms: float
@@ -129,8 +154,21 @@ class Projection:
         return sum(self.counted.values())
 
     @property
-    def projected_ms(self) -> float:
-        return round(max(self.baseline_ms - self.saved_ms, 0.0), 3)
+    def projected_ms(self) -> float | None:
+        """baseline − Σ counted; None when the savings counted exceed the baseline
+        (:attr:`not_additive`)."""
+        ms = self.baseline_ms - self.saved_ms
+        return round(ms, 3) if projectable(ms, self.baseline_ms) else None
+
+    @property
+    def not_additive(self) -> str:
+        """Why the projection is not shown ("" when it is, or when nothing counts): the
+        savings counted are more than the baseline (:func:`exceeds`). Module-level estimates
+        taken against the eager model can be: an estimate from before #119 (the even split)
+        or kernels whose time model-level transforms already took."""
+        if not self.used or projectable(self.baseline_ms - self.saved_ms, self.baseline_ms):
+            return ""
+        return exceeds(self.counted, self.baseline_ms)
 
     @property
     def used(self) -> list[str]:
@@ -156,19 +194,26 @@ class Projection:
         """``a + b (40 %) + c; not counted (nested): d, e; not projected (why): f`` ("" without
         a saving)."""
         used = [t if self.part(t) > 0.995 else f"{t} ({self.part(t):.0%})" for t in self.used]
-        parts = [" + ".join(used)] if used else []
+        return "; ".join(([" + ".join(used)] if used else []) + self._rest())
+
+    def headline(self) -> str:
+        """``projected from`` :meth:`describe`; only what is not projected without a saving;
+        ``not projectable: why`` when the savings exceed the baseline (:attr:`not_additive`)."""
+        if why := self.not_additive:
+            return "; ".join([f"not projectable: {why}", *self._rest()])
+        return f"projected from {self.describe()}" if self.used else self.describe()
+
+    def _rest(self) -> list[str]:
+        """What :meth:`describe` says after the targets counted."""
+        parts = []
         if self.left_out:
             parts.append("not counted (nested): " + ", ".join(self.left_out))
         if self.unknown:
             parts.append(f"not projected ({self.unknown_why}): " + ", ".join(self.unknown))
-        return "; ".join(parts)
-
-    def headline(self) -> str:
-        """``projected from`` :meth:`describe`; only what is not projected without a saving."""
-        return f"projected from {self.describe()}" if self.used else self.describe()
+        return parts
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "projected_ms": self.projected_ms,
             "saved_ms": round(self.saved_ms, 3),
             "counted": {t: round(ms, 3) for t, ms in self.counted.items()},
@@ -176,6 +221,9 @@ class Projection:
             "unknown": list(self.unknown),
             "label": self.describe(),
         }
+        if why := self.not_additive:
+            out["not_additive"] = why
+        return out
 
     def _order(self, target: str) -> tuple[float, str]:
         return (-self.counted.get(target, 0.0), target)
@@ -353,8 +401,9 @@ def of_sets(
     removes, ``est_gain_ms`` = the difference of the two sets' ``summed_ms``, next to its
     ``measured_gain_ms``). So the estimate of the new item meets what it gained on top of
     the others, instead of the others' gains alone, which do not add up (#121). A
-    projection at or below 0 ms counts more saving than there is time to save:
-    ``projected_ms`` is None and ``not_additive`` says why."""
+    projection at or below 0 ms counts more saving than there is time to save, one above
+    the baseline more loss than the savings (:func:`projectable`): ``projected_ms`` is None
+    and ``not_additive`` says why."""
     out: list[dict[str, Any]] = []
     for s in sets:
         saved = s.get("est_saved_ms") or {}
@@ -365,18 +414,28 @@ def of_sets(
         entry.update(summed_ms=entry["projected_ms"], measured_ms=s.get("measured_ms"))
         entry["est_saved_unit"] = SAVED_UNIT
         if out:
-            _step(entry, out[-1], s.get("from_ms"), changes or {})
+            _step(entry, out[-1], s.get("from_ms"), changes or {}, baseline_ms)
         elif entry["summed_ms"] <= 0:
-            counted = entry["counted_ms"]
-            big = sorted((a for a, ms in counted.items() if ms > 0), key=lambda a: -counted[a])
             entry["projected_ms"] = None
-            entry["not_additive"] = (
-                f"the savings counted ({sum(counted.values()):.1f} ms) are more than the "
-                f"baseline ({baseline_ms:.1f} ms); the largest: "
-                + _few([f"{ledger.item_label(a)} {counted[a]:.1f} ms" for a in big])
-            )
+            entry["not_additive"] = exceeds(entry["counted_ms"], baseline_ms)
+        elif not projectable(entry["summed_ms"], baseline_ms):
+            entry["projected_ms"] = None
+            entry["not_additive"] = _losses(entry, saved)
         out.append(entry)
     return out
+
+
+def _losses(entry: Mapping[str, Any], saved: Mapping[str, float | None]) -> str:
+    """``not_additive`` of a first set projected above the baseline: the items slower alone
+    (added back, :func:`of_set`) are more than the savings counted."""
+    grouped = {a for g in entry.get("overlaps") or [] for a in g["items"]}
+    lost = {a: -v for a, v in saved.items() if v is not None and v < 0 and a not in grouped}
+    slowest = sorted(lost, key=lambda a: -lost[a])
+    return (
+        f"the items slower alone ({sum(lost.values()):.1f} ms) are more than the savings "
+        f"counted ({sum(entry['counted_ms'].values()):.1f} ms); the slowest: "
+        + _few([f"{ledger.item_label(a)} {lost[a]:.1f} ms" for a in slowest])
+    )
 
 
 def of_integration(
@@ -408,11 +467,109 @@ def current(entry: Mapping[str, Any]) -> bool:
     return entry.get("est_saved_unit") == SAVED_UNIT and "summed_ms" in entry
 
 
+def accepted_sets(
+    run: RunDir, integration: Mapping[str, Any], baseline_ms: float | None
+) -> list[dict[str, Any]]:
+    """The ``projection`` of a run's ``integration.json`` (``integration``) as :func:`of_sets`
+    writes it: one from before #121 is projected again from the baseline (the file's, else
+    ``baseline_ms``) with the run's tree and units (:func:`of_integration`)."""
+    entries = [dict(p) for p in integration.get("projection") or []]
+    base = ledger._num(integration.get("baseline_ms")) or baseline_ms
+    if base is None or all(current(p) for p in entries):
+        return entries
+    return of_integration(integration, tree(run), units_of(run), base)
+
+
+#: :class:`Shown` ``source``: the best kernels', the integration's last accepted set's.
+KERNELS, INTEGRATION = "kernels", "integration"
+
+
+@dataclass(frozen=True)
+class Shown:
+    """The projection a run shows first (``status``, the dashboard and ``watch`` tiles,
+    ``report.md``, ``progress.png``; #128): the integration's projection of its last
+    accepted set (:func:`of_sets`, #121) where the run has one, else the best kernels'."""
+
+    ms: float | None  # None: not projectable (``why``), or nothing to project
+    source: str = KERNELS
+    why: str = ""  # not projectable: ``not_additive``
+    kernels: Projection | None = None  # the best kernels' (said next to the integration's)
+
+    def note(self) -> str:
+        """What it projects, or why it is not projectable ("" when there is nothing to say):
+        the kernels' :meth:`Projection.headline`; of the integration's set, that and the
+        best kernels' alone."""
+        k = self.kernels
+        alone = k.headline() if k is not None and k.shown else ""
+        if self.source != INTEGRATION:
+            return alone
+        if k is not None and k.used and k.projected_ms is not None:
+            alone = f"{k.projected_ms:,.1f} ms, {alone}"
+        text = "projected for the integration's last accepted set"
+        if self.ms is None:
+            text = f"not projectable for the integration's last accepted set: {self.why}"
+        return text + (f"; the best kernels alone: {alone}" if alone else "")
+
+
+def shown(kernels: Projection | None, last: Mapping[str, Any] | None) -> Shown:
+    """:class:`Shown` of the best kernels' projection (None: no baseline) and the projection
+    entry of the integration's last accepted set (None: the run has none,
+    :func:`accepted_sets`)."""
+    if kernels is None or last is None:
+        ms = kernels.projected_ms if kernels and (kernels.used or not kernels.unknown) else None
+        return Shown(ms, KERNELS, kernels.not_additive if kernels else "", kernels)
+    ms = last.get("projected_ms")
+    if projectable(ms, kernels.baseline_ms):
+        return Shown(ms, INTEGRATION, "", kernels)
+    why = last.get("not_additive") or (
+        "the set before it was not measured"
+        if ms is None
+        else f"{ms:.1f} ms projected against the {kernels.baseline_ms:.1f} ms baseline"
+    )
+    return Shown(None, INTEGRATION, why, kernels)
+
+
+def even_split(run: RunDir, targets: Iterable[str] | None = None) -> list[str]:
+    """The targets captured before #119 whose estimates split the calls evenly over their
+    instances (:func:`weights.even_split <kernel_agent.kernels.weights.even_split>`)."""
+    ids = run.target_ids() if targets is None else list(targets)
+    specs = {t: read_json(run.target(t) / "spec.json", {}) or {} for t in ids}
+    return [t for t, s in specs.items() if weights.even_split(s.get("capture") or {})]
+
+
+def recapture_hint(run: RunDir, targets: Iterable[str] | None = None) -> str:
+    """What a capture from before #119 means for its target's estimates and how to capture it
+    again ("" when no target has one, :func:`even_split`). The capture phase captures the
+    targets of ``plan.json`` (``kernel-agent resume --redo capture``); a pivot or a later
+    round's target is captured when it is proposed, so only a new run captures it again."""
+    stale = even_split(run, targets)
+    if not stale:
+        return ""
+    plan = {str(t.get("id")) for t in (read_json(run.plan_json, {}) or {}).get("targets") or []}
+    again, rest = [t for t in stale if t in plan], [t for t in stale if t not in plan]
+    text = (
+        f"captured before #119: {', '.join(stale)} (no per-instance call counts: their est. "
+        "saved ms count the captured instance's calls on every instance, too many where "
+        "instances run other shapes)"
+    )
+    if again:
+        text += (
+            f"; to capture {', '.join(again)} again: `kernel-agent resume {run.root} --redo "
+            "capture --until capture` (every target of plan.json), then `kernel-agent improve` "
+            "the run: kernels evaluated after it count the calls per instance group"
+        )
+    if rest:
+        it = "it" if len(rest) == 1 else "them"
+        text += f"; {', '.join(rest)}: not in plan.json, only a new run captures {it} again"
+    return text
+
+
 def _step(
     entry: dict[str, Any],
     before: Mapping[str, Any],
     from_ms: float | None,
     changes: Mapping[str, Iterable[str]],
+    baseline_ms: float,
 ) -> None:
     """``entry``'s ``step`` from the set ``before`` it, and its ``projected_ms`` from there
     (:func:`of_sets`)."""
@@ -431,8 +588,15 @@ def _step(
     }
     if start is None:
         entry["projected_ms"] = None
-    elif start - est > 0:
+    elif projectable(start - est, baseline_ms):
         entry["projected_ms"] = round(start - est, 3)
+    elif start - est > 0:  # an estimated loss that takes it past the baseline
+        entry["projected_ms"] = None
+        entry["not_additive"] = (
+            f"the estimated gain of {_few([ledger.item_label(a) for a in new])} ({est:.1f} ms) "
+            f"takes the {start:.1f} ms of the set before it above the baseline "
+            f"({baseline_ms:.1f} ms)"
+        )
     else:
         entry["projected_ms"] = None
         why = f"the estimated gain of {_few([ledger.item_label(a) for a in new])} ({est:.1f} ms)"

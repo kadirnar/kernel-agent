@@ -59,21 +59,63 @@ def _flat_metrics(metrics: Any, prefix: str = "") -> dict[str, Any]:
     return flat
 
 
-def _projection_lines(
-    integration: dict[str, Any], run: RunDir, baseline: dict[str, Any]
+def _projected_lines(
+    proj: projection.Projection | None, last: dict[str, Any] | None, metric: objective.Metric
 ) -> list[str]:
+    """The projection of the integration's last accepted set where the run has one (#121),
+    then the best kernels' alone. One that is not projectable says why, never a ratio
+    (#128)."""
+    if proj is None:
+        return []
+    lines = []
+    shown = projection.shown(proj, last)
+    if shown.source == projection.INTEGRATION and last is not None:
+        what = "Projected for the integration's last accepted set"
+        if shown.ms is None:
+            lines += [f"{what}: not projectable: {shown.why}.", ""]
+        else:
+            how = (
+                "the set before it as measured − the estimated gain of its step"
+                if last.get("step")
+                else "baseline − Σ est. saved ms of its items, overlaps counted once"
+            )
+            lines += [
+                f"{what}: **{shown.ms:.1f} ms** ({_x(proj.baseline_ms / shown.ms)} vs eager, "
+                f"measured {_fmt(last.get('measured_ms'), 1)} ms): {how} (see Integration).",
+                "",
+            ]
+    nested = (
+        "Nested targets count once: per instance the better of the parent's kernel and the "
+        "sum of its children's."
+    )
+    if proj.used and proj.projected_ms is not None:
+        lines += [
+            f"Projected from the best kernels: **{proj.projected_ms:.1f} ms** "
+            f"({_x(proj.baseline_ms / proj.projected_ms)} vs eager) = baseline − "
+            f"est. saved ms {metric.per} of {proj.describe()}. {nested}",
+            "",
+        ]
+    elif proj.used:  # module-level estimates against the eager model that exceed the run
+        lines += [
+            f"Projected from the best kernels (baseline − est. saved ms {metric.per}): "
+            f"{proj.headline()}. Module-level estimates are taken against the eager model: "
+            "they exceed the run where transforms already took their modules' time or a "
+            f"capture from before #119 split the calls evenly over the instances. {nested}",
+            "",
+        ]
+    elif proj.unknown:
+        lines += [f"Kernels {proj.describe()}.", ""]  # "not projected (why): a, b"
+    return lines
+
+
+def _projection_lines(entries: list[dict[str, Any]], baseline: dict[str, Any]) -> list[str]:
     """Projected vs measured latency of each accepted set: the first from the baseline − Σ
     est. saved ms, every later one from the set before it − its step's estimated gain. An
-    ``integration.json`` from before #121 (or #114) is projected again here from its
-    savings and history (:func:`projection.of_integration`)."""
-    entries = integration.get("projection") or []
+    ``integration.json`` from before #121 (or #114) is projected again from its savings and
+    history (:func:`projection.accepted_sets`)."""
     if not entries:
         return []
     metric = objective.of(baseline)
-    base = ledger._num(integration.get("baseline_ms")) or ledger._num(baseline.get("median_ms"))
-    if base is not None and not all(projection.current(p) for p in entries):
-        tree, units = projection.tree(run), projection.units_of(run)
-        entries = projection.of_integration(integration, tree, units, base)
     lines = [
         "",
         f"Projected vs measured {metric.label} of every accepted set. The first: baseline − "
@@ -299,17 +341,12 @@ def write_report(run: RunDir) -> Path:
             "instances it stands for): " + "; ".join(counted) + ".",
             "",
         ]
-    proj = projection.of_run(run, saved, ledger._num(baseline.get("median_ms")), units)
-    if proj and proj.used:
-        lines += [
-            f"Projected from the best kernels: **{proj.projected_ms:.1f} ms** "
-            f"({_x(proj.baseline_ms / max(proj.projected_ms, 1e-9))} vs eager) = baseline − "
-            f"est. saved ms {metric.per} of {proj.describe()}. Nested targets count once: per "
-            "instance the better of the parent's kernel and the sum of its children's.",
-            "",
-        ]
-    elif proj and proj.unknown:
-        lines += [f"Kernels {proj.describe()}.", ""]  # "not projected (why): a, b"
+        if hint := projection.recapture_hint(run):
+            lines += [hint[0].upper() + hint[1:] + ".", ""]
+    base_ms = ledger._num(baseline.get("median_ms"))
+    proj = projection.of_run(run, saved, base_ms, units)
+    sets = projection.accepted_sets(run, integration, base_ms)  # an old one projected again
+    lines += _projected_lines(proj, sets[-1] if sets else None, metric)
     for target_id in run.target_ids():
         lines += _chart(run, run.target(target_id) / "progress.png", f"{target_id} progress")
     transforms = read_jsonl(run.results_file())
@@ -373,7 +410,7 @@ def write_report(run: RunDir) -> Path:
                 olds = ", ".join(f"`{ledger.item_label(o)}`" for o in h.get("old") or [])
                 tried = f"`{ledger.item_label(str(h.get('new')))}` instead of {olds}"
             lines.append(f"* {tried}: {outcome}{verdict}")
-        lines += _projection_lines(integration, run, baseline)
+        lines += _projection_lines(sets, baseline)
         if reference:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))

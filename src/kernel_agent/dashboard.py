@@ -88,9 +88,10 @@ def write_dashboard(run: RunDir) -> Path:
     phase = ledger.phase_label(s)
 
     comp = s["compiled_ms"]  # strong baseline (strong_baseline.py)
-    proj = s["projection"]  # projection.py: nested targets counted once
-    # "from a + b; not counted (nested): c", or "not projected (why): d"
-    counted = proj.headline().removeprefix("projected ") if proj and proj.shown else ""
+    projected = s["projected_ms"]  # projection.Shown: the last accepted set's, or the kernels'
+    # "projected from a + b; not counted (nested): c", "not projected (why): d", or why it
+    # is not projectable (#128): never a ratio then
+    counted = s["shown"].note()
     compiled = f"torch.compile {_ms(comp)} ({base / comp:.2f}×)" if comp and base else ""
     vs_comp = f" · {comp / measured:.2f}× vs. compiled" if comp and measured else ""
     tiles = [
@@ -103,10 +104,13 @@ def write_dashboard(run: RunDir) -> Path:
             else "no passing run yet",
         ),
         (
-            "projected from kernels",
-            _ms(s["projected_ms"]),
-            (f"{base / s['projected_ms']:.2f}×" if base and s["projected_ms"] else "")
-            + (f" · {_e(counted)}" if counted else ""),
+            "projected",
+            _ms(projected),
+            " · ".join(
+                filter(
+                    None, [f"{base / projected:.2f}×" if base and projected else "", _e(counted)]
+                )
+            ),
         ),
         (
             "evaluations",

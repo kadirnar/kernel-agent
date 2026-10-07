@@ -510,7 +510,10 @@ def test_throughput_projects_kernel_savings_per_second_of_audio(tmp_path):
     run = _metric_run(tmp_path, THROUGHPUT, {"attn": 300.0, "mlp": 150.0})
     tree, rows, units = projection.tree(run), ledger.rows(run), projection.units_of(run)
     assert units.factor("attn") == pytest.approx(1 / 150)
-    assert projection.series(tree, 40.0, rows)[-1][1].projected_ms == 0.0  # the units mixed
+    mixed = projection.series(tree, 40.0, rows)[-1][1]  # the units mixed: past the baseline
+    assert mixed.projected_ms is None and mixed.not_additive.startswith(
+        "the savings counted (450.0 ms) are more than the baseline (40.0 ms)"
+    )
     steps = projection.series(tree, 40.0, rows, units)
     assert [p.projected_ms for _, p in steps] == pytest.approx([38.0, 37.0])
 

@@ -5,8 +5,9 @@
   on the floor), the running best and the 1.0× reference.
 * ``progress.png``: end-to-end latency over wall-clock time. The projection from
   the best kernels (baseline − Σ est. saved ms, nested targets counted once:
-  :mod:`kernel_agent.projection`) as a step line, measured end-to-end runs
-  (transforms, integration) as diamonds, baseline lines.
+  :mod:`kernel_agent.projection`) as a step line that stops where the savings exceed
+  the baseline (not projectable), measured end-to-end runs (transforms, integration)
+  as diamonds, baseline lines.
 * ``amdahl.png``: the baseline time split by target class share (from the
   profile), before and after the best per-target speedups, plus "other". Nested
   targets count once: the set the projection counts is drawn, the targets inside
@@ -578,10 +579,12 @@ def _draw_run(
     end = max(end, 1.0)
 
     # projected: baseline − Σ est. saved of each target's best kept candidate (or its
-    # re-evaluation) in the metric's ms, nested targets counted once (projection.py)
+    # re-evaluation) in the metric's ms, nested targets counted once (projection.py); None
+    # where the savings exceed the baseline (not projectable, #128): a gap in the line
     tree = projection.tree(run)
     last = projection.project(tree, {}, base_ms)
-    px, py = [0.0], [base_ms]
+    px: list[float] = [0.0]
+    py: list[float | None] = [base_ms]
     for r, last in projection.series(tree, base_ms, rows, projection.units_of(run)):
         px.append(minutes(ledger.epoch(r["time"])))
         py.append(last.projected_ms)
@@ -590,7 +593,7 @@ def _draw_run(
     failed = [(t, r) for t, r in e2e if r["status"] in FAILURES]
     compiled = _compiled_ms(baseline)
 
-    values = [base_ms, *py, *(r["new_ms"] for _, r in measured)]
+    values = [base_ms, *(y for y in py if y is not None), *(r["new_ms"] for _, r in measured)]
     if compiled:
         values.append(compiled)
     lo, hi = min(values), max(values)
@@ -647,9 +650,12 @@ def _draw_run(
 
     px.append(end)
     py.append(py[-1])
-    ax.step(px, py, where="post", color=PROJECTED_COLOR, lw=2.0, zorder=3)
+    line = [math.nan if y is None else y for y in py]
+    ax.step(px, line, where="post", color=PROJECTED_COLOR, lw=2.0, zorder=3)
     if len(px) > 2:
-        ax.scatter(px[1:-1], py[1:-1], s=16, color=PROJECTED_COLOR, zorder=3, lw=0)
+        ax.scatter(px[1:-1], line[1:-1], s=16, color=PROJECTED_COLOR, zorder=3, lw=0)
+    # where the line ends: its last step, at the last projectable value (py[0]: the baseline)
+    stop, tail = [(i, y) for i, y in enumerate(py[:-1]) if y is not None][-1]
 
     for status, color, size in ((DISCARD, DISCARD_COLOR, 40), (KEEP, KEEP_COLOR, 70)):
         pts = [(t, r) for t, r in measured if r["status"] == status]
@@ -686,16 +692,16 @@ def _draw_run(
         )
     # The two end labels (the projection's and the highlighted measurement) must not
     # overlap each other, the baseline labels, the projected line or the markers.
-    (x0, y0), (x1, _) = ax.transData.transform([(px[-2], py[-1]), (px[-1], py[-1])])
+    (x0, y0), (x1, _) = ax.transData.transform([(px[stop], tail), (px[stop + 1], tail)])
     avoid = [_box(x0, y0 - 2, x1 - x0, 4, 0.0, "left")]  # the last step of the projection
     half = 4.5 * ax.figure.dpi / 72  # of a diamond
     for t, r in measured:
         cx, cy = ax.transData.transform((t, r["new_ms"]))
         avoid.append(_box(cx - half, cy - half, 2 * half, 2 * half, 0.0, "left"))
-    _place_text(
+    _place_text(  # where the savings exceed the baseline: where the line stops (#128)
         ax,
-        (px[-1], py[-1]),
-        f"projected {py[-1]:,.1f} ms",
+        (px[stop + 1], tail),
+        f"projected {tail:,.1f} ms" + ("" if py[-1] is not None else ", then not projectable"),
         [(-2, 5, "right", "bottom"), (-2, -5, "right", "top")],
         taken,
         avoid,
@@ -734,12 +740,27 @@ def _draw_run(
         else f"baseline {base_ms:,.1f} ms"
     )
     n_kernel = sum(r["target"] != E2E for r in rows)
-    subtitle = (
-        f"{n_kernel} kernel evaluations, {len(e2e)} end-to-end runs  ·  "
-        f"projected from the best kernels: {py[-1]:,.1f} ms ({base_ms / max(py[-1], 1e-9):.2f}×)"
+    # the integration's projection of its last accepted set where the run has one (#121),
+    # else the best kernels'; one that is not projectable says why, never a ratio (#128)
+    sets = projection.accepted_sets(
+        run, read_json(run.root / "integration.json", {}) or {}, base_ms
     )
-    if last.shown:  # which targets the projection counts (and leaves out as unknown)
-        subtitle += "\n" + _short(last.headline(), 120)
+    shown = projection.shown(last, sets[-1] if sets else None)
+    value = "not projectable"
+    if shown.ms is not None or not shown.why:  # every saving unknown in the metric: the line's
+        ms = tail if shown.ms is None else shown.ms
+        value = f"{ms:,.1f} ms ({base_ms / ms:.2f}×)"
+    notes = []  # why the set is not projectable, what the line counts (and leaves out) or why not
+    if shown.source == projection.INTEGRATION:
+        what = "projected for the integration's last accepted set"
+        notes += [f"the last accepted set: {shown.why}"] if shown.ms is None else []
+        notes += [f"the best kernels (the step line): {last.headline()}"] if last.shown else []
+    else:
+        what = "projected from the best kernels"
+        notes += [last.headline()] if last.shown else []
+    subtitle = f"{n_kernel} kernel evaluations, {len(e2e)} end-to-end runs  ·  {what}: {value}"
+    if notes:
+        subtitle += "\n" + "\n".join(textwrap.wrap("; ".join(notes), 125, max_lines=2))
     _header(ax, f"{repo}: {headline}", subtitle, raise_pt=14 if spans else 0)
     handles = [
         Line2D([], [], color=PROJECTED_COLOR, lw=2, label="projected (kernels)"),
