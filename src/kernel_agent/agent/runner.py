@@ -33,6 +33,11 @@ BASE_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite"]
 READ_TOOLS = ["Read", "Glob", "Grep"]
 WEB_TOOLS = ["WebFetch", "WebSearch"]
 WRITE_TOOLS = "Write|Edit|MultiEdit|NotebookEdit"
+#: Set in every session (#126): no Claude Code auto memory, which would read and write the
+#: user's own ``~/.claude/projects/<repo>/memory/`` (lessons belong in library.py), and no
+#: claude.ai connectors of the login (they act on the user's account).
+SESSION_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
+INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md")
 
 
 @dataclass
@@ -100,6 +105,35 @@ def write_guard(writable: list[Path], cwd: Path) -> dict[HookEvent, list[HookMat
     return {"PreToolUse": [HookMatcher(matcher=WRITE_TOOLS, hooks=[guard])]}
 
 
+def claude_files_guard(cwd: Path) -> HookMatcher:
+    """PreToolUse hook of every session (#126): the file-writing tools may not touch Claude
+    Code's instruction files (:data:`INSTRUCTION_FILES`, anywhere) or its config directory
+    (``~/.claude``: settings, auto memory, skills), which later sessions, the user's own
+    among them, would load. With auto memory off, a session asked to remember something
+    wrote the repository's ``CLAUDE.md`` instead. Bash is not covered."""
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    config = config.expanduser().resolve()
+
+    async def guard(data: Any, tool_use_id: str | None, context: Any) -> HookJSONOutput:
+        tool_input = data.get("tool_input") or {}
+        path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+        target = _resolve(cwd, path) if path else None
+        if target is None or not (
+            target.name in INSTRUCTION_FILES or target.is_relative_to(config)
+        ):
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": f"{target}: Claude Code's instruction and config "
+                "files are off limits; keep notes in the run directory",
+            }
+        }
+
+    return HookMatcher(matcher=WRITE_TOOLS, hooks=[guard])
+
+
 def _resolve(cwd: Path, path: str) -> Path:
     p = Path(path).expanduser()
     return (p if p.is_absolute() else cwd / p).resolve()
@@ -149,16 +183,17 @@ async def run_agent(
         model=cfg.claude_model,
         max_turns=cfg.max_turns_per_agent,
         max_budget_usd=cfg.budget_usd_per_agent,
-        setting_sources=[],
-        env=env,
+        setting_sources=[],  # no user/project settings, hooks or CLAUDE.md files (#126)
+        env={**env, **SESSION_ENV},
         output_format=output_format,
     )
     if cfg.effort:
         options.effort = cfg.effort  # type: ignore[assignment]
     if tools is not None:  # a restricted session: no other built-in tool exists at all
         options.tools = builtin
-    if writable is not None:
-        options.hooks = write_guard(writable, cwd)
+    hooks = write_guard(writable, cwd) if writable is not None else {}
+    hooks.setdefault("PreToolUse", []).append(claude_files_guard(cwd))
+    options.hooks = hooks
     if resume:
         options.resume = resume
 

@@ -34,6 +34,11 @@ definition + solution + evaluation per kernel)::
 * **Lessons** (:func:`librarian_prompt`, :func:`write_lessons`): after the report a
   cheap agent turns the run's ``NOTES.md`` files and ledger rows into short validity
   rules and merges them into ``lessons/``, pruning duplicates and stale rules.
+* **Claude Code memory** (:func:`cmd_import_memory`): agent sessions run without Claude
+  Code's auto memory (``runner.SESSION_ENV``), so what they learn lands here, not in the
+  user's ``~/.claude/projects/<project>/memory/``. ``kernel-agent library import-memory DIR``
+  turns notes earlier sessions left there into lessons rules (a dry run unless ``--write``);
+  the memory files are only read.
 * **Safety.** Entries are code that will run. Every entry records the sha256 of its
   files; it is reused only when every digest matches and its ``sm_arch`` is this
   GPU's (other architectures' directories are never searched), and the reused
@@ -909,6 +914,224 @@ def write_lessons(structured: Any, names: Iterable[str]) -> list[Path]:
     return written
 
 
+# ------------------------------------------------------------------ Claude Code memory
+
+MEMORY_INDEX = "MEMORY.md"  # the index of an auto-memory directory, not a note
+#: Words of a memory note's name or description that name a backend's lessons file, most
+#: specific first (a Triton note that mentions CUDA graphs is a Triton note).
+MEMORY_BACKEND_WORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("triton", ("triton",)),
+    ("tilelang", ("tilelang",)),
+    ("cute", ("cute", "cutedsl")),
+    ("nvrtc", ("nvrtc",)),
+    ("cuda", ("cuda", "cublas", "cublaslt", "cutlass", "nvcc", "ptx")),
+)
+WRITERS = ("Write", "Edit", "MultiEdit")  # the tools that write a memory note
+SIMILAR = 0.5  # word overlap above which an imported rule is shown next to an existing one
+_STOP = {"a", "an", "and", "at", "for", "in", "is", "it", "of", "on", "or", "the", "to", "with"}
+
+
+@dataclass
+class MemoryNote:
+    """One note of a Claude Code auto-memory directory: ``<name>.md`` with a front matter
+    (``name``, ``description``, ``type``, and ``originSessionId`` when recorded)."""
+
+    path: Path
+    name: str
+    description: str
+    kind: str  # user, feedback, project or reference
+    origin: str  # the Claude Code session that wrote it ("" when not recorded)
+    body: str
+
+
+def _front_matter(text: str) -> tuple[dict[str, str], str]:
+    """The ``key: value`` lines of a note's front matter (nested ones too, first wins) and
+    the text after it."""
+    m = re.match(r"---\r?\n(.*?)\r?\n---[ \t]*\r?\n?", text, re.S)
+    if not m:
+        return {}, text
+    fields: dict[str, str] = {}
+    for line in m.group(1).splitlines():
+        key, sep, value = line.strip().partition(":")
+        if sep and key and key not in fields:
+            fields[key] = _scalar(value.strip())
+    return fields, text[m.end() :]
+
+
+def _scalar(value: str) -> str:
+    """A front-matter value without its YAML quotes (``"a \\"b\\""`` → ``a "b"``)."""
+    if len(value) > 1 and value[0] == value[-1] == '"':
+        try:
+            return str(json.loads(value))
+        except ValueError:
+            return value[1:-1]
+    if len(value) > 1 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def memory_notes(directory: Path) -> list[MemoryNote]:
+    """The notes of an auto-memory directory (``MEMORY.md`` left out). Only read."""
+    notes = []
+    for path in sorted(directory.glob("*.md")):
+        if path.name == MEMORY_INDEX or not path.is_file():
+            continue
+        fields, body = _front_matter(path.read_text(errors="replace"))
+        notes.append(
+            MemoryNote(
+                path=path,
+                name=fields.get("name") or path.stem,
+                description=fields.get("description", ""),
+                kind=fields.get("type", ""),
+                origin=fields.get("originSessionId", ""),
+                body=body.strip(),
+            )
+        )
+    return notes
+
+
+def memory_rule(note: MemoryNote) -> str:
+    """The lesson rule of a note: its description (the one-line summary Claude Code keeps
+    for it), else its first paragraph; at most :data:`RULE_CHARS` characters."""
+    text = note.description or note.body.split("\n\n")[0]
+    return _clean(text)
+
+
+def memory_lesson(note: MemoryNote) -> str | None:
+    """The lessons file a note most likely belongs to: a backend its name or description
+    mentions (:data:`MEMORY_BACKEND_WORDS`), else a module family in its name; None when
+    neither (``--to`` decides)."""
+    words = set(re.findall(r"[a-z0-9]+", f"{note.name} {note.description}".lower()))
+    for backend, keys in MEMORY_BACKEND_WORDS:
+        if words & set(keys):
+            return backend
+    for token in re.split(r"[^a-z0-9]+", note.name.lower()):
+        for family, keys in FAMILIES:
+            if token and any(k in token for k in keys):
+                return family
+    return None
+
+
+def agent_writers(runs: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """The run directory of every agent session in the agent logs (``logs/agent-*.jsonl``)
+    of the runs under ``runs``, by session id, and of every auto-memory note those sessions
+    wrote or edited (a Write or Edit of ``~/.claude/projects/<project>/memory/<file>``), by
+    file name."""
+    sessions: dict[str, str] = {}
+    notes: dict[str, str] = {}
+    for log_path in sorted(runs.rglob("agent-*.jsonl")):
+        run = str(log_path.parent.parent)
+        for line in log_path.read_text(errors="replace").splitlines():
+            for sid in re.findall(r'"session_id": "([0-9A-Fa-f-]{8,})"', line):
+                sessions.setdefault(sid, run)
+            if "/.claude/projects/" not in line or not line.startswith('{"type": "Assistant'):
+                continue
+            try:
+                blocks = json.loads(line)["data"]["content"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            for block in blocks if isinstance(blocks, list) else []:
+                tool_input = block.get("input") if isinstance(block, dict) else None
+                if not isinstance(tool_input, dict) or block.get("name") not in WRITERS:
+                    continue
+                path = Path(str(tool_input.get("file_path") or ""))
+                if path.parent.name == "memory" and "/.claude/projects/" in str(path):
+                    notes.setdefault(path.name, run)
+    return sessions, notes
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower())) - _STOP
+
+
+def similar_rule(rule: str, existing: Iterable[str]) -> str | None:
+    """The existing rule that shares most words with ``rule`` (at least :data:`SIMILAR` of
+    the shorter one's), or None."""
+    words = _words(rule)
+    best, score = None, SIMILAR
+    for other in existing:
+        theirs = _words(other)
+        if words and theirs:
+            overlap = len(words & theirs) / min(len(words), len(theirs))
+            if overlap >= score:
+                best, score = other, overlap
+    return best
+
+
+def _key(rule: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", rule.lower())  # as write_lessons deduplicates
+
+
+def cmd_import_memory(ns: argparse.Namespace) -> int:
+    """Turn Claude Code auto-memory notes into lessons rules. Prints the plan; writes the
+    lessons files only with ``--write``. The memory files are only read."""
+    source = Path(ns.memory_dir).expanduser()
+    if not source.is_dir():
+        raise SystemExit(
+            f"{source}: not a directory (a Claude Code memory directory is "
+            "~/.claude/projects/<project>/memory)"
+        )
+    if ns.to and not _NAME.match(ns.to):
+        raise SystemExit(f"--to {ns.to!r}: not a lessons file name (e.g. cuda, triton, norm)")
+    notes = memory_notes(source)
+    wanted = set(ns.note or [])
+    unknown = wanted - {n.name for n in notes} - {n.path.stem for n in notes}
+    if unknown:
+        raise SystemExit(f"no note named {', '.join(sorted(unknown))} in {source}")
+    sessions, written = agent_writers(Path(ns.runs).expanduser()) if ns.runs else ({}, {})
+    print(f"memory: {source} ({len(notes)} notes; {MEMORY_INDEX}, the index, is not imported)")
+    print(f"lessons: {lessons_dir()}")
+    added: dict[str, list[str]] = {}
+    for note in notes:
+        if wanted and not wanted & {note.name, note.path.stem}:
+            continue
+        run = sessions.get(note.origin) or written.get(note.path.name)
+        origin = f", session {note.origin[:8]}" if note.origin else ""
+        origin += f", by an agent of {run}" if run else ""
+        head = f"  {note.name} ({note.kind or 'no type'}{origin})"
+        name = ns.to or memory_lesson(note)
+        rule = memory_rule(note)
+        why = None
+        if note.kind == "user" and not wanted:
+            why = "a note about you, not a kernel lesson (select it with --note)"
+        elif ns.runs and run is None:
+            why = f"no agent session of the runs under {ns.runs} wrote it"
+        elif not rule:
+            why = "no description or text"
+        elif name is None:
+            why = "no backend or module family in its name or description (--to NAME)"
+        elif _key(rule) in {_key(r) for r in rules(name) + added.get(name, [])}:
+            why = f"already in {name}.md"
+        if why:
+            print(f"{head}: skipped, {why}")
+            continue
+        assert name is not None
+        print(f"{head} -> {name}.md")
+        print(f"      + {rule}")
+        if like := similar_rule(rule, rules(name) + added.get(name, [])):
+            print(f"      ~ similar to: {like}")
+        added.setdefault(name, []).append(rule)
+    total = sum(len(v) for v in added.values())
+    files = ", ".join(f"{k}.md +{len(v)}" for k, v in added.items())
+    for name, new in added.items():
+        over = len(rules(name)) + len(new) - MAX_RULES
+        if over > 0:
+            print(f"  {name}.md: {over} rule(s) over the cap of {MAX_RULES} would be dropped")
+    if not ns.write:
+        print(
+            f"dry run: {total} rule(s) would be added ({files or 'none'}). Nothing was "
+            "written; --write writes them. The memory files are never changed."
+        )
+        return 0
+    for name, new in added.items():
+        write_lessons({"lessons": [{"file": name, "rules": rules(name) + new}]}, [name])
+    print(
+        f"added {total} rule(s) ({files or 'none'}) to {lessons_dir()}; the memory files "
+        "are unchanged (delete them yourself if you no longer want them)."
+    )
+    return 0
+
+
 # ------------------------------------------------------------------ report
 
 
@@ -1075,6 +1298,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "show": cmd_show,
     "prune": cmd_prune,
     "path": cmd_path,
+    "import-memory": cmd_import_memory,
 }
 
 
@@ -1082,7 +1306,7 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
     """The ``kernel-agent library`` subcommands (``sub``: the CLI's subparsers)."""
     p: argparse.ArgumentParser = sub.add_parser(
         "library",
-        help="cross-run kernel library: list, show, prune, path",
+        help="cross-run kernel library: list, show, prune, path, import-memory",
         description=f"Kernels that won earlier runs, per GPU architecture, and distilled "
         f"lessons. Location: ${ENV} or ~/.cache/kernel-agent/library.",
     )
@@ -1096,6 +1320,23 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
     q.add_argument("--older-than", type=float, metavar="DAYS")
     q.add_argument("--dry-run", action="store_true", help="only list what would go")
     lib.add_parser("path", help="print the library directory")
+    q = lib.add_parser(
+        "import-memory",
+        help="turn Claude Code auto-memory notes into lessons (dry run unless --write)",
+        description="Turn the notes of a Claude Code auto-memory directory into rules of "
+        "lessons/<backend or module family>.md. Prints what it would add; --write adds it. "
+        "The memory files are only read, never changed or deleted.",
+    )
+    q.add_argument("memory_dir", help="e.g. ~/.claude/projects/<project>/memory")
+    q.add_argument("--note", action="append", metavar="NAME", help="only this note (repeat)")
+    q.add_argument("--to", metavar="NAME", help="lessons file for every selected note")
+    q.add_argument(
+        "--runs",
+        metavar="DIR",
+        help="only notes that agent sessions of the runs under DIR wrote (from their "
+        "logs/agent-*.jsonl: a Write or Edit of the note, or its originSessionId)",
+    )
+    q.add_argument("--write", action="store_true", help="write the lessons files")
     return p
 
 
