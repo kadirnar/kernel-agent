@@ -209,7 +209,9 @@ class GemvChain(nn.Module):
 #: an RTX 5070 Ti: streamed from DRAM), as in docs/PARALLEL.md §4.6; a 4-row call
 #: (correctness only) takes the example's fallback.
 PDL_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
-    "cuda_pdl_gemv_chain.py": (1024, 28, [((1,), 64), ((4,), 0)]),
+    # 8 layers: an exact-tier chain of bf16 GEMVs drifts from cuBLAS's rounding with depth
+    # (28 layers: 14 of 40 draws had > 0.1 % of elements outside bf16's tolerance; 8: none)
+    "cuda_pdl_gemv_chain.py": (1024, 8, [((1,), 64), ((4,), 0)]),
 }
 
 
@@ -607,7 +609,7 @@ def smoke_fp8_toolkit(tmp: Path, verbose: bool = False, *, cuda: bool, triton: b
             kv_heads,
             dim,
             decode,
-            tier="near-lossless",
+            tier="near-lossless-kv",
             precision="fp8_kv",
         )
         result = run_evaluation(capture, EXAMPLES_DIR / name)

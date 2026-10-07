@@ -238,9 +238,10 @@ def test_async_flags_and_the_side_stage_on_cuda():
         assert torch.equal(flags.read(ticket), (x * i).argmax(dim=-1).cpu())
     model = Counter(2, STOPS)
     stage = SideStage("cuda", pipelined=True)
-    inline = serve(Counter(2, STOPS), 5, continuous=True, max_steps=10)
+    same = SideStage("cuda", pipelined=False)  # the same post-stage groups, run inline
+    inline = serve(Counter(2, STOPS), 5, continuous=True, max_steps=10, stage=same)
     served = serve(model, 5, continuous=True, max_steps=10, stage=stage)
-    assert stage.pipelined and stage.submitted == 4
+    assert stage.pipelined and not same.pipelined and stage.submitted == same.submitted > 0
     assert [o.tolist() for o in served.outputs] == [o.tolist() for o in inline.outputs]
     copy = HostCopy(torch.arange(4, device="cuda"))
     assert copy.wait().tolist() == [0, 1, 2, 3] and copy.ready()

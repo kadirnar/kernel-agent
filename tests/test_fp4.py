@@ -178,7 +178,11 @@ def test_fp4_precision_maps_to_its_tier():
     assert compare.tier_for("near-lossless", "fp8_weights") == compare.NEAR_LOSSLESS_TIER
     assert compare.tier_for("exact", "fp4_weights") == compare.EXACT_TIER
     assert compare.tier_of({"tier": FP4}) == FP4
-    assert set(compare.NEAR_LOSSLESS_BOUNDS) == {compare.NEAR_LOSSLESS_TIER, FP4}
+    assert set(compare.NEAR_LOSSLESS_BOUNDS) == {
+        compare.NEAR_LOSSLESS_TIER,
+        FP4,
+        compare.NEAR_LOSSLESS_KV_TIER,  # fp8_kv: near-lossless's bounds on captured inputs
+    }
     fp8_bounds, fp4_bounds = (compare.NEAR_LOSSLESS_BOUNDS[t] for t in ("near-lossless", FP4))
     assert fp4_bounds[0] < fp8_bounds[0] and fp4_bounds[1] > fp8_bounds[1]  # looser
 
