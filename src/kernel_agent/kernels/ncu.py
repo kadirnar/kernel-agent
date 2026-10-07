@@ -460,18 +460,22 @@ def ncu_entry(
     from kernel_agent import toolchain
     from kernel_agent.kernels.evaluate import load_candidate_module
     from kernel_agent.profiling.capture import load_capture
-    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.profiling.state import Replay, split
 
     toolchain.setup()
     capture = load_capture(capture_path, device="cuda", sha256=capture_sha256)
     reference = capture["module"].eval()
+    replay = Replay(capture, reference)  # the case's module state, outside the NVTX range
     case = max(capture["cases"], key=lambda c: int(c.get("count") or 0))
     module = load_candidate_module(candidate_path)
-    candidate = module.build(copy.deepcopy(reference))
-    fn = entrypoint(candidate, case.get("method", "forward"))
+    given = copy.deepcopy(reference)
+    candidate = module.build(given)
+    fn, restore = split(replay.call(case, candidate, given))
     with torch.inference_mode():
         for i in range(calls + 1):
             args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
+            if restore is not None:
+                restore()
             torch.cuda.synchronize()
             ranged = torch.cuda.nvtx.range(NVTX_RANGE) if i else contextlib.nullcontext()
             with ranged:

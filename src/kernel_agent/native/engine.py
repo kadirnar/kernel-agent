@@ -11,7 +11,9 @@ kernel or a few. Scopes:
 * ``stage``: one module group of the profile (an iterative solver module, a layer stack, a
   decode step, a one-shot decoder): replaced as a kernel target (``native_<id>``, captured
   like any target, so its correctness is checked teacher forced on the stage's recorded
-  inputs) or as a transform;
+  inputs, each case from the module state its call saw, e.g. a KV-cache attribute; a
+  capture the unmodified reference fails is refused, and the digest says why:
+  :func:`capture_refusal`) or as a transform;
 * ``group``: the stages that run once per iteration of the generation loop (the same calls
   per run), fused across their boundaries: a transform, checked end to end;
 * ``loop``: the whole generation loop: a transform that keeps the per-iteration seams the
@@ -447,6 +449,20 @@ def module_precision(specs: Iterable[Mapping[str, Any]]) -> str | None:
 def is_stage_target(spec: Mapping[str, Any]) -> bool:
     """A target the native arm owns (no kernel arm of its own)."""
     return bool(spec.get("native"))
+
+
+def capture_refusal(run: RunDir, target_id: str) -> str | None:
+    """Why the capture of a (stage) target failed (``capture_error`` of its
+    ``spec.failed.json``: the last line of the error, e.g. the reference failing its own
+    capture, :class:`kernel_agent.profiling.capture.UnverifiableCapture`); None when it
+    did not fail."""
+    spec = read_json(run.target(target_id) / "spec.failed.json", {}) or {}
+    lines = [line.strip() for line in str(spec.get("capture_error") or "").splitlines()]
+    last = next((line for line in reversed(lines) if line), "")
+    if not last:
+        return None
+    raised = re.match(r"[A-Za-z_][\w.]*: (.+)", last)  # "<module>.<Exception>: <why>"
+    return (raised.group(1) if raised else last)[:600]
 
 
 # ------------------------------------------------------------------ rows

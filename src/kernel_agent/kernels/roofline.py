@@ -884,18 +884,25 @@ def annotate(
     peaks: dict[str, Any] | None = None,
     l2_flush: bool = False,
     precision: str | None = None,
+    restore: Any = None,
 ) -> None:
     """Add SOL fields to a timed evaluation result in place; never raises. ``precision``:
-    the capture's reduced precision (weights counted at :data:`WEIGHT_BITS`)."""
+    the capture's reduced precision (weights counted at :data:`WEIGHT_BITS`); ``restore``:
+    sets a case's module state before its call (``restore(case)``, profiling/state.py)."""
     peaks = peaks or current_peaks()
     if not peaks:
         result["sol_note"] = "GPU peaks not measured yet (`kernel-agent doctor` measures them)"
         return
     try:
-        costs = [
-            count_case(module, c["args"], c["kwargs"], method=c.get("method"), precision=precision)
-            for c in cases
-        ]
+        costs = []
+        for c in cases:
+            if restore is not None:
+                restore(c)
+            costs.append(
+                count_case(
+                    module, c["args"], c["kwargs"], method=c.get("method"), precision=precision
+                )
+            )
         apply_sol(result, costs, peaks, hot_l2=not l2_flush)
     except Exception as exc:
         result["sol_error"] = f"{type(exc).__name__}: {exc}"[:300]

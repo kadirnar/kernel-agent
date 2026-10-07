@@ -48,12 +48,18 @@ def _reasons(explanation: Any) -> list[str]:
 
 
 def check(
-    build: Callable[[], Any], cases: list[dict[str, Any]], *, backend: str | None = None
+    build: Callable[[], Any],
+    cases: list[dict[str, Any]],
+    *,
+    backend: str | None = None,
+    restore: Callable[[dict[str, Any], Any], None] | None = None,
 ) -> dict[str, Any]:
     """Graph breaks and compiled correctness of the candidate made by ``build()``
     (a fresh instance: tracing must not touch the one being timed) on the captured
     ``cases``.  ``passed``: every case runs compiled and matches the reference
-    outputs; ``fullgraph_ok``: no graph break (it also works under ``fullgraph=True``)."""
+    outputs; ``fullgraph_ok``: no graph break (it also works under ``fullgraph=True``).
+    ``restore(case, candidate)``: sets a case's module state before each call
+    (:mod:`kernel_agent.profiling.state`)."""
     import torch
     import torch._dynamo as dynamo
 
@@ -86,6 +92,8 @@ def check(
                 continue
             fn = entrypoint(candidate, method)
             args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
+            if restore is not None:
+                restore(case, candidate)
             with torch.inference_mode():
                 explanation = dynamo.explain(fn)(*args, **kwargs)
             graphs = int(explanation.graph_count)
@@ -103,6 +111,8 @@ def check(
         cases_out = []
         for i, case in enumerate(cases):
             args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
+            if restore is not None:
+                restore(case, candidate)
             with torch.inference_mode():
                 out = compiled[case.get("method", "forward")](*args, **kwargs)
             synchronize()

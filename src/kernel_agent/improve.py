@@ -331,6 +331,8 @@ def native_digest(
             if target and run.capture_file(target).exists()
             else ""
         )
+        if target and not teacher and (refused := native_engine.capture_refusal(run, target)):
+            teacher = f"; no teacher-forced target (capture refused: {refused}): end to end only"
         lines.append(f"{i}. [{state}] {stage.describe()}{teacher}")
     if not status.plan:
         lines.append("* (no stage graph: no ceilings table; derive the stages from the profile)")

@@ -54,8 +54,9 @@ from kernel_agent import ledger
 from kernel_agent.workspace import TRUTH_DIR, RunDir, write_json
 
 VERSION = 1
-#: Case fields of a capture that hold the answer key (reference outputs + side effects).
-ANSWER_KEYS = ("output", "post_args", "post_kwargs")
+#: Case fields of a capture that hold the answer key (reference outputs + side effects; a
+#: case's module ``state`` before its call is an input and stays, profiling/state.py).
+ANSWER_KEYS = ("output", "post_args", "post_kwargs", "post_state")
 
 __all__ = ["TRUTH_DIR", "TamperError", "Truth", "of"]
 

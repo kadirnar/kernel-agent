@@ -320,19 +320,20 @@ def _time_configs(
     reference: Any,
     cases: list[dict[str, Any]],
     timed: list[int],
-    passing: list[tuple[dict[str, Any], Any]],
+    passing: list[tuple[dict[str, Any], tuple[Any, ...]]],
     *,
     timer: Callable[..., dict[str, Any]],
     check_output: Callable[[Any, dict[str, Any]], dict[str, Any]] | None,
     l2_flush: bool,
     deadline: float | None,
     emit: Callable[[dict[str, Any]], None],
+    replay: Any,
 ) -> tuple[int, dict[int, float]]:
-    """Interleaved timing rounds of the passing configs; fills their rows (speedup per
-    case and weighted).  Returns the number of whole rounds and the reference's time
-    per timed case."""
+    """Interleaved timing rounds of the passing configs (``(row, (candidate, the reference
+    copy it was built from))``); fills their rows (speedup per case and weighted). Every
+    call runs from its case's module state (``replay``, profiling/state.py). Returns the
+    number of whole rounds and the reference's time per timed case."""
     from kernel_agent.kernels.bench import median_round
-    from kernel_agent.profiling.methods import entrypoint
 
     ref_rounds: dict[int, list[dict[str, Any]]] = {ci: [] for ci in timed}
     new_rounds: dict[int, dict[int, list[dict[str, Any]]]] = {
@@ -347,18 +348,18 @@ def _time_configs(
         order = passing[shift:] + passing[:shift]
         for ci in timed:
             case = cases[ci]
-            args, kwargs, method = case["args"], case["kwargs"], case["method"]
-            ref_fn = entrypoint(reference, method)
+            args, kwargs = case["args"], case["kwargs"]
+            ref_fn = replay.call(case, reference)
             ref_rounds[ci].append(
                 timer(ref_fn, args, kwargs, l2_flush=l2_flush, target_ms=TARGET_MS)
             )
-            for row, candidate in order:
+            for row, holders in order:
                 if not row["correct"]:
                     continue
                 emit({"event": "running", "index": row["index"]})
                 try:
                     t = timer(
-                        entrypoint(candidate, method),
+                        replay.call(case, *holders),
                         args,
                         kwargs,
                         l2_flush=l2_flush,
@@ -430,26 +431,30 @@ def _speed_of_light(
     timed: list[int],
     l2_flush: bool,
     precision: str | None = None,
+    replay: Any = None,
 ) -> str | None:
     """``pct_of_sol`` of every timed row (:func:`kernels.roofline.apply_sol`, the work
-    counted once per case, weights at the capture's ``precision``); a note when it cannot
-    be computed."""
+    counted once per case from its module state (``replay``), weights at the capture's
+    ``precision``); a note when it cannot be computed."""
     from kernel_agent.kernels.roofline import apply_sol, count_case, current_peaks
 
     peaks = current_peaks()
     if not peaks:
         return "GPU peaks not measured yet (`kernel-agent doctor` measures them)"
     try:
-        costs = [
-            count_case(
-                reference,
-                cases[ci]["args"],
-                cases[ci]["kwargs"],
-                method=cases[ci]["method"],
-                precision=precision,
+        costs = []
+        for ci in timed:
+            if replay is not None:
+                replay.restore(cases[ci], reference)
+            costs.append(
+                count_case(
+                    reference,
+                    cases[ci]["args"],
+                    cases[ci]["kwargs"],
+                    method=cases[ci]["method"],
+                    precision=precision,
+                )
             )
-            for ci in timed
-        ]
         for row in rows:
             if row.get("correct") and row.get("cases"):
                 apply_sol(row, costs, peaks, hot_l2=not l2_flush)
@@ -490,6 +495,7 @@ def sweep(
     from kernel_agent.kernels import bench
     from kernel_agent.kernels.evaluate import capture_precision, evaluate, quick_cases
     from kernel_agent.profiling.capture import load_capture
+    from kernel_agent.profiling.state import Replay
 
     start = time.monotonic()
     indices = list(range(len(configs))) if indices is None else indices
@@ -506,12 +512,17 @@ def sweep(
         case.setdefault("method", "forward")
     named = list(reference.named_parameters())
     backup = [w.detach().clone() for _, w in named]
-    session: dict[str, Any] = {"capture": capture, "memo": {id(w): w for _, w in named}}
+    replay = Replay(capture, reference)  # each case's module state, before any call
+    session: dict[str, Any] = {
+        "capture": capture,
+        "memo": {id(w): w for _, w in named},
+        "replay": replay,
+    }
     checks_until = None if deadline is None else start + CHECK_SHARE * (deadline - start)
 
     # 1. every config through the quick tier
     rows: list[dict[str, Any]] = []
-    passing: list[tuple[dict[str, Any], Any]] = []
+    passing: list[tuple[dict[str, Any], tuple[Any, ...]]] = []
     for index, config in zip(indices, configs, strict=True):
         row: dict[str, Any] = {"index": index, "config": config}
         rows.append(row)
@@ -542,8 +553,9 @@ def sweep(
             }
         row.update(_row(result))
         candidate = session.pop("candidate", None)
+        holders = session.pop("holders", None) or (candidate,)
         if row["correct"] and candidate is not None:
-            passing.append((row, candidate))
+            passing.append((row, holders))
         elif cuda:
             _check_context(index)
         emit({"event": "row", **row})
@@ -573,11 +585,14 @@ def sweep(
             l2_flush=l2_flush,
             deadline=deadline,
             emit=emit,
+            replay=replay,
         )
         for case in out["cases"]:
             case["ref_ms"] = ref_ms[case["case"]]
         precision = capture_precision(capture)  # reduced-precision weights: their own bytes
-        if cuda and (note := _speed_of_light(rows, reference, cases, timed, l2_flush, precision)):
+        if cuda and (
+            note := _speed_of_light(rows, reference, cases, timed, l2_flush, precision, replay)
+        ):
             out["sol_note"] = note
     elif passing:
         out["timing"] = "skipped: no CUDA device" if timed else "skipped: no timed case"

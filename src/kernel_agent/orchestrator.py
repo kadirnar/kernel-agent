@@ -462,7 +462,12 @@ class Orchestrator:
             info = self._worker("capture", "--target", t["id"], *parent)
             if "error" in info:
                 log(f"capture: {t['id']} failed, dropping target:\n{info['error'][-800:]}")
-                (target_dir / "spec.json").rename(target_dir / "spec.failed.json")
+                # the reason stays with it (an unverifiable capture: native/engine.py digest)
+                failed = read_json(target_dir / "spec.json", {}) or spec
+                write_json(
+                    target_dir / "spec.failed.json", {**failed, "capture_error": info["error"]}
+                )
+                (target_dir / "spec.json").unlink(missing_ok=True)
                 continue
             capture = self.run.capture_file(t["id"])
             if parent:
