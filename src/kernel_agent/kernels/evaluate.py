@@ -18,7 +18,11 @@ Each captured case is replayed through the entrypoint it was recorded from:
 ``candidate(*args, **kwargs)`` for ``forward`` cases and
 ``candidate.<method>(*args, **kwargs)`` otherwise (e.g. ``forward_step`` of a
 custom decode loop), for correctness and timing alike.  A candidate that lacks
-a captured method is a ``build_error``.
+a captured method is a ``build_error``.  The cases of a stateful module (a KV-cache
+attribute: ``state`` in the capture, :mod:`kernel_agent.profiling.state`) run from the
+module state their call saw: written into the candidate (and into the reference copy it was
+built from) before every call, outside timed regions, and the state after the call is
+checked like in-place argument updates (``state.*`` checks).
 
 Stages and their failure statuses:
 
@@ -221,6 +225,7 @@ def _kernel_table(fn: Any, args: Any, kwargs: Any, top: int = 15) -> list[dict[s
     from torch.profiler import ProfilerActivity, profile
 
     from kernel_agent.kernels.bench import has_mutable_state
+    from kernel_agent.profiling.state import split
 
     a, k = (
         (copy.deepcopy(args), copy.deepcopy(kwargs))
@@ -230,6 +235,9 @@ def _kernel_table(fn: Any, args: Any, kwargs: Any, top: int = 15) -> list[dict[s
             kwargs,
         )
     )
+    fn, restore = split(fn)  # the case's module state, restored outside the profile
+    if restore is not None:
+        restore()
     with torch.inference_mode(), profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn(*a, **k)
         torch.cuda.synchronize()
@@ -309,18 +317,19 @@ def _first_error(failures: list[dict[str, Any]]) -> str:
 def _reverify(
     result: dict[str, Any],
     reference: Any,
-    candidate: Any,
+    holders: tuple[Any, ...],
     cases: list[dict[str, Any]],
     pristine: list[tuple[Any, Any]],
     seed: int,
     device: str,
+    replay: Any,
 ) -> bool:
-    """Stage 4 (:func:`kernels.verify.reverify_case` on every case); False and
+    """Stage 4 (:func:`kernels.verify.reverify_case` on every case: the candidate is
+    ``holders[0]``, every call from the case's module state, ``replay``); False and
     ``incorrect_perturbed`` in ``result`` if a check fails."""
     import torch
 
     from kernel_agent.kernels.verify import reverify_case
-    from kernel_agent.profiling.methods import entrypoint
     from kernel_agent.workloads.base import synchronize
 
     gen = torch.Generator(device=device)
@@ -328,12 +337,11 @@ def _reverify(
     redraws: dict[str, Any] = {"ran": {}, "skipped": []}
     result["redraws"] = redraws  # the scaled checks (kernels.verify.SCALED) per case
     for i, (case, inputs) in enumerate(zip(cases, pristine, strict=True)):
-        method = case["method"]
         record: dict[str, Any] = {}
         try:
             failed = reverify_case(
-                entrypoint(reference, method),
-                entrypoint(candidate, method),
+                replay.call(case, reference),
+                replay.call(case, *holders),
                 case,
                 inputs,
                 gen,
@@ -533,6 +541,7 @@ def _evaluate(
     from kernel_agent.kernels.verify import alias_errors
     from kernel_agent.profiling.capture import load_capture
     from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.profiling.state import Replay
     from kernel_agent.workloads.base import synchronize
 
     result: dict[str, Any] = {
@@ -558,10 +567,13 @@ def _evaluate(
     cases = capture["cases"]
     for case in cases:
         case.setdefault("method", "forward")  # captures written before entrypoints existed
+    # module state per case (profiling/state.py), from the reference before any call
+    replay = session.get("replay") or Replay(capture, reference)
+    session["replay"] = replay
     comparator.TIER = comparator.tier_of(capture)  # before the snapshot, which watches it
     if comparator.TIER != comparator.EXACT_TIER:
         result["tolerance_tier"] = comparator.TIER
-    guard = integrity.Snapshot(reference)  # before the candidate is imported
+    guard = integrity.Snapshot(reference, state=replay.keys)  # before the candidate is imported
     guards.append(guard)
     _code_dirs(candidate_path)  # a bundle's code directory, read before it is imported
 
@@ -585,6 +597,9 @@ def _evaluate(
             "(that fallback is only for instances the kernel does not support)",
         )
         return result
+    # where a case's module state is restored (and read back): the candidate, and the copy
+    # of the reference it was built from (a wrapper keeps the state there)
+    holders = (candidate, given)
     calls: collections.Counter[str] = collections.Counter()
     for case in cases:
         calls[case["method"]] += case["count"]
@@ -616,7 +631,7 @@ def _evaluate(
         ref_args, ref_kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
         try:
             with torch.inference_mode():
-                out = entrypoint(candidate, case["method"])(*args, **kwargs)
+                out = replay.call(case, *holders)(*args, **kwargs)
             synchronize()
         except Exception:
             result.update(status="runtime_error", error=_short_tb(), failed_case=i)
@@ -628,8 +643,9 @@ def _evaluate(
         checks = compare_structures(case["output"], out, "output")
         checks += compare_side_effects(case["args"], case["post_args"], args, "args")
         checks += compare_side_effects(case["kwargs"], case["post_kwargs"], kwargs, "kwargs")
+        checks += replay.check(case, *holders)  # what the call changed in the module's state
         with torch.inference_mode():  # after the candidate: the aliasing of a live call
-            ref_out = entrypoint(reference, case["method"])(*ref_args, **ref_kwargs)
+            ref_out = replay.call(case, reference)(*ref_args, **ref_kwargs)
         synchronize()
         checks += alias_errors(ref_out, (ref_args, ref_kwargs), out, (args, kwargs))
         del ref_out, ref_args, ref_kwargs
@@ -673,6 +689,12 @@ def _evaluate(
             return result
     if not all_ok:
         failed = next(i for i, r in enumerate(case_reports) if not r["ok"])
+        if any(f.get("name", "").startswith("state.") for f in case_reports[failed]["failures"]):
+            result["state_note"] = (
+                "`state.*` is the module's state outside the call's arguments (e.g. a KV-cache "
+                "attribute), set from the capture before every call: the candidate must read "
+                "it and update it in place where and as the reference does"
+            )
         result.update(  # the failures are in result["cases"]
             status="incorrect",
             stage="correctness",
@@ -682,7 +704,11 @@ def _evaluate(
     if compile_check:  # optional stage on a fresh build: graph breaks + compiled outputs
         from kernel_agent.kernels.compile_check import check
 
-        result["compile_check"] = check(lambda: module.build(copy.deepcopy(reference)), cases)
+        result["compile_check"] = check(
+            lambda: module.build(copy.deepcopy(reference)),
+            cases,
+            restore=replay.restore if replay else None,
+        )
     if not _intact(result, guard, candidate_path, "after the correctness checks"):
         return result
     if save_outputs is not None:  # with the capture's case indices (quick: a subset)
@@ -697,12 +723,13 @@ def _evaluate(
     if quick or not device.startswith("cuda"):  # re-verified, never timed or profiled
         main = integrity.main_case(cases, case_reports)
         args, kwargs = copy.deepcopy(pristine[main])
+        call = replay.call(cases[main], *holders)
         with integrity.count_calls(codes) as counts, torch.inference_mode():
-            entrypoint(candidate, cases[main]["method"])(*args, **kwargs)
+            call(*args, **kwargs)
         ran = {codes[c]: n for c, n in counts.items() if n}
         if _fallback(result, main, cases[main], ran):
             return result
-        if not _reverify(result, reference, candidate, cases, pristine, seed, device):
+        if not _reverify(result, reference, holders, cases, pristine, seed, device, replay):
             return result
         if not _intact(result, guard, candidate_path, "at the end"):
             return result
@@ -710,6 +737,7 @@ def _evaluate(
         result.update(status="ok", correct=True, timing=timing)
         result["eval_seconds"] = round(time.perf_counter() - t0, 1)
         session["candidate"] = candidate  # a sweep times it next to its other configs
+        session["holders"] = holders
         return result
 
     # 3. performance (reference vs candidate, same inputs, same entrypoint)
@@ -725,14 +753,9 @@ def _evaluate(
         if not case["count"]:  # correctness-only case (another workload setting): not timed
             continue
         try:
-            ref_t, new_t = compare_timing(
-                entrypoint(reference, method),
-                entrypoint(candidate, method),
-                case["args"],
-                case["kwargs"],
-                l2_flush=l2_flush,
-            )
-            fns = (entrypoint(reference, method), entrypoint(candidate, method))
+            # every call from the case's module state (restored outside the timed region)
+            fns = (replay.call(case, reference), replay.call(case, *holders))
+            ref_t, new_t = compare_timing(*fns, case["args"], case["kwargs"], l2_flush=l2_flush)
             wall = wall_check(*fns, case["args"], case["kwargs"])
             if _hidden_work(wall):  # confirm: other processes can delay one measurement
                 again = wall_check(*fns, case["args"], case["kwargs"])
@@ -789,7 +812,10 @@ def _evaluate(
                         entrypoint(compiled_ref, method), mode="max-autotune-no-cudagraphs"
                     )
                 comp_t = time_call(
-                    compiled[method], case["args"], case["kwargs"], l2_flush=l2_flush
+                    replay.wrap(compiled[method], case, compiled_ref),
+                    case["args"],
+                    case["kwargs"],
+                    l2_flush=l2_flush,
                 )
                 report["torch_compile_ms"] = round(comp_t["median_ms"], 5)
             except Exception as exc:
@@ -808,11 +834,10 @@ def _evaluate(
         return result
     # One profiled pass over the dominant case: threads, unjoined streams, fallback.
     main = integrity.main_case(cases, case_reports)
-    method = cases[main]["method"]
     try:
         activity = integrity.activity_check(
-            entrypoint(reference, method),
-            entrypoint(candidate, method),
+            replay.call(cases[main], reference),
+            replay.call(cases[main], *holders),
             [copy.deepcopy(pristine[main]) for _ in range(ACTIVITY_CALLS)],
             codes,
         )
@@ -850,7 +875,7 @@ def _evaluate(
         return result
 
     # 4. re-verification after timing: fresh addresses and redrawn inputs
-    if not _reverify(result, reference, candidate, cases, pristine, seed, device):
+    if not _reverify(result, reference, holders, cases, pristine, seed, device, replay):
         return result
     result.update(
         status="ok",
@@ -864,13 +889,20 @@ def _evaluate(
     if (memory := peak_memory_summary(case_reports)) is not None:
         result["peak_memory"] = memory
     # speed of light per case (after timing, never inside it): sol_ms, pct_of_sol, bound
-    annotate(result, reference, cases, l2_flush=l2_flush, precision=capture_precision(capture))
+    annotate(
+        result,
+        reference,
+        cases,
+        l2_flush=l2_flush,
+        precision=capture_precision(capture),
+        restore=(lambda c: replay.restore(c, reference)) if replay else None,
+    )
     if profile:
         try:
             first = cases[0]
-            a, k, m = first["args"], first["kwargs"], first["method"]
-            result["kernels_candidate"] = _kernel_table(entrypoint(candidate, m), a, k)
-            result["kernels_reference"] = _kernel_table(entrypoint(reference, m), a, k)
+            a, k = first["args"], first["kwargs"]
+            result["kernels_candidate"] = _kernel_table(replay.call(first, *holders), a, k)
+            result["kernels_reference"] = _kernel_table(replay.call(first, reference), a, k)
         except Exception as exc:
             result["profile_error"] = str(exc)[:500]
         from kernel_agent.kernels.ncu import compiler_stats  # registers, spills (no GPU work)
@@ -1142,17 +1174,18 @@ def reference_timing(
     toolchain.setup()
     from kernel_agent.kernels.bench import compare_timing
     from kernel_agent.profiling.capture import load_capture
-    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.profiling.state import Replay
 
     capture = load_capture(capture_path, device="cuda", sha256=capture_sha256)
     reference = capture["module"].eval()
+    replay = Replay(capture, reference)  # every call from its case's module state
     ref_ms, unstable = [], []
     for case in capture["cases"]:
         if not case.get("count", 1):  # correctness-only case: the evaluator does not time it
             ref_ms.append(0.0)
             unstable.append(0.0)
             continue
-        fn = entrypoint(reference, case.get("method", "forward"))
+        fn = replay.call(case, reference)
         one, two = compare_timing(
             fn, fn, case["args"], case["kwargs"], l2_flush=l2_flush, verify=False
         )

@@ -194,7 +194,10 @@ def _module_classes(reference: nn.Module) -> list[type]:
 class Snapshot:
     """What a candidate must not change; see the module docstring."""
 
-    def __init__(self, reference: nn.Module | None = None) -> None:
+    def __init__(self, reference: nn.Module | None = None, state: Iterable[str] = ()) -> None:
+        """``state``: the reference's module state a capture restores per case
+        (``capture["state"]["keys"]``, :mod:`kernel_agent.profiling.state`); buffers among it
+        are written by every call and restore, so they are not watched as weights."""
         import kernel_agent.kernels.bench as bench
         import kernel_agent.kernels.compare as compare
         import kernel_agent.kernels.evaluate as evaluate
@@ -203,6 +206,7 @@ class Snapshot:
         import kernel_agent.kernels.verify as verify
         import kernel_agent.kernels.weights as weights
         import kernel_agent.profiling.methods as methods
+        import kernel_agent.profiling.state as module_state
         import kernel_agent.workloads.base as base
 
         self.watches = [
@@ -227,6 +231,9 @@ class Snapshot:
             _watch("kernel_agent.kernels.scale_guard", scale_guard, constants=True),
             _watch("kernel_agent.kernels.integrity", sys.modules[__name__], constants=True),
             _watch("kernel_agent.profiling.methods", methods),
+            # restores each case's module state and checks what a call changed in it
+            _watch("kernel_agent.profiling.state", module_state, constants=True),
+            _watch("kernel_agent.profiling.state.Replay", module_state.Replay),
             _watch("kernel_agent.workloads.base", base),
         ]
         for name in dir(nn):
@@ -241,8 +248,10 @@ class Snapshot:
             for name, module in reference.named_modules():
                 label = f"reference.{name}" if name else "reference"
                 self.instances.append((label, module, dict(vars(module))))
+            skip = set(state)
             for name, t in [*reference.named_parameters(), *reference.named_buffers()]:
-                self.weights.append((name, t, t._version, t.data_ptr()))
+                if name not in skip:
+                    self.weights.append((name, t, t._version, t.data_ptr()))
         self.flags = _flags()
         self.flag_values = {name: get() for name, (get, _) in self.flags.items()}
 
@@ -452,23 +461,36 @@ def activity_check(
       candidate's calls (``{label: count}``);
     * ``reference_kernels`` / ``candidate_kernels``: kernel launches per call by name
       (:func:`fallback_reason`).
+
+    A case's module state (:mod:`kernel_agent.profiling.state`) is restored before each
+    call, outside the profiled ranges.
     """
     from torch.autograd.profiler import record_function
     from torch.profiler import ProfilerActivity, profile
 
     from kernel_agent.kernels import e2e_activity
+    from kernel_agent.profiling.state import split
 
+    def prepare(restore: Callable[[], None] | None) -> None:
+        if restore is not None:
+            restore()
+            torch.cuda.synchronize()
+
+    reference, ref_restore = split(reference)
+    candidate, new_restore = split(candidate)
     out: dict[str, Any] = {"foreign_threads": [], "unjoined": [], "reference_calls": {}}
     ref_args, ref_kwargs = inputs[0]
     ref_args, ref_kwargs = copy.deepcopy(ref_args), copy.deepcopy(ref_kwargs)
     torch.cuda.synchronize()
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
     with profile(activities=activities) as prof, torch.inference_mode():
+        prepare(ref_restore)
         with record_function("ka::reference"):
             reference(*ref_args, **ref_kwargs)
         torch.cuda.synchronize()
         with count_calls(codes) as counts:
             for i, (args, kwargs) in enumerate(inputs):
+                prepare(new_restore)
                 with record_function(f"ka::call{i}"):
                     candidate(*args, **kwargs)
                 with record_function(f"ka::mark{i}"):

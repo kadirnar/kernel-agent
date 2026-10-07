@@ -37,6 +37,15 @@ Correctness coverage beyond one call per signature:
   texts) are run once more each; calls with primary inputs the main run lacks
   become *correctness-only* cases (``count`` 0, ``correctness_only``) that the
   evaluator checks but does not time.
+
+Module state outside the arguments (a KV-cache attribute, a step counter: issue #162,
+:mod:`kernel_agent.profiling.state`): the module is saved with its state at the end of the
+run, so every case also keeps the state its call saw (``state``, a diff against the saved
+module) and what its call changed (``post_state``); the evaluator restores a case's state
+before each call. Self-check (:func:`self_check`): the saved capture is replayed through the
+evaluator's correctness flow with the reference; a capture the reference fails is refused
+(:class:`UnverifiableCapture`, the file removed) with the reason, so no agent ever gets a
+target nothing can pass.
 """
 
 from __future__ import annotations
@@ -45,6 +54,7 @@ import collections
 import copy
 import io
 import re
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -54,6 +64,7 @@ from torch import nn
 
 from kernel_agent.kernels.compare import flatten
 from kernel_agent.phases import PHASES, call_phase
+from kernel_agent.profiling import state
 from kernel_agent.profiling.methods import (
     entrypoint,
     entrypoints_of,
@@ -195,8 +206,13 @@ class _Recorder:
         self.instance_calls: dict[tuple[str, str], collections.Counter[int]] = (
             collections.defaultdict(collections.Counter)
         )
-        #: Per open call: (key, (bucket, decode step) or None, args, kwargs), or None.
-        self._pending: list[tuple[tuple[str, str], tuple[str, int] | None, Any, Any] | None] = []
+        #: Per open call: (key, (bucket, decode step) or None, args, kwargs, index of the
+        #: module-state snapshot before it), or None.
+        self._pending: list[
+            tuple[tuple[str, str], tuple[str, int] | None, Any, Any, int | None] | None
+        ] = []
+        #: The module's state around every recorded call (``profiling/state.py``).
+        self.log = state.Log(module)
         self._ctx: Any = instrument(
             [module, *peers], {type(module): list(methods)}, self._pre, self._post
         )
@@ -232,7 +248,8 @@ class _Recorder:
             self._pending.append(None)
         elif case is not None or self._make_room(method):
             # a new case, or the middle / last step of a bucketed decode signature
-            self._pending.append((key, bucket, _detach(args), _detach(kwargs)))
+            pre_args, pre_kwargs = _detach(args), _detach(kwargs)
+            self._pending.append((key, bucket, pre_args, pre_kwargs, self.log.take()))
         else:
             self._pending.append(None)
 
@@ -269,7 +286,7 @@ class _Recorder:
         pending = self._pending.pop() if self._pending else None
         if pending is None:
             return
-        key, bucket, pre_args, pre_kwargs = pending
+        key, bucket, pre_args, pre_kwargs, before = pending
         case: dict[str, Any] = {
             "method": method,
             "signature": key[1],
@@ -281,6 +298,7 @@ class _Recorder:
             "post_args": _detach(args),
             "post_kwargs": _detach(kwargs),
         }
+        state.record(case, self.log, before, self.log.take())
         if bucket is not None:
             case["bucket"], case["decode_step"] = bucket
         if key in self.cases:  # a middle / last decode step
@@ -465,11 +483,14 @@ def capture_module(
     variant_cases: int = 2,
     tier: str | None = None,
     precision: str | None = None,
+    self_check: bool = True,
 ) -> dict[str, Any]:
     """Run the workload and save one instance of ``cls`` plus its calls (``tier``: the
     tolerance tier the evaluator applies, :mod:`kernel_agent.kernels.compare`;
     ``precision``: the reduced precision the target may use, e.g. ``fp8_weights``, for the
-    speed of light of :mod:`kernel_agent.kernels.roofline`).
+    speed of light of :mod:`kernel_agent.kernels.roofline`). With ``self_check`` the saved
+    capture is refused (:class:`UnverifiableCapture`) when the reference fails it
+    (:func:`self_check`).
 
     The target's instances are those a patch replaces (``cls``, matching
     ``qualname_regex``); every call of theirs goes into the workload profile
@@ -543,6 +564,8 @@ def capture_module(
     # weights of the estimated saving (kernels/weights.py).
     qualnames = {id(m): q for q, m in [*candidates, (full, module)]}
     instance_groups = recorder.instance_groups(qualnames)
+    # the state each case saw, as diffs against the module as saved (profiling/state.py)
+    tracked = state.finalize(cases, module)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -555,12 +578,14 @@ def capture_module(
             "instance_groups": instance_groups,
             "methods": calls,
             "cases": cases,
+            **({"state": tracked} if tracked else {}),
             **({"phase": phase} if phase else {}),
             **({"tier": tier} if tier else {}),
             **({"precision": precision} if precision else {}),
         },
         path,
     )
+    checked = _refuse_unverifiable(path, tracked) if self_check else None
     return {
         "qualname": full,
         # calls per run of this instance, per entrypoint (captured or not)
@@ -578,6 +603,8 @@ def capture_module(
             for c in cases
         ],
         "bytes": path.stat().st_size,
+        **({"state": tracked} if tracked else {}),
+        **({"self_check": checked} if checked else {}),
         **({"phase": phase} if phase else {}),
         **({"tier": tier} if tier else {}),
         **({"precision": precision} if precision else {}),
@@ -618,35 +645,40 @@ def capture_calls(
     instances: int = 1,
     tier: str | None = None,
     precision: str | None = None,
+    self_check: bool = False,
 ) -> None:
     """Build a capture file from explicit ``(args, kwargs, count[, method])`` calls.
 
     Used by tests and for synthetic shapes (e.g. other batch sizes) that the
-    workload run did not exercise.  ``method`` defaults to ``"forward"``; ``tier`` and
-    ``precision`` as in :func:`capture_module`."""
+    workload run did not exercise.  ``method`` defaults to ``"forward"``; ``tier``,
+    ``precision`` and ``self_check`` as in :func:`capture_module` (the module's state
+    is recorded per case the same way)."""
     cases = []
     totals: collections.Counter[str] = collections.Counter()
+    log = state.Log(module)
     with torch.inference_mode():
         for call in calls:
             args, kwargs, count = call[0], call[1], int(call[2])
             method = str(call[3]) if len(call) > 3 else "forward"
             pre_args, pre_kwargs = _detach(args), _detach(kwargs)
+            before = log.take()
             output = entrypoint(module, method)(*args, **kwargs)
             synchronize()
             totals[method] += count
-            cases.append(
-                {
-                    "method": method,
-                    "signature": call_signature(method, pre_args, pre_kwargs, limit=1),
-                    "full_signature": signature_of(pre_args, pre_kwargs, limit=8),
-                    "count": count,
-                    "args": pre_args,
-                    "kwargs": pre_kwargs,
-                    "output": _detach(output),
-                    "post_args": _detach(args),
-                    "post_kwargs": _detach(kwargs),
-                }
-            )
+            case = {
+                "method": method,
+                "signature": call_signature(method, pre_args, pre_kwargs, limit=1),
+                "full_signature": signature_of(pre_args, pre_kwargs, limit=8),
+                "count": count,
+                "args": pre_args,
+                "kwargs": pre_kwargs,
+                "output": _detach(output),
+                "post_args": _detach(args),
+                "post_kwargs": _detach(kwargs),
+            }
+            state.record(case, log, before, log.take())
+            cases.append(case)
+    tracked = state.finalize(cases, module)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -657,8 +689,76 @@ def capture_calls(
             "instances": instances,
             "methods": dict(totals.most_common()),
             "cases": cases,
+            **({"state": tracked} if tracked else {}),
             **({"tier": tier} if tier else {}),
             **({"precision": precision} if precision else {}),
         },
         path,
+    )
+    if self_check:
+        _refuse_unverifiable(path, tracked)
+
+
+class UnverifiableCapture(RuntimeError):
+    """The unmodified reference fails its own capture (:func:`self_check`): refused."""
+
+
+def self_check(path: Path, device: str | None = None) -> dict[str, Any]:
+    """The reference through the evaluator's correctness flow on the saved capture: every
+    case in order, its module state restored first (:class:`state.Replay`), its outputs,
+    in-place argument updates and state changes compared with the recorded ones in the
+    capture's tolerance tier (:mod:`kernel_agent.kernels.compare`). Returns ``ok``,
+    ``cases``, ``failures`` (per failing case: ``case``, ``signature`` and the failed
+    checks or the ``error`` it raised) and ``seconds``."""
+    from kernel_agent.kernels.compare import compare_side_effects, compare_structures, tier_of
+
+    t0 = time.perf_counter()
+    capture = load_capture(path, device=device)
+    reference = capture["module"].eval()
+    replay = state.Replay(capture, reference)  # its state as saved: before any call
+    tier = tier_of(capture)
+    failures: list[dict[str, Any]] = []
+    for i, case in enumerate(capture["cases"]):
+        args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
+        where = {"case": i, "signature": case.get("signature")}
+        try:
+            with torch.inference_mode():
+                out = replay.call(case, reference)(*args, **kwargs)
+            synchronize()
+        except Exception as exc:
+            failures.append({**where, "error": f"{type(exc).__name__}: {exc}"[:300]})
+            continue
+        checks = compare_structures(case["output"], out, "output", tier=tier)
+        checks += compare_side_effects(case["args"], case["post_args"], args, "args", tier=tier)
+        checks += compare_side_effects(
+            case["kwargs"], case["post_kwargs"], kwargs, "kwargs", tier=tier
+        )
+        checks += replay.check(case, reference, tier=tier)
+        if bad := [c for c in checks if not c.get("ok")]:
+            failures.append({**where, "failures": bad[:3]})
+    seconds = round(time.perf_counter() - t0, 2)
+    cases = len(capture["cases"])
+    return {"ok": not failures, "cases": cases, "failures": failures, "seconds": seconds}
+
+
+def _refuse_unverifiable(path: Path, tracked: dict[str, Any]) -> dict[str, Any]:
+    """:func:`self_check` of a capture just saved; removes the file and raises
+    :class:`UnverifiableCapture` with the reason when the reference fails it."""
+    result = self_check(path)
+    if result["ok"]:
+        return {k: result[k] for k in ("cases", "seconds")}
+    path.unlink(missing_ok=True)
+    first = result["failures"][0]
+    detail = first.get("error")
+    if detail is None:
+        check = first["failures"][0]
+        detail = f"{check.get('name')}: " + str(
+            check.get("error") or f"max abs err {check.get('max_abs_err')}"
+        )
+    raise UnverifiableCapture(
+        f"the unmodified reference fails its own capture on {len(result['failures'])} of "
+        f"{result['cases']} cases (first: case {first['case']}, {first['signature']}: "
+        f"{detail[:240]}); {state.describe(tracked)}. Its calls depend on something the "
+        "capture does not hold (state outside the module and its arguments, randomness), "
+        "so no candidate could be checked against it: capture refused."
     )

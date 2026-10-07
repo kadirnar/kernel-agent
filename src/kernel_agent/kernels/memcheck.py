@@ -162,24 +162,26 @@ def cases_main(
     capture: Path, candidate: Path, *, capture_sha256: str | None, variants: bool = True
 ) -> dict[str, Any]:
     """The candidate once on every captured case and on the odd-size variants the reference
-    runs (run by the reference before the candidate is imported)."""
+    runs (run by the reference before the candidate is imported), each call from its
+    case's module state (:mod:`kernel_agent.profiling.state`)."""
     import torch
 
     from kernel_agent.kernels.evaluate import load_candidate_module
     from kernel_agent.kernels.recheck import _device, _load
-    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.profiling.state import Replay
     from kernel_agent.workloads.base import synchronize
 
     if _device() != "cuda":
         return {"status": "skipped", "reason": "no CUDA device"}
     data = _load(capture, "cuda", capture_sha256)
     reference, cases = data["module"].eval(), data["cases"]
+    replay = Replay(data, reference)  # each case's module state (profiling/state.py)
     given = copy.deepcopy(reference)  # what build() gets: untouched by the variants' calls
 
-    def call(module: Any, i: int, args: Any, kwargs: Any) -> None:
+    def call(holders: tuple[Any, ...], i: int, args: Any, kwargs: Any) -> None:
         args, kwargs = copy.deepcopy((args, kwargs))
         with torch.inference_mode():
-            entrypoint(module, cases[i]["method"])(*args, **kwargs)
+            replay.call(cases[i], *holders)(*args, **kwargs)
         synchronize()
 
     runs: list[tuple[int, list[list[int]] | None, Any, Any]] = [
@@ -188,7 +190,7 @@ def cases_main(
     dropped = 0
     for i, shapes, args, kwargs in odd_variants(cases) if variants else []:
         try:
-            call(reference, i, args, kwargs)
+            call((reference,), i, args, kwargs)
         except Exception:  # not an input the module takes
             dropped += 1
             continue
@@ -204,7 +206,7 @@ def cases_main(
     refused: list[dict[str, Any]] = []
     for i, sizes, args, kwargs in runs:
         try:
-            call(new, i, args, kwargs)
+            call((new, given), i, args, kwargs)
         except Exception:
             if sizes is None:
                 tb = traceback.format_exc()[-3000:]

@@ -100,6 +100,44 @@ same time.
   **correctness-only** cases (`count` 0, `[correctness only: ...]` in the
   signature): checked like the others, never timed. A kernel that only
   handles the captured length fails them.
+* **Module state outside the arguments** (#162): a module that keeps state in
+  its attributes (a KV-cache attribute such as VoxCPM's
+  `MiniCPMModel.kv_cache`, a `transformers` `DynamicCache` attribute, a step
+  counter, an RNN state) is saved with the state it has at the end of the
+  capture run, e.g. after a correctness variant's prefill, while each case
+  was recorded with the state its own call saw; replayed on the end-of-run
+  state, the unmodified reference failed its own capture. So `capture`
+  snapshots the module's state (found generically: every tensor, plain value
+  and list / dict / object holding them in the attributes and buffers of the
+  module and its submodules, parameters excluded) to the CPU before and after
+  every recorded call, and each case keeps `state` (the state before its call,
+  as a diff against the saved module) and `post_state` (what the call
+  changed). Only what differs is stored, a tensor as the 8 KiB chunks that
+  differ, so a KV cache costs the positions that differ, not a cache per case
+  (VoxCPM2's residual LM stage `native_residual_lm`, a 64 MiB KV cache: 3.9 MB
+  of diffs for its 5 cases, +0.5 % on an 823 MB capture, where whole
+  snapshots would add 320 MiB; capturing costs two CPU copies of the module's
+  non-parameter tensors per recorded call). The evaluator (every stage and
+  the reference timing), the sweep, the re-check, memcheck, the compile check
+  and Nsight Compute restore a case's state before every call (in place,
+  outside timed and profiled regions), into the candidate and into the
+  reference copy it was built from (a wrapper keeps it there), and compare
+  what the call changed with `post_state` like in-place argument updates
+  (failures named `state.<attribute>...`, with a `state_note`). A candidate
+  keeps the state where the reference keeps it, in its format (the model
+  sets it there, e.g. with `setup_cache`). `capture.state` in `spec.json`
+  lists the tracked entries, the bytes of their diffs and the cases with a
+  state of their own.
+* **Self-checked captures** (#162): right after saving, `capture` replays the
+  capture through the evaluator's correctness flow with the unmodified
+  reference (each case from its state, outputs, side effects and state
+  changes in the capture's tier, `capture.self_check` in `spec.json`). A
+  capture the reference fails (its calls depend on something the capture does
+  not hold: a global, randomness) is refused (`UnverifiableCapture`, the file
+  removed): the target is dropped with the reason in `spec.failed.json`
+  (`capture_error`), and a native stage's digest says it has no
+  teacher-forced target and why, so no agent is handed a target nothing can
+  pass.
 * **Beyond the captured values**: during timing, inputs rotate between three
   copies, and one random timed call runs on redrawn input values; its output
   and side effects must match a fresh reference call
@@ -1252,7 +1290,8 @@ evaluator trusts. Everything it trusts lives in `<run>/.truth/`, outside the
 agents' working directories: the full captures (with reference outputs and
 post-call state), the baseline output, every evaluation record and every
 evaluated snapshot. The agent's `targets/<id>/` holds `capture_inputs.pt`
-(module + inputs, no outputs) for local debugging, plus copies of its
+(module + inputs, no outputs; a stateful module's cases keep their `state`,
+not their `post_state`) for local debugging, plus copies of its
 snapshots (`history/`) and records (`results.jsonl`) that nothing reads back.
 
 Truth files are `chmod a-w`, and their sha256 is recorded when kernel-agent

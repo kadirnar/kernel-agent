@@ -12,6 +12,8 @@ from typing import Any
 
 import torch
 
+from kernel_agent.profiling.state import split as split_state
+
 # Timing primitives, bound when the evaluator imports this module (before any
 # candidate): a candidate that later patches ``torch.cuda.Event.elapsed_time``,
 # ``torch.cuda.synchronize`` or ``time.perf_counter`` cannot change a measurement
@@ -234,7 +236,12 @@ def time_call(
     is repeated (at most CLOCK_RETRIES times) when either reads below CLOCK_OK: ``clock``
     is the lower of the two of the measurement returned (about 1: full clocks),
     ``clock_retries`` the repeats.
+
+    An entrypoint bound to a case of a stateful module (:class:`kernel_agent.profiling.
+    state.StatefulCall`) gets the case's module state back before every call, outside the
+    timed region like the copies of mutable inputs.
     """
+    fn, restore = split_state(fn)
     mutable = has_mutable_state(args, kwargs)
     sets = [(args, kwargs)]
     if not mutable:
@@ -243,6 +250,8 @@ def time_call(
 
     def fresh() -> tuple[tuple[Any, ...], dict[str, Any]]:
         nonlocal turn
+        if restore is not None:
+            restore()
         if mutable:
             return copy.deepcopy(args), copy.deepcopy(kwargs)
         turn += 1
@@ -357,17 +366,19 @@ def wall_check(
     gap minus the reference's (the fixed synchronisation overhead cancels): GPU
     work the timer does not see.  Pairing and the median keep a busy GPU (other
     processes) from looking like hidden work; ``*_wall_ms`` / ``*_event_ms`` are
-    medians."""
+    medians. A case's module state is restored before each call, outside the timing."""
     mutable = has_mutable_state(args, kwargs)
     walls: dict[str, list[float]] = {"ref": [], "new": []}
     evts: dict[str, list[float]] = {"ref": [], "new": []}
-    order = [("ref", reference), ("new", candidate)]
+    order = [("ref", *split_state(reference)), ("new", *split_state(candidate))]
     rng = random.SystemRandom()
     with torch.inference_mode():
         for _ in range(iters):
             rng.shuffle(order)
-            for label, fn in order:
+            for label, fn, restore in order:
                 a, k = (copy.deepcopy(args), copy.deepcopy(kwargs)) if mutable else (args, kwargs)
+                if restore is not None:
+                    restore()
                 start, end = _events()
                 _synchronize()
                 t0 = _perf_counter()
@@ -404,10 +415,13 @@ def peak_memory(
     caches it allocated at build time) is not part of it."""
     mutable = has_mutable_state(args, kwargs)
     peaks: dict[str, list[int]] = {"ref": [], "new": []}
+    fns = (("ref", *split_state(reference)), ("new", *split_state(candidate)))
     with torch.inference_mode():
         for _ in range(calls):
-            for label, fn in (("ref", reference), ("new", candidate)):
+            for label, fn, restore in fns:
                 a, k = (copy.deepcopy(args), copy.deepcopy(kwargs)) if mutable else (args, kwargs)
+                if restore is not None:  # a case's module state, before the measurement
+                    restore()
                 _synchronize()
                 before = _allocated()
                 _reset_peak()

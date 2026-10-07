@@ -10,7 +10,9 @@ from scratch, with nothing shared with the evaluation:
    statistics (:func:`kernels.verify.perturb_`: a normal draw for the first seed, a
    uniform / Laplace / log-normal one for the others; masks and non-finite tensors
    stay); integer and boolean tensors (ids, positions, masks) as captured; mutable
-   state objects (KV caches) copied as captured. It saves the inputs, computes the
+   state objects (KV caches) copied as captured, and a stateful module's state set to
+   the case's before every call (:mod:`kernel_agent.profiling.state`, in both
+   subprocesses). It saves the inputs, computes the
    reference outputs and post-call state on them and times the reference on the
    timed cases (``count`` > 0, the first seed's inputs);
 2. the parent loads those expected results into its memory and deletes them from
@@ -145,11 +147,15 @@ def _load(capture: Path, device: str, sha256: str | None) -> dict[str, Any]:
 
 
 def _time_cases(
-    module: Any, cases: list[dict[str, Any]], entries: list[dict[str, Any]], rounds: int
+    holders: tuple[Any, ...],
+    cases: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+    rounds: int,
+    replay: Any,
 ) -> list[Any]:
-    """``[median ms, spread]`` per case (None: not timed) on the first seed's inputs."""
+    """``[median ms, spread]`` per case (None: not timed) on the first seed's inputs, of the
+    module ``holders[0]`` (every call from the case's module state: ``replay``)."""
     from kernel_agent.kernels.bench import median_round, time_call, warm_gpu
-    from kernel_agent.profiling.methods import entrypoint
 
     warm_gpu()
     first = {e["case"]: e for e in reversed(entries)}  # the first seed of every case
@@ -159,7 +165,7 @@ def _time_cases(
             out.append(None)
             continue
         args, kwargs = copy.deepcopy((first[i]["args"], first[i]["kwargs"]))
-        fn = entrypoint(module, case["method"])
+        fn = replay.call(case, *holders)
         best = median_round([time_call(fn, args, kwargs, target_ms=60.0) for _ in range(rounds)])
         out.append([best["median_ms"], best["spread"]])
     return out
@@ -178,12 +184,13 @@ def reference_main(
     """Fresh inputs, the reference's outputs on them and its timing (no candidate here)."""
     import torch
 
-    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.profiling.state import Replay
     from kernel_agent.workloads.base import synchronize
 
     device = _device()
     data = _load(capture, device, capture_sha256)
     reference, cases = data["module"].eval(), data["cases"]
+    replay = Replay(data, reference)  # each case's module state (profiling/state.py)
     entries: list[dict[str, Any]] = []
     redrawn = [0] * len(cases)
     for j in range(seeds):
@@ -201,7 +208,7 @@ def reference_main(
         args, kwargs = copy.deepcopy((entry["args"], entry["kwargs"]))
         pre = _flat(args=args, kwargs=kwargs)
         with torch.inference_mode():
-            out = entrypoint(reference, case["method"])(*args, **kwargs)
+            out = replay.call(case, reference)(*args, **kwargs)
         synchronize()
         expected.append({"pre": pre, **_flat(output=out, args=args, kwargs=kwargs)})
     torch.save({"entries": expected}, workdir / EXPECTED)
@@ -214,7 +221,7 @@ def reference_main(
         "tier": data.get("tier"),  # the capture's tolerance tier (kernels/compare.py)
     }
     if timing and device == "cuda":
-        result["ms"] = _time_cases(reference, cases, entries, rounds)
+        result["ms"] = _time_cases((reference,), cases, entries, rounds, replay)
     return result
 
 
@@ -234,15 +241,16 @@ def candidate_main(
     import kernel_agent.kernels.bench  # noqa: F401  (binds the timer before the candidate)
     from kernel_agent.kernels import integrity
     from kernel_agent.kernels.evaluate import load_candidate_module
-    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.profiling.state import Replay
     from kernel_agent.workloads.base import synchronize
 
     flat, save = _flat, torch.save  # bound before the candidate is imported
     device = _device()
     data = _load(capture, device, capture_sha256)
     reference, cases = data["module"].eval(), data["cases"]
+    replay = Replay(data, reference)  # each case's module state (profiling/state.py)
     entries = torch.load(workdir / INPUTS, map_location=device, weights_only=False)
-    guard = integrity.Snapshot(reference)
+    guard = integrity.Snapshot(reference, state=replay.keys)
 
     def violation(where: str) -> dict[str, Any] | None:
         problems = guard.changes()
@@ -281,7 +289,7 @@ def candidate_main(
                 args, kwargs = copy.deepcopy((entry["args"], entry["kwargs"]))
                 try:
                     with torch.inference_mode():
-                        out = entrypoint(new, cases[entry["case"]]["method"])(*args, **kwargs)
+                        out = replay.call(cases[entry["case"]], new, given)(*args, **kwargs)
                     synchronize()
                 except Exception:
                     return {
@@ -300,7 +308,7 @@ def candidate_main(
             return bad
         result: dict[str, Any] = {"status": "ok", "device": device}
         if timing and device == "cuda":
-            result["ms"] = _time_cases(new, cases, entries, rounds)
+            result["ms"] = _time_cases((new, given), cases, entries, rounds, replay)
             # the same inputs again: a kernel that changes behaviour after its first calls
             saved["after_timing"] = calls()
             if isinstance(saved["after_timing"], dict):

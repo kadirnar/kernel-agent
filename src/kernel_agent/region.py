@@ -269,7 +269,7 @@ def verify(
     call: outputs and side effects must match the reference (:func:`strict_compare`),
     and the parent must call its ``Region_<id>`` module (through ``__call__``)."""
     from kernel_agent.profiling.capture import load_capture
-    from kernel_agent.profiling.methods import entrypoint
+    from kernel_agent.profiling.state import Replay
     from kernel_agent.workloads.base import synchronize
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -289,6 +289,7 @@ def verify(
         return result
     reference = capture["module"].eval()
     cases = capture["cases"]
+    replay = Replay(capture, reference)  # each case's module state (profiling/state.py)
     try:
         new = load_rewrite(rewrite_path, target_id).rewrite(copy.deepcopy(reference))
         if not isinstance(new, nn.Module):
@@ -323,10 +324,9 @@ def verify(
         for i, case in enumerate(cases):
             args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
             before = calls[0]
-            method = case.get("method", "forward")
             try:
                 with torch.inference_mode():
-                    out = entrypoint(new, method)(*args, **kwargs)
+                    out = replay.call(case, new)(*args, **kwargs)
                 synchronize()
             except Exception:
                 result.update(status="runtime_error", error=_short_tb(), failed_case=i)
@@ -338,7 +338,7 @@ def verify(
             reports.append(
                 {
                     "case": i,
-                    "method": method,
+                    "method": case.get("method", "forward"),
                     "signature": case.get("signature"),
                     "ok": not bad,
                     "bitwise": all(c["bitwise"] for c in checks),

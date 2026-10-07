@@ -638,6 +638,24 @@ check with a fallback.
 """
 
 
+def _state_block(capture_info: dict[str, Any]) -> str:
+    """Module state the capture restores per case (``profiling/state.py``), if any."""
+    keys = (capture_info.get("state") or {}).get("keys") or []
+    if not keys:
+        return ""
+    names = ", ".join(f"`{k}`" for k in keys[:6])
+    return f"""
+# Module state
+This module keeps state outside its arguments ({names}, e.g. a KV cache). Every case runs
+from the state its call saw: the evaluator writes it into your module (and into the
+reference copy `build()` got) before each call, and checks what the call changes in it
+like in-place argument updates (`state.*` failures). Read and update it where and in the
+format the reference does: the model sets it there (e.g. `setup_cache`). Locally:
+`Replay(capture, capture["module"]).restore(case, module)` (`kernel_agent.profiling.state`)
+before calling a case of `capture_inputs.pt`.
+"""
+
+
 def reduced_precision(target: dict[str, Any], capture_info: dict[str, Any]) -> str | None:
     """The reduced precision a target may use: its spec's ``precision`` when its capture is
     in the near-lossless tier (``--quality near-lossless``), else None."""
@@ -833,7 +851,7 @@ custom kernels while keeping its results identical within numerical tolerance.
 * suggested approach: {target.get("approach", "")}
 * captured cases (real shapes from the model run):
 {cases}
-{_workload_block(capture_info)}
+{_workload_block(capture_info)}{_state_block(capture_info)}
 Files in your working directory:
 * `capture_inputs.pt` — the module (with weights) + the captured inputs, for local
   debugging (`torch.load(path, weights_only=False)`). The reference outputs stay with
@@ -1073,6 +1091,10 @@ digest) so compiler errors cost no evaluation.
 * A **stage** with a kernel target `native_<id>` (the digest says which): the entry defines
   `build(reference)`; `evaluate_candidate(target_id="native_<id>", candidate="<dir>")`
   checks it teacher forced on the stage's recorded inputs and times it against the stage.
+  Each case runs from the module state its call saw (a KV-cache attribute: written into
+  your module before every call, its updates checked as `state.*`), so keep that state
+  where and as the reference keeps it. A stage whose capture the unmodified reference fails
+  has no kernel target (the digest says why): check it end to end.
 * A **group** or the **loop** (and any stage, end to end): the entry defines
   `apply(workload)` (`kind = "transform"`) and replaces the modules / methods it takes
   over; `evaluate_e2e(transforms=["<dir>"], kernels=[...])` runs the full workload with the
