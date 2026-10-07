@@ -49,13 +49,18 @@ counted (the floors of attention-heavy rows are too low); weights stream from DR
 on every call (no L2 reuse); fp32 convolutions are held to the fp32 peak (cuDNN may
 use TF32); ‡ rows have the math and dtypes of the unmodified model (a transform that
 merges or trims layers, or lowers the precision, makes them approximate).
+
+The improve scheduler reads the table of the newest (re-profiled) run for its expected
+gains (issue #122): the rows that hold a target's instance groups (:func:`holding`) and
+their floor at the target's precision (:func:`floor_ms`, :data:`TARGET_PRECISIONS`).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -284,6 +289,78 @@ def _e2e(rows: list[dict[str, Any]], precision: str, baseline_ms: float) -> dict
         "speedup": round(baseline_ms / floor_ms, 2) if floor_ms > 0 else None,
         "counted": proj.used[:8],
     }
+
+
+# ------------------------------------------------------------------ targets (the scheduler)
+
+#: A target's ``precision`` (``spec.json``, ``kernels.compare.PRECISIONS``) → the precision
+#: of its floor. ``reduced`` (another numerics-changing kernel): bf16 math and weights.
+TARGET_PRECISIONS = {
+    "exact": PRECISIONS["exact"],
+    "fp8_weights": PRECISIONS["fp8_weights"],
+    "fp8_w8a8": PRECISIONS["w8a8"],
+    "fp4_weights": PRECISIONS["fp4_weights"],
+    "reduced": Precision("bf16", 2.0, "bfloat16"),
+}
+_SIBLINGS = re.compile(r"(.*)\.\{([^{}]*)\}")
+
+
+def target_precision(precision: str | None) -> Precision:
+    """The floor's precision of a target's ``precision`` (none or unknown: ``exact``)."""
+    return TARGET_PRECISIONS.get(str(precision or "exact"), PRECISIONS["exact"])
+
+
+def patterns(row: Mapping[str, Any]) -> list[str]:
+    """The instance groups a row times: ``a.{b,c}`` (sibling leaves that share a row) →
+    ``a.b``, ``a.c``."""
+    group = str(row.get("group") or "")
+    found = _SIBLINGS.fullmatch(group)
+    return [f"{found[1]}.{leaf}" for leaf in found[2].split(",")] if found else [group]
+
+
+def holding(
+    table: Mapping[str, Any], pattern: str, cls: str | None = None, phase: str | None = None
+) -> tuple[list[dict[str, Any]], bool]:
+    """The rows of ``table`` that time the instance group ``pattern`` (a qualname with the
+    layer indices folded), and whether they hold more than it (``inside``).
+
+    Its own rows: the module at that qualname (of class ``cls`` when one of them is; a
+    transform may have wrapped it, e.g. ``_TF32Scope`` around VoxCPM2's VAE decoder), in
+    ``phase`` (every phase without one). Else, when its calls are hidden inside a compiled
+    or CUDA-graph-replayed parent (the optimised model of an improve round: the LocDiT
+    layers inside the graph of ``UnifiedCFM`` ``model.feat_decoder``), the rows of the
+    innermost group that encloses it, in every phase (a parent's call may be in another
+    phase than its children's: VoxCPM2's LocEnc decode calls run their layers at prefill
+    shapes): ``inside``. ``([], False)``: no row holds it, or it has rows only in other
+    phases (its calls in ``phase`` ran outside any module call, e.g. a graph-replayed
+    decode step: no row says what they take)."""
+    rows = list(table.get("rows") or [])
+    own = [r for r in rows if pattern in patterns(r)]
+    if own:
+        own = [r for r in own if r.get("cls") == cls] or own
+        return [r for r in own if phase is None or r.get("phase") == phase], False
+    outer = [(g, r) for r in rows for g in patterns(r) if g and pattern.startswith(g + ".")]
+    if not outer:
+        return [], False
+    deepest = max(len(g) for g, _ in outer)
+    held = {id(r): r for g, r in outer if len(g) == deepest}
+    return list(held.values()), True
+
+
+def floor_ms(
+    rows: Iterable[Mapping[str, Any]], precision: Precision, peaks: Mapping[str, Any] | None
+) -> float | None:
+    """Σ floor ms of ``rows`` at ``precision`` (the table's ``peaks``); None when a row's
+    work is unknown or a peak it needs was not measured."""
+    if not peaks or not peaks.get("dram_gbps"):
+        return None
+    total = 0.0
+    for row in rows:
+        f = floor(row, precision, peaks) if row.get("work_known", True) else None
+        if f is None:
+            return None
+        total += f["ms"]
+    return total
 
 
 # ------------------------------------------------------------------ markdown

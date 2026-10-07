@@ -229,7 +229,8 @@ def kernel_digest(
         "## Where this target stands",
         # the scheduler's ms are the metric's (#114): per second of audio for throughput
         f"* It costs about {arm.remaining_ms:.1f} ms {_per(run)} now; the scheduler expects "
-        f"{arm.headroom:.0%} of that can still go.",
+        f"{arm.headroom:.0%} of that can still go"
+        + (f" ({arm.ceiling.describe()})." if arm.ceiling else "."),
         f"* {arm.streak} evaluations in a row without a new best; after {policy.patience} the "
         "target is stopped, so prefer a fundamentally different idea over small variations.",
     ]
@@ -655,14 +656,15 @@ class Improver:
             "exp_before": len(ledger.rows(self.run)),
             "best_before": arm.best,
             **{k: info[k] for k in ("remaining_ms", "headroom", "expected_ms", "index", "score")},
+            "why": info["why"],  # the score's components (scheduler.Arm.why, issue #122)
             **self._session_time(arm),
         }
         self.state["slices"].append(rec)
         self.save()
-        others = ", ".join(f"{a.id} {a.score:.0f}" for a in arms if a is not arm and not a.stop)
+        others = ", ".join(f"{a.id} {a.score:.3g}" for a in arms if a is not arm and not a.stop)
         log(
-            f"slice {n}: {arm.id} (best {arm.best:.2f}x, expected gain {arm.expected_ms:.1f} ms, "
-            f"score {arm.score:.0f}; others: {others or 'none'})"
+            f"slice {n}: {arm.id} (best {arm.best:.2f}x, expected gain {arm.expected_ms:.3g} ms, "
+            f"score {arm.score:.3g}: {info['why']}; others: {others or 'none'})"
         )
         ledger.event(
             self.run,
@@ -671,6 +673,7 @@ class Improver:
             arm=arm.id,
             score=info["score"],
             expected_ms=info["expected_ms"],
+            why=info["why"],
         )
         evaluations = self.icfg.slice
         try:
