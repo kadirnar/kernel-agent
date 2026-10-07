@@ -127,6 +127,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "eval_seconds",
             "compile_s",
             "compile_check",  # torch.compile compatibility (kernels/compile_check.py)
+            "scale_rule",  # fp8_mx: the MXFP8 scale-rule guard (kernels/scale_guard.py)
             # speed of light (kernels/roofline.py)
             "pct_of_sol",
             "sol_ms_weighted",

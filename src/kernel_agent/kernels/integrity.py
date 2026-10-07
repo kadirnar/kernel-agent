@@ -196,6 +196,8 @@ class Snapshot:
         import kernel_agent.kernels.bench as bench
         import kernel_agent.kernels.compare as compare
         import kernel_agent.kernels.evaluate as evaluate
+        import kernel_agent.kernels.quant as quant
+        import kernel_agent.kernels.scale_guard as scale_guard
         import kernel_agent.kernels.verify as verify
         import kernel_agent.kernels.weights as weights
         import kernel_agent.profiling.methods as methods
@@ -218,6 +220,9 @@ class Snapshot:
             _watch("kernel_agent.kernels.verify", verify, constants=True),
             _watch("kernel_agent.kernels.evaluate", evaluate, constants=True),
             _watch("kernel_agent.kernels.weights", weights, constants=True),
+            # the reference quantisers and the MXFP8 scale-rule guard (fp8_mx targets)
+            _watch("kernel_agent.kernels.quant", quant, constants=True),
+            _watch("kernel_agent.kernels.scale_guard", scale_guard, constants=True),
             _watch("kernel_agent.kernels.integrity", sys.modules[__name__], constants=True),
             _watch("kernel_agent.profiling.methods", methods),
             _watch("kernel_agent.workloads.base", base),

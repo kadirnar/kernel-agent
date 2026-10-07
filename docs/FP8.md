@@ -274,6 +274,10 @@ residual dominates its output.
   4-bit. Ceilings (#90): the W8A8 column's 330 TFLOP/s peak holds for MXFP8 (316–320
   measured); kernels on `QMMA.F32` (row-wise CUTLASS, Triton `tl.dot`,
   DeepSeek-style blockwise) are capped at 208 — the table should say which (§9).
+  *Implemented in #144 as its own class*, `fp8_mx` (same near-lossless tier, 8-bit:
+  allowed by default), so that the planner policy, an *MXFP8* ceilings column at the
+  measured MXFP8 peak and the evaluator's scale-rule guard can address it
+  (README, "MXFP8 W8A8").
 
 ## 4. Technique 2: FP8 activations kept between fused ops
 

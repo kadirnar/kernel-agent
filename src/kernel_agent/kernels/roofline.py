@@ -33,7 +33,9 @@ Reduced precision (the capture's ``precision``): the weights of an ``fp8_weights
 ``fp8_w8a8`` target count at one byte per element (:data:`WEIGHT_BITS`), and the GEMMs on
 the weights of an ``fp8_w8a8`` target at the measured FP8 peak (:data:`MATH_DTYPE`); without
 an FP8 peak (none measured on this GPU, or a cache older than :data:`PEAKS_VERSION`) such
-cases are flagged ``sol_unreliable`` with a ``sol_note``.
+cases are flagged ``sol_unreliable`` with a ``sol_note``. An ``fp8_mx`` (MXFP8) target's
+weights count at one byte plus one scale byte per 32, its GEMMs at the measured MXFP8 peak
+(:data:`MXFP8`: the block-scaled tensor cores through ``F.scaled_mm`` ``BlockWise1x32``).
 
 Limitations: bytes are what the reference touches.  Reads through gather ops
 (embedding, index, index_select, gather) count the gathered rows, and SDPA counts
@@ -68,18 +70,22 @@ MASKED = -1e4  # additive attention-mask values at or below this mask the positi
 #: the 2-D floating-point parameters the reference reads count at this width plus one fp32
 #: scale per output channel (row), so ``pct_of_sol`` of an FP8 kernel is measured against
 #: the bytes it must stream, not the bf16 weights it replaced.
-WEIGHT_BITS = {"fp8_weights": 8, "fp4_weights": 4, "fp8_w8a8": 8}
+WEIGHT_BITS = {"fp8_weights": 8, "fp4_weights": 4, "fp8_w8a8": 8, "fp8_mx": 8}
 #: ... or, for block-scaled formats, plus one 1-byte scale per this many elements and one
-#: fp32 scale per tensor (``fp4_weights``: NVFP4, an e4m3 scale per 16).
-WEIGHT_SCALE_BLOCK = {"fp4_weights": 16}
+#: fp32 scale per tensor (``fp4_weights``: NVFP4, an e4m3 scale per 16; ``fp8_mx``: MXFP8,
+#: an e8m0 scale per 32).
+WEIGHT_SCALE_BLOCK = {"fp4_weights": 16, "fp8_mx": 32}
 #: ``peaks["tflops"]`` keys of the low-precision tensor-core peaks: FP8 e4m3 and NVFP4.
 FP8, FP4 = "float8_e4m3fn", "float4_e2m1fn_x2"
-#: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks. :func:`ensure_peaks` measures an
-#: older cache again (once per process at most); until then it stays in use.
-PEAKS_VERSION = 2
+#: ... and MXFP8 (e4m3 with an e8m0 scale per 32 along K on both operands: the block-scaled
+#: MMA, ``kind::mxf8f6f4.block_scale``, sm_100 / sm_120; cuBLASLt ``VEC32_UE8M0``).
+MXFP8 = "mxfp8"
+#: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks, 3 the MXFP8 one. :func:`ensure_peaks`
+#: measures an older cache again (once per process at most); until then it stays in use.
+PEAKS_VERSION = 3
 #: The tensor-core math of a reduced-precision target: the FLOPs of every op that reads one
 #: of its narrowed weights count at this dtype's peak (W8A8: FP8), not at the reference's.
-MATH_DTYPE = {"fp8_w8a8": FP8}
+MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8}
 _MiB = 1024**2
 
 # Ops that look at a tensor argument's metadata only (no data read).
@@ -244,6 +250,49 @@ def _fp4_tflops(shapes: list[tuple[int, int, int]], free: int) -> float | None:
     return None if best is None else round(best, 1)
 
 
+def _mxfp8_tflops(shapes: list[tuple[int, int, int]], free: int) -> float | None:
+    """Dense MXFP8 (e4m3 + one e8m0 scale per 32 along K, both operands, swizzled 128 x 4
+    scale blocks) -> bf16 via ``torch.nn.functional.scaled_mm`` ``BlockWise1x32``: the
+    block-scaled tensor cores (cuBLASLt ``VEC32_UE8M0``); raises where torch or the GPU has
+    no such kernel (before sm_100)."""
+    import torch
+    import torch.nn.functional as F
+
+    from kernel_agent.kernels.quant import swizzle_mx_scales
+
+    scaled_mm = getattr(F, "scaled_mm", None)
+    if scaled_mm is None or not hasattr(torch, "float8_e8m0fnu"):
+        raise RuntimeError("this torch has no MXFP8 scaled_mm")
+    blockwise, swizzle = F.ScalingType.BlockWise1x32, F.SwizzleType.SWIZZLE_32_4_4
+    best = None
+    for m, n, k in shapes:
+        if m * k + k * n + 2 * m * n > free // 2:
+            continue
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        b = w.t()  # column-major [K, N]
+        unit = torch.full((max(m, n), k // 32), 127, device="cuda", dtype=torch.uint8)  # 2^0
+        scale_a, scale_b = swizzle_mx_scales(unit[:m]), swizzle_mx_scales(unit[:n])
+
+        def mx_mm(a: Any = a, b: Any = b, sa: Any = scale_a, sb: Any = scale_b) -> Any:
+            return scaled_mm(
+                a,
+                b,
+                scale_a=sa,
+                scale_recipe_a=blockwise,
+                scale_b=sb,
+                scale_recipe_b=blockwise,
+                swizzle_a=swizzle,
+                swizzle_b=swizzle,
+                output_dtype=torch.bfloat16,
+            )
+
+        tflops = _gemm_tflops(mx_mm, m, n, k)
+        best = tflops if best is None else max(best, tflops)
+        del a, w, b, unit, scale_a, scale_b
+    return None if best is None else round(best, 1)
+
+
 def measure_peaks() -> dict[str, Any]:
     """Measure the roofline peaks of the current GPU (takes ~10-30 s; hold the GPU lock)."""
     import torch
@@ -293,7 +342,7 @@ def measure_peaks() -> dict[str, Any]:
     # Low-precision tensor cores: measured where torch has a kernel for this GPU, else the
     # reason is recorded (a ratio to bf16 is never assumed).
     unavailable: dict[str, str] = {}
-    for name, measure in ((FP8, _fp8_tflops), (FP4, _fp4_tflops)):
+    for name, measure in ((FP8, _fp8_tflops), (FP4, _fp4_tflops), (MXFP8, _mxfp8_tflops)):
         try:
             tflops = measure(big, free)
         except Exception as exc:  # no kernel for this GPU / torch build
@@ -719,12 +768,12 @@ def count_case(
 
 
 def sol_time(cost: CaseCost, peaks: dict[str, Any], *, hot_l2: bool = True) -> dict[str, Any]:
-    """Speed-of-light time (ms) and bound of one case. FP8 FLOPs without a measured FP8 peak
-    count at the fastest peak, and ``peak_missing`` says so: the estimate is then too slow,
-    not a ceiling."""
+    """Speed-of-light time (ms) and bound of one case. FP8 (or MXFP8) FLOPs without a
+    measured peak of their own count at the fastest peak, and ``peak_missing`` says so: the
+    estimate is then too slow, not a ceiling."""
     tflops = {k: float(v) for k, v in (peaks.get("tflops") or {}).items() if v}
     fastest = max(tflops.values(), default=0.0)
-    missing = bool(cost.flops.get(FP8)) and FP8 not in tflops
+    missing = next((d for d in MATH_DTYPE.values() if cost.flops.get(d) and d not in tflops), None)
     compute_ms = sum(
         f / (tflops.get(dtype) or fastest) / 1e9
         for dtype, f in cost.flops.items()
@@ -741,7 +790,7 @@ def sol_time(cost: CaseCost, peaks: dict[str, Any], *, hot_l2: bool = True) -> d
     if sol_ms < floor_ms:
         bound = "launch"  # one launch from Python costs more than the work
     found = {"sol_ms": sol_ms, "bound": bound, "l2_resident": l2}
-    return found | ({"peak_missing": FP8} if missing else {})
+    return found | ({"peak_missing": missing} if missing else {})
 
 
 def _sig(value: float, digits: int = 4) -> float:

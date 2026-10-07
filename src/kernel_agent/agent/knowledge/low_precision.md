@@ -5,14 +5,16 @@ Verified examples: `examples/cuda_fp8_gemv.py` (decode GEMV, M <= 4) and
 tokens beyond, slower than cuBLAS bf16 from M ~ 64) for `fp8_weights`; FP4:
 `examples/cuda_fp4_gemv.py` (NVFP4 decode GEMV, M <= 4; "FP4 weights" below);
 W8A8: `examples/triton_fp8_w8a8_gemm.py` (e4m3 tensor cores, compute-bound
-GEMMs; "FP8 W8A8" below). Helpers: `kernel_agent.kernels.quant` (`quantize_fp8`,
+GEMMs; "FP8 W8A8" below); MXFP8 W8A8 (`fp8_mx`): `examples/triton_mxfp8_gemm.py`
+("MXFP8 W8A8" below). Helpers: `kernel_agent.kernels.quant` (`quantize_fp8`,
 `dequantize_fp8`, `fp8_error`; `quantize_fp4`, `dequantize_fp4`, `fp4_error`;
-`quantize_fp8_activations`, `fp8_w8a8_linear`, `fp8_w8a8_error`).
+`quantize_fp8_activations`, `fp8_w8a8_linear`, `fp8_w8a8_error`; `quantize_mxfp8`,
+`mxfp8_linear`, `mxfp8_error`).
 
 ## When it is allowed
 
 Only for a target whose spec says `"precision": "fp8_weights"` (or `"fp8_w8a8"`,
-below), which the planner
+`"fp8_mx"`, below), which the planner
 may set in a `--quality near-lossless` run (an exact run refuses such targets).
 The target is then captured in the **near-lossless tolerance tier**
 (`kernels/compare.py`): instead of per-element (atol, rtol), every output tensor
@@ -337,7 +339,8 @@ is unchanged; these are the measured alternatives (RTX 5070 Ti, cuBLASLt 13.1, t
   VoxCPM2's massive activations it fails the near-lossless tier (LocDiT o_proj /
   down_proj norm off by 4.0 % / 2.0 %). With the ceil rule MXFP8 has W8A8's error
   (LocDiT layer relative L2 0.0205 vs 0.0204 per token; passes captured and redrawn
-  inputs).
+  inputs). MXFP8 targets are their own class, `fp8_mx` ("MXFP8 W8A8" below), whose
+  evaluations reject a saturating rule.
 * **Where finer activation scales matter**: not at M = 352 (tensor-wise, per-token,
   1x128, blockwise and MXFP8 all give relative L2 0.0195-0.0205 on the LocDiT layer).
   At decode (M = 1) the LM q_proj fails the tier with per-token or tensor-wise scales
@@ -365,6 +368,90 @@ is unchanged; these are the measured alternatives (RTX 5070 Ti, cuBLASLt 13.1, t
   kernel over e4m3 K/V is slower than bf16 at 77 tokens and 1.3x faster only from
   ~2k tokens. A static K/V scale from one text is exceeded by another in ~50 % of
   the layers. FlashAttention-3's FP8 path is Hopper only.
+
+## MXFP8 W8A8 (`precision: fp8_mx`)
+
+For a target whose spec says `"precision": "fp8_mx"`: W8A8 on the block-scaled
+tensor cores (sm_100 / sm_120, `mma.sync kind::mxf8f6f4.block_scale`): e4m3 weights
+and activations with one power-of-two ue8m0 scale per 32 consecutive elements along K
+on both operands, applied by the tensor core (no promotion step). Same
+near-lossless tier as `fp8_w8a8`; allowed by default in near-lossless runs (8-bit).
+Verified-style example (written from the measurements, not yet run on a GPU):
+`examples/triton_mxfp8_gemm.py`. Helpers: `quantize_mxfp8`, `dequantize_mxfp8`,
+`swizzle_mx_scales`, `mx_scale_offset`, `mxfp8_linear` (reference), `mxfp8_error`,
+`mxfp8_saturation` in `kernel_agent.kernels.quant`.
+
+**When it pays** (decide from the target's bound and shapes, not the model's name):
+compute-bound GEMMs (M >= ~64 rows per call; clearly FLOP bound from the bf16 ridge,
+M ~130 on an RTX 5070 Ti) with wide outputs (N >= ~2560), on a GPU whose *Ceilings*
+table has an *MXFP8* column (block-scaled MMA measured). Measured there (docs/FP8.md
+§3.1, M = 352, L2-cold CUDA graph): cuBLASLt MXFP8 runs [352 x 1024] x [1024 x 8192]
+in 24.7 us (239 TFLOP/s) vs 29.5 tensor-wise FP8 and 69.0 bf16, N = 2560 in 9.3 vs
+10.6, and its output arrives scaled (no s_x * s_w pass in the consumer). Not at
+N <= ~1024 at such M: cuBLASLt offers one MXFP8 algorithm and no split-K, its large
+tiles leave SMs idle (N = 1024: 14.8 / 26.6 us vs 8.8 / 15.2 for tensor-wise FP8
+batched over two K halves). Inside an `fp8_mx` target run those GEMMs tensor-wise
+with batched split-K (`fp8_w8a8` numerics, same tier) until a split-K or small-tile
+MXFP8 kernel exists (Triton `tl.dot_scaled` with split-K, CuTe), or plan the target
+`fp8_w8a8`. Not at a few rows per call: memory bound, the same bytes as FP8
+weight-only (`fp8_weights`), and cuBLASLt's single MXFP8 algorithm is slower there.
+
+The contract:
+
+* **Weights** once in `build()`: `quantize_mxfp8(weight)` → e4m3 codes `[N, K]` and
+  e8m0 scales `[N, K / 32]`; swizzle the scales once (`swizzle_mx_scales`); no bf16
+  copy kept.
+* **Activations per block of 32, every call** (dynamic), scale
+  `2^ceil(log2(amax / 448))`: the smallest power of two that keeps the block within
+  ±448, so the block maximum lands in (224, 448] and nothing saturates. Exact from the
+  exponent bits of `amax = m * 2^E` (m in [1, 2)): `e = E - 8`, plus one when
+  `m > 1.75` (448 = 1.75 * 2^8); a zero block gets code 0. **Never the OCP reference
+  rule** `2^(floor(log2 amax) - 8)`: it maps block maxima in [256, 512) x scale onto
+  e4m3 and clamps those above 448, a quarter of the blocks on Gaussian data and the
+  largest elements of every block holding a massive activation (shrunk by up to
+  12.5 %): measured, it fails the tier on a DiT layer whose o_proj / down_proj inputs
+  carry outlier channels (norm off by 4.0 % / 2.0 %) and passes on the same layer's
+  redrawn inputs, which have none.
+* **The scale-rule guard**: define a module-level `quantize_activations(x) ->
+  (codes, scales)` with the rule your kernels use (codes e4m3 `[rows, K]`, scales
+  e8m0 or uint8 biased exponents `[rows, K / 32]`, unswizzled). The evaluator runs it
+  on the captured input and on a stress input of the same shape whose block maxima
+  sit at 1.9 x 2^e (where the OCP rule saturates every block) and rejects the
+  candidate when a block maximum exceeds 448 x scale (`stage: scale_rule`, with the
+  reason). Its `scale_rule` report also gives the captured input's outliers: the
+  largest `|x| / RMS` of a row (`crest`) and the largest channel amax over the median
+  channel's (`channel_ratio`; hundreds and more: massive activations).
+* **Math**: `F.scaled_mm(x_q, w_q.t(), scale_a=sa, scale_recipe_a=
+  ScalingType.BlockWise1x32, scale_b=sb, scale_recipe_b=ScalingType.BlockWise1x32,
+  swizzle_a=SwizzleType.SWIZZLE_32_4_4, swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+  output_dtype=torch.bfloat16)` (cuBLASLt `VEC32_UE8M0`; K a multiple of 128, any M),
+  the scales in 128 x 4 blocks: row `r`, column `c` of `[rows, K / 32]` at
+  `((r // 128) * ceil(K / 128) + c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4
+  + c % 4` (`mx_scale_offset`; rows padded to 128). A quantiser can write its scales
+  there directly (the example does). Or Triton `tl.dot_scaled(a, sa, "e4m3", b, sb,
+  "e4m3", acc)` (`QMMA.SF`; 215 TFLOP/s at 8192^3 with real scale loads vs cuBLASLt's
+  316-320). fp32 accumulation, bias once, one rounding to bf16.
+* **Report** `mxfp8_error(weight, q, scales, x)` on captured activations (weight
+  error, `activation_rel_l2`, `activation_saturation`, output relative L2 / cosine /
+  norm ratio) and the evaluator's per-case `min_cosine` / `max_rel_l2` in `NOTES.md`.
+* **Fallback / reference**: `mxfp8_linear(x, q, scales, bias)` (`F.scaled_mm` where it
+  applies, else the same math in fp32).
+
+**Accuracy** with the ceil rule (docs/FP8.md §3.2, fake quant on real captures):
+the error of per-token W8A8 (DiT layer at M = 352: relative L2 0.0205 vs 0.0204,
+norm 0.92 %, passes 30 redrawn draws); finer than per-token at M = 1 where an
+activation's crest is high (an LM q_proj at decode: 0.023 vs 0.037, which fails),
+but decode is memory bound: `fp8_weights` there.
+
+**Scales: dynamic by default.** A static (offline-calibrated) activation scale saves
+<= 0.3 us per producer call and saturates on inputs larger than the calibration set
+(measured: up to 8.8 % of another text's calls; a layer with static scales failed
+the redrawn-input check in 1 of 10 draws). Use one only when the target passes the
+evaluator's redrawn-input check with it; group scales (1 x 32, 1 x 128) are the local
+alternative when a producer cannot see a whole row.
+
+**Host time**: `F.scaled_mm` (MXFP8) costs ~27 us per eager call, a direct
+`cublasLtMatmul` with cached descriptors ~6 us; inside CUDA graphs neither counts.
 
 ## FP4 weights (`fp4_weights`)
 

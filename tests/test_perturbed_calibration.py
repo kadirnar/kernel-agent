@@ -20,12 +20,22 @@ CANDIDATE = """import torch
 from kernel_agent.kernels import quant
 
 PRECISION, BUG = {precision!r}, {bug!r}
+RULE = "floor" if BUG == "floor scale rule" else "ceil"
+
+
+def quantize_activations(x):  # fp8_mx: the scale-rule guard's hook
+    return quant.quantize_mxfp8(x, RULE)
 
 
 class Linear(torch.nn.Module):
     def __init__(self, linear):
         super().__init__()
         w = linear.weight.detach()
+        if PRECISION == "fp8_mx":
+            self.q, self.s = quant.quantize_mxfp8(w)
+            if BUG == "neighbour scale":
+                self.s = self.s.roll(1, dims=0)
+            return
         if PRECISION == "fp4_weights":
             codes, scales, ts = quant.quantize_fp4(w)
             if BUG == "nibbles":
@@ -41,6 +51,8 @@ class Linear(torch.nn.Module):
         self.cache = {{}}
 
     def forward(self, x):
+        if PRECISION == "fp8_mx":
+            return quant.mxfp8_linear(x, self.q, self.s, rule=RULE)
         if PRECISION != "fp8_w8a8":
             return torch.nn.functional.linear(x, self.w)
         if BUG is None:
@@ -69,7 +81,7 @@ class Mlp(torch.nn.Module):
 def build(reference):
     return Mlp(reference)
 """
-REFERENCE_MATH = ("fp8_weights", "fp8_w8a8", "fp4_weights")
+REFERENCE_MATH = ("fp8_weights", "fp8_w8a8", "fp4_weights", "fp8_mx")
 
 
 class Mlp(nn.Module):
@@ -183,6 +195,7 @@ def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, pre
         ("fp8_w8a8", "cached activation scales", "incorrect_perturbed"),
         ("fp8_weights", "scale x1.05", "incorrect"),
         ("fp8_weights", "neighbour scale", "incorrect"),
+        ("fp8_mx", "neighbour scale", "incorrect"),
         ("fp4_weights", "nibbles", "incorrect"),
     ],
 )
@@ -193,6 +206,24 @@ def test_broken_scales_still_fail(tmp_path, writer, precision, bug, status):
     assert result["status"] == status, result
     if status == "incorrect":  # and on every redrawn input too
         assert not any(r["ok"] for r in _redrawn(writer, build, tier, perturbed=True))
+
+
+def test_a_saturating_mxfp8_scale_rule_is_rejected_with_its_reason(tmp_path, writer):
+    """The OCP floor rule clamps block maxima above 448 x scale: the scale-rule guard
+    (kernels/scale_guard.py) names it even where the tier alone would not catch it."""
+    capture, _ = _capture(tmp_path, writer, "fp8_mx")
+    path, _ = _candidate(tmp_path, "fp8_mx", "floor scale rule")
+    result = evaluate(capture, path, device="cpu")
+    assert result["status"] == "incorrect" and result["stage"] == "scale_rule", result
+    assert "saturate" in result["error"] and "2^ceil(log2(amax / 448))" in result["error"]
+    assert result["scale_rule"]["checked"] and result["scale_rule"]["input"] in (
+        "captured",
+        "stress",
+    )
+    good, _ = _candidate(tmp_path, "fp8_mx")
+    report = evaluate(capture, good, device="cpu")["scale_rule"]
+    assert report["ok"] and report["checked"] and report["stress"]["saturated"] == 0
+    assert report["stress"]["worst_ratio"] <= 448 and report["outliers"]["channel_ratio"] > 5
 
 
 def _wide_channel() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

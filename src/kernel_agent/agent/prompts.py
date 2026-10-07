@@ -166,13 +166,20 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
-                    # fp8_weights / reduced / fp4_weights / fp8_w8a8
+                    # fp8_weights / reduced / fp4_weights / fp8_w8a8 / fp8_mx
                     # (kernels.compare.PRECISIONS): --quality near-lossless captures the
                     # target with a near-lossless tolerance tier; an exact run refuses it.
                     # Default exact.
                     "precision": {
                         "type": "string",
-                        "enum": ["exact", "fp8_weights", "reduced", "fp4_weights", "fp8_w8a8"],
+                        "enum": [
+                            "exact",
+                            "fp8_weights",
+                            "reduced",
+                            "fp4_weights",
+                            "fp8_w8a8",
+                            "fp8_mx",
+                        ],
                     },
                     "precision_why": {"type": "string"},
                     # other starting points for parallel workers (workers.py)
@@ -251,7 +258,7 @@ def precision_policy(quality: str, precisions: Iterable[str] | None = None) -> s
     return """
 # Precision (`--quality exact`)
 This run keeps full precision: do not set `precision` (a target with
-`fp8_weights`, `fp4_weights`, `fp8_w8a8` or `reduced` is refused); every kernel
+`fp8_weights`, `fp4_weights`, `fp8_w8a8`, `fp8_mx` or `reduced` is refused); every kernel
 must match eager within rounding noise.
 """
 
@@ -259,7 +266,9 @@ must match eager within rounding noise.
 def _near_lossless_policy(allowed: tuple[str, ...], four_bit: tuple[str, ...]) -> str:
     """The near-lossless precision policy: a paragraph per precision in ``allowed``."""
     names = ", ".join(f"`{p}`" for p in allowed)
-    refused = [p for p in ("fp8_weights", "fp8_w8a8", "reduced", *four_bit) if p not in allowed]
+    refused = [
+        p for p in ("fp8_weights", "fp8_w8a8", "fp8_mx", "reduced", *four_bit) if p not in allowed
+    ]
     lines = [
         "",
         "# Precision (`--quality near-lossless`)",
@@ -282,9 +291,11 @@ def _near_lossless_policy(allowed: tuple[str, ...], four_bit: tuple[str, ...]) -
             "(where shown) are out of reach."
         )
     lines.append(_POLICY["intro"])
-    for name in ("fp8_weights", "fp4_weights", "fp8_w8a8", "reduced"):
+    for name in ("fp8_weights", "fp4_weights", "fp8_w8a8", "fp8_mx", "reduced"):
         if name in allowed:
             lines.append(_POLICY[name])
+    if "fp8_w8a8" in allowed or "fp8_mx" in allowed:
+        lines.append(_POLICY["fp8_scales"])
     lines.append(_POLICY["exact"])
     return "\n".join(lines) + "\n"
 
@@ -318,6 +329,28 @@ cores, fp32 accumulation. Its `precision_why` names the FLOP-bound number (e.g.
 "LocDiT GEMMs at M=352: 80 TFLOP per run = 0.81 s at 99 bf16 TFLOP/s, compute
 bound"). Few rows per call stay `fp8_weights` (memory bound: quantising the
 activations saves nothing there and their outlier channels cost accuracy).""",
+    "fp8_mx": """`precision: "fp8_mx"` (MXFP8 W8A8: e4m3 weights and activations with one
+power-of-two ue8m0 scale per 32 elements along K on both operands, applied by the
+block-scaled tensor cores of sm_100 / sm_120; the same tolerance tier as `fp8_w8a8`)
+instead of `fp8_w8a8` where its column of the *Ceilings* table, *MXFP8*, is known
+(a GPU with block-scaled MMA) and the target's GEMMs are compute bound with wide
+outputs: M >= ~64 rows per call (clearly from the bf16 ridge the *Ceilings* table
+names: M ~130 on an RTX 5070 Ti) and N >= ~2560
+(measured on an RTX 5070 Ti at M = 352: cuBLASLt MXFP8 12-16 % faster than tensor-wise
+FP8 at N = 2560 / 8192, 239 TFLOP/s, and its output arrives scaled). Not for GEMMs with
+N <= ~1024 at that M: cuBLASLt has one MXFP8 algorithm and no split-K, so its large
+tiles leave SMs idle (1.7x slower than tensor-wise FP8 with batched split-K there) —
+inside an `fp8_mx` target such GEMMs run tensor-wise W8A8 with split-K (same tier), or
+plan the target `fp8_w8a8`. Not at a few rows per call (memory bound: `fp8_weights`).
+Its `precision_why` names M, the N of its GEMMs and the bound.""",
+    "fp8_scales": """FP8 activation scales stay dynamic (computed from every call's data: per
+token, per 32 / 128 block); a static (offline-calibrated) activation scale is allowed
+only when the target passes the evaluator's redrawn-input check with it (a scale
+calibrated on one input saturates others: measured up to 8.8 % of calls). Where the
+captured activations have outlier channels (a row's amax tens of times its RMS, a
+channel hundreds of times the median one: the `scale_rule` report of an `fp8_mx`
+evaluation measures both), finer scales (MXFP8, 1 x 128 groups) keep the bulk's
+precision; per-tensor scales do not.""",
     "reduced": """`precision: "reduced"` (also
 with `precision_why`) is for another numerics-changing idea.""",
     "exact": """Leave `precision`
@@ -617,6 +650,33 @@ def _precision_block(
   guide: "FP8 W8A8" in "Low-precision weights" below;
 * report the numerical error in `NOTES.md`: `fp8_w8a8_error(weight, q, scale, x)`
   on captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
+    elif precision == "fp8_mx":
+        contract = """MXFP8 W8A8 (block-scaled FP8 tensor-core math):
+* quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
+  quantize_mxfp8, swizzle_mx_scales, mxfp8_linear, mxfp8_error`): e4m3 codes [N, K],
+  one ue8m0 (power-of-two) scale per 32 consecutive K elements; keep no bf16 copy;
+* quantise the activations per block of 32 on every call (dynamic), scale
+  `2^ceil(log2(amax / 448))`: the smallest power of two that keeps the block within
+  ±448. Never the OCP reference rule `2^(floor(log2 amax) - 8)`: it saturates block
+  maxima above 448 x scale (outlier channels then shrink the output by up to 12.5 %);
+  static (calibrated) scales only if the redrawn-input check passes with them;
+* define a module-level `quantize_activations(x) -> (codes, scales)` with the rule your
+  kernels use (codes e4m3 [rows, K], scales e8m0 or uint8 [rows, K / 32], unswizzled):
+  the evaluator runs it on the captured input and on blocks where the OCP rule
+  saturates, and rejects a candidate whose block maxima exceed 448 x scale
+  (`stage: scale_rule`; its `scale_rule` report also gives the input's outliers);
+* the GEMM on the block-scaled MMA: `F.scaled_mm` with `ScalingType.BlockWise1x32` and
+  `SwizzleType.SWIZZLE_32_4_4` (cuBLASLt `VEC32_UE8M0`; scales in the 128 x 4 blocked
+  layout: `swizzle_mx_scales`, or written in place at `mx_scale_offset`), Triton
+  `tl.dot_scaled`, or `mma ... kind::mxf8f6f4.block_scale`; fp32 accumulation, bias once,
+  one rounding to bf16; norms, softmax / attention math and residual adds as in eager;
+* GEMMs with N <= ~1024 at a few hundred rows: tensor-wise FP8 with batched split-K
+  (the `fp8_w8a8` numerics, same tier) beats cuBLASLt's single MXFP8 algorithm there;
+* verified-style example: `triton_mxfp8_gemm.py` (ceil-rule quantiser writing swizzled
+  scales + `F.scaled_mm`); reference: `mxfp8_linear`; guide: "MXFP8 W8A8" in
+  "Low-precision weights" below;
+* report the numerical error in `NOTES.md`: `mxfp8_error(weight, q, scales, x)` on
+  captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     else:
         contract = """Reduced precision: keep the change to the numerics as small as the speedup
 allows, and report the numerical error (the evaluator's per-case `min_cosine` /
@@ -1029,6 +1089,8 @@ def _pivot_block(
     bounds = []
     if "fp8_w8a8" in choices:
         bounds.append("compute bound at the bf16 peak (W8A8: twice the FLOP rate, `fp8_w8a8`)")
+    if "fp8_mx" in choices:
+        bounds.append("compute bound with wide outputs (N >= ~2560: MXFP8, `fp8_mx`)")
     streams = [f"`{p}`" for p in ("fp8_weights", "fp4_weights") if p in choices]
     if streams:
         bounds.append(f"bound by streaming weights ({', '.join(streams)})")

@@ -21,6 +21,9 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   - ``exact``: as profiled, each dtype at its own peak;
   - ``fp8_weights``: one byte per weight (e4m3; per-channel scales neglected), math as profiled;
   - ``w8a8``: FP8 weights, all FLOPs at the FP8 tensor-core peak;
+  - ``mxfp8``: MXFP8 weights (one byte + an e8m0 scale per 32), all FLOPs at the measured
+    MXFP8 peak (the block-scaled tensor cores, cuBLASLt ``VEC32_UE8M0``; target precision
+    ``fp8_mx``);
   - ``fp4_weights``: NVFP4 weights, 4.5 bits each (e2m1 + one e4m3 scale per 16), math
     as profiled;
   - ``w4a4``: NVFP4 weights, all FLOPs at the NVFP4 tensor-core peak.
@@ -28,7 +31,7 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   A precision whose peak was not measured is unknown: no ratio to bf16 is assumed.
   ``ceilings.json`` has every floor; the markdown shows the ``columns`` of the precisions
   the run allows (``--precisions``, :mod:`kernel_agent.precisions`: exact; near-lossless
-  FP8 w and W8A8, FP4 w and W4A4 only with 4-bit allowed), and only they rank a row.
+  FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with 4-bit allowed), and only they rank a row.
 * **bound**: the term that sets the exact floor (``compute``, ``memory`` or ``launch``).
 * **now**: hooked inclusive ms scaled to the unhooked run (× baseline / hooked wall
   ms); **saves** = now − floor. Rows rank by the exact one; a row already below its exact
@@ -69,7 +72,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import projection
-from kernel_agent.kernels.roofline import FP4, FP8
+from kernel_agent.kernels.roofline import FP4, FP8, MXFP8
 
 
 @dataclass(frozen=True)
@@ -83,10 +86,11 @@ PRECISIONS = {
     "exact": Precision("exact", None, None),
     "fp8_weights": Precision("FP8 w", 1.0, None),
     "w8a8": Precision("W8A8", 1.0, FP8),
+    "mxfp8": Precision("MXFP8", 1.0 + 1.0 / 32, MXFP8),
     "fp4_weights": Precision("FP4 w", 4.5 / 8, None),
     "w4a4": Precision("W4A4", 4.5 / 8, FP4),
 }
-_SHORT = {FP8: "FP8", FP4: "NVFP4"}
+_SHORT = {FP8: "FP8", FP4: "NVFP4", MXFP8: "block-scaled FP8"}
 #: What each precision's floor assumes, for the table's legend.
 _LEGEND = {
     "exact": "exact (as profiled)",
@@ -99,6 +103,7 @@ TARGET_COLUMNS = {
     "exact": "exact",
     "fp8_weights": "fp8_weights",
     "fp8_w8a8": "w8a8",
+    "fp8_mx": "mxfp8",
     "fp4_weights": "fp4_weights",
 }
 #: The 4-bit columns, and the target precision that allows them (W4A4: no target precision
@@ -342,6 +347,7 @@ TARGET_PRECISIONS = {
     "exact": PRECISIONS["exact"],
     "fp8_weights": PRECISIONS["fp8_weights"],
     "fp8_w8a8": PRECISIONS["w8a8"],
+    "fp8_mx": PRECISIONS["mxfp8"],
     "fp4_weights": PRECISIONS["fp4_weights"],
     "reduced": Precision("bf16", 2.0, "bfloat16"),
 }

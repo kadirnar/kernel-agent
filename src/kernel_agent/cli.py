@@ -541,7 +541,7 @@ def _add_precisions_arg(p: argparse.ArgumentParser) -> None:
         type=_precisions,
         metavar="P,P,...",
         help="target precisions the run allows, recorded in run.json (exact is always "
-        "allowed): exact, fp8_weights, fp8_w8a8, reduced, fp4_weights (needs --quality "
+        "allowed): exact, fp8_weights, fp8_w8a8, fp8_mx, reduced, fp4_weights (needs --quality "
         "near-lossless). Default: exact; near-lossless: all but the 4-bit fp4_weights, which "
         "is opt-in. Given to a run that exists (improve, resume, integrate), it replaces "
         "the run's list",

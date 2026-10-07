@@ -218,7 +218,7 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   the stop logits, margins reported). Options set with `-o` win. A candidate
   below the floor is rejected without running the gate.
 * **Module tolerance tier.** A target whose spec allows reduced precision
-  (`"precision": "fp8_weights"`, `"fp8_w8a8"` or `"reduced"` in the plan, see
+  (`"precision": "fp8_weights"`, `"fp8_w8a8"`, `"fp8_mx"` or `"reduced"` in the plan, see
   "Low-precision weights" below) is captured with the `near-lossless` tier of
   `kernels/compare.py`, recorded in its sealed capture (an edited `spec.json`
   cannot change it, and a candidate that changes `compare.TIER` is an
@@ -251,8 +251,9 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
 
 **Allowed precisions** (`--precisions`, `kernel_agent/precisions.py`). A run lists
 the target precisions it allows; `exact` is always one of them. `--quality exact`
-allows `exact` only. `--quality near-lossless` allows `fp8_weights`, `fp8_w8a8` and
-`reduced` by default, but **not** the 4-bit `fp4_weights`: 4-bit is opt-in
+allows `exact` only. `--quality near-lossless` allows `fp8_weights`, `fp8_w8a8`,
+`fp8_mx` (MXFP8, 8-bit) and `reduced` by default, but **not** the 4-bit
+`fp4_weights`: 4-bit is opt-in
 (`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights`). The list is
 recorded in `run.json` → `config.precisions`; a run whose `run.json` has none
 (made before the option) gets the default, so its FP4 targets stay out.
@@ -611,6 +612,57 @@ bf16 module, on real VoxCPM2 capture inputs (fake quant on the CPU; on the GPU
 
 The only real-input failure is a memory-bound GEMM at decode whose activation
 outliers squeeze the rest of the token: `fp8_weights` territory anyway.
+
+#### MXFP8 W8A8 (`fp8_mx`): block-scaled tensor cores
+
+On sm_100 / sm_120 the fine-grained FP8 scaling that runs at full rate is MXFP8:
+e4m3 with one power-of-two ue8m0 scale per 32 elements along K on both operands,
+applied by the tensor core (`mma.sync kind::mxf8f6f4.block_scale`, cuBLASLt
+`VEC32_UE8M0`; DeepSeek-style 1 x 128 / 128 x 128 scaling is not supported there,
+docs/FP8.md). `"precision": "fp8_mx"` is its own class (8-bit: allowed by default
+in near-lossless runs, like `fp8_w8a8`), in the same near-lossless tier:
+
+* **Planner.** Compute-bound GEMMs with wide outputs (M >= ~64 rows per call, N >=
+  ~2560) on a GPU whose ceilings table has an *MXFP8* column; `precision_why` names
+  M, N and the bound. Measured on an RTX 5070 Ti at M = 352 (docs/FP8.md §3.1):
+  cuBLASLt MXFP8 runs N = 8192 in 24.7 us vs 29.5 tensor-wise FP8 (69.0 bf16) and
+  N = 2560 in 9.3 vs 10.6, but N = 1024 in 14.8 / 26.6 vs 8.8 / 15.2 for tensor-wise
+  with batched split-K (one MXFP8 algorithm, no split-K): such GEMMs run tensor-wise
+  inside an `fp8_mx` target, or the target is `fp8_w8a8`. FP8 activation scales stay
+  dynamic; a static (calibrated) one only when the redrawn-input check passes.
+* **Contract** (`knowledge/low_precision.md` → "MXFP8 W8A8"): weights once in
+  `build()` (`quant.quantize_mxfp8`, scales swizzled once into cuBLASLt's 128 x 4
+  layout, `quant.swizzle_mx_scales`), activations per block of 32 on every call
+  with the scale `2^ceil(log2(amax / 448))`, the GEMM through `F.scaled_mm`
+  `BlockWise1x32` / `SWIZZLE_32_4_4` (or `tl.dot_scaled`), `quant.mxfp8_linear` the
+  reference, `quant.mxfp8_error` the report.
+* **Scale-rule guard** (`kernels/scale_guard.py`). The OCP reference rule
+  `2^(floor(log2 amax) - 8)` clamps block maxima above 448 x scale: on a DiT layer
+  whose inputs carry massive-activation channels it fails the tier (norm off by
+  4 %), on inputs without them it passes while clamping a quarter of the blocks. An
+  `fp8_mx` candidate defines `quantize_activations(x) -> (codes, scales)`; the
+  evaluator runs it on the captured input and on a stress input whose block maxima
+  sit where the OCP rule saturates, and rejects a candidate whose block maxima
+  exceed 448 x scale (`status: incorrect`, `stage: scale_rule`, the reason in
+  `error`). The `scale_rule` field of every `fp8_mx` evaluation also reports the
+  captured input's outliers (`crest`: the largest row amax / RMS; `channel_ratio`:
+  the largest channel amax over the median one). The guard's module and the
+  quantisers are watched by the integrity snapshot.
+* **Speed of light and ceilings.** Weights count at one byte plus an e8m0 scale per
+  32, the GEMMs at the measured MXFP8 peak (`F.scaled_mm` `BlockWise1x32` in the
+  GPU peaks, key `mxfp8`; peaks cache version 3); the ceilings table's *MXFP8*
+  column uses it, unknown on GPUs without block-scaled MMA.
+* **Verified-style example** `examples/triton_mxfp8_gemm.py`: a Triton quantiser
+  with the ceil rule from the exponent bits, writing its scales straight into the
+  swizzled layout, and `F.scaled_mm`. Written from the docs/FP8.md measurements and
+  not yet run on a GPU: `doctor --smoke` (sm_100+) runs it in the near-lossless tier,
+  against the exact tier and with the floor rule against the guard.
+
+Tier calibration (docs/FP8.md §3.2, fake quant on real captures): with the ceil
+rule MXFP8 has per-token W8A8's error (DiT layer at M = 352: relative L2 0.0205,
+norm 0.92 %, element ratio 0.17; 30 redrawn draws pass), so it shares the
+near-lossless bounds; the CPU tests calibrate its reference math on captured and
+redrawn inputs with the other precisions (`tests/test_perturbed_calibration.py`).
 
 ### What "faster" means
 
@@ -1377,11 +1429,13 @@ re-profile makes a new one for its re-plan.
 * **Floors** (ms per run) = max(FLOPs / peak, (weight + I/O bytes) / DRAM
   bandwidth, calls × launch floor), per precision: *exact* (as profiled),
   *FP8 w* (one byte per weight, bf16 math), *W8A8* (FP8 tensor-core peak),
+  *MXFP8* (one byte + an e8m0 scale per 32 per weight, the measured MXFP8 peak
+  of the block-scaled tensor cores: target precision `fp8_mx`),
   *FP4 w* (NVFP4, 4.5 bits per weight, bf16 math) and *W4A4* (NVFP4 peak). A
   precision whose peak was not measured is `?`. `ceilings.json` keeps every
   floor; `summary.md` (what the planner reads) shows only the columns of the
   precisions the run allows ("Allowed precisions": exact; near-lossless also
-  FP8 w and W8A8, FP4 w and W4A4 only with `fp4_weights` asked for), names the
+  FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with `fp4_weights` asked for), names the
   others as not shown, and ranks rows below their exact floor by those columns only.
 * **End to end**, per precision: the run with every class at its floor, nested
   classes counted once (the non-overlapping set of `projection.py`).
@@ -1799,8 +1853,9 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
   * `remaining_ms`: `now`, or the arm's best kernel per run when that is faster
     (not integrated yet: Σ its new ms per call × the calls each case stands for).
   * `headroom`: `1 − floor / remaining_ms`, the rows' floor at the arm's
-    precision: exact, FP8 w, W8A8 (`fp8_w8a8`), FP4 w, or bf16 math and weights
-    (`reduced`). A precision pivot's arm takes the floor of its new precision.
+    precision: exact, FP8 w, W8A8 (`fp8_w8a8`), MXFP8 (`fp8_mx`), FP4 w, or bf16
+    math and weights (`reduced`). A precision pivot's arm takes the floor of its
+    new precision.
 
   Without a table, a row that holds it or a floor (an older run, a region
   target, unknown work, a peak not measured), Amdahl as before:
@@ -2325,7 +2380,9 @@ example (`cuda_fp4_gemv.py`) goes to an `fp4_weights` target; the smoke test
 runs it in the near-lossless-fp4 tier and against the FP8 tier, which must
 reject it. The W8A8 example (`triton_fp8_w8a8_gemm.py`) goes to an
 `fp8_w8a8` target; the smoke test runs it in the near-lossless tier and against
-the exact tier.
+the exact tier. The MXFP8 example (`triton_mxfp8_gemm.py`) goes to an `fp8_mx`
+target; on sm_100+ the smoke test runs it like the W8A8 one, and its OCP floor
+scale-rule variant must fail the scale-rule guard.
 
 **No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
 (`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a
