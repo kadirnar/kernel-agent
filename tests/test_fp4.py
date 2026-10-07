@@ -186,10 +186,13 @@ def test_fp4_precision_maps_to_its_tier():
 def test_fp4_policy_planner_orchestrator_and_engineer_prompt():
     enum = prompts.PLAN_SCHEMA["properties"]["targets"]["items"]["properties"]["precision"]
     assert "fp4_weights" in enum["enum"]
-    policy = prompts.precision_policy("near-lossless")
+    every = compare.PRECISIONS  # 4-bit is opt-in (--precisions ...,fp4_weights; #131)
+    policy = prompts.precision_policy("near-lossless", every)
     assert '`precision: "fp4_weights"`' in policy and "`fp8_weights` is already in use" in policy
+    assert '`precision: "fp4_weights"`' not in prompts.precision_policy("near-lossless")
     target = {"id": "mlp", "precision": "fp4_weights", "precision_why": "decode GEMVs"}
-    assert orchestrator._precision(dict(target), "near-lossless") is None
+    assert orchestrator._precision(dict(target), "near-lossless", every) is None
+    assert "not allowed" in orchestrator._precision(dict(target), "near-lossless")
     assert "needs --quality near-lossless" in orchestrator._precision(dict(target), "exact")
 
     spec = {

@@ -64,7 +64,10 @@ Stop rules per arm (AutoKernel's move-on rules, :func:`stop_reason`): ``patience
 consecutive evaluations without a new best (across slices), ≥ ``sol_stop`` of
 the speed of light, ``target_hours`` spent in its slices, or the module speedup
 ``speedup_goal`` reached. The loop stops when the budget is spent or every arm
-has stopped (:mod:`kernel_agent.improve`).
+has stopped (:mod:`kernel_agent.improve`). A kernel arm at a precision the run does
+not allow (``--precisions``, :mod:`kernel_agent.precisions`: 4-bit unless named) is
+stopped for good (``refused``) and has no ceiling; the systems agent's end-to-end
+estimate takes only the allowed precisions' floors.
 
 A kernel arm that has plateaued (:func:`plateau`) gets a research session
 before the patience rule stops it (:mod:`kernel_agent.research`); a plan it
@@ -87,7 +90,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, projection, truth
+from kernel_agent import ledger, precisions, projection, truth
 from kernel_agent.budget import (
     PLATEAU,
     PRIOR_HYPOTHESIS,
@@ -204,6 +207,8 @@ class Arm:
     ceiling: Ceiling | None = None  # kernels: from the newest ceilings table (issue #122)
     basis: str = ""  # systems: where its estimate comes from
     damp: float = 1.0  # decay ** stale (:func:`rank`)
+    # kernels: why its precision is not one the run allows (precisions.py); it never runs
+    refused: str | None = None
 
     @property
     def agent(self) -> str:
@@ -491,16 +496,12 @@ def _e2e_estimate(
     """Systems: the end-to-end speedup over the baseline (``base_ms``, the metric's ms) the
     newest ceilings table allows (its end-to-end line: every row at its floor, nested rows
     counted once, the time outside them unchanged), at the lowest floor of the precisions
-    the run's quality allows (exact; ``near-lossless``: FP8 / W8A8 / FP4 weights too), and
-    a note on it."""
-    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER
-
+    the run allows (exact; ``near-lossless``: FP8 weights / W8A8 too, FP4 weights only
+    with ``--precisions`` naming them: ``precisions.py``), and a note on it."""
     newest = profiles[0] if profiles else {}
     table = newest.get("ceilings") or {}
     e2e, window = table.get("e2e") or {}, float(table.get("baseline_ms") or 0.0)
-    names = ["exact"]
-    if (run.load().get("config") or {}).get("quality") == NEAR_LOSSLESS_TIER:
-        names += ["fp8_weights", "w8a8", "fp4_weights"]
+    names = ceilings.target_columns(precisions.of_run(run))
     floors = {n: float(e2e[n]["floor_ms"]) for n in names if (e2e.get(n) or {}).get("floor_ms")}
     if not floors or window <= 0 or base_ms <= 0:
         return None
@@ -676,6 +677,7 @@ def build_arms(
     rows = ledger.rows(run) if rows is None else rows
     profiles = _profiles(run, rounds or [])
     base_ms = profiles[-1]["baseline_ms"] if profiles else 0.0
+    allowed = precisions.of_run(run)  # an arm at another precision is stopped (#131)
     ids = run.target_ids() if targets is None else targets
     specs = {t: read_json(run.target(t) / "spec.json", {}) or {} for t in ids}
     groups: dict[str, list[projection.Group]] = {}  # the instance groups of each target
@@ -686,7 +688,8 @@ def build_arms(
         spec = specs[target_id]
         estimate = ledger._num(spec.get("expected_speedup")) or policy.estimate
         target_rows = [r for r in rows if r["target"] == target_id]
-        ceiling = arm_ceiling(spec, groups.get(target_id, []), profiles)
+        refused = precisions.refusal(precisions.of_spec(spec), allowed)
+        ceiling = None if refused else arm_ceiling(spec, groups.get(target_id, []), profiles)
         if ceiling is not None:  # its modules in the re-profiled run, at 1.0x of its kernel
             ref_ms = ceiling.now * ceiling.factor * _applied(target_id, profiles[0])
         else:
@@ -699,6 +702,7 @@ def build_arms(
             module_class=spec.get("module_class"),
             estimate=estimate,
             rows=ledger.measured(target_rows),
+            refused=refused,
         )
         plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
         _kernel_history(arm, target_rows, max(plans, default=None))
@@ -744,6 +748,8 @@ def build_arms(
 
 def stop_reason(arm: Arm, policy: Policy) -> str | None:
     """Why an arm gets no more slices (None: it is live)."""
+    if arm.refused:  # its precision is not allowed: no research session revives it
+        return arm.refused
     if policy.patience and arm.streak >= policy.patience:
         return f"plateau: {arm.streak} evaluations in a row without a new best"
     if arm.idle >= IDLE_SLICES:

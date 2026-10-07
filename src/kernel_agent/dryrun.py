@@ -493,6 +493,8 @@ class World:
         return advice == "consider_stopping" and rng.random() < 0.5
 
     def _kernel(self, target_id: str, system: str = "", worker: int | None = None) -> int:
+        from kernel_agent.kernels.compare import tier_of
+
         target_dir = self.run.target(target_id)
         home = workers.directory(self.run, target_id, worker) if worker else target_dir
         agent = workers.agent_name(target_id, worker) if worker else f"kernel-{target_id}"
@@ -521,6 +523,7 @@ class World:
             )
             snap = snapshot(self.run, src, target_id)
             result = kernel_result(outcome, ref_ms, instances, sim)
+            result["tolerance_tier"] = tier_of(spec.get("capture"))  # as the evaluator's
             _, row = record_candidate(
                 self.run,
                 target_id,

@@ -5,7 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import abtest, ledger, library, objective, projection, strong_baseline
+from kernel_agent import (
+    abtest,
+    ledger,
+    library,
+    objective,
+    precisions,
+    projection,
+    strong_baseline,
+)
 from kernel_agent.agent import auth, web
 from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
@@ -193,17 +201,21 @@ def _step_text(step: dict[str, Any]) -> str:
 
 
 def _quality_lines(data: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
-    """The quality mode, and eager's perceptual scores next to it (``near-lossless``)."""
+    """The quality mode, eager's perceptual scores next to it and the precisions the run
+    allows (``near-lossless``)."""
     mode = (data.get("config") or {}).get("quality") or "exact"
     if mode == "exact":
         return []
+    allowed = precisions.of_config(data.get("config"))
+    line = f"* precisions allowed: {precisions.describe(allowed)} (`--precisions`)"
     info = baseline.get("perceptual") or {}
     if info.get("status") != "ok":
         why = info.get("reason") or info.get("status") or "analyze predates it"
-        return [f"* quality: **{mode}**, no perceptual baseline ({why}): exact checks"]
+        return [f"* quality: **{mode}**, no perceptual baseline ({why}): exact checks", line]
     mean = ", ".join(f"{k}={v}" for k, v in (info.get("mean") or {}).items())
     return [
-        f"* quality: **{mode}**: perceptual gate on {info.get('samples')} samples (eager: {mean})"
+        f"* quality: **{mode}**: perceptual gate on {info.get('samples')} samples (eager: {mean})",
+        line,
     ]
 
 
@@ -304,16 +316,24 @@ def write_report(run: RunDir) -> Path:
     ]
     saved: dict[str, float | None] = {}
     counted: list[str] = []  # the calls behind each estimate (kernels/weights.py)
+    allowed = precisions.of_config(data.get("config"))
+    refused: list[str] = []  # at a precision the run does not allow: not integrated
     for target_id in run.target_ids():
         spec = read_json(run.target(target_id) / "spec.json", {})
         records = read_jsonl(run.results_file(target_id))
         best = best_for_target(run, target_id)
-        saved[target_id] = ledger._num((best or {}).get("est_saved_ms_per_run"))
-        if best and saved[target_id] is not None and (note := _calls(target_id, spec, best)):
+        est = ledger._num((best or {}).get("est_saved_ms_per_run"))
+        mark = ""
+        if precisions.refusal(precisions.of_spec(spec), allowed):
+            refused.append(target_id)
+            mark = f" (`{precisions.of_spec(spec)}`: not allowed, skipped)"
+        else:
+            saved[target_id] = est
+        if best and est is not None and not mark and (note := _calls(target_id, spec, best)):
             counted.append(note)
-        mine = f" {_fmt(units(target_id, saved[target_id]))} |" if other else ""
+        mine = f" {_fmt(units(target_id, est))} |" if other else ""
         lines.append(
-            f"| `{target_id}` | `{spec.get('module_class')}` | "
+            f"| `{target_id}`{mark} | `{spec.get('module_class')}` | "
             f"{', '.join(spec.get('backends', []))} | "
             f"{len(records)} | {_fmt(best and best.get('speedup'))} | "
             f"{_fmt(best and best.get('est_saved_ms_per_run'))} |{mine} "
@@ -335,6 +355,13 @@ def write_report(run: RunDir) -> Path:
                     f"{_fmt(case.get('new_ms'), 4)} ms{sol}) | | |" + (" |" if other else "")
                 )
     lines.append("")
+    if refused:
+        lines += [
+            f"Not allowed in this run (precisions: {precisions.describe(allowed)}; "
+            f"`--precisions`): {', '.join(f'`{t}`' for t in refused)}. Their kernels are "
+            "neither projected nor integrated.",
+            "",
+        ]
     if counted:
         lines += [
             "Calls behind the estimates (a case's gain per call × the calls of the target's "
@@ -375,6 +402,8 @@ def write_report(run: RunDir) -> Path:
                 f"({len(composite.get('items') or [])} items) "
                 + ("seeded the search" if composite.get("seeded") else "was not faster")
             )
+        for s in integration.get("skipped") or []:  # precisions.py: not allowed in this run
+            lines.append(f"* skipped `{s.get('target')}`: {s.get('reason')}")
         for item in integration.get("accepted", []):
             lines.append(f"* accepted {item['kind']}: `{item['item']}`")
         for r in integration.get("recheck") or []:  # kernels/recheck.py

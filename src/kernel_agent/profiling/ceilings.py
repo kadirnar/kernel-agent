@@ -26,6 +26,9 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   - ``w4a4``: NVFP4 weights, all FLOPs at the NVFP4 tensor-core peak.
 
   A precision whose peak was not measured is unknown: no ratio to bf16 is assumed.
+  ``ceilings.json`` has every floor; the markdown shows the ``columns`` of the precisions
+  the run allows (``--precisions``, :mod:`kernel_agent.precisions`: exact; near-lossless
+  FP8 w and W8A8, FP4 w and W4A4 only with 4-bit allowed), and only they rank a row.
 * **bound**: the term that sets the exact floor (``compute``, ``memory`` or ``launch``).
 * **now**: hooked inclusive ms scaled to the unhooked run (× baseline / hooked wall
   ms); **saves** = now − floor. Rows rank by the exact one; a row already below its exact
@@ -84,6 +87,41 @@ PRECISIONS = {
     "w4a4": Precision("W4A4", 4.5 / 8, FP4),
 }
 _SHORT = {FP8: "FP8", FP4: "NVFP4"}
+#: What each precision's floor assumes, for the table's legend.
+_LEGEND = {
+    "exact": "exact (as profiled)",
+    "fp8_weights": "FP8 w (1 byte per weight, bf16 math)",
+    "fp4_weights": "FP4 w (NVFP4, 4.5 bits per weight, bf16 math)",
+}
+#: A target's ``precision`` (``kernels.compare.PRECISIONS``) → the column of its floor
+#: (``reduced``: none, bf16 math and weights: :data:`TARGET_PRECISIONS`).
+TARGET_COLUMNS = {
+    "exact": "exact",
+    "fp8_weights": "fp8_weights",
+    "fp8_w8a8": "w8a8",
+    "fp4_weights": "fp4_weights",
+}
+#: The 4-bit columns, and the target precision that allows them (W4A4: no target precision
+#: reaches it; shown when 4-bit weights are allowed).
+_FOUR_BIT_COLUMNS = {"fp4_weights": "fp4_weights", "w4a4": "fp4_weights"}
+
+
+def target_columns(allowed: Iterable[str]) -> list[str]:
+    """The columns of the target precisions ``allowed`` (``precisions.py``): the floors a
+    run that allows them can reach (the scheduler's end-to-end estimate)."""
+    found = {TARGET_COLUMNS[p] for p in allowed if p in TARGET_COLUMNS}
+    return [name for name in PRECISIONS if name in found]
+
+
+def columns(allowed: Iterable[str] | None) -> list[str]:
+    """The table's columns for a run that allows the target precisions ``allowed`` (None:
+    every column): those of :func:`target_columns`, and W4A4 with the 4-bit weights."""
+    if allowed is None:
+        return list(PRECISIONS)
+    allowed = tuple(allowed)
+    found = set(target_columns(allowed))
+    found |= {c for c, p in _FOUR_BIT_COLUMNS.items() if p in allowed}
+    return [name for name in PRECISIONS if name in found]
 
 
 # ------------------------------------------------------------------ rows
@@ -195,8 +233,12 @@ def build(
     baseline_ms: float,
     *,
     per: str = "per run",
+    allowed: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """The ceilings table of a profile (``baseline_ms``: the profiled window, unhooked)."""
+    """The ceilings table of a profile (``baseline_ms``: the profiled window, unhooked).
+    ``allowed``: the target precisions the run allows (``precisions.py``; None: every one):
+    its ``columns`` (every floor is in ``floors``; only these are shown and rank a row)."""
+    shown = columns(allowed)
     hooked = float(profile.get("hooked_wall_ms") or 0.0)
     scale = baseline_ms / hooked if hooked > 0 and baseline_ms > 0 else 1.0
     usable = bool(peaks and peaks.get("dram_gbps"))
@@ -225,7 +267,7 @@ def build(
             if name == "exact" and f:
                 row["bound"] = f["bound"]
         exact = row["floors"]["exact"]
-        lower = {k: v for k, v in row["saves_ms"].items() if k != "exact" and v}
+        lower = {k: v for k, v in row["saves_ms"].items() if k != "exact" and k in shown and v}
         if exact is not None and now < exact and lower:
             best = max(lower, key=lambda k: lower[k])
             row["saves_best"] = {"precision": best, "ms": lower[best]}
@@ -253,6 +295,7 @@ def build(
             if peaks is not None and k in peaks
         },
         "precisions": precisions,
+        "columns": shown,
         "rows": rows,
         "e2e": {name: _e2e(rows, name, baseline_ms) for name in PRECISIONS} if usable else {},
         "unknown_work": [r["target"] for r in rows if not r["work_known"]],
@@ -389,6 +432,9 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
     peaks = table.get("peaks")
     per = table.get("per", "per run")
     precisions = table["precisions"]
+    # the run's allowed precisions (build(allowed=...)); a table from before #131: every one
+    cols = [c for c in table.get("columns") or list(PRECISIONS) if c in precisions]
+    hidden = [precisions[c]["label"] for c in precisions if c not in cols]
     shown = [r for r in table["rows"] if r["share"] >= min_share][:top]
     lines = ["", "## Ceilings: floors at the observed shapes", ""]
     if peaks is None:
@@ -403,12 +449,17 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             * 1000
             / float(peaks["dram_gbps"])
         )
-        peak_text = []
-        for name in ("w8a8", "w4a4"):
+        legend = [_LEGEND[name] for name in cols if name in _LEGEND]
+        for name in (c for c in cols if c not in _LEGEND):  # at a tensor-core peak of its own
             p = precisions[name]
-            peak_text.append(
+            legend.append(
                 f"{p['label']} at {_SHORT.get(p['peak'], p['peak'])} "
                 + (f"{p['peak_tflops']:.0f} TFLOP/s" if p.get("peak_tflops") else "unknown")
+            )
+        if hidden:
+            legend[-1] += (
+                f" (not shown: {', '.join(hidden)}, precisions this run does not allow, "
+                "`--precisions`)"
             )
         lines += [
             "What each module class could reach if its kernels ran at this GPU's roofline, "
@@ -419,8 +470,7 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             f"Floor ({per}, ms) = max(FLOPs / peak, (weight + I/O bytes) / "
             f"{float(peaks['dram_gbps']):.0f} GB/s, calls × "
             f"{float(peaks.get('launch_floor_us') or 0):.1f} us launch floor) per precision: "
-            "exact (as profiled), FP8 w (1 byte per weight, bf16 math), FP4 w (NVFP4, 4.5 "
-            f"bits per weight, bf16 math), {', '.join(peak_text)}. *now* = the hooked time "
+            f"{', '.join(legend)}. *now* = the hooked time "
             "scaled to the unhooked run (approximate: hooks inflate many small calls more than "
             "a few large ones); *saves* = now − exact floor (ceiling × share; 0 when the floor "
             "is above *now*, then the best saving at a lower precision in brackets: the row "
@@ -428,9 +478,10 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             "",
         ]
     lines += [
-        "| target | phase | inst | calls | M | now ms | share | TFLOP | weights GB | bound "
-        "| exact | FP8 w | W8A8 | FP4 w | W4A4 | saves ms |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| target | phase | inst | calls | M | now ms | share | TFLOP | weights GB | bound | "
+        + " | ".join(precisions[c]["label"] for c in cols)
+        + " | saves ms |",
+        "|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(cols) + "---|",
     ]
     for r in shown:
         marks = {"†": r["estimated_calls"], "‡": r.get("reference_calls")}
@@ -444,15 +495,15 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             f"| `{r['cls']}` `{r['group']}`{mark} | {r['phase']} | {r['instances']} | "
             f"{r['calls']} | {m if known else '?'} | {_ms(r['now_ms'])} | "
             f"{r['share']:.1%} | {tflop} | {weights} | "
-            f"{r.get('bound', '?')} | {_ms(f['exact'])} | {_ms(f['fp8_weights'])} | "
-            f"{_ms(f['w8a8'])} | {_ms(f['fp4_weights'])} | {_ms(f['w4a4'])} | "
-            f"{_saves(r, precisions)} |"
+            f"{r.get('bound', '?')} | "
+            + "".join(f"{_ms(f.get(c))} | " for c in cols)
+            + f"{_saves(r, precisions)} |"
         )
     e2e = table.get("e2e") or {}
     if e2e:
         parts = []
-        for name, p in precisions.items():
-            e = e2e.get(name)
+        for name in cols:
+            p, e = precisions[name], e2e.get(name)
             if e is None:
                 parts.append(f"{p['label']} unknown ({p.get('unknown', 'no peak')})"[:120])
             else:
@@ -477,7 +528,7 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             "kernel); their work is that of the same calls in the unmodified model, with its "
             "math and dtypes (approximate where a transform merged or trimmed layers; *now* "
             "can be below the exact floor where the model already runs at a lower precision: "
-            "compare it with the FP8 / FP4 floors)."
+            "compare it with the lower-precision floors)."
             if any(r.get("reference_calls") for r in shown)
             else ""
         )
@@ -504,13 +555,15 @@ def write(
     baseline_ms: float,
     *,
     per: str = "per run",
+    allowed: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Build the table and write ``ceilings.json`` + ``ceilings.md`` into ``profile_dir``.
-    Never raises on a malformed profile: the table then only holds the error."""
+    """Build the table (``allowed``: the run's precisions, :func:`build`) and write
+    ``ceilings.json`` + ``ceilings.md`` into ``profile_dir``. Never raises on a malformed
+    profile: the table then only holds the error."""
     from kernel_agent.workspace import write_json
 
     try:
-        table = build(profile, peaks, baseline_ms, per=per)
+        table = build(profile, peaks, baseline_ms, per=per, allowed=allowed)
     except Exception as exc:  # the ceilings never break an analyze
         table = {"error": f"{type(exc).__name__}: {exc}"[:300], "rows": []}
     write_json(profile_dir / "ceilings.json", table)

@@ -246,6 +246,63 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   `analyze` ran in exact mode) a near-lossless run keeps the exact checks;
   `metrics.perceptual.skipped` says why.
 
+**Allowed precisions** (`--precisions`, `kernel_agent/precisions.py`). A run lists
+the target precisions it allows; `exact` is always one of them. `--quality exact`
+allows `exact` only. `--quality near-lossless` allows `fp8_weights`, `fp8_w8a8` and
+`reduced` by default, but **not** the 4-bit `fp4_weights`: 4-bit is opt-in
+(`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights`). The list is
+recorded in `run.json` → `config.precisions`; a run whose `run.json` has none
+(made before the option) gets the default, so its FP4 targets stay out.
+`--precisions` on a run that exists (`improve <run_dir>`, `resume`,
+`integrate`) replaces its list in `run.json`. A reduced precision needs
+`--quality near-lossless` (else the command stops). The list is enforced
+wherever a precision is chosen or used:
+
+* **planner**: its precision policy describes only the allowed precisions (and
+  says which are not allowed), and its output schema offers only them; a planned
+  target at another precision is dropped;
+* **pivots**: a research session is offered (and a round re-plan's `pivots`
+  schema lists) only the allowed precisions; a proposal for another one is
+  refused (`pivot_refused`);
+* **capture**: a target at another precision is refused with the reason
+  (`capture_refused`); the worker refuses it too (a spec edited afterwards);
+* **library priors**: an entry at another precision is not evaluated, and a
+  target at one is not seeded;
+* **kernels phase and improve scheduler**: such a target gets no agent session;
+  its arm is stopped for good (the precision is the reason) and has no ceiling;
+* **integration**: its kernels are skipped, and so is any kernel evaluated in the
+  tolerance tier of a disallowed precision (the records' `tolerance_tier`);
+  each skip is logged, kept in `integration.json` → `skipped` and listed in
+  `report.md` (also next to the target in *Kernel targets*, out of the
+  projection; the report's header names the allowed precisions);
+* **ceilings**: `profile/summary.md` shows (and ranks rows by) only the floors of
+  the allowed precisions (`ceilings.json` keeps every floor), and the systems
+  agent's end-to-end estimate takes only them;
+* **prompts**: engineer, research and systems sessions are told that 4-bit
+  weights and activations are not allowed.
+
+`kernel-agent integrate <run_dir> [--precisions ...]` integrates a run again
+(A/B measurements of unchanged content reused, no agent session) and rewrites its
+report. Take a copy of the VoxCPM2 latency run `20261005-192504`. In that run the
+planner opened `lm_stack_fp4` on its own, and a precision pivot opened
+`lm_step_fp8__fp4_weights`, whose FP4 kernel measured 16.2x against the FP8 arm's
+10.5x. Its last integration needed a one-off script to hide both. Its `run.json`
+has no `precisions`, and a plain `integrate` of the copy now leaves them out by
+itself. All 12 A/B steps were reused, so it took 81 s, and it reached the result of
+the script: 522.2 ms, 10.49x.
+
+```
+integrate: skipping lm_stack_fp4: precision 'fp4_weights' is not allowed in this run (4-bit precisions are opt-in): --precisions exact,fp8_weights,reduced,fp8_w8a8
+integrate: skipping lm_step_fp8__fp4_weights: precision 'fp4_weights' is not allowed in this run (4-bit precisions are opt-in): --precisions exact,fp8_weights,reduced,fp8_w8a8
+integrate: 7 candidate optimisations + the combination of exp 38
+...
+integrate: 12 of 12 measurements reused (unchanged content), 0 measured
+integrate: final 522.2 ms vs 5476.4 ms = 10.488x (7.20x vs compiled)
+```
+
+`integrate --precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights` on the same
+copy records that list in its `run.json` and lets the FP4 arm back in.
+
 Calibration on VoxCPM2 (RTX 5070 Ti; the 8 cloned samples, each paired with
 eager's sample of the same text and seed; teacher forcing on the 60-patch main
 input; FP8 = every `nn.Linear` weight of both LMs and the LocDiT quantised to
@@ -458,9 +515,10 @@ scale per tensor, 4.5 bits per weight (`kernels/quant.py`: `quantize_fp4`,
 `dequantize_fp4`, `fp4_error`; `fmt="mxfp4"`: a power-of-two scale per 32,
 less accurate), activations bf16. Its relative L2 error is 0.095 on VoxCPM2's
 weights (FP8 0.026), above the near-lossless tier's 0.08, so it has its own
-`near-lossless-fp4` tier ("Quality modes"). The planner may use it in a
-`--quality near-lossless` run only for memory-bound decode GEMVs / skinny
-GEMMs where `fp8_weights` is already in use or the ceilings table shows the
+`near-lossless-fp4` tier ("Quality modes"). It is opt-in: only a run whose
+`--precisions` names `fp4_weights` allows it ("Allowed precisions"). The planner
+may use it in such a `--quality near-lossless` run only for memory-bound decode
+GEMVs / skinny GEMMs where `fp8_weights` is already in use or the ceilings table shows the
 target still bound by streaming weights; the engineer gets the FP4 contract, the FP4
 section of `low_precision.md` and `examples/cuda_fp4_gemv.py` (M <= 4:
 codes dequantised in registers with a few integer ops, fp32 accumulation per
@@ -1317,7 +1375,11 @@ re-profile makes a new one for its re-plan.
   bandwidth, calls × launch floor), per precision: *exact* (as profiled),
   *FP8 w* (one byte per weight, bf16 math), *W8A8* (FP8 tensor-core peak),
   *FP4 w* (NVFP4, 4.5 bits per weight, bf16 math) and *W4A4* (NVFP4 peak). A
-  precision whose peak was not measured is `?`.
+  precision whose peak was not measured is `?`. `ceilings.json` keeps every
+  floor; `summary.md` (what the planner reads) shows only the columns of the
+  precisions the run allows ("Allowed precisions": exact; near-lossless also
+  FP8 w and W8A8, FP4 w and W4A4 only with `fp4_weights` asked for), names the
+  others as not shown, and ranks rows below their exact floor by those columns only.
 * **End to end**, per precision: the run with every class at its floor, nested
   classes counted once (the non-overlapping set of `projection.py`).
 * The planner ranks targets by ceiling × share (*saves ms*) and names each
@@ -1750,10 +1812,13 @@ the budget is spent or every target has stopped (`kernel_agent/improve.py`,
     max(2 ÷ best, 1.1)` is the speedup still assumed possible. For the systems
     agent, `further` starts at the largest of the end-to-end speedup the newest
     ceilings table allows (its end-to-end line, at the lowest floor of the
-    precisions the run's `--quality` allows), 1 ÷ the GPU-busy share of the
-    profile and 1.25. Transforms and kernels may reach for the same floor; the
-    UCB index below tells which of them pays.
+    precisions the run allows: `--precisions`, no FP4 unless asked for), 1 ÷
+    the GPU-busy share of the profile and 1.25. Transforms and kernels may reach
+    for the same floor; the UCB index below tells which of them pays.
   * `k`: slices of this arm in a row that found no new best.
+
+  A kernel arm at a precision the run does not allow ("Allowed precisions") is
+  stopped for good, with that as its reason: no ceiling, no research session.
 
   The slice log, `improve.json` (`slices[].why`) and the `slice_start` event
   name the components of the score, for example (VoxCPM2 round 2, ms per second
@@ -2289,6 +2354,9 @@ kernel-agent optimize <hf-url> [options]
                                                min_speaker_similarity(_worst), perceptual_max_patches
   --quality exact|near-lossless        near-lossless: numerics-changing optimisations pass a
                                        perceptual gate (see "Quality modes")
+  --precisions exact,fp8_weights,...   target precisions the run allows, in run.json (default:
+                                       exact; near-lossless: all but the 4-bit fp4_weights,
+                                       which is opt-in; see "Allowed precisions")
   --backends cuda,triton,cute,tilelang,nvrtc
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
@@ -2325,6 +2393,10 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
   --integration-reserve auto|MINUTES   time kept for the final integration (auto: its
                                        estimate, at most a third of --max-hours; 0: none)
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]
+                                       [--precisions P,P]  (replaces the run's list in run.json)
+kernel-agent integrate <run_dir> [--precisions P,P] [--no-reuse]
+                                       integrate again (unchanged A/B measurements reused, no
+                                       agent session) and rewrite the report
 kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]
                                        [--quick] [--timeout 300]

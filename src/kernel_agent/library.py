@@ -25,7 +25,8 @@ definition + solution + evaluation per kernel)::
 * **Reuse** (:func:`seed_target`, before a target's first agent session): up to
   :data:`MAX_PRIORS` entries of the same module class and GPU architecture whose
   entrypoints and dtypes cover the target's (and whose precision the target allows: a
-  reduced-precision kernel serves only a target of that precision) are copied to
+  reduced-precision kernel serves only a target of that precision, and only in a run whose
+  ``--precisions`` allow it: no FP4 prior unless 4-bit is asked for) are copied to
   ``candidates/prior_<entry-id>.py`` and evaluated like any candidate (verified
   capture, snapshot, ``results.jsonl``, a ledger row with the hypothesis ``prior
   winner from <repo>``), at no LLM cost. The engineer prompt lists them slow → fast
@@ -301,13 +302,22 @@ def precision_of(capture_info: dict[str, Any]) -> str:
     return str(capture_info.get("precision") or "exact")
 
 
-def matches(arch: str, spec: dict[str, Any], *, limit: int = MAX_PRIORS) -> list[Entry]:
+def matches(
+    arch: str,
+    spec: dict[str, Any],
+    *,
+    limit: int = MAX_PRIORS,
+    precisions: Iterable[str] | None = None,
+) -> list[Entry]:
     """Entries of ``arch`` that can serve the target ``spec``: same module class, compatible
     entrypoints and dtypes, and a precision the target allows (an ``exact`` kernel serves
-    any target, a reduced-precision one only a target of that precision); closest shapes,
+    any target, a reduced-precision one only a target of that precision) and the run allows
+    (``precisions``, ``kernel_agent/precisions.py``; None: no further limit); closest shapes,
     accepted end to end and fastest first; one entry per kernel source."""
     target_sig = signature_summary(spec.get("capture") or {})
     allowed = {"exact", precision_of(spec.get("capture") or {})}
+    if precisions is not None:
+        allowed &= set(precisions)
     found = []
     for entry in entries(arch, str(spec.get("module_class") or "")):
         if entry.meta.get("broken") or entry.meta.get("module_class") != spec.get("module_class"):
@@ -570,12 +580,18 @@ def seed_target(
 
     Returns what was tried (also rejected entries); the caller records it with
     :func:`remember_seed` so this runs once per target."""
+    from kernel_agent import precisions
+
     target_dir = run.target(target_id)
     spec = read_json(target_dir / "spec.json", {}) or {}
     if not run.capture_file(target_id).exists():
         return []
+    allowed = precisions.of_run(run)  # --precisions: no 4-bit prior unless the run allows it
+    if why := precisions.refusal(precisions.of_spec(spec), allowed):
+        say(f"{target_id}: no library priors: {why}")
+        return []
     tried: list[dict[str, Any]] = []
-    for entry in matches(arch, spec):
+    for entry in matches(arch, spec, precisions=allowed):
         info: dict[str, Any] = {
             "entry": entry.id,
             "repo_id": entry.meta.get("repo_id"),
