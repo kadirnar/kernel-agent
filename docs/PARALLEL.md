@@ -2,14 +2,14 @@
 
 Research and design for [#136](https://github.com/kadirnar/kernel-agent/issues/136):
 stream and stage overlap, persistent and warp-specialised kernels, SM partitioning,
-request pipelining and multi-GPU. All numbers are **measured** on this machine (RTX 5070 Ti
+and request pipelining, on one GPU. All numbers are **measured** on this machine (RTX 5070 Ti
 16 GB, sm_120, 70 SMs, 48 MB L2, driver 615.71 / CUDA UMD 13.4, torch 2.14.1+cu130) on
 `openbmb/VoxCPM2` with the built-in workload (60 patches, 10 timesteps, CFG 2.0, seed 0)
 and the accepted sets of the runs in [VOXCPM2.md](VOXCPM2.md): latency
 `runs/openbmb--VoxCPM2/20261005-192504` (FP8, 522 ms) and throughput
 `runs/openbmb--VoxCPM2/20261006-004718-retest2` (batch 16, 6.03 ms per audio second),
 applied through their exported `optimized/apply.py` to a freshly loaded model. Nothing in
-the library changes here: the design (§7) and the plan (§8) are for review first, as the
+the library changes here: the design (§6) and the plan (§7) are for review first, as the
 issue asks.
 
 ## 0. Summary
@@ -58,10 +58,10 @@ issue asks.
   natural length is worth up to 1.31× for the default 16 texts and nothing in the
   fixed-length benchmark.
 
-Plan (§8), in order: timeline view in the profile → asynchronous stop check in the batched
+Plan (§7), in order: timeline view in the profile → asynchronous stop check in the batched
 loop → declared streams in the evaluator → PDL in the kernel toolkit → warp-specialised
 LocDiT layer → graphed streaming / pipelined VAE → serialization points → green-context-aware
-grids → continuous batching → multi-GPU replicas. Outlook on this GPU: latency 522 → ~370 ms
+grids → continuous batching. Outlook on this GPU: latency 522 → ~370 ms
 (~1.4×), almost all of it from PR 5; everything else in this issue is ≤ 1–5 % for one request.
 
 ## 1. Method
@@ -463,35 +463,9 @@ decode, which is DRAM-bound.
   already takes a position per request) and per-request teacher forcing with slot reuse: a
   benchmark change to review before any code.
 
-## 6. Multiple GPUs (design notes; one GPU here)
+## 6. Library design: legitimate concurrency in kernel-agent
 
-The GPU pool (#23) gives every evaluation its own GPU (`gpu{i}.lock`, `CUDA_VISIBLE_DEVICES`);
-a run itself uses one device. For VoxCPM2:
-
-* **Request (data) parallelism** first: one replica per GPU (2.3 B parameters; the accepted
-  sets peak at 7.5 GB allocated at batch 1 and 6.6 GB at batch 16), a router assigning
-  requests or batches. Linear in GPUs, no numerics change, no interconnect traffic;
-  throughput is the sum over replicas, latency unchanged.
-* **Pipeline parallelism across stages** fits the serial patch loop badly: base LM → residual
-  LM → LocDiT → LocEnc is one cycle per patch, so a stage split adds two transfers per patch
-  (hidden states of a few KB, ~10 µs over PCIe) with no overlap for one request. With ≥ 2
-  requests in flight, GPU 0 running request *A*'s LMs while GPU 1 runs request *B*'s LocDiT is
-  a 2-stage pipeline bounded by the slower stage (LocDiT 63 % of the batch-1 patch, so ≤ 1.6×
-  on 2 GPUs vs 2× for replicas). Only worth it when one replica does not fit a GPU.
-* **Tensor parallelism** of the decode GEMVs halves each GPU's weight stream (the batch-1
-  latency lever: ~2.0 → ~1.0 ms base LM step on 2 GPUs) but needs two all-reduces per layer:
-  (36 LM + 108 LocDiT + 12 LocEnc layers) × 2 = 312 all-reduces of 4–90 KB per patch. Over PCIe
-  without NVLink at ~10–20 µs each that is 3–6 ms per patch, more than it saves; TP pays only
-  with NVLink-class links or P2P all-reduce under ~3 µs.
-* **Library implications**: a workload option `devices=` handled by the workload (replicas),
-  evaluation on a GPU set from the pool (`gpu_lock(n=2)`), the paired A/B on the same set,
-  per-device profiles merged on one timeline (§7.3 keyed by device and stream), and the
-  integrity checks extended to work on other devices (the device-wide `synchronize()` of
-  `timed_run` covers the current device only).
-
-## 7. Library design: legitimate concurrency in kernel-agent
-
-### 7.1 How streams are treated today
+### 6.1 How streams are treated today
 
 * **Module evaluator** (`kernels/evaluate.py`, `kernels/integrity.py`, `kernels/bench.py`):
   times with CUDA events on the current stream. Joined side streams are already allowed and
@@ -516,7 +490,7 @@ a run itself uses one device. For VoxCPM2:
   view, no stage timeline and no idle-gap attribution, so the 31 ms of host-sync gaps per
   batch-16 run (§3.3) and the 15 ms VAE tail at batch 1 are invisible to the planner.
 
-### 7.2 Proposed API: `kernel_agent/concurrency.py`
+### 6.2 Proposed API: `kernel_agent/concurrency.py`
 
 New, importable by candidates and transforms, CPU-testable with a fake stream:
 
@@ -578,7 +552,7 @@ CUDA-L1's solutions, 2.5 % of SOL-ExecBench submissions;
 4. Timing stays as it is: wall time with every stream synchronised end to end, CUDA events on
    the caller's stream after the join at module level, `wall_check` beside them.
 
-### 7.3 The profile's timeline: dependency graph and idle gaps
+### 6.3 The profile's timeline: dependency graph and idle gaps
 
 `profiling/timeline.py` (new; the prototype is `analyze.py`, appendix A.1):
 
@@ -620,31 +594,30 @@ and tests: CPU (union / gap / attribution on synthetic event lists, `cc.fork` se
 fake stream), GPU-marked (joined / unjoined / late-thread fixtures for `e2e_activity`, a
 multi-stream graph capture).
 
-## 8. Plan
+## 7. Plan
 
-### 8.1 Proposed PRs in priority order
+### 7.1 Proposed PRs in priority order
 
 Gains against today's measured runs: 522 ms latency; 6.05–6.10 ms per audio second at batch 16
 (937 ms per batched run). Kernel work is listed with its measured headroom, not a promise.
 
 | # | PR | kind | latency (522 ms) | throughput (batch 16) | why this order |
 |---|---|---|---|---|---|
-| 1 | Timeline view in the profile: union busy, per-stream busy, stage ranges, gap attribution, SM fill (§7.3) | library | 0 (enables the rest) | 0 | every decision below needs it; removes the false "unreliable" for overlapping streams |
+| 1 | Timeline view in the profile: union busy, per-stream busy, stage ranges, gap attribution, SM fill (§6.3) | library | 0 (enables the rest) | 0 | every decision below needs it; removes the false "unreliable" for overlapping streams |
 | 2 | Asynchronous stop check in the batched VoxCPM loop (§3.3) | workload | 0 (batch 1 has it) | **−14 ms per run, −1.5 %** (measured, identical latents) | measured, small, independent |
-| 3 | Declared concurrency: `kernel_agent.concurrency`, `e2e_activity` hidden-work check, prompt and knowledge (§7.2) | library + evaluator | 0 directly | 0 directly | makes 6 expressible and safe |
+| 3 | Declared concurrency: `kernel_agent.concurrency`, `e2e_activity` hidden-work check, prompt and knowledge (§6.2) | library + evaluator | 0 directly | 0 directly | makes 6 expressible and safe |
 | 4 | PDL in the kernel toolkit: launch helper, idiom, verified example, doctor probe | library | −9…−24 ms (2–5 %): 8.8 ms of visible boundary gaps, ~0.9 µs × 474 boundaries per patch at most | −21…−119 ms (2–13 %): 20.8 ms visible, 2,326 boundaries per patch at most | measured: graph + PDL reaches the DRAM floor |
 | 5 | Warp-specialised weight streaming for the fused LocDiT layer: cross-phase and cross-layer prefetch, PDL between layers (#134 stage 2, #133 for TMA) | kernel target | **−130 ms → ~390 ms (1.34×)** at the LM kernel's 80 % of DRAM | small (batch-16 LocDiT is GEMM-bound, #132) | the largest measured headroom |
 | 6 | Graphed streaming VAE on a side stream; pipelined VAE across batched runs | transform (needs 3) | −2…−3 ms; time to first audio ~523 → ~20 ms | −0.7 % (measured) | only after 3 |
 | 7 | Serialization points: `sr_cond` made once (no pageable copy), no `.cpu()` before the VAE, the prefill's first-copy gap | transform | −2…−3 ms | ≤ 3 ms (4 gaps > 0.5 ms, 7.4 ms, of which the final audio copy, 4.1 ms, stays) | cheap, below the 1 % bar alone |
 | 8 | Green contexts in the toolkit: disjoint splits, partition-aware grids (`cc.sm_count()`), capture inside a partition | library | isolation only; at most the ~15 ms VAE tail, once the loop's kernels are DRAM-bound on 62 SMs (after 5) | not positive in any pair measured | only with 5 and 6 |
 | 9 | Continuous batching workload (natural lengths, slot refill) | workload + objective | 0 | up to 1.31× at natural length for the default texts; 0 at fixed length | changes the benchmark: review first |
-| 10 | Multi-GPU replicas over the GPU pool (§6) | library | 0 | × number of GPUs | when a second GPU exists |
 
 Outlook on this GPU: latency 522 → ~390 ms (PR 5) → ~370 ms (PRs 4 and 7), about 1.4×;
 throughput 6.05 → ~5.9 ms per audio second from PRs 2, 4 and 6 at fixed length, more at natural
 length with PR 9. Streams, partitions and pipelining are each ≤ 1 % for one request.
 
-### 8.2 Proposed follow-up issues (not opened)
+### 7.2 Proposed follow-up issues (not opened)
 
 1. **Profile timeline: union GPU busy, per-stream view, stage ranges and idle-gap attribution.**
    `kernel_profile` sums kernel times, so overlapping streams exceed the wall time and the
@@ -696,10 +669,7 @@ length with PR 9. Streams, partitions and pipelining are each ≤ 1 % for one re
    teacher forcing with slot reuse and per-request latency in `metric_detail`. Worth up to 1.31×
    for the default texts at natural length (mean / max 0.76), nothing at fixed length: decide the
    benchmark definition first.
-9. **Multi-GPU replicas over the GPU pool.** `devices=` workload option with one replica per GPU
-   and a router, evaluation on a GPU set from the pool, A/B on the same set, per-device timelines,
-   integrity checks covering other devices. Pipeline and tensor parallelism only with design
-   review (§6: PCIe all-reduces cost more than TP saves at batch 1).
+
 
 ## Appendix: script excerpts
 
