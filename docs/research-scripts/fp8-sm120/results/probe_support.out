@@ -1,0 +1,34 @@
+NVIDIA GeForce RTX 5070 Ti (12, 0) 2.14.1+cu130
+M=352 N=2560 K=1024
+  _scaled_mm tensorwise                        OK   rel err vs fp32 math of the codes 1.66e-03
+  _scaled_mm rowwise                           OK   rel err vs fp32 math of the codes 1.66e-03
+  F.scaled_mm 1x128 (row-major) x 128x128 [N/128,K/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (row-major) x 128x128 [K/128,N/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (M-major) x 128x128 [N/128,K/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (M-major) x 128x128 [K/128,N/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 x 1x128                    FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm MXFP8 (1x32 e8m0, swizzled)      OK   rel err vs fp32 math of the codes 1.66e-03
+  _scaled_mm MXFP8 (old API)                   OK   rel err vs fp32 math of the codes 1.66e-03
+  (fp8 codes: 360448 activations)
+M=22 N=2560 K=1024
+  _scaled_mm tensorwise                        OK   rel err vs fp32 math of the codes 1.66e-03
+  _scaled_mm rowwise                           OK   rel err vs fp32 math of the codes 1.66e-03
+  F.scaled_mm 1x128 (row-major) x 128x128 [N/128,K/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (row-major) x 128x128 [K/128,N/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (M-major) x 128x128 [N/128,K/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (M-major) x 128x128 [K/128,N/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 x 1x128                    FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm MXFP8 (1x32 e8m0, swizzled)      OK   rel err vs fp32 math of the codes 1.65e-03
+  _scaled_mm MXFP8 (old API)                   OK   rel err vs fp32 math of the codes 1.65e-03
+  (fp8 codes: 22528 activations)
+M=16 N=2048 K=6144
+  _scaled_mm tensorwise                        OK   rel err vs fp32 math of the codes 1.66e-03
+  _scaled_mm rowwise                           OK   rel err vs fp32 math of the codes 1.64e-03
+  F.scaled_mm 1x128 (row-major) x 128x128 [N/128,K/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (row-major) x 128x128 [K/128,N/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (M-major) x 128x128 [N/128,K/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 (M-major) x 128x128 [K/128,N/128] FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm 1x128 x 1x128                    FAIL NotImplementedError: DeepSeek style (1x128, 128x128) scaling only supported in CUDA for SM90
+  F.scaled_mm MXFP8 (1x32 e8m0, swizzled)      OK   rel err vs fp32 math of the codes 1.68e-03
+  _scaled_mm MXFP8 (old API)                   OK   rel err vs fp32 math of the codes 1.68e-03
+  (fp8 codes: 98304 activations)

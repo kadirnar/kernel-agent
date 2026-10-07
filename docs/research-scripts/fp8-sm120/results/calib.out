@@ -1,0 +1,77 @@
+  WeightNorm.apply(module, name, dim)
+Loading AudioVAE from pytorch: /home/kadir/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/32279effe8c19989596f05d353d1447f51d9e915/audiovae.pth
+Running on device: cuda, dtype: bfloat16
+Loading model from safetensors: /home/kadir/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/32279effe8c19989596f05d353d1447f51d9e915/model.safetensors
+## input-channel outliers (text A): max channel amax / median channel amax
+  LocDiT       down_proj  median ratio     13.3  max   1052.6 (channel 3882, feat_decoder.estimator.decoder.layers.0.mlp.down_proj)
+  LocDiT       gate_proj  median ratio      7.3  max     16.5 (channel 497, feat_decoder.estimator.decoder.layers.0.mlp.gate_proj)
+  LocDiT       k_proj     median ratio      9.8  max     20.9 (channel 497, feat_decoder.estimator.decoder.layers.1.self_attn.k_proj)
+  LocDiT       linear_1   median ratio 1000000015047466219876688855040.0  max 1000000015047466219876688855040.0 (channel 512, feat_decoder.estimator.delta_time_mlp.linear_1)
+  LocDiT       linear_2   median ratio   2758.8  max   2758.8 (channel 654, feat_decoder.estimator.delta_time_mlp.linear_2)
+  LocDiT       o_proj     median ratio      3.6  max     31.0 (channel 337, feat_decoder.estimator.decoder.layers.0.self_attn.o_proj)
+  LocDiT       out_proj   median ratio     13.7  max     13.7 (channel 247, feat_decoder.estimator.out_proj)
+  LocDiT       q_proj     median ratio      9.8  max     20.9 (channel 497, feat_decoder.estimator.decoder.layers.1.self_attn.q_proj)
+  LocDiT       up_proj    median ratio      7.3  max     16.5 (channel 497, feat_decoder.estimator.decoder.layers.0.mlp.up_proj)
+  LocDiT       v_proj     median ratio      9.8  max     20.9 (channel 497, feat_decoder.estimator.decoder.layers.1.self_attn.v_proj)
+  LocEnc       down_proj  median ratio     11.1  max    224.3 (channel 787, feat_encoder.encoder.layers.0.mlp.down_proj)
+  LocEnc       gate_proj  median ratio      6.3  max     13.8 (channel 372, feat_encoder.encoder.layers.1.mlp.gate_proj)
+  LocEnc       k_proj     median ratio      9.3  max     16.9 (channel 372, feat_encoder.encoder.layers.1.self_attn.k_proj)
+  LocEnc       o_proj     median ratio      2.5  max    232.8 (channel 224, feat_encoder.encoder.layers.0.self_attn.o_proj)
+  LocEnc       q_proj     median ratio      9.3  max     16.9 (channel 372, feat_encoder.encoder.layers.1.self_attn.q_proj)
+  LocEnc       up_proj    median ratio      6.3  max     13.8 (channel 372, feat_encoder.encoder.layers.1.mlp.up_proj)
+  LocEnc       v_proj     median ratio      9.3  max     16.9 (channel 372, feat_encoder.encoder.layers.1.self_attn.v_proj)
+  base LM      down_proj  median ratio     41.3  max   6345.4 (channel 523, base_lm.layers.2.mlp.down_proj)
+  base LM      gate_proj  median ratio     11.9  max    183.6 (channel 762, base_lm.layers.2.mlp.gate_proj)
+  base LM      k_proj     median ratio     28.5  max    396.4 (channel 1299, base_lm.layers.0.self_attn.k_proj)
+  base LM      o_proj     median ratio      6.7  max     18.8 (channel 1148, base_lm.layers.0.self_attn.o_proj)
+  base LM      q_proj     median ratio     28.5  max    396.4 (channel 1299, base_lm.layers.0.self_attn.q_proj)
+  base LM      up_proj    median ratio     11.9  max    183.6 (channel 762, base_lm.layers.2.mlp.up_proj)
+  base LM      v_proj     median ratio     28.5  max    396.4 (channel 1299, base_lm.layers.0.self_attn.v_proj)
+  residual LM  down_proj  median ratio     53.8  max     91.3 (channel 2860, residual_lm.layers.1.mlp.down_proj)
+  residual LM  gate_proj  median ratio     12.6  max     17.5 (channel 375, residual_lm.layers.7.mlp.gate_proj)
+  residual LM  k_proj     median ratio     21.0  max     25.9 (channel 375, residual_lm.layers.6.self_attn.k_proj)
+  residual LM  o_proj     median ratio      4.6  max      7.0 (channel 1914, residual_lm.layers.1.self_attn.o_proj)
+  residual LM  q_proj     median ratio     21.0  max     25.9 (channel 375, residual_lm.layers.6.self_attn.q_proj)
+  residual LM  up_proj    median ratio     12.6  max     17.5 (channel 375, residual_lm.layers.7.mlp.up_proj)
+  residual LM  v_proj     median ratio     21.0  max     25.9 (channel 375, residual_lm.layers.6.self_attn.v_proj)
+
+## text B: activation quantisation error (rel L2 of x itself; mean / max over calls)
+| module | linear | calls | per token | 1x128 | MXFP8 ceil | per tensor dynamic | static (A amax) | static saturates (calls) | max amax B/A |
+|---|---|---|---|---|---|---|---|---|---|
+| LocDiT | down_proj | 1080 | 0.0249 / 0.0266 | 0.0195 / 0.0225 | 0.0269 / 0.0415 | 0.0259 / 0.0284 | 0.0268 / 0.1385 | 2.6 % | 1.56 |
+| LocDiT | gate_proj | 1080 | 0.0235 / 0.0261 | 0.0210 / 0.0243 | 0.0274 / 0.0416 | 0.0263 / 0.0307 | 0.0260 / 0.0296 | 0.0 % | 1.00 |
+| LocDiT | k_proj | 1080 | 0.0212 / 0.0254 | 0.0169 / 0.0231 | 0.0269 / 0.0410 | 0.0253 / 0.0304 | 0.0256 / 0.0304 | 0.6 % | 1.01 |
+| LocDiT | linear_1 | 180 | 0.0108 / 0.0226 | 0.0107 / 0.0224 | 0.0098 / 0.0203 | 0.0108 / 0.0226 | 0.0108 / 0.0226 | 0.0 % | 1.00 |
+| LocDiT | linear_2 | 180 | 0.0274 / 0.0285 | 0.0212 / 0.0257 | 0.0242 / 0.0274 | 0.0274 / 0.0285 | 0.0284 / 0.0299 | 0.0 % | 1.00 |
+| LocDiT | o_proj | 1080 | 0.0261 / 0.0269 | 0.0251 / 0.0265 | 0.0266 / 0.0307 | 0.0264 / 0.0278 | 0.0265 / 0.0287 | 2.6 % | 1.17 |
+| LocDiT | out_proj | 90 | 0.0208 / 0.0255 | 0.0142 / 0.0171 | 0.0260 / 0.0381 | 0.0240 / 0.0282 | 0.0261 / 0.0319 | 0.0 % | 0.97 |
+| LocDiT | q_proj | 1080 | 0.0212 / 0.0254 | 0.0169 / 0.0231 | 0.0269 / 0.0410 | 0.0253 / 0.0304 | 0.0256 / 0.0304 | 0.6 % | 1.01 |
+| LocDiT | up_proj | 1080 | 0.0235 / 0.0261 | 0.0210 / 0.0243 | 0.0274 / 0.0416 | 0.0263 / 0.0307 | 0.0260 / 0.0296 | 0.0 % | 1.00 |
+| LocDiT | v_proj | 1080 | 0.0212 / 0.0254 | 0.0169 / 0.0231 | 0.0269 / 0.0410 | 0.0253 / 0.0304 | 0.0256 / 0.0304 | 0.6 % | 1.01 |
+| LocEnc | down_proj | 120 | 0.0243 / 0.0271 | 0.0185 / 0.0212 | 0.0263 / 0.0312 | 0.0253 / 0.0287 | 0.0323 / 0.2820 | 5.8 % | 1.86 |
+| LocEnc | gate_proj | 120 | 0.0235 / 0.0262 | 0.0219 / 0.0250 | 0.0267 / 0.0302 | 0.0253 / 0.0283 | 0.0259 / 0.0294 | 0.0 % | 1.00 |
+| LocEnc | k_proj | 120 | 0.0221 / 0.0268 | 0.0202 / 0.0254 | 0.0272 / 0.0324 | 0.0249 / 0.0287 | 0.0253 / 0.0296 | 0.0 % | 1.00 |
+| LocEnc | o_proj | 120 | 0.0261 / 0.0270 | 0.0247 / 0.0266 | 0.0270 / 0.0326 | 0.0262 / 0.0271 | 0.0267 / 0.0302 | 2.5 % | 1.13 |
+| LocEnc | q_proj | 120 | 0.0221 / 0.0268 | 0.0202 / 0.0254 | 0.0272 / 0.0324 | 0.0249 / 0.0287 | 0.0253 / 0.0296 | 0.0 % | 1.00 |
+| LocEnc | up_proj | 120 | 0.0235 / 0.0262 | 0.0219 / 0.0250 | 0.0267 / 0.0302 | 0.0253 / 0.0283 | 0.0259 / 0.0294 | 0.0 % | 1.00 |
+| LocEnc | v_proj | 120 | 0.0221 / 0.0268 | 0.0202 / 0.0254 | 0.0272 / 0.0324 | 0.0249 / 0.0287 | 0.0253 / 0.0296 | 0.0 % | 1.00 |
+| base LM | down_proj | 280 | 0.0244 / 0.0293 | 0.0198 / 0.0242 | 0.0263 / 0.0545 | 0.0244 / 0.0293 | 0.0278 / 0.1520 | 1.4 % | 1.27 |
+| base LM | gate_proj | 280 | 0.0251 / 0.0274 | 0.0238 / 0.0269 | 0.0267 / 0.0354 | 0.0251 / 0.0274 | 0.0262 / 0.0320 | 0.0 % | 1.00 |
+| base LM | k_proj | 280 | 0.0171 / 0.0267 | 0.0143 / 0.0204 | 0.0263 / 0.0494 | 0.0171 / 0.0267 | 0.0251 / 0.0414 | 0.7 % | 1.01 |
+| base LM | o_proj | 280 | 0.0260 / 0.0293 | 0.0251 / 0.0298 | 0.0266 / 0.0308 | 0.0260 / 0.0293 | 0.0265 / 0.0834 | 2.1 % | 1.48 |
+| base LM | q_proj | 280 | 0.0171 / 0.0267 | 0.0143 / 0.0204 | 0.0263 / 0.0494 | 0.0171 / 0.0267 | 0.0251 / 0.0414 | 0.7 % | 1.01 |
+| base LM | up_proj | 280 | 0.0251 / 0.0274 | 0.0238 / 0.0269 | 0.0267 / 0.0354 | 0.0251 / 0.0274 | 0.0262 / 0.0320 | 0.0 % | 1.00 |
+| base LM | v_proj | 280 | 0.0171 / 0.0267 | 0.0143 / 0.0204 | 0.0263 / 0.0494 | 0.0171 / 0.0267 | 0.0251 / 0.0414 | 0.7 % | 1.01 |
+| residual LM | down_proj | 80 | 0.0246 / 0.0293 | 0.0186 / 0.0214 | 0.0266 / 0.0370 | 0.0246 / 0.0293 | 0.0307 / 0.3281 | 1.2 % | 1.80 |
+| residual LM | gate_proj | 80 | 0.0246 / 0.0263 | 0.0229 / 0.0250 | 0.0260 / 0.0326 | 0.0246 / 0.0263 | 0.0265 / 0.0321 | 0.0 % | 0.95 |
+| residual LM | k_proj | 80 | 0.0211 / 0.0276 | 0.0191 / 0.0240 | 0.0256 / 0.0426 | 0.0211 / 0.0276 | 0.0240 / 0.0308 | 2.5 % | 1.01 |
+| residual LM | o_proj | 80 | 0.0264 / 0.0282 | 0.0256 / 0.0270 | 0.0266 / 0.0285 | 0.0264 / 0.0282 | 0.0265 / 0.0309 | 8.8 % | 1.17 |
+| residual LM | q_proj | 80 | 0.0211 / 0.0276 | 0.0191 / 0.0240 | 0.0256 / 0.0426 | 0.0211 / 0.0276 | 0.0240 / 0.0308 | 2.5 % | 1.01 |
+| residual LM | up_proj | 80 | 0.0246 / 0.0263 | 0.0229 / 0.0250 | 0.0260 / 0.0326 | 0.0246 / 0.0263 | 0.0265 / 0.0321 | 0.0 % | 0.95 |
+| residual LM | v_proj | 80 | 0.0211 / 0.0276 | 0.0191 / 0.0240 | 0.0256 / 0.0426 | 0.0211 / 0.0276 | 0.0240 / 0.0308 | 2.5 % | 1.01 |
+
+## KV cache: base LM 28 layers, length A 46, B 48 tokens (residual LM 8 layers, length 48); 28 KB per token (bf16, base LM)
+  K/V amax over layers (A): K 4.91..21.75, V 0.195..18.500; layers where B exceeds A's static scale: K 43 %, V 54 %
+  e4m3 static per-tensor (A)    rel L2 of K/V: mean 0.0275 max 0.0547
+  e4m3 per-tensor dynamic       rel L2 of K/V: mean 0.0264 max 0.0271
+  e4m3 per token+head           rel L2 of K/V: mean 0.0250 max 0.0261

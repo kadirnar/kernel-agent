@@ -1,0 +1,5 @@
+clock state 1.0
+L=   77: KV   1.26 MB/layer bf16 | bf16   2.75 us (  458 GB/s) | e4m3   3.07 us (  205 GB/s) | 0.90x | out rel err (random K/V) 0.037
+L=  512: KV   8.39 MB/layer bf16 | bf16  11.82 us (  709 GB/s) | e4m3   9.81 us (  427 GB/s) | 1.21x | out rel err (random K/V) 0.039
+L= 2048: KV  33.55 MB/layer bf16 | bf16  42.25 us (  794 GB/s) | e4m3  32.62 us (  514 GB/s) | 1.29x | out rel err (random K/V) 0.039
+L= 8192: KV 134.22 MB/layer bf16 | bf16 161.74 us (  830 GB/s) | e4m3 123.00 us (  546 GB/s) | 1.31x | out rel err (random K/V) 0.039

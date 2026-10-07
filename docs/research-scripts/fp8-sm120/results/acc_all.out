@@ -1,0 +1,105 @@
+LocDiT layer 0 input: 320 non-zero rows of 352, crest (amax/RMS) per token median 7.5
+  self_attn.q_proj input channel amax: median 0.789, top [(497, 12.3), (247, 7.8), (1009, 5.6)]
+  self_attn.o_proj input channel amax: median 0.161, top [(73, 6.1), (969, 5.0), (201, 4.9)]
+  mlp.gate_proj input channel amax: median 0.746, top [(497, 17.5), (247, 8.8), (1009, 5.7)]
+  mlp.down_proj input channel amax: median 0.375, top [(991, 844.0), (3882, 768.0), (3208, 420.0)]
+
+## LocDiT layer 0, each nn.Linear alone (captured input, rel L2 vs bf16)
+| linear (rows) | FP8 weights only | tensorwise | rowwise | per channel x 1x128 groups | blockwise | MXFP8 OCP floor scale | MXFP8 ceil scale | static per-tensor activations | SmoothQuant a=0.5 + rowwise |
+|---|---|---|---|---|---|---|---|---|---|
+| self_attn.q_proj (352) | 0.006 | 0.009 | 0.008 | 0.008 | 0.008 | 0.013 | 0.008 | 0.008 | 0.008 |
+| self_attn.k_proj (352) | 0.009 | 0.013 | 0.012 | 0.012 | 0.012 | 0.016 | 0.013 | 0.013 | 0.012 |
+| self_attn.v_proj (352) | 0.015 | 0.021 | 0.020 | 0.020 | 0.020 | 0.027 | 0.021 | 0.021 | 0.021 |
+| self_attn.o_proj (352) | 0.005 | 0.009 | 0.007 | 0.006 | 0.006 | 0.041 **fail** (norm 4.0%) | 0.007 | 0.009 | 0.007 |
+| mlp.gate_proj (352) | 0.015 | 0.020 | 0.019 | 0.019 | 0.018 | 0.027 | 0.023 | 0.020 | 0.018 |
+| mlp.up_proj (352) | 0.014 | 0.019 | 0.018 | 0.017 | 0.018 | 0.024 | 0.021 | 0.019 | 0.018 |
+| mlp.down_proj (352) | 0.006 | 0.008 | 0.007 | 0.005 | 0.006 | 0.021 **fail** (norm 2.0%) | 0.007 | 0.008 | 0.003 |
+
+## LocDiT decoder layer 0, M = 352 (outputs: hidden, k, v)
+bf16 (reference math, fp32)                      cap: pass cos 1.00000 rel 0.0033 elem 0.06 norm 0.10% | redrawn: 0/30 fail, max rel 0.0015 max elem 0.04 max norm 0.00%
+FP8 weights only (per channel)                   cap: pass cos 0.99989 rel 0.0151 elem 0.14 norm 0.22% | redrawn: 0/30 fail, max rel 0.0268 max elem 0.38 max norm 0.08%
+W8A8 tensorwise (per tensor x per tensor)        cap: pass cos 0.99979 rel 0.0205 elem 0.25 norm 0.46% | redrawn: 0/30 fail, max rel 0.0379 max elem 0.44 max norm 0.40%
+W8A8 rowwise (per channel x per token)           cap: pass cos 0.99979 rel 0.0204 elem 0.19 norm 0.21% | redrawn: 0/30 fail, max rel 0.0377 max elem 0.38 max norm 0.15%
+W8A8 per channel x 1x128 groups                  cap: pass cos 0.99979 rel 0.0203 elem 0.17 norm 0.11% | redrawn: 0/30 fail, max rel 0.0376 max elem 0.49 max norm 0.13%
+W8A8 blockwise (128x128 x 1x128)                 cap: pass cos 0.99981 rel 0.0195 elem 0.18 norm 0.66% | redrawn: 0/30 fail, max rel 0.0375 max elem 0.53 max norm 0.16%
+W8A8 1x128 x 1x128                               cap: pass cos 0.99981 rel 0.0195 elem 0.15 norm 0.64% | redrawn: 0/30 fail, max rel 0.0372 max elem 0.39 max norm 0.10%
+MXFP8 OCP floor scale (1x32 x 1x32)              cap: FAIL cos 0.99969 rel 0.0399 elem 0.41 norm 3.90% | redrawn: 0/30 fail, max rel 0.0443 max elem 0.50 max norm 0.78%
+MXFP8 ceil scale (1x32 x 1x32)                   cap: pass cos 0.99979 rel 0.0205 elem 0.17 norm 0.92% | redrawn: 0/30 fail, max rel 0.0380 max elem 0.44 max norm 0.17%
+W8A8 static per-tensor activations (calibrated)  cap: pass cos 0.99978 rel 0.0209 elem 0.24 norm 0.06% | redrawn: 0/30 fail, max rel 0.0379 max elem 0.46 max norm 0.07%
+SmoothQuant a=0.5 + rowwise                      cap: pass cos 0.99978 rel 0.0209 elem 0.17 norm 0.27% | redrawn: 0/30 fail, max rel 0.0378 max elem 0.38 max norm 0.12%
+SmoothQuant a=0.5 + static per-tensor            cap: pass cos 0.99978 rel 0.0209 elem 0.18 norm 0.65% | redrawn: 6/30 fail, max rel 0.1032 max elem 2.67 max norm 2.28%
+
+## LocDiT layer 0, attention in FP8 (GEMMs bf16)
+attention none       (SDPA output rel L2 vs torch 0.0012) cap: pass cos 1.00000 rel 0.0011 elem 0.06 norm 0.02% | redrawn: 0/30 fail, max rel 0.0015 max elem 0.04 max norm 0.00%
+attention qk         (SDPA output rel L2 vs torch 0.0297) cap: pass cos 1.00000 rel 0.0033 elem 0.06 norm 0.15% | redrawn: 0/30 fail, max rel 0.0019 max elem 0.04 max norm 0.00%
+attention qkpv       (SDPA output rel L2 vs torch 0.0379) cap: pass cos 1.00000 rel 0.0035 elem 0.06 norm 0.17% | redrawn: 0/30 fail, max rel 0.0028 max elem 0.06 max norm 0.01%
+
+## LocDiT layer 0, rowwise W8A8 GEMMs + FP8 attention (qkpv)
+rowwise + qkpv                                   cap: pass cos 0.99979 rel 0.0204 elem 0.19 norm 0.21% | redrawn: 0/30 fail, max rel 0.0377 max elem 0.38 max norm 0.15%
+
+## base-LM decoder layer 0, decode (M = 1), forward_step with its KV cache
+
+### decode step 1 (position 16, 17 cached tokens; K amax 4.9 rms 0.75, V amax 0.20 rms 0.014)
+bf16 (reference math, fp32)                      cap: pass cos 1.00000 rel 0.0002 elem 0.01 norm 0.00% | redrawn: 0/10 fail, max rel 0.0001 max elem 0.00 max norm 0.00%
+FP8 weights only (per channel)                   cap: pass cos 0.99999 rel 0.0043 elem 0.03 norm 0.01% | redrawn: 0/10 fail, max rel 0.0086 max elem 0.04 max norm 0.05%
+W8A8 tensorwise (per tensor x per tensor)        cap: pass cos 0.99998 rel 0.0058 elem 0.04 norm 0.02% | redrawn: 0/10 fail, max rel 0.0123 max elem 0.15 max norm 0.14%
+W8A8 rowwise (per channel x per token)           cap: pass cos 0.99998 rel 0.0060 elem 0.04 norm 0.03% | redrawn: 0/10 fail, max rel 0.0122 max elem 0.10 max norm 0.08%
+W8A8 per channel x 1x128 groups                  cap: pass cos 0.99998 rel 0.0081 elem 0.05 norm 0.49% | redrawn: 0/10 fail, max rel 0.0117 max elem 0.05 max norm 0.08%
+W8A8 blockwise (128x128 x 1x128)                 cap: pass cos 0.99998 rel 0.0078 elem 0.05 norm 0.45% | redrawn: 0/10 fail, max rel 0.0113 max elem 0.07 max norm 0.13%
+W8A8 1x128 x 1x128                               cap: pass cos 0.99998 rel 0.0079 elem 0.05 norm 0.46% | redrawn: 0/10 fail, max rel 0.0117 max elem 0.05 max norm 0.08%
+MXFP8 OCP floor scale (1x32 x 1x32)              cap: pass cos 0.99995 rel 0.0138 elem 0.10 norm 0.95% | redrawn: 0/10 fail, max rel 0.0199 max elem 0.18 max norm 0.62%
+MXFP8 ceil scale (1x32 x 1x32)                   cap: pass cos 0.99998 rel 0.0059 elem 0.04 norm 0.01% | redrawn: 0/10 fail, max rel 0.0139 max elem 0.08 max norm 0.31%
+W8A8 static per-tensor activations (calibrated)  cap: pass cos 0.99995 rel 0.0101 elem 0.07 norm 0.02% | redrawn: 1/10 fail, max rel 0.1360 max elem 0.85 max norm 4.21%
+SmoothQuant a=0.5 + rowwise                      cap: pass cos 0.99998 rel 0.0062 elem 0.04 norm 0.00% | redrawn: 0/10 fail, max rel 0.0123 max elem 0.08 max norm 0.25%
+SmoothQuant a=0.5 + static per-tensor            cap: FAIL cos 0.99871 rel 0.0681 elem 0.52 norm 4.67% | redrawn: 3/10 fail, max rel 0.1267 max elem 1.17 max norm 4.12%
+KV fp32 math (no quant)                          (SDPA rel L2 0.0018) cap: pass cos 1.00000 rel 0.0007 elem 0.01 norm 0.00% | redrawn: 0/10 fail, max rel 0.0021 max elem 0.04 max norm 0.05%
+KV e4m3 per-tensor, calibrated scale             (SDPA rel L2 0.0164) cap: pass cos 1.00000 rel 0.0009 elem 0.03 norm 0.00% | redrawn: 0/10 fail, max rel 0.0025 max elem 0.04 max norm 0.06%
+KV e4m3 per-tensor, scale 1.0 (uncalibrated)     (SDPA rel L2 0.0335) cap: pass cos 1.00000 rel 0.0011 elem 0.02 norm 0.00% | redrawn: 0/10 fail, max rel 0.0025 max elem 0.04 max norm 0.06%
+KV e4m3 per token and head                       (SDPA rel L2 0.0154) cap: pass cos 1.00000 rel 0.0008 elem 0.01 norm 0.00% | redrawn: 0/10 fail, max rel 0.0013 max elem 0.02 max norm 0.01%
+
+### decode step 31 (position 46, 47 cached tokens; K amax 4.9 rms 0.65, V amax 0.20 rms 0.013)
+
+Each nn.Linear alone (captured input, rel L2 vs bf16):
+| linear (rows) | FP8 weights only | tensorwise | rowwise | per channel x 1x128 groups | blockwise | MXFP8 OCP floor scale | MXFP8 ceil scale | static per-tensor activations | SmoothQuant a=0.5 + rowwise |
+|---|---|---|---|---|---|---|---|---|---|
+| self_attn.q_proj (1) | 0.017 | 0.036 **fail** (norm 2.3%) | 0.037 **fail** (norm 2.4%) | 0.018 | 0.019 | 0.037 **fail** (norm 2.0%) | 0.023 | 0.019 | 0.024 |
+| self_attn.k_proj (1) | 0.012 | 0.026 | 0.021 | 0.013 | 0.019 | 0.038 **fail** (norm 2.2%) | 0.026 | 0.013 | 0.023 |
+| self_attn.v_proj (1) | 0.024 | 0.037 | 0.037 | 0.028 | 0.030 | 0.041 | 0.028 | 0.030 | 0.036 |
+| self_attn.o_proj (1) | 0.011 | 0.012 | 0.013 | 0.015 | 0.014 | 0.018 | 0.011 | 0.013 | 0.011 |
+| mlp.gate_proj (1) | 0.017 | 0.024 | 0.024 | 0.023 | 0.024 | 0.028 | 0.025 | 0.025 | 0.024 |
+| mlp.up_proj (1) | 0.018 | 0.026 | 0.026 | 0.025 | 0.026 | 0.029 | 0.026 | 0.026 | 0.026 |
+| mlp.down_proj (1) | 0.008 | 0.011 | 0.011 | 0.010 | 0.010 | 0.013 | 0.010 | 0.011 | 0.011 |
+bf16 (reference math, fp32)                      cap: pass cos 1.00000 rel 0.0000 elem 0.00 norm 0.00% | redrawn: 0/10 fail, max rel 0.0002 max elem 0.01 max norm 0.00%
+FP8 weights only (per channel)                   cap: pass cos 0.99999 rel 0.0041 elem 0.03 norm 0.01% | redrawn: 0/10 fail, max rel 0.0076 max elem 0.04 max norm 0.03%
+W8A8 tensorwise (per tensor x per tensor)        cap: pass cos 0.99998 rel 0.0073 elem 0.05 norm 0.40% | redrawn: 0/10 fail, max rel 0.0108 max elem 0.15 max norm 0.05%
+W8A8 rowwise (per channel x per token)           cap: pass cos 0.99999 rel 0.0053 elem 0.04 norm 0.01% | redrawn: 0/10 fail, max rel 0.0107 max elem 0.07 max norm 0.07%
+W8A8 per channel x 1x128 groups                  cap: pass cos 0.99999 rel 0.0051 elem 0.03 norm 0.02% | redrawn: 0/10 fail, max rel 0.0105 max elem 0.04 max norm 0.05%
+W8A8 blockwise (128x128 x 1x128)                 cap: pass cos 0.99999 rel 0.0049 elem 0.05 norm 0.01% | redrawn: 0/10 fail, max rel 0.0105 max elem 0.09 max norm 0.08%
+W8A8 1x128 x 1x128                               cap: pass cos 0.99999 rel 0.0048 elem 0.03 norm 0.01% | redrawn: 0/10 fail, max rel 0.0105 max elem 0.07 max norm 0.07%
+MXFP8 OCP floor scale (1x32 x 1x32)              cap: pass cos 0.99998 rel 0.0081 elem 0.06 norm 0.44% | redrawn: 0/10 fail, max rel 0.0172 max elem 0.19 max norm 0.45%
+MXFP8 ceil scale (1x32 x 1x32)                   cap: pass cos 0.99999 rel 0.0052 elem 0.04 norm 0.01% | redrawn: 0/10 fail, max rel 0.0139 max elem 0.08 max norm 0.30%
+W8A8 static per-tensor activations (calibrated)  cap: pass cos 0.99998 rel 0.0059 elem 0.04 norm 0.02% | redrawn: 1/10 fail, max rel 0.1152 max elem 0.68 max norm 3.24%
+SmoothQuant a=0.5 + rowwise                      cap: pass cos 0.99999 rel 0.0052 elem 0.04 norm 0.01% | redrawn: 0/10 fail, max rel 0.0110 max elem 0.10 max norm 0.21%
+SmoothQuant a=0.5 + static per-tensor            cap: pass cos 0.99971 rel 0.0277 elem 0.30 norm 1.36% | redrawn: 3/10 fail, max rel 0.1104 max elem 1.07 max norm 3.22%
+KV fp32 math (no quant)                          (SDPA rel L2 0.0009) cap: pass cos 1.00000 rel 0.0004 elem 0.01 norm 0.00% | redrawn: 0/10 fail, max rel 0.0011 max elem 0.02 max norm 0.00%
+KV e4m3 per-tensor, calibrated scale             (SDPA rel L2 0.0080) cap: pass cos 1.00000 rel 0.0008 elem 0.02 norm 0.00% | redrawn: 0/10 fail, max rel 0.0015 max elem 0.02 max norm 0.01%
+KV e4m3 per-tensor, scale 1.0 (uncalibrated)     (SDPA rel L2 0.0152) cap: pass cos 1.00000 rel 0.0009 elem 0.02 norm 0.00% | redrawn: 0/10 fail, max rel 0.0012 max elem 0.02 max norm 0.01%
+KV e4m3 per token and head                       (SDPA rel L2 0.0074) cap: pass cos 1.00000 rel 0.0009 elem 0.02 norm 0.01% | redrawn: 0/10 fail, max rel 0.0018 max elem 0.04 max norm 0.03%
+
+### decode step 60 (position 75, 76 cached tokens; K amax 4.9 rms 0.67, V amax 0.20 rms 0.013)
+bf16 (reference math, fp32)                      cap: pass cos 1.00000 rel 0.0000 elem 0.00 norm 0.00% | redrawn: 0/10 fail, max rel 0.0003 max elem 0.01 max norm 0.00%
+FP8 weights only (per channel)                   cap: pass cos 0.99999 rel 0.0034 elem 0.02 norm 0.01% | redrawn: 0/10 fail, max rel 0.0090 max elem 0.04 max norm 0.07%
+W8A8 tensorwise (per tensor x per tensor)        cap: pass cos 0.99999 rel 0.0046 elem 0.03 norm 0.00% | redrawn: 0/10 fail, max rel 0.0126 max elem 0.13 max norm 0.14%
+W8A8 rowwise (per channel x per token)           cap: pass cos 0.99999 rel 0.0047 elem 0.03 norm 0.01% | redrawn: 0/10 fail, max rel 0.0132 max elem 0.09 max norm 0.10%
+W8A8 per channel x 1x128 groups                  cap: pass cos 0.99999 rel 0.0045 elem 0.03 norm 0.01% | redrawn: 0/10 fail, max rel 0.0121 max elem 0.08 max norm 0.08%
+W8A8 blockwise (128x128 x 1x128)                 cap: pass cos 0.99999 rel 0.0044 elem 0.03 norm 0.01% | redrawn: 0/10 fail, max rel 0.0119 max elem 0.12 max norm 0.11%
+W8A8 1x128 x 1x128                               cap: pass cos 0.99999 rel 0.0043 elem 0.03 norm 0.00% | redrawn: 0/10 fail, max rel 0.0126 max elem 0.07 max norm 0.09%
+MXFP8 OCP floor scale (1x32 x 1x32)              cap: pass cos 0.99996 rel 0.0133 elem 0.11 norm 0.99% | redrawn: 0/10 fail, max rel 0.0183 max elem 0.16 max norm 0.50%
+MXFP8 ceil scale (1x32 x 1x32)                   cap: pass cos 0.99999 rel 0.0047 elem 0.05 norm 0.02% | redrawn: 0/10 fail, max rel 0.0145 max elem 0.08 max norm 0.32%
+W8A8 static per-tensor activations (calibrated)  cap: pass cos 0.99999 rel 0.0047 elem 0.03 norm 0.04% | redrawn: 1/10 fail, max rel 0.1356 max elem 0.83 max norm 4.28%
+SmoothQuant a=0.5 + rowwise                      cap: pass cos 0.99999 rel 0.0046 elem 0.03 norm 0.01% | redrawn: 0/10 fail, max rel 0.0122 max elem 0.07 max norm 0.10%
+SmoothQuant a=0.5 + static per-tensor            cap: FAIL cos 0.99954 rel 0.0420 elem 0.32 norm 2.95% | redrawn: 3/10 fail, max rel 0.1228 max elem 1.25 max norm 4.04%
+KV fp32 math (no quant)                          (SDPA rel L2 0.0009) cap: pass cos 1.00000 rel 0.0003 elem 0.01 norm 0.00% | redrawn: 0/10 fail, max rel 0.0009 max elem 0.01 max norm 0.00%
+KV e4m3 per-tensor, calibrated scale             (SDPA rel L2 0.0068) cap: pass cos 1.00000 rel 0.0006 elem 0.01 norm 0.00% | redrawn: 0/10 fail, max rel 0.0012 max elem 0.01 max norm 0.01%
+KV e4m3 per-tensor, scale 1.0 (uncalibrated)     (SDPA rel L2 0.0110) cap: pass cos 1.00000 rel 0.0006 elem 0.01 norm 0.00% | redrawn: 0/10 fail, max rel 0.0013 max elem 0.01 max norm 0.01%
+KV e4m3 per token and head                       (SDPA rel L2 0.0057) cap: pass cos 1.00000 rel 0.0008 elem 0.02 norm 0.01% | redrawn: 0/10 fail, max rel 0.0012 max elem 0.02 max norm 0.00%

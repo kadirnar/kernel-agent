@@ -1,0 +1,45 @@
+clock state 1.0
+
+### LocDiT q|k|v b1: M=22 N=2560 K=1024 (62 weight copies, L2-cold)
+  bf16                                             8.67 us    13.3 TFLOP/s     604 GB/s(W)   1.00x
+  torch tensorwise                                 8.20 us    14.1 TFLOP/s     320 GB/s(W)   1.06x
+  torch rowwise                                    9.91 us    11.6 TFLOP/s     265 GB/s(W)   0.88x
+  torch MXFP8                                      8.84 us    13.0 TFLOP/s     296 GB/s(W)   0.98x
+  Lt tensorwise                                    5.24 us    22.0 TFLOP/s     500 GB/s(W)   1.65x
+  Lt MXFP8                                         8.84 us    13.1 TFLOP/s     297 GB/s(W)   0.98x
+  Triton rowwise (example)                         8.08 us    14.3 TFLOP/s     324 GB/s(W)   1.07x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)     8.02 us    14.4 TFLOP/s     327 GB/s(W)   1.08x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)      8.20 us    14.1 TFLOP/s     320 GB/s(W)   1.06x
+
+### LocDiT o_proj b1: M=22 N=1024 K=2048 (77 weight copies, L2-cold)
+  bf16                                            12.68 us     7.3 TFLOP/s     331 GB/s(W)   1.00x
+  torch tensorwise                                10.25 us     9.0 TFLOP/s     205 GB/s(W)   1.24x
+  torch rowwise                                   15.13 us     6.1 TFLOP/s     139 GB/s(W)   0.84x
+  torch MXFP8                                     14.48 us     6.4 TFLOP/s     145 GB/s(W)   0.88x
+  Lt tensorwise                                    6.36 us    14.5 TFLOP/s     330 GB/s(W)   1.99x
+  Lt MXFP8                                        14.49 us     6.4 TFLOP/s     145 GB/s(W)   0.87x
+  Triton rowwise (example)                        13.53 us     6.8 TFLOP/s     155 GB/s(W)   0.94x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)     7.01 us    13.2 TFLOP/s     299 GB/s(W)   1.81x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)      6.61 us    14.0 TFLOP/s     317 GB/s(W)   1.92x
+
+### LocDiT gate|up b1: M=22 N=8192 K=1024 (20 weight copies, L2-cold)
+  bf16                                            21.38 us    17.3 TFLOP/s     785 GB/s(W)   1.00x
+  torch tensorwise                                11.91 us    31.0 TFLOP/s     704 GB/s(W)   1.79x
+  torch rowwise                                   15.08 us    24.5 TFLOP/s     556 GB/s(W)   1.42x
+  torch MXFP8                                     13.56 us    27.2 TFLOP/s     619 GB/s(W)   1.58x
+  Lt tensorwise                                   11.96 us    30.9 TFLOP/s     702 GB/s(W)   1.79x
+  Lt MXFP8                                        13.56 us    27.2 TFLOP/s     619 GB/s(W)   1.58x
+  Triton rowwise (example)                        11.81 us    31.2 TFLOP/s     710 GB/s(W)   1.81x
+  Triton blockwise 1x128/128x128 (16, 128, 4, 3)    11.59 us    31.9 TFLOP/s     724 GB/s(W)   1.85x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)     12.25 us    30.1 TFLOP/s     685 GB/s(W)   1.75x
+
+### LocDiT down b1: M=22 N=1024 K=4096 (39 weight copies, L2-cold)
+  bf16                                            13.16 us    14.0 TFLOP/s     637 GB/s(W)   1.00x
+  torch tensorwise                                10.25 us    18.0 TFLOP/s     409 GB/s(W)   1.28x
+  torch rowwise                                   26.49 us     7.0 TFLOP/s     158 GB/s(W)   0.50x
+  torch MXFP8                                     26.28 us     7.0 TFLOP/s     160 GB/s(W)   0.50x
+  Lt tensorwise                                    9.17 us    20.1 TFLOP/s     457 GB/s(W)   1.43x
+  Lt MXFP8                                        26.30 us     7.0 TFLOP/s     159 GB/s(W)   0.50x
+  Triton rowwise (example)                        25.54 us     7.2 TFLOP/s     164 GB/s(W)   0.52x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)    12.68 us    14.6 TFLOP/s     331 GB/s(W)   1.04x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)     12.31 us    15.0 TFLOP/s     341 GB/s(W)   1.07x

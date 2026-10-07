@@ -1,0 +1,49 @@
+clock state 1.0
+
+### LM q|k|v b16: M=16 N=2560 K=2048 (31 weight copies, L2-cold)
+  bf16                                            14.62 us    11.5 TFLOP/s     717 GB/s(W)   1.00x
+  torch tensorwise                                11.88 us    14.1 TFLOP/s     441 GB/s(W)   1.23x
+  torch rowwise                                   15.48 us    10.8 TFLOP/s     339 GB/s(W)   0.94x
+  torch MXFP8                                     14.72 us    11.4 TFLOP/s     356 GB/s(W)   0.99x
+  Lt tensorwise                                    8.63 us    19.4 TFLOP/s     607 GB/s(W)   1.69x
+  Lt MXFP8                                        14.73 us    11.4 TFLOP/s     356 GB/s(W)   0.99x
+  Triton rowwise (example)                        14.17 us    11.8 TFLOP/s     370 GB/s(W)   1.03x
+  Triton rowwise tuned BK128 (16, 64, 4, 4)       13.88 us    12.1 TFLOP/s     378 GB/s(W)   1.05x
+  Triton blockwise 1x128/128x128 (32, 64, 4, 4)    14.30 us    11.7 TFLOP/s     367 GB/s(W)   1.02x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)     14.53 us    11.6 TFLOP/s     361 GB/s(W)   1.01x
+
+### LM o_proj b16: M=16 N=2048 K=2048 (39 weight copies, L2-cold)
+  bf16                                            21.75 us     6.2 TFLOP/s     386 GB/s(W)   1.00x
+  torch tensorwise                                15.08 us     8.9 TFLOP/s     278 GB/s(W)   1.44x
+  torch rowwise                                   15.36 us     8.7 TFLOP/s     273 GB/s(W)   1.42x
+  torch MXFP8                                     14.64 us     9.2 TFLOP/s     287 GB/s(W)   1.49x
+  Lt tensorwise                                    7.60 us    17.7 TFLOP/s     552 GB/s(W)   2.86x
+  Lt MXFP8                                        14.63 us     9.2 TFLOP/s     287 GB/s(W)   1.49x
+  Triton rowwise (example)                        13.97 us     9.6 TFLOP/s     300 GB/s(W)   1.56x
+  Triton rowwise tuned BK128 (16, 64, 4, 4)        6.67 us    20.1 TFLOP/s     629 GB/s(W)   3.26x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)     7.43 us    18.1 TFLOP/s     565 GB/s(W)   2.93x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)      8.32 us    16.1 TFLOP/s     504 GB/s(W)   2.61x
+
+### LM gate|up b16: M=16 N=12288 K=2048 (7 weight copies, L2-cold)
+  bf16                                            65.84 us    12.2 TFLOP/s     764 GB/s(W)   1.00x
+  torch tensorwise                                32.21 us    25.0 TFLOP/s     781 GB/s(W)   2.04x
+  torch rowwise                                   52.17 us    15.4 TFLOP/s     482 GB/s(W)   1.26x
+  torch MXFP8                                     38.07 us    21.2 TFLOP/s     661 GB/s(W)   1.73x
+  Lt tensorwise                                   31.93 us    25.2 TFLOP/s     788 GB/s(W)   2.06x
+  Lt MXFP8                                        38.17 us    21.1 TFLOP/s     659 GB/s(W)   1.72x
+  Triton rowwise (example)                        38.11 us    21.1 TFLOP/s     660 GB/s(W)   1.73x
+  Triton rowwise tuned BK128 (16, 64, 4, 4)       31.42 us    25.6 TFLOP/s     801 GB/s(W)   2.10x
+  Triton blockwise 1x128/128x128 (16, 128, 4, 3)    31.22 us    25.8 TFLOP/s     806 GB/s(W)   2.11x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)     34.21 us    23.5 TFLOP/s     736 GB/s(W)   1.92x
+
+### LM down b16: M=16 N=2048 K=6144 (13 weight copies, L2-cold)
+  bf16                                            38.73 us    10.4 TFLOP/s     650 GB/s(W)   1.00x
+  torch tensorwise                                20.39 us    19.7 TFLOP/s     617 GB/s(W)   1.90x
+  torch rowwise                                   38.40 us    10.5 TFLOP/s     328 GB/s(W)   1.01x
+  torch MXFP8                                     38.51 us    10.5 TFLOP/s     327 GB/s(W)   1.01x
+  Lt tensorwise                                   20.53 us    19.6 TFLOP/s     613 GB/s(W)   1.89x
+  Lt MXFP8                                        38.49 us    10.5 TFLOP/s     327 GB/s(W)   1.01x
+  Triton rowwise (example)                        38.36 us    10.5 TFLOP/s     328 GB/s(W)   1.01x
+  Triton rowwise tuned BK128 (16, 64, 4, 4)       17.92 us    22.5 TFLOP/s     702 GB/s(W)   2.16x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)    22.41 us    18.0 TFLOP/s     561 GB/s(W)   1.73x
+  Triton MXFP8 dot_scaled (32, 64, 128, 4, 3)     22.55 us    17.9 TFLOP/s     558 GB/s(W)   1.72x

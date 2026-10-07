@@ -22,8 +22,9 @@ Further reading: [VoxCPM2 case study](docs/VOXCPM2.md) (7.3–7.4× vs eager,
 5.2× vs `torch.compile`) · [roadmap](docs/ROADMAP.md) ·
 [research notes](docs/RESEARCH.md) · [Triton research: libraries, agents,
 backends on sm_120](docs/RESEARCH-TRITON.md) · [parallelisation: measured
-overlap opportunities and design](docs/PARALLEL.md) · [references: what was
-taken from which project or paper](docs/REFERENCES.md).
+overlap opportunities and design](docs/PARALLEL.md) · [FP8 on sm_120: blockwise /
+MXFP8, fused FP8 activations, FP8 attention, scales, host cost](docs/FP8.md) ·
+[references: what was taken from which project or paper](docs/REFERENCES.md).
 
 ## How it works
 
