@@ -159,7 +159,12 @@ def make_run(tmp_path, *, integration: bool = True) -> RunDir:
     run = RunDir(tmp_path / "openbmb--VoxCPM2" / "20261006-004718-retest2")
     run.root.mkdir(parents=True)
     card = {"repo_id": "openbmb/VoxCPM2", "modality": "tts", "architectures": ["voxcpm2"]}
-    data = {"card": card, "created": "2026-10-06 00:47:18", "phases": {"report": {"done": True}}}
+    data = {
+        "card": card,
+        "created": "2026-10-06 00:47:18",
+        "config": {"quality": "near-lossless"},  # its targets' FP8 / reduced precisions (#131)
+        "phases": {"report": {"done": True}},
+    }
     write_json(run.run_json, data)
     write_json(run.toolchain_json, {"gpu": {"name": "NVIDIA GeForce RTX 5070 Ti"}})
     write_json(run.baseline_json, BASELINE)
