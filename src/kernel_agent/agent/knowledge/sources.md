@@ -39,10 +39,12 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://github.com/NVIDIA/CUDALibrarySamples/tree/master/cuBLASLt — runnable samples: `LtFp8Matmul` (tensor-wide scales), `LtFp8CustomFind` (algo search), `LtMxfp8Matmul`, `LtNvfp4Matmul`, `LtBlk128x128Fp8Matmul`.
 * https://developer.nvidia.com/blog/boosting-matrix-multiplication-speed-and-flexibility-with-nvidia-cublas-12-9/ — cuBLAS 12.9 scaling modes (block, outer-vector) and where they run.
 * https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/ScaledBlas.cpp — how `torch._scaled_mm` checks layouts and scale modes before cuBLASLt.
+* https://docs.nvidia.com/cuda/cublas/ — cuBLAS / cuBLASLt guide: the "Scaling Mode Support Overview" table (which FP8 scale mode runs on which compute capability; deep in the page, read with `offset`).
 
 ## CUTLASS / CuTe
 * https://github.com/NVIDIA/cutlass/tree/main/examples/79_blackwell_geforce_gemm — sm_120 NVFP4 x bf16, NVFP4 x NVFP4 and MXFP8 x MXFP6 GEMMs.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/87_blackwell_geforce_gemm_blockwise — sm_120 FP8 x FP8 -> bf16 GEMMs with blockwise / groupwise scales.
+* https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/blackwell_functionality.md — "Blackwell SM120 GEMMs": mma.sync kinds and types, TN layout only, no TMA multicast (cluster 1x1x1).
 * https://github.com/NVIDIA/cutlass/blob/main/examples/91_fp4_gemv/91_fp4_gemv.cu — FP4 GEMV.
 * https://github.com/NVIDIA/cutlass/blob/main/examples/94_ada_fp8_blockwise/ada_fp8_blockwise.cu — sm_89-class (mma.sync) FP8 blockwise GEMM.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/blackwell_geforce/kernel — CuTe DSL sm_120 kernels: `dense_gemm`, `blockscaled_gemm`.
@@ -93,6 +95,10 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://github.com/Dao-AILab/flash-attention — FlashAttention-2 (and `hopper/`: FA3).
 * https://crfm.stanford.edu/2023/10/12/flashdecoding.html — flash-decoding: split-KV for one-query decode.
 * https://github.com/vllm-project/vllm/tree/main/csrc/quantization/w8a8 — production W8A8 kernels: `fp8/` (activation quantisation), `cutlass/` (scaled GEMMs).
+* https://github.com/vllm-project/vllm/blob/main/docs/features/quantization/quantized_kvcache.md — FP8 KV cache: per-tensor / per-head scales, default 1.0 without calibration.
+* https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/decode.py — FlashInfer decode with an FP8 KV cache (`k_scale` / `v_scale`, one scalar each).
+* https://github.com/thu-ml/SageAttention — SageAttention: INT8 QKᵀ + FP8 PV attention kernels, sm_120 included (fp32 accumulation there).
+* https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm120.py — FlashAttention-4 (CuTe DSL) forward on sm_120: mma.sync bf16 / fp16, no FP8.
 * https://github.com/IST-DASLab/marlin — mixed-precision (int4 weight x fp16) GEMM near the bandwidth limit at small batch.
 
 ## Low precision (formats, scaling, accuracy)
@@ -100,6 +106,10 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://arxiv.org/abs/2310.10537 — Microscaling (MX) formats; spec: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 * https://arxiv.org/abs/2209.05433 — FP8 formats (e4m3 / e5m2) for deep learning.
 * https://arxiv.org/abs/2211.10438 — SmoothQuant: migrate activation outliers into the weights for W8A8.
+* https://arxiv.org/abs/2412.19437 — DeepSeek-V3 §3.3: FP8 recipe (1x128 activation tiles, 128x128 weight blocks, promotion to fp32 every 128 along K, online scales).
+* https://arxiv.org/abs/2402.17762 — Massive activations: a few fixed channels / tokens 10^3-10^5 x the median, acting as biases.
+* https://arxiv.org/abs/2411.10958 — SageAttention2: INT4 / INT8 QKᵀ, FP8 PV, the FP22 accumulator of FP8 mma on Ada / Hopper.
+* https://docs.nvidia.com/deeplearning/transformer-engine-releases/release-2.18/user-guide/features/low_precision_training/ — Transformer Engine FP8 recipes: delayed vs current scaling, 1x128 / 128x128 block scaling, MXFP8, and which GPUs run each.
 * https://arxiv.org/abs/2405.04532 — QServe: W4A8KV4 and its GEMM design (code: https://github.com/mit-han-lab/omniserve).
 * https://github.com/pytorch/ao/tree/main/torchao/prototype/mx_formats — MX / NVFP4 reference quantisation in PyTorch.
 

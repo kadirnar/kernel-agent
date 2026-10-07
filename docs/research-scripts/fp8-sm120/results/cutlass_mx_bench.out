@@ -1,0 +1,6 @@
+clock state 1.0
+LocDiT q|k|v     | cuBLASLt tensorwise    10.59 us (174.2 TF, err 2e-03) | cuBLASLt MXFP8     9.32 us (198.1 TF, err 2e-03) | CUTLASS MXFP8 coop 128x128x128 RuntimeError: init failed | CUTLASS MXFP8 auto 128x128x128 RuntimeError: init failed
+LocDiT o_proj    | cuBLASLt tensorwise    10.20 us (144.7 TF, err 2e-03) | cuBLASLt MXFP8    14.80 us ( 99.8 TF, err 2e-03) | CUTLASS MXFP8 coop 128x128x128 RuntimeError: init failed | CUTLASS MXFP8 auto 128x128x128 RuntimeError: init failed
+LocDiT gate|up   | cuBLASLt tensorwise    30.65 us (192.7 TF, err 2e-03) | cuBLASLt MXFP8    24.70 us (239.1 TF, err 2e-03) | CUTLASS MXFP8 coop 128x128x128 RuntimeError: init failed | CUTLASS MXFP8 auto 128x128x128 RuntimeError: init failed
+LocDiT down      | cuBLASLt tensorwise    18.45 us (160.0 TF, err 2e-03) | cuBLASLt MXFP8    26.77 us (110.3 TF, err 2e-03) | CUTLASS MXFP8 coop 128x128x128 RuntimeError: init failed | CUTLASS MXFP8 auto 128x128x128 RuntimeError: init failed
+8192^3           | cuBLASLt tensorwise  3335.53 us (329.6 TF, err 2e-03) | cuBLASLt MXFP8  3436.31 us (320.0 TF, err 2e-03) | CUTLASS MXFP8 coop 128x128x128 RuntimeError: init failed | CUTLASS MXFP8 auto 128x128x128 RuntimeError: init failed

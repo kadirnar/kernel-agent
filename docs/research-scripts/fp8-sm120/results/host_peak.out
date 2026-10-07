@@ -1,0 +1,31 @@
+  warnings.warn(
+clock state 0.8459051901451489
+
+## host time per call, eager, [16, 256] x [256, 256] (GPU work ~ a few us)
+  F.linear bf16 (cuBLAS)                                    10.0 us/call
+  torch._scaled_mm tensorwise                               18.3 us/call
+  torch._scaled_mm rowwise                                  19.6 us/call
+  F.scaled_mm MXFP8                                         27.1 us/call
+  at::_scaled_mm from C++ (pybind11)                        19.4 us/call
+  cuBLASLt direct, cached plan (pybind11)                    6.1 us/call
+  pybind11 call, empty body                                  0.4 us/call
+  CUTLASS sm120 blockwise (load_inline, per-call init)       5.4 us/call
+  Triton e4m3 GEMM launch (prequantised x)                  12.2 us/call
+  Triton quant + GEMM (example launcher)                    43.5 us/call
+  Triton quant + GEMM via torch.library custom_op           69.2 us/call
+  4 cuBLASLt GEMMs behind one pybind11 call                 21.8 us/call (5.5 per GEMM)
+  CUDA graph replay (4 cuBLASLt GEMMs inside)                5.0 us/replay
+  CuTe DSL RMSNorm (TVM-FFI launch)                         12.4 us/call
+  CUDA C++ RMSNorm (load_inline launch)                      6.9 us/call
+  torch RMSNorm module (eager ops)                          63.3 us/call
+
+## dense peak, 8192^3, CUDA graph (min of replays)
+  bf16 cuBLAS                                     99.5 TFLOP/s
+  tensorwise cuBLASLt (direct)                   328.8 TFLOP/s
+  rowwise torch._scaled_mm                       194.1 TFLOP/s
+  MXFP8 cuBLASLt (F.scaled_mm)                   316.5 TFLOP/s
+  blockwise CUTLASS sm120 coop 128x128x128       187.9 TFLOP/s
+  blockwise CUTLASS sm120 pingpong 64x128x128    117.7 TFLOP/s
+  blockwise Triton (128x128, 8 warps)            152.2 TFLOP/s
+  MXFP8 Triton tl.dot_scaled (128x128x128)       215.3 TFLOP/s
+  rowwise Triton tl.dot (128x128x128)            186.7 TFLOP/s

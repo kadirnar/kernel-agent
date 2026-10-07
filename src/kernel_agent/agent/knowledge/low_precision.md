@@ -120,6 +120,12 @@ a power-of-two (e8m0) scale per 32.
 * `torch._scaled_mm`: FP8 row-wise scales and NVFP4 (`float4_e2m1fn_x2` with
   e4m3 block scales, 128-row padded scale layout) both work, but they quantise
   the activations too (W8A8 / W4A4; usage and limits under "FP8 W8A8").
+* Rates (register-only `mma.sync`, docs/RESEARCH-TRITON.md §1.1): e4m3 with fp32
+  accumulation (`QMMA.F32`) 208 TFLOP/s, the block-scaled e4m3 instruction
+  (`kind::mxf8f6f4.block_scale`, `QMMA.SF`) 416, bf16 104. Every FP8 kernel on the
+  plain instruction (row-wise `_scaled_mm`, Triton `tl.dot`, CUTLASS SM120 dense or
+  blockwise) stops below 208; cuBLASLt's tensor-wise and MXFP8 kernels reach 316-329
+  at 8192³. FP8 scaling recipes on this GPU: "FP8 scaling recipes on sm_120" below.
 
 ## Measured (RTX 5070 Ti, DRAM 767 GB/s copy peak, L2 48 MB)
 
@@ -281,8 +287,10 @@ output is read next (the `silu(gate) * up`, the residual add: Inductor fuses
 it under torch.compile, a fused custom kernel does it in registers). As separate
 torch ops on an fp32 output the scales cost more than they save (gate|up
 52.6 us); in bf16 the product of e4m3 codes is exact enough (one more bf16
-rounding, 2^-9, next to FP8's ~3 %). This is the next step past the example's
-Triton GEMM, which runs at ~55 % of the FP8 peak.
+rounding, 2^-9, next to FP8's ~3 %). The example's Triton GEMM (`tl.dot`, ~55 % of
+the FP8 peak) runs on `QMMA.F32`, capped at 208 TFLOP/s; `tl.dot_scaled` with unit
+ue8m0 scales (127) runs on `QMMA.SF`, bit-identical and 4-16 % faster at M = 352
+(docs/RESEARCH-TRITON.md §1.2).
 
 **Eager timing.** The module evaluator times eager calls. The example's host
 time per call (two Triton launches and three allocations, ~47 us; ~89 us through
@@ -299,6 +307,64 @@ perceptual gate): W8A8 `_scaled_mm` on the LocDiT MLP took it from 11.36 to 9.74
 ms per audio second (3.32x -> 3.87x vs eager), on q|k|v and o_proj to 9.03
 (4.17x), the Triton GEMM to 8.73 (4.31x), while the exact-tier kernel arm on the
 same layer stayed at 3.01x module speedup.
+
+## FP8 scaling recipes on sm_120 (measured, docs/FP8.md)
+
+The `fp8_w8a8` contract above (per-channel weights, per-token activations, dynamic)
+is unchanged; these are the measured alternatives (RTX 5070 Ti, cuBLASLt 13.1, torch
+2.14; scripts in `docs/research-scripts/fp8-sm120/`).
+
+* **Supported here**: cuBLASLt scale modes `SCALAR_32F` (tensor-wise, 8 algorithms
+  per shape) and `VEC32_UE8M0` (MXFP8: e4m3 + one power-of-two ue8m0 scale per 32
+  along K on both operands, applied by the tensor core; 1 algorithm per shape).
+  `OUTER_VEC_32F`, `VEC128_32F`, `BLK128x128_32F` return
+  `CUBLAS_STATUS_NOT_SUPPORTED`; `F.scaled_mm` with `BlockWise1x128` /
+  `BlockWise128x128` (DeepSeek-style blockwise) raises "only supported in CUDA for
+  SM90". MXFP8 through torch: `F.scaled_mm(x_q, w_q.t(), scale_a=sa, scale_recipe_a=
+  ScalingType.BlockWise1x32, scale_b=sb, scale_recipe_b=ScalingType.BlockWise1x32,
+  swizzle_a=SwizzleType.SWIZZLE_32_4_4, swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+  output_dtype=torch.bfloat16)` with `float8_e8m0fnu` scales `[rows, K / 32]`
+  rearranged into 128 x 4 blocks (rows padded to 128); equals the fp32 math of the
+  codes.
+* **Speed at M = 352** (LocDiT, us, L2-cold graph): q|k|v 10.6 tensor-wise / **9.3
+  MXFP8**; gate|up 29.5 / **24.7** (239 TFLOP/s); o_proj **8.8** (tensor-wise,
+  2-batch split-K) / 14.8; down **15.2** / 26.6. MXFP8 has no split-K algorithm, so
+  at N = 1024 it leaves SMs idle. Software blockwise (1x128 activations, 128x128
+  weights, partial sums promoted every 128 K: CUTLASS SM120 example-87 kernel or
+  Triton) is exact but runs on `QMMA.F32`: 15.9 / 15.7 / 40.8 / 28.0 us here.
+* **MXFP8 scale rule**: use `2^ceil(log2(amax / 448))` per block. The OCP reference
+  rule `2^(floor(log2 amax) - 8)` saturates block maxima above 448 x scale; on
+  VoxCPM2's massive activations it fails the near-lossless tier (LocDiT o_proj /
+  down_proj norm off by 4.0 % / 2.0 %). With the ceil rule MXFP8 has W8A8's error
+  (LocDiT layer relative L2 0.0205 vs 0.0204 per token; passes captured and redrawn
+  inputs).
+* **Where finer activation scales matter**: not at M = 352 (tensor-wise, per-token,
+  1x128, blockwise and MXFP8 all give relative L2 0.0195-0.0205 on the LocDiT layer).
+  At decode (M = 1) the LM q_proj fails the tier with per-token or tensor-wise scales
+  (0.037, norm off by 2.4 %) and passes with 1x128 groups (0.018) or MXFP8 (0.023);
+  decode is memory bound, so FP8 weight-only (0.017) is the right class there anyway.
+* **Static (calibrated) activation scales**: calibrated on one text, a per-tensor
+  scale saturates in up to 8.8 % of another text's calls (activation error up to
+  0.33 vs 0.03 dynamic) and a layer with static scales fails the redrawn-input check
+  in 1 of 10 LM decode draws (SmoothQuant + static: 3 of 10). It saves <= 0.3 us per
+  producer call. Keep dynamic scales; group scales (1x32, 1x128) are the local
+  alternative when a producer cannot see the whole row.
+* **Quantising in the producer** costs little: RMSNorm [352, 1024] 1.35 us (bf16
+  out) -> 1.48 us (e4m3 + per-token scale) vs 2.67 us with a separate quantisation
+  pass; silu(gate) * up [352, 4096] 3.34 -> 3.03 us (half the bytes written) vs 5.50
+  separate. Applying the tensor-wise GEMM's s_x * s_w in that kernel costs +2.7 us
+  (5.74 us); an MXFP8 GEMM's output is already scaled.
+* **Host time per eager call**: `torch._scaled_mm` 18-20 us, `F.scaled_mm` MXFP8 27,
+  `at::_scaled_mm` from C++ 19, a direct `cublasLtMatmul` with cached descriptors and
+  algorithm 6.1 (5.5 each for several behind one C++ call). Under CUDA graphs it does
+  not count.
+* **FP8 attention / KV cache**: e4m3 K/V (per-tensor or per-token scales) or FP8
+  QK^T / PV change a VoxCPM2 layer's output by <= 0.004 relative L2, but there is no
+  speed to win: the LocDiT attention covers 11 tokens (latency bound) and the LM's
+  KV cache holds <= ~77 tokens (2.6 % of a batch-16 decode step's bytes); a decode
+  kernel over e4m3 K/V is slower than bf16 at 77 tokens and 1.3x faster only from
+  ~2k tokens. A static K/V scale from one text is exceeded by another in ~50 % of
+  the layers. FlashAttention-3's FP8 path is Hopper only.
 
 ## FP4 weights (`fp4_weights`)
 

@@ -1,0 +1,16 @@
+clock state 1.0
+
+### LocEnc q|k|v b16: M=80 N=2560 K=1024 (62 weight copies, L2-cold)
+  bf16                                            12.04 us    34.8 TFLOP/s     435 GB/s(W)   1.00x
+  Triton rowwise tuned BK128 (32, 64, 4, 4)        5.40 us    77.6 TFLOP/s     485 GB/s(W)   2.23x
+  Triton blockwise 1x128/128x128 (32, 64, 4, 4)     6.03 us    69.6 TFLOP/s     435 GB/s(W)   2.00x
+
+### LocEnc gate|up b16: M=80 N=8192 K=1024 (20 weight copies, L2-cold)
+  bf16                                            25.94 us    51.8 TFLOP/s     647 GB/s(W)   1.00x
+  Triton rowwise tuned BK128 (32, 64, 4, 4)       14.45 us    92.9 TFLOP/s     581 GB/s(W)   1.80x
+  Triton blockwise 1x128/128x128 (64, 64, 4, 3)    15.83 us    84.8 TFLOP/s     530 GB/s(W)   1.64x
+
+### LocEnc down b16: M=80 N=1024 K=4096 (39 weight copies, L2-cold)
+  bf16                                            15.94 us    42.1 TFLOP/s     526 GB/s(W)   1.00x
+  Triton rowwise tuned BK128 (32, 64, 4, 4)        9.84 us    68.2 TFLOP/s     426 GB/s(W)   1.62x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)    12.45 us    53.9 TFLOP/s     337 GB/s(W)   1.28x

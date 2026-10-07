@@ -1,0 +1,21 @@
+clock state 1.0
+
+### LocDiT q|k|v b1: M=22 N=2560 K=1024 (62 weight copies, L2-cold)
+  bf16                                             8.68 us    13.3 TFLOP/s     604 GB/s(W)   1.00x
+  Triton rowwise tuned BK128 (32, 64, 4, 4)        4.74 us    24.3 TFLOP/s     553 GB/s(W)   1.83x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)     5.03 us    22.9 TFLOP/s     521 GB/s(W)   1.72x
+
+### LocDiT o_proj b1: M=22 N=1024 K=2048 (77 weight copies, L2-cold)
+  bf16                                             7.65 us    12.1 TFLOP/s     548 GB/s(W)   1.00x
+  Triton rowwise tuned BK128 (16, 64, 4, 4)        4.45 us    20.7 TFLOP/s     471 GB/s(W)   1.72x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)     6.96 us    13.3 TFLOP/s     301 GB/s(W)   1.10x
+
+### LocDiT gate|up b1: M=22 N=8192 K=1024 (20 weight copies, L2-cold)
+  bf16                                            21.38 us    17.3 TFLOP/s     785 GB/s(W)   1.00x
+  Triton rowwise tuned BK128 (16, 128, 4, 3)      11.78 us    31.3 TFLOP/s     712 GB/s(W)   1.81x
+  Triton blockwise 1x128/128x128 (16, 128, 4, 3)    11.59 us    31.8 TFLOP/s     724 GB/s(W)   1.84x
+
+### LocDiT down b1: M=22 N=1024 K=4096 (39 weight copies, L2-cold)
+  bf16                                            13.19 us    14.0 TFLOP/s     636 GB/s(W)   1.00x
+  Triton rowwise tuned BK128 (16, 64, 4, 4)        7.81 us    23.6 TFLOP/s     537 GB/s(W)   1.69x
+  Triton blockwise 1x128/128x128 (16, 64, 4, 4)    12.65 us    14.6 TFLOP/s     332 GB/s(W)   1.04x

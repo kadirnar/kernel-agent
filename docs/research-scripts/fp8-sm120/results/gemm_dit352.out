@@ -1,0 +1,48 @@
+clock state 1.0
+
+### LocDiT q|k|v: M=352 N=2560 K=1024 (62 weight copies, L2-cold)
+  bf16                                            25.63 us    72.0 TFLOP/s     205 GB/s(W)   1.00x
+  torch tensorwise                                10.58 us   174.5 TFLOP/s     248 GB/s(W)   2.42x
+  torch rowwise                                   15.68 us   117.7 TFLOP/s     167 GB/s(W)   1.63x
+  torch MXFP8                                      9.27 us   199.0 TFLOP/s     283 GB/s(W)   2.76x
+  Lt tensorwise                                   10.60 us   174.0 TFLOP/s     247 GB/s(W)   2.42x
+  Lt MXFP8                                         9.34 us   197.5 TFLOP/s     281 GB/s(W)   2.74x
+  Triton rowwise (example)                        14.02 us   131.6 TFLOP/s     187 GB/s(W)   1.83x
+  Triton blockwise 1x128/128x128 (64, 64, 4, 3)    16.00 us   115.3 TFLOP/s     164 GB/s(W)   1.60x
+  Triton MXFP8 dot_scaled (64, 128, 128, 4, 3)    12.61 us   146.3 TFLOP/s     208 GB/s(W)   2.03x
+
+### LocDiT o_proj: M=352 N=1024 K=2048 (77 weight copies, L2-cold)
+  bf16                                            22.56 us    65.5 TFLOP/s     186 GB/s(W)   1.00x
+  torch tensorwise                                13.25 us   111.4 TFLOP/s     158 GB/s(W)   1.70x
+  torch rowwise                                   15.51 us    95.2 TFLOP/s     135 GB/s(W)   1.45x
+  torch MXFP8                                     14.78 us    99.9 TFLOP/s     142 GB/s(W)   1.53x
+  Lt tensorwise                                   10.14 us   145.5 TFLOP/s     207 GB/s(W)   2.22x
+  Lt MXFP8                                        14.88 us    99.2 TFLOP/s     141 GB/s(W)   1.52x
+  Lt tensorwise split2                            14.80 us    99.8 TFLOP/s     142 GB/s(W)   1.52x
+  Triton rowwise (example)                        14.04 us   105.2 TFLOP/s     149 GB/s(W)   1.61x
+  Triton blockwise 1x128/128x128 (128, 64, 8, 3)    15.14 us    97.5 TFLOP/s     139 GB/s(W)   1.49x
+  Triton MXFP8 dot_scaled (64, 128, 128, 4, 3)    12.85 us   114.9 TFLOP/s     163 GB/s(W)   1.75x
+
+### LocDiT gate|up: M=352 N=8192 K=1024 (20 weight copies, L2-cold)
+  bf16                                            69.04 us    85.5 TFLOP/s     243 GB/s(W)   1.00x
+  torch tensorwise                                29.64 us   199.2 TFLOP/s     283 GB/s(W)   2.33x
+  torch rowwise                                   41.47 us   142.4 TFLOP/s     202 GB/s(W)   1.66x
+  torch MXFP8                                     24.71 us   239.0 TFLOP/s     339 GB/s(W)   2.79x
+  Lt tensorwise                                   29.51 us   200.1 TFLOP/s     284 GB/s(W)   2.34x
+  Lt MXFP8                                        24.80 us   238.1 TFLOP/s     338 GB/s(W)   2.78x
+  Triton rowwise (example)                        35.30 us   167.3 TFLOP/s     238 GB/s(W)   1.96x
+  Triton blockwise 1x128/128x128 (64, 64, 4, 3)    40.22 us   146.8 TFLOP/s     209 GB/s(W)   1.72x
+  Triton MXFP8 dot_scaled (64, 128, 128, 4, 3)    34.61 us   170.6 TFLOP/s     242 GB/s(W)   1.99x
+
+### LocDiT down: M=352 N=1024 K=4096 (39 weight copies, L2-cold)
+  bf16                                            38.95 us    75.8 TFLOP/s     215 GB/s(W)   1.00x
+  torch tensorwise                                17.50 us   168.7 TFLOP/s     240 GB/s(W)   2.23x
+  torch rowwise                                   27.18 us   108.6 TFLOP/s     154 GB/s(W)   1.43x
+  torch MXFP8                                     26.65 us   110.8 TFLOP/s     157 GB/s(W)   1.46x
+  Lt tensorwise                                   18.29 us   161.5 TFLOP/s     229 GB/s(W)   2.13x
+  Lt MXFP8                                        26.67 us   110.7 TFLOP/s     157 GB/s(W)   1.46x
+  Lt tensorwise split2                         AcceleratorError: CUDA error: an illegal memory access was encountered
+  Triton rowwise (example)                     AcceleratorError: CUDA error: an illegal memory access was encountered
+  Triton blockwise 1x128/128x128 None          AcceleratorError: CUDA error: an illegal memory access was encountered
+  Triton MXFP8 dot_scaled                      AcceleratorError: CUDA error: an illegal memory access was encountered
+(traceback cut: the illegal memory access above came from the split-K layout bug, fixed before gemm_dit352n1024.out)

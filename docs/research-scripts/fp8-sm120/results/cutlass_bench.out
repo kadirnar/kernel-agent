@@ -1,0 +1,37 @@
+clock state 1.0
+
+### LocDiT q|k|v: M=352 N=2560 K=1024
+  CUTLASS blockwise coop128    16.01 us  115.2 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     15.87 us  116.3 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LocDiT o_proj: M=352 N=1024 K=2048
+  CUTLASS blockwise coop128    26.91 us   54.9 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     15.71 us   94.0 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LocDiT gate|up: M=352 N=8192 K=1024
+  CUTLASS blockwise coop128    42.50 us  139.0 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     40.84 us  144.6 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LocDiT down: M=352 N=1024 K=4096
+  CUTLASS blockwise coop128    49.93 us   59.1 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     28.03 us  105.3 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LocDiT gate|up b1: M=22 N=8192 K=1024
+  CUTLASS blockwise coop128    16.74 us   22.1 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     14.36 us   25.7 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LocEnc gate|up b16: M=80 N=8192 K=1024
+  CUTLASS blockwise coop128    16.73 us   80.2 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     16.23 us   82.7 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LM prefill gate|up b16: M=272 N=12288 K=2048
+  CUTLASS blockwise coop128   125.85 us  108.8 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     90.54 us  151.2 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LM prefill down b16: M=272 N=2048 K=6144
+  CUTLASS blockwise coop128    73.37 us   93.3 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     77.90 us   87.9 TFLOP/s  rel err vs fp32 math 1.7e-03
+
+### LM gate|up b16: M=16 N=12288 K=2048
+  CUTLASS blockwise coop128    53.60 us   15.0 TFLOP/s  rel err vs fp32 math 1.7e-03
+  CUTLASS blockwise ping64     38.36 us   21.0 TFLOP/s  rel err vs fp32 math 1.7e-03

@@ -1,0 +1,29 @@
+clock state 1.0
+
+## (1) CUTLASS SM120 dense FP8 (TMA warp-specialised, scalar scale) vs cuBLASLt
+  q|k|v                    | cuBLASLt  10.55 us (175.0 TF, err 2e-03) | CUTLASS coop 128x128  15.05 us (122.6 TF, err 2e-03) | CUTLASS pingpong 64x128  15.38 us (120.0 TF, err 2e-03) | CUTLASS pingpong 64x64  15.56 us (118.6 TF, err 2e-03)
+  o_proj                   | cuBLASLt  10.09 us (146.3 TF, err 2e-03) | CUTLASS coop 128x128  26.17 us ( 56.4 TF, err 2e-03) | CUTLASS pingpong 64x128  15.23 us ( 96.9 TF, err 2e-03) | CUTLASS pingpong 64x64  15.50 us ( 95.3 TF, err 2e-03)
+  gate|up                  | cuBLASLt  30.45 us (194.0 TF, err 2e-03) | CUTLASS coop 128x128  40.98 us (144.1 TF, err 2e-03) | CUTLASS pingpong 64x128  39.58 us (149.2 TF, err 2e-03) | CUTLASS pingpong 64x64  39.09 us (151.1 TF, err 2e-03)
+  down                     | cuBLASLt  18.44 us (160.1 TF, err 2e-03) | CUTLASS coop 128x128  49.02 us ( 60.2 TF, err 2e-03) | CUTLASS pingpong 64x128  27.14 us (108.8 TF, err 2e-03) | CUTLASS pingpong 64x64  28.28 us (104.4 TF, err 2e-03)
+  8192^2 x K=8192, M=8192  | cuBLASLt 3371.77 us (326.1 TF, err 2e-03) | CUTLASS coop 128x128 5717.55 us (192.3 TF, err 2e-03) | CUTLASS pingpong 64x128 9344.77 us (117.7 TF, err 2e-03) | CUTLASS pingpong 64x64 10281.31 us (106.9 TF, err 2e-03)
+
+## (2) quantising activations: separate pass vs fused into the producer (M = 352)
+  RMSNorm [352,1024] -> bf16 (no quant)                  1.35 us
+  RMSNorm -> bf16, then per-token quant pass             2.67 us
+  RMSNorm + per-token e4m3 (fused)                       1.48 us
+  RMSNorm + static-scale e4m3 (fused)                    1.27 us
+  RMSNorm + MXFP8 1x32 (fused)                           1.54 us
+  silu*up [352,8192]->[352,4096] bf16 (no quant)         3.34 us
+  silu*up -> bf16, then per-token quant pass             5.50 us
+  silu*up + per-token e4m3 (fused)                       3.03 us
+  scale(sx*sw) + silu*up + per-token e4m3 (fused)        5.74 us
+  silu*up + static-scale e4m3 (fused)                    2.71 us
+  silu*up + MXFP8 1x32 (fused)                           3.35 us
+
+## (3) gate|up GEMM + silu*up + e4m3 for down_proj (M = 352, [1024 -> 2 x 4096])
+  cuBLASLt tensorwise GEMM (bf16 out) + scale/silu*up/per-token quant kernel      35.60 us
+  cuBLASLt tensorwise GEMM alone                                                  29.54 us
+  cuBLASLt MXFP8 GEMM (bf16 out) + silu*up/MXFP8 quant kernel                     28.11 us
+  Triton GEMM + silu*up epilogue (bf16 h out)                                     45.63 us
+  Triton GEMM + silu*up + 1x128 e4m3 epilogue (one kernel)                        46.09 us
+    best fused config (64, 256, 64, 8, 4)                                         44.58 us
