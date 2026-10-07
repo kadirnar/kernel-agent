@@ -2403,6 +2403,7 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
 ```
 ~/.cache/kernel-agent/library/          ($KERNEL_AGENT_LIBRARY overrides it)
   <sm_arch>/<module_class>/<entry-id>/  kernel.py  spec.json  result.json  NOTES.md  entry.json
+  <sm_arch>/backends.jsonl              per run and target: class, planned and tried backends, winner
   lessons/<backend>.md  lessons/<module_family>.md
 ```
 
@@ -2552,6 +2553,43 @@ Triton toolkit (#148, `knowledge/triton.md`), for any model:
 
 `doctor --smoke` runs both examples through the evaluator (the attention one
 with `--compile-check`).
+
+**Backend policy by target class.** The planner gets a table of target classes
+(compute-bound FP8 GEMM, small-M GEMV, attention over ≤ 16 tokens, conv, fused
+decoder layer, bf16 GEMM, norm / glue) with the first and second backend of
+each and the measured evidence (docs/RESEARCH-TRITON.md §5.1), and each engineer
+gets its target's row (`kernel_agent/backends.py`). Classes are read from the
+module family, the rows `M` of the dominant captured case, the sequence length
+and the precision, never from a model's module names. On sm_120 a compute-bound
+FP8 GEMM goes to the block-scaled MMA (`QMMA.SF`, 416 TFLOP/s on an RTX 5070 Ti)
+and never to plain e4m3 `mma.sync` (`QMMA.F32`, Triton `tl.dot`, row-wise
+`_scaled_mm`: half rate). `report.md` ("Backends") and `status` show the run's
+evaluations per backend, classified from each snapshot's source (what it runs:
+`@triton.jit`, `load_inline`, `T.prim_func`, `cutlass.cute`; a CUDA kernel that
+imports `tilelang` only for its CUTLASS headers counts as CUDA), and per target
+the planned vs tried backends. After each integration the outcomes go to the
+kernel library's `<sm_arch>/backends.jsonl`; the next planner sees which backend
+won which class on that GPU.
+
+**CuTe DSL on sm_120.** `kernel-agent doctor` checks the install statically
+(version, library wheels, import, the architecture it compiles for, whether the
+block-scaled `MmaMXF8Op` admits it, TVM-FFI) and summarises a compile cache:
+`kernel_agent.cute_dsl.compile_cached` stores each compiled kernel as the object
+file CuTe DSL exports, keyed by source digest + arch + DSL version + options +
+the caller's specialisation key, so a later evaluation (a fresh process) loads
+it in ~0.04 s instead of compiling again (0.2-2 s per kernel; `meta.json` records
+the compile time; `KERNEL_AGENT_CUTE_CACHE` moves it, `off` disables it). Two
+FP8 examples go with `knowledge/cute_dsl.md`: `cute_fp8_blockscaled_gemm.py`
+(W8A8 `nn.Linear` on `MmaMXF8Op` with unit ue8m0 scales, persistent and
+warp-specialised: a TMA producer warp and two MMA warpgroups, the per-token ×
+per-channel scales, bias, residual and an optional e4m3 output fused into the
+epilogue) and `cute_fp8_decoder_block.py` (M ≤ 16, FP8 weights: RMSNorm →
+gate|up → silu·up in one launch, down + residual in a second). Both compile for
+`sm_120a` on the CPU (`tests/test_cute_examples.py` checks the PTX for the
+block-scaled `mma.sync` and TMA); they have not run on a GPU yet. On sm_120,
+`doctor --smoke` runs them through the evaluator (near-lossless tier, rejected
+by the exact tier), and `pytest -m gpu tests/test_cute_examples.py` runs their
+selftests.
 
 **No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
 (`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a
@@ -2779,7 +2817,8 @@ value for that column.
   `status`, the report, the live dashboard and the projection.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
-  there is no custom kernel).
+  there is no custom kernel). The report's and `status`'s per-backend tables read
+  what the snapshot runs instead (see Backends).
 * `results.jsonl` (in `.truth/`) still has the full records (cases, errors)
   plus `exp`, `ledger_status`, `hypothesis` and the snapshot's sha256. For
   runs that predate the ledger, the rows are rebuilt from the `results.jsonl`
@@ -2789,8 +2828,9 @@ value for that column.
 baseline, the projected (nested targets counted once, see Charts) and measured
 end-to-end latency, the total cost from
 `costs.json`, a table per target (evaluations, keeps, failures, best speedup,
-its % of speed of light, estimated ms saved in the metric's ms, last hypothesis)
-and the last 10 ledger rows.
+its % of speed of light, estimated ms saved in the metric's ms, last hypothesis),
+the evaluations per backend (classified from each snapshot's source: targets
+tried and won, correct, kept, best speedup) and the last 10 ledger rows.
 
 `dashboard.html` in the run directory is self-contained: charts inlined as
 PNG, the target table, the latest evaluations and the agent costs. It supports

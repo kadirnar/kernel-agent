@@ -45,6 +45,10 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
 
         ensure_peaks(remeasure=ns.remeasure_peaks, verbose=True)  # cached per GPU + torch
     print(tc.summary())
+    from kernel_agent import cute_dsl
+
+    # CuTe DSL: version, import, the arch it compiles for, block-scaled MMA, compile cache
+    print("\n".join(cute_dsl.check(tc.gpu.capability if tc.gpu else None).describe()))
     from kernel_agent.gpulock import describe
 
     print(describe())  # the GPU lock pool (nvidia-smi, CUDA_VISIBLE_DEVICES, KERNEL_AGENT_GPUS)

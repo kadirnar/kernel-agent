@@ -391,6 +391,7 @@ class Orchestrator:
                 self.tc.summary(),
                 quality=self.cfg.quality,
                 precisions=self.allowed_precisions(),
+                backend_record=self._backend_record(),
             ),
             cwd=self.run.root,
             mcp_tools=[],
@@ -1964,6 +1965,7 @@ class Orchestrator:
                 self.tc.summary(),
                 quality=self.cfg.quality,
                 precisions=self.allowed_precisions(),
+                backend_record=self._backend_record(),
             )
             + context,
             cwd=round_dir,
@@ -2047,10 +2049,27 @@ class Orchestrator:
             return ""
         return library.prompt_note(self.run, target_id, spec)
 
+    def _backend_record(self) -> str:
+        """Planner-prompt section: which backend won which target class on this GPU in
+        earlier runs (kernel_agent/backends.py; "" without a library or a record)."""
+        from kernel_agent import backends
+
+        try:
+            return backends.track_record_note(self._library_arch())
+        except Exception as exc:  # advice only: never fails the plan
+            log(f"library: backend track record unreadable: {exc!r}")
+            return ""
+
     def _library_store(self, accepted: list[str], final: dict[str, Any] | None) -> None:
         """Store the verified module winners and accepted kernels (never fails the run)."""
         if (arch := self._library_arch()) is None:
             return
+        from kernel_agent import backends
+
+        try:  # which backend each target tried and which won (by source), per target class
+            backends.record_run(self.run, arch)
+        except Exception as exc:
+            log(f"library: recording the backends of this run failed: {exc!r}")
         try:
             stored = library.store_run(
                 self.run,

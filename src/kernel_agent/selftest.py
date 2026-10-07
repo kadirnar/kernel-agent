@@ -3,7 +3,8 @@ weight-only, W8A8 and MXFP8 examples in the near-lossless tier, and their reject
 exact tier, MXFP8 with the OCP floor scale rule by the scale-rule guard; the FP4 one in the
 near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+; the
 Triton toolkit examples, cached launches and short-sequence attention:
-:func:`smoke_triton_tools`)."""
+:func:`smoke_triton_tools`; on sm_120 the CuTe DSL block-scaled W8A8 GEMM and the fused FP8
+decoder block)."""
 
 from __future__ import annotations
 
@@ -168,6 +169,20 @@ MX_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
 _EXAMPLES = {"fp8_w8a8": W8A8_EXAMPLES, "fp8_mx": MX_EXAMPLES}
 
 
+#: The CuTe DSL W8A8 example on sm_120's block-scaled MMA, as :data:`W8A8_EXAMPLES`: a
+#: compute-bound merged gate|up GEMM (704 rows) and, correctness only, 300 rows (not a
+#: multiple of the 128-row tile: TMA's zero-filled tail).
+CUTE_W8A8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cute_fp8_blockscaled_gemm.py": (1024, 8192, [((4, 176), 100), ((300,), 0)]),
+}
+#: The fused small-M CuTe DSL decoder block (``precision: fp8_weights``) on a gated MLP:
+#: hidden and intermediate size, the captured calls (decode rows; 3 rows: a row bucket with
+#: a tail; 40 rows, correctness only: the fallback past 16 rows).
+CUTE_BLOCK_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cute_fp8_decoder_block.py": (1024, 4096, [((16, 1), 100), ((3,), 0), ((40,), 0)]),
+}
+
+
 #: The FP4 weight-only examples (``precision: fp4_weights``) on the GEMV's shapes above; a
 #: 22-row call (0 calls per run: correctness only) takes the dequantised fallback.
 FP4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
@@ -310,20 +325,76 @@ def floor_rule_variant(tmp: Path, name: str) -> Path:
     return path
 
 
-def smoke_fp8(tmp: Path, verbose: bool = False, *, precision: str = "fp8_weights") -> bool:
+def cute_fp8_supported(tc: object) -> bool:
+    """Whether the CuTe DSL FP8 examples can run: the ``cute`` backend on sm_120 / sm_121
+    (the block-scaled MMA the GEMM example uses exists only there)."""
+    gpu = getattr(tc, "gpu", None)
+    backends = getattr(tc, "backends", {}) or {}
+    major = tuple(gpu.capability)[:1] if gpu is not None else ()
+    return bool(backends.get("cute")) and major == (12,)
+
+
+class GatedMLP(nn.Module):
+    """``down(silu(gate(x)) * up(x))``, the common gated-MLP layout (bias-free)."""
+
+    def __init__(self, hidden: int, inter: int) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden, inter, bias=False)
+        self.up_proj = nn.Linear(hidden, inter, bias=False)
+        self.down_proj = nn.Linear(inter, hidden, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+def make_mlp_capture(
+    path: Path,
+    hidden: int,
+    inter: int,
+    calls: list[tuple[tuple[int, ...], int]],
+    *,
+    tier: str | None = None,
+    precision: str | None = None,
+) -> Path:
+    """A bf16 :class:`GatedMLP` (Gaussian weights, std ``fan_in ** -0.5``) and its calls."""
+    from kernel_agent.profiling.capture import capture_calls
+
+    torch.manual_seed(0)
+    module = GatedMLP(hidden, inter).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        for lin in (module.gate_proj, module.up_proj, module.down_proj):
+            lin.weight.normal_(0.0, lin.in_features**-0.5)
+    cases: list[tuple[Any, ...]] = [
+        ((torch.randn(*shape, hidden, device="cuda", dtype=torch.bfloat16),), {}, count)
+        for shape, count in calls
+    ]
+    capture_calls(module, cases, path, tier=tier, precision=precision)
+    return path
+
+
+def smoke_fp8(
+    tmp: Path,
+    verbose: bool = False,
+    *,
+    precision: str = "fp8_weights",
+    examples: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] | None = None,
+    capture: Any = make_linear_capture,
+) -> bool:
     """Every FP8 example of ``precision`` (:data:`FP8_EXAMPLES`, :data:`W8A8_EXAMPLES`,
-    :data:`MX_EXAMPLES`) passes the evaluator in the near-lossless tier, and the exact tier (a
-    quick check) rejects it; an MXFP8 example with the OCP floor scale rule fails the
-    scale-rule guard."""
+    :data:`MX_EXAMPLES`, or ``examples`` captured with ``capture``) passes the evaluator in
+    the near-lossless tier, and the exact tier (a quick check) rejects it; an MXFP8 example
+    with the OCP floor scale rule fails the scale-rule guard."""
     from kernel_agent.kernels.evaluate import run_evaluation
 
     ok = True
-    examples = _EXAMPLES.get(precision, FP8_EXAMPLES)
+    if examples is None:
+        examples = _EXAMPLES.get(precision, FP8_EXAMPLES)
     for name, (k, n, calls) in examples.items():
-        near = make_linear_capture(
+        near = capture(
             tmp / f"{name}.near.pt", k, n, calls, tier="near-lossless", precision=precision
         )
-        exact = make_linear_capture(tmp / f"{name}.exact.pt", k, n, calls)
+        exact = capture(tmp / f"{name}.exact.pt", k, n, calls)
         result = run_evaluation(near, EXAMPLES_DIR / name)
         rejected = run_evaluation(exact, EXAMPLES_DIR / name, quick=True)
         passed = bool(result.get("correct")) and rejected.get("status") == "incorrect"
@@ -480,4 +551,9 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
         if tc.backends.get("triton") and (backends is None or "triton" in backends):
             ok &= smoke_triton_tools(Path(tmp), verbose)
+        if cute_fp8_supported(tc) and (backends is None or "cute" in backends):
+            ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8", examples=CUTE_W8A8_EXAMPLES)
+            ok &= smoke_fp8(
+                Path(tmp), verbose, examples=CUTE_BLOCK_EXAMPLES, capture=make_mlp_capture
+            )
     return ok
