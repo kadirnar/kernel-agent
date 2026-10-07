@@ -443,7 +443,8 @@ def test_write_guard_and_restricted_tools(tmp_path, monkeypatch):
 
     run_agent(mcp_tools=tools_mod.tool_names("best_result"), tools=[*runner.READ_TOOLS, "Write"])
     restricted = seen[-1]
-    assert restricted.tools == ["Read", "Glob", "Grep", "Write"] and restricted.hooks is None
+    assert restricted.tools == ["Read", "Glob", "Grep", "Write"]
+    assert len(restricted.hooks["PreToolUse"]) == 1  # only the Claude files guard (#126)
     assert set(restricted.allowed_tools) == {
         "Read",
         "Glob",
@@ -452,9 +453,10 @@ def test_write_guard_and_restricted_tools(tmp_path, monkeypatch):
         "mcp__ka__best_result",
     }
     run_agent(mcp_tools=[], tools=["Read", "Write"], writable=[plan])
-    assert "PreToolUse" in seen[-1].hooks
+    assert len(seen[-1].hooks["PreToolUse"]) == 2  # write guard + Claude files guard
     run_agent(mcp_tools=[])  # the other agents: unchanged
-    assert seen[-1].tools is None and seen[-1].hooks is None and "Bash" in seen[-1].allowed_tools
+    assert seen[-1].tools is None and "Bash" in seen[-1].allowed_tools
+    assert len(seen[-1].hooks["PreToolUse"]) == 1  # the Claude files guard (#126)
 
 
 # ------------------------------------------------------------------ prompts and digests
