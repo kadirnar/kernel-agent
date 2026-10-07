@@ -19,7 +19,9 @@ Integer and boolean tensors must match exactly. In the ``near-lossless`` tier
 precision) whole-tensor bounds replace the per-element tolerances; FP4 weights
 (``fp4_weights``) get the wider bounds of the ``near-lossless-fp4`` tier. On redrawn
 inputs (``perturbed``) these tiers use their own bounds (:data:`PERTURBED_BOUNDS`), with
-the element bound scaled per channel.
+the element bound scaled per channel. On inputs scaled by a factor (``input_scale``: the
+evaluator's ×3 / ×0.01 / ×−1 checks, :mod:`kernel_agent.kernels.verify`) the absolute
+tolerance grows with a factor above 1 and the signal threshold shrinks with one below 1.
 """
 
 from __future__ import annotations
@@ -275,9 +277,20 @@ def compare_tensors(
     *,
     tier: str | None = None,
     perturbed: bool = False,
+    input_scale: float = 1.0,
 ) -> dict[str, Any]:
     """One tensor against its reference (module docstring); ``tier``: the tolerance tier
-    (default :data:`TIER`); ``perturbed``: on redrawn inputs (:data:`PERTURBED_BOUNDS`)."""
+    (default :data:`TIER`); ``perturbed``: on redrawn inputs (:data:`PERTURBED_BOUNDS`);
+    ``input_scale``: the factor ``f`` the inputs were scaled by (the evaluator's ×3, ×0.01
+    and ×−1 checks, :data:`kernel_agent.kernels.verify.SCALED`). A module's outputs, and
+    their rounding errors, grow with ``|f| > 1``, so the absolute tolerance is
+    ``atol × |f|`` (honest per-element flips near zero at ×3 are not a bug); with
+    ``|f| < 1`` they shrink, so a tensor has signal from ``|f| × atol × √n`` on and gets
+    the whole-tensor checks (cosine and relative L2 error; the near-lossless tiers' bounds,
+    which are relative). Without that a ×0.01 output below the absolute tolerance would
+    pass anything, e.g. an FP8 kernel with an activation scale calibrated on the captured
+    inputs. The per-element tolerance itself never shrinks: intermediate rounding (a
+    residual add, a normalisation) does not scale with the inputs."""
     result: dict[str, Any] = {"name": name, "ok": False}
     error = type_error(new)
     if error is not None:
@@ -300,6 +313,9 @@ def compare_tensors(
         result.update(ok=mismatches == 0, mismatch_frac=mismatches)
         return result
     atol, rtol = tol or TOLERANCES.get(ref.dtype, (1e-3, 1e-3))
+    factor = abs(float(input_scale)) or 1.0
+    floor = atol * min(1.0, factor)  # the signal threshold per element
+    atol *= max(1.0, factor)
     a = full = ref.detach().to(new.device).float()
     b = new.detach().float()
     error = _non_finite_error(a, b)
@@ -312,7 +328,7 @@ def compare_tensors(
         a, b = a[finite], b[finite]
     diff = (a - b).abs()
     ref_norm, new_norm = float(a.norm()), float(b.norm())
-    signal = a.numel() > 0 and ref_norm > atol * math.sqrt(a.numel())
+    signal = a.numel() > 0 and ref_norm > floor * math.sqrt(a.numel())
     near = (PERTURBED_BOUNDS if perturbed else NEAR_LOSSLESS_BOUNDS).get(tier or TIER)
     allowed = atol + rtol * a.abs()
     if perturbed and near is not None and not signal:  # the tier's element bound at RMS atol
@@ -386,18 +402,23 @@ def compare_tensors(
 
 
 def compare_structures(
-    ref: Any, new: Any, prefix: str = "out", *, tier: str | None = None, perturbed: bool = False
+    ref: Any,
+    new: Any,
+    prefix: str = "out",
+    *,
+    tier: str | None = None,
+    perturbed: bool = False,
+    input_scale: float = 1.0,
 ) -> list[dict[str, Any]]:
     ref_flat = flatten(ref, prefix)
     new_flat = flatten(new, prefix)
+    kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
     results = []
     for name, tensor in ref_flat.items():
         if name not in new_flat:
             results.append({"name": name, "ok": False, "error": "missing in candidate output"})
             continue
-        results.append(
-            compare_tensors(name, tensor, new_flat[name], tier=tier, perturbed=perturbed)
-        )
+        results.append(compare_tensors(name, tensor, new_flat[name], **kw))
     return results
 
 
@@ -409,6 +430,7 @@ def compare_side_effects(
     *,
     tier: str | None = None,
     perturbed: bool = False,
+    input_scale: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Compare the post-call state of a call's arguments (in-place side effects).
 
@@ -424,6 +446,7 @@ def compare_side_effects(
         flatten(new_post, prefix),
         tier=tier,
         perturbed=perturbed,
+        input_scale=input_scale,
     )
 
 
@@ -434,8 +457,10 @@ def compare_side_effects_flat(
     *,
     tier: str | None = None,
     perturbed: bool = False,
+    input_scale: float = 1.0,
 ) -> list[dict[str, Any]]:
     """:func:`compare_side_effects` on already flattened ``{name: tensor}`` states."""
+    kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
     results: list[dict[str, Any]] = []
     for name, ref in ref_flat.items():
         new = new_flat.get(name)
@@ -449,7 +474,7 @@ def compare_side_effects_flat(
             or not (before.shape == ref.shape == new.shape)
             or not (before.dtype == ref.dtype == new.dtype)
         ):
-            results.append(compare_tensors(name, ref, new, tier=tier, perturbed=perturbed))
+            results.append(compare_tensors(name, ref, new, **kw))
             continue
         before, ref = before.to(new.device), ref.to(new.device)
         changed = (ref != before) | (new != before)
@@ -457,7 +482,7 @@ def compare_side_effects_flat(
         if count == 0:
             results.append({"name": name, "ok": True, "changed_elements": 0, "max_abs_err": 0.0})
             continue
-        result = compare_tensors(name, ref[changed], new[changed], tier=tier, perturbed=perturbed)
+        result = compare_tensors(name, ref[changed], new[changed], **kw)
         result["changed_elements"] = count
         results.append(result)
     return results

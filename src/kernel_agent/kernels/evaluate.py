@@ -30,7 +30,16 @@ Stages and their failure statuses:
    before the profiled activity pass below (its CUPTI subscription stays: every later
    launch of the process is 1.5-3 us slower).
 4. ``incorrect_perturbed``: re-verification after timing (on CPU right after
-   stage 2) at fresh addresses and with redrawn inputs (:mod:`kernels.verify`).
+   stage 2) at fresh addresses, with redrawn inputs and with the captured inputs
+   scaled by 3, 0.01 and −1 (:mod:`kernels.verify`; ``redraws`` in the result: the
+   scaled checks that ran and any skipped for a non-finite reference output).
+
+Peak memory (CUDA, not a failure): per timed case the peak GPU memory of one call of
+the reference and of the candidate (:func:`kernels.bench.peak_memory`; ``ref_peak_mib``,
+``new_peak_mib``, ``peak_delta_mib``) and ``peak_memory`` for the case with the largest
+increase, with a ``warning`` above :data:`PEAK_MEMORY_WARN_SHARE` and
+:data:`PEAK_MEMORY_WARN_MIB` (KernelBench-Verified: 28 % of correct kernels raised peak
+memory; an end-to-end gate can run out of memory, #137).
 
 Anti-gaming guards (:mod:`kernels.integrity`), status ``integrity_violation``
 unless noted:
@@ -100,6 +109,10 @@ HIDDEN_WORK_MS = 0.1
 HIDDEN_WORK_SHARE = 0.5
 #: Candidate calls in the profiled activity pass over the main case.
 ACTIVITY_CALLS = 3
+#: ``peak_memory`` warns when a candidate's per-call peak exceeds the reference's by more
+#: than this share of it and by more than this many MiB (small modules: noise).
+PEAK_MEMORY_WARN_SHARE = 0.25
+PEAK_MEMORY_WARN_MIB = 16.0
 #: Measurement semantics of this evaluator: bump it when a change makes earlier results
 #: incomparable (what is timed and how, how cases are weighted, what counts as correct).
 #: Records without ``evaluator_version`` predate it and count as schema 0.
@@ -237,6 +250,42 @@ def quick_cases(cases: list[dict[str, Any]]) -> list[int]:
     return sorted({order[0], order[-1]}) if order else []
 
 
+def _mib(n: int) -> float:
+    return round(n / 2**20, 3)
+
+
+def peak_memory_summary(cases: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """``peak_memory`` of a result from its cases' ``ref_peak_mib`` / ``new_peak_mib``: the
+    case with the largest increase (``case``, ``ref_mib``, ``new_mib``, ``delta_mib``,
+    ``ratio``) and a ``warning`` when the increase is above both :data:`PEAK_MEMORY_WARN_SHARE`
+    of the reference's peak and :data:`PEAK_MEMORY_WARN_MIB`; None without measurements."""
+    rows = [
+        (i, float(c["ref_peak_mib"]), float(c["new_peak_mib"]))
+        for i, c in enumerate(cases)
+        if c.get("ref_peak_mib") is not None and c.get("new_peak_mib") is not None
+    ]
+    if not rows:
+        return None
+    i, ref, new = max(rows, key=lambda r: (r[2] - r[1], r[2]))
+    delta = new - ref
+    out: dict[str, Any] = {
+        "case": i,
+        "ref_mib": round(ref, 3),
+        "new_mib": round(new, 3),
+        "delta_mib": round(delta, 3),
+        "ratio": round(new / ref, 3) if ref > 0 else None,
+    }
+    if delta > PEAK_MEMORY_WARN_MIB and delta > PEAK_MEMORY_WARN_SHARE * ref:
+        sig = cases[i].get("signature") or f"case {i}"
+        out["warning"] = (
+            f"a call of {sig} peaks at {new:.1f} MiB of GPU memory, {delta:.1f} MiB more than "
+            f"the reference's {ref:.1f} MiB (warning above +{PEAK_MEMORY_WARN_SHARE:.0%} and "
+            f"+{PEAK_MEMORY_WARN_MIB:g} MiB): intermediates, fp32 copies or workspaces the "
+            "reference does not allocate; in the whole model they can run it out of memory"
+        )
+    return out
+
+
 def _first_error(failures: list[dict[str, Any]]) -> str:
     first = failures[0] if failures else {}
     detail = first.get("error") or (
@@ -264,8 +313,11 @@ def _reverify(
 
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
+    redraws: dict[str, Any] = {"ran": {}, "skipped": []}
+    result["redraws"] = redraws  # the scaled checks (kernels.verify.SCALED) per case
     for i, (case, inputs) in enumerate(zip(cases, pristine, strict=True)):
         method = case["method"]
+        record: dict[str, Any] = {}
         try:
             failed = reverify_case(
                 entrypoint(reference, method),
@@ -274,10 +326,14 @@ def _reverify(
                 inputs,
                 gen,
                 synchronize,
+                record,
             )
         except Exception:
             result.update(status="runtime_error", correct=False, error=_short_tb(), failed_case=i)
             return False
+        for name, n in (record.get("ran") or {}).items():
+            redraws["ran"][name] = redraws["ran"].get(name, 0) + n
+        redraws["skipped"] += [{"case": i, **skip} for skip in record.get("skipped") or []]
         if failed:
             check = failed[0]
             result.update(
@@ -289,10 +345,13 @@ def _reverify(
                 f"{check['what']} ({_first_error(check['failures'])}): the candidate must be "
                 "correct for any input of these shapes and dtypes, recomputed on every "
                 "call (no output caching by address, shape or values; no reading of "
-                "unused cache slots)",
+                "unused cache slots; no shortcuts for the captured value range or sign: "
+                "scales such as FP8 activation scales follow the input)",
             )
             return False
     result["checks"] = ["captured", "aliasing", "timed_output", "perturbed"]
+    if redraws["ran"]:
+        result["checks"].append("scaled")
     if "quick" in result or not device.startswith("cuda"):  # untimed
         result["checks"].remove("timed_output")
     return True
@@ -446,7 +505,7 @@ def _evaluate(
     from kernel_agent import concurrency
     from kernel_agent.kernels import compare as comparator
     from kernel_agent.kernels import integrity, weights
-    from kernel_agent.kernels.bench import compare_timing, time_call, wall_check
+    from kernel_agent.kernels.bench import compare_timing, peak_memory, time_call, wall_check
     from kernel_agent.kernels.compare import compare_side_effects, compare_structures
     from kernel_agent.kernels.verify import alias_errors
     from kernel_agent.profiling.capture import load_capture
@@ -658,6 +717,14 @@ def _evaluate(
             result.update(status="runtime_error", error=_short_tb(), failed_case=i)
             return result
         report["hidden_ms"] = round(wall["hidden_ms"], 4)
+        try:  # after timing; a warning, never a failure (peak_memory_summary)
+            peak = peak_memory(*fns, case["args"], case["kwargs"])
+        except Exception as exc:
+            report["peak_memory_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        else:
+            report["ref_peak_mib"] = _mib(peak["ref_bytes"])
+            report["new_peak_mib"] = _mib(peak["new_bytes"])
+            report["peak_delta_mib"] = _mib(peak["new_bytes"] - peak["ref_bytes"])
         if _hidden_work(wall):
             _violation(
                 result,
@@ -770,6 +837,8 @@ def _evaluate(
         ref_ms_weighted=round(ref_total, 4),
         new_ms_weighted=round(new_total, 4),
     )
+    if (memory := peak_memory_summary(case_reports)) is not None:
+        result["peak_memory"] = memory
     # speed of light per case (after timing, never inside it): sol_ms, pct_of_sol, bound
     annotate(result, reference, cases, l2_flush=l2_flush, precision=capture_precision(capture))
     if profile:

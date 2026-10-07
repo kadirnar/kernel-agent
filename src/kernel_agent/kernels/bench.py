@@ -26,6 +26,9 @@ _synchronize: Callable[[], Any] = getattr(torch._C, "_cuda_synchronize", torch.c
 _perf_counter = time.perf_counter
 _empty = torch.empty
 _copy: Callable[..., Any] = torch.Tensor.copy_
+_allocated: Callable[[], int] = torch.cuda.memory_allocated
+_max_allocated: Callable[[], int] = torch.cuda.max_memory_allocated
+_reset_peak: Callable[[], None] = torch.cuda.reset_peak_memory_stats
 
 #: Clock guard (#81). After about a second without work the GPU drops to a lower
 #: performance state (an RTX 5070 Ti: memory clock 7001 or 405 MHz instead of 13801, DRAM
@@ -383,6 +386,36 @@ def wall_check(
         n - r for n, r in zip(gaps["new"], gaps["ref"], strict=True)
     )
     return out
+
+
+def peak_memory(
+    reference: Callable[..., Any],
+    candidate: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    calls: int = 2,
+) -> dict[str, int]:
+    """Peak GPU memory of one call of each (bytes, ``ref_bytes`` / ``new_bytes``): what the
+    caching allocator holds at the call's peak above what it held right before it, the
+    output included, the inputs (copied first when they hold mutable state) not. The
+    smallest of ``calls`` calls each, after timing (workspaces, compiled kernels and
+    tuned configs already in place). Memory the module keeps between calls (weights,
+    caches it allocated at build time) is not part of it."""
+    mutable = has_mutable_state(args, kwargs)
+    peaks: dict[str, list[int]] = {"ref": [], "new": []}
+    with torch.inference_mode():
+        for _ in range(calls):
+            for label, fn in (("ref", reference), ("new", candidate)):
+                a, k = (copy.deepcopy(args), copy.deepcopy(kwargs)) if mutable else (args, kwargs)
+                _synchronize()
+                before = _allocated()
+                _reset_peak()
+                out = fn(*a, **k)
+                _synchronize()
+                peaks[label].append(max(0, _max_allocated() - before))
+                del out, a, k
+    return {"ref_bytes": min(peaks["ref"]), "new_bytes": min(peaks["new"])}
 
 
 def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> dict[str, Any]:

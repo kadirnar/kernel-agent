@@ -36,7 +36,9 @@ the tensor's and the element's channel's (last dimension), and the tiers have
 wider bounds (`compare.PERTURBED_BOUNDS`; near-lossless: every element within
 0.75 x RMS + 0.125 x |reference|). The reference math of every precision passes
 both checks; if only the perturbed check fails, run `fp8_w8a8_linear` /
-`dequantize_fp8` on the same redrawn inputs before you hunt the kernel.
+`dequantize_fp8` on the same redrawn inputs before you hunt the kernel. The same
+check also runs the captured inputs x 3, x 0.01 and x -1 (`scaled_x3`, ...):
+activation scales must follow the input; a scale calibrated once saturates at x 3.
 
 ## The contract
 

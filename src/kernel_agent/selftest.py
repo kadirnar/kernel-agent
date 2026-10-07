@@ -1,7 +1,9 @@
 """Backend smoke test: run every bundled example kernel through the evaluator (the FP8
 weight-only, W8A8 and MXFP8 examples in the near-lossless tier, and their rejection by the
 exact tier, MXFP8 with the OCP floor scale rule by the scale-rule guard; the FP4 one in the
-near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+)."""
+near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+; the
+Triton toolkit examples, cached launches and short-sequence attention:
+:func:`smoke_triton_tools`)."""
 
 from __future__ import annotations
 
@@ -29,6 +31,100 @@ class RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+class GatedMlpBlock(nn.Module):
+    """A pre-norm gated MLP block, ``x + down(silu(gate(norm(x))) * up(norm(x)))``: the
+    reference of ``examples/triton_cheap_launch.py``."""
+
+    def __init__(self, hidden: int, inter: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.norm = RMSNorm(hidden, eps)
+        self.gate_proj = nn.Linear(hidden, inter, bias=False)
+        self.up_proj = nn.Linear(hidden, inter, bias=False)
+        self.down_proj = nn.Linear(inter, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        return x + self.down_proj(nn.functional.silu(self.gate_proj(h)) * self.up_proj(h))
+
+
+class AttentionCore(nn.Module):
+    """SDPA over ``[B, H, S, D]`` heads (GQA when K / V have fewer heads), output
+    ``[B, S, Hq * D]``: the reference of ``examples/triton_short_attention.py``."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        out = nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=q.shape[1] != k.shape[1]
+        )
+        return out.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
+
+
+#: The cheap-launch example's blocks: (hidden, intermediate, [(rows shape, calls per run)]):
+#: a decode-sized block (host bound when timed eagerly) and one with sizes that are not
+#: powers of two.
+MLP_BLOCKS: list[tuple[int, int, list[tuple[tuple[int, ...], int]]]] = [
+    (1024, 4096, [((2, 11), 40), ((1, 1), 0)]),
+    (896, 4864, [((3, 5), 10), ((64,), 0)]),
+]
+
+
+def make_mlp_block_capture(
+    path: Path, hidden: int, inter: int, calls: list[tuple[tuple[int, ...], int]]
+) -> Path:
+    from kernel_agent.profiling.capture import capture_calls
+
+    torch.manual_seed(0)
+    module = GatedMlpBlock(hidden, inter).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        module.norm.weight.copy_(torch.randn(hidden) * 0.1 + 1)
+        for linear in (module.gate_proj, module.up_proj, module.down_proj):
+            linear.weight.normal_(0.0, linear.in_features**-0.5)
+    cases: list[tuple[Any, ...]] = [
+        ((torch.randn(*shape, hidden, device="cuda", dtype=torch.bfloat16),), {}, count)
+        for shape, count in calls
+    ]
+    capture_calls(module.eval(), cases, path)
+    return path
+
+
+def make_attention_capture(path: Path) -> Path:
+    """Attention-core calls of several shapes: the timed one (32 sequences of 11 tokens,
+    16 query / 2 KV heads, head dim 128) and correctness-only ones with other head counts,
+    GQA ratios, head dims (incl. 80, 96), lengths up to 32, causal, boolean and additive
+    masks, fp16, and one longer than the kernel takes (SDPA's path)."""
+    from kernel_agent.profiling.capture import capture_calls
+
+    torch.manual_seed(0)
+
+    def qkv(
+        b: int, hq: int, hk: int, sq: int, sk: int, d: int, dtype: torch.dtype = torch.bfloat16
+    ) -> tuple[torch.Tensor, ...]:
+        return (
+            torch.randn(b, hq, sq, d, device="cuda", dtype=dtype),
+            torch.randn(b, hk, sk, d, device="cuda", dtype=dtype),
+            torch.randn(b, hk, sk, d, device="cuda", dtype=dtype),
+        )
+
+    padding = torch.ones(2, 1, 1, 7, device="cuda", dtype=torch.bool)
+    padding[1, ..., 5:] = False  # the second sequence has 5 tokens
+    bias = torch.randn(1, 24, device="cuda", dtype=torch.float16)
+    cases: list[tuple[Any, ...]] = [
+        (qkv(32, 16, 2, 11, 11, 128), {}, 540),
+        (qkv(4, 8, 8, 32, 32, 64), {"is_causal": True}, 0),
+        (qkv(2, 12, 4, 7, 7, 80), {"attn_mask": padding}, 0),
+        (qkv(3, 6, 1, 1, 24, 96, torch.float16), {"attn_mask": bias}, 0),
+        (qkv(2, 4, 2, 40, 40, 64), {}, 0),  # longer than MAX_SEQ: SDPA
+    ]
+    capture_calls(AttentionCore().eval(), cases, path)
+    return path
 
 
 def make_rmsnorm_capture(path: Path, hidden: int = 2048) -> Path:
@@ -290,6 +386,67 @@ def smoke_fp4(tmp: Path, verbose: bool = False) -> bool:
     return ok
 
 
+def cheap_launch_check() -> dict[str, Any]:
+    """In this process: ``examples/triton_cheap_launch.py`` built with and without
+    ``fast_launch`` gives bit-identical outputs, and its later calls launch through the
+    cached ``CompiledKernel`` (``hits``)."""
+    from kernel_agent.kernels.evaluate import load_candidate_module
+
+    example = load_candidate_module(EXAMPLES_DIR / "triton_cheap_launch.py")
+    torch.manual_seed(0)
+    module = GatedMlpBlock(1024, 4096).cuda().to(torch.bfloat16).eval()
+    x = torch.randn(2, 11, 1024, device="cuda", dtype=torch.bfloat16)
+    fast, slow = example.build(module), example.build(module, fast_launch=False)
+    with torch.inference_mode():
+        outs = [fast(x), fast(x), slow(x)]
+    hits = example._rmsnorm.hits + example._silu_mul.hits
+    same = all(torch.equal(outs[0], o) for o in outs[1:])
+    return {"passed": same and hits >= 2, "bit_identical": same, "hits": hits}
+
+
+def smoke_triton_tools(tmp: Path, verbose: bool = False) -> bool:
+    """The Triton toolkit examples (#148): ``triton_cheap_launch.py`` passes the evaluator on
+    every block of :data:`MLP_BLOCKS` and its cached launches match the JIT's
+    (:func:`cheap_launch_check`); ``triton_short_attention.py`` passes on
+    :func:`make_attention_capture` and traces without a graph break (``compile_check``)."""
+    from kernel_agent.kernels.evaluate import run_evaluation
+
+    rows: list[tuple[str, bool, str]] = []
+    for hidden, inter, calls in MLP_BLOCKS:
+        capture = make_mlp_block_capture(tmp / f"mlp{hidden}.pt", hidden, inter, calls)
+        result = run_evaluation(capture, EXAMPLES_DIR / "triton_cheap_launch.py")
+        passed = bool(result.get("correct"))
+        detail = (
+            f"speedup {result.get('speedup')}x"
+            if passed
+            else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+        )
+        rows.append((f"cheap_launch {hidden}", passed, detail))
+    try:
+        check = cheap_launch_check()
+    except Exception as exc:
+        check = {"passed": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    rows.append(("cheap_launch cache", bool(check["passed"]), str(check)))
+    capture = make_attention_capture(tmp / "attention.pt")
+    example = EXAMPLES_DIR / "triton_short_attention.py"
+    result = run_evaluation(capture, example, compile_check=True)
+    compiled = result.get("compile_check") or {}
+    passed = bool(result.get("correct") and compiled.get("passed") and compiled.get("fullgraph_ok"))
+    detail = (
+        f"speedup {result.get('speedup')}x, compiled {compiled.get('passed')}, "
+        f"fullgraph {compiled.get('fullgraph_ok')}"
+        if result.get("correct")
+        else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+    )
+    rows.append(("short_attention", passed, detail))
+    ok = True
+    for name, passed, detail in rows:
+        ok &= passed
+        if verbose:
+            print(f"  {name:22s} {'OK ' if passed else 'FAIL'} {detail}")
+    return ok
+
+
 def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> bool:
     from kernel_agent import toolchain
     from kernel_agent.kernels.evaluate import run_evaluation
@@ -321,4 +478,6 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8")
         if mxfp8_supported(tc) and (backends is None or "triton" in backends):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
+        if tc.backends.get("triton") and (backends is None or "triton" in backends):
+            ok &= smoke_triton_tools(Path(tmp), verbose)
     return ok

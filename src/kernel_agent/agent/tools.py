@@ -139,6 +139,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "sol_unreliable",
             "sol_note",
             "sol_error",
+            "peak_memory",  # the per-call peak vs the reference's (kernels/evaluate.py)
         )
         if k in result
     }
@@ -166,6 +167,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
                 "l2_resident",
                 "suspicious_faster_than_sol",
                 "sol_unreliable",
+                "peak_delta_mib",
             )
             if c.get(k) is not None
         }

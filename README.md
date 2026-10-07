@@ -114,6 +114,30 @@ same time.
   call count, skipped work and reads of unused cache slots are rejected.
   Correctness-only cases are re-verified too. The result names the failed
   `stage` and `failed_check`. These checks add about 0.2 s to an evaluation.
+* **Scaled and sign-flipped inputs** (#148): the same stage runs every case
+  once more with its captured floating-point inputs × 3, × 0.01 and × −1
+  (`scaled_x3`, `scaled_x0.01`, `sign_flipped`), against the reference called
+  live. KernelBench-Verified caught a "374×" kernel that skipped a ReLU because
+  its test inputs were all positive; constants calibrated on the captured
+  values (a static FP8 activation scale saturates at × 3: scales must follow
+  the input), absolute epsilons and overflow handling fail here too. The
+  absolute tolerance grows with × 3 (outputs and their rounding errors grow)
+  and the signal threshold shrinks with × 0.01, so a 100× smaller output still
+  gets the whole-tensor checks (`compare_tensors(..., input_scale=)`); the
+  near-lossless tiers use their bounds for redrawn inputs. A check whose
+  reference output turns non-finite where the captured one is finite (fp16
+  overflow at × 3) is skipped. `redraws` in the result lists the checks that
+  ran and were skipped.
+* **Peak memory** (a warning, not a failure): after timing, one call of the
+  reference and of the candidate per timed case measures the GPU memory the
+  allocator holds at the call's peak above what it held before
+  (`ref_peak_mib`, `new_peak_mib`, `peak_delta_mib` per case;
+  `kernels/bench.py: peak_memory`). `peak_memory` in the result names the case
+  with the largest increase and warns when it is above both 25 % of the
+  reference's peak and 16 MiB (`PEAK_MEMORY_WARN_SHARE`, `PEAK_MEMORY_WARN_MIB`
+  in `kernels/evaluate.py`): KernelBench-Verified found 28 % of correct kernels
+  raising peak memory, and a model-level gate can run out of memory (#137).
+  `report.md` lists the warnings of the best kernels.
 * **Model level** (`e2e`): the workload's own comparison. For LLM/STT that is
   identical greedy tokens for the first N tokens plus first-step logits cosine
   ≥ 0.99. For TTS it is spectral cosine. For diffusion it is PSNR ≥ 25 dB on
@@ -2502,6 +2526,32 @@ reject it. The W8A8 example (`triton_fp8_w8a8_gemm.py`) goes to an
 the exact tier. The MXFP8 example (`triton_mxfp8_gemm.py`) goes to an `fp8_mx`
 target; on sm_100+ the smoke test runs it like the W8A8 one, and its OCP floor
 scale-rule variant must fail the scale-rule guard.
+
+Triton toolkit (#148, `knowledge/triton.md`), for any model:
+
+* **Cheap launches** for eager-timed targets: `kernels/triton_launch.py`
+  (`CachedLaunch(kernel)[grid](...)`, used like `kernel[grid](...)`) keeps the
+  `CompiledKernel` of each specialisation and calls its C launcher directly,
+  skipping the JIT's per-call binding. `examples/triton_cheap_launch.py`: a
+  pre-norm gated MLP block in 2 Triton launches + 2 GEMMs per call
+  (`fast_launch=False` for the JIT path, to compare with `sweep_candidate`).
+* **Short-sequence attention**: `examples/triton_short_attention.py`, one tile
+  per (sequence, query head) for query / key lengths <= 32, any head counts,
+  GQA ratio and head dim, causal / boolean / additive masks; a drop-in `sdpa`,
+  a `TorchFunctionMode` that routes `F.scaled_dot_product_attention` calls
+  into a `custom_op` (traces under `fullgraph=True`).
+* **Tuned-config cache**: `kernels/tuned.py` keeps tile / warp / stage choices
+  of Triton kernels, CUTLASS configs and cuBLASLt algorithms per (GPU, library
+  versions, op, shape bucket) in `~/.cache/kernel-agent/tuned-configs.sqlite`
+  (`KERNEL_AGENT_TUNED_DB`), across evaluations and runs: `tuned.best_config(op,
+  shape, candidates, bench)` returns the stored config or times the candidates
+  once and stores the fastest; a torch / CUDA / driver / library upgrade
+  invalidates the entry; nothing is timed while a CUDA graph is captured
+  (`KERNEL_AGENT_TUNE=0`: never). `python -m kernel_agent.kernels.tuned` lists
+  the entries (`--purge-stale`, `--clear`).
+
+`doctor --smoke` runs both examples through the evaluator (the attention one
+with `--compile-check`).
 
 **No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
 (`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a
