@@ -11,6 +11,6 @@ description = "RMSNorm as a multi-file torch extension: header helpers, a .cu la
 backend = "torch_extension"  # or "command" (command = [...], outputs = [...], load = ...)
 sources = ["csrc/*.cpp", "csrc/*.cu"]
 include_dirs = ["include"]
-cflags = ["-O3", "-std=c++17"]
-cuda_cflags = ["-O3", "--use_fast_math", "-std=c++17", "-lineinfo"]
+cflags = ["-O3"]  # no -std: torch builds with -std=c++20, which its headers need
+cuda_cflags = ["-O3", "--use_fast_math", "-lineinfo"]
 timeout_s = 600
