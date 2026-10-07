@@ -1,0 +1,16 @@
+# Template of a multi-file project candidate (kernel_agent/native/project.py, issue #134).
+# Copy the directory, rename `name`, and keep every file the build needs in it.
+
+[project]
+name = "native_rmsnorm"
+entry = "candidate.py"      # build(reference) for kind = "kernel", apply(workload) for "transform"
+kind = "kernel"
+description = "RMSNorm as a multi-file torch extension: header helpers, a .cu launcher, a binding"
+
+[build]
+backend = "torch_extension"  # or "command" (command = [...], outputs = [...], load = ...)
+sources = ["csrc/*.cpp", "csrc/*.cu"]
+include_dirs = ["include"]
+cflags = ["-O3", "-std=c++17"]
+cuda_cflags = ["-O3", "--use_fast_math", "-std=c++17", "-lineinfo"]
+timeout_s = 600

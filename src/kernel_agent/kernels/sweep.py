@@ -809,10 +809,14 @@ def run_sweep(
     recorded (the tool: its snapshot).  Returns ``evaluation`` (the full evaluator's
     result, or the first failure when no config passed), ``config``, ``evaluated``
     (that file), ``sweep`` (counts, ``cases``, the sorted ``table``) and ``gpu_index``."""
-    source = candidate_path.read_text()  # read once: what is swept is what is bound
+    from kernel_agent.native import project
+
+    # read once: what is swept is what is bound (a project directory: its bundle)
+    source = project.source_of(candidate_path)
+    name = project.bundle_name(candidate_path) if candidate_path.is_dir() else candidate_path.name
     workdir = Path(tempfile.mkdtemp(prefix="ka-sweep-"))
     try:
-        swept = workdir / "swept" / candidate_path.name
+        swept = workdir / "swept" / name
         swept.parent.mkdir()
         swept.write_text(source)
         start = time.monotonic()
@@ -828,7 +832,7 @@ def run_sweep(
             )
             seconds = round(time.monotonic() - start, 1)
             top = data["table"][0]
-            bound = workdir / "best" / candidate_path.name
+            bound = workdir / "best" / name
             bound.parent.mkdir()
             bound.write_text(bind_config(source, top["config"]))
             evaluated = prepare(bound) if prepare is not None else bound

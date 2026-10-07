@@ -142,7 +142,16 @@ def apply_kernels(
 
 
 def load_transform(path: Path) -> Any:
+    """Import a transform: a ``.py`` file (a project bundle is one) or a project directory
+    whose entry defines ``apply`` (:mod:`kernel_agent.native.project`)."""
     path = path.resolve()
+    if path.is_dir():
+        from kernel_agent.native import project
+
+        module = project.import_project(path)
+        if not callable(getattr(module, "apply", None)):
+            raise AttributeError(f"{path.name}: the project's entry must define apply(workload)")
+        return module
     name = f"ka_transform_{path.stem}_{abs(hash(path.read_text()))}"
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:

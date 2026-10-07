@@ -225,6 +225,33 @@ PLAN_SCHEMA: dict[str, Any] = {
                 "required": ["target", "precision", "precision_why"],
             },
         },
+        # the native arm of improve (native/engine.py, issue #134): optional; asking for it
+        # opens the arm once the module arms plateau (--native plan, the default)
+        "native": {
+            "type": "object",
+            "properties": {
+                "why": {"type": "string"},
+                "stages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$"},
+                            "scope": {"type": "string", "enum": ["stage", "group", "loop"]},
+                            "group": {"type": "string"},
+                            "module_class": {"type": "string"},
+                            "members": {"type": "array", "items": {"type": "string"}},
+                            "pattern": {"type": "string", "enum": ["solver", "stack", "other"]},
+                            "idea": {"type": "string"},
+                            "why": {"type": "string"},
+                            "expected_speedup": {"type": "number"},
+                        },
+                        "required": ["id", "scope", "idea"],
+                    },
+                },
+            },
+            "required": ["why", "stages"],
+        },
     },
     "required": ["analysis", "targets", "transforms"],
 }
@@ -474,6 +501,13 @@ model. Specialist agents will then write custom kernels for each target you pick
    + CUDA graphs, merged projections, precomputed tables, removing host syncs)
    when the profile shows launch/CPU-bound behaviour or redundant work.
 5. Ids are short snake_case.
+6. Optional **native engine** (`native`): when the ceilings show stages far above their
+   floor whose time is spread over many small module calls (a solver loop that re-streams
+   its network's weights every step, a layer stack or decode step of many short launches,
+   glue between modules), module kernels will plateau there. Name those stages in order
+   (`stages`: `scope` stage / group / loop, `group` = the instance group of the ceilings
+   row, `idea`); a systems-native agent rewrites them as native CUDA projects once the
+   module targets have plateaued. Leave it out when module kernels can reach the floors.
 {precision_policy(quality, precisions)}
 {backend_policy.policy_text(backends)}
 {backend_record}
@@ -966,6 +1000,77 @@ Budget: about {evaluations} evaluations (each reloads the model).
 Finish with a summary of which transforms helped and by how much."""
 
 
+def native_prompt(
+    card: dict[str, Any],
+    baseline: dict[str, Any],
+    profile_summary: str,
+    python: str,
+    toolchain: str,
+    evaluations: int,
+    *,
+    why: str,
+    blocks: list[str],
+) -> str:
+    """The systems-native agent (``native`` sessions, issue #134): rewrites a stage, a group
+    of stages or the whole generation loop as native code (multi-file CUDA / C++ projects,
+    ``native/project.py``) once the module kernels have plateaued."""
+    blocks_text = "\n".join(blocks) or "* (none yet)"
+    return f"""You are a systems-native inference engineer. The module-by-module kernels of
+`{card["repo_id"]}` ({card["modality"]}) have plateaued ({why}). Rewrite part of its inference
+path natively: one stage, the stages of one loop iteration, or the whole generation loop, as
+a CUDA C++ / CuTe engine that keeps weights streaming, fuses across module boundaries and
+runs in one persistent kernel or a few launches instead of many.
+
+Baseline: {baseline.get("median_ms", 0):.1f} ms {objective.of(baseline).per} \
+({baseline.get("workload")}).
+{profile_summary}
+
+# Read first
+`{KNOWLEDGE_DIR / "native.md"}`: the native-engine contract (scopes, the staged plan, the
+interface to the PyTorch model, correctness, integration, timing) and the project layout.
+The template project `{EXAMPLES_DIR / "native_project"}` builds and passes the evaluator:
+copy it to start a project.
+
+# Building blocks (verified kernels: reuse their device code, do not start from zero)
+{blocks_text}
+
+# Projects
+A project is a directory `<stage id>/` in your working directory (name it after the stage
+of the plan it implements: the ledger tracks stages by that name) with
+`kernel_project.toml`, an entry `candidate.py` and its sources (`include/*.cuh`,
+`csrc/*.cu`, `csrc/binding.cpp`, a build script). `python -m kernel_agent.native.project
+check <dir>` validates it and `... build <dir>` compiles it (CPU only, cached by content
+digest) so compiler errors cost no evaluation.
+* A **stage** with a kernel target `native_<id>` (the digest says which): the entry defines
+  `build(reference)`; `evaluate_candidate(target_id="native_<id>", candidate="<dir>")`
+  checks it teacher forced on the stage's recorded inputs and times it against the stage.
+* A **group** or the **loop** (and any stage, end to end): the entry defines
+  `apply(workload)` (`kind = "transform"`) and replaces the modules / methods it takes
+  over; `evaluate_e2e(transforms=["<dir>"], kernels=[...])` runs the full workload with the
+  quality checks (in a near-lossless run the perceptual gate) and times it.
+* Share the model's weights (read the reference modules' parameters, or convert them once
+  in `build` / `apply` by rebinding `param.data`), and hand outputs to the model's unchanged
+  modules in their dtypes and layouts. Keep the per-iteration seam the workload's quality
+  check wraps (see the workload file in `{WORKLOADS_DIR}`): a loop engine still calls that
+  module once per iteration from Python.
+
+# The staged plan
+Work on the **current** stage of the digest. A stage counts only when a native end-to-end
+run of it beats the bar (the best module-level result end to end); only then start the
+next. Measure the stage alone first (its target), then end to end on top of the accepted
+kernels (`kernels=[...]` from the list above).
+
+Budget: about {evaluations} evaluations; a native session is longer than a kernel session,
+so plan the engine, write it in several files, compile it with the CLI, then evaluate.
+
+{COMMON_RULES}
+
+{_env_block(python, toolchain)}
+
+Finish with a summary: the stage, what the engine fuses, the measured stage and end-to-end
+speedups and what limits it now."""
+
+
 def research_prompt(
     target: dict[str, Any],
     capture_info: dict[str, Any],
@@ -1238,7 +1343,15 @@ the verification result."""
 # ------------------------------------------------------------------ documentation (#125)
 
 #: Lookups (fetches + searches) a session's prompt allows, about, per role.
-WEB_BUDGET = {"kernel": 4, "systems": 4, "planner": 3, "research": 4, "dossier": 6, "harness": 3}
+WEB_BUDGET = {
+    "kernel": 4,
+    "systems": 4,
+    "native": 6,
+    "planner": 3,
+    "research": 4,
+    "dossier": 6,
+    "harness": 3,
+}
 
 _WEB_WHEN = {
     "kernel": """Look things up instead of guessing:
@@ -1254,6 +1367,10 @@ it first and do not repeat its lookups.""",
 errors, an API of the model's library, a change to the sampler or to the model's numerics
 (papers on step reduction), and a transform that failed twice for a reason you do not
 understand.""",
+    "native": """Look things up instead of guessing: PTX / CuTe instructions and their
+operand layouts (TMA, mbarriers, warp-specialised pipelines, programmatic dependent launch,
+cooperative launches), reference engines of the model family (inference libraries'
+persistent decode kernels, fused samplers), and any compiler error you do not understand.""",
     "planner": """Before a precision or data format choice, or for a module type you do not
 know, check a few sources (a format's accuracy, which GEMM or attention path exists on
 this GPU).""",
@@ -1270,6 +1387,7 @@ repository) when its inference API is not clear from the code.""",
 _WEB_CITE = {
     "kernel": "`NOTES.md`",
     "systems": "`NOTES.md`",
+    "native": "`NOTES.md`",
     "planner": "the plan's `analysis`",
     "research": "`plan.md` (and `research.md`)",
     "dossier": "`research.md`",

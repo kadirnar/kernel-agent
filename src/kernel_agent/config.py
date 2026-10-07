@@ -31,6 +31,11 @@ class OptimizeConfig:
     seeds_per_target: int | str | None = None
     reseed_workers: bool = False  # a second round of worker sessions from the 2 best snapshots
     do_transforms: bool = True
+    #: The native arm of `improve` (native/engine.py, issue #134): "off", "plan" (only when
+    #: the plan asks for it) or "on" (once every module arm has plateaued).
+    native: str = "plan"
+    native_minutes: float | None = None  # per native session (None: 3 × agent_minutes)
+    native_evaluations: int = 6  # evaluations per native slice
     allow_harness_agent: bool = True
     #: analyze: also time a generic torch.compile when the workload has no
     #: reference_optimizations() hook (strong_baseline.py).

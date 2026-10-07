@@ -24,6 +24,7 @@ Further reading: [VoxCPM2 case study](docs/VOXCPM2.md) (7.3–7.4× vs eager,
 backends on sm_120](docs/RESEARCH-TRITON.md) · [parallelisation: measured
 overlap opportunities and design](docs/PARALLEL.md) · [FP8 on sm_120: blockwise /
 MXFP8, fused FP8 activations, FP8 attention, scales, host cost](docs/FP8.md) ·
+[native engines: multi-file CUDA projects and the systems-native agent](docs/NATIVE.md) ·
 [references: what was taken from which project or paper](docs/REFERENCES.md).
 
 ## How it works
@@ -2325,6 +2326,36 @@ captured from the unmodified model.
   worker; `kernel-agent watch` shows the worker in the ledger, the events and
   the tooltips, and quick checks and duplicates as neutral rows.
 
+### Native engines: when module kernels plateau
+
+Module kernels stop paying where the time sits between modules: a solver that
+re-streams its network's weights every step, a decode step of many short launches,
+glue between stages. `--native on` (or `--native plan`, the default, when the
+planner's plan has a `native` entry) gives the improve loop a **native arm**: once
+every module arm has stopped or plateaued, a systems-native agent rewrites one
+stage, the stages of one loop iteration or the whole generation loop as a
+multi-file CUDA project, in the order of a staged plan derived from the ceilings
+table (topmost stages by time above their floor, then the loop body, then the
+loop; any model family). A stage is captured as a kernel target `native_<id>` and
+checked teacher forced on its recorded inputs, then end to end; each stage must
+beat the best module-level result end to end before the next starts. Sessions are
+longer (`--native-minutes`, default 3 × `--agent-minutes`;
+`--native-evaluations 6`). Design: [docs/NATIVE.md](docs/NATIVE.md).
+
+**Project candidates.** Every candidate or transform can be a directory instead of
+one file: `kernel_project.toml` (name, entry, kind; build backend
+`torch_extension` or `command`, source globs, include dirs, flags), an entry
+`candidate.py` (`build(reference)` or `apply(workload)`), headers, several `.cu`
+files and a build script (template: `agent/examples/native_project/`). The entry
+gets the compiled project with `project.load(__file__)`
+(`kernel_agent.native.project`), built once per content digest and toolchain in
+`~/.cache/kernel-agent/native/`. The tools snapshot a project as its **bundle**, one
+generated `.py` file holding every file and the project's sha256, so the
+evaluator, the snapshot digests, duplicates, sweeps, memcheck, the integration and
+the export treat it like a single-file candidate; a project is compiled outside the
+GPU lock before its evaluation. `python -m kernel_agent.native.project
+check|pack|build DIR` validates, packs or compiles one by hand.
+
 ### Parameter sweeps
 
 InferenceBench found a plain hyperparameter sweep (11.5×) ahead of agents (8.1×)
@@ -2728,6 +2759,9 @@ kernel-agent optimize <hf-url> [options]
                                        "Research support")
   --no-dossier                         no research dossier before a target's first session
   --agent-minutes 45                   time limit per agent session
+  --native off|plan|on                 improve: the native-engine arm (default plan: only
+  --native-minutes M                   when the plan asks); its session length (3 x
+  --native-evaluations 6               --agent-minutes) and evaluations per slice
   --eval-timeout 300                   seconds per evaluate_candidate
   --budget-reserve 0.15                share of --max-hours kept for integrate + report
   --harness my_harness.py              your own workload
@@ -3129,6 +3163,10 @@ def build(reference):
     new.__class__ = Fast
     return new
 ```
+
+A multi-file CUDA / C++ project (a directory with `kernel_project.toml`, see
+"Native engines") is a candidate too: its entry module's `build` is the
+contract.
 
 To keep a kernel working when the model runs under `torch.compile` (the
 compiled baseline), register its launcher as a custom op

@@ -101,6 +101,7 @@ _FLOATS = {"speedup", "ref_ms", "new_ms", "est_saved_ms", "spread", "pct_of_sol"
 # Statuses of the evaluator / e2e worker that are not ledger statuses.
 _STATUS_MAP = {"patch_error": "build_error", "harness_error": "crash", "error": "crash"}
 _BACKENDS = (
+    ("native", re.compile(r"^KA_PROJECT = \{", re.M)),  # a project's bundle (native/project.py)
     ("cute", re.compile(r"^\s*(?:import|from)\s+cutlass\b", re.M)),
     ("tilelang", re.compile(r"^\s*(?:import|from)\s+tilelang\b", re.M)),
     (

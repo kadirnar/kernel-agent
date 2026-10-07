@@ -20,6 +20,8 @@ from kernel_agent.dashboard import refresh
 from kernel_agent.kernels import sweep as sweep_mod
 from kernel_agent.kernels.evaluate import run_evaluation
 from kernel_agent.kernels.roofline import sol_signal
+from kernel_agent.native import engine as native_engine
+from kernel_agent.native import project as native_project
 from kernel_agent.truth import TamperError, Truth, sha256_file
 from kernel_agent.worker import call_worker
 from kernel_agent.workspace import RunDir, append_jsonl, read_json
@@ -47,13 +49,23 @@ def _resolve(base: Path, path: str) -> Path:
 
 
 def _snapshot(src: Path, history: Path) -> Path:
+    """Copy ``src`` into ``history`` as ``NNN_<stem>_<sha1:8>.py``; a project directory
+    (``native/project.py``) as its bundle, named after the project."""
     history.mkdir(parents=True, exist_ok=True)
     # after the highest number, not the count: a deleted snapshot must not cause a clash
     numbers = [int(m[1]) for p in history.glob("*.py") if (m := re.match(r"(\d+)_", p.name))]
     seq = 1 + max(numbers, default=0)
-    digest = hashlib.sha1(src.read_bytes()).hexdigest()[:8]
-    dst = history / f"{seq:03d}_{src.stem}_{digest}.py"
-    shutil.copy2(src, dst)
+    if src.is_dir():
+        text, project = native_project.pack(src)
+        data, stem = text.encode(), project.manifest.name
+    else:
+        data, stem = src.read_bytes(), src.stem
+    digest = hashlib.sha1(data).hexdigest()[:8]
+    dst = history / f"{seq:03d}_{stem}_{digest}.py"
+    if src.is_dir():
+        dst.write_bytes(data)
+    else:
+        shutil.copy2(src, dst)
     return dst
 
 
@@ -310,11 +322,12 @@ def record_e2e_result(
     keeper: Truth | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append an ``evaluate_e2e`` measurement to the transforms' ``results.jsonl`` and the
-    ledger; ``transforms_sha256`` holds the digests of the snapshots it measured."""
+    ledger; ``transforms_sha256`` holds the digests of the snapshots it measured; a run
+    with a project bundle or a native stage target is the native arm's (``native/engine.py``)."""
     row = ledger.record_e2e(
         run,
         result,
-        backend=ledger.e2e_backend(snaps, kernels),
+        backend=native_engine.e2e_backend(snaps, kernels),
         snapshot=ledger.e2e_snapshot(snaps, kernels),
         hypothesis=hypothesis,
         eval_s=eval_s,
@@ -383,16 +396,50 @@ def _uncounted(budget: Budget, agent: str, evals_budget: int | None) -> dict[str
     return {"budget": {"evals_used": used, "evals_budget": evals_budget, "counted": False}}
 
 
+def _prebuilt(path: Path) -> dict[str, Any] | None:
+    """Compile a project candidate (directory or bundle) outside the GPU lock
+    (``native_project.prebuild``): None when it built (or cannot be built without the
+    evaluator), else the ``build_error`` / ``timeout`` result to record instead of an
+    evaluation."""
+    if not (path.is_dir() or native_project.read_bundle(path) is not None):
+        return None
+    pre = native_project.prebuild(path)
+    if pre.get("status") in ("ok", "skipped"):
+        return None
+    return {
+        "status": pre.get("status") or "build_error",
+        "correct": False,
+        "passed": False,
+        "error": f"the project did not build (outside the GPU, before the evaluation):\n"
+        f"{pre.get('error', '')}"[-4000:],
+        "compile_s": pre.get("seconds"),
+    }
+
+
 def build_server(
     run: RunDir,
     budget: Budget | None = None,
     keeper: Truth | None = None,
     worker: workers.Binding | None = None,
+    *,
+    agent: str | None = None,
+    evaluations: int | None = None,
+    cwd: Path | None = None,
 ) -> Any:
     """Tools bound to one run directory (its budget: eval timeout + advice; its truth) and,
-    for a worker session, to that worker (its directory, agent name and evaluation budget)."""
+    for a worker session, to that worker (its directory, agent name and evaluation budget).
+    ``agent`` / ``evaluations``: the session every evaluation's budget advice is for (the
+    native session, ``native/engine.py``; default: the target's kernel agent, ``systems``
+    for ``evaluate_e2e``); ``cwd``: its working directory, where relative candidate,
+    transform and project paths are looked up first."""
     budget = budget or Budget(run)
     keeper = keeper or truth.of(run)
+
+    def _path(base: Path, path: str) -> Path:
+        """``path`` relative to the session's ``cwd`` when it exists there, else to ``base``."""
+        if cwd is not None and not Path(path).is_absolute() and (cwd / path).exists():
+            return cwd / path
+        return _resolve(base, path)
 
     def _best_so_far(target_id: str) -> dict[str, Any]:
         best = best_for_target(run, target_id, keeper)
@@ -505,11 +552,15 @@ def build_server(
         mine = worker if worker is not None and worker.target_id == target_id else None
         if mine is not None:  # a worker session: its own directory, name and budget
             target_dir = workers.directory(run, target_id, mine.worker)
-        src = _resolve(target_dir, args["candidate"])
+        src = _path(target_dir, args["candidate"])
         if (refused := _in_truth(run, src)) is not None:
             return _text(refused)
         if not src.exists():
             return _text({"status": "error", "error": f"{src} does not exist"})
+        try:  # a project directory evaluates as its bundle (native/project.py)
+            source = native_project.source_of(src)
+        except (native_project.ProjectError, OSError) as exc:
+            return _text({"status": "error", "error": f"{src}: {exc}"})
         hypothesis = str(args.get("hypothesis") or "").strip()
         if not hypothesis:
             return _text(
@@ -525,15 +576,14 @@ def build_server(
         quick = mode == dedup.QUICK
         idea = ledger.idea_slug(args.get("idea_id"))
         expected = _expected(args.get("expected_speedup"))
-        agent = mine.agent if mine else f"kernel-{target_id}"
-        evals_budget = budget.kernel_evals
+        name = mine.agent if mine else agent or f"kernel-{target_id}"
+        evals_budget = budget.kernel_evals if evaluations is None else evaluations
         if mine is not None and mine.evaluations is not None:
             evals_budget = mine.evaluations
         try:
             capture_sha256 = keeper.expect(capture)
         except TamperError as exc:
             return _text({"status": "error", "error": str(exc)})
-        source = src.read_text(errors="replace")
         slot = (str(run.root), target_id, dedup.source_key(source))
         while (busy := _inflight.get(slot)) is not None:  # another worker evaluates this source
             await busy.wait()
@@ -553,23 +603,26 @@ def build_server(
                     return _text({"status": "tampered", "correct": False, "error": str(exc)})
                 return _text(
                     await _duplicate(cached, args, hypothesis, source, idea, mine)
-                    | _uncounted(budget, agent, evals_budget)
+                    | _uncounted(budget, name, evals_budget)
                 )
         _inflight[slot] = done = asyncio.Event()
         try:
             snap = snapshot(run, src, target_id)
             snap_sha256 = sha256_file(snap)
             start = time.perf_counter()
-            result = await asyncio.to_thread(
-                run_evaluation,
-                capture,
-                snap,
-                profile=bool(args.get("profile")) and not quick,
-                timeout=budget.eval_timeout_s,
-                capture_sha256=capture_sha256,
-                **({"compile_check": True} if args.get("compile_check") else {}),
-                **({"quick": True} if quick else {}),
-            )
+            # a project compiles outside the GPU lock first: a compiler error is its result
+            result = await asyncio.to_thread(_prebuilt, snap)
+            if result is None:
+                result = await asyncio.to_thread(
+                    run_evaluation,
+                    capture,
+                    snap,
+                    profile=bool(args.get("profile")) and not quick,
+                    timeout=budget.eval_timeout_s,
+                    capture_sha256=capture_sha256,
+                    **({"compile_check": True} if args.get("compile_check") else {}),
+                    **({"quick": True} if quick else {}),
+                )
             if result.get("status") == "tampered":  # the evaluator refused the capture
                 keeper.alarm(capture, str(result.get("error")))
             elif sha256_file(snap) != snap_sha256:
@@ -609,7 +662,7 @@ def build_server(
             )
         if quick:
             out["mode"], out["not_a_benchmark"] = dedup.QUICK, QUICK_NOTE
-            return _text(out | _best_so_far(target_id) | _uncounted(budget, agent, evals_budget))
+            return _text(out | _best_so_far(target_id) | _uncounted(budget, name, evals_budget))
         if idea or expected is not None:
             try:
                 records = keeper.records(run.results_file(target_id))
@@ -618,7 +671,7 @@ def build_server(
             out["idea"] = idea_feedback(records, idea, expected, row)
         out |= _best_so_far(target_id)
         out |= budget.feedback(
-            agent,
+            name,
             run.results_file(target_id),
             evals_budget,
             pct_of_sol=sol_signal(result),
@@ -675,11 +728,18 @@ def build_server(
         mine = worker if worker is not None and worker.target_id == target_id else None
         if mine is not None:
             target_dir = workers.directory(run, target_id, mine.worker)
-        src = _resolve(target_dir, args["candidate"])
+        src = _path(target_dir, args["candidate"])
         if (refused := _in_truth(run, src)) is not None:
             return _text(refused)
         if not src.exists():
             return _text({"status": "error", "error": f"{src} does not exist"})
+        if src.is_dir():  # a project: valid, and compiled outside the GPU lock first
+            try:
+                native_project.Project.from_dir(src)
+            except native_project.ProjectError as exc:
+                return _text({"status": "error", "error": f"{src}: {exc}"})
+            if (failed := await asyncio.to_thread(_prebuilt, src)) is not None:
+                return _text(failed)
         hypothesis = str(args.get("hypothesis") or "").strip()
         if not hypothesis:
             return _text({"status": "error", "error": "hypothesis is required"})
@@ -689,8 +749,8 @@ def build_server(
             return _text({"status": "error", "error": str(exc)})
         idea = ledger.idea_slug(args.get("idea_id"))
         expected = _expected(args.get("expected_speedup"))
-        agent = mine.agent if mine else f"kernel-{target_id}"
-        evals_budget = budget.kernel_evals
+        name = mine.agent if mine else agent or f"kernel-{target_id}"
+        evals_budget = budget.kernel_evals if evaluations is None else evaluations
         if mine is not None and mine.evaluations is not None:
             evals_budget = mine.evaluations
         try:
@@ -766,7 +826,7 @@ def build_server(
             out["idea"] = idea_feedback(records, idea, expected, row)
         out |= _best_so_far(target_id)
         out |= budget.feedback(  # a sweep is one evaluation, however many configs it timed
-            agent,
+            name,
             run.results_file(target_id),
             evals_budget,
             pct_of_sol=sol_signal(result),
@@ -834,22 +894,32 @@ def build_server(
         cli: list[str] = ["--warmup", "2"]
         snaps = []
         for t in args.get("transforms") or []:
-            src = _resolve(run.transforms_dir, t)
+            src = _path(run.transforms_dir, t)
             if (refused := _in_truth(run, src)) is not None:
                 return _text(refused)
             if not src.exists():
                 return _text({"status": "error", "error": f"{src} does not exist"})
-            snap = snapshot(run, src)
+            try:  # a project directory: its bundle (native/project.py)
+                snap = snapshot(run, src)
+            except native_project.ProjectError as exc:
+                return _text({"status": "error", "error": f"{src}: {exc}"})
             snaps.append(snap)
             cli += ["--transform", str(snap)]
+        kernels: list[Path] = []
         for k in args.get("kernels") or []:
             target_id, _, path = k.partition("=")
-            kernel = _resolve(run.target(target_id), path)
+            kernel = _path(run.target(target_id), path)
             if (refused := _in_truth(run, kernel)) is not None:
                 return _text(refused)
+            kernels.append(kernel)
             cli += ["--kernel", f"{target_id}={kernel}"]
         start = time.perf_counter()
-        result = await asyncio.to_thread(call_worker, run, "e2e", *cli, *keeper.worker_args())
+        result: dict[str, Any] | None = None
+        for file in [*snaps, *kernels]:  # projects compile outside the GPU lock, first
+            if result is None:
+                result = await asyncio.to_thread(_prebuilt, file)
+        if result is None:
+            result = await asyncio.to_thread(call_worker, run, "e2e", *cli, *keeper.worker_args())
         _, row = record_e2e_result(
             run,
             result,
@@ -864,7 +934,10 @@ def build_server(
         if isinstance(result.get("error"), str):
             result["error"] = result["error"][-3000:]
         result |= budget.feedback(
-            "systems", run.results_file(), budget.transform_evals, ok_key="passed"
+            agent or "systems",
+            run.results_file(),
+            budget.transform_evals if evaluations is None else evaluations,
+            ok_key="passed",
         )
         return _text(result)
 
