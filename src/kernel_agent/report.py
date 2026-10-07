@@ -60,44 +60,94 @@ def _flat_metrics(metrics: Any, prefix: str = "") -> dict[str, Any]:
 
 
 def _projection_lines(
-    entries: list[dict[str, Any]], run: RunDir, baseline: dict[str, Any], base_ms: Any
+    integration: dict[str, Any], run: RunDir, baseline: dict[str, Any]
 ) -> list[str]:
-    """Projected (baseline − Σ est. saved ms) vs measured latency of each accepted set; an
-    ``integration.json`` from before #114 has its kernels' savings converted to the metric's
-    ms here (:func:`projection.in_metric`)."""
+    """Projected vs measured latency of each accepted set: the first from the baseline − Σ
+    est. saved ms, every later one from the set before it − its step's estimated gain. An
+    ``integration.json`` from before #121 (or #114) is projected again here from its
+    savings and history (:func:`projection.of_integration`)."""
+    entries = integration.get("projection") or []
     if not entries:
         return []
     metric = objective.of(baseline)
-    base = ledger._num(base_ms) or ledger._num(baseline.get("median_ms"))
-    if base is not None and any("est_saved_unit" not in p for p in entries):
+    base = ledger._num(integration.get("baseline_ms")) or ledger._num(baseline.get("median_ms"))
+    if base is not None and not all(projection.current(p) for p in entries):
         tree, units = projection.tree(run), projection.units_of(run)
-        entries = [projection.in_metric(p, tree, units, base) for p in entries]
+        entries = projection.of_integration(integration, tree, units, base)
     lines = [
         "",
-        f"Projected (baseline − Σ est. saved ms {metric.per}: a kernel's module-level "
-        "estimate, nested kernels counted once, a transform's gain alone) vs measured "
-        f"{metric.label} of every accepted set:",
+        f"Projected vs measured {metric.label} of every accepted set. The first: baseline − "
+        f"Σ est. saved ms {metric.per} (a kernel's module-level estimate, a transform's gain "
+        "alone; nested kernels and items that change the same modules counted once). Every "
+        "later one: the set before it, as measured in its step's A/B, − the estimated gain "
+        "of the step (what it adds minus what it removes):",
         "",
         "| accepted set | projected ms | measured ms | measured / projected |",
         "|---|---|---|---|",
     ]
+    before: dict[str, Any] | None = None
     for p in entries:
-        names = " + ".join(f"`{ledger.item_label(i)}`" for i in p.get("items", []))
-        saved = p.get("est_saved_ms") or {}
-        unknown = [ledger.item_label(i) for i, v in saved.items() if v is None]
-        nested = [  # the kernels inside (or around) a kernel that counts instead
-            ledger.item_label(i) + (f" ({ms / saved[i]:.0%} counted)" if ms > 0 else "")
-            for i, ms in (p.get("counted_ms") or {}).items()
-            if saved.get(i) and ms < 0.995 * saved[i]
-        ]
-        projected, measured = p.get("projected_ms"), p.get("measured_ms")
-        ratio = measured / projected if measured and projected else None
-        note = f" (no estimate: {', '.join(unknown)})" if unknown else ""
-        note += f" (not counted, nested: {', '.join(nested)})" if nested else ""
-        lines.append(
-            f"| {names}{note} | {_fmt(projected, 1)} | {_fmt(measured, 1)} | {_fmt(ratio, 2)} |"
-        )
+        lines.append(_set_row(p, before))
+        before = p
     return lines
+
+
+def _set_row(p: dict[str, Any], before: dict[str, Any] | None) -> str:
+    """The projection table's row of an accepted set. The first lists its items; a later
+    one its step (``↳ + `a` instead of `b```), the estimated gain of the step next to the
+    measured one, and only what changed in what is counted: the new items not counted
+    (nested in or overlapping a counted item), the items they are counted instead of."""
+    saved, counted = p.get("est_saved_ms") or {}, p.get("counted_ms") or {}
+    items, step = p.get("items") or [], p.get("step")
+    mine = set(step.get("new") or []) if step else set(items)
+    once = {i for g in p.get("overlaps") or [] for i in g["items"] if i not in g["counted"]}
+    unknown = [ledger.item_label(i) for i in items if i in mine and i in saved and saved[i] is None]
+    nested = [  # the kernels inside (or around) a kernel that counts instead
+        ledger.item_label(i) + (f" ({ms / saved[i]:.0%} counted)" if ms > 0 else "")
+        for i, ms in counted.items()
+        if i in mine and saved.get(i) and ms < 0.995 * saved[i] and i not in once
+    ]
+    overlapping = [ledger.item_label(i) for i in items if i in mine and i in once]
+    note = f" (no estimate: {', '.join(unknown)})" if unknown else ""
+    note += f" (not counted, nested: {', '.join(nested)})" if nested else ""
+    if overlapping:
+        note += f" (not counted, overlapping a counted item: {', '.join(overlapping)})"
+    if step:
+        was = (before or {}).get("counted_ms") or {}
+        instead = [
+            ledger.item_label(i)
+            for i in items
+            if i not in mine and (was.get(i) or 0.0) > 0 and (counted.get(i) or 0.0) <= 0
+        ]
+        note += f" (counted instead of {', '.join(instead)})" if instead else ""
+        note += (
+            f" (est. gain {_fmt(step.get('est_gain_ms'), 2)} ms, "
+            f"measured {_fmt(step.get('measured_gain_ms'), 2)} ms)"
+        )
+    if p.get("not_additive"):
+        note += f" (not additive: {p['not_additive']})"
+    if step:
+        names = f"↳ {_step_text(step)}"
+    else:
+        names = " + ".join(f"`{ledger.item_label(i)}`" for i in items)
+    projected, measured = p.get("projected_ms"), p.get("measured_ms")
+    ratio = measured / projected if measured and projected else None
+    shown = "not additive" if p.get("not_additive") else _fmt(projected, 1)
+    return f"| {names}{note} | {shown} | {_fmt(measured, 1)} | {_fmt(ratio, 2)} |"
+
+
+def _step_text(step: dict[str, Any]) -> str:
+    """``+ `a` instead of `b`, `c``` (a version swap: ``+ `a` #014 instead of `a` #013``)."""
+    added, removed = step.get("new") or [], step.get("old") or []
+    swap = {ledger.item_label(i) for i in added} & {ledger.item_label(i) for i in removed}
+
+    def names(items: list[str]) -> str:
+        return ", ".join(
+            f"`{ledger.item_label(i)}`" + (f" {ledger.item_version(i)}" if swap else "")
+            for i in items
+        )
+
+    return f"+ {names(added) or 'nothing'}" + (f" instead of {names(removed)}" if removed else "")
 
 
 def _quality_lines(data: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
@@ -319,9 +369,7 @@ def write_report(run: RunDir) -> Path:
                 f"* {tried}: passed={h.get('passed')} "
                 f"speedup={h.get('speedup')} {h.get('reason') or ''}{verdict}"
             )
-        lines += _projection_lines(
-            integration.get("projection") or [], run, baseline, integration.get("baseline_ms")
-        )
+        lines += _projection_lines(integration, run, baseline)
         if reference:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))

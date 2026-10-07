@@ -23,7 +23,11 @@ the container still calls what is inside.
 
 Names are compact: list indices become ``*`` (``layers.*.mlp`` for the MLPs of every
 layer), so a record stays small and a kernel of ``layers.*`` overlaps a transform of
-``layers.*.mlp``."""
+``layers.*.mlp``.
+
+The projection of an accepted set (``projection.of_set``, #121) counts the savings of
+overlapping items once, by a wider rule (:func:`common`): there a module that contains
+another item's overlaps it too."""
 
 from __future__ import annotations
 
@@ -57,6 +61,18 @@ def topmost(names: Iterable[str]) -> list[str]:
     """``names`` without those inside another of them."""
     names = sorted(set(names))
     return [n for n in names if not any(m != n and inside(n, m) for m in names)]
+
+
+def common(x: Iterable[str], y: Iterable[str]) -> list[str]:
+    """Where the time two items save overlaps (#121): the modules one of them changes that
+    are, or lie inside, a module the other changes (topmost; empty: none). Unlike
+    :meth:`Owners.shared` (can one be stacked on the other), a module that contains the
+    other's counts: a CUDA graph or compile of the solver saves time in the DiT layers it
+    calls, which a kernel of those layers saves again."""
+    xs, ys = set(x), set(y)
+    out = {a for a in xs if any(inside(a, b) for b in ys)}
+    out |= {b for b in ys if any(inside(b, a) for a in xs)}
+    return topmost(out)
 
 
 class Owners:
@@ -101,6 +117,27 @@ class Owners:
             for _, arg in items
             if arg in self.touched
         }
+
+    def changes(self) -> dict[str, list[str]]:
+        """Item → every module it touches or owns (the projection's overlaps, :func:`common`)."""
+        return {a: sorted(t | self.owns.get(a, set())) for a, t in self.touched.items()}
+
+    @classmethod
+    def of_history(cls, history: Iterable[dict[str, Any]]) -> Owners:
+        """What an ``integration.json`` ``history`` recorded of its items (B's ``patches``,
+        A's ``ab.a_patches``)."""
+        owners = cls()
+        for h in history:
+            ab = h.get("ab") or {}
+            owners.note([_kind(x) for x in ab.get("a_items") or []], ab.get("a_patches"))
+            owners.note([_kind(x) for x in h.get("items") or []], h.get("patches"))
+        return owners
+
+
+def _kind(item: str) -> tuple[str, str]:
+    """An integration item as (kind, arg): ``target=path`` is a kernel, a path a transform."""
+    target, sep, _ = item.partition("=")
+    return ("kernel" if sep and "/" not in target else "transform", item)
 
 
 def context_line(owners: dict[str, dict[str, list[str]]] | None, *, limit: int = 4) -> str:

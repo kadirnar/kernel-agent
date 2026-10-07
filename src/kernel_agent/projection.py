@@ -54,10 +54,18 @@ converts them first (:func:`kernel_agent.objective.from_run`): as they are for
 ``latency``, ÷ the seconds of audio of a batched run for ``throughput`` (ms per second of
 generated audio), their share inside the first-audio window for ``ttfa``
 (:func:`window`). A saving with no value in the metric is not projected (``unknown``).
+
+Accepted sets of the integration (:func:`of_sets`, ``integration.json`` ``projection``)
+also hold transforms, whose saving is their gain measured alone. Items whose modules
+overlap count once (#121): the modules each item changed (``integrate/owners.py``) put a
+kernel and the transforms of its modules, or two transforms of one module, in one group,
+and each group counts its best items that do not overlap. Every set after the first is
+projected from the set before it, as measured, minus the estimated gain of its step.
 """
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -65,6 +73,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger, objective
+from kernel_agent.integrate import owners as owners_mod
 from kernel_agent.kernels import weights
 from kernel_agent.workspace import RunDir, read_json
 
@@ -283,24 +292,221 @@ def in_metric(
     return {**entry, **of_set(tree, saved, baseline_ms), "est_saved_unit": SAVED_UNIT}
 
 
-def of_set(tree: Tree, saved: Mapping[str, float | None], baseline_ms: float) -> dict[str, Any]:
-    """Projected ms of an integration's accepted set (``integration.json`` ``projection``):
-    ``saved`` maps each item (a kernel's ``target=path``, a transform's path) to its est.
-    saved ms in the metric's ms (a kernel's module-level estimate, :class:`Units`; a
-    transform's measured gain alone). Kernels nest by target; transforms are in no tree
-    and count in full, a slower one too. ``counted_ms``: the part of each saving counted."""
+def of_set(
+    tree: Tree,
+    saved: Mapping[str, float | None],
+    baseline_ms: float,
+    changes: Mapping[str, Iterable[str]] | None = None,
+) -> dict[str, Any]:
+    """Projected ms of an integration's accepted set from the baseline: ``saved`` maps each
+    item (a kernel's ``target=path``, a transform's path) to its est. saved ms in the
+    metric's ms (a kernel's module-level estimate, :class:`Units`; a transform's measured
+    gain alone). Kernels nest by target (the tree). Items whose modules overlap count once
+    (``changes``: the modules each item touched or owns, ``integrate/owners.py``;
+    :func:`owners.common <kernel_agent.integrate.owners.common>`, #121): of each group of
+    them, the items that do not overlap with the largest saving (of two, the larger).
+    A slower item (a negative saving) is added back, unless it overlaps another: its time
+    alone says nothing of what it does with them. ``counted_ms``: the part of each saving
+    counted; ``overlaps``: each group, the items counted and where they overlap."""
     key = {a: kernel_target(a) or a for a in saved}
     proj = project(tree, {key[a]: v for a, v in saved.items()}, baseline_ms)
-    slower = sum(v for v in saved.values() if v is not None and v < 0)
-    return {
-        "projected_ms": round(baseline_ms - proj.saved_ms - slower, 3),
-        "est_saved_ms": dict(saved),
-        "counted_ms": {
-            a: round(proj.counted.get(key[a], 0.0), 3)
-            for a, v in saved.items()
-            if v is not None and v > 0
-        },
+    counted = {
+        a: proj.counted.get(key[a], 0.0) for a, v in saved.items() if v is not None and v > 0
     }
+    pairs = _overlaps(list(saved), changes or {})
+    groups: list[dict[str, Any]] = []
+    for members in _components(list(saved), pairs):
+        inner = {p: w for p, w in pairs.items() if p[0] in members}
+        keep = _once({a: counted.get(a, 0.0) for a in members}, inner)
+        for a in members:
+            if a in counted and a not in keep:
+                counted[a] = 0.0
+        order = sorted(members, key=lambda a: -(saved[a] or 0.0))
+        where = owners_mod.topmost(m for w in inner.values() for m in w)
+        groups.append({"items": order, "counted": [a for a in order if a in keep], "where": where})
+    grouped = {a for g in groups for a in g["items"]}
+    slower = sum(v for a, v in saved.items() if v is not None and v < 0 and a not in grouped)
+    out: dict[str, Any] = {
+        "projected_ms": round(baseline_ms - sum(counted.values()) - slower, 3),
+        "est_saved_ms": dict(saved),
+        "counted_ms": {a: round(ms, 3) for a, ms in counted.items()},
+    }
+    if groups:
+        out["overlaps"] = groups
+    return out
+
+
+def of_sets(
+    tree: Tree,
+    sets: Sequence[Mapping[str, Any]],
+    baseline_ms: float,
+    changes: Mapping[str, Iterable[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """``integration.json`` ``projection``: projected vs measured ms of every accepted set,
+    in the order the integration accepted them (each with ``items``, ``est_saved_ms`` in the
+    metric's ms, ``measured_ms`` and ``from_ms``: the set before it, measured in the A/B of
+    its step).
+
+    ``summed_ms`` projects a set from the baseline (:func:`of_set`, overlaps counted once).
+    ``projected_ms`` of the first set is the same; of every later one it is the set before
+    it as measured − the estimated gain of its step (``step``: the items it adds and
+    removes, ``est_gain_ms`` = the difference of the two sets' ``summed_ms``, next to its
+    ``measured_gain_ms``). So the estimate of the new item meets what it gained on top of
+    the others, instead of the others' gains alone, which do not add up (#121). A
+    projection at or below 0 ms counts more saving than there is time to save:
+    ``projected_ms`` is None and ``not_additive`` says why."""
+    out: list[dict[str, Any]] = []
+    for s in sets:
+        saved = s.get("est_saved_ms") or {}
+        entry: dict[str, Any] = {
+            "items": list(s.get("items") or []),
+            **of_set(tree, saved, baseline_ms, changes),
+        }
+        entry.update(summed_ms=entry["projected_ms"], measured_ms=s.get("measured_ms"))
+        entry["est_saved_unit"] = SAVED_UNIT
+        if out:
+            _step(entry, out[-1], s.get("from_ms"), changes or {})
+        elif entry["summed_ms"] <= 0:
+            counted = entry["counted_ms"]
+            big = sorted((a for a, ms in counted.items() if ms > 0), key=lambda a: -counted[a])
+            entry["projected_ms"] = None
+            entry["not_additive"] = (
+                f"the savings counted ({sum(counted.values()):.1f} ms) are more than the "
+                f"baseline ({baseline_ms:.1f} ms); the largest: "
+                + _few([f"{ledger.item_label(a)} {counted[a]:.1f} ms" for a in big])
+            )
+        out.append(entry)
+    return out
+
+
+def of_integration(
+    data: Mapping[str, Any], tree: Tree, units: Units, baseline_ms: float
+) -> list[dict[str, Any]]:
+    """``integration.json`` ``projection`` as :func:`of_sets` writes it. An entry written
+    before #121 (no ``summed_ms``) is projected again: its savings in the metric's ms
+    (:func:`in_metric`), the modules each item changed and the A of each step from the
+    file's ``history``."""
+    entries = [dict(p) for p in data.get("projection") or []]
+    if all(current(p) for p in entries):
+        return entries
+    history = list(data.get("history") or [])
+    starts = {  # the A/B that accepted each set: its A is the set before it
+        tuple(h.get("items") or []): (h.get("ab") or {}).get("a_median_ms")
+        for h in history
+        if (h.get("ab") or {}).get("accepted")
+    }
+    sets = [
+        {**p, "from_ms": starts.get(tuple(p.get("items") or []))}
+        for p in (in_metric(p, tree, units, baseline_ms) for p in entries)
+    ]
+    return of_sets(tree, sets, baseline_ms, owners_mod.Owners.of_history(history).changes())
+
+
+def current(entry: Mapping[str, Any]) -> bool:
+    """Whether an ``integration.json`` projection entry is as :func:`of_sets` writes it
+    (savings in the metric's ms, #114; overlaps counted once, ``summed_ms``, #121)."""
+    return entry.get("est_saved_unit") == SAVED_UNIT and "summed_ms" in entry
+
+
+def _step(
+    entry: dict[str, Any],
+    before: Mapping[str, Any],
+    from_ms: float | None,
+    changes: Mapping[str, Iterable[str]],
+) -> None:
+    """``entry``'s ``step`` from the set ``before`` it, and its ``projected_ms`` from there
+    (:func:`of_sets`)."""
+    new = [a for a in entry["items"] if a not in before["items"]]
+    old = [a for a in before["items"] if a not in entry["items"]]
+    start = from_ms if from_ms is not None else before.get("measured_ms")
+    est = round(before["summed_ms"] - entry["summed_ms"], 3)
+    measured = entry.get("measured_ms")
+    gain = round(start - measured, 3) if start is not None and measured is not None else None
+    entry["step"] = {
+        "new": new,
+        "old": old,
+        "from_ms": start,
+        "est_gain_ms": est,
+        "measured_gain_ms": gain,
+    }
+    if start is None:
+        entry["projected_ms"] = None
+    elif start - est > 0:
+        entry["projected_ms"] = round(start - est, 3)
+    else:
+        entry["projected_ms"] = None
+        why = f"the estimated gain of {_few([ledger.item_label(a) for a in new])} ({est:.1f} ms)"
+        why += f" is more than the {start:.1f} ms of the set before it"
+        rest = [a for a in entry["items"] if a not in new]
+        pairs = _overlaps([*new, *rest], changes)
+        saved = entry.get("est_saved_ms") or {}
+        others = sorted(
+            {b for a, b in pairs if a in new and b not in new}, key=lambda b: -(saved[b] or 0.0)
+        )
+        if others:
+            where = owners_mod.topmost(m for (a, b), w in pairs.items() if a in new for m in w)
+            why += f", where it overlaps {_few([ledger.item_label(b) for b in others])}"
+            why += f" (in {_few(where, 2)})"
+        entry["not_additive"] = why
+
+
+def _overlaps(
+    items: Sequence[str], changes: Mapping[str, Iterable[str]]
+) -> dict[tuple[str, str], list[str]]:
+    """The pairs of ``items`` whose savings overlap, with where (:func:`owners.common
+    <kernel_agent.integrate.owners.common>`): a kernel and a transform, or two transforms.
+    Two kernels nest in the tree instead, which counts the instances they share."""
+    out: dict[tuple[str, str], list[str]] = {}
+    for i, a in enumerate(items):
+        for b in items[i + 1 :]:
+            if kernel_target(a) and kernel_target(b):
+                continue
+            if where := owners_mod.common(changes.get(a, ()), changes.get(b, ())):
+                out[(a, b)] = where
+    return out
+
+
+def _components(items: Sequence[str], pairs: Iterable[tuple[str, str]]) -> list[list[str]]:
+    """The groups of ``items`` that overlap, directly or through others (two or more)."""
+    group = {a: {a} for a in items}
+    for a, b in pairs:
+        if group[a] is not group[b]:
+            merged = group[a] | group[b]
+            for x in merged:
+                group[x] = merged
+    out: list[list[str]] = []
+    for a in items:
+        if len(group[a]) > 1 and not any(a in g for g in out):
+            out.append([x for x in items if x in group[a]])
+    return out
+
+
+def _once(value: Mapping[str, float], pairs: Iterable[tuple[str, str]]) -> set[str]:
+    """Of a group of overlapping items, those counted: the items that do not overlap with
+    the largest total saving (on a tie, the fewer), as the tree takes the better of a
+    parent and what lies inside it. Groups are small (one per module of the model)."""
+    near: dict[str, set[str]] = {a: set() for a in value}
+    for a, b in pairs:
+        near[a].add(b)
+        near[b].add(a)
+
+    @functools.cache
+    def best(free: frozenset[str]) -> tuple[float, int, tuple[str, ...]]:
+        if not free:
+            return (0.0, 0, ())
+        v = max(free, key=lambda a: (len(near[a] & free), value[a], a))
+        if not near[v] & free:  # none of them overlaps another one any more: all count
+            return (round(sum(value[a] for a in free), 9), -len(free), tuple(sorted(free)))
+        rest = best(free - {v} - near[v])
+        take = (round(rest[0] + value[v], 9), rest[1] - 1, tuple(sorted((*rest[2], v))))
+        return max(best(free - {v}), take)
+
+    return set(best(frozenset(a for a, ms in value.items() if ms > 0))[2])
+
+
+def _few(names: Sequence[str], n: int = 3) -> str:
+    """The first ``n`` of ``names``, and how many more."""
+    return ", ".join(names[:n]) + (f" (+{len(names) - n} more)" if len(names) > n else "")
 
 
 # ------------------------------------------------------------------ units

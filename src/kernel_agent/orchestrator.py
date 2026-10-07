@@ -739,7 +739,8 @@ class Orchestrator:
         recorded as ``oom``, which a re-integration measures again.
         ``integration.json`` keeps each step's ``ab`` record (a swap's with
         ``kind: swap``, ``old`` and ``new``), the ``projection`` (baseline −
-        Σ est. saved ms, nested kernels counted once) of every accepted set and
+        Σ est. saved ms, nested kernels and items of overlapping modules counted
+        once; a later set from the set before it) of every accepted set and
         the ``owners`` (touched and owned modules) of the accepted items.
 
         ``reuse`` (re-integrations of the improve loop) takes the measurements
@@ -924,7 +925,7 @@ class Orchestrator:
                 if r.get("passed"):
                     reason = f"no significant gain: {abtest.describe(r['ab'])}; {r['ab']['why']}"
                 log(f"integrate: keep {Path(old[1]).name}, not {Path(new[1]).name} ({reason})")
-        projection = self._projection(base_ms, sets, history)
+        projection = self._projection(base_ms, sets, history, owners.changes())
         result = {
             "baseline_ms": base_ms,
             "accepted": [{"kind": k, "item": a} for k, a in accepted],
@@ -961,7 +962,11 @@ class Orchestrator:
                 f"integrate: final {final['median_ms']:.1f} ms vs {base_ms:.1f} ms "
                 f"= {final['speedup']}x"
                 + (f" ({vs_compiled:.2f}x vs compiled)" if vs_compiled else "")
-                + f"; projected {projected:.1f} ms"
+                + (
+                    f"; projected {projected:.1f} ms"
+                    if projected is not None
+                    else f"; not projected ({projection[-1].get('not_additive') or 'no A/B'})"
+                )
             )
         else:
             log("integrate: no optimisation survived end-to-end validation")
@@ -1403,26 +1408,35 @@ class Orchestrator:
         base_ms: float,
         sets: list[tuple[list[tuple[str, str]], dict[str, Any]]],
         history: list[dict[str, Any]],
+        changes: dict[str, list[str]],
     ) -> list[dict[str, Any]]:
         """Projected (baseline − Σ est. saved ms of its items) vs measured latency of every
         accepted set: a kernel's saving is its module-level estimate in the metric's ms
         (``projection.Units``: per second of audio for ``metric=throughput``), a transform's
         its measured gain alone (paired against the unmodified model). Nested kernels count
         once (:func:`projection.of_set`: a decoder layer's kernel replaces the attention
-        kernel inside it); ``counted_ms`` is the part of each item's saving that counts."""
+        kernel inside it), and so do items whose modules overlap (``changes``: what each
+        item touched or owns, #121); ``counted_ms`` is the part of each item's saving that
+        counts. A set after the first is projected from the set before it, measured in the
+        A/B of its step, minus its step's estimated gain (:func:`projection.of_sets`)."""
         alone = _alone(base_ms, history)
         tree, units = projection.tree(self.run), self._units()
-        out = []
+        rows = []
         for combo, r in sets:
             saved: dict[str, float | None] = {}
             for item in combo:
                 est = self._saving(item, alone, units)
                 saved[item[1]] = None if est is None else round(est, 3)
-            entry = {"items": [a for _, a in combo], **projection.of_set(tree, saved, base_ms)}
-            entry["measured_ms"] = r.get("median_ms")
-            entry["est_saved_unit"] = projection.SAVED_UNIT  # since #114: in the metric's ms
-            out.append(entry)
-        return out
+            a_ms = (r.get("ab") or {}).get("a_median_ms")  # the set before it, same A/B
+            rows.append(
+                {
+                    "items": [a for _, a in combo],
+                    "est_saved_ms": saved,
+                    "measured_ms": r.get("median_ms"),
+                    "from_ms": a_ms,
+                }
+            )
+        return projection.of_sets(tree, rows, base_ms, changes)  # in the metric's ms (#114)
 
     def _units(self) -> projection.Units:
         """A kernel's est. saved ms per run → the metric's ms (#114), from the sealed

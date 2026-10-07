@@ -707,14 +707,33 @@ Every step in `integration.json` → `history` carries its `ab` record: `mode`
 (`paired` / `separate`), `a_items`, the timings `a_ms` / `b_ms`, `wins`,
 `win_rate`, `gain`, `ci95`, `accepted`, `why`, the `rule`, the undo check and
 the GPU telemetry. `projection` lists, for every accepted set, the projected
-latency (baseline − Σ est. saved ms: a kernel's module-level estimate converted
-to the metric's ms, see "What faster means"; a transform's measured gain alone)
-next to the measured one; `report.md` shows both. `est_saved_unit: "metric"`
-marks the conversion. In a file written before it, a kernel's saving is per run,
-and `report.md` converts it when it reads the file. Nested kernels count once, as in the run's projection (see Charts): a
-decoder layer's kernel and the attention kernel inside it add up to the better
-of the two, not both. `counted_ms` holds the part of each item's saving that
-counts, and `report.md` names the kernels not counted.
+latency next to the measured one; `report.md` shows both. The first set is
+projected from the baseline: baseline − Σ est. saved ms (a kernel's module-level
+estimate converted to the metric's ms, see "What faster means"; a transform's
+measured gain alone). `est_saved_unit: "metric"` marks the conversion. Nested
+kernels count once, as in the run's projection (see Charts): a decoder layer's
+kernel and the attention kernel inside it add up to the better of the two, not
+both. Items whose modules overlap count once too (#121), by what the patcher
+recorded of each (the modules it touched or owns, as for the replacements
+above): two transforms of the LM step, a kernel and the transforms that change
+something inside its modules, a CUDA graph of the solver and a kernel of the
+layers it calls. Of each such group the items that do not overlap with the
+largest saving count (of two, the larger), and a slower transform in a group is
+not added back. `counted_ms` holds the part of each item's saving that counts,
+`overlaps` each group (`items`, `counted`, `where`), `summed_ms` the set
+projected this way. Every later set is projected from the set before it, as
+measured in the A/B of its step, minus the estimated gain of the step (what it
+adds minus what it removes: the difference of the two sets' `summed_ms`; `step`
+has `new`, `old`, `from_ms`, `est_gain_ms` and `measured_gain_ms`). So the
+estimate of the new item meets the gain it measured on top of the others,
+instead of joining a sum of gains measured alone, which do not add up: in
+`runs/openbmb--VoxCPM2/20261006-004718-retest2` the final set projected
+−24.6 ms against 6.03 ms measured; it now projects 5.3 ms. A projection at or
+below 0 ms (a step estimated to save more than the set before it took) is
+`null`, with `not_additive` saying why and naming the items the step overlaps;
+`report.md` shows `not additive`, the step's estimated and measured gain, and
+which items are not counted. `report.md` projects a file written before #121
+(or #114, whose kernel savings are per run) again from its savings and `history`.
 
 A re-integration reuses an A/B (an item alone, a step, a swap) of the previous
 integration whose content is unchanged, whatever the snapshot names: every

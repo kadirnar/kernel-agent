@@ -402,7 +402,12 @@ def test_paired_ab_rejects_what_the_old_rule_accepted_as_noise(tmp_path):
     alone = next(h for h in singles if h["items"] == [plus_gain["items"][1]])
     saved = BASE * alone["ab"]["gain"]  # the paired gain alone
     assert saved == pytest.approx(0.03 * BASE, rel=0.1)
-    assert second["projected_ms"] == pytest.approx(0.55 * BASE - saved, abs=0.01)
+    assert second["summed_ms"] == pytest.approx(0.55 * BASE - saved, abs=0.01)
+    # a later set: the set before it (A of its step) − the estimated gain of the step (#121)
+    step = second["step"]
+    assert step["from_ms"] == plus_gain["ab"]["a_median_ms"]
+    assert step["est_gain_ms"] == pytest.approx(saved, abs=0.01)
+    assert second["projected_ms"] == pytest.approx(step["from_ms"] - saved, abs=0.01)
     assert second["measured_ms"] == final["median_ms"]
     report = write_report(run).read_text()
     assert "| accepted set | projected ms | measured ms | measured / projected |" in report
@@ -445,10 +450,12 @@ def test_projection_counts_nested_kernels_once(tmp_path):
     attn, layer = second["items"]
     assert second["est_saved_ms"] == pytest.approx({attn: 0.45 * BASE, layer: 0.30 * BASE})
     assert second["counted_ms"] == pytest.approx({attn: 0.45 * BASE, layer: 0.0})
-    assert second["projected_ms"] == pytest.approx(0.55 * BASE)  # not 0.25 x the baseline
+    assert second["summed_ms"] == pytest.approx(0.55 * BASE)  # not 0.25 x the baseline
+    assert second["step"]["est_gain_ms"] == 0.0  # the layer adds nothing to the estimate
+    assert second["projected_ms"] == second["step"]["from_ms"]  # the set before it, measured
     assert second["measured_ms"] == data["final"]["median_ms"]
     report = write_report(run).read_text()
-    assert "| `attn` + `layer` (not counted, nested: layer) |" in report
+    assert "| ↳ + `layer` (not counted, nested: layer) (est. gain 0.00 ms, measured" in report
 
 
 def test_projection_puts_kernel_savings_in_the_metric(tmp_path):
