@@ -21,6 +21,9 @@ Two complementary views are collected:
   profiled runs that must agree with each other and with the end-to-end latency
   (:func:`kernel_problems`), or the view is profiled again and, failing again,
   marked unreliable: :func:`summarize` then draws no conclusion from it.
+* **Host syncs** – one more run under :mod:`.host_sync` lists every call that makes the
+  host wait for the GPU (``.item()``, ``.cpu()``, pageable copies, ``torch.tensor(...,
+  device=...)``) by call site, as transform opportunities.
 
 Regions the module view cannot see into (an optimised model in a later improve
 round has them): a ``torch.compile``'d module is timed as one call (hooks inside
@@ -51,6 +54,7 @@ from torch import nn
 from kernel_agent import telemetry
 from kernel_agent.gpulock import gpu_lock
 from kernel_agent.phases import call_phase
+from kernel_agent.profiling import host_sync
 from kernel_agent.profiling.methods import (
     describe,
     discover_entrypoints,
@@ -959,6 +963,7 @@ def profile_workload(
         synchronize()
     hooked_ms = (time.perf_counter() - start) * 1000
     classes = timer.class_stats()
+    syncs = host_sync.scan(workload, inputs)  # one more run: host syncs by call site
     kernel_view = guarded_kernel_profile(workload, inputs, reference_ms)
     return {
         "hooked_wall_ms": round(hooked_ms, 2),
@@ -968,6 +973,7 @@ def profile_workload(
         **({"work_reference": work.info()} if work is not None else {}),
         "classes": [asdict(c) for c in classes],
         "kernel_view": kernel_view,
+        "host_syncs": syncs,
     }
 
 
@@ -1067,6 +1073,7 @@ def summarize(
     ]
     for o in kv["aten_ops"][:20]:
         lines.append(f"| `{o['name']}` | {o['calls']} | {o['device_ms']:.3f} |")
+    lines += host_sync.summary_lines(profile.get("host_syncs"))
     lines += _roofline_note()
     return "\n".join(lines) + "\n"
 

@@ -933,6 +933,7 @@ weights by rebinding (`param.data = new`), not in place (`param.mul_()`), or
 the transform falls back to slower separate-process measurements; a transform
 that cannot be undone that way sets `undo = False` or defines `undo(workload)`.
 
+{knowledge("systems.md")}
 # Tools
 * `evaluate_e2e(transforms=["transforms/<id>.py"], kernels=[], hypothesis="...")` loads
   the full model in a fresh process, applies the transforms, runs the workload,

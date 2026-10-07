@@ -311,7 +311,13 @@ class VoxCPMBatchWorkload(VoxCPMWorkload):
         finished = torch.zeros(batch, dtype=torch.bool)
         margins: list[torch.Tensor] = []
         pred_feat_seq = []
+        flags = self.async_flags()
         for i in range(n):
+            # every request's own stop flag (it depends on lm_hidden only), sent to the host
+            # now and read once the LocDiT and LocEnc are queued: one host sync per patch, as
+            # VoxCPM's loop, but on the flags' copy, not on the whole patch (bit-identical)
+            logits = model.stop_head(model.stop_actn(model.stop_proj(lm_hidden)))
+            ticket = flags.send(logits.argmax(dim=-1))
             dit_hidden = torch.cat(
                 (model.lm_to_dit_proj(lm_hidden), model.res_to_dit_proj(residual_hidden)), dim=-1
             )
@@ -327,9 +333,7 @@ class VoxCPMBatchWorkload(VoxCPMWorkload):
             pred_feat_seq.append(pred_feat.unsqueeze(1))
             prefix_feat_cond = pred_feat
 
-            # one host sync per patch, as VoxCPM's loop; every request's own flag
-            logits = model.stop_head(model.stop_actn(model.stop_proj(lm_hidden)))
-            stop = logits.argmax(dim=-1).cpu()
+            stop = flags.read(ticket)
             if min_len < n:
                 margins.append(logits.detach().float())
             if i > min_len:
