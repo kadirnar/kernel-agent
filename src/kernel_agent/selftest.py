@@ -540,6 +540,18 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
                     else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
                 )
                 print(f"  {backend:9s} {'OK ' if passed else 'FAIL'} {detail}")
+        native = EXAMPLES_DIR / "native_project"  # a multi-file project (native/project.py)
+        if native.is_dir() and tc.backends.get("cuda") and (backends is None or "cuda" in backends):
+            result = run_evaluation(capture, native)
+            passed = bool(result.get("correct"))
+            ok &= passed
+            if verbose:
+                detail = (
+                    f"speedup {result.get('speedup')}x"
+                    if passed
+                    else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+                )
+                print(f"  {'project':9s} {'OK ' if passed else 'FAIL'} {detail}")
         if fp8_supported(tc) and (backends is None or "cuda" in backends):
             ok &= smoke_fp8(Path(tmp), verbose)
             ok &= smoke_fp4(Path(tmp), verbose)

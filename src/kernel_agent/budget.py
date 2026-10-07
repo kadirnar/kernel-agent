@@ -173,6 +173,8 @@ class Budget:
     max_sessions: int | None = None
     started: float = field(default_factory=time.monotonic)
     deadlines: dict[str, float] = field(default_factory=dict)
+    # agent -> its own session length (the native agent's longer one), else agent_minutes
+    minutes_by_agent: dict[str, float] = field(default_factory=dict)
     evals: dict[str, int] = field(default_factory=dict)
     # agent -> evaluations in its results file when its plateau count restarted (a research plan)
     restarted: dict[str, int] = field(default_factory=dict)
@@ -255,8 +257,9 @@ class Budget:
         it is not a new session, that time counts against ``agent_minutes`` and its
         evaluations so far still count."""
         limits = []
-        if self.agent_minutes is not None:
-            limits.append(max(self.agent_minutes * 60 - (worked_s or 0.0), 0.0))
+        minutes = self.minutes_by_agent.get(name, self.agent_minutes)
+        if minutes is not None:
+            limits.append(max(minutes * 60 - (worked_s or 0.0), 0.0))
         left = self.agent_seconds_left()
         if left is not None:
             limits.append(max(left, MIN_AGENT_SECONDS))

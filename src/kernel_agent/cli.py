@@ -151,6 +151,9 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         seeds_per_target=ns.seeds_per_target,
         reseed_workers=ns.reseed_workers,
         do_transforms=not ns.no_transforms,
+        native=ns.native or "plan",
+        native_minutes=ns.native_minutes,
+        native_evaluations=ns.native_evaluations,
         claude_model=ns.claude_model,
         effort=ns.effort,
         max_turns_per_agent=ns.max_turns,
@@ -499,6 +502,19 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         "--max-sessions", type=int, help="agent sessions this invocation may start (all agents)"
     )
     p.add_argument("--agent-minutes", type=float, help="time limit per agent session")
+    p.add_argument(
+        "--native",
+        choices=["off", "plan", "on"],
+        help="improve: the native-engine arm (issue #134, docs/NATIVE.md): a systems-native "
+        "agent rewrites stages as multi-file CUDA projects once every module arm has "
+        "plateaued; plan (default): only when the plan asks for it",
+    )
+    p.add_argument(
+        "--native-minutes",
+        type=float,
+        help="time limit per native session (default: 3 x --agent-minutes)",
+    )
+    p.add_argument("--native-evaluations", type=int, default=6, help="evaluations per native slice")
     p.add_argument(
         "--budget-reserve",
         type=float,

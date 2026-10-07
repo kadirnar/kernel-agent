@@ -7,6 +7,8 @@ is appended to the system prompt of the matching agents:
 * `## planner`: picks targets and transforms from the profile
 * `## kernel`: one kernel engineer per target (writes `build()` replacements)
 * `## systems`: model-level transforms, validated end to end
+* `## native`: rewrites a stage, a loop iteration or the whole generation loop as a
+  multi-file CUDA project once the module kernels have plateaued (`--native`)
 * `## harness`: writes `harness.py` when no built-in workload runs the model
 * `## research`: reviews a target that has plateaued, from a clean context,
   and writes its `plan.md` (no code)
@@ -148,6 +150,17 @@ version is saved as `logs/program-<sha12>.md`.
   removed, work not repeated) over a gain of a few percent seen in a single
   evaluation, because each `evaluate_e2e` reloads the model and timings vary
   between calls.
+
+## native
+
+* One stage at a time, in the order of the staged plan: measure the stage on
+  its own target first (teacher forced), then end to end on top of the
+  accepted kernels; the next stage starts only when this one beats the best
+  module-level result end to end.
+* Reuse the device code of the verified kernels you are given (this run's
+  winners, the library) instead of rewriting their math from scratch.
+* Compile with `python -m kernel_agent.native.project build <dir>` until it
+  builds cleanly; an evaluation is for a hypothesis, not for a compiler error.
 
 ## harness
 

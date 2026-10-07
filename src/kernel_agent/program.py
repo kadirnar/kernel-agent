@@ -6,6 +6,7 @@ reads a section:
 
 * ``## all`` – every agent
 * ``## planner``, ``## kernel`` (``kernel-<target>`` agents), ``## systems``,
+  ``## native`` (the systems-native agent of native engines, issue #134),
   ``## harness``, ``## research`` (``research-<target>``: plateau reviews),
   ``## refactor`` (``refactor-<target>``: rewrites of region targets) – that
   role only; ``## kernel, systems`` names several roles.
@@ -33,7 +34,7 @@ from pathlib import Path
 
 from kernel_agent.workspace import RunDir, write_json
 
-ROLES = ("planner", "kernel", "systems", "harness", "research", "refactor")
+ROLES = ("planner", "kernel", "systems", "native", "harness", "research", "refactor")
 SECTIONS = ("all", *ROLES)
 FILENAME = "program.md"
 TEMPLATE = Path(__file__).parent / "agent" / "program.md"

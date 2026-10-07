@@ -56,6 +56,7 @@ from kernel_agent.integrate import owners as owners_mod
 from kernel_agent.integrate import reuse as reuse_cache
 from kernel_agent.integrate.export import export_optimized
 from kernel_agent.kernels import evaluate, memcheck, recheck
+from kernel_agent.native import engine as native_engine
 from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
@@ -1804,6 +1805,61 @@ class Orchestrator:
             cwd=self.run.transforms_dir,
             mcp_tools=tool_names("evaluate_e2e", "run_info"),
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
+        )
+
+    #: A native session gets this many times the turns of the others (and, without
+    #: ``--native-minutes``, this many times ``--agent-minutes``).
+    NATIVE_FACTOR = 3
+
+    def native_minutes(self) -> float | None:
+        """Session length of the native agent: ``--native-minutes``, else a multiple of
+        ``--agent-minutes`` (None: no per-session limit)."""
+        if self.cfg.native_minutes:
+            return float(self.cfg.native_minutes)
+        return self.cfg.agent_minutes * self.NATIVE_FACTOR if self.cfg.agent_minutes else None
+
+    async def native_slice(self, *, evaluations: int, digest: str, label: str) -> AgentResult:
+        """A fresh systems-native session (``native/engine.py``, issue #134) seeded with
+        ``digest``: a longer session (:meth:`native_minutes`, more turns), the native-engine
+        contract, this run's and the library's best kernels as building blocks, and the
+        tools for its stage targets and end-to-end runs, working in ``transforms/native/``
+        (its project directories)."""
+        cwd = native_engine.native_dir(self.run)
+        cwd.mkdir(parents=True, exist_ok=True)
+        (cwd / "NOTES.md").touch()
+        self.budget.transform_evals = evaluations
+        if (minutes := self.native_minutes()) is not None:
+            self.budget.minutes_by_agent["native"] = minutes
+        why = native_engine.enabled(self.cfg.native, native_engine.plan_entry(self.run))
+        blocks = native_engine.building_blocks(self._kernel_winners(), self._library_arch())
+        system = prompts.native_prompt(
+            self.run.load()["card"],
+            read_json(self.run.baseline_json, {}),
+            (self.run.profile_dir / "summary.md").read_text(),
+            self.python,
+            self.tc.summary(),
+            evaluations,
+            why=f"{why or 'opened by the scheduler'}; every module arm has plateaued",
+            blocks=blocks,
+        ) + prompts.precision_note(self.cfg.quality, self.allowed_precisions())
+        server = build_server(
+            self.run, self.budget, self.truth, agent="native", evaluations=evaluations, cwd=cwd
+        )
+        return await self._agent(
+            "native",
+            label,
+            config={"max_turns_per_agent": self.cfg.max_turns_per_agent * self.NATIVE_FACTOR},
+            prompt=(
+                "Continue the native engine of this model. Read the `# Improve slice` section "
+                "first: it says which stage is current and where the previous sessions left off."
+            ),
+            system_append=system + digest,
+            cwd=cwd,
+            mcp_tools=tool_names(
+                "evaluate_candidate", "sweep_candidate", "best_result", "evaluate_e2e", "run_info"
+            ),
+            add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR, prompts.WORKLOADS_DIR],
+            mcp_server=server,
         )
 
     async def research(

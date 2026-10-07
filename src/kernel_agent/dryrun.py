@@ -51,6 +51,7 @@ from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapsh
 from kernel_agent.budget import Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.kernels.roofline import sol_signal
+from kernel_agent.native import engine as native_engine
 from kernel_agent.research import PLAN_FILE
 from kernel_agent.scheduler import class_shares, snapshot_record, systems_rows
 from kernel_agent.workspace import RunDir, read_json, read_jsonl, write_json
@@ -457,6 +458,9 @@ class World:
         elif name == "systems":
             evals = self._systems()
             result.cost_usd = 0.3 + 0.5 * evals * rng.uniform(0.8, 1.2)
+        elif name == "native":
+            evals = self._native()
+            result.cost_usd = 0.8 + 1.2 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("kernel-"):
             target_id, worker = workers.parse_agent(name)
             evals = self._kernel(target_id, system_append, worker=worker)
@@ -485,7 +489,7 @@ class World:
     ) -> bool:
         """Whether the simulated agent stops after this evaluation (it follows the advice)."""
         budget = self.orch.budget
-        ok_key = "passed" if agent == "systems" else "correct"
+        ok_key = "passed" if agent in ("systems", "native") else "correct"
         feedback = budget.feedback(agent, results, evals, ok_key=ok_key, pct_of_sol=pct_of_sol)
         advice = feedback["advice"]
         if advice == "stop" or budget.exhausted():
@@ -599,6 +603,49 @@ class World:
                 self.hook("systems", used)
             results = self.run.results_file()
             if self._advice("systems", results, self.orch.budget.transform_evals, rng):
+                return used
+
+    def _native(self) -> int:
+        """A simulated systems-native session: per evaluation a multi-file project of the
+        current stage (``loop`` without a staged plan), snapshotted as its bundle like a
+        real one, measured end to end around the module-level bar."""
+        used = 0
+        while True:
+            rows = ledger.rows(self.run)
+            k = sum(native_engine.is_native(r) for r in rows)
+            rng = _rng(self.seed, "native", k)
+            level = native_engine.bar(rows)
+            stage = native_engine.current(native_engine.stages(self.run), rows)
+            name = stage.id if stage is not None else "loop"
+            self.clock.advance(rng.uniform(600, 1200))  # writing and compiling a project
+            project = native_engine.native_dir(self.run) / name
+            (project / "csrc").mkdir(parents=True, exist_ok=True)
+            (project / "kernel_project.toml").write_text(
+                f'[project]\nname = "{name}"\nkind = "transform"\n\n'
+                '[build]\nsources = ["csrc/*.cu"]\n'
+            )
+            hypothesis = f"native engine of {name}, attempt {k + 1}"
+            (project / "candidate.py").write_text(
+                f'"""{hypothesis}"""\n\n\ndef apply(workload):\n    pass\n'
+            )
+            (project / "csrc" / "engine.cu").write_text(f"// {hypothesis}\n")
+            snap = snapshot(self.run, project)
+            outcome = level * rng.uniform(0.96, 1.1)
+            result = _e2e_result(BASELINE_MS / outcome)
+            record_e2e_result(
+                self.run,
+                result,
+                [snap],
+                [],
+                hypothesis=hypothesis,
+                eval_s=round(rng.uniform(200, 400), 1),
+                when=self.clock.now(),
+            )
+            used += 1
+            if self.hook:
+                self.hook("native", used)
+            results = self.run.results_file()
+            if self._advice("native", results, self.orch.budget.transform_evals, rng):
                 return used
 
     def _research(self, target_id: str, writable: list[Path]) -> None:

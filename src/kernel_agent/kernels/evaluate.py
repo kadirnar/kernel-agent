@@ -10,6 +10,9 @@ Candidate contract (``candidates/<name>.py``)::
 
 ``build`` may take keyword arguments with defaults (block sizes, ``num_warps``, ...):
 the evaluator calls ``build(reference)``; :mod:`kernels.sweep` tries configs of them.
+A multi-file CUDA / C++ project (a directory with ``kernel_project.toml``) is a candidate
+too, as a directory or as its bundle (:mod:`kernel_agent.native.project`): its entry
+module's ``build`` is the contract.
 
 Each captured case is replayed through the entrypoint it was recorded from:
 ``candidate(*args, **kwargs)`` for ``forward`` cases and
@@ -174,7 +177,16 @@ def stale(record: dict[str, Any]) -> str | None:
 
 
 def load_candidate_module(path: Path) -> Any:
+    """Import a candidate: a ``.py`` file (a project bundle is one) or a project directory
+    (:mod:`kernel_agent.native.project`: its entry module, run from the build cache)."""
     path = path.resolve()
+    if path.is_dir():
+        from kernel_agent.native import project
+
+        module = project.import_project(path)
+        if not callable(getattr(module, "build", None)):
+            raise AttributeError(f"{path.name}: the project's entry must define build(reference)")
+        return module
     digest = hashlib.sha1(path.read_bytes()).hexdigest()[:10]
     name = f"ka_candidate_{path.stem}_{digest}"
     spec = importlib.util.spec_from_file_location(name, path)
@@ -371,6 +383,15 @@ def _hidden_work(wall: dict[str, float]) -> bool:
     return wall["hidden_ms"] > max(HIDDEN_WORK_MS, HIDDEN_WORK_SHARE * wall["new_event_ms"])
 
 
+@functools.cache
+def _code_dirs(candidate_path: Path) -> tuple[Path, ...]:
+    """Where the candidate's code lives: its directory, and a project's source directory in
+    the build cache (:func:`kernel_agent.native.project.code_dirs`); read before import."""
+    from kernel_agent.native.project import code_dirs
+
+    return (candidate_path.parent, *code_dirs(candidate_path))
+
+
 def _intact(result: dict[str, Any], guard: Any, candidate_path: Path, where: str) -> bool:
     """Integrity checkpoint: False (and ``integrity_violation``) if the candidate changed
     watched state or runs threads."""
@@ -378,7 +399,9 @@ def _intact(result: dict[str, Any], guard: Any, candidate_path: Path, where: str
 
     problems = guard.changes()
     problems += [
-        f"thread {t} runs candidate code" for t in candidate_threads(candidate_path.parent)
+        f"thread {t} runs candidate code"
+        for directory in _code_dirs(candidate_path)
+        for t in candidate_threads(directory)
     ]
     if not problems:
         return True
@@ -540,6 +563,7 @@ def _evaluate(
         result["tolerance_tier"] = comparator.TIER
     guard = integrity.Snapshot(reference)  # before the candidate is imported
     guards.append(guard)
+    _code_dirs(candidate_path)  # a bundle's code directory, read before it is imported
 
     # 1. import + build
     t_build = time.perf_counter()

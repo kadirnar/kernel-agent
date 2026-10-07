@@ -13,6 +13,9 @@
             a digest (last ledger rows, ideas, best snapshot, plan.md, NOTES.md); a
             target with workers (--seeds-per-target, workers.py) gets one session per
             worker, concurrently up to --parallel, that share the slice's evaluations
+        the native arm (--native, native/engine.py, issue #134), once every module arm
+            has plateaued: first the capture of its current stage (teacher-forced
+            checks), then a longer systems-native session with --native-evaluations
         every --integrate-every kept results: measured re-integration
     every arm stopped: with --rounds > 1 and a real end-to-end gain in this round,
         re-profile the optimised model, re-plan with the prior rounds as context
@@ -51,10 +54,13 @@ from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.owners import context_line
+from kernel_agent.native import engine as native_engine
+from kernel_agent.profiling import ceilings
 from kernel_agent.research import rows_table
 from kernel_agent.scheduler import (
     INTEGRATION_SHARE,
     KERNEL,
+    NATIVE,
     SHORT_SLICE,
     SYSTEMS,
     Arm,
@@ -288,6 +294,67 @@ def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Poli
     return "\n".join(lines + _footer("NOTES.md"))
 
 
+def native_digest(
+    run: RunDir,
+    arm: Arm,
+    n: int,
+    evaluations: int,
+    policy: Policy,
+    status: native_engine.Status,
+    arms: list[Arm],
+) -> str:
+    """Context of a fresh systems-native session: the module-level bar, the staged plan
+    with each stage's state, why the module arms stopped, the last native evaluations."""
+    lines = _header(
+        n, evaluations, "the transforms' `results.jsonl`, your `NOTES.md` and the ledger"
+    )
+    lines += [
+        "",
+        "## Where the native engine stands",
+        f"* Bar: the best module-level result end to end is {status.bar:.3f}x the baseline "
+        "(integrations, transforms); a native run counts once it beats it.",
+    ]
+    if arm.best_snapshot:
+        lines.append(f"* Best native run: `{arm.best_snapshot}`, {arm.best:.3f}x the bar.")
+    else:
+        lines.append("* No native run has beaten the bar yet.")
+    lines += ["", "## Staged plan (a stage must beat the bar end to end before the next)"]
+    for i, stage in enumerate(status.plan, 1):
+        state = "later"
+        if stage.id in status.finished:
+            state = f"done, {status.finished[stage.id]:.3f}x"
+        elif status.stage is not None and stage.id == status.stage.id:
+            state = "**current**"
+        target = stage.target_id
+        teacher = (
+            f"; teacher-forced target `{target}` (evaluate_candidate)"
+            if target and run.capture_file(target).exists()
+            else ""
+        )
+        lines.append(f"{i}. [{state}] {stage.describe()}{teacher}")
+    if not status.plan:
+        lines.append("* (no stage graph: no ceilings table; derive the stages from the profile)")
+    module = [a for a in arms if a.kind == KERNEL]
+    if module:
+        lines += ["", "## Module arms (their kernels are your building blocks)"]
+        lines += [
+            f"* `{a.id}` ({a.module_class}): best {a.best:.2f}x"
+            + (f", {a.stop}" if a.stop else ", plateaued")
+            for a in module
+        ]
+    rows = arm.rows[-LAST_ROWS:]
+    if rows:
+        lines += ["", f"## Last {len(rows)} evaluations (oldest first; `keep` = new best)", ""]
+        lines += rows_table(rows)
+    lines += _notes(native_engine.native_dir(run) / "NOTES.md", "NOTES.md")
+    lines += [
+        "",
+        f"* {arm.streak} native runs in a row without a new best; after "
+        f"{policy.native_patience} the native arm is stopped.",
+    ]
+    return "\n".join(lines + _footer("NOTES.md"))
+
+
 def rounds_context(
     run: RunDir,
     state: dict[str, Any],
@@ -397,10 +464,14 @@ class Improver:
             ids = [t for t in ids if self.run.capture_file(t).exists()]
         return ids
 
+    def native_why(self) -> str | None:
+        """Why the run has a native arm (``--native``, the plan's ``native`` entry), or None."""
+        return native_engine.enabled(self.orch.cfg.native, native_engine.plan_entry(self.run))
+
     def arms(self, rows: list[dict[str, Any]] | None = None) -> list[Arm]:
         return build_arms(
             self.run,
-            self.policy,
+            dataclasses.replace(self.policy, native=self.native_why() is not None),
             self.state["slices"],
             targets=self.targets(),
             rounds=self.state["rounds"],
@@ -704,7 +775,16 @@ class Improver:
         )
         evaluations = self.icfg.slice
         try:
-            if arm.kind == SYSTEMS:
+            if arm.kind == NATIVE:
+                evaluations = self.orch.cfg.native_evaluations or evaluations
+                stand = await self._native_stage()
+                digest = native_digest(self.run, arm, n, evaluations, self.policy, stand, arms)
+                results = [
+                    await self.orch.native_slice(
+                        evaluations=evaluations, digest=digest, label=label
+                    )
+                ]
+            elif arm.kind == SYSTEMS:
                 digest = systems_digest(self.run, arm, n, evaluations, self.policy)
                 results = [
                     await self.orch.systems_slice(
@@ -744,6 +824,34 @@ class Improver:
             status = "timed_out"
         self._close(rec, status, usd=sum(r.cost_usd for r in results))
         return rec
+
+    async def _native_stage(self) -> native_engine.Status:
+        """The native arm's staged plan and current stage; a stage with a module group is
+        captured as its kernel target first (once), so the native session can check it
+        teacher forced (``evaluate_candidate``) before the end-to-end run."""
+        columns = ceilings.columns(self.orch.allowed_precisions())
+        status = native_engine.status(self.run, ledger.rows(self.run), columns)
+        stage = status.stage
+        if stage is None or stage.target_id is None:
+            return status
+        target_dir = self.run.target(stage.target_id)
+        if (
+            self.run.capture_file(stage.target_id).exists()
+            or (target_dir / "spec.failed.json").exists()
+        ):
+            return status
+        specs = [
+            read_json(self.run.target(t) / "spec.json", {}) or {} for t in self.run.target_ids()
+        ]
+        backends = [b for b in self.orch._available_backends() if b == "cuda"]
+        spec = native_engine.target_spec(
+            stage, native_engine.module_precision(specs), backends or ["cuda"]
+        )
+        if spec is not None:
+            log(f"native: capturing stage {stage.id} as target {spec['id']}")
+            with self._doing(f"capture of native stage {stage.id}"):
+                await self.orch.capture_targets([spec])
+        return status
 
     def _team(self, arm: Arm, evaluations: int) -> list[workers.Seed]:
         """The worker sessions of a kernel slice ([]: one classic session). With
@@ -1138,7 +1246,7 @@ def report_lines(run: RunDir) -> list[str]:
         mine = [s for s in slices if s["arm"] == arm]
         best = max(float(s.get("best_after") or s.get("best_before") or 1.0) for s in mine)
         spec = read_json(run.target(arm) / "spec.json", {}) or {}
-        tier = pivot.label(spec) if arm != SYSTEMS else "—"
+        tier = pivot.label(spec) if arm not in (SYSTEMS, NATIVE) else "—"
         lines.append(
             f"| `{arm}` | {tier} | {len(mine)} | {sum(s.get('evals') or 0 for s in mine)} | "
             f"{sum(bool(s.get('improved')) for s in mine)} | {best:.3f}x |"
@@ -1368,6 +1476,8 @@ async def improve(
             **({"reseed_workers": True} if cfg.reseed_workers else {}),
             **({"parallel": cfg.parallel} if cfg.parallel > 1 else {}),
             **({"precisions": cfg.precisions} if cfg.precisions else {}),  # into run.json
+            **({"native": cfg.native} if cfg.native != "plan" else {}),  # else the run's
+            **({"native_minutes": cfg.native_minutes} if cfg.native_minutes else {}),
         }
         orch = Orchestrator.resume(path, overrides)
     elif dry_run:

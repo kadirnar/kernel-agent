@@ -73,6 +73,16 @@ A kernel arm that has plateaued (:func:`plateau`) gets a research session
 before the patience rule stops it (:mod:`kernel_agent.research`); a plan it
 wrote restarts the arm's count of evaluations without a new best.
 
+The native arm (:data:`NATIVE`, issue #134, :mod:`kernel_agent.native.engine`; only with
+:attr:`Policy.native`: ``--native on``, or the plan asks for it) rewrites a stage, a group
+of stages or the whole generation loop natively. It waits while any kernel arm is live and
+has not plateaued (:func:`native_arm`), then competes like the others: ``remaining_ms`` is
+the run at the best module-level result end to end (``native.engine.bar``: integrations and
+the systems agent's runs), ``best`` its fastest native run over that bar, ``estimate``
+:attr:`Policy.native_estimate`; its stop rules use ``native_patience`` and ``native_hours``,
+and it stops when every stage of its staged plan has beaten the bar. Native stage targets
+(``spec.native``) are its own: they get no kernel arm.
+
 Time (issue #100): a slice of an arm needs the agent's warm-up, one evaluation
 of the arm and the wrap-up (:func:`slice_seconds`), and the run's time budget
 keeps the final integration's expected duration (:func:`integration_estimate`).
@@ -101,10 +111,12 @@ from kernel_agent.budget import (
 )
 from kernel_agent.kernels import weights
 from kernel_agent.kernels.roofline import sol_signal
+from kernel_agent.native import engine as native_engine
 from kernel_agent.profiling import ceilings
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 SYSTEMS = "systems"  # pseudo-target: the systems agent's slices
+NATIVE = "native"  # pseudo-target: the systems-native agent's slices (native/engine.py)
 KERNEL = "kernel"
 MIN_FURTHER = 1.1  # without a SOL estimate, assume at least 10 % more is always possible
 IDLE_SLICES = 2  # an arm whose last slices made no evaluation at all is stopped
@@ -112,7 +124,8 @@ FAIL_STREAK = 3  # failed evaluations in a row that call for a research session
 # An agent reads its digest and NOTES.md and writes a candidate before its first evaluation:
 # median 142-328 s from slice start to the first evaluation in three VoxCPM2 runs.
 WARMUP_SECONDS = 240.0
-EVAL_SECONDS = {KERNEL: 60.0, SYSTEMS: 120.0}  # one evaluation of an arm with none timed yet
+# one evaluation of an arm with none timed yet (native: a project build + an end-to-end run)
+EVAL_SECONDS = {KERNEL: 60.0, SYSTEMS: 120.0, NATIVE: 300.0}
 AB_SECONDS = 2 * EVAL_SECONDS[SYSTEMS]  # one A/B of the integration: A and B end to end
 SHORT_SLICE = 2.0  # a session with less than this × slice_seconds was cut short by the budget
 # The time budget keeps at most this share of --max-hours for the final integration
@@ -137,6 +150,10 @@ class Policy:
     estimate: float = 2.0  # module speedup assumed reachable without a SOL estimate
     systems_estimate: float = 1.25  # end-to-end speedup assumed reachable by transforms
     systems: bool = True  # schedule systems-agent slices
+    native: bool = False  # schedule the native arm (--native on, or the plan asks for it)
+    native_estimate: float = 1.3  # speedup over the module-level bar assumed reachable
+    native_patience: int = 8  # its native runs in a row without a new best
+    native_hours: float | None = 6.0  # time in its slices
 
 
 @dataclass(frozen=True)
@@ -212,7 +229,7 @@ class Arm:
 
     @property
     def agent(self) -> str:
-        return SYSTEMS if self.kind == SYSTEMS else f"kernel-{self.id}"
+        return self.kind if self.kind in (SYSTEMS, NATIVE) else f"kernel-{self.id}"
 
     @property
     def remaining_ms(self) -> float:
@@ -238,6 +255,11 @@ class Arm:
         else:
             if self.kind == SYSTEMS:
                 text = f"end to end {self.remaining_ms:.3g} ms at its best {self.best:.2f}x"
+            elif self.kind == NATIVE:
+                text = (
+                    f"native: end to end {self.remaining_ms:.3g} ms at {self.best:.2f}x over "
+                    "the best module-level result"
+                )
             else:
                 text = (
                     f"Amdahl: {self.ref_ms:.3g} ms at 1.0x ÷ its best {self.best:.2f}x = "
@@ -526,8 +548,15 @@ def gpu_busy(run: RunDir) -> float | None:
 
 
 def systems_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """End-to-end rows of the systems agent (integration steps are not its evaluations)."""
-    return [r for r in rows if r["target"] == ledger.E2E and r["backend"] != "integrate"]
+    """End-to-end rows of the systems agent (integration steps and the native arm's runs are
+    not its evaluations)."""
+    return [
+        r
+        for r in rows
+        if r["target"] == ledger.E2E
+        and r["backend"] != "integrate"
+        and not native_engine.is_native(r)
+    ]
 
 
 def _improves(row: dict[str, Any], best: float) -> bool:
@@ -631,6 +660,8 @@ def _systems_history(arm: Arm, rows: list[tuple[dict[str, Any], frozenset[str]]]
     """
     refs: dict[frozenset[str], float] = {frozenset(): 1.0}  # kernels → speedup to beat
     for row, kernels in rows:
+        if native_engine.is_native(row):  # the native arm's (native_arm)
+            continue
         measured = float(row["speedup"]) if row["correct"] and row["speedup"] else None
         ref = refs.get(kernels)
         if row["backend"] == "integrate":  # not an evaluation of the systems agent
@@ -686,6 +717,8 @@ def build_arms(
     arms: list[Arm] = []
     for target_id in ids:
         spec = specs[target_id]
+        if native_engine.is_stage_target(spec):  # the native arm's own (native_arm)
+            continue
         estimate = ledger._num(spec.get("expected_speedup")) or policy.estimate
         target_rows = [r for r in rows if r["target"] == target_id]
         refused = precisions.refusal(precisions.of_spec(spec), allowed)
@@ -725,6 +758,9 @@ def build_arms(
         )
         _systems_history(arm, e2e_kernels(rows, read_jsonl(run.results_file())))
         arms.append(arm)
+    if policy.native:
+        stage_targets = {t for t in ids if native_engine.is_stage_target(specs[t])}
+        arms.append(native_arm(run, rows, policy, stage_targets))
     for arm in arms:
         mine = [s for s in slices if s.get("arm") == arm.id]
         arm.hours = sum(float(s.get("seconds") or 0.0) for s in mine) / 3600
@@ -740,7 +776,58 @@ def build_arms(
             arm.idle += 1
         arm.evals = len(arm.rows)
         arm.stop = stop_reason(arm, policy)
+    _native_gate(run, arms, policy, rows, allowed)
     return rank(arms, policy)
+
+
+def native_arm(
+    run: RunDir, rows: list[dict[str, Any]], policy: Policy, stage_targets: set[str]
+) -> Arm:
+    """The native arm: its evaluations are its end-to-end runs (``native.engine.is_native``)
+    and those of its stage targets; ``best`` is its fastest run over the module-level bar
+    (``native.engine.bar``, 1.0 = at the bar), a new best when it beats the previous one
+    beyond the noise; ``ref_ms`` is the run at the bar."""
+    level = native_engine.bar(rows)
+    base = float((read_json(run.baseline_json, {}) or {}).get("median_ms") or 0.0)
+    arm = Arm(NATIVE, NATIVE, base / level, estimate=policy.native_estimate)
+    arm.basis = ": the native estimate (--native)"
+    runs = [r for r in rows if native_engine.is_native(r)]
+    stage_rows = ledger.measured(r for r in rows if r["target"] in stage_targets)
+    arm.rows = sorted([*runs, *stage_rows], key=lambda r: r["exp"] or 0)
+    best = level
+    for row in runs:
+        measured = float(row["speedup"]) if row["correct"] and row["speedup"] else None
+        if measured and _improves(row, best):
+            arm.gain_ms += base * (1.0 / best - 1.0 / measured)
+            best, arm.streak, arm.best_snapshot = measured, 0, row["snapshot"]
+        else:
+            arm.streak += 1
+        arm.fails = arm.fails + 1 if row["status"] in ledger.FAILURES else 0
+    arm.best = best / level
+    return arm
+
+
+def _native_gate(
+    run: RunDir,
+    arms: list[Arm],
+    policy: Policy,
+    rows: list[dict[str, Any]],
+    allowed: Iterable[str] | None,
+) -> None:
+    """Hold the native arm while a kernel arm is live and has not plateaued (module kernels
+    first), and stop it once every stage of its staged plan beat the module-level bar."""
+    arm = next((a for a in arms if a.kind == NATIVE), None)
+    if arm is None or arm.stop is not None:
+        return
+    live = [
+        a.id for a in arms if a.kind == KERNEL and a.stop is None and plateau(a, policy) is None
+    ]
+    if live:
+        arm.stop = f"waiting: module arms still improving ({', '.join(live[:4])})"
+        return
+    plan = native_engine.stages(run, ceilings.columns(allowed))
+    if plan and native_engine.current(plan, rows) is None:
+        arm.stop = "every stage of the native plan beat the best module-level result"
 
 
 # ------------------------------------------------------------------ decisions
@@ -750,14 +837,16 @@ def stop_reason(arm: Arm, policy: Policy) -> str | None:
     """Why an arm gets no more slices (None: it is live)."""
     if arm.refused:  # its precision is not allowed: no research session revives it
         return arm.refused
-    if policy.patience and arm.streak >= policy.patience:
+    patience = policy.native_patience if arm.kind == NATIVE else policy.patience
+    if patience and arm.streak >= patience:
         return f"plateau: {arm.streak} evaluations in a row without a new best"
     if arm.idle >= IDLE_SLICES:
         return f"no evaluation in its last {arm.idle} slices"
     if policy.sol_stop and arm.sol is not None and arm.sol >= policy.sol_stop:
         return f"at {arm.sol:.0%} of the speed of light (stop at {policy.sol_stop:.0%})"
-    if policy.target_hours and arm.hours >= policy.target_hours:
-        return f"time cap: {arm.hours:.1f} h in its slices (cap {policy.target_hours:g} h)"
+    cap = policy.native_hours if arm.kind == NATIVE else policy.target_hours
+    if cap and arm.hours >= cap:
+        return f"time cap: {arm.hours:.1f} h in its slices (cap {cap:g} h)"
     if arm.kind == KERNEL and policy.speedup_goal and arm.best >= policy.speedup_goal:
         return f"speedup goal reached: {arm.best:.2f}x (goal {policy.speedup_goal:g}x)"
     return None
