@@ -90,9 +90,12 @@ TIERS = (EXACT_TIER, NEAR_LOSSLESS_TIER, NEAR_LOSSLESS_FP4_TIER)
 #: compute-bound GEMMs), ``fp8_mx`` (MXFP8 W8A8: e4m3 + ue8m0 per 32 along K on both
 #: operands, block-scaled tensor cores; compute-bound GEMMs with wide N) or ``reduced``
 #: (another numerics-changing kernel); ``fp4_weights`` (block-scaled FP4 weights, bf16
-#: activations) in the near-lossless-fp4 tier (:data:`PRECISION_TIERS`). Anything else
-#: (``exact``, none) is the exact tier.
-REDUCED_PRECISIONS = ("fp8_weights", "reduced", "fp4_weights", "fp8_w8a8", "fp8_mx")
+#: activations) in the near-lossless-fp4 tier (:data:`PRECISION_TIERS`). ``fp8_kv``: an FP8
+#: (e4m3) KV cache, one scale per token and KV head, bf16 weights and math
+#: (kernels/kv_quant.py); opt-in (``precisions.OPT_IN``), in the near-lossless tier: e4m3 K / V
+#: moved a decoder layer's output by <= 0.0011 relative L2 on real captures (docs/FP8.md §5).
+#: Anything else (``exact``, none) is the exact tier.
+REDUCED_PRECISIONS = ("fp8_weights", "reduced", "fp4_weights", "fp8_w8a8", "fp8_mx", "fp8_kv")
 #: The tier of a reduced precision other than the near-lossless tier.
 PRECISION_TIERS = {"fp4_weights": NEAR_LOSSLESS_FP4_TIER}
 PRECISIONS = (EXACT_TIER, *REDUCED_PRECISIONS)

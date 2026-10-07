@@ -167,7 +167,9 @@ def _redrawn(writer, build, tier, *, perturbed, seeds=6):
 
 
 def test_every_reduced_precision_is_calibrated_on_both_input_classes():
-    assert set(REFERENCE_MATH) == set(compare.REDUCED_PRECISIONS) - {"reduced"}
+    # fp8_kv (a KV cache, not a GEMM): calibrated on a decode-attention capture in
+    # test_fp8_toolkit.py
+    assert set(REFERENCE_MATH) == set(compare.REDUCED_PRECISIONS) - {"reduced", "fp8_kv"}
     assert set(compare.PERTURBED_BOUNDS) == set(compare.NEAR_LOSSLESS_BOUNDS)
     for tier, (cosine, rel_l2, norm, (a, r)) in compare.PERTURBED_BOUNDS.items():
         captured = compare.NEAR_LOSSLESS_BOUNDS[tier]  # never tighter on redrawn inputs

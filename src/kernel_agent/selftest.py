@@ -518,6 +518,113 @@ def smoke_triton_tools(tmp: Path, verbose: bool = False) -> bool:
     return ok
 
 
+# ------------------------------------------------------------------ the FP8 toolkit (#145)
+
+#: The direct cuBLASLt FP8 example (``cuda`` backend, ``fp8_w8a8``, tensor-wise mode), as
+#: :data:`W8A8_EXAMPLES`.
+CUBLASLT_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cuda_cublaslt_fp8.py": (1024, 8192, [((64, 11), 540), ((32, 11), 0)]),
+}
+#: The producer example (``triton``, ``fp8_w8a8``): a gated SiLU MLP hidden -> inter ->
+#: hidden and its calls (input shape without the feature dimension, calls per run).
+PRODUCER_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "triton_fp8_producers.py": (1024, 4096, [((64, 11), 540), ((3, 5), 0)]),
+}
+#: The FP8 KV-cache example (``triton``, ``fp8_kv``): query heads, KV heads, head dim and the
+#: decode calls (batch, cached tokens, calls per run): a long cache, and a short one.
+FP8_KV_EXAMPLES: dict[str, tuple[int, int, int, list[tuple[int, int, int]]]] = {
+    "triton_fp8_kv_decode.py": (16, 2, 128, [(4, 4096, 28), (2, 77, 0)]),
+}
+
+
+class DecodeAttention(nn.Module):
+    """One decode step of attention: ``q [B, Hq, 1, D]`` over ``k / v [B, Hkv, L, D]``."""
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return nn.functional.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+
+def make_decode_attention_capture(
+    path: Path,
+    heads: int,
+    kv_heads: int,
+    head_dim: int,
+    calls: list[tuple[int, int, int]],
+    *,
+    tier: str | None = None,
+    precision: str | None = None,
+) -> Path:
+    from kernel_agent.profiling.capture import capture_calls
+
+    torch.manual_seed(0)
+    cases: list[tuple[Any, ...]] = []
+    for batch, tokens, count in calls:
+        q = torch.randn(batch, heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(batch, kv_heads, tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(batch, kv_heads, tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+        cases.append(((q, k, v), {}, count))
+    capture_calls(DecodeAttention(), cases, path, tier=tier, precision=precision)
+    return path
+
+
+def smoke_block_scale(capability: tuple[int, ...], verbose: bool = False) -> bool:
+    """The Triton W8A8 example's GEMM lowers to the block-scaled MMA (PTX ``block_scale``,
+    ``QMMA.SF``) on a GPU that has it (sm_100+): compiled for ``capability``, not run."""
+    from kernel_agent.kernels.evaluate import load_candidate_module
+
+    module = load_candidate_module(EXAMPLES_DIR / "triton_fp8_w8a8_gemm.py")
+    if not module.block_scale_capable(capability):
+        return True
+    try:
+        passed = bool(module.block_scale_mma(module.gemm_ptx(capability)))
+        detail = "tl.dot_scaled -> block_scale MMA" if passed else "no block_scale MMA in PTX"
+    except Exception as exc:  # a Triton that cannot compile it
+        passed, detail = False, f"{type(exc).__name__}: {str(exc)[-200:]}"
+    if verbose:
+        print(f"  {'w8a8 block_scale':22s} {'OK ' if passed else 'FAIL'} {detail}")
+    return passed
+
+
+def smoke_fp8_toolkit(tmp: Path, verbose: bool = False, *, cuda: bool, triton: bool) -> bool:
+    """The FP8 toolkit examples on the evaluator: the cuBLASLt helper (``cuda``) and the
+    producer MLP (``triton``) pass ``fp8_w8a8``'s near-lossless tier and fail the exact one
+    (:func:`smoke_fp8`); the FP8 KV decode attention (``triton``) passes ``fp8_kv``'s (e4m3
+    K / V can stay inside the exact tier's tolerances: no rejection check)."""
+    from kernel_agent.kernels.evaluate import run_evaluation
+
+    ok = True
+    if cuda:
+        ok &= smoke_fp8(tmp, verbose, precision="fp8_w8a8", examples=CUBLASLT_EXAMPLES)
+    if not triton:
+        return ok
+    ok &= smoke_fp8(
+        tmp, verbose, precision="fp8_w8a8", examples=PRODUCER_EXAMPLES, capture=make_mlp_capture
+    )
+    for name, (heads, kv_heads, dim, decode) in FP8_KV_EXAMPLES.items():
+        capture = make_decode_attention_capture(
+            tmp / f"{name}.pt",
+            heads,
+            kv_heads,
+            dim,
+            decode,
+            tier="near-lossless",
+            precision="fp8_kv",
+        )
+        result = run_evaluation(capture, EXAMPLES_DIR / name)
+        passed = bool(result.get("correct"))
+        ok &= passed
+        if verbose:
+            cases = result.get("cases") or [{}]
+            detail = (
+                f"speedup {result.get('speedup')}x, rel L2 {cases[0].get('max_rel_l2')} "
+                "(near-lossless, fp8_kv)"
+                if passed
+                else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+            )
+            print(f"  {name.removesuffix('.py'):22s} {'OK ' if passed else 'FAIL'} {detail}")
+    return ok
+
+
 def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> bool:
     from kernel_agent import toolchain
     from kernel_agent.kernels.evaluate import run_evaluation
@@ -559,6 +666,7 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_pdl(Path(tmp), verbose)
         if w8a8_supported(tc) and (backends is None or "triton" in backends):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8")
+            ok &= smoke_block_scale(tuple(tc.gpu.capability) if tc.gpu else (0, 0), verbose)
         if mxfp8_supported(tc) and (backends is None or "triton" in backends):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
         if tc.backends.get("triton") and (backends is None or "triton" in backends):
@@ -568,4 +676,8 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_fp8(
                 Path(tmp), verbose, examples=CUTE_BLOCK_EXAMPLES, capture=make_mlp_capture
             )
+        cuda = fp8_supported(tc) and (backends is None or "cuda" in backends)
+        triton = w8a8_supported(tc) and (backends is None or "triton" in backends)
+        if cuda or triton:
+            ok &= smoke_fp8_toolkit(Path(tmp), verbose, cuda=cuda, triton=triton)
     return ok

@@ -256,7 +256,7 @@ def test_prompts_name_no_4bit_unless_allowed():
     assert "streaming weights (`fp4_weights`" not in block
     allowed = prompts._pivot_block(target, Path("/r/pivot.json"), EVERY)
     assert "never propose" not in allowed and "streaming weights (`fp4_weights`)" in allowed
-    assert "<one of `reduced`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`>" in allowed
+    assert "<one of `reduced`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`, `fp8_kv`>" in allowed
     assert prompts._pivot_block(target, Path("/r/p.json"), ("exact", "fp8_weights")) == ""
 
     spec = {"id": "lm", "module_class": "Linear", "why": "w", "approach": "a", "backends": ["cuda"]}
