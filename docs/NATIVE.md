@@ -183,7 +183,7 @@ toolchain discovery), as compiled kernels already need the toolchain.
 | `project.kind` | `kernel` (`build`) or `transform` (`apply`) |
 | `build.backend` | `torch_extension` (default; `torch.utils.cpp_extension.load`) or `command` |
 | `build.sources` | globs of `.cu` / `.cpp` / `.c` files (each must match) |
-| `build.include_dirs`, `cflags`, `cuda_cflags`, `ldflags` | compiler inputs (the project root is always an include dir) |
+| `build.include_dirs`, `cflags`, `cuda_cflags`, `ldflags` | compiler inputs (the project root and the toolkit headers, `ka_launch.cuh` for PDL / cooperative launches, are always include dirs) |
 | `build.command`, `outputs`, `load` | a `command` build (`{src}`, `{build}`, `{python}` substituted; `KA_SRC_DIR`, `KA_BUILD_DIR`, `KA_PYTHON`, `KA_TORCH_CMAKE_PREFIX` set), its shared libraries, how they load (`torch_ops`, `python`, `none`) |
 | `build.timeout_s` | build time limit (≤ 3600 s) |
 
@@ -203,7 +203,7 @@ kernel library. The evaluator, memcheck and the patcher also accept a project di
 `<digest>/src/` holds the files (rewritten from the bundle on every load; stray files and
 `__pycache__` removed, so a stale `.pyc` cannot stand in for the entry) and
 `<digest>/build-<key>/` one build per toolchain (key: digest + torch, CUDA, arch list, nvcc
-flags, Python, C++ ABI) with a `stamp.json` of every output's sha256; a damaged build is
+flags, Python, C++ ABI, the toolkit headers' digest) with a `stamp.json` of every output's sha256; a damaged build is
 rebuilt. `project.load(__file__)` in the entry compiles once per key and process.
 
 **Integrity.** The snapshot's sha256 covers every project file; the bundle checks its own

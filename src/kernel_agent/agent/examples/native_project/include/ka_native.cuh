@@ -1,11 +1,14 @@
-// Device and launch helpers shared by the .cu files of a native project.
+// Device helpers shared by the .cu files of a native project.
+//
+// Launch helpers come from kernel-agent's toolkit header, on the include path of every
+// project build: `#include "ka_launch.cuh"` for programmatic dependent launch (PDL) and
+// cooperative grids (`ka_launch(kernel, grid, block, smem, stream, opt, args...)`,
+// `ka_pdl_wait()`, `ka_pdl_launch_dependents()`, `ka_coresident_blocks(...)`).
 #pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
-#include <utility>
 
 namespace ka {
 
@@ -26,40 +29,6 @@ template <> __device__ __forceinline__ float from_f(float v) { return v; }
 __device__ __forceinline__ float warp_sum(float v) {
   for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
   return v;
-}
-
-// ------------------------------------------------------------------ programmatic dependent launch
-// A kernel launched with launch_pdl() may start while the previous kernel of the stream is
-// still running: issue the loads that do not depend on it (weights) first, then pdl_wait()
-// before reading the previous kernel's output; pdl_launch_dependents() lets the next kernel
-// start its own prologue. Both are no-ops without PDL (and before sm_90).
-
-__device__ __forceinline__ void pdl_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
-}
-
-__device__ __forceinline__ void pdl_launch_dependents() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-#endif
-}
-
-template <typename... Params, typename... Args>
-inline cudaError_t launch_pdl(void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
-                              cudaStream_t stream, Args&&... args) {
-  cudaLaunchConfig_t config = {};
-  config.gridDim = grid;
-  config.blockDim = block;
-  config.dynamicSmemBytes = smem;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = attrs;
-  config.numAttrs = 1;
-  return cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
 }
 
 }  // namespace ka

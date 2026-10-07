@@ -90,6 +90,9 @@ module so the rest of the accepted set keeps applying.
 * `project.load(__file__)` (`from kernel_agent.native import project`) compiles the
   project once per content digest and toolchain (`~/.cache/kernel-agent/native/`) and
   returns it; its attributes are the functions `binding.cpp` binds.
+* kernel-agent's toolkit headers are on every build's include path:
+  `#include "ka_launch.cuh"` for PDL and cooperative launches (`ka_launch`,
+  `ka_pdl_wait`, `ka_pdl_launch_dependents`, `ka_coresident_blocks`; see `cuda.md`).
 * `python -m kernel_agent.native.project check <dir>` validates the manifest and files;
   `... build <dir>` compiles on the CPU (no GPU, no evaluation used): fix compiler errors
   there. The tools also compile a project before its evaluation, outside the GPU lock.

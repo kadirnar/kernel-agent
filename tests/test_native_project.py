@@ -183,6 +183,9 @@ def test_build_key_is_per_digest_and_toolchain(tmp_path, cache):
     assert key != proj.build_key("d" * 64, {**fp, "arch": "9.0"})
     assert proj.cache_dir("d" * 64) == cache / ("d" * 24)
     assert proj.src_dir("d" * 64) == cache / ("d" * 24) / "src"
+    # kernel-agent's toolkit headers (ka_launch.cuh) are on every build's path and in its key
+    assert (proj.toolkit_include() / "ka_launch.cuh").is_file()
+    assert proj.fingerprint()["toolkit"] == proj._toolkit_digest()
 
 
 # ------------------------------------------------------------------ bundles

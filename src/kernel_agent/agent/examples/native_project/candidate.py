@@ -4,7 +4,8 @@ Layout::
 
     kernel_project.toml   name, entry, kind; build backend, sources (globs), flags
     candidate.py          this entry module: build(reference) for kind = "kernel"
-    include/ka_native.cuh device helpers (conversions, warp sums, PDL wait / launch helpers)
+    include/ka_native.cuh device helpers (conversions, warp sums); PDL and cooperative
+                          launches: kernel-agent's "ka_launch.cuh", always on the include path
     include/ops.h         host entry points of the project
     csrc/rmsnorm.cu       kernels and their launchers (one .cu per stage or op family)
     csrc/binding.cpp      PYBIND11_MODULE: the functions the entry module calls

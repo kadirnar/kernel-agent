@@ -44,12 +44,15 @@ have been compiled; ``KERNEL_AGENT_NATIVE_REBUILD=1`` ignores the cache).
 **Build backends** (``[build] backend``):
 
 * ``torch_extension`` (default): ``torch.utils.cpp_extension.load`` over ``sources`` (globs)
-  with ``include_dirs`` (the project root is always one), ``cflags``, ``cuda_cflags`` and
-  ``ldflags``; loaded as a Python module (``PYBIND11_MODULE`` / ``TORCH_LIBRARY``).
+  with ``include_dirs`` (the project root and kernel-agent's toolkit headers,
+  :func:`toolkit_include`: ``ka_launch.cuh`` for PDL / cooperative launches, are always
+  on the path), ``cflags``, ``cuda_cflags`` and ``ldflags``; loaded as a Python module
+  (``PYBIND11_MODULE``) or, with ``load = "torch_ops"``, as ``TORCH_LIBRARY`` ops.
 * ``command``: ``command`` (e.g. ``["bash", "{src}/build.sh"]``; ``{src}``, ``{build}``,
   ``{python}`` are substituted) runs in the build directory with ``KA_SRC_DIR``,
   ``KA_BUILD_DIR``, ``KA_PYTHON``, ``KA_TORCH_CMAKE_PREFIX`` and the toolchain's environment
-  (CMake, make, nvcc directly) and must produce ``outputs`` (shared libraries, relative to
+  (CMake, make, nvcc directly; ``KA_TOOLKIT_INCLUDE``: the toolkit headers) and must
+  produce ``outputs`` (shared libraries, relative to
   the build directory), loaded per ``load``: ``torch_ops`` (``torch.ops.load_library``),
   ``python`` (extension modules) or ``none`` (``Built.libraries``, e.g. for ctypes).
 
@@ -537,12 +540,29 @@ def src_dir(project_digest: str) -> Path:
     return cache_dir(project_digest) / "src"
 
 
+def toolkit_include() -> Path:
+    """kernel-agent's C++ toolkit headers (``ka_launch.cuh``: PDL and cooperative launches;
+    the directory of ``kernel_agent.concurrency.include_dir()``), on every build's path."""
+    return Path(__file__).resolve().parent.parent / "include"
+
+
+def _toolkit_digest() -> str:
+    """sha256 of the toolkit headers: a changed header rebuilds every project."""
+    h = hashlib.sha256()
+    root = toolkit_include()
+    for path in sorted(root.glob("*")) if root.is_dir() else []:
+        if path.is_file():
+            h.update(path.name.encode() + b"\0" + path.read_bytes())
+    return h.hexdigest()[:16]
+
+
 def fingerprint() -> dict[str, str]:
     """What a build depends on besides the sources (call after ``toolchain.setup()``)."""
     import torch
 
     abi = getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", None)
     return {
+        "toolkit": _toolkit_digest(),
         "format": str(FORMAT),
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
         "torch": torch.__version__,
@@ -706,7 +726,11 @@ def _compile_extension(project: Project, src: Path, out: Path, name: str) -> tup
     module = load_extension(
         name=name,
         sources=[str(src / s) for s in m.sources],
-        extra_include_paths=[str(src), *(str(src / d) for d in m.include_dirs)],
+        extra_include_paths=[
+            str(src),
+            *(str(src / d) for d in m.include_dirs),
+            str(toolkit_include()),
+        ],
         extra_cflags=list(m.cflags),
         extra_cuda_cflags=list(m.cuda_cflags),
         extra_ldflags=list(m.ldflags),
@@ -735,6 +759,7 @@ def _run_command(project: Project, src: Path, out: Path) -> list[str]:
         KA_BUILD_DIR=str(out),
         KA_PYTHON=sys.executable,
         KA_TORCH_CMAKE_PREFIX=str(getattr(torch.utils, "cmake_prefix_path", "")),
+        KA_TOOLKIT_INCLUDE=str(toolkit_include()),
         KA_PROJECT_NAME=m.name,
         KA_PROJECT_DIGEST=project.digest,
     )
