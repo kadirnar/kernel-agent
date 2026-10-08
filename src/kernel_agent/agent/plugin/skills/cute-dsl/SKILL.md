@@ -1,14 +1,16 @@
 ---
 name: cute-dsl
-description: CuTe DSL (cutlass.cute) kernels — when to choose it, kernel / jit structure, fake-tensor compilation and the compile cache, language facts, CPU-only PTX checks, sm_120 block-scaled MMA, TMA pipelines, warp specialisation, CUTLASS ports. Use when a target's backend is cute.
+description: CuTe DSL (cutlass.cute) kernels — when to choose it, kernel / jit structure, fake-tensor compilation and the compile cache, language facts, CPU-only PTX checks, sm_120 block-scaled MMA, sm_90 wgmma and sm_100 tcgen05 / TMEM templates, TMA pipelines, warp specialisation, CUTLASS ports. Use when a target's backend is cute.
 ---
 
 # CuTe DSL backend (`nvidia-cutlass-dsl`, `import cutlass.cute as cute`)
 
-The examples below target sm_120 (their `ARCHS`); on Hopper the peak MMA is the warpgroup
-one (`cute.nvgpu.warpgroup`, wgmma) and on datacenter Blackwell `cute.nvgpu.tcgen05`
-(CUTLASS's CuTe DSL `cute/hopper/` and `cute/blackwell/` examples: the `documentation-sources` skill), with ~227 KB of
-shared memory per block instead of 99.
+Each example declares the GPUs it runs on (`ARCHS`): the peak MMA differs per family and
+none of them runs on another. sm_120: block-scaled `mma.sync` (the examples below the
+first two). Hopper: the warpgroup MMA (`cute.nvgpu.warpgroup`, wgmma). Datacenter
+Blackwell: `cute.nvgpu.tcgen05` with tensor memory. Hopper and B200 have ~227 KB of shared
+memory per block instead of 99 (CUTLASS's CuTe DSL `cute/hopper/` and `cute/blackwell/`
+examples: the `documentation-sources` skill).
 
 When to use it (backend policy, docs/RESEARCH-TRITON.md §5.1): **compute-bound FP8 GEMMs
 on sm_120** (W8A8, M ≳ 128 rows), because CuTe DSL exposes the block-scaled tensor-core
@@ -19,6 +21,12 @@ specialisation does not pay on sm_120). Small-M GEMVs (memory bound) go to CUDA 
 
 Examples (copy their structure; `kernel-agent doctor --smoke` runs them):
 * `examples/cute_rmsnorm.py`: verified. `@cute.kernel` + `@cute.jit`, TVM-FFI, one CTA per row.
+* `examples/cute_sm90_gemm_ws.py` (sm_90): bf16 / W8A8 `nn.Linear` on `wgmma`, TMA, a
+  producer and consumer warpgroups, persistent, fused epilogue, swap-AB for M ≤ 64:
+  [sm90-wgmma.md](sm90-wgmma.md). `examples/cute_sm100_gemm_tcgen05.py` (sm_100 / sm_103):
+  the same on `tcgen05.mma` with TMEM accumulators and optional 2-CTA pairs:
+  [sm100-tcgen05.md](sm100-tcgen05.md). **Compiled for sm_90a / sm_100a on the CPU, not run
+  on an H100 / B200 yet**: evaluate a copy with `mode="quick"` first.
 * `examples/cute_fp8_blockscaled_gemm.py`: W8A8 `nn.Linear` on `MmaMXF8Op`, persistent,
   warp-specialised (1 TMA producer warp + 8 MMA warps), fused epilogue (per-token ×
   per-channel scales, bias, residual, optional e4m3 output), per-token quantiser kernel.
@@ -110,7 +118,11 @@ the example's `compile_*` functions: fake tensors trace and compile on the CPU i
 `cp.async.bulk.tensor` and `setmaxnreg`; `CUTE_DSL_COMPILER_OPT="remarks{ptx}"` prints
 registers and spills. `print(tensor.layout)` inside a jit prints at trace time. A kernel
 whose output registers never get written still compiles: look for conversions or stores
-of undefined registers (one `cvt` feeding every store) before you blame the GPU.
+of undefined registers (one `cvt` feeding every store) before you blame the GPU. Any
+architecture compiles on any machine: `sm_90a` (expect `wgmma.mma_async`) and `sm_100a`
+(`tcgen05.mma`, `tcgen05.alloc`, `tcgen05.ld`) as in the two files above; dump names are
+truncated, so read `fn.__ptx__` right after each compile; `CUTE_DSL_KEEP=sass` (nvdisasm ≥
+12.9 under `CUDA_HOME`) adds the SASS.
 
 ## Plan amnesia and false infeasibility
 
@@ -130,6 +142,6 @@ failure modes follow:
 
 ## Examples and sources
 
-* Examples: `examples/cute_rmsnorm.py`, `examples/cute_fp8_blockscaled_gemm.py`, `examples/cute_fp8_decoder_block.py`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Examples: `examples/cute_rmsnorm.py`, `examples/cute_fp8_blockscaled_gemm.py`, `examples/cute_fp8_decoder_block.py`, `examples/cute_sm90_gemm_ws.py`, `examples/cute_sm100_gemm_tcgen05.py`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
 * Sources: the `documentation-sources` skill's `sources.md`, sections "CUTLASS / CuTe"; "Local reference code".
 * Code: `kernel_agent.cute_dsl.compile_cached`.

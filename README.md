@@ -3842,10 +3842,19 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
 * **Builds.** `load_inline` compiles for the GPU's arch (`TORCH_CUDA_ARCH_LIST`, unless
   set); on Hopper and datacenter Blackwell for the arch-specific target (`9.0a`,
   `10.0a`), where `wgmma` / `tcgen05` and CUTLASS's sm_90 / sm_100 kernels live.
+* **Hopper and datacenter Blackwell templates** (#228): `cute_sm90_gemm_ws.py` (TMA +
+  `wgmma`, producer / consumer warpgroups, persistent, fused epilogue, swap-AB for
+  M ≤ 64) and `cute_sm100_gemm_tcgen05.py` (TMA + `tcgen05.mma` into TMEM, warp roles,
+  persistent, optional 2-CTA pairs, fused epilogue), bf16 and W8A8 FP8, with the
+  `cute-dsl` skill's `sm90-wgmma.md` / `sm100-tcgen05.md`; the Hopper and Blackwell FP8
+  policy rows name them. They compile for `sm_90a` / `sm_100a` on the CPU and their PTX
+  has `wgmma.mma_async` / `tcgen05.mma` + `tcgen05.alloc` + `tcgen05.ld` and TMA
+  (`tests/test_cute_examples.py`); **not run on an H100 or B200 yet**.
 * **Tested** on the CPU with faked GPUs (sm_80, sm_86, sm_89, sm_90, sm_100, sm_120:
   `tests/test_gpu_arch.py`) and run on an RTX 5070 Ti. The CUDA weight-only examples
-  were compiled for sm_80 / 86 / 89 / 90 / 100 / 120 on the CPU; on other GPUs nothing
-  has run yet: `kernel-agent doctor --smoke` is the first check there.
+  were compiled for sm_80 / 86 / 89 / 90 / 100 / 120 on the CPU, the CuTe DSL templates
+  above for sm_90a / sm_100a; on other GPUs nothing has run yet: `kernel-agent doctor
+  --smoke` is the first check there.
 
 ### GPUs and the GPU lock
 
@@ -4189,6 +4198,25 @@ block-scaled `mma.sync` and TMA); they have not run on a GPU yet. On sm_120,
 `doctor --smoke` runs them through the evaluator (near-lossless tier, rejected
 by the exact tier), and `pytest -m gpu tests/test_cute_examples.py` runs their
 selftests.
+
+**CuTe DSL on Hopper and datacenter Blackwell.** Two GEMM templates for the GPUs
+whose peak MMA is not `mma.sync` (#228), ported from CUTLASS 4.8's CuTe DSL examples
+(BSD-3-Clause) for `nvidia-cutlass-dsl` 4.8: `cute_sm90_gemm_ws.py` (`ARCHS =
+"sm_90"`: TMA loads, `wgmma` in producer / consumer warpgroups with `setmaxnreg`, a
+static persistent scheduler, optional 2-CTA clusters with TMA multicast, and a swap-AB
+kernel for M ≤ 64) and `cute_sm100_gemm_tcgen05.py` (`ARCHS = "sm_10x"`: TMA, one MMA
+warp issuing `tcgen05.mma` into double-buffered TMEM accumulators, four epilogue warps
+reading them with `tcgen05.ld`, persistent, optional 2-CTA pairs). Both run bf16 or W8A8
+(e4m3 weights per channel, activations per token) with the scales, bias, residual and an
+optional e4m3 output fused into the epilogue. They compile on the CPU for `sm_90a` /
+`sm_100a`, and `tests/test_cute_examples.py` checks their PTX (`wgmma.mma_async` and
+`cp.async.bulk.tensor`; `tcgen05.mma`, `tcgen05.alloc`, `tcgen05.ld`; never `mma.sync`).
+**They have not run on an H100 or B200 yet**: there, `doctor --smoke` runs them through
+the evaluator (near-lossless tier, rejected by the exact tier) and `pytest -m gpu
+tests/test_cute_examples.py` runs their selftests; on other GPUs `doctor --smoke` lists
+them as skipped with the reason. The `cute-dsl` skill's `sm90-wgmma.md` and
+`sm100-tcgen05.md` cover the TMEM budget, `tcgen05.alloc` / `dealloc`, mbarrier phases,
+2-CTA pairs, cluster launch control and what not to copy to sm_120.
 
 **No system CUDA toolkit needed.** If `nvcc` is missing, the pip wheels
 (`nvidia-cuda-nvcc`, `nvidia-cuda-cccl`, ...) are assembled into a

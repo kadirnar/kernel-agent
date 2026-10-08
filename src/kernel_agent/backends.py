@@ -300,7 +300,9 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
             "persistent tiles): Triton `tl.dot` on e4m3 (it emits wgmma on sm_90), cuBLASLt "
             "as the baseline (`torch._scaled_mm`, `examples/cuda_cublaslt_fp8.py`), CuTe DSL "
             "/ CUTLASS sm_90 GEMMs (`cute.nvgpu.warpgroup`) when the epilogue fuses scales, "
-            "bias or quantisation",
+            "bias or quantisation (`examples/cute_sm90_gemm_ws.py`: TMA + wgmma, producer / "
+            "consumer warpgroups, persistent, fused epilogue, swap-AB for M ≤ 64; the "
+            "`cute-dsl` skill's `sm90-wgmma.md`)",
             "Hopper's FP8 peak (2x bf16) is reached by `wgmma` only: e4m3 `mma.sync` is "
             "emulated through fp16 HMMA on sm_90, bf16 `mma.sync` reaches ~2/3 of the wgmma "
             "peak, and there is no block-scaled MMA",
@@ -335,7 +337,9 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
             "`examples/cuda_cublaslt_fp8.py`), Triton `tl.dot` on e4m3 (`tcgen05.mma "
             "kind::f8f6f4`: `examples/triton_fp8_w8a8_gemm.py` takes this path here), CuTe "
             "DSL Blackwell GEMMs (`cute.nvgpu.tcgen05`) when the epilogue fuses scales, bias "
-            "or quantisation",
+            "or quantisation (`examples/cute_sm100_gemm_tcgen05.py`: TMA + tcgen05.mma into "
+            "TMEM, persistent, optional 2-CTA pairs, fused epilogue; the `cute-dsl` skill's "
+            "`sm100-tcgen05.md`)",
             "datacenter Blackwell reaches its FP8 peak (plain and block-scaled) through "
             "`tcgen05.mma` only: e4m3 `mma.sync` is emulated through fp16 HMMA on sm_100, "
             "`mma.sync` saturates near a quarter of the B200 peak, `wgmma` does not exist",
@@ -375,6 +379,9 @@ ARCH_RULES: dict[str, tuple[str, ...]] = {
         "kernel stops below it.",
         "Triton on sm_90: `tl.dot` on e4m3 for FP8; sweep TMA descriptors and "
         "`warp_specialize=True` (Hopper is what they were built for).",
+        "CuTe DSL on sm_90: start from `examples/cute_sm90_gemm_ws.py` (the `cute-dsl` "
+        "skill's `sm90-wgmma.md`: wgmma, TMA, mbarrier phases, `setmaxnreg`); none of it "
+        "runs on sm_100 or sm_120.",
     ),
     "blackwell": (
         "Compute-bound GEMM-like work needs `tcgen05.mma` for the tensor-core peak: Triton "
@@ -386,6 +393,10 @@ ARCH_RULES: dict[str, tuple[str, ...]] = {
         "upcast: check the PTX, Triton 3.8).",
         "Shared memory is ~227 KB per block: deeper pipelines and larger tiles than the "
         "sm_120 examples (99 KB) use.",
+        "CuTe DSL on sm_100: start from `examples/cute_sm100_gemm_tcgen05.py` (the "
+        "`cute-dsl` skill's `sm100-tcgen05.md`: TMEM 512-column budget, `tcgen05.alloc` / "
+        "`dealloc`, 2-CTA pairs); Triton stays first for GEMM-shaped glue (`tl.dot` lowers "
+        "to tcgen05 here).",
     ),
     "blackwell_geforce": (
         "Triton FP8: start from `tl.dot_scaled` with unit ue8m0 scales (`QMMA.SF`); never "
