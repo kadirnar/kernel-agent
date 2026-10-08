@@ -9,7 +9,7 @@ from typing import Any
 ALL_BACKENDS = ("cuda", "triton", "cute", "tilelang", "nvrtc")
 DEFAULT_MODEL = "claude-opus-5-5"
 SONNET_MODEL = "claude-sonnet-5-5"
-HAIKU_MODEL = "claude-haiku-4-5"
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
 #: A role's model or effort that is the session's: ``--claude-model`` / ``--effort``.
 INHERIT = "inherit"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
