@@ -3785,6 +3785,14 @@ measurement holds the lock of one GPU while its subprocess runs
     10, with `MAX_JOBS` at each session's share of them (8 other CPUs, 3 sessions: 2;
     a template-heavy nvcc job takes about 2 GB of host memory). Below 8 CPUs only the
     nice values and `MAX_JOBS` apply.
+  * *Quiet timing phases.* Builds on the other cores still share the L3 cache, the
+    memory bandwidth and the package's clocks with the timing cores. So while a timed
+    subprocess times (the evaluator's timing stage, the candidate-free reference
+    re-time, the end-to-end measurement; it says so in a file its hold watches), the
+    agents' background work is paused (SIGSTOP, then SIGCONT): every process below a
+    session's Claude Code CLI (its Bash commands and their builds; not the CLI) and the
+    prebuilds. Imports and builds of the timed job are never paused around, so a paused
+    build never holds a lock the timed job waits for; nothing stays paused past the hold.
   * *Builds before the GPU lock* (`kernel_agent/kernels/prebuild.py`). An evaluation or
     a sweep of a `load_inline` candidate first builds its extensions in a process that
     sees no GPU, into the same `TORCH_EXTENSIONS_DIR` (`prebuild` in the record): the

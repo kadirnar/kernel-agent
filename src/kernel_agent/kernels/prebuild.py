@@ -173,12 +173,15 @@ def prebuild(
     with subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
     ) as proc:
+        hygiene.background(proc.pid)  # a timed job's timing pauses it
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             interrupt.kill(proc.pid)  # with ninja and nvcc
             proc.communicate()
             return {"status": "timeout", "seconds": round(time.perf_counter() - start, 1)}
+        finally:
+            hygiene.done(proc.pid)
     seconds = round(time.perf_counter() - start, 1)
     lines = out.splitlines()
     for line in lines[::-1]:

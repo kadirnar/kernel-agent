@@ -744,9 +744,10 @@ def _evaluate(
         return result
 
     # 3. performance (reference vs candidate, same inputs, same entrypoint)
-    from kernel_agent import telemetry
+    from kernel_agent import hygiene, telemetry
 
     sched = telemetry.schedstat()  # how long this thread waits for a CPU while it times
+    hygiene.phase(hygiene.TIMING)  # the agents' builds pause meanwhile (several sessions)
     compiled_ref = copy.deepcopy(reference) if compile_baseline else None
     compiled: dict[str, Any] = {}
     saved = 0.0
@@ -836,6 +837,7 @@ def _evaluate(
         covered += weight
         saved += (ref_t["median_ms"] - new_t["median_ms"]) * weight
     cpu_wait = telemetry.cpu_wait_share(sched)
+    hygiene.phase("")
 
     if not _intact(result, guard, candidate_path, "after timing"):
         return result
@@ -1257,7 +1259,7 @@ def reference_timing(
     in the process: interleaved rounds of the reference against itself give two
     medians per case; ``ref_ms`` is their mean and ``instability`` their relative
     difference (a busy GPU)."""
-    from kernel_agent import toolchain
+    from kernel_agent import hygiene, toolchain
 
     toolchain.setup()
     from kernel_agent.kernels.bench import compare_timing
@@ -1268,18 +1270,19 @@ def reference_timing(
     reference = capture["module"].eval()
     replay = Replay(capture, reference)  # every call from its case's module state
     ref_ms, unstable = [], []
-    for case in capture["cases"]:
-        if not case.get("count", 1):  # correctness-only case: the evaluator does not time it
-            ref_ms.append(0.0)
-            unstable.append(0.0)
-            continue
-        fn = replay.call(case, reference)
-        one, two = compare_timing(
-            fn, fn, case["args"], case["kwargs"], l2_flush=l2_flush, verify=False
-        )
-        a, b = one["median_ms"], two["median_ms"]
-        ref_ms.append(round((a + b) / 2, 5))
-        unstable.append(round(abs(a - b) / max(min(a, b), 1e-9), 4))
+    with hygiene.timing():  # the agents' builds pause meanwhile (several sessions)
+        for case in capture["cases"]:
+            if not case.get("count", 1):  # correctness-only case: the evaluator does not time it
+                ref_ms.append(0.0)
+                unstable.append(0.0)
+                continue
+            fn = replay.call(case, reference)
+            one, two = compare_timing(
+                fn, fn, case["args"], case["kwargs"], l2_flush=l2_flush, verify=False
+            )
+            a, b = one["median_ms"], two["median_ms"]
+            ref_ms.append(round((a + b) / 2, 5))
+            unstable.append(round(abs(a - b) / max(min(a, b), 1e-9), 4))
     return {"status": "ok", "ref_ms": ref_ms, "instability": unstable}
 
 

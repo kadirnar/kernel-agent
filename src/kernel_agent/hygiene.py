@@ -16,6 +16,11 @@ keeps the timed jobs clean:
   each session's share of them (a template-heavy nvcc job takes about 2 GB of host memory:
   N sessions building at once must not swap). Below :data:`MIN_CPUS` CPUs the affinity is
   off (two cores less would starve the builds); the nice values and ``MAX_JOBS`` still apply.
+* **Quiet timing phases** (:class:`Quiet`): while a timed subprocess times (the evaluator's
+  timing stage, the candidate-free reference re-time, the end-to-end measurement), the
+  agents' background work (:func:`background`: the Claude Code CLIs' Bash commands and the
+  prebuilds) is paused: builds on the other cores still share the L3 cache, the memory
+  bandwidth and the package's clocks with the timing cores.
 * **Builds off the GPU lock**: ``run_evaluation`` and ``run_sweep`` compile a candidate's
   ``load_inline`` extensions first, in a process without a GPU (``kernels/prebuild.py``).
 * **Dirty-timing re-runs**: ``telemetry.HoldWatch`` around a timed job and the evaluator's
@@ -31,12 +36,17 @@ Linux) only ``MAX_JOBS`` applies.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import os
+import signal
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from kernel_agent import interrupt
 
 CPUS_ENV = "KERNEL_AGENT_CPUS"  # a child's CPUs, e.g. "4,5,10,11"
 NICE_ENV = "KERNEL_AGENT_NICE"  # ... and its nice value
@@ -261,17 +271,163 @@ def environ_has(pid: int, key: str, value: str) -> bool:
 def move_session(mark: str) -> list[int]:
     """Move the Claude Code CLI started with ``SESSION_ENV=mark`` (a child of this process)
     and its children to the other cores at nice :data:`BACKGROUND_NICE`; what it starts
-    later (its Bash commands, their builds) inherits that. Returns the moved pids ([]:
-    clean timing is off or the CLI is not found)."""
-    plan = _active.plan if _active is not None else None
-    if plan is None:
+    later (its Bash commands, their builds) inherits that, and the timing phases of timed
+    jobs pause it (:func:`background`; not the CLI itself). Returns the CLI's pid first,
+    then the others ([]: clean timing is off or the CLI is not found)."""
+    if _active is None:
         return []
-    cpus = set(plan.other) if plan.affinity else None
+    plan = _active.plan
+    cpus = set(plan.other) if plan is not None and plan.affinity else None
+    clis = [p for p in _children(os.getpid()) if environ_has(p, SESSION_ENV, mark)]
+    for cli in clis:
+        background(cli, itself=False)
     moved: list[int] = []
-    todo = [p for p in _children(os.getpid()) if environ_has(p, SESSION_ENV, mark)]
+    todo = list(clis)
     while todo:
-        pid = todo.pop()
-        apply(pid, cpus, BACKGROUND_NICE)
+        pid = todo.pop(0)
+        if plan is not None:
+            apply(pid, cpus, BACKGROUND_NICE)
         moved.append(pid)
         todo += _children(pid)
     return moved
+
+
+# ------------------------------------------------------------------ quiet timing phases
+
+PHASE_ENV = "KERNEL_AGENT_PHASE"  # a timed subprocess's phase file: "timing" while it times
+TIMING = "timing"
+QUIET_POLL_S = 0.05  # how often a hold looks at its phase file
+
+_work: dict[interrupt.Proc, bool] = {}  # background work: (pid, start) -> pause the root too
+_work_lock = threading.Lock()
+_paused: set[interrupt.Proc] = set()  # paused now, by any hold (continued at exit too)
+
+
+def background(pid: int, *, itself: bool = True) -> None:
+    """Process ``pid`` does background work for the agents: a prebuild (``itself``: it and
+    what it starts) or a Claude Code CLI (only what it starts: its Bash commands, their
+    builds). The timing phases of timed jobs pause it (:class:`Quiet`) until :func:`done`."""
+    if _active is None or (proc := interrupt.process(pid)) is None:
+        return
+    with _work_lock:
+        _work[proc] = itself
+
+
+def done(pid: int) -> None:
+    """Process ``pid`` does no background work any more (it ended)."""
+    with _work_lock:
+        for proc in [p for p in _work if p[0] == pid]:
+            del _work[proc]
+
+
+def work() -> set[interrupt.Proc]:
+    """The background work running now: below every :func:`background` process (and the
+    process itself when it is work itself); never this process."""
+    with _work_lock:
+        roots = dict(_work)
+    out: set[interrupt.Proc] = set()
+    for root, itself in roots.items():
+        if not interrupt.alive(root):
+            continue
+        out |= interrupt.descendants(root[0])
+        if itself:
+            out.add(root)
+    return {p for p in out if p[0] != os.getpid()}
+
+
+def _continue_all() -> None:
+    """At exit: nothing stays paused."""
+    with _work_lock:
+        paused = set(_paused)
+        _paused.clear()
+    interrupt.send(paused, signal.SIGCONT)
+
+
+atexit.register(_continue_all)
+
+
+class Quiet:
+    """The agents' background work (:func:`background`) paused while a timed subprocess of
+    this hold times. The subprocess says so in its phase file (``phase``, its
+    :data:`PHASE_ENV`; :func:`timing`); a thread looks every :data:`QUIET_POLL_S` and pauses
+    the work (SIGSTOP; work started meanwhile too) until the timing ends, or the hold does.
+    Builds on the other cores still slow a timed job down: they share the L3 cache and the
+    memory bandwidth, and the package's clocks drop under all-core load (the reference of a
+    launch-bound module ran up to 14 % slower beside them). Only timing pauses them, never
+    an import or a build, so a paused build never holds a lock (torch's extension baton)
+    the timed job waits for. ``paused_s``: how long the work was paused."""
+
+    def __init__(self, phase: Path) -> None:
+        self.phase = phase
+        self.paused_s = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._mine: set[interrupt.Proc] = set()
+        self._since = 0.0
+
+    def __enter__(self) -> Quiet:
+        self._thread = threading.Thread(target=self._watch, name="quiet-timing", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+        self._resume()
+        with contextlib.suppress(OSError):
+            self.phase.unlink()
+
+    def _timing(self) -> bool:
+        try:
+            return self.phase.read_text().strip() == TIMING
+        except OSError:
+            return False
+
+    def _watch(self) -> None:
+        last_scan = 0.0
+        while not self._stop.wait(QUIET_POLL_S):
+            if not self._timing():
+                self._resume()
+            elif not self._mine or time.monotonic() - last_scan > 1.0:  # and work started since
+                last_scan = time.monotonic()
+                self._pause()
+
+    def _pause(self) -> None:
+        new = work() - self._mine
+        if not new:
+            return
+        if not self._mine:
+            self._since = time.monotonic()
+        with _work_lock:
+            _paused.update(new)
+        interrupt.send(new, signal.SIGSTOP)
+        self._mine |= new
+
+    def _resume(self) -> None:
+        if not self._mine:
+            return
+        interrupt.send(self._mine, signal.SIGCONT)
+        with _work_lock:
+            _paused.difference_update(self._mine)
+        self._mine = set()
+        self.paused_s += time.monotonic() - self._since
+
+
+def phase(name: str) -> None:
+    """In a timed subprocess: it times now (``name`` :data:`TIMING`: its parent's
+    :class:`Quiet` pauses the agents' background work) or no more (""); nothing without
+    :data:`PHASE_ENV`."""
+    if path := os.environ.get(PHASE_ENV):
+        with contextlib.suppress(OSError):
+            Path(path).write_text(name)
+
+
+@contextlib.contextmanager
+def timing() -> Iterator[None]:
+    """:func:`phase` :data:`TIMING` while entered."""
+    phase(TIMING)
+    try:
+        yield
+    finally:
+        phase("")

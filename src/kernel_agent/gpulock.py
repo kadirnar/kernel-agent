@@ -35,7 +35,9 @@ exclusive one, and another process's exclusive lock still excludes it.
 With clean timing on (:mod:`kernel_agent.hygiene`, several agent sessions at once) a child
 of a hold also gets :data:`HOLD_ENV`, the hold's own token (``telemetry.HoldWatch`` tells
 the processes of the hold from foreign ones on the GPU by it), and its CPUs and nice value:
-the timing cores for an exclusive (timed) job, the other cores for a non-exclusive one.
+the timing cores for an exclusive (timed) job, the other cores for a non-exclusive one. An
+exclusive hold also pauses the agents' background work while its subprocess times
+(``hygiene.Quiet``; the subprocess's :data:`hygiene.PHASE_ENV` file says when).
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ import functools
 import itertools
 import os
 import subprocess
+import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -311,14 +314,20 @@ def gpu_lock(name: str = "gpu") -> Iterator[int]:
         raise
     wait.started(index)
     held[name] = index
+    quiet: hygiene.Quiet | None = None
     if hygiene.current() is not None and not getattr(_held, "token", None):
-        _held.token = f"{os.getpid()}.{next(_tokens)}"  # its children's HOLD_ENV
+        _held.token = token = f"{os.getpid()}.{next(_tokens)}"  # its children's HOLD_ENV
+        if job.exclusive:  # its subprocesses' timing pauses the agents' background work
+            _held.phase = Path(tempfile.gettempdir()) / f"kernel-agent-phase-{token}"
+            quiet = hygiene.Quiet(_held.phase).__enter__()
     try:
         yield index
     finally:
         del held[name]
+        if quiet is not None:
+            quiet.__exit__(None, None, None)
         if not held:
-            _held.token = None
+            _held.token = _held.phase = None
         fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
         if thread_lock is not None:
@@ -391,4 +400,6 @@ def child_env() -> dict[str, str]:
             timed = job is None or job.exclusive
             env[HOLD_ENV] = token
             env.update(hygiene.timed_env() if timed else hygiene.background_env())
+            if timed and (phase := getattr(_held, "phase", None)) is not None:
+                env[hygiene.PHASE_ENV] = str(phase)  # where it says that it times
     return env

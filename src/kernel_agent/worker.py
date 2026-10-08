@@ -312,7 +312,7 @@ def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> 
 
 
 def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
-    from kernel_agent import telemetry
+    from kernel_agent import hygiene, telemetry
     from kernel_agent.integrate.patcher import PatchReport, apply_kernels, apply_transforms
     from kernel_agent.telemetry import Monitor
     from kernel_agent.workloads.base import measure
@@ -335,7 +335,8 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     monitor.sample("before", loaded=False)  # the clocks may still be idling
     sched = telemetry.schedstat()  # how long this thread waits for a CPU while it times
     try:
-        timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
+        with hygiene.timing():  # the agents' builds pause meanwhile (several sessions)
+            timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     except Exception:
         return _failed("runtime_error", patches=report.__dict__)
     cpu_wait = telemetry.cpu_wait_share(sched)

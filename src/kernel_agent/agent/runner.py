@@ -316,6 +316,7 @@ async def run_agent(
     helpers = fields["agents"] or {}  # the role's delegates (#176)
     # clean timing (hygiene.py): the CLI, found by this mark, moves off the timing cores
     mark = {hygiene.SESSION_ENV: f"{os.getpid()}-{name}"} if hygiene.current() else {}
+    cli: list[int] = []  # its pid, once moved
     options = ClaudeAgentOptions(
         system_prompt={
             "type": "preset",
@@ -388,7 +389,7 @@ async def run_agent(
                                 _log(f"agent {who}: {block.text[:300]}")
                     elif isinstance(message, SystemMessage) and message.subtype == "init":
                         if mark:  # before its first command: what it starts inherits it
-                            hygiene.move_session(mark[hygiene.SESSION_ENV])
+                            cli[:] = hygiene.move_session(mark[hygiene.SESSION_ENV])[:1]
                         result.session_id = message.data.get("session_id") or result.session_id
                         result.api_key_source = message.data.get("apiKeySource")
                         if why := auth.session_problem(cfg.auth, result.api_key_source, env):
@@ -419,6 +420,8 @@ async def run_agent(
         # exception (e.g. a timeout cancelling this task); closing it runs the
         # SDK's cleanup, which ends the Claude Code subprocess.
         await stream.aclose()  # type: ignore[attr-defined]
+        for pid in cli:
+            hygiene.done(pid)
         result.seconds = seconds + time.perf_counter() - start
         how = "done" if finished else "stopped"
         if result.usage_limit:

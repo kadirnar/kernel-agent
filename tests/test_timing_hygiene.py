@@ -147,6 +147,65 @@ def test_move_session_moves_the_cli_and_its_children(clean):
             proc.wait()
 
 
+def _state(pid):
+    from kernel_agent import interrupt
+
+    stat = interrupt._stat(pid)
+    return stat[2] if stat else None
+
+
+def _until(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.02)
+
+
+def test_quiet_pauses_the_agents_work_while_a_timed_subprocess_times(tmp_path, monkeypatch, clean):
+    """A Claude Code CLI's Bash commands and a prebuild stop while the hold's subprocess
+    says it times, and go on when it is done or the hold ends; the CLI itself never stops."""
+    code = "import subprocess, time; subprocess.Popen(['sleep', '30']); time.sleep(30)"
+    cli = subprocess.Popen([sys.executable, "-c", code])
+    build = subprocess.Popen(["sleep", "30"])
+    other = subprocess.Popen(["sleep", "30"])  # not the agents' work
+    phase = tmp_path / "phase"
+    monkeypatch.setenv(hygiene.PHASE_ENV, str(phase))  # as the timed subprocess has it
+    try:
+        _until(lambda: hygiene._children(cli.pid))
+        bash = hygiene._children(cli.pid)[0]
+        hygiene.background(cli.pid, itself=False)
+        hygiene.background(build.pid)
+        with hygiene.Quiet(phase) as quiet:
+            time.sleep(0.2)
+            assert _state(bash) != "T" and _state(build.pid) != "T"
+            hygiene.phase(hygiene.TIMING)
+            _until(lambda: _state(bash) == "T" and _state(build.pid) == "T")
+            assert _state(cli.pid) != "T" and _state(other.pid) != "T"
+            hygiene.phase("")
+            _until(lambda: _state(bash) != "T" and _state(build.pid) != "T")
+            with hygiene.timing():
+                _until(lambda: _state(bash) == "T")
+                time.sleep(0.2)
+        assert _state(bash) != "T" and _state(build.pid) != "T"  # the hold ended: going on
+        assert quiet.paused_s > 0.1 and not phase.exists()
+    finally:
+        hygiene.done(cli.pid)
+        hygiene.done(build.pid)
+        for proc in (cli, build, other):
+            proc.kill()
+            proc.wait()
+    assert hygiene.work() == set()
+
+
+def test_an_exclusive_hold_tells_its_subprocess_where_to_say_it_times(clean):
+    with gpulock.gpu_lock():
+        env = gpulock.child_env()
+    assert env[hygiene.PHASE_ENV].endswith(env[gpulock.HOLD_ENV])
+    shared = gpuqueue.Job(kind="dev", job_class=gpuqueue.DEV, exclusive=False, mem_gb=1.0)
+    with gpuqueue.using(shared), gpulock.gpu_lock():
+        assert hygiene.PHASE_ENV not in gpulock.child_env()
+
+
 def test_agent_env_hides_the_gpu_in_tool_mode(clean):
     env = runner.agent_env({"TORCH_CUDA_ARCH_LIST": "12.0"}, gpu=runner.GPU_TOOL)
     assert env["CUDA_VISIBLE_DEVICES"] == "" and env["TORCH_CUDA_ARCH_LIST"] == "12.0"
@@ -397,6 +456,30 @@ def test_run_on_gpu_runs_the_script_as_a_dev_job(tmp_path, monkeypatch, clean):
     assert "shared" not in out and json.loads(out["output"])["nice"] in (-5, os.nice(0))
     missing = asyncio.run(server["run_on_gpu"].handler({"script": "nope.py"}))
     assert "is not a file" in missing["content"][0]["text"]
+
+
+def test_kill_stops_children_in_process_groups_of_their_own(tmp_path):
+    """nvcc runs in a process group of its own: a timed-out prebuild or dev run stops it."""
+    from kernel_agent import interrupt
+
+    pid_file = tmp_path / "grandchild"
+    code = (
+        "import subprocess, sys, time; "
+        "p = subprocess.Popen(['sleep', '60'], start_new_session=True); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid)); time.sleep(60)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code])
+    deadline = time.monotonic() + 10
+    while not (pid_file.exists() and pid_file.read_text()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    grandchild = int(pid_file.read_text())
+    assert os.getpgid(grandchild) != os.getpgid(child.pid)
+    interrupt.kill(child.pid)
+    child.wait(10)
+    deadline = time.monotonic() + 10
+    while (stat := interrupt._stat(grandchild)) is not None and stat[2] != "Z":
+        assert time.monotonic() < deadline, "the grandchild still runs"
+        time.sleep(0.05)
 
 
 def test_run_script_stops_a_script_at_its_timeout(tmp_path):
