@@ -49,7 +49,8 @@ and for the systems agent (Amdahl):
 ``share 66.8% of 7.73 ms: now 793 ms per batched run (...), W8A8 floor 258 ms → 3.48 ms``.
 
 A kernel arm's rows are its benchmark evaluations (``ledger.measured``: quick
-checks and duplicates count for nothing) of all its workers (``workers.py``). The
+checks and duplicates count for nothing) of all its workers or islands (``workers.py``:
+its move-on rules count across them, the same rules in evaluation units). The
 integration's re-evaluations are not evaluations either, but replace a snapshot's
 earlier result in the arm's best, as in the ledger's keep bar (``ledger.standing``).
 
@@ -101,7 +102,8 @@ Concurrent sessions (``improve --agents N``, :mod:`kernel_agent.coordinator`, is
 :func:`virtual_pulls`: every running session counts as if it had made its expected
 evaluations and found nothing (its arm's UCB ``n`` grows, one more step of ``decay``), so the
 slots spread over the arms that pay instead of all going to the top one. An arm takes at
-most ``max_sessions`` sessions at once (1 without islands), a role at most its
+most ``max_sessions`` sessions at once (its live islands, ``--islands``: 1 without; which
+island gets a slot is the island UCB's, ``workers.rank``), a role at most its
 ``max_concurrent`` (``roles.REGISTRY``, ``--role-max``), an agent name at most one, and no
 new session while a GPU-free session of it (research, a dossier) runs (paused); it needs
 time for a slice (:func:`slice_seconds`, the queue's expected wait included). There the
@@ -255,7 +257,7 @@ class Arm:
     base: float = 1.0  # kernels: its best at the start of the round (the goal counts from it)
     fresh: bool = True  # kernels: its best was found in this round (the SOL rule applies)
     note: str | None = None  # native: its staged plan is done, and what it works on now
-    max_sessions: int = 1  # sessions it may run at once (--agents N; islands, later: more)
+    max_sessions: int = 1  # sessions it may run at once (--agents N): its live islands
     # native, gate relaxed (build_arms(relax_native=True)): why it would wait; it takes a
     # slot only when no other arm can use it
     held: str | None = None
@@ -746,6 +748,7 @@ def build_arms(
     rows: list[dict[str, Any]] | None = None,
     research: list[dict[str, Any]] | None = None,
     relax_native: bool = False,
+    islands: Mapping[str, int] | None = None,
 ) -> list[Arm]:
     """Every arm with its history, stop reason and score (live arms first, best first).
 
@@ -753,7 +756,8 @@ def build_arms(
     (``plan``) restarts its arm's streak at its ``exp``. ``rounds``: the round records; the
     move-on rules count from the current round's start (its ``exp``, issue #166).
     ``relax_native``: concurrent sessions; the native arm is not stopped while kernel arms
-    improve, only marked :attr:`Arm.held` (:func:`assign`)."""
+    improve, only marked :attr:`Arm.held` (:func:`assign`). ``islands``: the live islands of
+    each kernel target with several (``workers.py``, issue #189), its ``max_sessions``."""
     rows = ledger.rows(run) if rows is None else rows
     profiles = _profiles(run, rounds or [])
     current = (rounds or [{}])[-1]
@@ -788,6 +792,7 @@ def build_arms(
             estimate=estimate,
             rows=ledger.measured(target_rows),
             refused=refused,
+            max_sessions=max(int((islands or {}).get(target_id, 1)), 1),
         )
         plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
         _kernel_history(arm, target_rows, max(plans, default=None), since)

@@ -558,6 +558,28 @@ sees it piggybacked. Typical messages:
   digest (already: `plan.md` is in `workers.SHARED`).
 * The classic session and islands are mutually exclusive per target. With `--islands ≥ 2`
   every session of the target is an island session.
+* **As built (#189)**, where it differs from the above:
+  * `improve.json` → `islands[target][k]` keeps only what the ledger cannot say
+    (direction, generation, the ledger length its generation starts after, parent,
+    the target's evaluations at its last inspiration); evaluations, best, gain, streak
+    and stale sessions are measured from the rows of its `worker` (`workers.measure`),
+    so a restart rebuilds them. A culled island is reseeded at once (no `culled` state):
+    every island stays live, and the arm's cap is the island count.
+  * The island UCB's rate is the island's own gain per evaluation in `1/speedup`
+    (a migrated parent lifts its best but is not its gain); its score is decayed by its
+    stale sessions.
+  * Migration goes only to an island whose last session found no new island best (one
+    that still climbs keeps its own direction), at most every `--migrate-every`
+    evaluations of the target and after as many of its own. Inspirations are faster than
+    the reference: the best of the other islands when it beats the island's lineage, and
+    one other cell (another backend, else another idea).
+  * Culling: `cull_after` is 8 evaluations of the generation, with 2 stale sessions.
+  * `--reseed-workers` keeps its meaning for `optimize`'s `kernels` phase; in `improve`
+    migration replaces it.
+  * Dry run: per-backend ceilings (`dryrun.SimTarget.ceilings`; the planned first
+    backend's is the target's ceiling, so `--islands 1` is unchanged) and simulated islands
+    that build on an inspiration at least 2 % faster
+    (`docs/research-scripts/islands-189/`, results in the README's "Islands").
 
 ### 3.6 Ownership and locking
 

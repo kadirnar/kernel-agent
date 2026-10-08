@@ -156,6 +156,24 @@ def _agents(raw: str) -> int:
     return n
 
 
+def _count(raw: str) -> int:
+    """A count >= 0 (``--migrate-every``)."""
+    if not raw.strip().isdigit():
+        raise argparse.ArgumentTypeError(f"expected a count >= 0, got {raw!r}")
+    return int(raw)
+
+
+def _share(raw: str) -> float:
+    """A share in [0, 1) (``--cull-gap``)."""
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0.0 <= value < 1.0:
+        raise argparse.ArgumentTypeError(f"expected a share in [0, 1), got {raw!r}")
+    return value
+
+
 def _role_max(raw: str) -> dict[str, int]:
     """``--role-max kernel=2,research=1``: sessions of a role at once (the roles not named
     keep the role registry's ``max_concurrent``, ``roles.REGISTRY``)."""
@@ -371,6 +389,8 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         board=ns.board,
         critic=ns.critic,
         critic_wait=ns.critic_wait,
+        migrate_every=ns.migrate_every,
+        cull_gap=ns.cull_gap,
         policy=Policy(
             patience=ns.patience,
             sol_stop=ns.sol_stop or None,
@@ -564,17 +584,20 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--parallel", type=int, default=1, help="kernel agents running concurrently")
     p.add_argument(
         "--seeds-per-target",
+        "--islands",
+        dest="seeds_per_target",
         type=_seeds,
         metavar="K|auto",
         help="isolated workers per target, each from another approach or backend (auto: 2 "
-        "for targets with >= 20%% of the profile); the target's evaluation budget is split "
-        "across them (default 1)",
+        "for targets with >= 20%% of the profile; default 1). optimize splits the target's "
+        "evaluation budget across them; improve keeps them as islands: each session goes to "
+        "the island that pays most, with migration and culling (--migrate-every, --cull-gap)",
     )
     p.add_argument(
         "--reseed-workers",
         action="store_true",
-        help="with several workers: a second round of sessions from each target's two best "
-        "snapshots (half of the budget)",
+        help="optimize, with several workers: a second round of sessions from each target's "
+        "two best snapshots (half of the budget; improve: migration does this)",
     )
     p.add_argument("--no-transforms", action="store_true", help="skip model-level transforms")
     p.add_argument("--claude-model", default=DEFAULT_MODEL)
@@ -899,6 +922,22 @@ def main(argv: list[str] | None = None) -> int:
         default=30.0,
         metavar="S",
         help="--critic model: ask the model only when the job is expected to wait this long",
+    )
+    p.add_argument(
+        "--migrate-every",
+        type=_count,
+        default=4,
+        metavar="M",
+        help="--islands: every M evaluations of a target an island's next digest lists the "
+        "best results of the other islands as inspirations (0: no migration)",
+    )
+    p.add_argument(
+        "--cull-gap",
+        type=_share,
+        default=0.15,
+        metavar="F",
+        help="--islands: an island this share below its target's best after 8 evaluations "
+        "and 2 sessions without a new island best is reseeded from that best (0: never)",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="simulated agents and GPU (no Claude, no GPU)"

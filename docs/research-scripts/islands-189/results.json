@@ -1,0 +1,924 @@
+{
+ "max-hours 8": {
+  "1 (default)": [
+   {
+    "kernel_evals": 62,
+    "speedup": 2.0308,
+    "agent_h": 10.00675,
+    "per_agent_h": 0.07079519365339419,
+    "loop_h": 6.509,
+    "rounds": 3,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2597,
+     "mlp": 1.7651,
+     "rmsnorm": 1.8755,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 112,
+    "speedup": 2.6471,
+    "agent_h": 15.121333333333334,
+    "per_agent_h": 0.06437690907869717,
+    "loop_h": 6.734,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2661,
+     "mlp": 1.7646,
+     "mlp__fp8_weights": 2.8625,
+     "rmsnorm": 1.8456,
+     "rope": 2.1035
+    }
+   },
+   {
+    "kernel_evals": 101,
+    "speedup": 2.6285,
+    "agent_h": 13.552472222222223,
+    "per_agent_h": 0.07130900734795242,
+    "loop_h": 7.483,
+    "rounds": 3,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2862,
+     "mlp": 1.7704,
+     "mlp__fp8_weights": 2.8195,
+     "rmsnorm": 1.8513,
+     "rope": 2.0736
+    }
+   },
+   {
+    "kernel_evals": 114,
+    "speedup": 2.6507,
+    "agent_h": 15.093583333333333,
+    "per_agent_h": 0.0645853098320904,
+    "loop_h": 6.463,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.286,
+     "mlp": 1.7842,
+     "mlp__fp8_weights": 2.8649,
+     "rmsnorm": 1.8736,
+     "rope": 1.9423
+    }
+   },
+   {
+    "kernel_evals": 109,
+    "speedup": 2.6238,
+    "agent_h": 14.241555555555555,
+    "per_agent_h": 0.06773302571491205,
+    "loop_h": 7.569,
+    "rounds": 3,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2467,
+     "mlp": 1.7842,
+     "mlp__fp8_weights": 2.8576,
+     "rmsnorm": 1.8137,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "2": [
+   {
+    "kernel_evals": 106,
+    "speedup": 2.6989,
+    "agent_h": 14.299666666666667,
+    "per_agent_h": 0.06943128855613866,
+    "loop_h": 7.347,
+    "rounds": 3,
+    "offered": 7,
+    "used": 1,
+    "culls": 0,
+    "best": {
+     "attn": 2.4297,
+     "mlp": 1.7392,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 2.0185,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 119,
+    "speedup": 2.7344,
+    "agent_h": 15.6815,
+    "per_agent_h": 0.0641464166935044,
+    "loop_h": 6.734,
+    "rounds": 2,
+    "offered": 4,
+    "used": 1,
+    "culls": 0,
+    "best": {
+     "attn": 2.5077,
+     "mlp": 1.7663,
+     "mlp__fp8_weights": 2.8747,
+     "rmsnorm": 2.0084,
+     "rope": 2.2069
+    }
+   },
+   {
+    "kernel_evals": 123,
+    "speedup": 2.6824,
+    "agent_h": 15.6075,
+    "per_agent_h": 0.06322036944865493,
+    "loop_h": 6.469,
+    "rounds": 2,
+    "offered": 6,
+    "used": 3,
+    "culls": 0,
+    "best": {
+     "attn": 2.4057,
+     "mlp": 1.7704,
+     "mlp__fp8_weights": 2.7283,
+     "rmsnorm": 2.0911,
+     "rope": 2.1404
+    }
+   },
+   {
+    "kernel_evals": 115,
+    "speedup": 2.6794,
+    "agent_h": 14.380749999999999,
+    "per_agent_h": 0.06853556934518355,
+    "loop_h": 6.205,
+    "rounds": 2,
+    "offered": 5,
+    "used": 2,
+    "culls": 0,
+    "best": {
+     "attn": 2.3739,
+     "mlp": 1.5425,
+     "mlp__fp8_weights": 2.8303,
+     "rmsnorm": 2.0329,
+     "rope": 1.4536
+    }
+   },
+   {
+    "kernel_evals": 123,
+    "speedup": 2.6335,
+    "agent_h": 15.944138888888888,
+    "per_agent_h": 0.06073164356440116,
+    "loop_h": 6.8,
+    "rounds": 2,
+    "offered": 11,
+    "used": 6,
+    "culls": 0,
+    "best": {
+     "attn": 2.2241,
+     "mlp": 1.7644,
+     "mlp__fp8_weights": 2.7089,
+     "rmsnorm": 1.9642,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "2, independent": [
+   {
+    "kernel_evals": 106,
+    "speedup": 2.6989,
+    "agent_h": 14.299666666666667,
+    "per_agent_h": 0.06943128855613866,
+    "loop_h": 7.347,
+    "rounds": 3,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4297,
+     "mlp": 1.7392,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 2.0185,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 122,
+    "speedup": 2.7616,
+    "agent_h": 16.007694444444446,
+    "per_agent_h": 0.06345762192253201,
+    "loop_h": 6.763,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.5077,
+     "mlp": 1.7746,
+     "mlp__fp8_weights": 2.8771,
+     "rmsnorm": 2.0084,
+     "rope": 1.9981
+    }
+   },
+   {
+    "kernel_evals": 122,
+    "speedup": 2.6926,
+    "agent_h": 15.7735,
+    "per_agent_h": 0.06279565534364583,
+    "loop_h": 6.469,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4057,
+     "mlp": 1.7706,
+     "mlp__fp8_weights": 2.7283,
+     "rmsnorm": 2.0911,
+     "rope": 1.9866
+    }
+   },
+   {
+    "kernel_evals": 116,
+    "speedup": 2.7127,
+    "agent_h": 14.377333333333334,
+    "per_agent_h": 0.06941095582402962,
+    "loop_h": 6.209,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.3739,
+     "mlp": 1.7471,
+     "mlp__fp8_weights": 2.8303,
+     "rmsnorm": 2.0045,
+     "rope": 1.4536
+    }
+   },
+   {
+    "kernel_evals": 121,
+    "speedup": 2.6161,
+    "agent_h": 15.769916666666665,
+    "per_agent_h": 0.060982228345998875,
+    "loop_h": 6.8,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2241,
+     "mlp": 1.7116,
+     "mlp__fp8_weights": 2.7089,
+     "rmsnorm": 1.9642,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "3": [
+   {
+    "kernel_evals": 120,
+    "speedup": 2.577,
+    "agent_h": 16.063861111111112,
+    "per_agent_h": 0.058928916598728696,
+    "loop_h": 7.393,
+    "rounds": 3,
+    "offered": 7,
+    "used": 4,
+    "culls": 0,
+    "best": {
+     "attn": 2.1642,
+     "mlp": 1.645,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 1.9209,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 137,
+    "speedup": 2.5537,
+    "agent_h": 17.812638888888888,
+    "per_agent_h": 0.052633598747259425,
+    "loop_h": 7.167,
+    "rounds": 3,
+    "offered": 5,
+    "used": 3,
+    "culls": 0,
+    "best": {
+     "attn": 2.159,
+     "mlp": 1.7637,
+     "mlp__fp8_weights": 2.489,
+     "rmsnorm": 1.9055,
+     "rope": 2.2069
+    }
+   },
+   {
+    "kernel_evals": 129,
+    "speedup": 2.5885,
+    "agent_h": 17.02675,
+    "per_agent_h": 0.05585790343781514,
+    "loop_h": 6.779,
+    "rounds": 2,
+    "offered": 3,
+    "used": 2,
+    "culls": 0,
+    "best": {
+     "attn": 2.2559,
+     "mlp": 1.7686,
+     "mlp__fp8_weights": 2.7716,
+     "rmsnorm": 1.9528,
+     "rope": 1.4959
+    }
+   },
+   {
+    "kernel_evals": 128,
+    "speedup": 2.5979,
+    "agent_h": 16.72711111111111,
+    "per_agent_h": 0.05707521280984375,
+    "loop_h": 6.535,
+    "rounds": 2,
+    "offered": 8,
+    "used": 5,
+    "culls": 0,
+    "best": {
+     "attn": 2.2655,
+     "mlp": 1.5973,
+     "mlp__fp8_weights": 2.7039,
+     "rmsnorm": 1.9703,
+     "rope": 1.4536
+    }
+   },
+   {
+    "kernel_evals": 121,
+    "speedup": 2.7371,
+    "agent_h": 15.139166666666666,
+    "per_agent_h": 0.06650953701181996,
+    "loop_h": 7.328,
+    "rounds": 3,
+    "offered": 7,
+    "used": 4,
+    "culls": 0,
+    "best": {
+     "attn": 2.4914,
+     "mlp": 1.5815,
+     "mlp__fp8_weights": 2.8574,
+     "rmsnorm": 1.949,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "3, independent": [
+   {
+    "kernel_evals": 110,
+    "speedup": 2.6498,
+    "agent_h": 15.130083333333333,
+    "per_agent_h": 0.06440705870436177,
+    "loop_h": 7.055,
+    "rounds": 3,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4143,
+     "mlp": 1.5164,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 1.9209,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 145,
+    "speedup": 2.5503,
+    "agent_h": 18.910833333333333,
+    "per_agent_h": 0.049506596711371045,
+    "loop_h": 6.8,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.159,
+     "mlp": 1.7497,
+     "mlp__fp8_weights": 2.489,
+     "rmsnorm": 1.9055,
+     "rope": 2.077
+    }
+   },
+   {
+    "kernel_evals": 131,
+    "speedup": 2.6176,
+    "agent_h": 17.167555555555555,
+    "per_agent_h": 0.05605095404015726,
+    "loop_h": 6.8,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2559,
+     "mlp": 1.6914,
+     "mlp__fp8_weights": 2.7716,
+     "rmsnorm": 1.9528,
+     "rope": 1.9779
+    }
+   },
+   {
+    "kernel_evals": 127,
+    "speedup": 2.6815,
+    "agent_h": 16.843583333333335,
+    "per_agent_h": 0.05856095582041684,
+    "loop_h": 6.588,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4176,
+     "mlp": 1.5973,
+     "mlp__fp8_weights": 2.7039,
+     "rmsnorm": 1.9703,
+     "rope": 1.6421
+    }
+   },
+   {
+    "kernel_evals": 118,
+    "speedup": 2.6643,
+    "agent_h": 14.866,
+    "per_agent_h": 0.06591829402330358,
+    "loop_h": 7.168,
+    "rounds": 3,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.3741,
+     "mlp": 1.5727,
+     "mlp__fp8_weights": 2.6463,
+     "rmsnorm": 1.949,
+     "rope": 2.0312
+    }
+   }
+  ]
+ },
+ "rounds 2": {
+  "1 (default)": [
+   {
+    "kernel_evals": 54,
+    "speedup": 2.0308,
+    "agent_h": 8.507972222222222,
+    "per_agent_h": 0.08326658639537325,
+    "loop_h": 4.798,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2558,
+     "mlp": 1.7651,
+     "rmsnorm": 1.8755,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 112,
+    "speedup": 2.6471,
+    "agent_h": 15.121333333333334,
+    "per_agent_h": 0.06437690907869717,
+    "loop_h": 6.734,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2661,
+     "mlp": 1.7646,
+     "mlp__fp8_weights": 2.8625,
+     "rmsnorm": 1.8456,
+     "rope": 2.1035
+    }
+   },
+   {
+    "kernel_evals": 101,
+    "speedup": 2.637,
+    "agent_h": 13.990277777777777,
+    "per_agent_h": 0.06930826698175596,
+    "loop_h": 7.639,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2862,
+     "mlp": 1.7704,
+     "mlp__fp8_weights": 2.8195,
+     "rmsnorm": 1.8513,
+     "rope": 2.0736
+    }
+   },
+   {
+    "kernel_evals": 119,
+    "speedup": 2.6879,
+    "agent_h": 15.873833333333334,
+    "per_agent_h": 0.062288685966711985,
+    "loop_h": 7.377,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.286,
+     "mlp": 1.7842,
+     "mlp__fp8_weights": 2.8649,
+     "rmsnorm": 1.8736,
+     "rope": 2.1757
+    }
+   },
+   {
+    "kernel_evals": 108,
+    "speedup": 2.6239,
+    "agent_h": 14.420666666666667,
+    "per_agent_h": 0.06689439419811033,
+    "loop_h": 7.027,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2467,
+     "mlp": 1.7842,
+     "mlp__fp8_weights": 2.8576,
+     "rmsnorm": 1.8137,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "2": [
+   {
+    "kernel_evals": 105,
+    "speedup": 2.6762,
+    "agent_h": 14.425083333333333,
+    "per_agent_h": 0.0682420929669096,
+    "loop_h": 7.096,
+    "rounds": 2,
+    "offered": 8,
+    "used": 1,
+    "culls": 0,
+    "best": {
+     "attn": 2.4297,
+     "mlp": 1.7548,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 2.0185,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 118,
+    "speedup": 2.7482,
+    "agent_h": 16.00211111111111,
+    "per_agent_h": 0.0631757987990462,
+    "loop_h": 7.499,
+    "rounds": 2,
+    "offered": 4,
+    "used": 1,
+    "culls": 0,
+    "best": {
+     "attn": 2.5077,
+     "mlp": 1.7663,
+     "mlp__fp8_weights": 2.8747,
+     "rmsnorm": 2.0084,
+     "rope": 2.1566
+    }
+   },
+   {
+    "kernel_evals": 118,
+    "speedup": 2.7033,
+    "agent_h": 15.666777777777778,
+    "per_agent_h": 0.06347656570054594,
+    "loop_h": 7.299,
+    "rounds": 2,
+    "offered": 5,
+    "used": 3,
+    "culls": 0,
+    "best": {
+     "attn": 2.4057,
+     "mlp": 1.7704,
+     "mlp__fp8_weights": 2.7831,
+     "rmsnorm": 2.0911,
+     "rope": 1.8875
+    }
+   },
+   {
+    "kernel_evals": 129,
+    "speedup": 2.7209,
+    "agent_h": 16.852805555555555,
+    "per_agent_h": 0.05939442573117357,
+    "loop_h": 7.915,
+    "rounds": 2,
+    "offered": 4,
+    "used": 2,
+    "culls": 0,
+    "best": {
+     "attn": 2.3739,
+     "mlp": 1.5388,
+     "mlp__fp8_weights": 2.8303,
+     "rmsnorm": 2.0329,
+     "rope": 1.8716
+    }
+   },
+   {
+    "kernel_evals": 119,
+    "speedup": 2.6241,
+    "agent_h": 15.815138888888889,
+    "per_agent_h": 0.061000917341900156,
+    "loop_h": 7.366,
+    "rounds": 2,
+    "offered": 9,
+    "used": 5,
+    "culls": 0,
+    "best": {
+     "attn": 2.2241,
+     "mlp": 1.7625,
+     "mlp__fp8_weights": 2.7089,
+     "rmsnorm": 1.9642,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "2, independent": [
+   {
+    "kernel_evals": 105,
+    "speedup": 2.6762,
+    "agent_h": 14.425083333333333,
+    "per_agent_h": 0.0682420929669096,
+    "loop_h": 7.096,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4297,
+     "mlp": 1.7548,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 2.0185,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 129,
+    "speedup": 2.7479,
+    "agent_h": 17.20325,
+    "per_agent_h": 0.05875848944798656,
+    "loop_h": 7.626,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.5077,
+     "mlp": 1.7718,
+     "mlp__fp8_weights": 2.8771,
+     "rmsnorm": 2.0084,
+     "rope": 2.1566
+    }
+   },
+   {
+    "kernel_evals": 127,
+    "speedup": 2.692,
+    "agent_h": 16.95722222222222,
+    "per_agent_h": 0.05839897589386583,
+    "loop_h": 7.39,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4057,
+     "mlp": 1.7706,
+     "mlp__fp8_weights": 2.7831,
+     "rmsnorm": 2.0911,
+     "rope": 1.9866
+    }
+   },
+   {
+    "kernel_evals": 132,
+    "speedup": 2.7064,
+    "agent_h": 17.047527777777777,
+    "per_agent_h": 0.058402564375474815,
+    "loop_h": 8.234,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.3739,
+     "mlp": 1.7693,
+     "mlp__fp8_weights": 2.8303,
+     "rmsnorm": 2.0045,
+     "rope": 1.9543
+    }
+   },
+   {
+    "kernel_evals": 123,
+    "speedup": 2.6241,
+    "agent_h": 16.178583333333332,
+    "per_agent_h": 0.059630559748955064,
+    "loop_h": 7.426,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2241,
+     "mlp": 1.7625,
+     "mlp__fp8_weights": 2.7089,
+     "rmsnorm": 1.9642,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "3": [
+   {
+    "kernel_evals": 120,
+    "speedup": 2.577,
+    "agent_h": 16.063861111111112,
+    "per_agent_h": 0.058928916598728696,
+    "loop_h": 6.338,
+    "rounds": 2,
+    "offered": 7,
+    "used": 4,
+    "culls": 0,
+    "best": {
+     "attn": 2.1642,
+     "mlp": 1.645,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 1.9209,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 137,
+    "speedup": 2.5537,
+    "agent_h": 17.858888888888888,
+    "per_agent_h": 0.052497291054367325,
+    "loop_h": 7.008,
+    "rounds": 2,
+    "offered": 5,
+    "used": 3,
+    "culls": 0,
+    "best": {
+     "attn": 2.159,
+     "mlp": 1.7637,
+     "mlp__fp8_weights": 2.489,
+     "rmsnorm": 1.9055,
+     "rope": 2.2069
+    }
+   },
+   {
+    "kernel_evals": 153,
+    "speedup": 2.6333,
+    "agent_h": 20.23483333333333,
+    "per_agent_h": 0.04785005127281678,
+    "loop_h": 8.051,
+    "rounds": 2,
+    "offered": 9,
+    "used": 6,
+    "culls": 0,
+    "best": {
+     "attn": 2.2559,
+     "mlp": 1.7709,
+     "mlp__fp8_weights": 2.7716,
+     "rmsnorm": 1.9528,
+     "rope": 1.9371
+    }
+   },
+   {
+    "kernel_evals": 155,
+    "speedup": 2.6467,
+    "agent_h": 20.158555555555555,
+    "per_agent_h": 0.048282902923658395,
+    "loop_h": 8.553,
+    "rounds": 2,
+    "offered": 9,
+    "used": 6,
+    "culls": 0,
+    "best": {
+     "attn": 2.2655,
+     "mlp": 1.5973,
+     "mlp__fp8_weights": 2.7039,
+     "rmsnorm": 1.9703,
+     "rope": 1.9053
+    }
+   },
+   {
+    "kernel_evals": 116,
+    "speedup": 2.7021,
+    "agent_h": 15.34911111111111,
+    "per_agent_h": 0.06476135596908275,
+    "loop_h": 7.693,
+    "rounds": 2,
+    "offered": 7,
+    "used": 4,
+    "culls": 0,
+    "best": {
+     "attn": 2.4914,
+     "mlp": 1.5815,
+     "mlp__fp8_weights": 2.7654,
+     "rmsnorm": 1.949,
+     "rope": 2.0312
+    }
+   }
+  ],
+  "3, independent": [
+   {
+    "kernel_evals": 110,
+    "speedup": 2.6498,
+    "agent_h": 15.130083333333333,
+    "per_agent_h": 0.06440705870436177,
+    "loop_h": 6.11,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4143,
+     "mlp": 1.5164,
+     "mlp__fp8_weights": 2.6104,
+     "rmsnorm": 1.9209,
+     "rope": 2.1826
+    }
+   },
+   {
+    "kernel_evals": 146,
+    "speedup": 2.5458,
+    "agent_h": 19.027749999999997,
+    "per_agent_h": 0.04910958691669783,
+    "loop_h": 7.404,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.159,
+     "mlp": 1.7497,
+     "mlp__fp8_weights": 2.489,
+     "rmsnorm": 1.9055,
+     "rope": 2.128
+    }
+   },
+   {
+    "kernel_evals": 142,
+    "speedup": 2.6186,
+    "agent_h": 18.626416666666668,
+    "per_agent_h": 0.05168142864184017,
+    "loop_h": 7.849,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.2559,
+     "mlp": 1.6914,
+     "mlp__fp8_weights": 2.7716,
+     "rmsnorm": 1.9528,
+     "rope": 1.9779
+    }
+   },
+   {
+    "kernel_evals": 142,
+    "speedup": 2.7088,
+    "agent_h": 18.69516666666667,
+    "per_agent_h": 0.05330285362865984,
+    "loop_h": 8.1,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.4176,
+     "mlp": 1.5973,
+     "mlp__fp8_weights": 2.7039,
+     "rmsnorm": 1.9703,
+     "rope": 2.1197
+    }
+   },
+   {
+    "kernel_evals": 124,
+    "speedup": 2.6829,
+    "agent_h": 16.232,
+    "per_agent_h": 0.06079955021181051,
+    "loop_h": 7.498,
+    "rounds": 2,
+    "offered": 0,
+    "used": 0,
+    "culls": 0,
+    "best": {
+     "attn": 2.3741,
+     "mlp": 1.5727,
+     "mlp__fp8_weights": 2.8342,
+     "rmsnorm": 1.949,
+     "rope": 2.0312
+    }
+   }
+  ]
+ }
+}

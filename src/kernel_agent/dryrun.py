@@ -8,7 +8,11 @@ through the same code as the evaluation tools (``record_candidate`` with an
 trigger, the charts, the dashboard and the report are exercised end to end, with
 workers per target too
 (``--seeds-per-target``: a worker session writes to its own directory and follows
-the evaluation budget of its ``# Worker`` section). The simulated engineer
+the evaluation budget of its ``# Worker`` section). An island session (``--islands``,
+issue #189) builds on its own lineage in its direction's backend, whose ceiling is the
+target's own per backend (:attr:`SimTarget.ceilings`; the planned first backend's is the
+target's ceiling, so one session per target behaves as before), and on an inspiration of
+its digest that is at least :data:`ADOPT` faster (a migration). The simulated engineer
 retries an idea once after a failed attempt and starts from the plan's
 directions; the research agent writes its plan from the ledger (the outcomes do
 not depend on either).
@@ -102,6 +106,13 @@ FIRST_MESSAGE_S = 12.0  # a simulated session's first streamed message (virtual 
 # checks), not the model; docs/MULTIAGENT-DATA.md measured 46 % for kernel sessions
 OWN_RUNS = 0.45
 EVALUATION_TOOLS = {"eval": "evaluate_candidate", "e2e": "evaluate_e2e"}
+# islands (#189): the ceiling of a backend a target lists no ceiling for, × the planned one's
+OTHER_BACKEND = 0.85
+ADOPT = 1.02  # a simulated island builds on an inspiration at least this much faster
+_HEAD = re.compile(r"^\* Your island's best: `history/([^`]+)`", re.M)
+_SNAPSHOT = re.compile(r"^\* `history/([^`]+)`: ", re.M)
+_INSPIRATIONS = re.compile(r"^## Inspirations[^\n]*\n(.*?)(?=^#|\Z)", re.M | re.S)
+_DIRECTION = re.compile(r"^\* Your direction: .*\(backends: ([a-z0-9_]+)", re.M)
 
 HEADERS = {
     "triton": "import torch\nimport triton\nimport triton.language as tl\n",
@@ -137,6 +148,19 @@ class SimTarget:
     round: int = 1  # the round whose plan has it
     # the precision its research session proposes in a near-lossless run (pivot.py)
     pivot: str | None = None
+    # an island's lineage in another backend approaches its own ceiling (islands, #189):
+    # (backend, ceiling); the planned first backend's is ``ceiling``, an unlisted one
+    # OTHER_BACKEND × it (:meth:`ceiling_of`)
+    ceilings: tuple[tuple[str, float], ...] = ()
+
+    def ceiling_of(self, backend: str) -> float:
+        """The ceiling an island lineage in ``backend`` approaches."""
+        found = dict(self.ceilings).get(backend)
+        if found is not None:
+            return found
+        if not self.backends or backend == self.backends[0]:
+            return self.ceiling
+        return round(self.ceiling * OTHER_BACKEND, 3)
 
 
 TARGETS = (
@@ -159,6 +183,7 @@ TARGETS = (
             "separate static-shape prefill and decode kernels",
             "bf16x8 vector loads for K and V",
         ),
+        ceilings=(("cuda", 2.6), ("cute", 2.0)),
     ),
     SimTarget(
         "mlp",
@@ -178,6 +203,7 @@ TARGETS = (
             "overlap the gate/up GEMV with the SiLU",
         ),
         pivot="fp8_weights",  # M=1 decode GEMVs: bound by streaming the bf16 weights
+        ceilings=(("triton", 1.55), ("cute", 1.6)),
     ),
     SimTarget(
         "rmsnorm",
@@ -194,6 +220,7 @@ TARGETS = (
             "__launch_bounds__(256), no shared memory",
             "CuTe DSL with the TVM-FFI calling convention",
         ),
+        ceilings=(("cute", 2.1), ("triton", 1.7)),
     ),
     SimTarget(
         "rope",
@@ -209,6 +236,7 @@ TARGETS = (
             "return views of the table instead of copies",
         ),
         round=2,
+        ceilings=(("cuda", 2.0), ("cute", 1.9)),
     ),
 )
 
@@ -244,8 +272,13 @@ def sim_target(spec: dict[str, Any]) -> SimTarget:
         if sim.cls == spec.get("module_class"):
             if spec.get("pivot_of"):
                 faster = None if sim.sol_at is None else round(sim.sol_at * 1.9, 3)
+                ceilings = tuple((b, round(c * 1.6, 3)) for b, c in sim.ceilings)
                 return dataclasses.replace(
-                    sim, ceiling=round(sim.ceiling * 1.6, 3), sol_at=faster, pivot=None
+                    sim,
+                    ceiling=round(sim.ceiling * 1.6, 3),
+                    sol_at=faster,
+                    pivot=None,
+                    ceilings=ceilings,
                 )
             return sim
     rng = _rng(0, "target", spec.get("id"))
@@ -455,6 +488,48 @@ class _BatonExecutor(concurrent.futures.ThreadPoolExecutor):
 
         threading.Thread(target=body, name="dry-run-thread", daemon=True).start()
         return future
+
+
+@dataclass
+class _Lineage:
+    """What a simulated island session builds on (``--islands``, #189): the snapshot, its
+    speedup and its backend. It starts from its digest: its island's best (``## Your
+    island``), or the fastest inspiration (``## Inspirations``) at least :data:`ADOPT` faster
+    (a migration used), else the reference in its direction's first backend; then each
+    faster result of its own."""
+
+    parent: str | None
+    level: float
+    backend: str
+
+    @classmethod
+    def of(cls, run: RunDir, target_id: str, brief: str) -> _Lineage:
+        rows = ledger.rows(run)
+        found = {
+            r["snapshot"]: r
+            for r in rows
+            if r["target"] == target_id and r["correct"] and r["speedup"]
+        }
+        direction = _DIRECTION.search(brief)
+        out = cls(None, 1.0, direction[1] if direction else "")
+        if (head := _HEAD.search(brief)) and head[1] in found:
+            out = cls._from(found[head[1]])
+        section = _INSPIRATIONS.search(brief)
+        offered = _SNAPSHOT.findall(section[1]) if section else []
+        better = [found[s] for s in offered if s in found]
+        top = max(better, key=lambda r: float(r["speedup"]), default=None)
+        if top is not None and float(top["speedup"]) > out.level * ADOPT:
+            out = cls._from(top)
+        return out
+
+    @classmethod
+    def _from(cls, row: dict[str, Any]) -> _Lineage:
+        return cls(f"history/{row['snapshot']}", float(row["speedup"]), str(row["backend"]))
+
+    def saw(self, row: dict[str, Any]) -> None:
+        """Its own evaluation ``row``: a faster correct one is what it builds on next."""
+        if row["correct"] and row["speedup"] and float(row["speedup"]) > self.level:
+            self.parent, self.level = f"history/{row['snapshot']}", float(row["speedup"])
 
 
 class _Limited(Exception):
@@ -880,6 +955,10 @@ class World:
         ref_ms = self.ref_ms(sim.cls) or 10.0
         instances = self.shares.get(sim.cls, (0.0, 1))[1]
         plan = _plan_directions(system)  # a research plan in the digest comes first
+        # an island session (--islands, #189) builds on its own lineage, in its own backend
+        lineage = (
+            _Lineage.of(self.run, target_id, system) if workers.ISLAND_MARK in system else None
+        )
         used = 0
         while True:
             rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
@@ -887,10 +966,16 @@ class World:
             rng = _rng(self.seed, "kernel", target_id, k)
             kept = [r for r in rows if r["status"] == ledger.KEEP]
             best = ledger.best_kept(rows)
-            backend = sim.backends[(k // 5 + (worker or 1) - 1) % len(sim.backends)]
+            if lineage is None:  # the target's best, the backends in turn
+                backend = sim.backends[(k // 5 + (worker or 1) - 1) % len(sim.backends)]
+                parent = f"history/{kept[-1]['snapshot']}" if kept else None
+                level, model = best, sim
+            else:  # its lineage's, toward its backend's ceiling
+                backend, parent, level = lineage.backend, lineage.parent, lineage.level
+                model = dataclasses.replace(sim, ceiling=sim.ceiling_of(backend))
             idea, hypothesis = _next_idea(sim, rows, plan)
-            expected = best * _rng(self.seed, "expect", target_id, k).uniform(1.05, 1.4)
-            outcome = self._kernel_outcome(sim, best, rng)
+            expected = level * _rng(self.seed, "expect", target_id, k).uniform(1.05, 1.4)
+            outcome = self._kernel_outcome(model, level, rng)
             await self._think(rng.uniform(150, 330))
             src = home / "candidates" / f"{backend}_v{k + 1}.py"
             header = HEADERS.get(backend, "import torch\n")
@@ -911,7 +996,7 @@ class World:
                 snap,
                 result,
                 hypothesis=hypothesis,
-                parent=f"history/{kept[-1]['snapshot']}" if kept else None,
+                parent=parent,
                 eval_s=eval_s,
                 when=self.clock.now(),
                 idea=idea,
@@ -920,6 +1005,8 @@ class World:
                 queue_s=queue_s,
                 session=bound.label or None,
             )
+            if lineage is not None:
+                lineage.saw(row)
             used += 1
             _note(home / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
             self._wrote(bound, home / "NOTES.md")

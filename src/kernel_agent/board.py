@@ -199,20 +199,31 @@ def brief(entry: dict[str, Any], chars: int = DIGEST_CHARS) -> str:
 
 
 def open_claims(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """``entries`` without the claims a later ``release`` of the same arm closed (an arm
-    runs one session at a time) and without the releases."""
-    closed: dict[str, int] = {}  # arm -> its last release
+    """``entries`` without the claims a later ``release`` closed and without the releases:
+    a claim of a session (kernel-agent's names it, an agent's is its author's) closes with
+    that session's release (the islands of a target run at once, ``workers.py``), one of no
+    session with the next release of its arm."""
+    by_arm: dict[str, int] = {}  # arm -> its last release
+    by_session: dict[str, int] = {}  # session -> its last release
     for e in entries:
         if e.get("kind") == RELEASE:
-            closed[str((e.get("tags") or {}).get("arm"))] = int(e["id"])
+            tags = e.get("tags") or {}
+            by_arm[str(tags.get("arm"))] = int(e["id"])
+            if tags.get("session"):
+                by_session[str(tags["session"])] = int(e["id"])
+
+    def closed(e: dict[str, Any]) -> bool:
+        tags = e.get("tags") or {}
+        author = e.get("author")
+        session = tags.get("session") or (author if author != COORDINATOR else None)
+        if session:
+            return by_session.get(str(session), 0) > int(e["id"])
+        return by_arm.get(str(tags.get("arm")), 0) > int(e["id"])
+
     return [
         e
         for e in entries
-        if e.get("kind") != RELEASE
-        and not (
-            e.get("kind") == CLAIM
-            and closed.get(str((e.get("tags") or {}).get("arm")), 0) > int(e["id"])
-        )
+        if e.get("kind") != RELEASE and not (e.get("kind") == CLAIM and closed(e))
     ]
 
 
