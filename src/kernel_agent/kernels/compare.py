@@ -34,7 +34,10 @@ K / V) is compared in two parts (:func:`compare_grown`): the appended rows on th
 (the tier's checks with their own RMS), and the part of the input's shape, which must stay
 bit for bit where the reference kept it. Compared whole, one wrong new row of a 4096-token
 cache was 0.02 % of the elements, inside :data:`MAX_MISMATCH`, and at ×0.01 the scaled old
-rows set the element bound of a new row that is not scaled (#202).
+rows set the element bound of a new row that is not scaled (#202). An output of an input's
+shape that the reference wrote a few rows into (:func:`written_box`: a static KV cache
+returned by a functional ``index_copy`` / ``scatter``) likewise (:func:`compare_written`): the
+written rows on their own, the rest bit for bit (#206).
 """
 
 from __future__ import annotations
@@ -351,6 +354,16 @@ CHANNEL_MIN_ROWS = 16
 #: numerics (of 80: FP8 weights 4 / 0 -> 5 / 0, MXFP8 65 / 1 -> 70 / 1, MXFP4 6 / 0 ->
 #: 8 / 1, the key row's norm). Every broken variant is still rejected in both modes; the
 #: VoxCPM2 captures (in-place caches) are unchanged.
+#:
+#: Re-measured with returned same-shape caches compared in parts (#206,
+#: :func:`compare_written`; docs/research-scripts/same-shape-cache-206), the bounds unchanged:
+#: the captures above give byte for byte the same results (none returns a written cache); the
+#: Qwen3 layer with a returned static cache (its cache in the first half of a static one) as
+#: the grown one: x 0.01 no longer fails the reference math (of 12: FP8 weights 4 / 3 -> 0 / 0,
+#: NVFP4 and MXFP4 4 / 4 -> 0 / 0, FP8 W8A8 6 / 4 -> 2 / 0, MXFP8 5 / 4 -> 1 / 0, INT8 weights
+#: 1 / 0 -> 0 / 0, INT8 W8A8 4 / 3 -> 0 / 0); redrawn (of 80) FP8 weights 8 / 0 -> 9 / 0, FP8
+#: W8A8 63 / 3 -> 63 / 4, MXFP8 68 / 4 -> 68 / 6, MXFP4 5 / 1 -> 6 / 1 (the key row's norm).
+#: Every broken variant is still rejected in both modes.
 PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.03, (0.75, 0.125)),
     NEAR_LOSSLESS_FP4_TIER: (0.94, 0.40, 0.12, (2.5, 0.25)),
@@ -359,6 +372,18 @@ PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     RELAXED_FP4_TIER: (0.90, 0.55, 0.18, (3.0, 0.25)),
     RELAXED_KV_TIER: (0.97, 0.25, 0.06, (2.5, 0.125)),
 }
+#: An output of an input's shape is that input with rows written into it (:func:`written_box`,
+#: #206) when the elements the reference changed fill at least WRITTEN_MIN_DENSITY of their box
+#: (along each dimension, the indices where one changed) and the box is at most
+#: WRITTEN_MAX_FRACTION of the tensor. A cache write fills its box (a new value equals the
+#: slot's old one by chance: ~0.1 % of bf16 elements over random old rows); the rounding of a
+#: residual add that leaves some elements of a short output as they were scatters them (two
+#: tokens changed with probability p each: 1 / (2 - p) <= 0.59 of the box when the box is at
+#: most half the tensor; 0.58 measured), and one token has no whole dimension of more than one
+#: element. On the captures of VoxCPM2 and Qwen3-0.6B no residual output keeps more than
+#: 0.88 % of its elements (docs/research-scripts/same-shape-cache-206, ``scan.md``).
+WRITTEN_MAX_FRACTION = 0.5
+WRITTEN_MIN_DENSITY = 0.75
 #: The tier of this process's comparisons when a call passes none. The evaluator sets it
 #: from the capture before the candidate is imported, so the integrity snapshot
 #: (:mod:`kernel_agent.kernels.integrity`) watches it like the constants above.
@@ -709,6 +734,115 @@ def compare_grown(
     return result
 
 
+def written_box(before: Any, after: Any) -> list[torch.Tensor] | None:
+    """Per dimension, the indices of the box of elements a call wrote into ``before`` to give
+    ``after`` of the same shape (a static KV cache returned by a functional ``index_copy`` /
+    ``scatter`` of the new token's K / V: the token's slot along the sequence dimension, every
+    KV head and channel). None unless both are floating-point strided tensors of one dtype
+    and shape, they differ (NaN as NaN) and the elements that differ are written rows: they
+    fill at least :data:`WRITTEN_MIN_DENSITY` of their box (along each dimension, the indices
+    where one differs), which spans a whole dimension of more than one element (rows are
+    vectors, not the few scalars of a short output that a residual add's rounding left as
+    they were) and at most :data:`WRITTEN_MAX_FRACTION` of the tensor."""
+    if not (isinstance(before, torch.Tensor) and isinstance(after, torch.Tensor)):
+        return None
+    if (
+        not before.is_floating_point()
+        or before.dtype != after.dtype
+        or before.shape != after.shape
+        or before.layout != torch.strided
+        or after.layout != torch.strided
+        or before.dim() == 0
+        or before.numel() == 0
+    ):
+        return None
+    changed = ~_same(after.detach(), before.detach().to(after.device))
+    count = int(changed.sum())
+    if count == 0:  # the input itself: compared whole
+        return None
+    hits = [changed.movedim(d, 0).reshape(n, -1).any(1) for d, n in enumerate(changed.shape)]
+    sizes = [int(h.sum()) for h in hits]
+    box = math.prod(sizes)
+    if (
+        box > WRITTEN_MAX_FRACTION * changed.numel()
+        or count < WRITTEN_MIN_DENSITY * box
+        or not any(s == n > 1 for s, n in zip(sizes, changed.shape, strict=True))
+    ):
+        return None
+    return [h.nonzero().flatten() for h in hits]
+
+
+def compare_written(
+    name: str,
+    before: torch.Tensor,
+    ref: torch.Tensor,
+    new: torch.Tensor,
+    box: list[torch.Tensor],
+    *,
+    tier: str | None = None,
+    perturbed: bool = False,
+    input_scale: float = 1.0,
+) -> dict[str, Any]:
+    """``new`` against ``ref``, both ``before`` with rows written into it (:func:`written_box`:
+    ``box``, the indices per dimension of the elements the reference changed; a static KV
+    cache returned by a functional ``index_copy``), as grown caches are
+    (:func:`compare_grown`):
+
+    * the written part (the box) on its own, with the tier's checks (its own RMS, mismatch
+      fraction, norm, cosine and relative L2 error; on redrawn inputs an element's channel
+      RMS is at least its channel's in the whole reference);
+    * the rest, which the reference kept as it was, bit for bit.
+
+    Compared whole, one wrong written row of a 4096-slot cache was 0.02 % of the elements,
+    inside :data:`MAX_MISMATCH` (#206). A candidate whose tensor does not match ``ref``'s
+    type, shape, dtype, layout or device is compared whole (the error)."""
+    kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
+    if (
+        type_error(new) is not None
+        or new.shape != ref.shape
+        or new.dtype != ref.dtype
+        or new.layout != ref.layout
+        or new.device.type != ref.device.type
+    ):
+        return compare_tensors(name, ref, new, **kw)
+    ref, before = ref.detach().to(new.device), before.detach().to(new.device)
+    new = new.detach()
+    box = [index.to(new.device) for index in box]
+
+    def part(t: torch.Tensor) -> torch.Tensor:
+        for d, index in enumerate(box):
+            if index.numel() < t.shape[d]:
+                t = t.index_select(d, index)
+        return t
+
+    channels = _channels(ref.float()) if perturbed else None
+    if channels is not None and box[-1].numel() < ref.shape[-1]:  # written along the channels
+        channels = channels.index_select(-1, box[-1])
+    result = compare_tensors(name, part(ref), part(new), channel_rms=channels, **kw)
+    sizes = [int(index.numel()) for index in box]
+    result["written"] = {"box": sizes, "of": list(ref.shape)}
+    written = f"written {sizes} of {list(ref.shape)}"
+    where = f"the {written} (where the reference changed the input)"
+    problems = [f"{where}: {result['error']}"] if "error" in result else []
+    inside = torch.ones((), dtype=torch.bool, device=new.device)
+    for d, index in enumerate(box):
+        hit = torch.zeros(ref.shape[d], dtype=torch.bool, device=new.device)
+        hit[index] = True
+        inside = inside & hit.view([-1 if i == d else 1 for i in range(ref.dim())])
+    moved = int((~_same(new, before) & ~inside).sum())
+    result["kept_changed"] = moved
+    if moved:
+        problems.append(
+            f"{moved} of the {ref.numel() - math.prod(sizes)} elements outside the {written} "
+            "changed; the reference keeps them as they were (it only writes the box)"
+        )
+    result.pop("error", None)
+    if problems:
+        result["error"] = "; ".join(problems)
+    result["ok"] = not problems
+    return result
+
+
 def compare_output(
     name: str,
     ref: torch.Tensor,
@@ -722,7 +856,9 @@ def compare_output(
     """One output tensor against its reference: :func:`compare_grown` when the reference is
     one of the call's input tensors ``inputs`` (pre-call) grown along one dimension (its
     leading part there equal to that input, NaN as NaN: a returned ``torch.cat`` of a cache
-    and the new rows), else :func:`compare_tensors`."""
+    and the new rows), :func:`compare_written` when it is one of them with rows written into
+    it (:func:`written_box`: a returned functional ``index_copy`` into a static cache), else
+    :func:`compare_tensors`."""
     kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
     for before in inputs:
         dim = grown_dim(before, ref)
@@ -731,6 +867,10 @@ def compare_output(
         lead = ref.detach().narrow(dim, 0, before.shape[dim])
         if bool(_same(lead, before.detach().to(lead.device)).all()):
             return compare_grown(name, before, ref, new, dim, **kw)
+    for before in inputs:
+        box = written_box(before, ref)
+        if box is not None:
+            return compare_written(name, before, ref, new, box, **kw)
     return compare_tensors(name, ref, new, **kw)
 
 
@@ -746,7 +886,8 @@ def compare_structures(
 ) -> list[dict[str, Any]]:
     """The candidate's output ``new`` against the reference's ``ref``, tensor by tensor
     (:func:`compare_output`); ``inputs``: the call's inputs before the call (e.g.
-    ``(args, kwargs)``), for outputs that grow one of them (:func:`compare_grown`)."""
+    ``(args, kwargs)``), for outputs that grow one of them (:func:`compare_grown`) or write
+    rows into one (:func:`compare_written`)."""
     ref_flat = flatten(ref, prefix)
     new_flat = flatten(new, prefix)
     sources = list(flatten(inputs, "in").values())

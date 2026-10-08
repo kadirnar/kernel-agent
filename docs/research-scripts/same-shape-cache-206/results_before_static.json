@@ -1,0 +1,1471 @@
+{
+ "device": "cuda",
+ "seeds": 10,
+ "bounds": {
+  "near-lossless": {
+   "captured": [
+    0.996,
+    0.08,
+    0.02,
+    [
+     0.5,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.996,
+    0.08,
+    0.03,
+    [
+     0.75,
+     0.125
+    ]
+   ]
+  },
+  "near-lossless-fp4": {
+   "captured": [
+    0.96,
+    0.28,
+    0.04,
+    [
+     1.25,
+     0.25
+    ]
+   ],
+   "redrawn": [
+    0.94,
+    0.4,
+    0.12,
+    [
+     2.5,
+     0.25
+    ]
+   ]
+  },
+  "near-lossless-kv": {
+   "captured": [
+    0.996,
+    0.08,
+    0.02,
+    [
+     0.5,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.985,
+    0.16,
+    0.03,
+    [
+     1.5,
+     0.125
+    ]
+   ]
+  },
+  "relaxed": {
+   "captured": [
+    0.99,
+    0.16,
+    0.04,
+    [
+     0.75,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.99,
+    0.16,
+    0.06,
+    [
+     1.5,
+     0.125
+    ]
+   ]
+  },
+  "relaxed-fp4": {
+   "captured": [
+    0.94,
+    0.36,
+    0.06,
+    [
+     1.75,
+     0.25
+    ]
+   ],
+   "redrawn": [
+    0.9,
+    0.55,
+    0.18,
+    [
+     3.0,
+     0.25
+    ]
+   ]
+  },
+  "relaxed-kv": {
+   "captured": [
+    0.99,
+    0.16,
+    0.04,
+    [
+     0.75,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.97,
+    0.25,
+    0.06,
+    [
+     2.5,
+     0.125
+    ]
+   ]
+  }
+ },
+ "results": [
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "FP8 weights",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99941,
+     "max_rel_l2": 0.0344,
+     "max_norm_change": 0.0037,
+     "max_element_ratio": {
+      "near-lossless": 0.258,
+      "relaxed": 0.177
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 8,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99285,
+     "max_rel_l2": 0.1194,
+     "max_norm_change": 0.0218,
+     "max_element_ratio": {
+      "near-lossless": 0.712,
+      "relaxed": 0.366
+     },
+     "example": {
+      "near-lossless": "output[0]: relative L2 error 0.08746 > 0.08"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99863,
+     "max_rel_l2": 0.0524,
+     "max_norm_change": 0.0143,
+     "max_element_ratio": {
+      "near-lossless": 2.31,
+      "relaxed": 1.301
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 2.31x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[2]: an element is 1.3x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "FP8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99888,
+     "max_rel_l2": 0.0473,
+     "max_norm_change": 0.0048,
+     "max_element_ratio": {
+      "near-lossless": 0.347,
+      "relaxed": 0.238
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 63,
+      "relaxed": 3
+     },
+     "min_cosine": 0.98601,
+     "max_rel_l2": 0.1695,
+     "max_norm_change": 0.0251,
+     "max_element_ratio": {
+      "near-lossless": 0.737,
+      "relaxed": 0.401
+     },
+     "example": {
+      "near-lossless": "output[0]: relative L2 error 0.08084 > 0.08",
+      "relaxed": "output[0]: cosine 0.989646 < 0.99"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 4
+     },
+     "min_cosine": 0.99743,
+     "max_rel_l2": 0.0748,
+     "max_norm_change": 0.0462,
+     "max_element_ratio": {
+      "near-lossless": 3.14,
+      "relaxed": 1.677
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 3.14x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[2]: an element is 1.68x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "MXFP8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99848,
+     "max_rel_l2": 0.0552,
+     "max_norm_change": 0.0089,
+     "max_element_ratio": {
+      "near-lossless": 0.409,
+      "relaxed": 0.274
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 68,
+      "relaxed": 4
+     },
+     "min_cosine": 0.98673,
+     "max_rel_l2": 0.1625,
+     "max_norm_change": 0.0302,
+     "max_element_ratio": {
+      "near-lossless": 0.934,
+      "relaxed": 0.555
+     },
+     "example": {
+      "near-lossless": "output[0]: relative L2 error 0.08393 > 0.08",
+      "relaxed": "output[0]: cosine 0.986735 < 0.99; relative L2 error 0.1625 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 5,
+      "relaxed": 4
+     },
+     "min_cosine": 0.99781,
+     "max_rel_l2": 0.0732,
+     "max_norm_change": 0.0337,
+     "max_element_ratio": {
+      "near-lossless": 3.951,
+      "relaxed": 2.058
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 3.95x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[2]: an element is 2.06x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "NVFP4 weights",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99246,
+     "max_rel_l2": 0.1225,
+     "max_norm_change": 0.0131,
+     "max_element_ratio": {
+      "near-lossless": 0.373,
+      "relaxed": 0.271
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.94145,
+     "max_rel_l2": 0.3626,
+     "max_norm_change": 0.0749,
+     "max_element_ratio": {
+      "near-lossless": 0.519,
+      "relaxed": 0.436
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.98895,
+     "max_rel_l2": 0.1515,
+     "max_norm_change": 0.0745,
+     "max_element_ratio": {
+      "near-lossless": 2.553,
+      "relaxed": 2.163
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 2.55x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)",
+      "relaxed": "output[2]: an element is 2.16x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "MXFP4 weights",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.98926,
+     "max_rel_l2": 0.1462,
+     "max_norm_change": 0.0205,
+     "max_element_ratio": {
+      "near-lossless": 0.428,
+      "relaxed": 0.312
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 5,
+      "relaxed": 1
+     },
+     "min_cosine": 0.88515,
+     "max_rel_l2": 0.474,
+     "max_norm_change": 0.1137,
+     "max_element_ratio": {
+      "near-lossless": 0.615,
+      "relaxed": 0.515
+     },
+     "example": {
+      "near-lossless": "output[0]: cosine 0.934443 < 0.94",
+      "relaxed": "output[0]: cosine 0.885154 < 0.9"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.96917,
+     "max_rel_l2": 0.2464,
+     "max_norm_change": 0.0364,
+     "max_element_ratio": {
+      "near-lossless": 3.165,
+      "relaxed": 2.642
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 2.73x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)",
+      "relaxed": "output[2]: an element is 2.37x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.99848,
+     "max_rel_l2": 0.1258,
+     "max_norm_change": 0.1143,
+     "max_element_ratio": {
+      "near-lossless": 0.606,
+      "relaxed": 0.495
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1115 (allowed \u00b12%): a systematic error, not rounding noise; relative L2 error 0.1258 > 0.08",
+      "relaxed": "output[0]: norm x1.1115 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.99185,
+     "max_rel_l2": 0.2075,
+     "max_norm_change": 0.1669,
+     "max_element_ratio": {
+      "near-lossless": 0.967,
+      "relaxed": 0.619
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1669 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1834 > 0.08",
+      "relaxed": "output[0]: norm x1.1669 (allowed \u00b16%): a systematic error, not rounding noise; relative L2 error 0.1834 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": 0.99737,
+     "max_rel_l2": 0.1613,
+     "max_norm_change": 0.1454,
+     "max_element_ratio": {
+      "near-lossless": 2.439,
+      "relaxed": 1.276
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.0866 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1029 > 0.08",
+      "relaxed": "output[0]: norm x1.0866 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp8: scales x1.2",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.98525,
+     "max_rel_l2": 0.5579,
+     "max_norm_change": 0.5162,
+     "max_element_ratio": {
+      "near-lossless": 2.578,
+      "relaxed": 2.092
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.58x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x1.5162 (allowed \u00b12%): a systematic error, not rounding noise; cosine 0.985253 < 0.996; relative L2 error 0.5579 > 0.08",
+      "relaxed": "output[0]: an element is 2.05x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1.5162 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.985253 < 0.99; relative L2 error 0.5579 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.97344,
+     "max_rel_l2": 0.8236,
+     "max_norm_change": 0.7646,
+     "max_element_ratio": {
+      "near-lossless": 3.809,
+      "relaxed": 2.584
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 3.76x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.7204 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.985566 < 0.996; relative L2 error 0.7541 > 0.08",
+      "relaxed": "output[0]: an element is 2.5x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.7204 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.985566 < 0.99; relative L2 error 0.7541 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": 0.98177,
+     "max_rel_l2": 0.703,
+     "max_norm_change": 0.6661,
+     "max_element_ratio": {
+      "near-lossless": 3.867,
+      "relaxed": 3.16
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.09x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.3875 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.986291 < 0.996; relative L2 error 0.4338 > 0.08",
+      "relaxed": "output[0]: an element is 1.61x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.3875 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.986291 < 0.99; relative L2 error 0.4338 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp8: int4 per tensor",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.46881,
+     "max_rel_l2": 0.9331,
+     "max_norm_change": 0.2796,
+     "max_element_ratio": {
+      "near-lossless": 5.045,
+      "relaxed": 3.83
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 4.48x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x0.8038 (allowed \u00b12%): a systematic error, not rounding noise; cosine 0.630290 < 0.996; relative L2 error 0.7955 > 0.08",
+      "relaxed": "output[0]: an element is 3.1x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0.8038 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.630290 < 0.99; relative L2 error 0.7955 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.02375,
+     "max_rel_l2": 1.903,
+     "max_norm_change": 0.7356,
+     "max_element_ratio": {
+      "near-lossless": 9.338,
+      "relaxed": 5.259
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 5.84x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.4128 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.238710 < 0.996; relative L2 error 1.524 > 0.08",
+      "relaxed": "output[0]: an element is 2.92x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.4128 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.238710 < 0.99; relative L2 error 1.524 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": 0.28302,
+     "max_rel_l2": 1.683,
+     "max_norm_change": 0.6654,
+     "max_element_ratio": {
+      "near-lossless": 26.294,
+      "relaxed": 14.158
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 6.04x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.6573 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.417811 < 0.996; relative L2 error 1.537 > 0.08",
+      "relaxed": "output[0]: an element is 3.03x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.6573 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.417811 < 0.99; relative L2 error 1.537 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp8: row 0 of every GEMM skipped",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 3
+     },
+     "min_cosine": 0.97695,
+     "max_rel_l2": 0.2136,
+     "max_norm_change": 0.0148,
+     "max_element_ratio": {
+      "near-lossless": 4.957,
+      "relaxed": 4.142
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 4.96x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); cosine 0.976950 < 0.996; relative L2 error 0.2136 > 0.08",
+      "relaxed": "output[0]: an element is 4.14x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); cosine 0.976950 < 0.99; relative L2 error 0.2136 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 73,
+      "relaxed": 30
+     },
+     "min_cosine": 0.93891,
+     "max_rel_l2": 0.3442,
+     "max_norm_change": 0.067,
+     "max_element_ratio": {
+      "near-lossless": 2.741,
+      "relaxed": 1.654
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.3x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.9420 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.938909 < 0.996; relative L2 error 0.3442 > 0.08",
+      "relaxed": "output[0]: an element is 1.53x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); cosine 0.938909 < 0.99; relative L2 error 0.3442 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 10,
+      "relaxed": 10
+     },
+     "min_cosine": 0.98212,
+     "max_rel_l2": 0.195,
+     "max_norm_change": 0.09,
+     "max_element_ratio": {
+      "near-lossless": 6.298,
+      "relaxed": 5.194
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 3.93x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); cosine 0.982124 < 0.996; relative L2 error 0.1885 > 0.08",
+      "relaxed": "output[0]: an element is 2.57x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); cosine 0.982124 < 0.99; relative L2 error 0.1885 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp8: KV head 0 dropped",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.94291,
+     "max_rel_l2": 0.3339,
+     "max_norm_change": 0.0812,
+     "max_element_ratio": {
+      "near-lossless": 4.608,
+      "relaxed": 3.802
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 2.52x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|)",
+      "relaxed": "output[2]: an element is 1.88x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|)"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.84128,
+     "max_rel_l2": 0.5799,
+     "max_norm_change": 0.0864,
+     "max_element_ratio": {
+      "near-lossless": 3.264,
+      "relaxed": 2.05
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 2.04x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[2]: an element is 1.17x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 11,
+      "relaxed": 10
+     },
+     "min_cosine": 0.93688,
+     "max_rel_l2": 0.3704,
+     "max_norm_change": 0.1558,
+     "max_element_ratio": {
+      "near-lossless": 7.313,
+      "relaxed": 6.734
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 6.78x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); cosine 0.994722 < 0.996; relative L2 error 0.1026 > 0.08",
+      "relaxed": "output[2]: an element is 5.88x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp8: q heads 0/last swapped (layout)",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 3
+     },
+     "min_cosine": 0.91835,
+     "max_rel_l2": 0.4153,
+     "max_norm_change": 0.044,
+     "max_element_ratio": {
+      "near-lossless": 2.558,
+      "relaxed": 1.805
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.0255 (allowed \u00b12%): a systematic error, not rounding noise; cosine 0.991687 < 0.996; relative L2 error 0.1331 > 0.08",
+      "relaxed": "output[0]: an element is 1.8x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1.0440 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.918346 < 0.99; relative L2 error 0.4153 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.62488,
+     "max_rel_l2": 1.003,
+     "max_norm_change": 0.2544,
+     "max_element_ratio": {
+      "near-lossless": 3.782,
+      "relaxed": 2.095
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.04x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.0352 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.970748 < 0.996; relative L2 error 0.2486 > 0.08",
+      "relaxed": "output[0]: cosine 0.970748 < 0.99; relative L2 error 0.2486 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 10
+     },
+     "min_cosine": 0.8154,
+     "max_rel_l2": 0.6333,
+     "max_norm_change": 0.0775,
+     "max_element_ratio": {
+      "near-lossless": 2.677,
+      "relaxed": 1.437
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.68x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.0775 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.816679 < 0.996; relative L2 error 0.6333 > 0.08",
+      "relaxed": "output[0]: an element is 1.44x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.0775 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.816679 < 0.99; relative L2 error 0.6333 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG w8a8: first token's activation scale",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99888,
+     "max_rel_l2": 0.0473,
+     "max_norm_change": 0.0048,
+     "max_element_ratio": {
+      "near-lossless": 0.347,
+      "relaxed": 0.238
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 66,
+      "relaxed": 11
+     },
+     "min_cosine": 0.67891,
+     "max_rel_l2": 0.7434,
+     "max_norm_change": 0.2046,
+     "max_element_ratio": {
+      "near-lossless": 3.429,
+      "relaxed": 2.141
+     },
+     "example": {
+      "near-lossless": "output[0]: relative L2 error 0.08153 > 0.08",
+      "relaxed": "output[0]: cosine 0.989646 < 0.99"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 4
+     },
+     "min_cosine": 0.99743,
+     "max_rel_l2": 0.0748,
+     "max_norm_change": 0.0462,
+     "max_element_ratio": {
+      "near-lossless": 3.14,
+      "relaxed": 1.677
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 3.14x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[2]: an element is 1.68x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp4: nibbles swapped",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": -0.11328,
+     "max_rel_l2": 1.613,
+     "max_norm_change": 0.2695,
+     "max_element_ratio": {
+      "near-lossless": 5.697,
+      "relaxed": 4.444
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 3.75x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x1.2668 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.001558 < 0.96; relative L2 error 1.613 > 0.28",
+      "relaxed": "output[0]: an element is 3.05x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|); norm x1.2668 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.001558 < 0.94; relative L2 error 1.613 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": -0.08373,
+     "max_rel_l2": 1.7,
+     "max_norm_change": 0.4044,
+     "max_element_ratio": {
+      "near-lossless": 2.531,
+      "relaxed": 2.204
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.4x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x0.8019 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.141987 < 0.94; relative L2 error 1.19 > 0.4",
+      "relaxed": "output[0]: an element is 1.21x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x0.8019 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.141987 < 0.9; relative L2 error 1.19 > 0.55"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": -0.10465,
+     "max_rel_l2": 1.883,
+     "max_norm_change": 0.7181,
+     "max_element_ratio": {
+      "near-lossless": 36.626,
+      "relaxed": 30.63
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.68x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.6340 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.038536 < 0.94; relative L2 error 1.883 > 0.4",
+      "relaxed": "output[0]: an element is 2.25x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.6340 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.038536 < 0.9; relative L2 error 1.883 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp4: scales x1.2",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.97866,
+     "max_rel_l2": 0.5933,
+     "max_norm_change": 0.5352,
+     "max_element_ratio": {
+      "near-lossless": 1.214,
+      "relaxed": 0.99
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.21x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x1.5352 (allowed \u00b14%): a systematic error, not rounding noise; relative L2 error 0.5933 > 0.28",
+      "relaxed": "output[0]: norm x1.5352 (allowed \u00b16%): a systematic error, not rounding noise; relative L2 error 0.5933 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.91444,
+     "max_rel_l2": 0.9115,
+     "max_norm_change": 0.7543,
+     "max_element_ratio": {
+      "near-lossless": 1.66,
+      "relaxed": 1.463
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.41x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.7166 (allowed \u00b112%): a systematic error, not rounding noise; relative L2 error 0.7997 > 0.4",
+      "relaxed": "output[0]: an element is 1.25x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.7166 (allowed \u00b118%): a systematic error, not rounding noise; relative L2 error 0.7997 > 0.55"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": 0.97376,
+     "max_rel_l2": 0.699,
+     "max_norm_change": 0.6627,
+     "max_element_ratio": {
+      "near-lossless": 3.207,
+      "relaxed": 2.717
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.3909 (allowed \u00b112%): a systematic error, not rounding noise; relative L2 error 0.4601 > 0.4",
+      "relaxed": "output[0]: norm x1.3909 (allowed \u00b118%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp4: int4 per tensor",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.46881,
+     "max_rel_l2": 0.9331,
+     "max_norm_change": 0.2796,
+     "max_element_ratio": {
+      "near-lossless": 2.177,
+      "relaxed": 1.709
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.83x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x0.8038 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.630290 < 0.96; relative L2 error 0.7955 > 0.28",
+      "relaxed": "output[0]: an element is 1.35x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|); norm x0.8038 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.630290 < 0.94; relative L2 error 0.7955 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.02375,
+     "max_rel_l2": 1.903,
+     "max_norm_change": 0.7356,
+     "max_element_ratio": {
+      "near-lossless": 3.078,
+      "relaxed": 2.63
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.75x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.4128 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.238710 < 0.94; relative L2 error 1.524 > 0.4",
+      "relaxed": "output[0]: an element is 1.46x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.4128 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.238710 < 0.9; relative L2 error 1.524 > 0.55"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": 0.28302,
+     "max_rel_l2": 1.683,
+     "max_norm_change": 0.6654,
+     "max_element_ratio": {
+      "near-lossless": 8.219,
+      "relaxed": 7.079
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.82x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.6573 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.417811 < 0.94; relative L2 error 1.537 > 0.4",
+      "relaxed": "output[0]: an element is 1.52x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.6573 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.417811 < 0.9; relative L2 error 1.537 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp4: row 0 of every GEMM skipped",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 1,
+      "relaxed": 1
+     },
+     "min_cosine": 0.97162,
+     "max_rel_l2": 0.2375,
+     "max_norm_change": 0.0188,
+     "max_element_ratio": {
+      "near-lossless": 2.256,
+      "relaxed": 1.913
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.26x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|)",
+      "relaxed": "output[0]: an element is 1.91x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|)"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 0
+     },
+     "min_cosine": 0.91987,
+     "max_rel_l2": 0.3922,
+     "max_norm_change": 0.0872,
+     "max_element_ratio": {
+      "near-lossless": 0.953,
+      "relaxed": 0.827
+     },
+     "example": {
+      "near-lossless": "output[0]: cosine 0.919873 < 0.94"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 8,
+      "relaxed": 7
+     },
+     "min_cosine": 0.97549,
+     "max_rel_l2": 0.2207,
+     "max_norm_change": 0.0639,
+     "max_element_ratio": {
+      "near-lossless": 2.758,
+      "relaxed": 2.597
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.45x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)",
+      "relaxed": "output[0]: an element is 1.28x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp4: KV head 0 dropped",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 3
+     },
+     "min_cosine": 0.93559,
+     "max_rel_l2": 0.3536,
+     "max_norm_change": 0.0835,
+     "max_element_ratio": {
+      "near-lossless": 2.083,
+      "relaxed": 1.748
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 1.08x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|)",
+      "relaxed": "output[2]: an element is 1.51x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|)"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 44,
+      "relaxed": 20
+     },
+     "min_cosine": 0.81563,
+     "max_rel_l2": 0.5893,
+     "max_norm_change": 0.1044,
+     "max_element_ratio": {
+      "near-lossless": 1.17,
+      "relaxed": 1.025
+     },
+     "example": {
+      "near-lossless": "output[0]: cosine 0.865284 < 0.94; relative L2 error 0.5241 > 0.4",
+      "relaxed": "output[0]: cosine 0.865284 < 0.9"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 8,
+      "relaxed": 7
+     },
+     "min_cosine": 0.93442,
+     "max_rel_l2": 0.3791,
+     "max_norm_change": 0.123,
+     "max_element_ratio": {
+      "near-lossless": 3.458,
+      "relaxed": 3.367
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 3.08x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)",
+      "relaxed": "output[2]: an element is 2.94x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG fp4: q heads 0/last swapped (layout)",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 1
+     },
+     "min_cosine": 0.90823,
+     "max_rel_l2": 0.4349,
+     "max_norm_change": 0.0324,
+     "max_element_ratio": {
+      "near-lossless": 1.153,
+      "relaxed": 0.858
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.14x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); cosine 0.908230 < 0.96; relative L2 error 0.4349 > 0.28",
+      "relaxed": "output[0]: cosine 0.908230 < 0.94; relative L2 error 0.4349 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 69,
+      "relaxed": 33
+     },
+     "min_cosine": 0.59705,
+     "max_rel_l2": 1.073,
+     "max_norm_change": 0.3097,
+     "max_element_ratio": {
+      "near-lossless": 1.558,
+      "relaxed": 1.328
+     },
+     "example": {
+      "near-lossless": "output[0]: cosine 0.808351 < 0.94; relative L2 error 0.602 > 0.4",
+      "relaxed": "output[0]: cosine 0.808351 < 0.9; relative L2 error 0.602 > 0.55"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 8,
+      "relaxed": 8
+     },
+     "min_cosine": 0.80155,
+     "max_rel_l2": 0.6642,
+     "max_norm_change": 0.1277,
+     "max_element_ratio": {
+      "near-lossless": 2.553,
+      "relaxed": 2.163
+     },
+     "example": {
+      "near-lossless": "output[0]: cosine 0.801555 < 0.94; relative L2 error 0.6642 > 0.4",
+      "relaxed": "output[0]: cosine 0.801555 < 0.9; relative L2 error 0.6642 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG w8a8: cached activation scales",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99854,
+     "max_rel_l2": 0.0542,
+     "max_norm_change": 0.0048,
+     "max_element_ratio": {
+      "near-lossless": 0.64,
+      "relaxed": 0.457
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 71,
+      "relaxed": 16
+     },
+     "min_cosine": 0.79497,
+     "max_rel_l2": 0.6088,
+     "max_norm_change": 0.1539,
+     "max_element_ratio": {
+      "near-lossless": 4.427,
+      "relaxed": 2.65
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.27x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.9484 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.979686 < 0.996; relative L2 error 0.203 > 0.08",
+      "relaxed": "output[0]: cosine 0.979686 < 0.99; relative L2 error 0.203 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 11
+     },
+     "min_cosine": 0.77029,
+     "max_rel_l2": 0.6735,
+     "max_norm_change": 0.4463,
+     "max_element_ratio": {
+      "near-lossless": 4.317,
+      "relaxed": 3.136
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x0.9158 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.985684 < 0.996; relative L2 error 0.1825 > 0.08",
+      "relaxed": "output[0]: norm x0.9158 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.985684 < 0.99; relative L2 error 0.1825 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "INT8 weights",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.9999,
+     "max_rel_l2": 0.0143,
+     "max_norm_change": 0.0005,
+     "max_element_ratio": {
+      "near-lossless": 0.163,
+      "relaxed": 0.109
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99936,
+     "max_rel_l2": 0.0357,
+     "max_norm_change": 0.0077,
+     "max_element_ratio": {
+      "near-lossless": 0.168,
+      "relaxed": 0.103
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 1,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99967,
+     "max_rel_l2": 0.0258,
+     "max_norm_change": 0.0038,
+     "max_element_ratio": {
+      "near-lossless": 1.024,
+      "relaxed": 0.513
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 1.02x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "INT8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99847,
+     "max_rel_l2": 0.0554,
+     "max_norm_change": 0.0047,
+     "max_element_ratio": {
+      "near-lossless": 0.379,
+      "relaxed": 0.265
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99239,
+     "max_rel_l2": 0.1259,
+     "max_norm_change": 0.0248,
+     "max_element_ratio": {
+      "near-lossless": 0.601,
+      "relaxed": 0.324
+     },
+     "example": {
+      "near-lossless": "output[0]: cosine 0.994994 < 0.996; relative L2 error 0.1001 > 0.08"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99752,
+     "max_rel_l2": 0.0725,
+     "max_norm_change": 0.0149,
+     "max_element_ratio": {
+      "near-lossless": 2.502,
+      "relaxed": 1.393
+     },
+     "example": {
+      "near-lossless": "output[2]: an element is 2.5x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[2]: an element is 1.31x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG int8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.99902,
+     "max_rel_l2": 0.1213,
+     "max_norm_change": 0.1119,
+     "max_element_ratio": {
+      "near-lossless": 0.596,
+      "relaxed": 0.496
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1119 (allowed \u00b12%): a systematic error, not rounding noise; relative L2 error 0.1213 > 0.08",
+      "relaxed": "output[0]: norm x1.1119 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.9976,
+     "max_rel_l2": 0.1722,
+     "max_norm_change": 0.1573,
+     "max_element_ratio": {
+      "near-lossless": 0.794,
+      "relaxed": 0.538
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1492 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1593 > 0.08",
+      "relaxed": "output[0]: norm x1.1492 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": 0.99821,
+     "max_rel_l2": 0.1588,
+     "max_norm_change": 0.1475,
+     "max_element_ratio": {
+      "near-lossless": 1.073,
+      "relaxed": 0.725
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.0870 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.0987 > 0.08",
+      "relaxed": "output[0]: norm x1.0870 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "qwen3-static/layer_decode_static",
+   "variant": "BUG int8 w8a8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 4,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 4
+     },
+     "min_cosine": 0.99759,
+     "max_rel_l2": 0.133,
+     "max_norm_change": 0.1114,
+     "max_element_ratio": {
+      "near-lossless": 0.639,
+      "relaxed": 0.528
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1110 (allowed \u00b12%): a systematic error, not rounding noise; relative L2 error 0.133 > 0.08",
+      "relaxed": "output[0]: norm x1.1110 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 80,
+     "fails": {
+      "near-lossless": 80,
+      "relaxed": 80
+     },
+     "min_cosine": 0.9917,
+     "max_rel_l2": 0.2163,
+     "max_norm_change": 0.1657,
+     "max_element_ratio": {
+      "near-lossless": 1.114,
+      "relaxed": 0.641
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1470 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.995478 < 0.996; relative L2 error 0.1789 > 0.08",
+      "relaxed": "output[0]: norm x1.1470 (allowed \u00b16%): a systematic error, not rounding noise; relative L2 error 0.1789 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 12,
+     "fails": {
+      "near-lossless": 12,
+      "relaxed": 12
+     },
+     "min_cosine": 0.99553,
+     "max_rel_l2": 0.1925,
+     "max_norm_change": 0.1665,
+     "max_element_ratio": {
+      "near-lossless": 2.654,
+      "relaxed": 1.548
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.0889 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1091 > 0.08",
+      "relaxed": "output[0]: norm x1.0889 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  }
+ ]
+}
