@@ -1641,7 +1641,9 @@ The fixtures in `tests/test_evaluator_exploits.py` cover the known exploits:
 side streams, background threads, a patched `Event.elapsed_time`, patched
 tolerances, SDPA flags turned off for the reference, a dispatcher override that
 slows `aten::rsqrt`, a comparator blinded through `Tensor.__sub__`, and both
-fallbacks. On the RMSNorm smoke capture the guards add no measurable time
+fallbacks. Under `improve` the critic (`critic.py`) looks for the same patterns in the
+source before a candidate is queued and withdraws the ones it is sure of; the guards
+stay the gate. On the RMSNorm smoke capture the guards add no measurable time
 to an evaluation (median `eval_seconds` 2.1 s before and after). The first
 evaluation of a capture in a process pays for the candidate-free reference
 timing: 2 s for RMSNorm, 4–5 s for a VoxCPM2 attention capture, which also
@@ -2903,9 +2905,9 @@ librarian's model) live in one place, and `program.md`'s sections are its roles.
   `run.json`): the creative and planning roles (kernel, systems, native, planner, research,
   refactor, harness, the `reviewer` helper) run on `--claude-model` at `--effort`; the
   dossier, the librarian and the `doc-lookup` helper on Sonnet 5.5 (`claude-sonnet-5-5`)
-  at effort `low`, `profile-analyst` and `compile-triage` on Sonnet at `medium`; the critic
-  (#174, not run yet)
-  on Haiku 4.5. `--role-model ROLE=MODEL` and `--role-effort ROLE=LEVEL` change one
+  at effort `low`, `profile-analyst` and `compile-triage` on Sonnet at `medium`; the
+  critic's triage on Haiku 4.5 and its escalation (`critic-escalation`) on Sonnet at `low`
+  (`improve --critic model`). `--role-model ROLE=MODEL` and `--role-effort ROLE=LEVEL` change one
   (repeatable; `inherit` = `--claude-model` / `--effort`, an effort of `none` sets none);
   given to `improve` or `resume` on a run that exists, they replace those roles' settings
   and the run keeps the others. A run made before the registry keeps every role on
@@ -3294,6 +3296,37 @@ model and starts a new round (`kernel_agent/improve.py`,
       sub-lanes and adds the GPU's busy strip; `report.md` gets a "Concurrency"
       section: the sessions at once, the GPU's busy share (agents' jobs and background
       work) and the agents' waits, and the time split per role.
+  * *Critic* (`--critic static`, the default; `model`; `off`; issue #188,
+    `kernel_agent/critic.py`). Every full evaluation (`evaluate_candidate` in mode full,
+    `evaluate_e2e`) is reviewed before it reaches the GPU for the documented ways to game an
+    evaluator ([docs/MULTIAGENT-LITERATURE.md](docs/MULTIAGENT-LITERATURE.md) §5): the
+    reference's forward on the main path; an except handler that falls back to the reference
+    or to PyTorch; outputs cached by the inputs' address or shape; work on a side stream
+    nobody waits for, in a thread or in a tensor subclass that computes after the call;
+    reading the call stack, the evaluator's modules or the capture; patching the timer,
+    torch, backend flags, aten kernels or the reference; behaviour keyed on the evaluator's
+    environment, the profiler or a sleep; files written outside the candidate's directory.
+    The static checks read the AST (nothing is imported or run) and tell what runs per call
+    (`forward` and what it calls) from what runs once (`build`, `__init__`), so a `build`
+    that returns `reference` for shapes it does not support, a shape-checked fallback, a CUDA
+    graph cache keyed by `data_ptr` and a joined side stream pass. A reject is withdrawn
+    before the job is queued: the tool returns `status: "reviewed"` with the line and the
+    reason, and no evaluation, budget or streak is used; `force=true` evaluates it anyway.
+    With `--critic model` and `--agents` above 1, a candidate the static checks are unsure
+    about (a cache keyed by `data_ptr` that is not returned, a call counter in a condition,
+    a write to a path they cannot place) gets one tool-less turn of the `critic` role's
+    model (Haiku 4.5) while its job waits for the GPU (when the wait is expected to last
+    `--critic-wait` seconds, default 30), and an unsure answer one more of the
+    `critic-escalation` role's (Sonnet 5.5, effort `low`). A reject with confidence 0.8 or
+    more withdraws the job if it has not taken the GPU yet, and otherwise only annotates the
+    result. One reject in ten (a draw on the normalised source) is evaluated anyway: with
+    the forced ones and those whose verdict came late, they label the critic's precision
+    (rejects the evaluator refused too) and its recall on the anti-gaming gates, which the
+    report gives. A source (static, model) under 60 % precision over 5 labels stops
+    withdrawing until its labels recover. The verdicts are in `critic.jsonl`, the ledger's
+    `review` column and `critic` events, the model's cost in `costs.json`. The evaluator's
+    own checks stay the gate (LLM verifiers measured 0.73-0.82 accurate): the critic saves
+    the GPU time and the turn a refused candidate costs, and never passes one.
   * *Records.* A slice record names its sessions (`sessions`) and their GPU waits
     (`queue_s`); its evaluations, keeps and `improved` come from its own sessions'
     ledger rows, not from what the arm did meanwhile. `improve.json` → `coordinator`
@@ -3970,6 +4003,10 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
   --integration-reserve auto|MINUTES   time kept for the final integration (auto: its
                                        estimate, at most a third of --max-hours; 0: none)
   --board auto|on|off                  the sessions' blackboard (auto: with --agents > 1)
+  --critic off|static|model            review every full evaluation before the GPU (static
+                                       checks; model: + a cheap model while it waits,
+                                       --agents > 1); force=true overrides a reject
+  --critic-wait 30                     --critic model: the least expected GPU wait
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]
                                        [--precisions P,P]  (replaces the run's list in run.json)
 kernel-agent integrate <run_dir> [--precisions P,P] [--no-reuse]
@@ -4061,6 +4098,8 @@ runs/<org>--<name>/<timestamp>/
                               (winner, integration, round, claim, release)
   sessions.jsonl              every agent session's state changes (thinking, tools, queued,
                               on the GPU, ...) and, at its end, its time split (sessions.py)
+  critic.jsonl                improve: the critic's verdicts, withdrawals and the outcome
+                              of every reviewed evaluation (its precision and recall)
   progress.png  amdahl.png  integration.png  dashboard.html
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md, artifacts.jsonl:
                               kernel_agent.artifacts lookups, export_checks.jsonl)
@@ -4101,8 +4140,8 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  worker  session
-idea  hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  review  worker
+session  idea  hypothesis
 ```
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
@@ -4110,7 +4149,10 @@ idea  hypothesis
 time it waited for the GPU behind other jobs before that (see "GPUs and the GPU
 lock"). `diverse_speedup` is the median speedup of an `e2e` row over the
 workload's diverse input set, and `flags` says `data_dependent` when that speedup
-changes with the input (see "Data-dependent speedups"). `worker` is the target's worker that evaluated a kernel
+changes with the input (see "Data-dependent speedups"). `review` is the critic's verdict on
+what the row ran (`accept:static`, `unsure:static:output_cache`,
+`reject:model:fallback audit`, ...; see "Critic" under `kernel-agent improve`): advice,
+never part of the status. `worker` is the target's worker that evaluated a kernel
 candidate (empty without workers). `session` is the agent session that ran the evaluation
 (its label, the `costs.json` key such as `kernel-attn#7`; empty for the integration's
 steps), also in its `results.jsonl` record and `evaluation` event: each session's tools

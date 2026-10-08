@@ -156,6 +156,7 @@ REGISTRY: dict[str, RoleSpec] = {
         ),
         RoleSpec("librarian", "librarian", max_turns=8),
         RoleSpec("critic", max_turns=1, builtin_tools=READ_TOOLS, program=False),  # #174 PR 8
+        RoleSpec("critic-escalation", max_turns=1, builtin_tools=READ_TOOLS, program=False),
         RoleSpec("doc-lookup", "doc-lookup", helper=True, program=False),
         RoleSpec("profile-analyst", "profile-analyst", helper=True, program=False),
         RoleSpec("compile-triage", "compile-triage", helper=True, program=False),  # #186

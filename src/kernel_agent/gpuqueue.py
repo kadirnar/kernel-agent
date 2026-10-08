@@ -475,6 +475,18 @@ class Gate:
                     group.remove(job)
             self._notify()
 
+    def withdraw(self, job: Job) -> bool:
+        """Withdraw ``job`` if it has not taken a GPU yet (it waits, or is not queued yet):
+        it leaves the queue without running (:class:`Withdrawn`, the critic's reject,
+        ``critic.py``). False: it took one already (or held one and let it go)."""
+        with self.cond:
+            admitted = job in self.unplaced or any(job in g for g in self.holders.values())
+            if job.holds or admitted:
+                return False
+            job.withdraw()
+            self._notify()
+        return True
+
     def expected_wait(self, job_class: str) -> float:
         """Seconds a new job of ``job_class`` should wait: what the jobs on the GPUs have
         left and the jobs that would go before it, spread over the pool's GPUs."""

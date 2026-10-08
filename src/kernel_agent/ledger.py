@@ -35,7 +35,9 @@ Kernel rows carry the ``idea`` the agent tagged the candidate with (``idea_id`` 
 buggy attempt is not mistaken for a refuted idea, and the ``worker`` that produced them
 when the target has parallel workers (:mod:`kernel_agent.workers`; empty otherwise).
 Rows of an agent's evaluation carry its ``session`` (the session's label, as in
-``costs.json``: its rows, whatever ran beside it).
+``costs.json``: its rows, whatever ran beside it) and, under ``improve``, the critic's
+verdict on what it ran (``review``: ``accept:static``, ``reject:model:output_cache audit``,
+..., :mod:`kernel_agent.critic`; advice, never part of the classification).
 
 ``e2e`` rows carry the median speedup over the workload's diverse input set
 (``diverse_speedup``, :mod:`kernel_agent.workloads.diverse`) and ``flags``:
@@ -83,6 +85,7 @@ COLUMNS = (
     "queue_s",
     "diverse_speedup",
     "flags",
+    "review",
     "worker",
     "session",
     "idea",
@@ -421,13 +424,14 @@ def record_kernel(
     status: str | None = None,
     queue_s: float | None = None,
     session: str | None = None,
+    review: str | None = None,
 ) -> dict[str, Any]:
     """Classify a kernel evaluation against the target's running best and append it.
 
     ``status``: a status of :data:`UNMEASURED` instead of the classification;
     ``worker``: the target's worker that ran it (:mod:`kernel_agent.workers`); ``queue_s``:
     the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`); ``session``: the agent
-    session that ran it (its label)."""
+    session that ran it (its label); ``review``: the critic's verdict (``critic.cell``)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == target_id])
         row = append(
@@ -452,6 +456,7 @@ def record_kernel(
                 "hypothesis": hypothesis,
                 "worker": worker,
                 "session": session,
+                "review": review,
             },
         )
     tag: dict[str, Any] = {"worker": worker} if worker else {}
@@ -474,9 +479,11 @@ def record_e2e(
     when: float | None = None,
     queue_s: float | None = None,
     session: str | None = None,
+    review: str | None = None,
 ) -> dict[str, Any]:
     """Classify an end-to-end measurement (transform or integration step) and append it;
-    ``session``: the agent session that ran it (its label; none for the integration's)."""
+    ``session``: the agent session that ran it (its label; none for the integration's);
+    ``review``: the critic's verdict (``critic.cell``)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == E2E])
         status = classify(result, best, e2e=True)
@@ -504,6 +511,7 @@ def record_e2e(
                 "flags": diversity.flags(result),
                 "hypothesis": hypothesis,
                 "session": session,
+                "review": review,
             },
         )
     tag = {"session": session} if session else {}

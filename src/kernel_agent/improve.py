@@ -133,6 +133,10 @@ class ImproveConfig:
     stagger: bool = True
     # the blackboard (--board, board.py, issue #187): auto = with --agents N > 1, on, off
     board: str = "auto"
+    # the critic of every full evaluation (--critic, critic.py, issue #188): static checks
+    # (static), plus a cheap model's triage while a job waits --critic-wait s (model), off
+    critic: str = "static"
+    critic_wait: float = 30.0  # critic.MIN_WAIT_S
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -846,6 +850,17 @@ class Improver:
         if board.enabled(self.icfg.board, self.icfg.agents):  # the blackboard (board.py, #187)
             board.open_board(self.run)
         self.orch.observer.attach(self._live)  # improve.json: sessions and GPU, live (#184)
+        from kernel_agent import critic  # the critic of every full evaluation (#188)
+
+        critic.open_critic(
+            self.run,
+            self.icfg.critic,
+            agents=self.icfg.agents,
+            wait_s=self.icfg.critic_wait,
+            cfg=self.orch.cfg,
+            env=self.orch.env,
+            simulated=self.orch.simulated,
+        )
         try:
             reason = await self._loop()
             log(f"stopping: {reason}")
@@ -858,6 +873,7 @@ class Improver:
         finally:
             board.close(self.run)
             self.orch.observer.detach()
+            critic.close(self.run)
         ledger.event(self.run, "phase_done", phase="improve")
         return reason
 
@@ -1583,6 +1599,7 @@ def report_lines(run: RunDir) -> list[str]:
         *_budget_lines(finished),
         *_concurrency_lines(state),
         *board.report_lines(run),  # board.jsonl (#187)
+        *_critic_lines(run),  # critic.jsonl (#188)
         "",
         "| arm | precision | slices | evaluations | slices with a new best | best |",
         "|---|---|---|---|---|---|",
@@ -1648,6 +1665,12 @@ def _budget_lines(finished: dict[str, Any]) -> list[str]:
     left = float(used.get("unused_hours") or 0.0) * 60 >= 5.0  # more than a rounding error
     why = f"; unused because: {finished.get('reason')}" if left else ""
     return [f"* budget: {', '.join(parts)}{why}"]
+
+
+def _critic_lines(run: RunDir) -> list[str]:
+    from kernel_agent import critic  # the critic's verdicts and calibration (#188)
+
+    return critic.report_lines(run)
 
 
 def _concurrency_lines(state: dict[str, Any]) -> list[str]:

@@ -17,7 +17,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from kernel_agent import board, dashboard, dedup, gpuqueue, ledger, region, truth, workers
+from kernel_agent import board, critic, dashboard, dedup, gpuqueue, ledger, region, truth, workers
 from kernel_agent.budget import Budget
 from kernel_agent.kernels import sweep as sweep_mod
 from kernel_agent.kernels.evaluate import run_evaluation
@@ -351,6 +351,7 @@ def record_candidate(
     reevaluates: dict[str, Any] | None = None,
     queue_s: float | None = None,
     session: str | None = None,
+    review: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
 
@@ -365,6 +366,7 @@ def record_candidate(
     ``queue_s``: the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`; ``eval_s``
     is the evaluation's own time).
     ``session``: the agent session that evaluated it (:class:`SessionBinding` ``label``).
+    ``review``: the critic's verdict on it (``critic.cell``, issue #188).
     """
     target_dir = run.target(target_id)
     quick = mode == dedup.QUICK
@@ -385,6 +387,7 @@ def record_candidate(
         status=ledger.REEVALUATED if reevaluates else status,
         queue_s=queue_s,
         session=session,
+        review=review,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -407,6 +410,7 @@ def record_candidate(
         **({"mode": dedup.QUICK} if quick else {}),
         **({"reevaluates": reevaluates} if reevaluates else {}),
         **({"queue_s": queue_s} if queue_s is not None else {}),
+        **({"review": review} if review else {}),
     }
     if isinstance(record.get("error"), str):
         record["error"] = record["error"][-1500:]
@@ -472,11 +476,13 @@ def record_e2e_result(
     keeper: Truth | None = None,
     queue_s: float | None = None,
     session: str | None = None,
+    review: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append an ``evaluate_e2e`` measurement to the transforms' ``results.jsonl`` and the
     ledger; ``transforms_sha256`` holds the digests of the snapshots it measured; a run
     with a project bundle or a native stage target is the native arm's (``native/engine.py``);
-    ``session``: the agent session that ran it (:class:`SessionBinding` ``label``)."""
+    ``session``: the agent session that ran it (:class:`SessionBinding` ``label``);
+    ``review``: the critic's verdict on it (``critic.cell``, issue #188)."""
     row = ledger.record_e2e(
         run,
         result,
@@ -487,6 +493,7 @@ def record_e2e_result(
         when=when,
         queue_s=queue_s,
         session=session,
+        review=review,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -499,6 +506,7 @@ def record_e2e_result(
         "hypothesis": hypothesis,
         **({"queue_s": queue_s} if queue_s is not None else {}),
         **({"session": session} if session else {}),
+        **({"review": review} if review else {}),
     }
     _append(run, None, record, keeper)
     if row["status"] == ledger.KEEP:  # a new end-to-end best: on the board (#187)
@@ -555,6 +563,14 @@ def _uncounted(budget: Budget, agent: str, evals_budget: int | None) -> dict[str
     return {"budget": {"evals_used": used, "evals_budget": evals_budget, "counted": False}}
 
 
+def _source(path: Path) -> str:
+    """A candidate's source for the critic: a file's text, a project's bundle ("": none)."""
+    try:
+        return native_project.source_of(path)
+    except (native_project.ProjectError, OSError):
+        return ""
+
+
 def _prebuilt(path: Path) -> dict[str, Any] | None:
     """Compile a project candidate (directory or bundle) outside the GPU lock
     (``native_project.prebuild``): None when it built (or cannot be built without the
@@ -608,6 +624,40 @@ def build_server(
         if cwd is not None and not Path(path).is_absolute() and (cwd / path).exists():
             return cwd / path
         return _resolve(base, path)
+
+    async def _review(
+        kind: str,
+        texts: list[tuple[str, str, str]],
+        job: gpuqueue.Job,
+        args: dict[str, Any],
+        **kw: Any,
+    ) -> critic.Review | None:
+        """The critic's static review of what an evaluation would run (critic.py, #188;
+        None: the run has no critic)."""
+        found = critic.active(run)
+        if found is None:
+            return None
+        hypothesis = str(args.get("hypothesis") or "")
+        force = bool(args.get("force"))
+        return await asyncio.to_thread(
+            found.review,
+            kind,
+            texts,
+            session=session,
+            hypothesis=hypothesis,
+            force=force,
+            estimate_s=job.estimate_s,
+            **kw,
+        )
+
+    def _withdrawn(review: critic.Review | None, extra: dict[str, Any]) -> dict[str, Any]:
+        """The result of an evaluation the critic withdrew (no evaluation was used)."""
+        return _text(critic.withdrawn_result(review) | extra | _news())
+
+    def _parent(base: Path, parent: Any) -> Path | None:
+        """The file a candidate's ``parent`` names (None: none, or not a file)."""
+        path = _path(base, str(parent)) if parent else None
+        return path if path is not None and path.is_file() else None
 
     def _best_so_far(target_id: str) -> dict[str, Any]:
         best = best_for_target(run, target_id, keeper)
@@ -710,6 +760,12 @@ def build_server(
                     "the evaluation budget); full (default): every case, timed",
                     "default": dedup.FULL,
                 },
+                "force": {
+                    "type": "boolean",
+                    "description": "evaluate even when the critic rejects the candidate "
+                    "(it was withdrawn with status reviewed): use it when the critique is wrong",
+                    "default": False,
+                },
             },
             "required": ["target_id", "candidate", "hypothesis"],
         },
@@ -775,25 +831,49 @@ def build_server(
                     | _news()
                 )
         _inflight[slot] = done = asyncio.Event()
+        review: critic.Review | None = None
         try:
             snap = snapshot(run, src, target_id)
             snap_sha256 = sha256_file(snap)
             start = time.perf_counter()
             job = gpuqueue.Job.of(run, "quick" if quick else "eval", target_id)
+            if not quick:  # the critic (critic.py, #188): static checks now, a model's while
+                # the job queues (critic.during)
+                review = await _review(
+                    critic.KERNEL,
+                    [(src.name, source, critic.KERNEL)],
+                    job,
+                    args,
+                    target=target_id,
+                    candidate=args["candidate"],
+                    snapshot=f"history/{snap.name}",
+                    parent=_parent(target_dir, args.get("parent")),
+                    idea=idea,
+                )
+            if critic.blocks(review):  # a static reject: withdrawn before it is queued
+                uncounted = _uncounted(budget, name, evals_budget)
+                return _withdrawn(review, uncounted | _best_so_far(target_id))
             # a project compiles outside the GPU lock first: a compiler error is its result
             result = await asyncio.to_thread(_prebuilt, snap)
             if result is None:
-                result = await gpuqueue.run(
+                result = await critic.during(
+                    review,
                     job,
-                    run_evaluation,
-                    capture,
-                    snap,
-                    profile=bool(args.get("profile")) and not quick,
-                    timeout=budget.eval_timeout_s,
-                    capture_sha256=capture_sha256,
-                    **({"compile_check": True} if args.get("compile_check") else {}),
-                    **({"quick": True} if quick else {}),
+                    gpuqueue.run(
+                        job,
+                        run_evaluation,
+                        capture,
+                        snap,
+                        profile=bool(args.get("profile")) and not quick,
+                        timeout=budget.eval_timeout_s,
+                        capture_sha256=capture_sha256,
+                        **({"compile_check": True} if args.get("compile_check") else {}),
+                        **({"quick": True} if quick else {}),
+                    ),
                 )
+            if result is None:  # the critic withdrew it while it waited for the GPU
+                uncounted = _uncounted(budget, name, evals_budget)
+                return _withdrawn(review, uncounted | _best_so_far(target_id))
             if result.get("status") == "tampered":  # the evaluator refused the capture
                 keeper.alarm(capture, str(result.get("error")))
             elif sha256_file(snap) != snap_sha256:
@@ -820,13 +900,16 @@ def build_server(
                 mode=mode,
                 queue_s=job.queue_s,
                 session=session,
+                review=critic.cell(review),
             )
+            critic.outcome(review, row)  # the critic's label: what the evaluator said
         finally:
             _inflight.pop(slot, None)
             done.set()
         refresh(run, target_id)
         out = compact(result)
         out["ledger"] = {"exp": row["exp"], "status": row["status"]}
+        out |= critic.annotation(review)  # a reject or unsure verdict that ran anyway
         if str(args.get("profile")).lower() == "ncu" and not quick and result.get("correct"):
             from kernel_agent.kernels import ncu  # Nsight Compute (#10): not stored
 
@@ -1068,6 +1151,12 @@ def build_server(
                     "type": "string",
                     "description": "one sentence: what this combination tests",
                 },
+                "force": {
+                    "type": "boolean",
+                    "description": "evaluate even when the critic rejects it (it was "
+                    "withdrawn with status reviewed): use it when the critique is wrong",
+                    "default": False,
+                },
             },
         },
     )
@@ -1096,12 +1185,29 @@ def build_server(
             cli += ["--kernel", f"{target_id}={kernel}"]
         start = time.perf_counter()
         job = gpuqueue.Job.of(run, "e2e")
+        # the critic (critic.py, #188): static checks now, a model's while it queues
+        texts = [(f"transforms/{s.name}", _source(s), critic.E2E) for s in snaps]
+        named = zip(args.get("kernels") or [], kernels, strict=False)
+        texts += [(item, _source(path), critic.KERNEL) for item, path in named]
+        review = await _review(
+            critic.E2E,
+            texts,
+            job,
+            args,
+            candidate=" ".join([*(args.get("transforms") or []), *(args.get("kernels") or [])]),
+            snapshot=ledger.e2e_snapshot(snaps, args.get("kernels") or []),
+        )
+        if critic.blocks(review):  # a static reject: withdrawn before it is queued
+            return _withdrawn(review, {})
         result: dict[str, Any] | None = None
         for file in [*snaps, *kernels]:  # projects compile outside the GPU lock, first
             if result is None:
                 result = await asyncio.to_thread(_prebuilt, file)
         if result is None:
-            result = await gpuqueue.run(job, call_worker, run, "e2e", *cli, *keeper.worker_args())
+            evaluation = gpuqueue.run(job, call_worker, run, "e2e", *cli, *keeper.worker_args())
+            result = await critic.during(review, job, evaluation)
+            if result is None:  # the critic withdrew it while it waited for the GPU
+                return _withdrawn(review, {})
         _, row = record_e2e_result(
             run,
             result,
@@ -1112,9 +1218,12 @@ def build_server(
             keeper=keeper,
             queue_s=job.queue_s,
             session=session,
+            review=critic.cell(review),
         )
+        critic.outcome(review, row)  # the critic's label: what the evaluator said
         refresh(run)
         result["ledger"] = {"exp": row["exp"], "status": row["status"]}
+        result |= critic.annotation(review)  # a reject or unsure verdict that ran anyway
         if isinstance(result.get("error"), str):
             result["error"] = result["error"][-3000:]
         result |= budget.feedback(

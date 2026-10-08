@@ -1225,6 +1225,18 @@ tests), adds tests and is independently useful.
   `program.ROLES` adds `critic`.
 * **Risks**: false rejects lose good ideas (override, audit, auto-off); cost (only when a
   wait exceeds the threshold).
+* *Implemented in #188*: `improve --critic off|static|model` (default `static`). The static
+  checks (AST: fallback to the reference, broad except fallbacks, outputs cached by address
+  or shape, unjoined streams, threads, lazy subclasses, frame and `gc` reads, evaluator
+  imports and run files, patches, benchmark detection, writes outside the directory) run on
+  every full evaluation and withdraw a reject before it is queued. `model` (with `--agents`
+  above 1) asks the `critic` role (Haiku 4.5) about the static checks' `unsure` candidates
+  while their job waits at least `--critic-wait` s, escalating an unsure answer once to
+  `critic-escalation` (Sonnet 5.5); a reject at confidence ≥ 0.8 withdraws a job that has
+  not taken the GPU (`gpuqueue.Gate.withdraw`). Audit 10 %, auto-off below 60 % precision
+  over 5 labels, `critic.jsonl`, the ledger's `review` column, precision and recall in the
+  report. Not done: near-duplicates of failed snapshots and refuted ideas (PR 10 feeds
+  `ledger.ideas`' `refuted`), `review` posts on the board, the critic in the dry run.
 
 ### PR 9: islands
 
