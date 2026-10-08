@@ -75,21 +75,46 @@ between copies and mutable ones are copied outside the timed region.
 * `profile=true`: per-kernel GPU time tables for candidate and reference, and
   `compiler_stats` (registers, spills, shared memory of Triton, NVRTC and `load_inline`
   kernels) with a warning per spilling kernel.
+* The SASS census (`sass`, every `profile` evaluation, no GPU work): what each kernel was
+  compiled to. `tensor`: its tensor-core opcodes whole (`HMMA` / `IMMA` / `QMMA` / `OMMA`:
+  `mma.sync`; `QMMA.SF`: block-scaled; `HGMMA` / `QGMMA` / `IGMMA`: wgmma; `UTC*MMA`:
+  tcgen05); `categories`: global loads and stores, `cp_async` (`LDGSTS`), `tma`, `local`
+  (`LDL` / `STL`: spills or a run-time indexed array), shared memory, tensor memory,
+  barriers, shuffles, atomics, fp32 / fp16 math; `global_load_bits`: load widths. Counts
+  are static (instructions in the binary). `F2FP...E4M3.UNPACK` feeding `HMMA` is e4m3
+  `mma.sync` emulated through fp16 (sm_90, sm_100). Compare the tensor-core opcode with
+  this GPU's full-rate path (the toolchain block's measured rates, `gpu-architectures`):
+  on sm_120 `tl.dot` on e4m3 issues `QMMA.16832.F32` at half the rate of the
+  `QMMA.SF` that `tl.dot_scaled` issues. `missing`: kernels that ran without SASS here
+  (library kernels; an NVRTC kernel whose `ObjectCode` was freed: keep the result of
+  `Program(...).compile("cubin")` in a module global to include it).
 * `profile="ncu"`: Nsight Compute on the most-called case, 24 curated metrics (SM and
   memory throughput, DRAM bytes, L1 / L2 hit rates, achieved and theoretical occupancy,
   tensor-pipe activity, registers, shared memory, grid, block, waves, top warp stalls);
   each kernel classed *memory*, *compute* or *under-utilised* (both below 60 % of peak).
   ncu runs per launch with flushed caches at base clocks: compare kernels with each other,
   not with the evaluator's timings. `ncu.status: unavailable` says why and how to fix it.
+  Then `rules`: Nsight's 3 rules with the largest estimated speedup (global: share of the
+  kernel's time; local: a unit's efficiency), `lines`: the 5 source lines (SASS
+  instructions without `-lineinfo`) with most warp-stall samples, their share and
+  dominant stall (`stall_long_sb`: waiting on global memory; `stall_math`: a pipe is
+  saturated; `stall_barrier`; ...), `flagged`: uncoalesced or bank-conflicting lines.
+* `directives` (at most 5, in the summary): what the documented rules of
+  `kernel_agent.kernels.directives` conclude from all of the above, each with its numbers
+  (spills, emulated FP8, an instruction below the full rate, missing tensor cores, an
+  idle tensor pipe, the hottest stall line, uncoalesced lines, narrow loads, Nsight's top rule, register-staged
+  MMA operands). A directive is a hypothesis: test it, or say which number contradicts it.
 * In a kernel-agent session both write the full tables to `profiles/<snapshot>.json` in
   your working directory; the result keeps `profile`: the top kernels of candidate and
-  reference with their share of GPU time, the spill warnings, the top ncu kernels' bounds
-  and the file's path. Read the file for a detail, or hand the path and your question to
-  the `profile-analyst` helper.
+  reference with their share of GPU time, the spill warnings, the top ncu kernels' bounds,
+  one census line per top kernel, the directives and the file's path. Read the file for a
+  detail (the census per kernel, the directives' evidence), or hand the path and your
+  question to the `profile-analyst` helper.
 
 ## Examples and sources
 
 * Code: `kernel_agent.kernels.roofline`, `kernel_agent.kernels.ncu`,
+  `kernel_agent.kernels.sass`, `kernel_agent.kernels.directives`,
   `kernel_agent.profiling.ceilings` (`python -m kernel_agent.profiling.ceilings
   profile.json --baseline-ms <ms>` prints the table of any profile),
   `kernel_agent.profiling.timeline`, `kernel_agent.profiling.host_sync`.

@@ -284,6 +284,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "streams",  # declared side streams (kernel_agent.concurrency)
             "undeclared_streams",
             "compiler_stats",  # registers, spills (kernels/ncu.py)
+            "sass",  # the opcode census (kernels/sass.py, #230)
             "eval_seconds",
             "compile_s",
             "compile_check",  # torch.compile compatibility (kernels/compile_check.py)
@@ -340,7 +341,14 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
 
 #: An evaluation's profile tables (``profile=true`` / ``"ncu"``): they go to the session's
 #: ``profiles/<snapshot>.json`` and the result keeps a summary (:func:`profile_file`, #186).
-PROFILE_KEYS = ("kernels_candidate", "kernels_reference", "compiler_stats", "profile_error", "ncu")
+PROFILE_KEYS = (
+    "kernels_candidate",
+    "kernels_reference",
+    "compiler_stats",
+    "profile_error",
+    "ncu",
+    "sass",  # the SASS opcode census (kernels/sass.py, #230)
+)
 PROFILES_DIR = "profiles"
 PROFILE_TOP = 3  # kernels per side, spill warnings and ncu kernels in the summary
 
@@ -380,6 +388,20 @@ def profile_summary(tables: dict[str, Any]) -> dict[str, Any]:
         ]
     elif isinstance(ncu, dict):
         out["ncu"] = {"status": ncu.get("status"), "reason": ncu.get("reason")}
+    census = tables.get("sass")  # the opcodes of the top kernels, the directives (#230)
+    if isinstance(census, dict) and census.get("status") == "ok":
+        from kernel_agent.kernels.sass import line
+
+        out["sass"] = [line(k) for k in (census.get("kernels") or [])[:PROFILE_TOP]]
+        if missing := census.get("missing"):  # ran without SASS here: why
+            names = ", ".join(str(n)[:60] for n in missing[:2])
+            out["sass"].append(f"no SASS for {names}: {census.get('note')}"[:400])
+    elif isinstance(census, dict):
+        out["sass"] = {"status": census.get("status"), "reason": census.get("reason")}
+    if found := tables.get("directives"):
+        from kernel_agent.kernels.directives import texts
+
+        out["directives"] = texts(found)
     return out
 
 
@@ -393,6 +415,13 @@ def profile_file(directory: Path, snap: Path, out: dict[str, Any], result: dict[
     tables = {k: v for k, v in tables.items() if v}
     if not tables:
         return
+    try:  # what to change, each with its numbers (kernels/directives.py, #230)
+        from kernel_agent.kernels.directives import build
+
+        if found := build(tables, result):
+            tables["directives"] = found
+    except Exception as exc:  # never costs the evaluation its result
+        tables["directives_error"] = f"{type(exc).__name__}: {exc}"[:300]
     path = directory / PROFILES_DIR / f"{Path(snap.name).stem}.json"
     try:
         write_json(path, {"snapshot": snap.name, **tables})
@@ -403,7 +432,8 @@ def profile_file(directory: Path, snap: Path, out: dict[str, Any], result: dict[
     out["profile"] = profile_summary(tables) | {
         "file": str(path),
         "note": "the full tables (per-kernel GPU time of candidate and reference, compiler "
-        "stats, ncu metrics) are in the file: Read it, or give the path to profile-analyst",
+        "stats, SASS opcode census, ncu metrics, rules and stall lines, the directives' "
+        "evidence) are in the file: Read it, or give the path to profile-analyst",
     }
 
 
@@ -475,7 +505,12 @@ def record_candidate(
         else str(src),
         "snapshot": f"history/{snap.name}",
         "snapshot_sha256": snapshot_sha256 or sha256_file(snap),
-        **{k: v for k, v in result.items() if k not in ("kernels_candidate", "kernels_reference")},
+        # the per-kernel tables and the SASS census go to profiles/<snapshot>.json only
+        **{
+            k: v
+            for k, v in result.items()
+            if k not in ("kernels_candidate", "kernels_reference", "sass")
+        },
         "exp": row["exp"],
         "ledger_status": row["status"],
         "backend": row["backend"],
@@ -882,12 +917,16 @@ def build_server(
                 "profile": {
                     "type": ["boolean", "string"],
                     "enum": [False, True, "ncu"],
-                    "description": "true: per-kernel GPU time tables and compiler stats "
-                    '(registers, spills); "ncu": also Nsight Compute metrics per candidate '
-                    "kernel (SM / memory throughput, occupancy, cache hit rates, warp stalls, "
-                    "memory / compute / under-utilised), when ncu can profile on this machine. "
-                    "The tables go to profiles/<snapshot>.json in your working directory; the "
-                    "result has a summary and the file's path (`profile`)",
+                    "description": "true: per-kernel GPU time tables, compiler stats "
+                    "(registers, spills) and the SASS opcode census (which tensor-core, load "
+                    'and local-memory instructions each kernel issues); "ncu": also Nsight '
+                    "Compute metrics per candidate kernel (SM / memory throughput, occupancy, "
+                    "cache hit rates, warp stalls, memory / compute / under-utilised), its "
+                    "rules with estimated speedups and the source lines with most stall "
+                    "samples, when ncu can profile on this machine. The tables go to "
+                    "profiles/<snapshot>.json in your working directory; the result has a "
+                    "summary with up to 5 directives (each with its numbers) and the file's "
+                    "path (`profile`)",
                     "default": False,
                 },
                 "compile_check": {

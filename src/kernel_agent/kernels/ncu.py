@@ -25,6 +25,17 @@ metrics and the full report; KernelAgent: a SOL roofline classifier):
   compiled kernels), its NVRTC kernels (``cuda.core`` kernel attributes) and its
   ``load_inline`` extensions (``cuobjdump --dump-resource-usage``, the ``ptxas -v``
   numbers of the cubins inside); spills are the first thing to fix.
+* :func:`profile_details` (#230, after the metrics, same lock): a second ncu run with the
+  :data:`SECTIONS` exported to a report, read back twice: ``--page details``
+  (:func:`parse_details`: Nsight's rules with their estimated speedup, :func:`top_rules`
+  the :data:`TOP_RULES` largest) and ``--page source --print-source cuda,sass``
+  (:func:`parse_source`: warp-stall samples per CUDA / Python source line, per SASS
+  instruction without ``-lineinfo``; :func:`top_lines` the :data:`TOP_LINES` lines with
+  most samples and their dominant stall, :func:`flagged_lines` those with uncoalesced
+  global accesses or shared-memory bank conflicts). Triton kernels carry line info;
+  CUDA C++ needs ``-lineinfo`` (``extra_cuda_cflags``, NVRTC ``ProgramOptions(line_info=
+  True)``) for source lines. A failure there leaves the metrics as they are
+  (``details: {"status": "error", ...}``).
 
 Times under ncu are per launch with caches flushed and clocks locked to base (ncu's
 defaults): compare kernels with each other, not with the evaluator's timings.
@@ -428,6 +439,15 @@ def profile_candidate(
                 metrics = [m for m in metrics if m not in bad]
             else:
                 return {"status": "error", "reason": "ncu rejected the metrics", "dropped": dropped}
+            details = profile_details(
+                found["ncu"],
+                capture,
+                candidate,
+                workdir,
+                capture_sha256=capture_sha256,
+                timeout=timeout,
+                run=run,
+            )
     except Exception as exc:  # OSError, a broken lock, ...
         return {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:500]}
     finally:
@@ -439,10 +459,361 @@ def profile_candidate(
         "launches": len(launches),
         "kernels": found_kernels[:8],
         **({"dropped_metrics": dropped} if dropped else {}),
+        **details,
         "note": "per launch under ncu (caches flushed, base clocks): compare kernels with "
         "each other; bound = the larger of SM and memory throughput, under-utilised when "
         f"both are below {UNDER_UTILISED_PCT:.0f} % of peak",
     }
+
+
+# ------------------------------------------------------------------ rules and source lines
+
+#: Sections of the details run: the throughputs, stalls and occupancy its rules read, and
+#: the source counters (warp-stall samples per instruction, memory access efficiency).
+SECTIONS = (
+    "SpeedOfLight",
+    "ComputeWorkloadAnalysis",
+    "MemoryWorkloadAnalysis",
+    "SchedulerStats",
+    "WarpStateStats",
+    "Occupancy",
+    "LaunchStats",
+    "SourceCounters",
+)
+DETAILS_LAUNCHES = 8  # kernel launches the details run profiles (one candidate call)
+TOP_RULES = 3
+TOP_LINES = 5
+#: The source counters' stall columns in words (``stall_selected``, a warp issuing, is no
+#: stall and never a line's reason).
+SOURCE_STALLS = {
+    "stall_long_sb": "waiting on global / local memory (long scoreboard)",
+    "stall_short_sb": "waiting on shared memory or MUFU (short scoreboard)",
+    "stall_wait": "fixed-latency dependency (too little ILP)",
+    "stall_mio": "shared-memory / special-instruction queue full",
+    "stall_lg": "global-memory instruction queue full (too many small loads)",
+    "stall_math": "a math pipe is saturated",
+    "stall_barrier": "waiting at a barrier",
+    "stall_membar": "waiting at a memory barrier",
+    "stall_branch_resolving": "resolving a branch",
+    "stall_dispatch": "dispatch stall",
+    "stall_drain": "draining stores at exit",
+    "stall_no_inst": "instruction cache miss",
+    "stall_not_selected": "eligible, another warp issued",
+    "stall_sleep": "sleeping",
+    "stall_tex": "texture queue full",
+    "stall_imc": "constant cache miss",
+    "stall_misc": "miscellaneous",
+}
+_SAMPLES = "Warp Stall Sampling (All Samples)"
+
+
+def details_command(
+    ncu: str,
+    capture: Path,
+    candidate: Path,
+    report: Path,
+    log: Path,
+    *,
+    capture_sha256: str | None = None,
+    calls: int = 1,
+) -> list[str]:
+    """The ncu command line of the details run: :data:`SECTIONS` over one candidate call,
+    exported to ``report`` (read back by :func:`import_command`)."""
+    cmd = [ncu]
+    for section in SECTIONS:
+        cmd += ["--section", section]
+    cmd += [
+        "--replay-mode",
+        "kernel",
+        "--target-processes",
+        "all",
+        "--nvtx",
+        "--nvtx-include",
+        f"{NVTX_RANGE}/",
+        "--launch-count",
+        str(DETAILS_LAUNCHES),
+        "--export",
+        str(report),
+        "--force-overwrite",
+        "--log-file",
+        str(log),
+        sys.executable,
+        "-m",
+        "kernel_agent.kernels.evaluate",
+        str(capture),
+        str(candidate),
+        "--ncu-mode",
+        "--ncu-calls",
+        str(calls),
+    ]
+    if capture_sha256:
+        cmd += ["--capture-sha256", capture_sha256]
+    return cmd
+
+
+def import_command(ncu: str, report: Path, page: str, source: str | None = None) -> list[str]:
+    """``ncu --import report --csv --page <page>`` (``source``: ``--print-source``)."""
+    cmd = [ncu, "--import", str(report), "--csv", "--page", page]
+    return [*cmd, "--print-source", source] if source else cmd
+
+
+def _rows(text: str, first: str) -> list[list[str]]:
+    """The CSV rows of ``text`` from the first line starting with ``first`` (ncu's log
+    lines before it are skipped)."""
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith(first)), None)
+    return [] if start is None else list(csv.reader(io.StringIO("\n".join(lines[start:]))))
+
+
+def parse_details(text: str) -> list[dict[str, Any]]:
+    """The rule results of an ``ncu --csv --page details`` report (rows with a ``Rule
+    Name``): ``[{"id", "kernel", "section", "rule", "type", "speedup_type", "speedup_pct",
+    "description"}]``; ``speedup_pct`` is None for a rule without an estimate."""
+    rows = _rows(text, '"ID"')
+    if not rows:
+        return []
+    header = rows[0]
+    out = []
+    for row in rows[1:]:
+        if len(row) != len(header):
+            continue
+        record = dict(zip(header, row, strict=True))
+        if not record.get("Rule Name"):
+            continue
+        speedup = _number(record.get("Estimated Speedup") or "")
+        out.append(
+            {
+                "id": int(_number(record.get("ID") or "0") or 0),
+                "kernel": record.get("Kernel Name", ""),
+                "section": record.get("Section Name", ""),
+                "rule": record["Rule Name"],
+                "type": record.get("Rule Type", ""),
+                "speedup_type": record.get("Estimated Speedup Type", ""),
+                "speedup_pct": speedup if isinstance(speedup, float) else None,
+                "description": record.get("Rule Description", ""),
+            }
+        )
+    return out
+
+
+def _sentence(text: str, limit: int = 240) -> str:
+    """The first sentence of ``text`` (at most ``limit`` characters)."""
+    first = re.split(r"(?<=[.!?])\s", text.strip(), maxsplit=1)[0]
+    return first if len(first) <= limit else first[: limit - 3] + "..."
+
+
+def top_rules(rules: Iterable[Mapping[str, Any]], n: int = TOP_RULES) -> list[dict[str, Any]]:
+    """The ``n`` rules with the largest estimated speedup (one per kernel and rule, the
+    largest over its launches; global estimates, a share of the kernel's run time, before
+    local ones, a hardware unit's efficiency)."""
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for rule in rules:
+        speedup = rule.get("speedup_pct")
+        if not isinstance(speedup, float) or speedup <= 0 or rule.get("type") == "INF":
+            continue
+        key = (str(rule.get("kernel")), str(rule.get("rule")))
+        if key not in best or speedup > best[key]["speedup_pct"]:
+            best[key] = {
+                "kernel": str(rule.get("kernel"))[:120],
+                "rule": rule.get("rule"),
+                "section": rule.get("section"),
+                "speedup_type": rule.get("speedup_type") or "",
+                "speedup_pct": round(speedup, 1),
+                "description": _sentence(str(rule.get("description") or "")),
+            }
+    ranked = sorted(best.values(), key=lambda r: (r["speedup_type"] != "global", -r["speedup_pct"]))
+    return ranked[:n]
+
+
+def _int(raw: str | None) -> int:
+    value = _number(raw or "")
+    return int(value) if isinstance(value, float) else 0
+
+
+def parse_source(text: str) -> list[dict[str, Any]]:
+    """The rows of an ``ncu --csv --page source`` report (``--print-source cuda,sass`` or
+    ``sass``): ``[{"kernel", "file", "line", "address", "source", "samples", "stalls",
+    "sectors", "excessive_sectors", "shared_excessive", "shared_n_way"}]``. A CUDA / Python
+    source row has ``line`` (its SASS rows' totals), a SASS row ``address``; the ``...`` /
+    ``-`` filler rows are left out."""
+    out: list[dict[str, Any]] = []
+    kernel = file = ""
+    header: list[str] | None = None
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) >= 2 and row[0] in ("Kernel Name", "Function Name"):
+            kernel, header = row[1], None
+            continue
+        if len(row) >= 2 and row[0] == "File Path":
+            file, header = row[1], None
+            continue
+        if row and row[0] in ("Line No", "Address", "# Address", "# Line"):
+            header = row
+            continue
+        if header is None or len(row) != len(header):
+            continue
+        cells = list(zip(header, row, strict=True))
+        sources = [v for h, v in cells if h == "Source"]
+        record = dict(cells)
+        line = record.get("Line No") or record.get("# Line") or ""
+        address = record.get("Address") or record.get("# Address") or ""
+        is_line = line.strip().isdigit()
+        if not is_line and not address.strip().startswith("0x"):
+            continue
+        stalls = {
+            h: n for h, v in cells if h.startswith("stall_") and "(" not in h and (n := _int(v)) > 0
+        }
+        n_way = _number(record.get("L1 Conflicts Shared N-Way") or "")
+        out.append(
+            {
+                "kernel": kernel,
+                "file": file,
+                "line": int(line) if is_line else None,
+                "address": None if is_line else address.strip(),
+                "source": (sources[0] if is_line or len(sources) < 2 else sources[1]).strip(),
+                "samples": _int(record.get(_SAMPLES)),
+                "stalls": stalls,
+                "sectors": _int(record.get("L2 Theoretical Sectors Global")),
+                "excessive_sectors": _int(record.get("L2 Theoretical Sectors Global Excessive")),
+                "shared_excessive": _int(record.get("L1 Wavefronts Shared Excessive")),
+                "shared_n_way": n_way if isinstance(n_way, float) else None,
+            }
+        )
+    return out
+
+
+def _where(row: Mapping[str, Any]) -> str:
+    if row.get("line") is not None:
+        return f"{Path(str(row.get('file') or '?')).name}:{row['line']}"
+    return f"SASS {row.get('address')}"
+
+
+def _flags(row: Mapping[str, Any]) -> list[str]:
+    flags = []
+    if row.get("excessive_sectors"):
+        flags.append(
+            f"uncoalesced global access ({row['excessive_sectors']} of {row.get('sectors')} "
+            "L2 sectors excessive)"
+        )
+    n_way = row.get("shared_n_way")
+    if row.get("shared_excessive") or (isinstance(n_way, float) and n_way > 1.0):
+        flags.append(
+            "shared-memory bank conflicts"
+            + (f" ({n_way:g}-way)" if isinstance(n_way, float) and n_way > 1 else "")
+        )
+    return flags
+
+
+def _line_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per kernel, its source-line rows when it has any (``-lineinfo``), else its SASS
+    rows."""
+    by_kernel: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_kernel.setdefault(row["kernel"], []).append(row)
+    out = []
+    for kernel_rows in by_kernel.values():
+        lines = [r for r in kernel_rows if r["line"] is not None]
+        out += lines or kernel_rows
+    return out
+
+
+def top_lines(rows: list[dict[str, Any]], n: int = TOP_LINES) -> list[dict[str, Any]]:
+    """The ``n`` source lines (SASS instructions without line info) with the most warp-stall
+    samples: where, the source text, the samples and their share of the kernel's, the
+    dominant stall and its share of the line's samples, and the line's flags."""
+    picked = _line_rows(rows)
+    totals: dict[str, int] = {}
+    for row in picked:
+        totals[row["kernel"]] = totals.get(row["kernel"], 0) + int(row["samples"])
+    out = []
+    for row in sorted(picked, key=lambda r: -int(r["samples"]))[:n]:
+        if not row["samples"]:
+            break
+        stalls = {k: v for k, v in row["stalls"].items() if k != "stall_selected"}
+        reason, count = max(stalls.items(), key=lambda kv: kv[1], default=("", 0))
+        item: dict[str, Any] = {
+            "kernel": str(row["kernel"])[:120],
+            "where": _where(row),
+            "source": str(row["source"])[:160],
+            "samples": row["samples"],
+            "share_pct": round(100.0 * row["samples"] / max(totals[row["kernel"]], 1), 1),
+        }
+        if reason:
+            item["stall"] = reason
+            item["stall_pct"] = round(100.0 * count / max(int(row["samples"]), 1), 1)
+            item["why"] = SOURCE_STALLS.get(reason, reason)
+        if flags := _flags(row):
+            item["flags"] = flags
+        out.append(item)
+    return out
+
+
+def flagged_lines(rows: list[dict[str, Any]], n: int = TOP_RULES) -> list[dict[str, Any]]:
+    """The ``n`` lines Nsight flags (uncoalesced global accesses, shared-memory bank
+    conflicts), most excessive sectors first."""
+    flagged = [r for r in _line_rows(rows) if _flags(r)]
+    flagged.sort(key=lambda r: (-int(r["excessive_sectors"]), -int(r["shared_excessive"])))
+    return [
+        {
+            "kernel": str(r["kernel"])[:120],
+            "where": _where(r),
+            "source": str(r["source"])[:160],
+            "flags": _flags(r),
+        }
+        for r in flagged[:n]
+    ]
+
+
+def profile_details(
+    ncu: str,
+    capture: Path,
+    candidate: Path,
+    workdir: Path,
+    *,
+    capture_sha256: str | None = None,
+    timeout: float = TIMEOUT_S,
+    run: Any = subprocess.run,
+) -> dict[str, Any]:
+    """The details run (module docstring; the caller holds the GPU lock): ``{"rules",
+    "lines", "flagged"}``, or ``{"details": {"status": "error", "reason"}}``. Never
+    raises."""
+    from kernel_agent.gpulock import child_env
+
+    report = workdir / "details.ncu-rep"
+    log = workdir / "details.log"
+    try:
+        cmd = details_command(ncu, capture, candidate, report, log, capture_sha256=capture_sha256)
+        proc = run(cmd, capture_output=True, text=True, timeout=timeout, env=child_env())
+        if not report.exists():
+            said = log.read_text(errors="replace") if log.exists() else ""
+            said = "\n".join((said, proc.stdout or "", proc.stderr or "")).strip()
+            reason = f"ncu exited {proc.returncode} without a report: {said[-800:]}"
+            return {"details": {"status": "error", "reason": reason}}
+        out: dict[str, Any] = {}
+        page = run(
+            import_command(ncu, report, "details"),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        out["rules"] = top_rules(parse_details(page.stdout or ""))
+        rows: list[dict[str, Any]] = []
+        for view in ("cuda,sass", "sass"):  # source lines need -lineinfo; else SASS rows
+            page = run(
+                import_command(ncu, report, "source", view),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            rows = parse_source(page.stdout or "")
+            if rows:
+                break
+        out["lines"] = top_lines(rows)
+        out["flagged"] = flagged_lines(rows)
+        return out
+    except subprocess.TimeoutExpired:
+        return {"details": {"status": "error", "reason": f"ncu exceeded {timeout:.0f} s"}}
+    except Exception as exc:
+        return {"details": {"status": "error", "reason": f"{type(exc).__name__}: {exc}"[:300]}}
 
 
 def ncu_entry(
@@ -633,15 +1004,19 @@ def cuobjdump() -> str | None:
 
 def extension_files() -> list[Path]:
     """Shared libraries of the loaded ``torch.utils.cpp_extension`` builds (``load_inline``:
-    under ``TORCH_EXTENSIONS_DIR`` or a ``torch_extensions`` cache directory)."""
+    under ``TORCH_EXTENSIONS_DIR`` or a ``torch_extensions`` cache directory). ``load_inline``
+    does not register its module in ``sys.modules``: the libraries mapped into the process
+    (Linux ``/proc/self/maps``) are read too (#230)."""
     root = os.environ.get("TORCH_EXTENSIONS_DIR")
-    out = []
-    for module in list(sys.modules.values()):
-        path = str(getattr(module, "__file__", "") or "")
-        if path.endswith(".so") and (
-            "torch_extensions" in path or (root and path.startswith(root))
-        ):
-            out.append(Path(path))
+    paths = [str(getattr(m, "__file__", "") or "") for m in list(sys.modules.values())]
+    with contextlib.suppress(OSError):
+        maps = Path("/proc/self/maps").read_text().splitlines()
+        paths += [p[5].strip() for line in maps if len(p := line.split(maxsplit=5)) == 6]
+    out = [
+        Path(path)
+        for path in paths
+        if path.endswith(".so") and ("torch_extensions" in path or (root and path.startswith(root)))
+    ]
     return sorted(set(out))
 
 

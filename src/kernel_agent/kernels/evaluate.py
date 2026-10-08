@@ -1016,6 +1016,10 @@ def _stages(
 
         if stats := compiler_stats(module, candidate):
             result["compiler_stats"] = stats
+        from kernel_agent.kernels import sass  # the opcodes it issues (no GPU work, #230)
+
+        profiled = [str(r.get("kernel")) for r in result.get("kernels_candidate") or []]
+        result["sass"] = sass.census(module, candidate, ran=profiled, gpu=sass.gpu_facts())
     if not _intact(result, guard, candidate_path, "at the end"):
         return result
     result["eval_seconds"] = round(time.perf_counter() - t0, 1)

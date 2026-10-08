@@ -44,7 +44,9 @@ them with a warm cache.
    (`split-K=4, RED epilogue`): it names the experiment in the ledger, the charts and
    `kernel-agent exp`; the `hypothesis` says why it should be faster.
 3. Then optimise with evidence: run `evaluate_candidate` with `profile=true`
-   to see which kernels remain and how long each takes.
+   to see which kernels remain and how long each takes, which instructions they
+   issue (the SASS census) and the directives (each with its numbers: test the
+   one that names the largest share first, or say why its numbers do not hold).
 4. Cover every captured case (prefill AND decode shapes). Specialise per shape
    inside `forward` if needed (e.g. GEMV path for M ≤ 16, tensor-core path for
    larger M). Fall back to the reference math for shapes you do not handle.
