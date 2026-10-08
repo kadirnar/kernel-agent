@@ -300,7 +300,8 @@ def write_dashboard(run: RunDir) -> Path:
     )
     sections = [
         '<section><h2>Progress</h2><div class="stack">'
-        + _img(run.root / "progress.png", "run progress")
+        + _img(run.root / "progress.png", "progress over experiment number")
+        + _img(run.root / "timeline.png", "end-to-end latency over wall-clock time")
         + _img(run.root / "amdahl.png", "time split before and after")
         + _img(run.root / "integration.png", "integration waterfall")
         + "</div></section>",

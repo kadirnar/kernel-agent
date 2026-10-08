@@ -44,6 +44,12 @@ def test_state(run):
     transform = next(r for r in rows if r["backend"] == "transform")
     assert transform["file"].startswith("transforms/history/")
     assert all(r["file"] is None for r in rows if r["backend"] == "integrate")
+    # the end-to-end chart's points over experiment number (#223): each carries its exp and
+    # its kind (the integration's probes are left out of the line)
+    e2e = [r for r in rows if r["target"] == ledger.E2E]
+    assert [r["exp"] for r in e2e] == sorted(r["exp"] for r in e2e) and e2e[0]["exp"] > 0
+    assert {r["kind"] for r in e2e} == {ledger.E2E, ledger.INTEGRATION, ledger.PROBE}
+    assert sum(r["kind"] == ledger.PROBE for r in e2e) == len(SINGLES)
 
     header = s["run"]
     assert header["repo_id"] == "Qwen/Qwen3-0.6B" and header["modality"] == "llm"
@@ -349,3 +355,16 @@ def test_page_draws_progress_as_lines():
     for line in ('class: "each-line"', 'key("each"', 'key("failtick"', "failTick("):
         assert line in script, line
     assert "svg .each-line" in page and "svg .fail-tick" in page
+
+
+def test_page_e2e_chart_toggles_experiment_number_and_time():
+    """The end-to-end chart draws the same rows over experiment number (the default) or
+    wall-clock time; the integration's probes stay out of its line (#223)."""
+    page = watch.PAGE.read_text()
+    assert 'data-axis="exp" aria-pressed="true"' in page
+    assert 'data-axis="time" aria-pressed="false"' in page
+    script = page.split('<script nonce="__NONCE__">', 1)[1]
+    assert 'axis: "exp"' in script and 'const byExp = ui.axis === "exp"' in script
+    assert "const xOf = byExp ? (r) => r.exp : (r) => minutesOf(r.ts)" in script
+    assert 'if (r.kind === "probe") probes += 1' in script
+    assert '$("e2e-axis").addEventListener("click"' in script

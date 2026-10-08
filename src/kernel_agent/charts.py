@@ -1,13 +1,19 @@
 """Progress charts of a run (matplotlib, optional extra ``viz``).
 
-* ``targets/<id>/progress.png``: module speedup per evaluation. Kept candidates
-  (green, annotated with their hypothesis), discarded ones (grey), failures (red ×
-  on the floor), the running best and the 1.0× reference.
-* ``progress.png``: end-to-end latency over wall-clock time. The projection from
-  the best kernels (baseline − Σ est. saved ms, nested targets counted once:
-  :mod:`kernel_agent.projection`) as a step line that stops where the savings exceed
-  the baseline (not projectable), measured end-to-end runs (transforms, integration)
-  as diamonds, baseline lines.
+* ``targets/<id>/progress.png``: module speedup per evaluation. The running best, kept
+  candidates labelled with their experiment number and title, a thin line through every
+  evaluation, failures as ticks on the axis and the 1.0× reference.
+* ``progress.png``: the run's experiments over experiment number (the ledger's ``exp``,
+  issue #223), measured values only. The model panel: the running best of the metric
+  through every kept end-to-end result (each labelled), a thin line through every correct
+  end-to-end and integration experiment (the integration's probes left out), failures as
+  ticks, the baseline and ``torch.compile`` lines. The kernel panel: each target's running
+  best module speedup. Phases as bands over their experiments, re-integrations as dashed
+  lines (:func:`run_progress`).
+* ``timeline.png``: end-to-end latency over wall-clock time: where the hours went. The
+  projection from the best kernels (baseline − Σ est. saved ms, nested targets counted
+  once: :mod:`kernel_agent.projection`) as a step line that stops where the savings
+  exceed the baseline (not projectable), the measured end-to-end runs, baseline lines.
 * ``amdahl.png``: the baseline time split by target class share (from the
   profile), before and after the best per-target speedups, plus "other". Nested
   targets count once: the set the projection counts is drawn, the targets inside
@@ -30,7 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, objective, projection
+from kernel_agent import experiments, ledger, objective, projection
+from kernel_agent.budget import Standing
 from kernel_agent.ledger import DISCARD, E2E, FAILURES, KEEP
 from kernel_agent.workspace import RunDir, read_json
 
@@ -66,6 +73,9 @@ WORKER_STYLES: tuple[Any, ...] = (
 )
 BEST_LW = 2.4  # the running best: the improvement as one prominent line
 EACH_LW = 1.1  # every evaluation: a thin, light line through its results
+TARGET_LW = 1.8  # a target's running best in progress.png's kernel panel
+LOG_RATIO = 3.0  # progress.png: a log metric axis from baseline / best this large on
+MARGIN = 0.15  # progress.png: the frame beyond the best and the baseline, of the gain
 
 _RC: dict[Any, Any] = {  # matplotlib types its rc keys as literals
     "font.family": "DejaVu Sans",
@@ -118,7 +128,8 @@ def write_charts(run: RunDir, targets: Iterable[str] | None = None) -> list[Path
     rows = ledger.rows(run)
     ids = run.target_ids() if targets is None else list(targets)
     paths = [target_progress(run, t, rows) for t in ids]
-    paths += [run_progress(run, rows), amdahl(run, rows), integration(run)]
+    paths += [run_progress(run, rows), run_timeline(run, rows), amdahl(run, rows)]
+    paths.append(integration(run))
     return [p for p in paths if p is not None]
 
 
@@ -236,26 +247,46 @@ def _overlap(a: list[tuple[float, float]], b: list[tuple[float, float]], pad: fl
     return True
 
 
+#: Where :func:`_place_labels` tries a point's label, in order: ``(full label?, angle, dx,
+#: dy, ha)`` (offsets in points): the full label rotated up and to the right, else the
+#: short one up-left or below-right.
+LABEL_OPTIONS: tuple[tuple[bool, float, float, float, str], ...] = (
+    (True, 28.0, 5, 7, "left"),
+    (False, 0.0, -6, 5, "right"),
+    (False, 0.0, 6, -16, "left"),
+)
+#: :data:`LABEL_OPTIONS` of a running best that steps down (lower is better): the full label
+#: rotated, else level along the step it sets, else under the stairs ending left of the
+#: drop (a line lower when that line is taken; no result is ever there: each one is at
+#: least the best so far), else the short one there or as :data:`LABEL_OPTIONS`.
+STAIRS_LABEL_OPTIONS: tuple[tuple[bool, float, float, float, str], ...] = (
+    (True, 28.0, 5, 7, "left"),
+    (True, 0.0, 6, 7, "left"),
+    (True, 0.0, -6, -14, "right"),
+    (True, 0.0, -6, -28, "right"),
+    *LABEL_OPTIONS[1:],
+    (False, 0.0, -6, -14, "right"),
+)
+
+
 def _place_labels(
     ax: Any,
     items: list[tuple[float, float, float, str, str]],
     taken: list[list[tuple[float, float]]],
     size: float = 8.0,
+    options: Sequence[tuple[bool, float, float, float, str]] = LABEL_OPTIONS,
 ) -> None:
     """Annotate points without overlapping labels.
 
     ``items`` are ``(priority, x, y, label, short_label)``. In priority order each
-    point gets its full label rotated up and to the right; if that collides with
-    something already placed, the short label up-left or below-right; else none.
+    point gets its label at the first of ``options`` (:data:`LABEL_OPTIONS`) that collides
+    with nothing already placed; else none.
     """
     scale = ax.figure.dpi / 72
     for _, x, y, label, short in sorted(items, key=lambda it: -it[0]):
         px, py = ax.transData.transform((x, y))
-        for text, angle, dx, dy, ha in (
-            (label, 28.0, 5, 7, "left"),
-            (short, 0.0, -6, 5, "right"),
-            (short, 0.0, 6, -16, "left"),
-        ):
+        for full, angle, dx, dy, ha in options:
+            text = label if full else short
             w, h = _text_size(ax, text, size)
             box = _box(px + dx * scale, py + dy * scale, w, h, angle, ha)
             if any(_overlap(box, other) for other in taken):
@@ -315,6 +346,75 @@ def _place_text(
     note.set_visible(True)
     taken.append(box)
     return note
+
+
+def _step_boxes(
+    ax: Any, xs: Sequence[float], ys: Sequence[float], clear: float = 8.0
+) -> list[list[tuple[float, float]]]:
+    """Boxes (display px) along a ``where="post"`` step line through ``(xs, ys)``, for
+    labels to keep off: its flat segments and its risers, but ``clear`` px at each end of
+    a riser, where the label of the point it leads to starts."""
+    out = []
+    pts = ax.transData.transform(list(zip(xs, ys, strict=True)))
+    for k in range(len(xs) - 1):  # flat: from (xs[k], ys[k]) to (xs[k + 1], ys[k])
+        (x0, y0), x1 = pts[k], pts[k + 1][0]
+        out.append(_box(x0, y0 - 1.5, x1 - x0, 3, 0.0, "left"))
+    for k in range(1, len(xs) - 1):  # riser at xs[k], from ys[k - 1] to ys[k] (up or down)
+        lo, hi = sorted((pts[k - 1][1], pts[k][1]))
+        if hi - lo > 2 * clear:
+            out.append(_box(pts[k][0] - 1.5, lo + clear, 3, hi - lo - 2 * clear, 0.0, "left"))
+    return out
+
+
+def _walls(ax: Any) -> list[list[tuple[float, float]]]:
+    """Boxes (display px) just outside the axes' edges (the top one below the failure
+    ticks there): labels placed with them in ``taken`` stay inside the frame."""
+    frame = ax.get_window_extent(ax.figure.canvas.get_renderer())
+    top, far = frame.y1 - 0.035 * frame.height, 10_000.0
+    return [
+        _box(frame.x0 - far, top, 2 * far + frame.width, far, 0.0, "left"),
+        _box(frame.x1, frame.y0 - far, far, 2 * far, 0.0, "left"),
+        _box(frame.x0 - far, frame.y0 - far, far, 2 * far, 0.0, "left"),
+        _box(frame.x0 - far, frame.y0 - far, 2 * far + frame.width, far, 0.0, "left"),
+    ]
+
+
+def _end_labels(
+    ax: Any,
+    ends: list[tuple[float, float, str]],
+    taken: list[list[tuple[float, float]]] | None = None,
+    size: float = 8.5,
+    **style: Any,
+) -> None:
+    """Labels beside the right ends of lines (``(x, y, text)`` in data): each at the height
+    of its line's end, moved up or down just enough that no two overlap, the highest kept
+    inside the axes' height. Their boxes are added to ``taken``."""
+    if not ends:
+        return
+    scale = ax.figure.dpi / 72
+    frame = ax.get_window_extent(ax.figure.canvas.get_renderer())
+    gap = _text_size(ax, "Ag", size)[1]
+    at = sorted((float(ax.transData.transform((x, y))[1]), x, y, t) for x, y, t in ends)
+    ys = [a[0] for a in at]
+    for i in range(1, len(ys)):  # upwards: each at least a line above the one below
+        ys[i] = max(ys[i], ys[i - 1] + gap)
+    if (over := ys[-1] - (frame.y1 - gap / 2)) > 0:  # back down from the top of the axes
+        ys[-1] -= over
+        for i in range(len(ys) - 2, -1, -1):
+            ys[i] = min(ys[i], ys[i + 1] - gap)
+    for py, (y0, x, y, text) in zip(ys, at, strict=True):
+        note = ax.annotate(
+            text,
+            xy=(x, y),
+            xytext=(6, (py - y0) / scale),
+            textcoords="offset points",
+            ha="left",
+            va="center",
+            annotation_clip=False,
+            **{"fontsize": size, "color": INK_2, **style},
+        )
+        if taken is not None:
+            taken.append(_label_box(ax, note))
 
 
 def _short(text: str, limit: int) -> str:
@@ -452,31 +552,21 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
     if failed:  # ticks on the x axis
         _fail_ticks(ax, [i for i, _ in failed])
 
-    # Kept points carry their hypothesis; the biggest steps win when labels collide.
+    # Kept points carry their experiment number (results.tsv exp) and title; the biggest
+    # steps win when labels collide.
     items = []
     previous = 1.0
     for i, r in kept:
-        text = _short(r["hypothesis"] or r["snapshot"], 46)
+        text = ledger.cut(ledger.title(r), 46)
         speed = f"{r['speedup']:.2f}×"
-        items.append((r["speedup"] - previous, float(i), r["speedup"], f"{speed}  {text}", speed))
+        label = f"#{r['exp']} {speed}  {text}" if r.get("exp") else f"{speed}  {text}"
+        items.append((r["speedup"] - previous, float(i), r["speedup"], label, speed))
         previous = r["speedup"]
     # Labels must not cover points or the running-best line either.
     for i, r in kept + discarded:
         px, py = ax.transData.transform((i, r["speedup"]))
         taken.append(_box(px - 7, py - 7, 14, 14, 0.0, "left"))
-    corners = ax.transData.transform(
-        [(x, y) for k in range(len(xs) - 1) for x, y in ((xs[k], ys[k]), (xs[k + 1], ys[k]))]
-        + [(xs[k], ys[k - 1]) for k in range(1, len(xs) - 1)]
-        + [(xs[k], ys[k]) for k in range(1, len(xs) - 1)]
-    )
-    flat = len(xs) - 1
-    for k in range(flat):  # horizontal segments
-        (x0, y0), (x1, _) = corners[2 * k], corners[2 * k + 1]
-        taken.append(_box(x0, y0 - 1.5, x1 - x0, 3, 0.0, "left"))
-    risers = len(xs) - 2
-    for k in range(risers):  # vertical segments up to each kept point
-        (x0, y0), (_, y1) = corners[2 * flat + k], corners[2 * flat + risers + k]
-        taken.append(_box(x0 - 1.5, y0 + 8, 3, max(y1 - y0 - 16, 0.0), 0.0, "left"))
+    taken += _step_boxes(ax, xs, ys)
     _place_labels(ax, items, taken)
 
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
@@ -488,6 +578,9 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
     for _, r in failed:
         kinds[r["status"]] = kinds.get(r["status"], 0) + 1
     parts = [f"`{spec.get('module_class')}`" if spec.get("module_class") else ""]
+    exps = [r["exp"] for r in rows if r.get("exp")]
+    if exps:  # where its evaluations are in the run's experiments (progress.png)
+        parts.append(f"exp {min(exps)}–{max(exps)}")
     if spec.get("backends"):
         parts.append("backends: " + ", ".join(spec["backends"]))
     if team:
@@ -539,11 +632,380 @@ def _fail_key(label: str = "failed") -> Any:
     return Line2D([], [], ls="", marker="|", ms=9, mew=1.8, mec=FAIL_COLOR, label=label)
 
 
-# ------------------------------------------------------------------ run level
+# ------------------------------------------------------------------ run level: experiments
 
 
 def run_progress(run: RunDir, rows: list[dict[str, Any]] | None = None) -> Path | None:
-    """``progress.png``: projected and measured end-to-end latency over wall-clock time."""
+    """``progress.png``: the run's experiments over experiment number, measured values only
+    (issue #223): the model's metric above, the kernel targets' module speedups below
+    (:func:`_draw_experiments`). The projection is not drawn: it is ``amdahl.png``'s, and
+    ``timeline.png`` draws it over wall-clock time."""
+    baseline = read_json(run.baseline_json, {}) or {}
+    base_ms = _num(baseline.get("median_ms"))
+    if base_ms is None or not available():
+        return None
+    items = experiments.all_rows(run, ledger.rows(run) if rows is None else rows)
+    return _render(
+        run.root / "progress.png",
+        (10.0, 7.6),
+        lambda fig, ax: _draw_experiments(fig, ax, run, baseline, base_ms, items),
+    )
+
+
+def progress_scale(
+    base: float, best: float, keep_in: Iterable[float] = ()
+) -> tuple[bool, float, float]:
+    """``(log, bottom, top)`` of ``progress.png``'s model panel: a log axis when the baseline
+    is at least :data:`LOG_RATIO` × the best (on a linear one every later step would be
+    squeezed into its bottom); the frame from the best − :data:`MARGIN` of the gain to the
+    baseline + as much (in log space on a log axis), as autoresearch's chart. ``keep_in``:
+    values that stay inside the frame too (torch.compile's); every other value beyond it is
+    clipped at the frame."""
+    lo, hi = min(best, base, *keep_in), max(best, base, *keep_in)
+    if best > 0 and base / best >= LOG_RATIO:
+        pad = math.exp(MARGIN * math.log(hi / lo))
+        return True, lo / pad, hi * pad
+    span = max(hi - lo, 0.05 * hi)
+    return False, max(lo - MARGIN * span, 0.0), hi + MARGIN * span
+
+
+def exp_bands(
+    run: RunDir,
+    items: Sequence[experiments.Experiment],
+    log: list[dict[str, Any]] | None = None,
+) -> list[tuple[str, float, float]]:
+    """The phases of ``progress.png`` over experiment numbers: ``(label, first exp − 0.5,
+    last exp + 0.5)``. A row belongs to the phase span (:func:`kernel_agent.ledger.
+    phase_spans`; events from ``log``) that holds its time, a span to where the next one
+    starts; an ``improve`` round after the first (``improve.json`` ``rounds[].started``) is
+    ``improve round <n>``. Consecutive rows under one label make one band, so a phase
+    started again (a resumed ``improve``) is one band, not labels printed over each other;
+    a phase without rows (``analyze``, ``plan``) has none."""
+    starts = sorted((math.floor(a), p) for p, a, _ in ledger.phase_spans(run, log))
+    improve = read_json(run.root / "improve.json", {}) or {}
+    rounds = sorted(
+        (math.floor(float(r["started"])), r["n"])
+        for r in improve.get("rounds") or []
+        if isinstance(r, dict)
+        and isinstance(r.get("n"), int)
+        and r["n"] > 1
+        and _num(r.get("started")) is not None
+    )
+    bands: list[tuple[str, float, float]] = []
+    for e in sorted(items, key=lambda e: e.exp):
+        t = ledger.epoch(e.time)
+        phase = next((p for a, p in reversed(starts) if t is not None and a <= t), None)
+        if phase is None:
+            continue
+        if phase == "improve":
+            n = next((n for a, n in reversed(rounds) if a <= (t or 0)), 1)
+            phase = phase if n == 1 else f"improve round {n}"
+        if bands and bands[-1][0] == phase:
+            bands[-1] = (phase, bands[-1][1], e.exp + 0.5)
+        else:
+            bands.append((phase, e.exp - 0.5, e.exp + 0.5))
+    return bands
+
+
+def reintegrations(run: RunDir) -> list[float]:
+    """Where ``improve``'s re-integrations ended over experiment numbers: after the last
+    row each recorded (``improve.json`` ``integrations[].exp_after``)."""
+    improve = read_json(run.root / "improve.json", {}) or {}
+    return [
+        i["exp_after"] + 0.5
+        for i in improve.get("integrations") or []
+        if isinstance(i, dict) and isinstance(i.get("exp_after"), int)
+    ]
+
+
+def kernel_lines(
+    run: RunDir, items: Sequence[experiments.Experiment]
+) -> list[tuple[str, list[float], list[float]]]:
+    """Each kernel target's running best module speedup over experiment numbers, ``(target,
+    xs, ys)`` for a ``where="post"`` step line: 1.0× at its first experiment, a step where
+    its standing best changes (a keep; a re-evaluation of its best:
+    :class:`~kernel_agent.budget.Standing`, the ledger's bar), level to the run's last
+    experiment. In colour order: :func:`target_shares`' (as ``watch``), then by first
+    experiment."""
+    last = float(max((e.exp for e in items), default=0))
+    lines: dict[str, tuple[list[float], list[float], Standing]] = {}
+    for e in sorted(items, key=lambda e: e.exp):
+        if e.kind != ledger.KERNEL or (e.lineage not in lines and not e.measured):
+            continue
+        xs, ys, stand = lines.setdefault(e.lineage, ([float(e.exp)], [1.0], Standing()))
+        if e.status == ledger.REEVALUATED:
+            stand.replace(e.row)
+        elif e.status == KEEP:
+            stand.keep(e.row)
+        if stand.best != ys[-1]:
+            xs.append(float(e.exp))
+            ys.append(stand.best)
+    shares = [t for t, _, _ in target_shares(run) if t in lines]
+    order = shares + [t for t in lines if t not in shares]
+    return [(t, [*lines[t][0], last], [*lines[t][1], lines[t][1][-1]]) for t in order]
+
+
+def _gpu_name(run: RunDir) -> str:
+    """The GPU's name without its vendor's brand words (``RTX 5070 Ti``)."""
+    gpu = (read_json(run.toolchain_json, {}) or {}).get("gpu") or {}
+    name = str(gpu.get("name") or "") if isinstance(gpu, dict) else ""
+    for brand in ("NVIDIA ", "GeForce "):
+        name = name.removeprefix(brand)
+    return name
+
+
+def _duration(seconds: float) -> str:
+    return f"{seconds / 3600:.1f} h" if seconds >= 3600 else f"{seconds / 60:.0f} min"
+
+
+def _experiments_subtitle(
+    run: RunDir,
+    s: dict[str, Any],
+    base_ms: float,
+    final_ms: float | None,
+    items: Sequence[experiments.Experiment],
+    log: list[dict[str, Any]],
+) -> str:
+    """AutoKernel's summary box as two subtitle lines (a box would cover data): the measured
+    result, the GPU and the experiments by kind; then by status, the time and the cost."""
+    head = f"baseline {base_ms:,.1f} ms"
+    if final_ms:
+        head = f"{base_ms:,.1f} → {final_ms:,.1f} ms measured ({base_ms / final_ms:.2f}×)"
+    kinds = s["by_kind"]
+    names = {ledger.KERNEL: "kernel", E2E: "end-to-end", ledger.INTEGRATION: "integration"}
+    what = " / ".join(f"{kinds[k]} {name}" for k, name in names.items() if kinds.get(k))
+    if s["probes"]:  # left out of the chart and of N
+        what += f" (+{s['probes']} probe{'s' if s['probes'] > 1 else ''})"
+    first = "  ·  ".join(p for p in (head, _gpu_name(run), what) if p)
+    by = s["by_status"]
+    fails = sorted(((k, n) for k, n in by.items() if k in FAILURES), key=lambda kn: -kn[1])
+    status = f"{by.get(KEEP, 0)} kept  ·  {by.get(DISCARD, 0)} discarded  ·  "
+    status += f"{sum(n for _, n in fails)} failed"
+    if fails:
+        status += " (" + ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in fails) + ")"
+    parts = [status]
+    start = ledger.start_time(run, [e.row for e in items[:1]])
+    stamps = [float(ev["ts"]) for ev in log if _num(ev.get("ts")) is not None][-1:]
+    stamps += [t for t in (ledger.epoch(e.time) for e in items[-1:]) if t is not None]
+    if start is not None and stamps and max(stamps) > start:
+        parts.append(_duration(max(stamps) - start))
+    costs = read_json(run.root / "costs.json", {}) or {}
+    usd = sum(_num(c.get("usd")) or 0.0 for c in costs.values() if isinstance(c, dict))
+    if usd:
+        parts.append(f"${usd:,.2f}")
+    return first + "\n" + "  ·  ".join(parts)
+
+
+def _draw_experiments(
+    fig: Any,
+    ax: Any,
+    run: RunDir,
+    baseline: dict[str, Any],
+    base_ms: float,
+    items: list[experiments.Experiment],
+) -> None:
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
+
+    grid = fig.add_gridspec(2, 1, height_ratios=(2.0, 1.0), hspace=0.08)
+    ax.set_subplotspec(grid[0])  # the model panel: the axes _render made
+    kx = fig.add_subplot(grid[1], sharex=ax)  # the kernel panel
+    log = ledger.events(run)
+    last = max((e.exp for e in items), default=1)
+    model = [e for e in items if e.lineage == experiments.MODEL and e.measured]
+    # the running best through every kept row; the thin line and the ticks leave out the
+    # integration's probes (one item alone next to the combinations: a zigzag, #223)
+    kept = [e for e in model if e.status == KEEP and e.value is not None]
+    each = [e for e in model if e.kind != ledger.PROBE and e.value is not None]
+    failed = [e for e in model if e.kind != ledger.PROBE and e.failed]
+    compiled = _compiled_ms(baseline)
+    best = min((float(e.value or 0) for e in kept), default=None)
+    scale = best or min((float(e.value or 0) for e in each), default=base_ms)
+    is_log, bottom, top = progress_scale(base_ms, scale, [compiled] if compiled else [])
+    pad = max(0.6, 0.012 * last)
+    ax.set_xlim(-pad, last + pad)
+    if is_log:
+        ax.set_yscale("log")
+    ax.set_ylim(bottom, top)
+    kx.set_yscale("log")
+    lines = kernel_lines(run, items)
+    kx.set_ylim(1 / 1.2, max([2.0, *(y for _, _, ys in lines for y in ys)]) * 1.2)
+
+    labelled = False  # alternating bands; a label only where it fits
+    for k, (phase, x0, x1) in enumerate(exp_bands(run, items, log)):
+        if k % 2:
+            for panel in (ax, kx):
+                panel.axvspan(x0, x1, color=BAND, lw=0, zorder=0)
+        if _fits(ax, phase, 8.5, x0, x1, pad_px=2):
+            labelled = True
+            ax.annotate(
+                phase,
+                xy=((x0 + x1) / 2, 1),
+                xycoords=("data", "axes fraction"),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8.5,
+                color=MUTED,
+            )
+    again = reintegrations(run)
+    for x in again:
+        for panel in (ax, kx):
+            panel.axvline(x, color=MUTED, lw=0.9, ls=(0, (3, 3)), zorder=1)
+
+    ax.axhline(base_ms, color=INK_2, lw=1.0, ls=(0, (5, 4)), zorder=1)
+    reference = ax.annotate(
+        f"baseline {base_ms:,.1f} ms",
+        xy=(0, base_ms),
+        xycoords=("axes fraction", "data"),
+        xytext=(4, 4),
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=8.5,
+        color=INK_2,
+    )
+    taken = [_label_box(ax, reference)]  # labels placed so far (display px)
+    if compiled:  # AutoKernel's cuBLAS line: what users get without custom kernels
+        ax.axhline(compiled, color=COMPILE_COLOR, lw=1.2, ls=(0, (1.5, 2.5)), zorder=1)
+        _place_text(
+            ax,
+            (ax.get_xlim()[0], compiled),
+            f"torch.compile {compiled:,.1f} ms",
+            [(4, 4, "left", "bottom"), (4, -4, "left", "top")],
+            taken,
+            fontsize=8.5,
+            color=INK_2,
+        )
+
+    bx = [0.0, *(float(e.exp) for e in kept), float(last)]
+    by = [base_ms, *(float(e.value or 0) for e in kept)]
+    by.append(by[-1])
+    ax.step(bx, by, where="post", color=KEEP_COLOR, lw=BEST_LW, zorder=5)
+    if each:
+        pts = [(float(e.exp), float(e.value or 0)) for e in each]
+        if len(pts) == 1:  # one result: a short dash where it is
+            pts = [(pts[0][0] - 0.3, pts[0][1]), (pts[0][0] + 0.3, pts[0][1])]
+        ax.plot(
+            [x for x, _ in pts],
+            [y for _, y in pts],
+            color=DISCARD_COLOR,
+            lw=EACH_LW,
+            solid_joinstyle="round",
+            zorder=4,
+        )
+    if failed:  # ticks at the top (the labels keep the space above the line)
+        _fail_ticks(ax, [float(e.exp) for e in failed], top=True)
+    if kept:
+        _end_labels(
+            ax,
+            [(float(last), by[-1], f"best {by[-1]:,.1f} ms ({base_ms / by[-1]:.2f}×)")],
+            taken,
+            size=9,
+            color=INK,
+            fontweight="bold",
+        )
+
+    # Every kept step carries its number, value, ratio and title (the biggest steps win
+    # when labels collide); labels stay inside the frame, off the points and the lines.
+    taken += _walls(ax)
+    for e in each:  # as the target chart's: 7 px around every result
+        cx, cy = ax.transData.transform((e.exp, e.value))
+        taken.append(_box(cx - 7, cy - 7, 14, 14, 0.0, "left"))
+    # the line steps down onto a kept point and its label rises from just right of it:
+    # keep the riser's lowest part (a label's height above its offset) free for the label
+    rise = 7 * ax.figure.dpi / 72 + _text_size(ax, "Ag", 8.0)[1] + 4
+    taken += _step_boxes(ax, bx, by, clear=rise)
+    labels, previous = [], base_ms
+    for e in kept:
+        value = float(e.value or 0)
+        ratio = f"{base_ms / value:.2f}×"
+        text = f"#{e.exp} {value:,.1f} ms {ratio}  {ledger.cut(e.title, 40)}"
+        labels.append((previous / value - 1, float(e.exp), value, text, ratio))
+        previous = value
+    _place_labels(ax, labels, taken, options=STAIRS_LABEL_OPTIONS)
+
+    ms = FuncFormatter(lambda v, _: f"{v:,.0f}")
+    for panel, formatter in ((ax, ms), (kx, FuncFormatter(lambda v, _: f"{v:g}×"))):
+        lo, hi = panel.get_ylim()
+        if panel.get_yscale() == "log":  # 1, 2, 5 per decade (more within one), no minor labels
+            subs = (1.0, 2.0, 5.0) if hi / lo > 8 else (1.0, 1.5, 2.0, 3.0, 5.0, 7.0)
+            panel.yaxis.set_major_locator(LogLocator(base=10, subs=subs))
+            panel.yaxis.set_minor_formatter(NullFormatter())
+        panel.yaxis.set_major_formatter(formatter)
+    metric = objective.of(baseline)
+    axis = "ms, log scale, lower is better" if is_log else "ms, lower is better"
+    ax.set_ylabel(f"{metric.label} ({axis})")
+    ax.tick_params(labelbottom=False)
+
+    kx.axhline(1.0, color=INK_2, lw=1.0, ls=(0, (5, 4)), zorder=1)
+    ends, handles = [], []
+    for i, (target, xs, ys) in enumerate(lines):
+        colour = TARGET_COLORS[i] if i < len(TARGET_COLORS) else None
+        kx.step(
+            xs,
+            ys,
+            where="post",
+            color=colour or MUTED,
+            lw=TARGET_LW if colour else EACH_LW,
+            zorder=4 if colour else 3,
+        )
+        ends.append((xs[-1], ys[-1], f"{target} {ys[-1]:.2f}×"))
+        if colour:
+            handles.append(Line2D([], [], color=colour, lw=TARGET_LW, label=target))
+    if len(lines) > len(TARGET_COLORS):
+        others = len(lines) - len(TARGET_COLORS)
+        handles.append(Line2D([], [], color=MUTED, lw=EACH_LW, label=f"{others} more targets"))
+    _end_labels(kx, ends)
+    if not lines:
+        kx.annotate(
+            "no kernel experiments",
+            xy=(0.5, 0.5),
+            xycoords="axes fraction",
+            ha="center",
+            va="center",
+            fontsize=9,
+            color=MUTED,
+        )
+    kernel_failed = [float(e.exp) for e in items if e.kind == ledger.KERNEL and e.failed]
+    if kernel_failed:  # ticks on this panel's x axis
+        _fail_ticks(kx, kernel_failed)
+    kx.xaxis.set_major_locator(MaxNLocator(integer=True))
+    kx.set_xlabel("experiment # (results.tsv exp; 0 = the baseline)")
+    kx.set_ylabel("best module speedup (×)")
+
+    s = experiments.summary(run, items)
+    final = (read_json(run.root / "integration.json", {}) or {}).get("final") or {}
+    final_ms = _num(final.get("median_ms")) if final.get("passed") else None
+    _header(
+        ax,
+        experiments.headline(s),
+        _experiments_subtitle(run, s, base_ms, final_ms or best, items, log),
+        raise_pt=14 if labelled else 0,
+    )
+    keys = [
+        Line2D([], [], color=KEEP_COLOR, lw=BEST_LW, label="running best"),
+        Line2D([], [], color=DISCARD_COLOR, lw=EACH_LW, label="each experiment"),
+        _fail_key(),
+        Line2D([], [], color=INK_2, lw=1, ls=(0, (5, 4)), label="baseline"),
+    ]
+    if compiled:
+        keys.append(
+            Line2D([], [], color=COMPILE_COLOR, lw=1.2, ls=(0, (1.5, 2.5)), label="torch.compile")
+        )
+    if again:
+        keys.append(Line2D([], [], color=MUTED, lw=0.9, ls=(0, (3, 3)), label="re-integration"))
+    keys += handles
+    _legend(kx, keys, ncol=min(len(keys), 6))
+
+
+# ------------------------------------------------------------------ run level: timeline
+
+
+def run_timeline(run: RunDir, rows: list[dict[str, Any]] | None = None) -> Path | None:
+    """``timeline.png``: projected and measured end-to-end latency over wall-clock time,
+    where the hours went (``progress.png`` before issue #223)."""
     baseline = read_json(run.baseline_json, {}) or {}
     base_ms = _num(baseline.get("median_ms"))
     rows = ledger.rows(run) if rows is None else rows
@@ -553,7 +1015,7 @@ def run_progress(run: RunDir, rows: list[dict[str, Any]] | None = None) -> Path 
     if start is None:
         return None
     return _render(
-        run.root / "progress.png",
+        run.root / "timeline.png",
         (10.0, 5.6),
         lambda fig, ax: _draw_run(ax, run, baseline, base_ms, rows, start),
     )

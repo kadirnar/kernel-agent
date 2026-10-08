@@ -9,6 +9,7 @@ from kernel_agent import (
     abtest,
     backends,
     diversity,
+    experiments,
     ledger,
     library,
     objective,
@@ -58,6 +59,46 @@ def _calls(target_id: str, spec: dict[str, Any], rec: dict[str, Any]) -> str:
 def _chart(run: RunDir, path: Path, alt: str) -> list[str]:
     """Markdown image line for a chart that exists (charts need the ``viz`` extra)."""
     return [f"![{alt}]({path.relative_to(run.root).as_posix()})", ""] if path.exists() else []
+
+
+def _experiment_lines(run: RunDir, top: int = 20) -> list[str]:
+    """The "Experiments" section (issue #223): the headline "N experiments, K kept
+    improvements", the kept improvements ranked by their gain over the best before them
+    (:func:`kernel_agent.experiments.kept`, the first ``top``), then ``progress.png`` (over
+    experiment number) and ``timeline.png`` (over wall-clock time)."""
+    everything = experiments.all_rows(run)
+    if not any(e.measured for e in everything):
+        return []
+    s = experiments.summary(run, everything)
+    beside = [f"+{s['probes']} integration probes"] if s["probes"] else []
+    if unmeasured := sum(s["unmeasured"].values()):
+        beside.append(f"{unmeasured} rows that measured nothing")
+    headline = f"**{experiments.headline(s)}**" + (f" ({'; '.join(beside)})" if beside else "")
+    lines = ["## Experiments", "", headline, ""]
+    kept = experiments.kept(run, everything)
+    if kept:
+        lines += ["| exp | lineage | before → after | gain | title |", "|---|---|---|---|---|"]
+        for e in kept[:top]:
+            change = (
+                f"{experiments.value_text(e.best_before, e.unit)} → "
+                f"{experiments.value_text(e.value, e.unit)}"
+            )
+            title = e.title.replace("|", "\\|")
+            lines.append(
+                f"| {e.exp} | `{e.lineage}` | {change} | {experiments.gain_text(e.gain)} "
+                f"| {title} |"
+            )
+        if len(kept) > top:
+            lines += ["", f"{len(kept) - top} more kept improvements: `kernel-agent exp <run_dir>`"]
+        lines.append("")
+    lines += _chart(run, run.root / "progress.png", "the running best over experiment number")
+    lines += _chart(run, run.root / "timeline.png", "end-to-end latency over wall-clock time")
+    lines += [
+        "`kernel-agent exp <run_dir>` lists every experiment; `exp show <run_dir> N` gives one "
+        "with its hypothesis, record and diff to its parent.",
+        "",
+    ]
+    return lines
 
 
 def _flat_metrics(metrics: Any, prefix: str = "") -> dict[str, Any]:
@@ -360,13 +401,15 @@ def write_report(run: RunDir) -> Path:
         kept = "accepted" if item.get("accepted") else "not accepted"
         lines.append(f"* data-dependent alone ({kept}): `{name}` ({item.get('why')})")
     lines += [""] if alone else []
-    lines += _chart(run, run.root / "progress.png", "end-to-end progress")
     lines += _chart(run, run.root / "amdahl.png", "time split before and after the best kernels")
     lines += [
         "Every evaluation is a row of `results.tsv` (keep / discard / failure); "
         "`dashboard.html` shows the charts and tables, `kernel-agent status <run_dir>` a "
         "terminal summary.",
         "",
+    ]
+    lines += _experiment_lines(run)  # progress.png and the kept improvements (#223)
+    lines += [
         "## Planner analysis",
         "",
         plan.get("analysis", "(no plan)"),
