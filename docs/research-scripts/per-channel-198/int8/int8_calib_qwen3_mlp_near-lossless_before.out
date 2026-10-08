@@ -1,0 +1,69 @@
+Qwen--Qwen3-0.6B/20261008-063823/targets/mlp_decode/capture_inputs.pt [(1, 1, 1024), (1, 1, 1024), (1, 1, 1024)]
+
+### case 0
+| linear (rows, act crest) | int8 W8A8 (per channel x per token) | int8 weights only | int8 W8A8 + SmoothQuant a=0.4 | fp8 W8A8 (per channel x per token) |
+| gate_proj (1, 15) | 0.0254 | 0.0062 | 0.0120 | 0.0264 |
+| up_proj (1, 15) | 0.0377 | 0.0094 | 0.0174 | 0.0347 |
+| down_proj (1, 18) | 0.0397 | 0.0095 | 0.0466 | 0.0332 |
+int8 W8A8 (per channel x per token)            cap pass cos 0.99826 rel 0.0599 elem 0.38 norm 0.86% | redrawn 0/12 fail, max rel 0.0406 elem 0.17 norm 0.37% | x3:ok x0.01:ok x-1:ok (worst rel 0.0649 elem 0.27 norm 1.26%)
+int8 weights only                              cap pass cos 0.99990 rel 0.0142 elem 0.08 norm 0.06% | redrawn 0/12 fail, max rel 0.0165 elem 0.13 norm 0.25% | x3:ok x0.01:ok x-1:ok (worst rel 0.0141 elem 0.07 norm 0.09%)
+int8 W8A8 + SmoothQuant a=0.4                  cap pass cos 0.99876 rel 0.0500 elem 0.28 norm 0.37% | redrawn 1/12 fail, max rel 0.1127 elem 0.48 norm 0.82% | x3:ok x0.01:ok x-1:ok (worst rel 0.0550 elem 0.22 norm 0.90%)
+      first failure: out: cosine 0.993739 < 0.996; relative L2 error 0.1127 > 0.08
+fp8 W8A8 (per channel x per token)             cap pass cos 0.99867 rel 0.0517 elem 0.38 norm 0.57% | redrawn 0/12 fail, max rel 0.0665 elem 0.39 norm 0.85% | x3:ok x0.01:ok x-1:ok (worst rel 0.0527 elem 0.24 norm 0.63%)
+fp8 weights only                               cap pass cos 0.99927 rel 0.0382 elem 0.24 norm 0.13% | redrawn 0/12 fail, max rel 0.0478 elem 0.24 norm 0.49% | x3:ok x0.01:ok x-1:ok (worst rel 0.0381 elem 0.17 norm 1.10%)
+BUG weight scales x1.05                        cap FAIL cos 0.99763 rel 0.1707 elem 0.71 norm 15.39% | redrawn 3/3 fail, max rel 0.1725 elem 0.59 norm 16.92% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.1875 elem 0.84 norm 17.45%)
+      first failure: out: norm x1.1539 (allowed ±2%): a systematic error, not rounding noise; relative L2 error 0.17
+BUG neighbour channel's scale                  cap FAIL cos 0.89637 rel 0.6392 elem 6.70 norm 35.69% | redrawn 3/3 fail, max rel 0.6066 elem 7.17 norm 25.45% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.7017 elem 6.15 norm 48.20%)
+      first failure: out: an element is 6.7x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); nor
+BUG first token's scale                        cap pass cos 0.99826 rel 0.0599 elem 0.38 norm 0.86% | redrawn 0/3 fail, max rel 0.0336 elem 0.15 norm 0.25% | x3:ok x0.01:ok x-1:ok (worst rel 0.0649 elem 0.27 norm 1.26%)
+BUG per-tensor activation scale                cap pass cos 0.99826 rel 0.0599 elem 0.38 norm 0.86% | redrawn 0/3 fail, max rel 0.0336 elem 0.15 norm 0.25% | x3:ok x0.01:ok x-1:ok (worst rel 0.0649 elem 0.27 norm 1.26%)
+BUG zeroed output channel                      cap FAIL cos 0.98926 rel 0.1463 elem 3.96 norm 0.39% | redrawn 0/3 fail, max rel 0.0401 elem 0.81 norm 0.21% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.1852 elem 3.74 norm 2.44%)
+      first failure: out: an element is 3.96x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); co
+BUG static activation scale (calibrated)       cap FAIL cos 0.99641 rel 0.0863 elem 0.51 norm 1.31% | redrawn 3/3 fail, max rel 0.0911 elem 0.43 norm 1.28% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 1.0000 elem 2.77 norm 35.04%)
+      first failure: out: relative L2 error 0.08634 > 0.08
+BUG clipped activations (99.9th percentile)    cap FAIL cos 0.96997 rel 0.2437 elem 1.40 norm 4.44% | redrawn 2/3 fail, max rel 0.1006 elem 0.46 norm 2.80% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.5363 elem 3.60 norm 41.89%)
+      first failure: out: an element is 1.4x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); nor
+
+### case 1
+int8 W8A8 (per channel x per token)            cap pass cos 0.99823 rel 0.0595 elem 0.37 norm 0.46% | redrawn 0/12 fail, max rel 0.0401 elem 0.17 norm 0.46% | x3:ok x0.01:ok x-1:ok (worst rel 0.0628 elem 0.29 norm 1.11%)
+int8 weights only                              cap pass cos 0.99990 rel 0.0141 elem 0.10 norm 0.10% | redrawn 0/12 fail, max rel 0.0168 elem 0.12 norm 0.16% | x3:ok x0.01:ok x-1:ok (worst rel 0.0134 elem 0.07 norm 0.19%)
+int8 W8A8 + SmoothQuant a=0.4                  cap pass cos 0.99828 rel 0.0592 elem 0.42 norm 0.69% | redrawn 6/12 fail, max rel 0.1822 elem 0.77 norm 2.00% | x3:ok x0.01:ok x-1:ok (worst rel 0.0685 elem 0.29 norm 0.21%)
+      first failure: out: cosine 0.995646 < 0.996; relative L2 error 0.09354 > 0.08
+fp8 W8A8 (per channel x per token)             cap pass cos 0.99876 rel 0.0499 elem 0.33 norm 0.11% | redrawn 0/12 fail, max rel 0.0648 elem 0.36 norm 0.74% | x3:ok x0.01:ok x-1:ok (worst rel 0.0573 elem 0.26 norm 2.45%)
+fp8 weights only                               cap pass cos 0.99933 rel 0.0367 elem 0.24 norm 0.24% | redrawn 0/12 fail, max rel 0.0480 elem 0.22 norm 0.51% | x3:ok x0.01:ok x-1:ok (worst rel 0.0382 elem 0.18 norm 1.46%)
+BUG weight scales x1.05                        cap FAIL cos 0.99787 rel 0.1536 elem 0.66 norm 13.69% | redrawn 3/3 fail, max rel 0.1742 elem 0.59 norm 16.95% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.1814 elem 0.84 norm 17.07%)
+      first failure: out: norm x1.1369 (allowed ±2%): a systematic error, not rounding noise; relative L2 error 0.15
+BUG neighbour channel's scale                  cap FAIL cos 0.88970 rel 0.6097 elem 8.66 norm 29.38% | redrawn 3/3 fail, max rel 0.6057 elem 7.22 norm 25.41% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.7241 elem 6.11 norm 39.46%)
+      first failure: out: an element is 8.66x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); no
+BUG first token's scale                        cap pass cos 0.99823 rel 0.0595 elem 0.37 norm 0.46% | redrawn 0/3 fail, max rel 0.0344 elem 0.13 norm 0.26% | x3:ok x0.01:ok x-1:ok (worst rel 0.0628 elem 0.29 norm 1.11%)
+BUG per-tensor activation scale                cap pass cos 0.99823 rel 0.0595 elem 0.37 norm 0.46% | redrawn 0/3 fail, max rel 0.0344 elem 0.13 norm 0.26% | x3:ok x0.01:ok x-1:ok (worst rel 0.0628 elem 0.29 norm 1.11%)
+BUG zeroed output channel                      cap FAIL cos 0.99161 rel 0.1294 elem 3.66 norm 1.23% | redrawn 0/3 fail, max rel 0.0407 elem 0.81 norm 0.23% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.2198 elem 4.02 norm 3.17%)
+      first failure: out: an element is 3.66x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); co
+BUG static activation scale (calibrated)       cap FAIL cos 0.99614 rel 0.0879 elem 0.65 norm 0.00% | redrawn 3/3 fail, max rel 0.0887 elem 0.42 norm 0.71% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 1.0000 elem 3.12 norm 37.68%)
+      first failure: out: relative L2 error 0.08786 > 0.08
+BUG clipped activations (99.9th percentile)    cap FAIL cos 0.96631 rel 0.2576 elem 1.50 norm 2.24% | redrawn 2/3 fail, max rel 0.1007 elem 0.45 norm 2.67% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.6124 elem 4.00 norm 48.20%)
+      first failure: out: an element is 1.5x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); nor
+
+### case 2
+int8 W8A8 (per channel x per token)            cap FAIL cos 0.99644 rel 0.0843 elem 0.49 norm 0.59% | redrawn 0/12 fail, max rel 0.0405 elem 0.28 norm 0.65% | x3:FAIL x0.01:ok x-1:ok (worst rel 0.0803 elem 0.31 norm 0.85%)
+      first failure: out: relative L2 error 0.08432 > 0.08
+int8 weights only                              cap pass cos 0.99989 rel 0.0151 elem 0.12 norm 0.07% | redrawn 0/12 fail, max rel 0.0165 elem 0.13 norm 0.21% | x3:ok x0.01:ok x-1:ok (worst rel 0.0141 elem 0.06 norm 0.02%)
+int8 W8A8 + SmoothQuant a=0.4                  cap pass cos 0.99697 rel 0.0778 elem 0.55 norm 0.36% | redrawn 7/12 fail, max rel 0.1186 elem 0.50 norm 1.36% | x3:FAIL x0.01:ok x-1:ok (worst rel 0.0806 elem 0.35 norm 0.31%)
+      first failure: out: cosine 0.995450 < 0.996; relative L2 error 0.09623 > 0.08
+fp8 W8A8 (per channel x per token)             cap pass cos 0.99900 rel 0.0466 elem 0.28 norm 1.41% | redrawn 0/12 fail, max rel 0.0676 elem 0.31 norm 0.90% | x3:ok x0.01:ok x-1:FAIL (worst rel 0.0619 elem 0.35 norm 3.47%)
+      first failure: sign_flipped: out: norm x1.0347 (allowed ±3%): a systematic error, not rounding noise
+fp8 weights only                               cap pass cos 0.99945 rel 0.0331 elem 0.17 norm 0.02% | redrawn 0/12 fail, max rel 0.0481 elem 0.22 norm 0.46% | x3:ok x0.01:ok x-1:ok (worst rel 0.0422 elem 0.22 norm 1.98%)
+BUG weight scales x1.05                        cap FAIL cos 0.99633 rel 0.1661 elem 0.76 norm 13.87% | redrawn 3/3 fail, max rel 0.1760 elem 0.57 norm 17.14% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.1889 elem 0.87 norm 17.24%)
+      first failure: out: norm x1.1387 (allowed ±2%): a systematic error, not rounding noise; relative L2 error 0.16
+BUG neighbour channel's scale                  cap FAIL cos 0.90883 rel 0.7300 elem 9.86 norm 50.79% | redrawn 3/3 fail, max rel 0.6026 elem 7.10 norm 25.58% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.7625 elem 7.80 norm 58.50%)
+      first failure: out: an element is 9.86x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); no
+BUG first token's scale                        cap FAIL cos 0.99644 rel 0.0843 elem 0.49 norm 0.59% | redrawn 0/3 fail, max rel 0.0352 elem 0.28 norm 0.37% | x3:FAIL x0.01:ok x-1:ok (worst rel 0.0803 elem 0.31 norm 0.85%)
+      first failure: out: relative L2 error 0.08432 > 0.08
+BUG per-tensor activation scale                cap FAIL cos 0.99644 rel 0.0843 elem 0.49 norm 0.59% | redrawn 0/3 fail, max rel 0.0352 elem 0.28 norm 0.37% | x3:FAIL x0.01:ok x-1:ok (worst rel 0.0803 elem 0.31 norm 0.85%)
+      first failure: out: relative L2 error 0.08432 > 0.08
+BUG zeroed output channel                      cap FAIL cos 0.98889 rel 0.1487 elem 3.79 norm 1.45% | redrawn 0/3 fail, max rel 0.0426 elem 0.88 norm 0.37% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.1946 elem 3.62 norm 2.03%)
+      first failure: out: an element is 3.79x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); co
+BUG static activation scale (calibrated)       cap FAIL cos 0.98688 rel 0.1811 elem 0.92 norm 9.52% | redrawn 0/3 fail, max rel 0.0607 elem 0.29 norm 0.51% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 1.0000 elem 3.65 norm 59.09%)
+      first failure: out: norm x0.9048 (allowed ±2%): a systematic error, not rounding noise; cosine 0.986882 < 0.99
+BUG clipped activations (99.9th percentile)    cap FAIL cos 0.90819 rel 0.4451 elem 2.21 norm 24.33% | redrawn 2/3 fail, max rel 0.0919 elem 0.47 norm 2.69% | x3:FAIL x0.01:ok x-1:FAIL (worst rel 0.6201 elem 3.71 norm 51.97%)
+      first failure: out: an element is 2.21x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); no

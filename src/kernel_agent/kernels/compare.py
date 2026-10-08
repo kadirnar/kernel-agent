@@ -255,8 +255,10 @@ NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]]
 #: :mod:`kernel_agent.kernels.verify`, its timed-output check,
 #: :func:`kernel_agent.kernels.bench.check_timed_output`, and the integration's re-check,
 #: :mod:`kernel_agent.kernels.recheck`, compare the candidate with the reference called on
-#: inputs redrawn from each tensor's own mean and std) have no outlier channels, so bounds
-#: calibrated on real inputs do not carry over (#109). A weight row that writes a massive
+#: redrawn inputs) were drawn from each tensor's own mean and std, without outlier channels
+#: (since #198 only a single token or a short cache is, the rest per channel:
+#: :func:`kernel_agent.kernels.verify.redraw_stats`), so bounds calibrated on real inputs do
+#: not carry over (#109). A weight row that writes a massive
 #: activation (VoxCPM2 LocDiT o_proj / down_proj row 497: 10x / 7x the median row norm; real
 #: outputs up to 8576 there) gives its output channel that many times the rounding error of
 #: the others. On real inputs that channel stays massive and the ``r * |ref|`` term covers
@@ -314,10 +316,21 @@ CHANNEL_MIN_ROWS = 16
 #:   8-bit precision and NVFP4 / MXFP4 pass every draw (MXFP8 at decode reaches norm 5.0 %,
 #:   failing 5 of 60 near-lossless draws); ``fp8_kv`` on 192 redraws: cosine >= 0.995,
 #:   relative L2 <= 0.10, norm within 2.9 %, element ratio 0.31 (of ``a`` = 2.5). Scales x 1.2
-#:   fail every draw, V scales x 1.05 43 of 192 (and every captured case). On the Qwen3-0.6B
-#:   decoder layer at decode both modes fail most redraws of every reduced precision (FP8
-#:   weights: 70 / 54 of 80): the cache is redrawn from its global mean and std, and Qwen3's
-#:   few large K channels make every redrawn channel large (README, "Quality modes").
+#:   fail every draw, V scales x 1.05 43 of 192 (and every captured case).
+#:
+#: Re-measured with the per-channel redraw of #198 (``kernels.verify.redraw_stats``; rotary
+#: tables kept; docs/research-scripts/per-channel-198), the bounds unchanged: on the
+#: Qwen3-0.6B decoder layer at decode (K cache channels of RMS 225 against a median of 1.6)
+#: the reference math of FP8 weights fails 4 / 0 of 80 redraws in near-lossless / relaxed
+#: (before: 70 / 54), NVFP4 0 / 0 (71 / 59), MXFP4 6 / 0 (77 / 68), INT8 weights 0 / 0
+#: (27 / 2), INT8 W8A8 4 / 0 (64 / 38), FP8 W8A8 and MXFP8 at M = 1 65 / 0-1 (74-75 /
+#: 66-70); the VoxCPM2 LocDiT and base-LM layers as before (base-LM MXFP8
+#: at decode 11 of 60 near-lossless draws, from 5), ``fp8_kv`` 5 of 192 near-lossless draws
+#: on the norm (3.7-4.0 %; relaxed 0). Every broken variant of that calibration is rejected
+#: where it was before (activation scales cached from the first call: on 40 of 40 LocDiT
+#: draws in both modes, from 37 / 14), except FP4 weights with an unwritten output row on the
+#: LocDiT layer, which only the global redraw caught (23 of 40 near-lossless draws):
+#: realistic draws keep it within FP4's noise, as the captured inputs do.
 PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.03, (0.75, 0.125)),
     NEAR_LOSSLESS_FP4_TIER: (0.94, 0.40, 0.12, (2.5, 0.25)),

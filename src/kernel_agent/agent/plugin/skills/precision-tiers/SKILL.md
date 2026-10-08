@@ -59,8 +59,9 @@ of the elements outside the bf16 tolerance). `"precision": "fp4_weights"`
 (block-scaled FP4 weights) has its own tier, **near-lossless-fp4**: cosine >=
 0.96, relative L2 error <= 0.28, norm within ±4 %, every element within 1.25 x
 RMS + 0.25 x |reference| (skill `fp4-weights`); FP4 fails the FP8 tier.
-After timing the evaluator checks again on inputs redrawn from each tensor's own
-mean and std (the perturbed-input check). They have no outlier channels, so a
+After timing the evaluator checks again on inputs redrawn from each channel's own
+mean and std (the perturbed-input check; a single token from the tensor's, rotary
+cos / sin tables kept). A single token has no outlier channels then, so a
 weight row that writes a massive activation (VoxCPM2's LocDiT o_proj / down_proj
 row 497, 10x the median row norm) carries 10x the rounding error into a channel
 whose values are now small: there the RMS of the element bound is the larger of

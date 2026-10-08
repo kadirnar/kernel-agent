@@ -47,7 +47,7 @@ The contract:
   largest elements of every block holding a massive activation (shrunk by up to
   12.5 %): measured, it fails the tier on a DiT layer whose o_proj / down_proj inputs
   carry outlier channels (norm off by 4.0 % / 2.0 %) and passes on the same layer's
-  redrawn inputs, which have none.
+  redrawn inputs.
 * **The scale-rule guard**: define a module-level `quantize_activations(x) ->
   (codes, scales)` with the rule your kernels use (codes e4m3 `[rows, K]`, scales
   e8m0 or uint8 biased exponents `[rows, K / 32]`, unswizzled). The evaluator runs it

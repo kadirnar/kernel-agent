@@ -6,10 +6,10 @@ from scratch, with nothing shared with the evaluation:
 
 1. a *reference* subprocess (it never imports a candidate) draws ``seeds`` fresh
    inputs per captured case (:func:`fresh_inputs`): the captured shapes, dtypes,
-   strides and aliasing; floating-point tensors redrawn from each tensor's own
+   strides and aliasing; floating-point tensors redrawn from each channel's own
    statistics (:func:`kernels.verify.perturb_`: a normal draw for the first seed, a
-   uniform / Laplace / log-normal one for the others; masks and non-finite tensors
-   stay); integer and boolean tensors (ids, positions, masks) as captured; mutable
+   uniform / Laplace / log-normal one for the others; masks, rotary tables and non-finite
+   tensors stay); integer and boolean tensors (ids, positions, masks) as captured; mutable
    state objects (KV caches) copied as captured, and a stateful module's state set to
    the case's before every call (:mod:`kernel_agent.profiling.state`, in both
    subprocesses). It saves the inputs, computes the

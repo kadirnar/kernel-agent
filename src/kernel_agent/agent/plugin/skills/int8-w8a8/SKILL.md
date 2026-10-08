@@ -62,9 +62,10 @@ norm by -2.1 %: near-lossless (±2 %) rejects it, relaxed (±4 %) accepts it
 tokens: `x.reshape(-1, K).abs().amax(0)`), quantise `weight * s` (`quantize_int8(weight, s)`)
 and `x / s` (`quantize_int8_activations(x, s)`, or fold `1 / s` into the producer's weight,
 e.g. the RMSNorm's); `int8_w8a8_linear(..., smooth=s)` is the reference. The factors are
-static, so the redrawn-input check judges them: start at alpha 0.4 and keep the smallest
+static, so the redrawn and scaled checks judge them: start at alpha 0.4 and keep the smallest
 alpha that passes the captured cases (larger ones, or factors from a single decode token, fit
-the captured outliers and fail the redrawn draws). Or keep those GEMMs in FP8 / bf16 inside
+the captured outliers and fail the scaled or redrawn inputs: on the VoxCPM2 LocDiT layer
+alpha >= 0.6 fails x 0.01). Or keep those GEMMs in FP8 / bf16 inside
 the target.
 
 ## The path per GPU family

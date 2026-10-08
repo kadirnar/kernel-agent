@@ -1,8 +1,10 @@
 """The perturbed-input check of the reduced-precision tiers (#109): the reference math of
 every reduced precision passes both of the evaluator's checks (captured inputs, and inputs
-redrawn from each tensor's own mean and std by ``kernels.verify``) on a synthetic capture
-with a massive-activation writer row (VoxCPM2's LocDiT o_proj / down_proj row 497), the
-bounds of the captured inputs would reject it on the redrawn ones, and broken scales fail.
+redrawn from each channel's mean and std by ``kernels.verify``, #198) on a synthetic capture
+with a massive-activation writer row (VoxCPM2's LocDiT o_proj / down_proj row 497); where
+a redrawn input has lost the outlier channel (a single token is drawn from the tensor's
+statistics) the bounds of redrawn inputs scale the element bound per channel
+(``_wide_channel`` below); broken scales fail.
 Both quality modes with reduced precision: ``near-lossless`` and ``relaxed`` (#175, about
 twice the error budgets), where blatant bugs (int4 per tensor, scales x 1.2, a skipped
 output row, gate / up swapped) still fail. INT8 (#178: ``int8_weights``, ``int8_w8a8``)
@@ -285,14 +287,12 @@ def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, pre
     assert all(r["ok"] for r in redrawn), [r.get("error") for r in redrawn if not r["ok"]]
     if quality != "near-lossless":
         return
-    # what #109 fixed: the bounds of captured inputs reject the same draws (output channel 0
-    # keeps 6x the rounding error of the others, its values are no longer massive). INT8's
-    # uniform step is ~3x finer than e4m3's on these outlier-free draws: they fit even the
-    # bounds of captured inputs (0 of 12 weight-only, 1 of 12 W8A8 fail them)
+    # #198: the inputs are redrawn per channel, so input channel 0 keeps its offset and
+    # output channel 0 stays massive; these draws pass the bounds of captured inputs too.
+    # #109's wider bounds are for inputs drawn from the tensor's statistics (a decode token):
+    # there the massive channel is gone and its 6x rounding error is not
     old = _redrawn(writer, build, tier, perturbed=False)
-    if precision not in INT8:
-        assert sum(not r["ok"] for r in old) >= len(old) // 2
-    assert all("tolerance away" in r["error"] for r in old if not r["ok"])
+    assert all(r["ok"] for r in old), [r.get("error") for r in old if not r["ok"]]
 
 
 @pytest.mark.parametrize(

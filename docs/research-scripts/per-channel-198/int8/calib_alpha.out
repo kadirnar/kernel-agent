@@ -1,0 +1,22 @@
+
+## M = 352
+int8 W8A8 + SmoothQuant a=0.3            cap pass cos 0.99996 rel 0.0114 elem 0.12 norm 1.01% | redrawn 0/30 fail, max rel 0.0213 elem 0.20 norm 0.21% | x3:ok x0.01:ok x-1:ok (worst rel 0.0171 elem 0.15 norm 0.57%)
+int8 W8A8 + SmoothQuant a=0.4            cap pass cos 0.99997 rel 0.0082 elem 0.09 norm 0.24% | redrawn 0/30 fail, max rel 0.0212 elem 0.23 norm 0.27% | x3:ok x0.01:ok x-1:ok (worst rel 0.0169 elem 0.18 norm 0.10%)
+int8 W8A8 + SmoothQuant a=0.5            cap pass cos 0.99997 rel 0.0078 elem 0.08 norm 0.23% | redrawn 0/30 fail, max rel 0.0211 elem 0.18 norm 0.19% | x3:ok x0.01:ok x-1:ok (worst rel 0.0267 elem 0.25 norm 0.36%)
+int8 W8A8 + SmoothQuant a=0.6            cap pass cos 0.99997 rel 0.0079 elem 0.10 norm 0.13% | redrawn 0/30 fail, max rel 0.0214 elem 0.22 norm 0.15% | x3:ok x0.01:FAIL x-1:ok (worst rel 0.0631 elem 0.73 norm 3.23%)
+      first failure: scaled_x0.01: out[0]: norm x1.0323 (allowed ±3%): a systematic error, not rounding noise
+int8 W8A8 + SmoothQuant a=0.7            cap pass cos 0.99997 rel 0.0095 elem 0.15 norm 0.83% | redrawn 0/30 fail, max rel 0.0271 elem 0.69 norm 0.98% | x3:ok x0.01:FAIL x-1:FAIL (worst rel 0.4422 elem 3.90 norm 6.17%)
+      first failure: scaled_x0.01: out[0]: norm x1.0617 (allowed ±3%): a systematic error, not rounding noise
+int8 W8A8 + SmoothQuant a=0.8            cap FAIL cos 0.99996 rel 0.0209 elem 0.21 norm 2.03% | redrawn 12/30 fail, max rel 0.0783 elem 1.64 norm 2.05% | x3:ok x0.01:FAIL x-1:FAIL (worst rel 0.6058 elem 5.51 norm 8.74%)
+      first failure: out[0]: norm x0.9797 (allowed ±2%): a systematic error, not rounding noise
+
+## M = 176
+int8 W8A8 + SmoothQuant a=0.3            cap pass cos 0.99995 rel 0.0104 elem 0.12 norm 0.89% | redrawn 0/30 fail, max rel 0.0218 elem 0.24 norm 0.25% | x3:ok x0.01:ok x-1:ok (worst rel 0.0175 elem 0.14 norm 0.77%)
+int8 W8A8 + SmoothQuant a=0.4            cap pass cos 0.99997 rel 0.0083 elem 0.11 norm 0.10% | redrawn 0/30 fail, max rel 0.0215 elem 0.19 norm 0.25% | x3:ok x0.01:ok x-1:ok (worst rel 0.0175 elem 0.16 norm 0.19%)
+int8 W8A8 + SmoothQuant a=0.5            cap pass cos 0.99997 rel 0.0075 elem 0.10 norm 0.33% | redrawn 0/30 fail, max rel 0.0217 elem 0.18 norm 0.24% | x3:ok x0.01:ok x-1:ok (worst rel 0.0235 elem 0.17 norm 0.10%)
+int8 W8A8 + SmoothQuant a=0.6            cap pass cos 0.99997 rel 0.0076 elem 0.09 norm 0.04% | redrawn 0/30 fail, max rel 0.0222 elem 0.15 norm 0.16% | x3:ok x0.01:FAIL x-1:ok (worst rel 0.0615 elem 0.60 norm 3.12%)
+      first failure: scaled_x0.01: out[0]: norm x1.0312 (allowed ±3%): a systematic error, not rounding noise
+int8 W8A8 + SmoothQuant a=0.7            cap pass cos 0.99997 rel 0.0088 elem 0.12 norm 0.74% | redrawn 0/30 fail, max rel 0.0331 elem 0.62 norm 1.01% | x3:ok x0.01:FAIL x-1:FAIL (worst rel 0.4372 elem 3.91 norm 5.98%)
+      first failure: scaled_x0.01: out[0]: norm x1.0598 (allowed ±3%): a systematic error, not rounding noise
+int8 W8A8 + SmoothQuant a=0.8            cap pass cos 0.99996 rel 0.0184 elem 0.21 norm 1.77% | redrawn 8/30 fail, max rel 0.0911 elem 1.58 norm 2.43% | x3:ok x0.01:FAIL x-1:FAIL (worst rel 0.5978 elem 5.51 norm 8.53%)
+      first failure: out[0]: an element is 1.58x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la
