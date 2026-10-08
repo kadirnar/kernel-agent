@@ -1,4 +1,4 @@
-> Design for [#174](https://github.com/kadirnar/kernel-agent/issues/174): kernel-agent as a multi-agent system on one GPU. Literature review: [MULTIAGENT-LITERATURE.md](MULTIAGENT-LITERATURE.md). Implementation follows the staged PR plan in §5 (one issue per PR).
+> Design for [#174](https://github.com/kadirnar/kernel-agent/issues/174): kernel-agent as a multi-agent system on one GPU. Literature review: [MULTIAGENT-LITERATURE.md](MULTIAGENT-LITERATURE.md). Measured time split and k-agent simulation from our runs: [MULTIAGENT-DATA.md](MULTIAGENT-DATA.md) (it replaces the illustrative numbers of §4). Implementation follows the staged PR plan in §5 (one issue per PR).
 
 # #174 Multi-agent architecture: codebase audit and design proposal
 
