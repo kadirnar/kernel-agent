@@ -38,8 +38,9 @@ Measured (RTX 5070 Ti, CUDA graph, quantisation included; docs/research-scripts/
 gate|up [352, 1024] -> 8192 in 25.1 us (cuBLAS bf16 68.4, the FP8 example 32.0), at M = 704
 45.8 (126.6 / 57.7); down [352, 4096] -> 1024 20.0 (39.0 / 18.8), q|k|v -> 2560 10.6 (25.5 /
 10.8), o_proj [352, 2048] -> 1024 11.7 (22.6 / 10.7). Timed eagerly by the module evaluator
-(gate|up at M = 704): 1.65x. Report ``int8_w8a8_error(reference.weight, q, scale, x)`` on captured
-activations (weight, activation and output error; ``activation_crest`` above ~20 means
+(gate|up at M = 704, ``doctor --smoke``): 1.70x. Report ``int8_w8a8_error(reference.weight,
+q, scale, x)`` on captured activations (weight, activation and output error;
+``activation_crest`` above ~20 means
 outlier channels: SmoothQuant or FP8 / bf16 there) and the evaluator's per-case
 ``max_rel_l2`` in ``NOTES.md``.
 """

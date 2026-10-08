@@ -1049,10 +1049,11 @@ reaches the full tensor-core rate; `torch._int_mm` peaks at 327 TOPS (FP8 `_scal
 | [32, 6144] x [6144, 2048] / [64, 4096] x [4096, 1024] | 35.9 / 13.9 | skinny W8A8 22.5 / 11.5 | 36.3 / 25.1 |
 | [1, 2048] x [2048, 12288] / [1, 6144] x [6144, 2048] | 63.1 / 31.5 | GEMV (weight-only) 31.5 / 16.8 (799 / 751 GB/s) | GEMV 31.2 / 16.4 |
 
-The module evaluator (eager, warm L2) measures 1.65x for the Triton example at M = 704
-(gate|up, 540 calls), 1.88x for the GEMV at M = 1 and 1.06x for the skinny W8A8 kernel at
-[32, 6144] x [6144, 2048] (two launches per call: host bound when timed eagerly, like the
-FP8 skinny kernel's 0.98x there).
+`doctor --smoke` on the module evaluator (eager, warm L2): the Triton example 1.70x at
+M = 704 (gate|up, 540 calls; the FP8 W8A8 example 1.72x in the same run, at relative L2
+0.037 against INT8's 0.011), the GEMV 1.87x at M = 1 (the FP8 GEMV 1.98x) and the skinny
+W8A8 kernel 1.09x at 16 rows (two launches per call: host bound when timed eagerly; its GPU
+time is half of bf16's, table above).
 
 Tier calibration on real captures (every `nn.Linear` replaced by the reference math, on the
 GPU through `torch._int_mm`; captured inputs, then the evaluator's redrawn draws and the
