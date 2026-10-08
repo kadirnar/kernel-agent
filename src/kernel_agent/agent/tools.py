@@ -14,7 +14,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from kernel_agent import dedup, ledger, region, truth, workers
+from kernel_agent import dedup, gpuqueue, ledger, region, truth, workers
 from kernel_agent.budget import Budget
 from kernel_agent.dashboard import refresh
 from kernel_agent.kernels import sweep as sweep_mod
@@ -210,6 +210,7 @@ def record_candidate(
     worker: int | None = None,
     mode: str = dedup.FULL,
     reevaluates: dict[str, Any] | None = None,
+    queue_s: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
 
@@ -221,6 +222,8 @@ def record_candidate(
     ``mode`` check goes to ``quick.jsonl`` instead, as a ``quick_ok`` / ``quick_fail`` row.
     ``reevaluates``: the earlier record of the same snapshot this evaluation replaces
     (its ``exp``, ``speedup``, why; a ``re-evaluated`` row, :func:`current_records`).
+    ``queue_s``: the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`; ``eval_s``
+    is the evaluation's own time).
     """
     target_dir = run.target(target_id)
     quick = mode == dedup.QUICK
@@ -239,6 +242,7 @@ def record_candidate(
         idea=idea,
         worker=worker,
         status=ledger.REEVALUATED if reevaluates else status,
+        queue_s=queue_s,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -259,6 +263,7 @@ def record_candidate(
         **({"worker": worker} if worker else {}),
         **({"mode": dedup.QUICK} if quick else {}),
         **({"reevaluates": reevaluates} if reevaluates else {}),
+        **({"queue_s": queue_s} if queue_s is not None else {}),
     }
     if isinstance(record.get("error"), str):
         record["error"] = record["error"][-1500:]
@@ -320,6 +325,7 @@ def record_e2e_result(
     eval_s: float | None = None,
     when: float | None = None,
     keeper: Truth | None = None,
+    queue_s: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append an ``evaluate_e2e`` measurement to the transforms' ``results.jsonl`` and the
     ledger; ``transforms_sha256`` holds the digests of the snapshots it measured; a run
@@ -332,6 +338,7 @@ def record_e2e_result(
         hypothesis=hypothesis,
         eval_s=eval_s,
         when=when,
+        queue_s=queue_s,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -342,6 +349,7 @@ def record_e2e_result(
         "exp": row["exp"],
         "ledger_status": row["status"],
         "hypothesis": hypothesis,
+        **({"queue_s": queue_s} if queue_s is not None else {}),
     }
     _append(run, None, record, keeper)
     return record, row
@@ -610,10 +618,12 @@ def build_server(
             snap = snapshot(run, src, target_id)
             snap_sha256 = sha256_file(snap)
             start = time.perf_counter()
+            job = gpuqueue.Job.of(run, "quick" if quick else "eval", target_id)
             # a project compiles outside the GPU lock first: a compiler error is its result
             result = await asyncio.to_thread(_prebuilt, snap)
             if result is None:
-                result = await asyncio.to_thread(
+                result = await gpuqueue.run(
+                    job,
                     run_evaluation,
                     capture,
                     snap,
@@ -640,13 +650,14 @@ def build_server(
                 result,
                 hypothesis=hypothesis,
                 parent=args.get("parent"),
-                eval_s=round(time.perf_counter() - start, 1),
+                eval_s=round(time.perf_counter() - start - job.wait_s, 1),
                 snapshot_sha256=snap_sha256,
                 keeper=keeper,
                 idea=idea,
                 expected_speedup=expected,
                 worker=mine.worker if mine else None,
                 mode=mode,
+                queue_s=job.queue_s,
             )
         finally:
             _inflight.pop(slot, None)
@@ -657,8 +668,12 @@ def build_server(
         if str(args.get("profile")).lower() == "ncu" and not quick and result.get("correct"):
             from kernel_agent.kernels import ncu  # Nsight Compute (#10): not stored
 
-            out["ncu"] = await asyncio.to_thread(
-                ncu.profile_candidate, capture, snap, capture_sha256=capture_sha256
+            out["ncu"] = await gpuqueue.run(
+                gpuqueue.Job.of(run, "ncu", target_id),
+                ncu.profile_candidate,
+                capture,
+                snap,
+                capture_sha256=capture_sha256,
             )
         if quick:
             out["mode"], out["not_a_benchmark"] = dedup.QUICK, QUICK_NOTE
@@ -765,7 +780,9 @@ def build_server(
             return snap
 
         start = time.perf_counter()
-        data = await asyncio.to_thread(
+        job = gpuqueue.Job.of(run, "sweep", target_id)
+        data = await gpuqueue.run(
+            job,
             sweep_mod.run_sweep,
             capture,
             src,
@@ -798,12 +815,13 @@ def build_server(
             result,
             hypothesis=f"{hypothesis} [sweep: {tag}]",
             parent=args.get("parent"),
-            eval_s=round(time.perf_counter() - start, 1),
+            eval_s=round(time.perf_counter() - start - job.wait_s, 1),
             snapshot_sha256=snap_sha256,
             keeper=keeper,
             idea=idea,
             expected_speedup=expected,
             worker=mine.worker if mine else None,
+            queue_s=job.queue_s,
         )
         await asyncio.to_thread(refresh, run, target_id)
         out = compact(result)
@@ -914,20 +932,22 @@ def build_server(
             kernels.append(kernel)
             cli += ["--kernel", f"{target_id}={kernel}"]
         start = time.perf_counter()
+        job = gpuqueue.Job.of(run, "e2e")
         result: dict[str, Any] | None = None
         for file in [*snaps, *kernels]:  # projects compile outside the GPU lock, first
             if result is None:
                 result = await asyncio.to_thread(_prebuilt, file)
         if result is None:
-            result = await asyncio.to_thread(call_worker, run, "e2e", *cli, *keeper.worker_args())
+            result = await gpuqueue.run(job, call_worker, run, "e2e", *cli, *keeper.worker_args())
         _, row = record_e2e_result(
             run,
             result,
             snaps,
             args.get("kernels") or [],
             hypothesis=str(args.get("hypothesis") or ""),
-            eval_s=round(time.perf_counter() - start, 1),
+            eval_s=round(time.perf_counter() - start - job.wait_s, 1),
             keeper=keeper,
+            queue_s=job.queue_s,
         )
         await asyncio.to_thread(refresh, run)
         result["ledger"] = {"exp": row["exp"], "status": row["status"]}
@@ -953,7 +973,8 @@ def build_server(
         from kernel_agent.workspace import write_json
 
         write_json(run.run_json, cfg)
-        result = await asyncio.to_thread(call_worker, run, "analyze", "--no-profile")
+        job = gpuqueue.Job.of(run, "harness")
+        result = await gpuqueue.run(job, call_worker, run, "analyze", "--no-profile")
         if "error" not in result:
             result["status"] = "ok"
         return _text(result)
@@ -986,7 +1007,8 @@ def build_server(
     async def verify_rewrite(args: dict[str, Any]) -> dict[str, Any]:
         timeout = budget.eval_timeout_s
         target_id = str(args["target_id"])
-        result = await asyncio.to_thread(region.check, run, target_id, keeper, timeout=timeout)
+        job = gpuqueue.Job.of(run, "verify_rewrite", target_id)
+        result = await gpuqueue.run(job, region.check, run, target_id, keeper, timeout=timeout)
         return _text(result)
 
     doc_search, doc_read = doc_tools()

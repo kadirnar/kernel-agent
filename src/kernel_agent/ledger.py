@@ -40,6 +40,9 @@ when the target has parallel workers (:mod:`kernel_agent.workers`; empty otherwi
 ``data_dependent`` when that speedup changes with the input (:mod:`kernel_agent.diversity`;
 a label, the classification is the benchmark input's).
 
+``eval_s`` is the time an evaluation took, without the time it waited for the GPU behind
+other jobs (``queue_s``, :mod:`kernel_agent.gpuqueue`; empty when not known).
+
 ``results.jsonl`` (``RunDir.results_file``) keeps the full records; the TSV is the readable
 summary that the charts, ``kernel-agent status`` and ``dashboard.html`` read.
 """
@@ -75,6 +78,7 @@ COLUMNS = (
     "spread",
     "pct_of_sol",
     "eval_s",
+    "queue_s",
     "diverse_speedup",
     "flags",
     "worker",
@@ -113,6 +117,7 @@ _FLOATS = {
     "spread",
     "pct_of_sol",
     "eval_s",
+    "queue_s",
     "diverse_speedup",
 }
 # Statuses of the evaluator / e2e worker that are not ledger statuses.
@@ -406,11 +411,13 @@ def record_kernel(
     idea: str = "",
     worker: int | None = None,
     status: str | None = None,
+    queue_s: float | None = None,
 ) -> dict[str, Any]:
     """Classify a kernel evaluation against the target's running best and append it.
 
     ``status``: a status of :data:`UNMEASURED` instead of the classification;
-    ``worker``: the target's worker that ran it (:mod:`kernel_agent.workers`)."""
+    ``worker``: the target's worker that ran it (:mod:`kernel_agent.workers`); ``queue_s``:
+    the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == target_id])
         row = append(
@@ -430,6 +437,7 @@ def record_kernel(
                 "spread": kernel_spread(result),
                 "pct_of_sol": _num(result.get("pct_of_sol")),
                 "eval_s": eval_s if eval_s is not None else _num(result.get("eval_seconds")),
+                "queue_s": queue_s,
                 "idea": idea,
                 "hypothesis": hypothesis,
                 "worker": worker,
@@ -452,6 +460,7 @@ def record_e2e(
     parent: str | None = None,
     eval_s: float | None = None,
     when: float | None = None,
+    queue_s: float | None = None,
 ) -> dict[str, Any]:
     """Classify an end-to-end measurement (transform or integration step) and append it."""
     with _lock:
@@ -476,6 +485,7 @@ def record_e2e(
                 else None,
                 "spread": e2e_spread(result),
                 "eval_s": eval_s,
+                "queue_s": queue_s,
                 "diverse_speedup": diversity.median_speedup(result),
                 "flags": diversity.flags(result),
                 "hypothesis": hypothesis,
@@ -527,6 +537,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
                 "spread": kernel_spread(rec),
                 "pct_of_sol": _num(rec.get("pct_of_sol")),
                 "eval_s": _num(rec.get("eval_seconds")),
+                "queue_s": _num(rec.get("queue_s")),
                 "idea": rec.get("idea") or "",
                 "hypothesis": rec.get("hypothesis") or "",
                 "worker": rec.get("worker"),
@@ -550,6 +561,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
             "est_saved_ms": round(base - new, 3) if base is not None and new is not None else None,
             "spread": e2e_spread(rec),
             "eval_s": None,
+            "queue_s": _num(rec.get("queue_s")),
             "idea": "",
             "hypothesis": rec.get("hypothesis") or "",
         }

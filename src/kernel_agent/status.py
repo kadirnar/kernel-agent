@@ -6,7 +6,15 @@ import shutil
 import textwrap
 from typing import Any
 
-from kernel_agent import backends, diversity, ledger, objective, projection, strong_baseline
+from kernel_agent import (
+    backends,
+    diversity,
+    gpuqueue,
+    ledger,
+    objective,
+    projection,
+    strong_baseline,
+)
 from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
@@ -161,6 +169,8 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         lines.append("no evaluations yet")
     if per_backend := backends.status_lines(run, s["rows"]):  # by source, priors left out
         lines += ["", *(line[:width] for line in per_backend)]
+    if gpu := gpuqueue.status_lines(run, width):  # the GPU job queue (gpu_queue.jsonl)
+        lines += ["", *gpu]
 
     recent = s["rows"][-last:]
     if recent:
