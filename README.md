@@ -1283,6 +1283,60 @@ disjoint green contexts (SMs granted) whose streams run torch work. A probe that
 `~/.cache/kernel-agent/probes-<gpu>-torch<version>.json`.
 `kernel-agent memcheck capture.pt candidate.py` runs one candidate.
 
+### A self-contained `optimized/`: its run files and a self-test
+
+An accepted transform or kernel can load another file of the run: a native
+project's bundle by its snapshot name (a speculative decoder around a decode-step
+engine, say), an earlier snapshot, a helper module next to it. The export
+(`integrate/export.py`, issue #171) copies every such file into `optimized/`,
+where the item's own lookup finds it, without rewriting the item: at the same
+position relative to the item's directory (a sibling snapshot next to
+`transforms/<item>.py`, `../history/x.py` in `optimized/history/`), else next to
+it by name. `manifest.json` lists them per item (`needs`: file, source, sha256).
+They are found two ways (`integrate/deps.py`), and followed (a needed file's own
+needs count too):
+
+* **statically**: string literals that name an existing source file of the run
+  (a history snapshot's name, also without `.py`) or a native project directory,
+  relative to the file's directory, its `history/`, `../history/`, `..` or the run
+  directory, or by an absolute path in the run; and the modules it imports from
+  its own directory (the run's loaders and `apply.py` put that directory on
+  `sys.path`);
+* **at run time**: what an item loaded through the helper
+  `kernel_agent.artifacts` (`artifacts.load("028_..._2c930eef.py")` or
+  `artifacts.find(...)`, looked up next to the calling file, in its `history/`,
+  `../history/` and `..`). Worker processes that apply the run's items (`e2e`,
+  `e2e_ab`, `analyze`) record each lookup in `logs/artifacts.jsonl` with the
+  calling file's sha256, so a name computed at run time is copied too. The
+  systems and native agents are told to load run files this way
+  (`knowledge/systems.md`, `knowledge/native.md`).
+
+Then the integration **self-tests** the package: a copy of `optimized/` in a new
+temporary directory is imported (its `apply.py`) and applied to the workload in a
+fresh worker process (`worker export_check`) whose working directory is that
+copy's directory and which cannot open any file of the run directory but the
+harness (an audit hook, after the workload and the baseline output are loaded).
+One run's output must pass the workload's quality check against the baseline
+output, each kernel must replace as many module instances as in the
+integration's final measurement, every transform must apply, and no run file may
+be opened (a transform that falls back silently when it cannot read one fails
+too). A failure fails the export: `integrate: export FAILED its self-test:
+missing: not self-contained, missing 028_decode_step_megakernel_2c930eef.py
+(...)`, an `export_failed` event with the missing files, and
+`optimized/export_check.json` (`report.md` says so); the run goes on. Each result
+also goes to `logs/export_checks.jsonl`, and a passing result is reused while the
+package and the baseline are unchanged. `--no-export-check` turns it off; a
+simulated run skips it.
+
+`python -m kernel_agent.integrate.export RUN_DIR [--no-check]` re-exports a run
+from its `integration.json` (also a moved or copied run directory) and
+self-tests it: an older run's incomplete `optimized/`, say. On the Qwen3-0.6B run
+of 2026-10-08 (one accepted transform, 68.1× in the integration), the run's own
+`optimized/` fails the self-test with `missing 028_decode_step_megakernel_2c930eef.py`
+(6 s); the re-export copies that bundle to `optimized/transforms/` and passes
+(64 of 64 tokens equal to the baseline's, 30 s including the model load, the
+native build from its cache and the transform's compile).
+
 ### Ground truth the agents cannot quietly change
 
 Agents have a Bash tool, so file permissions alone cannot protect what the
@@ -3038,13 +3092,16 @@ runs/<org>--<name>/<timestamp>/
   results.tsv                 experiment ledger: one row per evaluation
   events.jsonl                phase changes, agent start/stop, evaluations
   progress.png  amdahl.png  integration.png  dashboard.html
-  integration.json  report.md  logs/  (incl. logs/program-<sha12>.md)
+  integration.json  report.md  logs/  (incl. logs/program-<sha12>.md, artifacts.jsonl:
+                              kernel_agent.artifacts lookups, export_checks.jsonl)
   improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256,
                               auth, api_key_source, billing (+ usage_limit_waits, web)
   research/sources.jsonl      every WebFetch / WebSearch: time, URL or query, outcome, sha256
   optimized/                  apply.py + manifest.json + kernels/ (+ rewrites/ of region targets)
+                              + transforms/, the run files they load (manifest `needs`) and
+                              export_check.json (the self-test, see above)
 ```
 
 To use the result in your own code:

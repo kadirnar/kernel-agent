@@ -48,6 +48,9 @@ class OptimizeConfig:
     #: Integration: re-check every kernel on fresh inputs, reference and kernel timed in
     #: processes of their own (kernels/recheck.py); a kernel that fails it is refused.
     recheck: bool = True
+    #: Integration: import and apply the exported optimized/ in a fresh process outside the
+    #: run directory (integrate/export.py, issue #171); a failure names the missing files.
+    export_check: bool = True
     #: "exact" (numerics within rounding noise) or "near-lossless": numerics-changing
     #: optimisations pass when the perceptual quality stays within the noise of eager
     #: (workloads/perceptual.py).

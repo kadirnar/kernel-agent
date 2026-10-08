@@ -89,3 +89,23 @@ with the async stop check, the post stage per finished request (on a `SideStage`
 `_max`). It is a benchmark option of the workload (`-o serving=continuous`), not a
 transform: the default fixed-length benchmark is unchanged and every candidate is compared
 on the same schedule.
+
+## 4. Building on another file of the run
+
+A transform that uses another evaluated file (a native project's bundle, an earlier
+snapshot, a helper module) loads it by its snapshot name through `kernel_agent.artifacts`:
+
+```python
+from kernel_agent import artifacts
+
+engine = artifacts.load("012_decode_loop_engine_1a2b3c4d.py")  # a history/ snapshot: the module
+path = artifacts.find("012_decode_loop_engine_1a2b3c4d.py")  # or only its path
+```
+
+It looks next to the calling file, then in its `history/`, `../history/` and `..`, so the
+same call works from your copy, from the evaluated snapshot and from the exported
+`optimized/` package. The export copies what an accepted transform loaded this way (and any
+run file whose name is a string literal in it) next to it, then applies the package in a
+fresh process that cannot read the run directory; a transform that reads a run file by an
+absolute path, relative to the run directory or by a glob for the newest snapshot fails
+that self-test.

@@ -52,6 +52,7 @@ from kernel_agent.agent.tools import (
 from kernel_agent.budget import MIN_AGENT_SECONDS, MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
+from kernel_agent.integrate import export as export_mod
 from kernel_agent.integrate import owners as owners_mod
 from kernel_agent.integrate import reuse as reuse_cache
 from kernel_agent.integrate.export import export_optimized
@@ -102,6 +103,9 @@ class Orchestrator:
         # The memcheck of a kernel that passed its re-check (kernels/memcheck.py); None = the
         # real one, which a simulated run skips.
         self.memchecker: Callable[..., dict[str, Any]] | None = None
+        # The self-test of the exported optimized/ (integrate/export.py check_export); None =
+        # the real one, which a simulated run (or a fake GPU worker) skips.
+        self.export_checker: Callable[..., dict[str, Any]] | None = None
         # (target, snapshot name) -> the conservative speedup of a kernel whose re-check
         # disagrees with its record (recheck.speed_warning): what ranks and projects it.
         self.speed_caps: dict[tuple[str, str], float] = {}
@@ -1049,6 +1053,7 @@ class Orchestrator:
                 f"(unchanged content), {counts['measured']} measured"
             )
         export_optimized(self.run, [(k, a, 0.0) for k, a in accepted], digests=digests)
+        self._check_export(final)
         self._library_store([a for k, a in accepted if k == "kernel"], final)
         if final:
             _, vs_compiled = strong_baseline.speedups(baseline, final["median_ms"])
@@ -1066,6 +1071,31 @@ class Orchestrator:
         else:
             log("integrate: no optimisation survived end-to-end validation")
         self._mark("integrate", speedup=final["speedup"] if final else 1.0)
+
+    def _check_export(self, final: dict[str, Any] | None) -> dict[str, Any] | None:
+        """The self-test of the exported ``optimized/`` (``integrate/export.py``, #171): it is
+        imported and applied in a fresh process outside the run directory. A failure fails
+        the export: a log line naming the files the package lacks, an ``export_failed`` event
+        and ``optimized/export_check.json``; the run goes on. None: not checked (nothing
+        accepted, ``--no-export-check``, a simulated run)."""
+        if final is None or not self.cfg.export_check:
+            return None
+        checker = self.export_checker
+        if checker is None:
+            if self.simulated or self.worker is not None:  # no GPU worker to import it in
+                return None
+            checker = export_mod.check_export
+        expected = final.get("patches")
+        result = checker(self.run, call_worker, self.truth.worker_args(), expected=expected)
+        if result.get("passed"):
+            again = " (the same package passed before)" if result.get("reused") else ""
+            log(f"integrate: export self-test passed{again}: {result.get('reason')}")
+            ledger.event(self.run, "export_check", passed=True, reused=bool(result.get("reused")))
+        else:
+            log(f"integrate: export FAILED its self-test: {result.get('reason')}")
+            missing = result.get("missing") or []
+            ledger.event(self.run, "export_failed", reason=result.get("reason"), missing=missing)
+        return result
 
     def _reuse_context(self, base_ms: float) -> dict[str, Any]:
         """What an integration measurement depends on besides its items, part of every

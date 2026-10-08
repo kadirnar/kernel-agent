@@ -7,6 +7,7 @@ orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
                                           [--baseline-ms MS] [--verify REL=SHA256 ...]
     python -m kernel_agent.worker e2e_ab  --run-dir R [A: --kernel ... --transform ...]
                                           [B: --b-kernel ... --b-transform ...] [--rounds K]
+    python -m kernel_agent.worker export_check --run-dir R --package DIR [--verify ...]
 
 A step that runs out of GPU memory has status ``oom`` (``abtest.OOM``), also when a check
 that catches its own errors ran out (the perceptual gate, say: no quality verdict); the
@@ -16,6 +17,7 @@ integration measures it again in separate processes with ``--expandable-segments
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -23,11 +25,11 @@ import subprocess
 import sys
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import precisions, truth
+from kernel_agent import artifacts, precisions, truth
 from kernel_agent.gpulock import child_env, gpu_lock
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -346,6 +348,59 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "peak_mem_gb": round(timing["peak_mem_gb"], 3),
         "patches": report.__dict__,
         **({"gpu": gpu} if (gpu := monitor.summary()) else {}),
+    }
+
+
+def cmd_export_check(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    """The export self-test (``integrate/export.py``, issue #171): import ``--package`` (a
+    copy of ``optimized/`` outside the run directory) as a user would and apply it to the
+    workload while no file of the run directory can be opened (but the harness), then judge
+    one run's output with the workload's quality check against the baseline output (in a
+    near-lossless run with a perceptual baseline: its sanity floor, as ``e2e`` does before
+    the perceptual gate). ``missing``: the run files it tried to open and the files an
+    error names."""
+    import torch
+
+    from kernel_agent.integrate import export
+    from kernel_agent.workloads import perceptual
+    from kernel_agent.workloads.base import measure
+    from kernel_agent.workloads.quality import assess, is_chaotic
+
+    if ns.package is None:
+        raise ValueError("export_check needs --package")
+    try:  # everything from the run directory first: it is hidden while the package runs
+        reference_bytes, baseline_bytes, _, _, perceptual_bytes = _truth_files(run, ns)
+    except truth.TamperError as exc:
+        return {"status": "tampered", "passed": False, "error": str(exc)}
+    mode = _quality(ns, run)
+    workload = _workload(run)
+    reference = torch.load(io.BytesIO(reference_bytes), weights_only=False)
+    baseline = json.loads(baseline_bytes or b"{}")
+    gate: Any = None
+    if perceptual_bytes and mode == perceptual.NEAR_LOSSLESS:
+        gate = torch.load(io.BytesIO(perceptual_bytes), weights_only=False)
+    with export.hidden(run.root, allow=[run.harness]) as refused:
+        try:
+            applied = export.apply_package(ns.package.resolve(), workload)
+            inputs = workload.make_inputs()
+            timing = measure(workload, inputs, warmup=1, iters=1)
+            with perceptual.judging(workload, mode, gate):
+                chaotic = is_chaotic(workload, baseline)
+                verdict = assess(workload, inputs, reference, timing["output"], chaotic=chaotic)
+        except Exception as exc:
+            lacks = export.missing(exc, refused, run.root)
+            return _failed("missing" if lacks else "error", missing=lacks or None)
+    if refused:  # the package read a run file and went on (a fallback): not self-contained
+        lacks = export.missing(None, refused, run.root)
+        reason = "it opened files of the run directory"
+        return {"status": "missing", "passed": False, "reason": reason, "missing": lacks}
+    return {
+        "status": "ok",
+        "passed": verdict["passed"],
+        "reason": verdict["reason"],
+        "metrics": verdict["metrics"],
+        "median_ms": round(timing["median_ms"], 3),
+        **applied,
     }
 
 
@@ -702,7 +757,29 @@ COMMANDS = {
     "capture": cmd_capture,
     "e2e": cmd_e2e,
     "e2e_ab": cmd_e2e_ab,
+    "export_check": cmd_export_check,
 }
+#: Commands that apply the run's items: their ``kernel_agent.artifacts`` lookups are recorded.
+RECORDED = ("analyze", "e2e", "e2e_ab")
+
+
+@contextlib.contextmanager
+def _recording(command: str, run: RunDir) -> Iterator[None]:
+    """The ``kernel_agent.artifacts`` lookups of a command that applies the run's items go
+    to the run's log, so the export copies what they found (#171); ``export_check``, which
+    must not open run files, records none. The environment is restored afterwards."""
+    before = os.environ.get(artifacts.LOG_ENV)
+    if command in RECORDED:
+        os.environ[artifacts.LOG_ENV] = before or str(artifacts.log_file(run.root))
+    elif command == "export_check":
+        os.environ.pop(artifacts.LOG_ENV, None)
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop(artifacts.LOG_ENV, None)
+        else:
+            os.environ[artifacts.LOG_ENV] = before
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -721,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--no-profile", action="store_true")
     parser.add_argument("--out-dir", type=Path, help="analyze: write baseline + profile here")
+    parser.add_argument("--package", type=Path, help="export_check: the copy of optimized/")
     parser.add_argument("--baseline-ms", type=float, help="e2e: the speedup denominator")
     parser.add_argument(
         "--verify", action="append", help="e2e: REL=SHA256, refuse a run file without it"
@@ -742,7 +820,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     run = RunDir(ns.run_dir.resolve())
     try:
-        result = COMMANDS[ns.command](run, ns)
+        with _recording(ns.command, run):
+            result = COMMANDS[ns.command](run, ns)
     except Exception:
         result = _failed("error", traceback.format_exc()[-6000:])
         result.pop("passed")  # an error of the command, not a verdict (as before)
@@ -750,16 +829,18 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if "error" in result else 0
 
 
-def call_worker(run: RunDir, command: str, *args: str, timeout: float = 3600.0) -> dict[str, Any]:
-    """Run a worker command under the GPU lock; returns its JSON result, with the GPU of
-    the pool it ran on (``gpu_index``)."""
+def call_worker(
+    run: RunDir, command: str, *args: str, timeout: float = 3600.0, cwd: str | Path | None = None
+) -> dict[str, Any]:
+    """Run a worker command under the GPU lock (in ``cwd``, default: this process's);
+    returns its JSON result, with the GPU of the pool it ran on (``gpu_index``)."""
     cmd = [sys.executable, "-m", "kernel_agent.worker", command, "--run-dir", str(run.root), *args]
     log = run.root / "logs" / f"worker-{command}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with gpu_lock() as gpu:
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout, env=child_env()
+                cmd, capture_output=True, text=True, timeout=timeout, env=child_env(), cwd=cwd
             )
         except subprocess.TimeoutExpired:
             return {

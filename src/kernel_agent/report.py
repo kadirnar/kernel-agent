@@ -224,6 +224,16 @@ def _quality_lines(
     ]
 
 
+def _export_check_lines(run: RunDir) -> list[str]:
+    """The export self-test's verdict on ``optimized/`` (``integrate/export.py``), if any."""
+    check = read_json(run.optimized_dir / "export_check.json", {}) or {}
+    if not check:
+        return []
+    if check.get("passed"):
+        return [f"Export self-test: passed ({check.get('reason')}).", ""]
+    return [f"**Export self-test FAILED**: {check.get('reason')}", ""]
+
+
 def write_report(run: RunDir) -> Path:
     refresh(run)  # charts + dashboard.html, so the report embeds current images
     data = run.load()
@@ -501,6 +511,7 @@ def write_report(run: RunDir) -> Path:
         ),
         "```",
         "",
+        *_export_check_lines(run),
     ]
     run.report.write_text("\n".join(lines))
     return run.report
