@@ -26,11 +26,12 @@ message, with the session's digest and budget after it).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import importlib.util
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -179,13 +180,45 @@ def _target_skill_lines(backends: list[str], precision: str | None) -> str:
     return "\n# Skills of this target\nLoad these too before you start:\n" + "\n".join(lines) + "\n"
 
 
+#: How the agents' own commands reach the GPU (``--agent-gpu``, #185): ``bash`` (their Bash
+#: commands see it) or ``tool`` (they do not: ``run_on_gpu``); the environment section of every
+#: prompt says it. ``improve`` sets it for the sessions of a run (:func:`gpu_access`).
+_agent_gpu = "bash"
+
+#: The environment section's GPU line per ``--agent-gpu`` mode.
+GPU_ACCESS = {
+    "bash": """* GPU access is serialised by the evaluation tools. Do not run long GPU jobs
+  yourself; short compile/debug scripts are fine.""",
+    "tool": """* Several agent sessions share this GPU and evaluations are timed on it, so your Bash
+  commands see no GPU (`CUDA_VISIBLE_DEVICES` is empty). Compile there: `load_inline`,
+  nvcc and `TORCH_CUDA_ARCH_LIST` work without a GPU. Run every script that needs the
+  GPU (a correctness check, a microbenchmark) with `run_on_gpu(script=..., args=[...],
+  timeout=...)` (at most 120 s): it takes its turn in the GPU job queue and returns the
+  exit code and the tail of the output. Pass `benchmark=true` when the script times
+  something (it then has the GPU alone); a correctness check that gives `mem_gb` may
+  share the GPU. Correctness on the captured cases: `evaluate_candidate(mode="quick")`.""",
+}
+
+
+@contextlib.contextmanager
+def gpu_access(mode: str) -> Iterator[None]:
+    """The prompts built inside say the agents reach the GPU by ``mode`` (:data:`GPU_ACCESS`)."""
+    global _agent_gpu
+    if mode not in GPU_ACCESS:
+        raise ValueError(f"--agent-gpu is one of {', '.join(GPU_ACCESS)}, not {mode!r}")
+    before, _agent_gpu = _agent_gpu, mode
+    try:
+        yield
+    finally:
+        _agent_gpu = before
+
+
 def _env_block(python: str, toolchain_summary: str) -> str:
     return f"""## Environment
 * Python interpreter for every command: `{python}` (torch, transformers, diffusers,
   triton, cutlass DSL, tilelang, cuda.core are installed there). Never install,
   upgrade or downgrade torch / CUDA packages.
-* GPU access is serialised by the evaluation tools. Do not run long GPU jobs
-  yourself; short compile/debug scripts are fine.
+{GPU_ACCESS[_agent_gpu]}
 * Toolchain:
 ```
 {toolchain_summary}

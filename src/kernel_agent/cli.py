@@ -391,6 +391,8 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         critic_wait=ns.critic_wait,
         migrate_every=ns.migrate_every,
         cull_gap=ns.cull_gap,
+        agent_gpu=ns.agent_gpu,
+        timing_cores=ns.timing_cores,
         policy=Policy(
             patience=ns.patience,
             sol_stop=ns.sol_stop or None,
@@ -874,13 +876,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--agents",
         type=_agents,
-        default=1,
+        default=3,
         metavar="N",
-        help="agent sessions at once (default 1: one at a time, as before). With N > 1 the "
-        "slots go to the arms that pay (slices, research sessions, dossiers), the GPU "
-        "evaluations take turns in the GPU job queue, the re-integration runs in the "
-        "background and a usage limit pauses every session once (docs/MULTIAGENT.md); "
-        "k = 3-4 is the measured sweet spot on one GPU",
+        help="agent sessions at once (default 3; 1: one at a time, the sequential loop). "
+        "With N > 1 the slots go to the arms that pay (slices, research sessions, dossiers), "
+        "the GPU evaluations take turns in the GPU job queue with clean timing (the agents' "
+        "GPU scripts through run_on_gpu, timing cores, builds before the lock, dirty "
+        "timings re-run), the re-integration runs in the background and a usage limit "
+        "pauses every session once (docs/MULTIAGENT.md); k = 3-4 is the measured sweet "
+        "spot on one GPU",
     )
     p.add_argument(
         "--role-max",
@@ -938,6 +942,23 @@ def main(argv: list[str] | None = None) -> int:
         metavar="F",
         help="--islands: an island this share below its target's best after 8 evaluations "
         "and 2 sessions without a new island best is reseeded from that best (0: never)",
+    )
+    p.add_argument(
+        "--agent-gpu",
+        choices=["tool", "bash"],
+        default=None,
+        help="how the agents' own scripts reach the GPU: tool (default with --agents > 1: "
+        "their Bash commands see no GPU and run GPU scripts with run_on_gpu, through the GPU "
+        "job queue, so they never run during a timed evaluation) or bash (they see it)",
+    )
+    p.add_argument(
+        "--timing-cores",
+        type=int,
+        default=None,
+        metavar="N",
+        help="physical CPU cores the timed GPU jobs get to themselves while builds and the "
+        "agents run on the others at a lower priority (default 2 with --agents > 1, off below "
+        "8 CPUs; 0: no CPU isolation)",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="simulated agents and GPU (no Claude, no GPU)"

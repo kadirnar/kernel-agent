@@ -596,11 +596,13 @@ def build_server(
     budget: Budget | None = None,
     keeper: Truth | None = None,
     binding: SessionBinding | None = None,
+    env: dict[str, str] | None = None,
 ) -> Any:
     """Tools bound to one run directory (its budget: eval timeout + advice; its truth) and
     to one agent session (:class:`SessionBinding`: its label, worker directory, the name its
     budget advice is kept under, its evaluation budget and working directory). Build one
-    server per session (``Orchestrator._agent``)."""
+    server per session (``Orchestrator._agent``); ``env``: the session's environment
+    (``runner.agent_env``), the one ``run_on_gpu`` runs its scripts in."""
     budget = budget or Budget(run)
     keeper = keeper or truth.of(run)
     bound = binding or SessionBinding()
@@ -1357,6 +1359,7 @@ def build_server(
         except board.Refused as exc:
             return _text({"status": "error", "error": str(exc)})
 
+    run_on_gpu = gpu_tool(run, bound, env)
     doc_search, doc_read = doc_tools()
     tools = [
         evaluate_candidate,
@@ -1366,12 +1369,93 @@ def build_server(
         check_harness,
         run_info,
         verify_rewrite,
+        run_on_gpu,
         doc_search,
         doc_read,
     ]
     if reader is not None:  # a session of a role with the board (board.ROLES)
         tools += [post_note, read_board]
     return create_sdk_mcp_server(SERVER_NAME, version="0.1.0", tools=tools)
+
+
+def gpu_tool(run: RunDir, bound: SessionBinding, env: dict[str, str] | None) -> Any:
+    """``run_on_gpu`` (#185): a session's own GPU script through the GPU job queue
+    (``devrun.py``), in its working directory and environment (``env``)."""
+    from kernel_agent import devrun
+
+    def home() -> Path:
+        """The session's working directory: where its scripts run and are looked up."""
+        if bound.cwd is not None:
+            return bound.cwd
+        if bound.target_id and bound.worker is not None:
+            return workers.directory(run, bound.target_id, bound.worker)
+        if bound.target_id:
+            return run.target(bound.target_id)
+        return run.transforms_dir if bound.role in ("systems", "native") else run.root
+
+    @tool(
+        "run_on_gpu",
+        "Run one of your Python scripts on the GPU: `python SCRIPT ARGS` in your working "
+        "directory, through the GPU job queue (after the evaluations waiting, never during "
+        "another session's timed evaluation), stopped after `timeout` seconds (at most "
+        f"{devrun.MAX_TIMEOUT_S:.0f}). Returns its exit code, seconds and the tail of its "
+        "output. benchmark=true when it times something: it then has the GPU alone. A "
+        "correctness check that gives mem_gb (its peak GPU memory) may share the GPU with "
+        "other such checks. Correctness on the captured cases: evaluate_candidate "
+        'mode="quick".',
+        {
+            "type": "object",
+            "properties": {
+                "script": {"type": "string", "description": "path to the .py script"},
+                "args": {"type": "array", "items": {"type": "string"}},
+                "timeout": {
+                    "type": "number",
+                    "description": f"seconds, at most {devrun.MAX_TIMEOUT_S:.0f}",
+                    "default": 60,
+                },
+                "benchmark": {
+                    "type": "boolean",
+                    "description": "true: it times something (it runs alone on the GPU)",
+                    "default": False,
+                },
+                "mem_gb": {
+                    "type": "number",
+                    "description": "its peak GPU memory in GB: a correctness check that "
+                    "fits may share the GPU with other checks (without it: alone)",
+                },
+            },
+            "required": ["script"],
+        },
+    )
+    async def run_on_gpu(args: dict[str, Any]) -> dict[str, Any]:
+        base = home()
+        script = _resolve(base, str(args.get("script") or ""))
+        if not script.is_file():
+            return _text({"status": "error", "error": f"{script} is not a file"})
+        try:
+            mem = float(args["mem_gb"]) if args.get("mem_gb") is not None else None
+            timeout = float(args.get("timeout") or 60)
+        except (TypeError, ValueError):
+            return _text({"status": "error", "error": "timeout and mem_gb are numbers"})
+        shared = not args.get("benchmark") and mem is not None and mem > 0
+        job = gpuqueue.Job.of(
+            run, "dev", bound.target_id, exclusive=not shared, mem_gb=mem if shared else None
+        )
+        argv = [str(a) for a in args.get("args") or []]
+        result = await gpuqueue.run(
+            job, devrun.run_script, script, argv, cwd=base, timeout=timeout, env=env
+        )
+        result["queue_s"] = job.queue_s or 0.0
+        if shared:
+            result["shared"] = True  # other correctness checks may have run beside it
+        log = run.root / "logs" / "run_on_gpu.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as fh:  # a record for humans, not the agent's evidence
+            when = time.strftime("%H:%M:%S")
+            fh.write(f"[{when}] {bound.label or '?'}: {script} {argv} -> {result['status']}\n")
+        return _text(result)
+
+    return run_on_gpu
 
 
 def doc_tools() -> tuple[Any, Any]:

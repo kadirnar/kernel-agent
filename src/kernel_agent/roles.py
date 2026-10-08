@@ -63,6 +63,9 @@ HELPER_TOOLS = (*READ_TOOLS, "Skill", *WEB_TOOLS, *DOC_TOOLS)
 #: kernel-agent's evaluation tools of the kernel and the end-to-end sessions (short names).
 KERNEL_TOOLS = ("evaluate_candidate", "sweep_candidate", "best_result")
 E2E_TOOLS = ("evaluate_e2e", "run_info")
+#: An agent's own GPU scripts through the GPU job queue (#185): every role whose Bash may need
+#: the GPU (with ``--agent-gpu tool`` its Bash commands see none).
+DEV_TOOLS = ("run_on_gpu",)
 
 
 @dataclass(frozen=True)
@@ -123,20 +126,30 @@ REGISTRY: dict[str, RoleSpec] = {
     for spec in (
         RoleSpec("planner", "planner"),
         RoleSpec(
-            "kernel", "kernel-engineer", mcp_tools=KERNEL_TOOLS, needs_gpu=True, max_concurrent=4
+            "kernel",
+            "kernel-engineer",
+            mcp_tools=(*KERNEL_TOOLS, *DEV_TOOLS),
+            needs_gpu=True,
+            max_concurrent=4,
         ),
         RoleSpec(
-            "systems", "systems-engineer", mcp_tools=E2E_TOOLS, needs_gpu=True, max_concurrent=1
+            "systems",
+            "systems-engineer",
+            mcp_tools=(*E2E_TOOLS, *DEV_TOOLS),
+            needs_gpu=True,
+            max_concurrent=1,
         ),
         RoleSpec(
             "native",
             "native-engineer",
             session_factor=3,
-            mcp_tools=(*KERNEL_TOOLS, *E2E_TOOLS),
+            mcp_tools=(*KERNEL_TOOLS, *E2E_TOOLS, *DEV_TOOLS),
             needs_gpu=True,
             max_concurrent=1,
         ),
-        RoleSpec("harness", "harness-author", mcp_tools=("check_harness",), needs_gpu=True),
+        RoleSpec(
+            "harness", "harness-author", mcp_tools=("check_harness", *DEV_TOOLS), needs_gpu=True
+        ),
         RoleSpec(
             "research",
             "researcher",

@@ -136,6 +136,28 @@ def _send(proc: Proc, sig: int) -> None:
         os.close(fd)
 
 
+def process(pid: int) -> Proc | None:
+    """``pid`` with its start time (None: no such process)."""
+    stat = _stat(pid)
+    return (pid, stat[1]) if stat is not None else None
+
+
+def send(procs: set[Proc], sig: int) -> None:
+    """Send ``sig`` to each of ``procs`` that has not ended (``hygiene.py``: SIGSTOP and
+    SIGCONT of the agents' background work)."""
+    for proc in procs:
+        _send(proc, sig)
+
+
+def kill(pid: int) -> None:
+    """SIGKILL process ``pid`` and every process below it, also those in process groups of
+    their own (nvcc starts one: a ``killpg`` of the caller's group misses it)."""
+    procs = descendants(pid)
+    if (root := process(pid)) is not None:
+        procs.add(root)
+    send(procs, signal.SIGKILL)
+
+
 def terminate(procs: set[Proc], grace: float = GRACE_S) -> None:
     """SIGTERM ``procs``, then SIGKILL the ones still alive after ``grace`` seconds."""
     for proc in procs:

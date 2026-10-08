@@ -96,7 +96,8 @@ def run_of(tmp_path):
     return RunDir(next((tmp_path / "runs").glob("org--model/*")))
 
 
-NEW = ("org/model", "--runs-dir", "runs", "--max-slices", "3")
+# the sequential loop (--agents 1): its slice is the one interrupted
+NEW = ("org/model", "--runs-dir", "runs", "--max-slices", "3", "--agents", "1")
 
 
 @LINUX
@@ -131,7 +132,7 @@ def test_first_ctrl_c_stops_the_run_and_its_processes(tmp_path, mode):
     assert "SIGINT: stopping" in text and f"`kernel-agent improve {run.root}` continues" in text
 
     # the same command continues the run
-    again = driver(tmp_path, "none", str(run.root), "--max-slices", "2")
+    again = driver(tmp_path, "none", str(run.root), "--max-slices", "2", "--agents", "1")
     assert again.wait(timeout=120) == 0
     state = read_json(run.root / "improve.json")
     assert "interrupted" not in state and state["interruptions"] == [stop]

@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import copy
 import functools
 import hashlib
@@ -100,7 +101,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from kernel_agent.gpulock import child_env, gpu_lock
+from kernel_agent import gpuqueue
+from kernel_agent.gpulock import child_env, gpu_lock, hold_token, holding
 from kernel_agent.kernels.roofline import annotate, ensure_peaks
 from kernel_agent.truth import TamperError
 
@@ -742,6 +744,11 @@ def _evaluate(
         return result
 
     # 3. performance (reference vs candidate, same inputs, same entrypoint)
+    from kernel_agent import hygiene, telemetry
+
+    sched = telemetry.schedstat()  # how long this thread waits for a CPU while it times
+    cores = telemetry.cores_busy()  # ... and how much others use its (timing) cores
+    hygiene.phase(hygiene.TIMING)  # the agents' builds pause meanwhile (several sessions)
     compiled_ref = copy.deepcopy(reference) if compile_baseline else None
     compiled: dict[str, Any] = {}
     saved = 0.0
@@ -830,6 +837,9 @@ def _evaluate(
         report["target_calls"] = round(weight, 3)
         covered += weight
         saved += (ref_t["median_ms"] - new_t["median_ms"]) * weight
+    cpu_wait = telemetry.cpu_wait_share(sched)
+    others = telemetry.others_share(cores)
+    hygiene.phase("")
 
     if not _intact(result, guard, candidate_path, "after timing"):
         return result
@@ -887,6 +897,10 @@ def _evaluate(
         ref_ms_weighted=round(ref_total, 4),
         new_ms_weighted=round(new_total, 4),
     )
+    if cpu_wait is not None:  # a contended CPU delays launches (telemetry.dirty)
+        result["cpu_wait_share"] = cpu_wait
+    if others is not None:
+        result["cpu_others_share"] = others
     if (memory := peak_memory_summary(case_reports)) is not None:
         result["peak_memory"] = memory
     # speed of light per case (after timing, never inside it): sol_ms, pct_of_sol, bound
@@ -951,7 +965,81 @@ def run_evaluation(
     result outside the candidate's process (:func:`_check_reference_timing`,
     :func:`_check_outputs`). The result says on which GPU of the pool it ran
     (``gpu_index``, :mod:`kernel_agent.gpulock`) and which evaluator measured it
-    (``evaluator_version``, set here: the candidate's process cannot choose it)."""
+    (``evaluator_version``, set here: the candidate's process cannot choose it).
+
+    With clean timing on (:mod:`kernel_agent.hygiene`, several sessions at once) a timed
+    evaluation first builds the candidate's ``load_inline`` extensions without the GPU
+    (:mod:`kernel_agent.kernels.prebuild`; ``prebuild`` in the result), and one whose timing
+    was dirty (another process on the GPU, a contended CPU, a reference slowdown: see
+    :func:`_dirty`) is measured once more, first of its class in the GPU queue; the result
+    is the second measurement (``retimed``: why the first did not count; ``timing_dirty``:
+    the second was dirty too)."""
+    from kernel_agent import hygiene
+
+    timed = hygiene.current() is not None and not quick
+    pre: dict[str, Any] | None = None
+    if timed and not holding():  # a sweep's evaluation: its configs were built before its lock
+        from kernel_agent.kernels import prebuild
+
+        pre = prebuild.prebuild(candidate_path, prebuild.inputs_capture(capture_path))
+    data: dict[str, Any] = {}
+    first: str | None = None
+    for attempt in range(2 if timed else 1):
+        data, why = _evaluate_once(
+            capture_path,
+            candidate_path,
+            profile=profile,
+            l2_flush=l2_flush,
+            compile_baseline=compile_baseline,
+            timeout=timeout,
+            capture_sha256=capture_sha256,
+            compile_check=compile_check,
+            quick=quick,
+            watch=timed,
+        )
+        if why is None:
+            break
+        if attempt:
+            data["timing_dirty"] = why
+        else:
+            first = why
+            if (job := gpuqueue.current()) is not None:
+                job.requeue()  # measured again at once: first of its class
+    if first is not None:
+        data["retimed"] = first
+    if pre is not None and pre.get("built"):
+        data["prebuild"] = {k: pre[k] for k in ("seconds", "built") if k in pre}
+    return data
+
+
+def _dirty(watch: Any, data: dict[str, Any]) -> str | None:
+    """Why a timed evaluation is not clean (``telemetry.dirty``: another process on the GPU,
+    a contended CPU), or a reference slowdown the candidate-free re-time confirmed: measured
+    again once, it is an integrity violation only when it happens again."""
+    from kernel_agent import telemetry
+
+    if why := telemetry.dirty(watch, data):
+        return why
+    if data.get("stage") == "reference_timing":
+        return "the reference ran slower next to the candidate than in a candidate-free process"
+    return None
+
+
+def _evaluate_once(
+    capture_path: Path,
+    candidate_path: Path,
+    *,
+    profile: bool,
+    l2_flush: bool,
+    compile_baseline: bool,
+    timeout: float,
+    capture_sha256: str | None,
+    compile_check: bool,
+    quick: bool,
+    watch: bool,
+) -> tuple[dict[str, Any], str | None]:
+    """One evaluation (:func:`run_evaluation`) and, with ``watch``, why its timing was dirty
+    (None: clean, or not watched)."""
     version = {"evaluator_version": evaluator_version()}
     workdir = Path(tempfile.mkdtemp(prefix="ka-eval-"))
     outputs = workdir / "outputs.pt"
@@ -983,36 +1071,41 @@ def run_evaluation(
     try:
         with gpu_lock() as gpu:  # reference and candidate run on this GPU, in one process
             ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    input=nonce + "\n",
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=child_env(),
-                )
-            except subprocess.TimeoutExpired as exc:
-                return _timeout_result(timeout, exc.stderr) | {"gpu_index": gpu} | version
-            data = _parse_result(proc.stdout, nonce)
-            if data is None:
-                tail = (proc.stderr or proc.stdout)[-4000:]
-                return {
-                    "status": "crash",
-                    "correct": False,
-                    "returncode": proc.returncode,
-                    "error": tail,
-                    "gpu_index": gpu,
-                    **version,
-                }
-            data.update(gpu_index=gpu, **version)
-            _check_reference_timing(
-                data, capture_path, capture_sha256, l2_flush=l2_flush, gpu=gpu
-            )  # in a subprocess pinned to the same GPU (child_env)
+            hold = _watch(gpu) if watch else None  # other processes on the GPU meanwhile
+            with hold or contextlib.nullcontext():
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        input=nonce + "\n",
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        env=child_env(),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    timed_out = _timeout_result(timeout, exc.stderr) | {"gpu_index": gpu}
+                    return timed_out | version, None
+                data = _parse_result(proc.stdout, nonce)
+                if data is None:
+                    tail = (proc.stderr or proc.stdout)[-4000:]
+                    crash = {"status": "crash", "correct": False, "returncode": proc.returncode}
+                    return {**crash, "error": tail, "gpu_index": gpu, **version}, None
+                data.update(gpu_index=gpu, **version)
+                _check_reference_timing(
+                    data, capture_path, capture_sha256, l2_flush=l2_flush, gpu=gpu
+                )  # in a subprocess pinned to the same GPU (child_env)
+            why = _dirty(hold, data) if watch else None
         _check_outputs(data, capture_path, capture_sha256, outputs)  # CPU only
-        return data
+        return data, why
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _watch(gpu: int) -> Any:
+    """``telemetry.HoldWatch`` of this thread's hold of GPU ``gpu``."""
+    from kernel_agent import telemetry
+
+    return telemetry.HoldWatch(gpu, hold_token())
 
 
 def _parse_result(stdout: str, nonce: str | None) -> dict[str, Any] | None:
@@ -1170,7 +1263,7 @@ def reference_timing(
     in the process: interleaved rounds of the reference against itself give two
     medians per case; ``ref_ms`` is their mean and ``instability`` their relative
     difference (a busy GPU)."""
-    from kernel_agent import toolchain
+    from kernel_agent import hygiene, toolchain
 
     toolchain.setup()
     from kernel_agent.kernels.bench import compare_timing
@@ -1181,18 +1274,19 @@ def reference_timing(
     reference = capture["module"].eval()
     replay = Replay(capture, reference)  # every call from its case's module state
     ref_ms, unstable = [], []
-    for case in capture["cases"]:
-        if not case.get("count", 1):  # correctness-only case: the evaluator does not time it
-            ref_ms.append(0.0)
-            unstable.append(0.0)
-            continue
-        fn = replay.call(case, reference)
-        one, two = compare_timing(
-            fn, fn, case["args"], case["kwargs"], l2_flush=l2_flush, verify=False
-        )
-        a, b = one["median_ms"], two["median_ms"]
-        ref_ms.append(round((a + b) / 2, 5))
-        unstable.append(round(abs(a - b) / max(min(a, b), 1e-9), 4))
+    with hygiene.timing():  # the agents' builds pause meanwhile (several sessions)
+        for case in capture["cases"]:
+            if not case.get("count", 1):  # correctness-only case: the evaluator does not time it
+                ref_ms.append(0.0)
+                unstable.append(0.0)
+                continue
+            fn = replay.call(case, reference)
+            one, two = compare_timing(
+                fn, fn, case["args"], case["kwargs"], l2_flush=l2_flush, verify=False
+            )
+            a, b = one["median_ms"], two["median_ms"]
+            ref_ms.append(round((a + b) / 2, 5))
+            unstable.append(round(abs(a - b) / max(min(a, b), 1e-9), 4))
     return {"status": "ok", "ref_ms": ref_ms, "instability": unstable}
 
 
