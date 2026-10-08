@@ -31,6 +31,11 @@ locks as above; a release wakes the queue. A re-entrant hold and a child process
 queue as they skip the lock. A non-exclusive job (correctness only) shares its GPU with
 other non-exclusive jobs whose memory fits (``LOCK_SH``, no thread lock), never with an
 exclusive one, and another process's exclusive lock still excludes it.
+
+With clean timing on (:mod:`kernel_agent.hygiene`, several agent sessions at once) a child
+of a hold also gets :data:`HOLD_ENV`, the hold's own token (``telemetry.HoldWatch`` tells
+the processes of the hold from foreign ones on the GPU by it), and its CPUs and nice value:
+the timing cores for an exclusive (timed) job, the other cores for a non-exclusive one.
 """
 
 from __future__ import annotations
@@ -48,18 +53,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from kernel_agent import gpuqueue, interrupt
+from kernel_agent import gpuqueue, hygiene, interrupt
 from kernel_agent.toolchain import CACHE_DIR
 
 ENV = "KERNEL_AGENT_LOCK_HELD"
 GPUS_ENV = "KERNEL_AGENT_GPUS"  # the pool as nvidia-smi indices, e.g. "0,2"
 INDEX_ENV = "KERNEL_AGENT_GPU"  # a pinned child: the GPU its parent locked
+HOLD_ENV = "KERNEL_AGENT_HOLD"  # a child of a hold (clean timing): the hold's token
 WAIT_S = 0.25  # a waiter checks this often whether the run is stopping
 
 _guard = threading.Lock()
 _thread_locks: dict[str, threading.Lock] = {}
 _waiting: collections.Counter[str] = collections.Counter()  # threads waiting per lock file
 _turn = itertools.count()
+_tokens = itertools.count(1)
 _held = threading.local()
 
 
@@ -150,6 +157,18 @@ def _held_gpus() -> dict[str, int]:
     if gpus is None:
         gpus = _held.gpus = {}
     return gpus
+
+
+def hold_token() -> str | None:
+    """The token of the hold this thread (or, in a child, its parent) has: what its children
+    get as :data:`HOLD_ENV` (None: no hold, or clean timing is off)."""
+    token: str | None = getattr(_held, "token", None)
+    return token or os.environ.get(HOLD_ENV) or None
+
+
+def holding() -> bool:
+    """Whether this thread (or this child's parent) holds a GPU lock."""
+    return bool(_held_gpus()) or os.environ.get(ENV) == "1"
 
 
 def _take(path: Path, lock: threading.Lock, *, wait: bool) -> IO[str] | None:
@@ -292,10 +311,14 @@ def gpu_lock(name: str = "gpu") -> Iterator[int]:
         raise
     wait.started(index)
     held[name] = index
+    if hygiene.current() is not None and not getattr(_held, "token", None):
+        _held.token = f"{os.getpid()}.{next(_tokens)}"  # its children's HOLD_ENV
     try:
         yield index
     finally:
         del held[name]
+        if not held:
+            _held.token = None
         fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
         if thread_lock is not None:
@@ -352,7 +375,9 @@ def pinned(index: int) -> dict[str, str]:
 def child_env() -> dict[str, str]:
     """Environment for a subprocess started while this thread holds the GPU lock: it
     does not wait for the lock, runs on the locked GPU and dies with this process
-    (``interrupt.die_with_parent``). A stopping run starts none (``Interrupted``)."""
+    (``interrupt.die_with_parent``). A stopping run starts none (``Interrupted``). With
+    clean timing on (:mod:`kernel_agent.hygiene`): the hold's token and the CPUs and nice
+    value of a timed job (an exclusive one) or of a correctness run (a non-exclusive one)."""
     interrupt.check()
     env = dict(os.environ)
     env[interrupt.PARENT_ENV] = str(os.getpid())
@@ -361,4 +386,9 @@ def child_env() -> dict[str, str]:
         env[ENV] = "1"
     if held:
         env.update(pinned(next(iter(held.values()))))
+        if token := getattr(_held, "token", None):
+            job = gpuqueue.current()
+            timed = job is None or job.exclusive
+            env[HOLD_ENV] = token
+            env.update(hygiene.timed_env() if timed else hygiene.background_env())
     return env

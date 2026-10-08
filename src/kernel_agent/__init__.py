@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from kernel_agent import hygiene as _hygiene
 from kernel_agent import interrupt as _interrupt
 from kernel_agent.config import OptimizeConfig
 
@@ -23,6 +24,7 @@ __version__ = "0.1.0"
 __all__ = ["OptimizeConfig", "__version__", "optimize"]
 
 _interrupt.die_with_parent()  # a worker started by a run dies with it (interrupt.py)
+_hygiene.apply_inherited()  # ... and runs on the CPUs and at the nice value it was given
 
 if TYPE_CHECKING:
     from kernel_agent.workspace import RunDir

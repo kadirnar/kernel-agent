@@ -31,10 +31,15 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookEvent
 
-from kernel_agent import roles, sessions
+from kernel_agent import hygiene, roles, sessions
 from kernel_agent.agent import auth, web
 from kernel_agent.config import OptimizeConfig
 
+#: ``--agent-gpu`` (#185): the agents' Bash commands see the GPU (``bash``, one session at a
+#: time) or not, and run their GPU scripts through the GPU job queue (``tool``: ``run_on_gpu``)
+GPU_BASH = "bash"
+GPU_TOOL = "tool"
+GPU_MODES = (GPU_TOOL, GPU_BASH)
 BASE_TOOLS = list(roles.BASE_TOOLS)
 READ_TOOLS = list(roles.READ_TOOLS)
 WEB_TOOLS = list(roles.WEB_TOOLS)
@@ -113,15 +118,24 @@ def _brief(block_input: Any, limit: int = 110) -> str:
     return str(block_input)[:limit]
 
 
-def agent_env(extra: dict[str, str], mode: str = auth.AUTO) -> dict[str, str]:
+def agent_env(
+    extra: dict[str, str], mode: str = auth.AUTO, *, gpu: str = GPU_BASH
+) -> dict[str, str]:
     """Environment for the agent's Bash tool: same Python env + toolchain variables; with
-    ``mode`` subscription, the API key / cloud provider variables blanked (auth.py)."""
+    ``mode`` subscription, the API key / cloud provider variables blanked (auth.py). With
+    ``gpu`` :data:`GPU_TOOL` (``--agent-gpu tool``, the default with several sessions) its
+    commands see no GPU (``CUDA_VISIBLE_DEVICES=""``; builds still work: the architectures
+    come from ``TORCH_CUDA_ARCH_LIST``) and run their GPU scripts with ``run_on_gpu``, through
+    the GPU job queue. With clean timing on (``hygiene.py``) its builds get ``MAX_JOBS``."""
     venv_bin = str(Path(sys.executable).parent)
     env = {
         "PATH": f"{venv_bin}{os.pathsep}{os.environ.get('PATH', '')}",
         "PYTHONUNBUFFERED": "1",
         **extra,
+        **hygiene.background_env(),
     }
+    if gpu == GPU_TOOL:
+        env["CUDA_VISIBLE_DEVICES"] = ""
     if "VIRTUAL_ENV" not in os.environ and (Path(venv_bin).parent / "pyvenv.cfg").exists():
         env["VIRTUAL_ENV"] = str(Path(venv_bin).parent)
     return auth.scrub(env) if mode == auth.SUBSCRIPTION else env
@@ -300,6 +314,8 @@ async def run_agent(
     role = roles.role_of(name) if role is None else role
     fields = roles.options_for(role, cfg, tools=tools, mcp=mcp_tools, extra_tools=extra_tools or ())
     helpers = fields["agents"] or {}  # the role's delegates (#176)
+    # clean timing (hygiene.py): the CLI, found by this mark, moves off the timing cores
+    mark = {hygiene.SESSION_ENV: f"{os.getpid()}-{name}"} if hygiene.current() else {}
     options = ClaudeAgentOptions(
         system_prompt={
             "type": "preset",
@@ -311,7 +327,7 @@ async def run_agent(
         mcp_servers={"ka": mcp_server},
         permission_mode=cfg.permission_mode,  # type: ignore[arg-type]
         max_budget_usd=cfg.budget_usd_per_agent,
-        env={**env, **SESSION_ENV},
+        env={**env, **SESSION_ENV, **mark},
         output_format=output_format,
         **fields,  # model, effort, turns, tools, helpers, skills, no settings (roles.py)
     )
@@ -371,6 +387,8 @@ async def run_agent(
                             elif isinstance(block, TextBlock) and cfg.verbose:
                                 _log(f"agent {who}: {block.text[:300]}")
                     elif isinstance(message, SystemMessage) and message.subtype == "init":
+                        if mark:  # before its first command: what it starts inherits it
+                            hygiene.move_session(mark[hygiene.SESSION_ENV])
                         result.session_id = message.data.get("session_id") or result.session_id
                         result.api_key_source = message.data.get("apiKeySource")
                         if why := auth.session_problem(cfg.auth, result.api_key_source, env):

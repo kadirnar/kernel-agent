@@ -144,6 +144,12 @@ class ImproveConfig:
     # the target's best a stagnant island is reseeded from it (0: never)
     migrate_every: int = workers.MIGRATE_EVERY
     cull_gap: float = workers.CULL_GAP
+    # how the agents' commands reach the GPU (--agent-gpu, #185): "tool" (their Bash sees no
+    # GPU: run_on_gpu) or "bash"; None: tool with agents > 1, else bash
+    agent_gpu: str | None = None
+    # physical cores the timed jobs get to themselves (--timing-cores, hygiene.py; None: 2
+    # with agents > 1, 0: no CPU isolation)
+    timing_cores: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -2057,6 +2063,27 @@ def _interrupt_note(run: RunDir) -> Iterator[None]:
         raise
 
 
+@contextmanager
+def _clean_timing(orch: Orchestrator, icfg: ImproveConfig, *, simulated: bool) -> Iterator[None]:
+    """Clean timing under concurrent load (#185, ``hygiene.py``): with ``--agents`` above 1 (or
+    ``--timing-cores N``) CPU isolation, builds off the GPU lock and dirty-timing re-runs (not
+    in a dry run: nothing is timed); and how the agents reach the GPU (``--agent-gpu``, by
+    default ``tool`` with several sessions: their Bash commands see no GPU, ``run_on_gpu``)."""
+    from kernel_agent import hygiene
+    from kernel_agent.agent.runner import GPU_BASH, GPU_TOOL
+
+    mode = icfg.agent_gpu or (GPU_TOOL if icfg.agents > 1 else GPU_BASH)
+    on = not simulated and (icfg.agents > 1 or bool(icfg.timing_cores))
+    with hygiene.active(icfg.timing_cores, icfg.agents) if on else nullcontext() as clean:
+        if clean is not None:
+            plan = clean.plan.describe() if clean.plan else "no CPU isolation (--timing-cores 0)"
+            log(f"clean timing: {plan}; builds before the GPU lock; dirty timings re-run")
+        if mode != GPU_BASH or icfg.agent_gpu:
+            log(f"agents' GPU access: {mode} (--agent-gpu)")
+        with orch.gpu_access(mode):  # after hygiene.active: the agents' MAX_JOBS
+            yield
+
+
 def _role_overrides(cfg: OptimizeConfig) -> dict[str, Any]:
     """The per-role models and efforts a resumed run takes over its own: those that differ
     from the defaults (``--role-model`` / ``--role-effort``; ``roles.changed``)."""
@@ -2137,6 +2164,7 @@ async def improve(
         _interrupt_note(orch.run),
         world.installed() if world else nullcontext(),
         world.driving() if world and world.virtual else nullcontext(),
+        _clean_timing(orch, icfg, simulated=dry_run),
     ):
         if not all(orch._phase_done(p) for p in ("analyze", "plan", "capture")):
             await orch.run_all(until="capture")

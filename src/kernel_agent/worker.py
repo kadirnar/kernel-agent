@@ -312,6 +312,7 @@ def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> 
 
 
 def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    from kernel_agent import telemetry
     from kernel_agent.integrate.patcher import PatchReport, apply_kernels, apply_transforms
     from kernel_agent.telemetry import Monitor
     from kernel_agent.workloads.base import measure
@@ -332,10 +333,12 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     inputs = workload.make_inputs()
     monitor = Monitor()  # GPU clocks / temperature / power before and after the timing
     monitor.sample("before", loaded=False)  # the clocks may still be idling
+    sched = telemetry.schedstat()  # how long this thread waits for a CPU while it times
     try:
         timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     except Exception:
         return _failed("runtime_error", patches=report.__dict__)
+    cpu_wait = telemetry.cpu_wait_share(sched)
     monitor.sample("after")
     output = timing.pop("output")
     base_ms, verdict = _judge(ns, workload, inputs, output, timing["median_ms"], truth_files)
@@ -352,6 +355,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "peak_mem_gb": round(timing["peak_mem_gb"], 3),
         "patches": report.__dict__,
         **({"gpu": gpu} if (gpu := monitor.summary()) else {}),
+        **({"cpu_wait_share": cpu_wait} if cpu_wait is not None else {}),
     }
 
 
@@ -853,25 +857,67 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if "error" in result else 0
 
 
+#: Worker commands whose result is a timed measurement: with clean timing on (``hygiene.py``)
+#: a dirty one is measured once more (:func:`call_worker`)
+TIMED_COMMANDS = frozenset({"e2e"})
+
+
 def call_worker(
     run: RunDir, command: str, *args: str, timeout: float = 3600.0, cwd: str | Path | None = None
 ) -> dict[str, Any]:
     """Run a worker command under the GPU lock (in ``cwd``, default: this process's);
-    returns its JSON result, with the GPU of the pool it ran on (``gpu_index``)."""
+    returns its JSON result, with the GPU of the pool it ran on (``gpu_index``). With clean
+    timing on (``hygiene.py``, several sessions at once) a timed command (:data:`TIMED_COMMANDS`)
+    whose timing was dirty (``telemetry.dirty``) runs once more, first of its class in the GPU
+    queue (``retimed``: why the first run did not count; ``timing_dirty``: the second was
+    dirty too)."""
+    from kernel_agent import gpuqueue, hygiene, telemetry
+    from kernel_agent.gpulock import hold_token
+
+    watch = hygiene.current() is not None and command in TIMED_COMMANDS
+    first: str | None = None
+    for attempt in range(2 if watch else 1):
+        with gpu_lock() as gpu:
+            hold = telemetry.HoldWatch(gpu, hold_token()) if watch else None
+            with hold or contextlib.nullcontext():
+                result = _call_once(run, command, args, timeout=timeout, cwd=cwd, gpu=gpu)
+        why = telemetry.dirty(hold, result) if watch and result.get("status") == "ok" else None
+        if why is None:
+            break
+        if attempt:
+            result["timing_dirty"] = why
+        else:
+            first = why
+            if (job := gpuqueue.current()) is not None:
+                job.requeue()  # measured again at once: first of its class
+    if first is not None:
+        result["retimed"] = first
+    return result
+
+
+def _call_once(
+    run: RunDir,
+    command: str,
+    args: tuple[str, ...],
+    *,
+    timeout: float,
+    cwd: str | Path | None,
+    gpu: int,
+) -> dict[str, Any]:
+    """One run of a worker command in this thread's hold of GPU ``gpu`` (:func:`call_worker`)."""
     cmd = [sys.executable, "-m", "kernel_agent.worker", command, "--run-dir", str(run.root), *args]
     log = run.root / "logs" / f"worker-{command}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
-    with gpu_lock() as gpu:
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout, env=child_env(), cwd=cwd
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "timeout",
-                "error": f"worker {command} exceeded {timeout:.0f}s",
-                "gpu_index": gpu,
-            }
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=child_env(), cwd=cwd
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "timeout",
+            "error": f"worker {command} exceeded {timeout:.0f}s",
+            "gpu_index": gpu,
+        }
     with log.open("a") as fh:
         fh.write(f"$ {' '.join(cmd)}\n{proc.stdout[-20000:]}\n{proc.stderr[-20000:]}\n")
     for line in proc.stdout.splitlines()[::-1]:

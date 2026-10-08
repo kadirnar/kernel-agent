@@ -3231,9 +3231,14 @@ model and starts a new round (`kernel_agent/improve.py`,
     failing session never stops the others: an arm whose last 3 slices of the
     round failed retires for the round (`failing`), a role whose last 3 sessions
     failed pauses for 30 min, and 3 failed slices in a row of different arms (6 of
-    one arm) stop the loop. Not yet: the agents' own GPU runs in Bash do not go
-    through the queue, so with N > 1 a session's benchmark script can overlap
-    another session's timed evaluation (clean timing under load: #185).
+    one arm) stop the loop.
+  * *Clean timing under load* (#185, `kernel_agent/hygiene.py`; "Clean timing" under
+    "GPUs and the GPU lock"). With N > 1 the agents' Bash commands see no GPU
+    (`--agent-gpu tool`, the default): they compile there and run their GPU scripts
+    with the `run_on_gpu` tool, through the GPU job queue, so no script of theirs
+    runs during another session's timed evaluation. The timed jobs get CPU cores of
+    their own, builds run before the GPU lock, and a measurement disturbed anyway
+    is measured again.
   * *Board* (`--board auto`: with `--agents` above 1; `on`, `off`; issue #187,
     `kernel_agent/board.py`). The sessions share conclusions in `board.jsonl`, never
     progress (KernelArc's wins and traps: two agents that shared them beat one by
@@ -3735,8 +3740,8 @@ measurement holds the lock of one GPU while its subprocess runs
   evaluation). Classes, best first: `deadline` (the final integration once the
   run is in its reserve window), `interactive` (`mode="quick"` checks,
   `verify_rewrite`), `eval` (full kernel evaluations), `e2e`
-  (`evaluate_e2e`, `check_harness`), `sweep`, `dev` (agents' own GPU runs,
-  for #185) and `background` (integration A/B steps, re-checks, memchecks,
+  (`evaluate_e2e`, `check_harness`), `sweep`, `dev` (agents' own GPU scripts:
+  `run_on_gpu`) and `background` (integration A/B steps, re-checks, memchecks,
   library seeding, captures, re-profiles). A waiting job moves up one class
   per 10 min of waiting (never to `deadline`). Within a class the session
   served least recently goes first, then the shortest job (the median `eval_s`
@@ -3747,8 +3752,8 @@ measurement holds the lock of one GPU while its subprocess runs
   `eval`. The `flock` stays the outer layer, so another process still
   excludes. Re-entrant locks and child processes skip the queue as they skip
   the lock. Every timed job holds its GPU alone. A job marked non-exclusive
-  (correctness only, the `dev` hook) shares a GPU only with other
-  non-exclusive jobs whose memory estimates fit in 90 % of it.
+  (a `run_on_gpu` correctness check that gives its `mem_gb`) shares a GPU only
+  with other non-exclusive jobs whose memory estimates fit in 90 % of it.
 * **Waiting is not the agent's time.** While a session's evaluation waits
   behind other jobs, its `--agent-minutes` timeout and the `minutes_left` of its
   evaluation advice stop running, never past the run's time for agents
@@ -3760,6 +3765,45 @@ measurement holds the lock of one GPU while its subprocess runs
   `kernel-agent status` summarises it: jobs and waits per class, what holds the GPU
   and what waits, the queue by class, and the busy share and waits p50 / p95 over
   the last hour.
+* **Clean timing under load** (`kernel_agent/hygiene.py`, #185). On in `improve` with
+  `--agents` above 1 (or with `--timing-cores N`): several sessions compile and run
+  their own scripts while another session's evaluation is timed.
+  * *The agents' GPU scripts go through the queue.* With `--agent-gpu tool` (the
+    default with N > 1) the agents' Bash commands see no GPU
+    (`CUDA_VISIBLE_DEVICES=""`; nvcc and `load_inline` still build, for
+    `TORCH_CUDA_ARCH_LIST`). Their `run_on_gpu(script, args, timeout)` tool runs
+    `python SCRIPT ARGS` in the session's directory and environment as a `dev` job
+    (at most 120 s; `logs/run_on_gpu.log`) and returns its exit code and the tail of
+    its output: `benchmark=true` holds the GPU alone, a correctness check that gives
+    `mem_gb` may share it with other such checks, never with a timed job. `--agent-gpu
+    bash` keeps the GPU visible in Bash, as with one session.
+  * *CPU isolation.* The last 2 physical cores (`--timing-cores N`, both hardware
+    threads of each; 0: off) run the timed jobs alone: a subprocess started under an
+    exclusive hold (the evaluator, the end-to-end worker, a sweep) runs there at nice
+    -5. The Claude Code CLIs (so every Bash command of theirs and its builds), the
+    prebuilds and the `run_on_gpu` correctness checks run on the other cores at nice
+    10, with `MAX_JOBS` at each session's share of them (8 other CPUs, 3 sessions: 2;
+    a template-heavy nvcc job takes about 2 GB of host memory). Below 8 CPUs only the
+    nice values and `MAX_JOBS` apply.
+  * *Builds before the GPU lock* (`kernel_agent/kernels/prebuild.py`). An evaluation or
+    a sweep of a `load_inline` candidate first builds its extensions in a process that
+    sees no GPU, into the same `TORCH_EXTENSIONS_DIR` (`prebuild` in the record): the
+    import, the module's loader functions that take no argument (`_load()`), and, when a
+    loader takes arguments, `build(reference, **config)` for each config on the target's
+    inputs-only capture whose weights are fake CUDA tensors (`FakeTensor`: the build's
+    `is_cuda` checks pass, its launches fail there). The evaluator's own build is then a
+    ninja no-op. A prebuild never fails an evaluation; Triton and CuTe kernels still
+    compile at their first launch, under the lock.
+  * *Dirty timings are measured again.* Around a timed evaluation and an `evaluate_e2e`
+    run the GPU's processes are sampled (`nvidia-smi` by index, at the start, every
+    10 s and at the end; the hold's own processes carry its token): one that ended
+    meanwhile, or computes at the end (`nvidia-smi pmon`), ran outside the lock. The
+    timed process measures how long its main thread waited for a CPU while it timed
+    (`cpu_wait_share`; above 5 % is dirty), the host's memory stalls are read
+    (`/proc/pressure/memory`; above 2 % of the hold), and a reference slowdown that the
+    candidate-free re-time confirms counts too. A dirty measurement is measured once
+    more, first of its class in the queue: the record is the second one (`retimed`:
+    why the first did not count; `timing_dirty`: the second was dirty too).
 * **Child processes.** A subprocess started under the lock gets
   `KERNEL_AGENT_LOCK_HELD=1` (it does not wait for its parent) and, when more
   than one GPU is visible, `CUDA_VISIBLE_DEVICES=<i>` with

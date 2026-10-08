@@ -15,11 +15,13 @@ a class the session served least recently goes first (round robin: one sweep-hea
 cannot monopolise the GPU), then the shortest job (:func:`estimate`), then the oldest.
 Every acquisition queues on its own, so a long sequence of acquisitions (an integration,
 one A/B step each) lets waiting jobs of a better class go between its steps; a step that
-runs is never interrupted. The ``flock`` stays the outer, cross-process layer: another
-process still excludes, and the queue orders this process's jobs. A coroutine of the event
-loop's thread waits its turn without blocking the loop (:meth:`Gate.admit_async`,
-:func:`holding`): the simulated executor of a virtual-time dry run (``dryrun.py``, whose
-clock replaces :data:`clock`) holds the GPU that way.
+runs is never interrupted. A measurement found dirty (``hygiene.py``: a foreign GPU process
+or CPU contention during its timing) queues again first of its class (:meth:`Job.requeue`).
+The ``flock`` stays the outer, cross-process layer: another process still excludes, and the
+queue orders this process's jobs. A coroutine of the event loop's thread waits its turn
+without blocking the loop (:meth:`Gate.admit_async`, :func:`holding`): the simulated
+executor of a virtual-time dry run (``dryrun.py``, whose clock replaces :data:`clock`) holds
+the GPU that way.
 
 **Exclusive and shared**: every timed job holds its GPU alone (``exclusive``, all of
 today's jobs). A job that only checks correctness may be non-exclusive (agents' dev runs,
@@ -138,6 +140,7 @@ class Job:
     hold_s: float = 0.0
     holds: int = 0
     withdrawn: bool = False
+    front: bool = False  # its next wait: first of its class (a dirty measurement's re-run)
 
     @classmethod
     def of(
@@ -166,6 +169,11 @@ class Job:
             parent=outer,
             clock=clock,
         )
+
+    def requeue(self) -> None:
+        """Its next acquisition goes first of its class: the re-run of a measurement whose
+        timing was dirty (``hygiene.py``)."""
+        self.front = True
 
     def withdraw(self) -> None:
         """Its caller is gone: if it still waits, it leaves the queue (:class:`Withdrawn`)."""
@@ -338,8 +346,9 @@ class Gate:
         self._seq = itertools.count()
         self._turn = itertools.count()
 
-    def _key(self, job: Job, now: float) -> tuple[int, int, float, int]:
-        return (rank(job, now), self.served.get(job.session, -1), job.estimate_s, job.seq)
+    def _key(self, job: Job, now: float) -> tuple[int, bool, int, float, int]:
+        served = self.served.get(job.session, -1)
+        return (rank(job, now), not job.front, served, job.estimate_s, job.seq)
 
     def head(self, now: float | None = None) -> Job | None:
         """The job that goes next (None: nothing waits)."""
@@ -447,6 +456,7 @@ class Gate:
 
     def _admitted(self, job: Job, room: tuple[int, ...]) -> tuple[int, ...]:
         self.served[job.session] = next(self._turn)
+        job.front = False
         if job.exclusive:
             self.unplaced.append(job)
         else:

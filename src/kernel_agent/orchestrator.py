@@ -18,7 +18,7 @@ import json
 import re
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -285,6 +285,20 @@ class Orchestrator:
                 job_class = gpuqueue.EVAL
         return gpuqueue.tagged(kind, self.run, job_class=job_class)
 
+    @contextlib.contextmanager
+    def gpu_access(self, mode: str) -> Iterator[None]:
+        """How the agents of the sessions started inside reach the GPU (``--agent-gpu``,
+        #185): their environment (``runner.agent_env``: ``tool`` hides the GPU from their
+        Bash commands; with clean timing on, ``hygiene.py``, their builds' ``MAX_JOBS``) and
+        what their prompts say (``prompts.gpu_access``)."""
+        before = self.env
+        self.env = agent_env(self.tc.env, self.cfg.auth, gpu=mode)
+        try:
+            with prompts.gpu_access(mode):
+                yield
+        finally:
+            self.env = before
+
     def _session_config(
         self, role: str | None, config: dict[str, Any] | None, label: str | None = None
     ) -> OptimizeConfig:
@@ -322,7 +336,7 @@ class Orchestrator:
         spec = roles.get(role)
         binding = kwargs.pop("binding", None) or SessionBinding()
         binding = dataclasses.replace(binding, label=label or name, role=binding.role or role or "")
-        server = build_server(self.run, self.budget, self.truth, binding)
+        server = build_server(self.run, self.budget, self.truth, binding, env=self.env)
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
         ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)

@@ -136,6 +136,16 @@ def _send(proc: Proc, sig: int) -> None:
         os.close(fd)
 
 
+def kill(pid: int) -> None:
+    """SIGKILL process ``pid`` and every process below it, also those in process groups of
+    their own (nvcc starts one: a ``killpg`` of the caller's group misses it)."""
+    procs = descendants(pid)
+    if (stat := _stat(pid)) is not None:
+        procs.add((pid, stat[1]))
+    for proc in procs:
+        _send(proc, signal.SIGKILL)
+
+
 def terminate(procs: set[Proc], grace: float = GRACE_S) -> None:
     """SIGTERM ``procs``, then SIGKILL the ones still alive after ``grace`` seconds."""
     for proc in procs:

@@ -805,6 +805,23 @@ def _stand_in(top: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _prebuild(
+    swept: Path, capture_path: Path, configs: list[dict[str, Any]], timeout: float
+) -> None:
+    """With clean timing on (``hygiene.py``): every config's ``load_inline`` extensions built
+    before the GPU lock, without a GPU (``kernels/prebuild.py``), so the sweep under the lock
+    only loads them."""
+    from kernel_agent import hygiene
+    from kernel_agent.gpulock import holding
+
+    if hygiene.current() is None or holding():
+        return
+    from kernel_agent.kernels import prebuild
+
+    inputs = prebuild.inputs_capture(capture_path)
+    prebuild.prebuild(swept, inputs, configs, timeout=timeout)
+
+
 def run_sweep(
     capture_path: Path,
     candidate_path: Path,
@@ -834,6 +851,7 @@ def run_sweep(
         swept = workdir / "swept" / name
         swept.parent.mkdir()
         swept.write_text(source)
+        _prebuild(swept, capture_path, configs, TIMEOUT_FACTOR * timeout)
         start = time.monotonic()
         with gpu_lock() as gpu:  # one acquisition: the configs and the full evaluation
             ensure_peaks()
