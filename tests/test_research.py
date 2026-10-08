@@ -453,6 +453,8 @@ def test_write_guard_and_restricted_tools(tmp_path, monkeypatch):
         "Grep",
         "Write",
         "mcp__ka__best_result",
+        "mcp__ka__doc_search",  # the doc library: every session (#177)
+        "mcp__ka__doc_read",
     }
     run_agent(mcp_tools=[], tools=["Read", "Write"], writable=[plan])
     assert len(seen[-1].hooks["PreToolUse"]) == 2  # write guard + Claude files guard

@@ -54,7 +54,7 @@ class AgentResult:
     timed_out: bool = False
     api_key_source: str | None = None  # the init message's; "none" = no API key in use
     usage_limit: auth.UsageLimit | None = None  # the session stopped at a usage limit
-    web: list[dict[str, Any]] = field(default_factory=list)  # WebFetch / WebSearch (web.py)
+    web: list[dict[str, Any]] = field(default_factory=list)  # WebFetch / WebSearch / doc_*
 
 
 def _log(msg: str) -> None:
@@ -178,7 +178,7 @@ async def run_agent(
         system_prompt={"type": "preset", "preset": "claude_code", "append": system_append},
         cwd=str(cwd),
         add_dirs=[str(d) for d in (add_dirs or [])],
-        allowed_tools=builtin + mcp_tools,
+        allowed_tools=builtin + mcp_tools + web.DOC_TOOLS,  # doc library: every session
         mcp_servers={"ka": mcp_server},
         permission_mode=cfg.permission_mode,  # type: ignore[arg-type]
         model=cfg.claude_model,
@@ -199,8 +199,8 @@ async def run_agent(
         options.resume = resume
 
     result = result or AgentResult(name=name)
-    lookups = web.Lookups(result.web, cfg.web_domains) if cfg.allow_web else None
-    if lookups is not None:  # WebFetch to documentation domains only, every lookup recorded
+    lookups = web.Lookups(result.web, cfg.web_domains, cfg.allow_web)  # + the doc library
+    if cfg.allow_web:  # WebFetch to documentation domains only, every lookup recorded
         hooks["PreToolUse"].append(lookups.guard())
     result.is_error, result.usage_limit = False, None
     usd, turns_before, seconds = result.cost_usd, result.turns, result.seconds  # resumed: > 0
@@ -218,8 +218,7 @@ async def run_agent(
                 async for message in stream:
                     _write(log, message)
                     watch.see(message)
-                    if lookups is not None:
-                        lookups.see(message)
+                    lookups.see(message)
                     if isinstance(message, AssistantMessage):
                         result.session_id = result.session_id or message.session_id
                         if message.parent_tool_use_id is None:

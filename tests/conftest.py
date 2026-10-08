@@ -50,6 +50,22 @@ def _private_tuned_configs(tmp_path_factory):
         os.environ["KERNEL_AGENT_TUNED_DB"] = old
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _private_docs(tmp_path_factory):
+    """Tests never read or write the user's doc library (doclib, #177), and a run under
+    test never builds or fetches it in the background."""
+    names = ("KERNEL_AGENT_DOCS", "KERNEL_AGENT_DOCS_PREPARE")
+    old = {name: os.environ.get(name) for name in names}
+    os.environ["KERNEL_AGENT_DOCS"] = str(tmp_path_factory.mktemp("docs"))
+    os.environ["KERNEL_AGENT_DOCS_PREPARE"] = "0"
+    yield
+    for name, value in old.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 @pytest.fixture(autouse=True)
 def _gpu_lock_for_gpu_tests(request):
     """`gpu` tests hold kernel-agent's GPU lock (of the GPU this process uses, see

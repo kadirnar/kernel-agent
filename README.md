@@ -2296,6 +2296,87 @@ something up or where, so the engineers found API facts by trial and error
   "Sources used": each page fetched, the sessions that fetched it and the files
   that cite it.
 
+### Doc library: the installed versions' documentation
+
+WebFetch reads ~100K characters of a page, so the PTX ISA ended before `mma`
+and cuBLAS before cuBLASLt, and the curated notes cover what someone wrote down,
+not the API of the Triton, CuTe DSL or CUDA headers installed here. Every agent
+session therefore has two more tools over a local library (`kernel_agent/doclib/`,
+issue #177), with or without `--no-web`:
+
+* **`doc_search(query, library=None, k=8)`** returns the best chunks: `id`,
+  `title`, `library`, `version`, `origin` (installed / web), `source` (an
+  installed `file:line` or a URL with its section anchor) and a snippet;
+  **`doc_read(id, max_chars)`** returns the chunk and reads on through the
+  following ones of the same page or file (`next`). No network at query time:
+  pure-Python BM25 with a code-aware tokenizer (`dot_scaled` → `dot`, `scaled`;
+  `cudaLaunchKernelEx` → `cuda`, `launch`, ...; `cp.async.bulk.tensor` →
+  `cp.async`, `cp.async.bulk`, ...), the chunk's title counted three times, and
+  a bonus for the chunk that documents the name the query spells out
+  (`tl.dot_scaled` → `triton.language.core.dot_scaled`, `T.gemm` →
+  `tilelang.language.gemm_op.gemm`). A search takes 5-15 ms; loading the index
+  0.2-0.4 s once per process.
+* **What it holds.** Installed (versioned by the installed package or header):
+  `triton.language` (+ Gluon, the autotuner, `triton.jit`), the CuTe DSL of
+  `nvidia-cutlass-dsl` (`cutlass.cute`, pipelines, utils; the wheel ships no
+  docs or examples, so its docstrings), TileLang's language / JIT / layouts,
+  `torch.utils.cpp_extension` and `torch.cuda` (one chunk per public function,
+  class and documented method: signature + docstring), and the Doxygen comments
+  of the CUDA headers (`cuda_runtime_api.h`, `driver_types.h` launch attributes,
+  `cuda.h`, `cuda_fp8.h` / `cuda_fp4.h` / `cuda_bf16.h`) and `cublasLt.h` (one
+  chunk per comment and its declaration, enum members included). Web (fetched
+  once, sections of Sphinx pages titled by their heading path): the CUDA
+  Programming Guide, Best Practices and Blackwell tuning guides, the whole PTX
+  ISA, cuBLAS with cuBLASLt, the CUTLASS / CuTe DSL docs, Triton's docs and
+  tutorials, TileLang's docs and the PyTorch pages of the installed version
+  (`docs.pytorch.org/docs/2.14/...`). On this machine (RTX 5070 Ti):
+
+  | library | installed | web |
+  |---|---|---|
+  | cuda | headers 13.0: 2378 chunks (9 files) | Programming Guide: 1042 (46 pages), Best Practices 13.4: 152, Blackwell tuning 13.4: 17 |
+  | ptx | — | PTX ISA 9.4: 892 chunks, inline PTX 13.4: 17 |
+  | cublas | `cublasLt.h` 13.1.1: 228 | cuBLAS 13.4: 418 |
+  | cutlass | CuTe DSL 4.8.0: 1158 (88 files) | CUTLASS 4.8.0: 2376 (129 pages) |
+  | triton | 3.8.0: 744 (36 files) | main: 482 (47 pages) |
+  | tilelang | 0.1.15: 548 (73 files) | 0.1.15: 283 (31 pages) |
+  | torch | 2.14.1+cu130: 238 (10 files) | 2.14: 74 (4 pages) |
+
+  11,047 chunks in 16 shelves, 26 MB with the page cache; the installed shelves
+  build in 4 s, the web shelves in 15 s, and the web fetch (262 pages) took
+  2.3 min, once.
+* **Versions.** `~/.cache/kernel-agent/docs/` (`$KERNEL_AGENT_DOCS`) holds one
+  shelf per source and version (`shelves/<name>-<version>.jsonl` + its BM25
+  postings) and `manifest.json`. The first search builds what is missing; a
+  shelf whose installed version (or cached pages) changed is rebuilt and the old
+  one dropped, so the agents read the docs of what they compile against.
+* **Fetching.** `kernel-agent docs build` builds the installed shelves and
+  fetches the web docs: only URLs (and redirects) on the WebFetch allowlist,
+  allowed by the host's `robots.txt`, one request at a time and at most one per
+  0.5 s per host, with a `kernel-agent-docs` User-Agent. Each page is cached
+  (gzip) with its URL, fetch time, HTTP code and sha256 and is never fetched
+  again (`--refresh` does); a failed page is retried by the next `docs build`
+  or after a day. Offline nothing is fetched and the cache is used as it is
+  (`--offline`). A run starts the same build in a background thread with its
+  first agent session (once per process; the web fetch only with the web tools;
+  `KERNEL_AGENT_DOCS_PREPARE=0` turns it off), so the sessions find the library
+  built.
+* **Prompts.** Every session gets `# Documentation library`: look an API up
+  before using it and whenever a compile error names one (CuTe DSL MMA atoms,
+  `tl.dot_scaled`, `cudaLaunchKernelEx` attributes, cuBLASLt scale modes, PTX
+  `mma ... block_scale`, `cp.async.bulk`, `griddepcontrol`, `mbarrier`), prefer
+  the installed version's entries, use WebFetch only for what the library does
+  not have, and cite `[source] doc:<id> <source> — <fact>`. The dossier answers
+  its questions from the library first.
+* **Record.** `doc_search` / `doc_read` calls go to `research/sources.jsonl` with
+  the web lookups (the query and the ids found; the chunk read with its title,
+  library, version and source); `costs.json` counts `doc_searches`,
+  `doc_reads` and `doc_chunks` per session, and "Sources used" in `report.md`
+  lists each chunk read, its version, who read it and the files that cite it.
+* `kernel-agent doctor` prints the coverage per library and version (building
+  the installed shelves if needed) and what is missing; `kernel-agent docs
+  search "tl.dot_scaled" --library triton` and `docs read <id>` are the agents'
+  tools on the command line.
+
 ### kernel-agent improve: the continuous loop
 
 ```bash
@@ -3162,6 +3243,8 @@ kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, las
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
 kernel-agent library list|show <id>|prune [--older-than DAYS]|path   cross-run kernel library
 kernel-agent library import-memory DIR [--write]   Claude Code memory notes → lessons
+kernel-agent docs build [--offline] [--refresh] | status | search QUERY [--library L] | read ID | path
+                                       the local doc library the agents search (see "Doc library")
 kernel-agent doctor [--smoke] [--remeasure-peaks] [--fetch-sanitizer] [--no-probes]
 kernel-agent install-claude-code <project-dir>
 ```
@@ -3228,7 +3311,8 @@ runs/<org>--<name>/<timestamp>/
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256,
                               auth, api_key_source, billing (+ usage_limit_waits, web)
-  research/sources.jsonl      every WebFetch / WebSearch: time, URL or query, outcome, sha256
+  research/sources.jsonl      every WebFetch / WebSearch: time, URL or query, outcome, sha256;
+                              every doc_search / doc_read: query and ids, chunk and its source
   optimized/                  apply.py + manifest.json + kernels/ (+ rewrites/ of region targets)
                               + transforms/, the run files they load (manifest `needs`) and
                               export_check.json (the self-test, see above)

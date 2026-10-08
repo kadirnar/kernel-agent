@@ -1568,6 +1568,34 @@ def web_note(agent: str, hosts: list[str]) -> str:
   lookup is a GET of a public page, or a search)."""
 
 
+def docs_note(agent: str) -> str:
+    """``# Documentation library`` section of an agent's system prompt (issue #177): every
+    session has ``doc_search`` / ``doc_read`` over the local doc library (``doclib``), with
+    or without the web tools. When to look an API up, how to search and how to cite; ""
+    for roles that need no lookups (refactor, librarian)."""
+    role = agent.split("-", 1)[0].lower()
+    if role not in _WEB_CITE:
+        return ""
+    return f"""
+
+# Documentation library (doc_search / doc_read)
+The documentation of the tools installed here, at their installed versions, is a local
+library (no network): Triton (`triton.language`, Gluon), CuTe DSL / CUTLASS, TileLang,
+PyTorch (`cpp_extension`, `torch.cuda`), the CUDA headers (runtime and driver API, launch
+attributes, FP8 / FP4 conversions) and cuBLASLt, plus (once fetched) the CUDA
+Programming Guide, the whole PTX ISA, cuBLAS, CUTLASS, Triton and TileLang web docs.
+* Look an API up before you use it, and whenever a compile error names one: CuTe DSL MMA
+  atoms and copy ops, `tl.dot_scaled`, `cudaLaunchKernelEx` attributes, cuBLASLt scale
+  modes, a PTX instruction (`mma ... block_scale`, `cp.async.bulk`, `griddepcontrol`,
+  `mbarrier`). `doc_search(query, library=...)` with the identifier and a few words, then
+  `doc_read(id)` of the best hit (`next` reads on). A search is free and local: search
+  before you guess a signature, an operand layout or an enum value.
+* Prefer the installed version's entries (`origin: installed`) to web pages of another
+  version. Use WebFetch only for what the library does not have.
+* Cite what you used in {_WEB_CITE[role]}, one line each:
+  `[source] doc:<id> <source> — <the fact you took>`."""
+
+
 def dossier_prompt(
     target: dict[str, Any], capture_info: dict[str, Any], dossier: Path, toolchain: str
 ) -> str:
@@ -1613,10 +1641,12 @@ and do not copy them into the dossier. The dossier is for what they do not say.
    guides leave open: the fastest known design for this op at this bound (a reference
    implementation), the exact API, instruction or library path it needs on this GPU, the
    accuracy or layout facts of the format.
-2. Answer each with a lookup in the sources of `sources.md`: local reference code (Grep /
-   Read) or one WebFetch with a precise question; WebSearch only when no listed source
-   covers it. At least one answer comes from a WebFetch of official documentation or
-   reference code: the knowledge files are not a lookup.
+2. Answer each from the doc library first (`doc_search` / `doc_read`: the installed
+   versions' APIs, the PTX ISA, the CUDA guide, cuBLASLt, CUTLASS), then for what it lacks
+   with a lookup in the sources of `sources.md`: local reference code (Grep / Read) or one
+   WebFetch with a precise question; WebSearch only when no listed source covers it. At
+   least one answer comes from the documentation (the doc library or a WebFetch of
+   official documentation or reference code): the knowledge files are not a lookup.
 3. Record only what you read, with its source. Never guess a URL or a number.
 
 # Write `{dossier}`
