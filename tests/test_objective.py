@@ -3,11 +3,11 @@ and the A/B / held-out timings return for ``latency`` and ``ttfa`` on a CPU stre
 and how reports, status and the live page name it."""
 
 import shutil
-import time
 from typing import Any
 
 import pytest
 import torch
+from fake_clock import Clock
 from synthetic_run import make_run
 from torch import nn
 
@@ -15,7 +15,7 @@ from kernel_agent import ledger, objective, watch
 from kernel_agent.integrate import ab
 from kernel_agent.report import write_report
 from kernel_agent.status import render
-from kernel_agent.workloads import create_workload, holdout, validate_metric
+from kernel_agent.workloads import base, create_workload, holdout, validate_metric
 from kernel_agent.workloads.base import Comparison, Workload, WorkloadSpec, measure, timed_run
 from kernel_agent.workspace import RunDir, read_json, write_json
 
@@ -24,8 +24,14 @@ FIRST_S, CHUNK_S, CHUNKS = 0.04, 0.01, 6
 
 @pytest.fixture(autouse=True)
 def _cpu(monkeypatch):
-    """Timing on the CPU: no GPU warm-up, no synchronisation."""
+    """Timing on the CPU: no GPU warm-up, no synchronisation; in simulated seconds, which
+    only the toys' sleeps move (real sleeps overshoot by tens of ms on a busy machine)."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(base, "time", Clock())
+
+
+def sleep(seconds: float) -> None:
+    base.time.sleep(seconds)  # the simulated clock's: time passes at once
 
 
 class Streamer(Workload):
@@ -45,11 +51,11 @@ class Streamer(Workload):
         return int(self.options["seed"])
 
     def run(self, inputs: int) -> dict[str, Any]:
-        time.sleep(float(self.options["first_s"]))
+        sleep(float(self.options["first_s"]))
         chunks = []
         for i in range(int(self.options["chunks"])):
             if i:
-                time.sleep(float(self.options["chunk_s"]))
+                sleep(float(self.options["chunk_s"]))
             chunks.append(torch.full((4,), float(inputs + i)))
             self.mark_chunk(audio_ms=40.0)
         return {"audio": torch.cat(chunks)}
@@ -130,7 +136,7 @@ def test_ttfa_clock_starts_before_the_run():
     original = wl.run
 
     def wrapped(x):  # a transform that works before the run (precomputes, say)
-        time.sleep(0.03)
+        sleep(0.03)
         return original(x)
 
     wl.run = wrapped  # type: ignore[method-assign]
@@ -153,7 +159,7 @@ class Batcher(Streamer):
     defaults = {**Streamer.defaults, "requests": 4}
 
     def run(self, inputs: int) -> dict[str, Any]:
-        time.sleep(float(self.options["first_s"]) + CHUNKS * float(self.options["chunk_s"]))
+        sleep(float(self.options["first_s"]) + CHUNKS * float(self.options["chunk_s"]))
         for _ in range(int(self.options["requests"])):
             self.mark_chunk(audio_ms=CHUNKS * 40.0)
         return {"audio": torch.full((int(self.options["requests"]), 4), float(inputs))}

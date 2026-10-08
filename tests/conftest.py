@@ -1,13 +1,41 @@
 import gc
 import os
+import subprocess
+import sys
 
 import pytest
 import torch
 
+#: A busy loop for ``--load``: it ends when its parent (this pytest process) does.
+BUSY = "import os\nparent = os.getppid()\nwhile os.getppid() == parent:\n    sum(range(100_000))\n"
+_BUSY = pytest.StashKey[list[subprocess.Popen]]()
+
+
+def pytest_addoption(parser):
+    """The flakiness check of AGENTS.md: ``--repeat 50 --load 8`` runs every selected test
+    50 times while 8 busy processes keep the CPUs loaded."""
+    group = parser.getgroup("kernel-agent")
+    group.addoption("--repeat", type=int, default=1, metavar="N", help="run each test N times")
+    group.addoption(
+        "--load", type=int, default=0, metavar="N", help="N busy processes during the session"
+    )
+
+
+def pytest_generate_tests(metafunc):
+    if (n := metafunc.config.getoption("repeat")) > 1:
+        metafunc.fixturenames.append("_repeat")
+        metafunc.parametrize("_repeat", range(n), ids=lambda i: f"x{i + 1}")
+
+
+@pytest.fixture
+def _repeat():
+    """The repetition of ``--repeat`` (parametrized)."""
+
 
 def pytest_configure(config):
     """With several GPUs in kernel-agent's lock pool, this process and its children use
-    the first one, the GPU `gpu` tests lock (set before CUDA starts)."""
+    the first one, the GPU `gpu` tests lock (set before CUDA starts). ``--load N``: the
+    busy processes start."""
     from kernel_agent import gpulock
 
     pool = gpulock.pool()
@@ -15,6 +43,14 @@ def pytest_configure(config):
         first = pool.gpus[0].index
         os.environ.update(gpulock.pinned(first), **{gpulock.GPUS_ENV: str(first)})
         gpulock.pool.cache_clear()
+    n = config.getoption("load")
+    config.stash[_BUSY] = [subprocess.Popen([sys.executable, "-c", BUSY]) for _ in range(n)]
+
+
+def pytest_unconfigure(config):
+    for proc in config.stash.get(_BUSY, []):
+        proc.kill()
+        proc.wait()
 
 
 def pytest_collection_modifyitems(config, items):

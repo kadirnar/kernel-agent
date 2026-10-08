@@ -1,6 +1,6 @@
 """Parameter sweeps (issue #19): configs of ``build(reference, **config)`` under one GPU lock.
 
-CPU: the sweep itself (quick-tier checks, a CPU stand-in for the CUDA timer), the
+CPU: the sweep itself (quick-tier checks, a simulated stand-in for the CUDA timer), the
 ``sweep_candidate`` tool's records and budget, and the real subprocesses (a config
 that kills its process).  GPU (``gpu``): a Triton RMSNorm with ``BLOCK`` / ``num_warps``.
 """
@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import statistics
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from torch.overrides import TorchFunctionMode
 
 from kernel_agent import cli, gpulock, ledger, truth
 from kernel_agent.agent import prompts
@@ -72,15 +71,25 @@ def toy_capture(path: Path) -> Path:
     return path
 
 
+class TorchCalls(TorchFunctionMode):
+    """Counts the torch functions and tensor methods called under it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.n = 0
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        self.n += 1
+        return func(*args, **(kwargs or {}))
+
+
 def cpu_timer(fn, args, kwargs, *, l2_flush=False, target_ms=60.0, keep=False):
-    """Stand-in for kernels.bench.time_call on the CPU (wall clock, median of 7 calls)."""
-    ms = []
-    with torch.inference_mode():
-        for _ in range(7):
-            t0 = time.perf_counter()
-            fn(*args, **kwargs)
-            ms.append((time.perf_counter() - t0) * 1e3)
-    return {"median_ms": statistics.median(ms)}
+    """Stand-in for kernels.bench.time_call on the CPU, in simulated time: 1 us per torch
+    call. The configs differ in the work they do (``repeat``); wall-clock times of a CPU
+    toy on a busy machine could put them in another order."""
+    with torch.inference_mode(), TorchCalls() as calls:
+        fn(*args, **kwargs)
+    return {"median_ms": calls.n * 1e-3}
 
 
 # ------------------------------------------------------------------ configs

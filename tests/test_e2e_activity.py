@@ -150,7 +150,11 @@ def test_no_gpu_activity_is_a_note() -> None:
 def _module(path: Path) -> Any:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        "def wait(event):\n    event.wait(30)\n\n\ndef noop():\n    pass\n",
+        "def wait(event, entered=None):\n"
+        "    if entered is not None:\n"
+        "        entered.release()  # this thread runs the evaluated code now\n"
+        "    event.wait(30)\n\n\n"
+        "def noop():\n    pass\n",
     )
     spec = importlib.util.spec_from_file_location(f"ka_threads_{path.parent.name}", path)
     assert spec is not None and spec.loader is not None
@@ -161,15 +165,17 @@ def _module(path: Path) -> Any:
 
 def test_live_threads_finds_threads_running_the_evaluated_code(tmp_path: Path) -> None:
     module = _module(tmp_path / "transforms" / "late.py")
-    stop = threading.Event()
-    direct = threading.Thread(target=module.wait, args=(stop,), name="direct")
-    wrapped = threading.Thread(target=functools.partial(module.wait, stop), name="wrapped")
+    stop, entered = threading.Event(), threading.Semaphore(0)
+    direct = threading.Thread(target=module.wait, args=(stop, entered), name="direct")
+    wrapped = threading.Thread(target=functools.partial(module.wait, stop, entered), name="wrapped")
     timer = threading.Timer(60, module.noop)
     timer.name = "timer"
     for t in (direct, wrapped, timer):
         t.start()
     try:
-        time.sleep(0.05)  # the wrapped one is inside module.wait by now
+        # both are inside module.wait (the wrapped one is found by its frames), however
+        # long the scheduler took to start them
+        assert entered.acquire(timeout=60) and entered.acquire(timeout=60)
         found = live_threads([tmp_path / "transforms"])
         assert {f.split(" ")[0] for f in found} == {"direct", "wrapped", "timer"}, found
         assert all("late.py" in f for f in found)

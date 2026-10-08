@@ -13,6 +13,7 @@ import pytest
 from kernel_agent import gpulock, interrupt
 
 NVIDIA_SMI = gpulock._nvidia_smi  # before the fixture fakes it
+TIMEOUT = 60  # seconds a thread waits for another before the test fails (never on time)
 POOL_ENV = (
     gpulock.ENV,
     gpulock.GPUS_ENV,
@@ -265,15 +266,25 @@ def test_threads_spread_over_the_pool_never_two_on_one_gpu(monkeypatch):
     inside = {0: 0, 1: 0}
     peak = {0: 0, 1: 0}
     guard = threading.Lock()
+    # The first two threads to get a GPU wait for each other: both GPUs in use at once,
+    # whatever the scheduler does (a sleep did not always overlap two on a busy machine).
+    # Only those two: a later thread may wait for a GPU while the other one is free
+    # (gpulock lets a job admitted later take the GPU an earlier one was admitted to).
+    first, arrived = threading.Barrier(2), []
 
     def work():
         with gpulock.gpu_lock() as gpu:
             with guard:
                 inside[gpu] += 1
                 peak[gpu] = max(peak[gpu], inside[gpu])
-            time.sleep(0.05)
-            with guard:
-                inside[gpu] -= 1
+                arrived.append(gpu)
+                n = len(arrived)
+            try:
+                if n <= 2:
+                    first.wait(TIMEOUT)
+            finally:
+                with guard:
+                    inside[gpu] -= 1
 
     threads = [threading.Thread(target=work) for _ in range(6)]
     for t in threads:
@@ -386,6 +397,12 @@ def test_parallel_evaluations_run_one_per_gpu(monkeypatch, tmp_path):
     busy = {"0": 0, "1": 0}
     peak = {"0": 0, "1": 0, "all": 0}
     guard = threading.Lock()
+    # Each evaluation keeps its GPU until the next one has started: the first two run at
+    # once, the third gets the GPU the first let go and the fourth the second's, by
+    # construction, not because sleeps happened to overlap them (on a busy machine they did
+    # not always: a GPU let go early went to the next evaluation, three ran on one GPU).
+    began = [threading.Event() for _ in range(5)]
+    started: list[str] = []
 
     def run(cmd, *, env, **kwargs):
         gpu = env["CUDA_VISIBLE_DEVICES"]
@@ -393,9 +410,14 @@ def test_parallel_evaluations_run_one_per_gpu(monkeypatch, tmp_path):
             busy[gpu] += 1
             peak[gpu] = max(peak[gpu], busy[gpu])
             peak["all"] = max(peak["all"], sum(busy.values()))
-        time.sleep(0.2)
-        with guard:
-            busy[gpu] -= 1
+            started.append(gpu)
+            n = len(started)
+        began[n].set()
+        try:  # (one at a time: the next one never starts, this wait fails)
+            assert n == 4 or began[n + 1].wait(TIMEOUT), "evaluations ran one at a time"
+        finally:
+            with guard:
+                busy[gpu] -= 1
         tag = kwargs["input"].strip() + "@@"  # run_evaluation's result-line nonce
         return subprocess.CompletedProcess(cmd, 0, "@@KA_RESULT@@" + tag + json.dumps({}), "")
 

@@ -120,7 +120,10 @@ class ToyDecoderWorkload(Workload):
         return ids.unsqueeze(0).to(self.device)
 
     def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
-        return {"offset": 3 * variant}
+        # The ids wrap around the vocabulary (96 = 3 x 32): offset 3 * variant would make
+        # every 32nd fresh input of the memoisation probe (variant >= 2) the held-out input
+        # (offset 3) or the main one (0). 3 * variant + 1 never is, nor are two in a row.
+        return {"offset": 3 * variant + (variant >= 2)}
 
     def run(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         ids, first = inputs, None

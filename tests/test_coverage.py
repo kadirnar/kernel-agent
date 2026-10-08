@@ -4,7 +4,6 @@ KV-length buckets of decode signatures, correctness-only capture variants."""
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +11,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from fake_clock import Clock
 from test_methods import PREFIX, SAME_STEP, STEPS, ToyWorkload, _candidate
 from test_truth import force_write, sealed_run, tamper_events
 from test_voxcpm import FakeVoxCPM, _voxcpm2_cached
@@ -21,7 +21,7 @@ from kernel_agent import toolchain, truth, worker
 from kernel_agent.hub import Modality
 from kernel_agent.kernels.evaluate import evaluate
 from kernel_agent.profiling.capture import _split_calls, bucket_plan, capture_module, load_capture
-from kernel_agent.workloads import create_workload, holdout
+from kernel_agent.workloads import base, create_workload, holdout
 from kernel_agent.workloads.base import Comparison, Workload, WorkloadSpec, measure
 from kernel_agent.workloads.diffusion import DiffusionWorkload
 from kernel_agent.workloads.llm import LLMWorkload
@@ -34,7 +34,7 @@ TOY = Path(__file__).with_name("chaotic_toy.py")
 #: A transform that memoises ``workload.run`` across runs and computes for real only
 #: under the teacher-forcing / probe hooks (so today's checks all pass).
 MEMO = """
-import time
+from kernel_agent.workloads import base
 
 CACHE = {{}}
 
@@ -47,7 +47,7 @@ def apply(workload):
             return run(inputs)
         key = {key}
         if key not in CACHE:
-            time.sleep(0.05)  # the real work of a bigger model
+            base.time.sleep(0.05)  # the real work of a bigger model (simulated time)
             CACHE[key] = run(inputs)
         return CACHE[key]
 
@@ -75,6 +75,16 @@ def _call(capsys, run: RunDir, *argv: Any) -> dict[str, Any]:
 def cpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(toolchain, "setup", lambda *a, **k: None)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Runs timed in simulated seconds: 1 ms each, plus what the test's own sleeps add.
+    The memoisation probe's verdict compares run times; real ones of a CPU toy on a busy
+    machine are off by tens of ms."""
+    fake = Clock(tick=1e-3)
+    monkeypatch.setattr(base, "time", fake)
+    return fake
 
 
 # ------------------------------------------------------------------ held-out input
@@ -191,7 +201,7 @@ def _held_out_verdict(wl: Workload, wrap: Any) -> dict[str, Any]:
     )
 
 
-def test_compiling_per_shape_is_not_memoisation():
+def test_compiling_per_shape_is_not_memoisation(clock):
     """A first run at new shapes may be slow (compile, graph capture); the probe times
     a fresh input at the held-out shapes, which the held-out run warmed up."""
 
@@ -201,7 +211,7 @@ def test_compiling_per_shape_is_not_memoisation():
         def compiled(inputs: torch.Tensor) -> Any:
             if tuple(inputs.shape) not in seen:
                 seen.add(tuple(inputs.shape))
-                time.sleep(0.2)  # compile for a new shape
+                clock.sleep(0.2)  # compile for a new shape
             return run(inputs)
 
         wl.run = compiled
@@ -216,14 +226,14 @@ def test_compiling_per_shape_is_not_memoisation():
     assert not result["equals_main_output"] and result["quality"]["passed"]
 
 
-def test_memoising_run_fails_the_probe():
+def test_memoising_run_fails_the_probe(clock):
     def memoise(wl: Workload) -> None:
         run, cache = wl.run, {}
 
         def memoised(inputs: torch.Tensor) -> Any:
             key = inputs.numpy().tobytes()
             if key not in cache:
-                time.sleep(0.05)
+                clock.sleep(0.05)
                 cache[key] = run(inputs)
             return cache[key]
 
@@ -239,7 +249,7 @@ def test_memoising_run_fails_the_probe():
     assert result["memoisation"]["fresh_over_repeat"] > holdout.MEMO_RATIO
 
 
-def test_one_slow_fresh_run_is_noise_not_memoisation():
+def test_one_slow_fresh_run_is_noise_not_memoisation(clock):
     """A busy GPU slows one run: the probe confirms on a second fresh input."""
 
     def hiccup(wl: Workload) -> None:
@@ -248,7 +258,7 @@ def test_one_slow_fresh_run_is_noise_not_memoisation():
         def busy(inputs: torch.Tensor) -> Any:
             calls[0] += 1
             if calls[0] == 6:  # 4 timed main runs, the held-out run, then the probe
-                time.sleep(0.2)
+                clock.sleep(0.2)
             return run(inputs)
 
         wl.run = busy
@@ -279,7 +289,7 @@ def test_outputs_equal():
     assert holdout.outputs_equal("text", "text") and not holdout.outputs_equal("a", "b")
 
 
-def test_worker_stores_verifies_and_checks_the_held_out_input(tmp_path, cpu, capsys):
+def test_worker_stores_verifies_and_checks_the_held_out_input(tmp_path, cpu, clock, capsys):
     """analyze stores the held-out baseline in .truth/ (sealed, verified by e2e); e2e
     passes a benign transform and rejects memoising ones that pass every other check."""
     spec = WorkloadSpec(repo_id="toy/chaotic", modality="tts", device="cpu", harness=str(TOY))
