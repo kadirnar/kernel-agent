@@ -143,14 +143,16 @@ svg .ref { stroke: var(--ink-2); stroke-width: 1; stroke-dasharray: 5 4; fill: n
 svg .now { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 3; }
 svg .compile { stroke: var(--compile); stroke-width: 1.6; stroke-dasharray: 1.5 3;
   stroke-linecap: round; fill: none; }
-svg .projected { stroke: var(--projected); stroke-width: 2; fill: none; stroke-linejoin: round; }
+/* progress is drawn as lines (no point markers): the best so far prominent, every result
+   as a thin light line, failures as ticks on the axis */
+svg .projected { stroke: var(--projected); stroke-width: 2.5; fill: none; stroke-linejoin: round; }
 svg .projected-dot { fill: var(--projected); stroke: var(--surface); stroke-width: 1.5; }
-svg .best-line { stroke: var(--keep); stroke-width: 2; fill: none; stroke-linejoin: round; }
-svg .keep { fill: var(--keep); stroke: var(--surface); stroke-width: 2; }
-svg .discard { fill: var(--discard); stroke: var(--surface); stroke-width: 2; }
+svg .best-line { stroke: var(--keep); stroke-width: 2.5; fill: none; stroke-linejoin: round; }
+svg .each-line { stroke: var(--discard); stroke-width: 1.3; fill: none; stroke-linejoin: round;
+  stroke-linecap: round; }
 svg .fail { stroke: var(--fail); stroke-width: 2; fill: none; stroke-linecap: round; }
-svg .cost-line { stroke: var(--cost); stroke-width: 2; fill: none; stroke-linejoin: round; }
-svg .cost-dot { fill: var(--cost); stroke: var(--surface); stroke-width: 2; }
+svg .fail-tick { stroke: var(--fail); stroke-width: 2; stroke-linecap: round; }
+svg .cost-line { stroke: var(--cost); stroke-width: 2.5; fill: none; stroke-linejoin: round; }
 svg .budget { stroke: var(--critical); stroke-width: 1; stroke-dasharray: 5 4; }
 svg .total { fill: var(--total); }
 svg .gain { fill: var(--keep); }
@@ -158,6 +160,17 @@ svg .nogain { stroke: var(--discard); stroke-width: 1; }
 svg .hatch { stroke: var(--discard); stroke-width: 1.2; }
 svg .connector { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 2; }
 svg .row-hover { fill: var(--hover); }
+/* agent swimlanes (sessions.py): a session's states, the GPU's holders */
+svg .st-model { fill: var(--t0); }
+svg .st-gpu, svg .gpu-agent { fill: var(--t2); }
+svg .st-queued { fill: var(--fail); }
+svg .st-eval { fill: var(--t4); }
+svg .st-tools { fill: var(--t3); }
+svg .st-idle { fill: var(--other); }
+svg .gpu-bg { fill: var(--muted); }
+svg .sess { fill: none; stroke: var(--surface); stroke-width: 1.5; }
+svg .lane-label { fill: var(--ink); font-size: 10.5px; font-weight: 600; paint-order: stroke;
+  stroke: var(--surface); stroke-width: 3px; stroke-linejoin: round; pointer-events: none; }
 svg .focus-ring { fill: none; stroke: var(--ink); stroke-width: 1.5; pointer-events: none; }
 .tooltip { position: fixed; z-index: 20; max-width: min(360px, calc(100vw - 16px));
   padding: 8px 10px; pointer-events: none; background: var(--surface); color: var(--ink);
@@ -276,6 +289,16 @@ td.nowrap { white-space: nowrap; }
   <div class="multiples" id="multiples"></div>
 </section>
 
+<section aria-labelledby="h-lanes">
+  <div class="card">
+    <div class="head"><h2 id="h-lanes">Agents</h2><span class="note" id="lanes-note"></span></div>
+    <p class="caption">What each agent session did over wall-clock time, one row per session running
+      at the same time, coloured by its state; the last row shows who held the GPU.</p>
+    <div class="chart" id="chart-lanes"></div>
+    <div class="legend" id="legend-lanes"></div>
+  </div>
+</section>
+
 <div class="two">
   <section aria-labelledby="h-cost" class="card">
     <div class="head"><h2 id="h-cost">Agent cost</h2><span class="note" id="cost-note"></span></div>
@@ -352,7 +375,7 @@ td.nowrap { white-space: nowrap; }
   // not the agents' benchmark evaluations (ledger.UNMEASURED): quick checks, duplicates, re-evaluations
   const UNMEASURED = ["quick_ok", "quick_fail", "duplicate", "re-evaluated"];
   const MAX_EVENTS = 600, MAX_LOGS = 400;
-  const S = { summary: null, rows: [], events: [], logs: [] };
+  const S = { summary: null, rows: [], events: [], logs: [], lanes: null };
   const ui = { target: "", status: "", query: "", limit: 100, files: null, file: null, filter: "",
                conn: "connecting", filesStale: false };
   let clockOffset = 0;
@@ -448,8 +471,11 @@ td.nowrap { white-space: nowrap; }
     return g;
   }
   const dot = (x, y, r, cls) => svg("circle", { cx: x, cy: y, r, class: cls });
-  const diamond = (x, y, r, cls) =>
-    svg("path", { d: `M${x},${y - r}L${x + r},${y}L${x},${y + r}L${x - r},${y}Z`, class: cls });
+  // a thin line through points (x, y); one point: a short dash
+  const through = (pts) => (pts.length > 1 ? pts.map((p, i) => `${i ? "L" : "M"}${p.x},${p.y}`).join("")
+    : pts.length ? `M${pts[0].x - 4},${pts[0].y}H${pts[0].x + 4}` : "");
+  const failTick = (x, y0, y1) => svg("line", { class: "fail-tick", x1: x, x2: x, y1: y0, y2: y1 });
+  const DASHES = [null, "5 2", "1 2.5", "6 2 1.5 2", "10 3", "3 1 1 1"];  // a worker's line
   const cross = (x, y, r, cls = "fail") =>
     svg("path", { d: `M${x - r},${y - r}L${x + r},${y + r}M${x - r},${y + r}L${x + r},${y - r}`, class: cls });
   function label(x, y, text, anchor = "start", cls = "") {
@@ -463,11 +489,8 @@ td.nowrap { white-space: nowrap; }
       best: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "best-line" }),
       ref: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "ref" }),
       compile: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "compile" }),
-      keep: () => dot(9, 6, 5, "keep"),
-      discard: () => dot(9, 6, 4.5, "discard"),
-      dkeep: () => diamond(9, 6, 5.5, "keep"),
-      ddiscard: () => diamond(9, 6, 5, "discard"),
-      fail: () => cross(9, 6, 3.5),
+      each: () => svg("line", { x1: 1, y1: 6, x2: 17, y2: 6, class: "each-line" }),
+      failtick: () => svg("line", { x1: 9, y1: 1.5, x2: 9, y2: 10.5, class: "fail-tick" }),
       total: () => svg("rect", { x: 2, y: 2, width: 14, height: 8, rx: 2, class: "total" }),
       gain: () => svg("rect", { x: 2, y: 2, width: 14, height: 8, rx: 2, class: "gain" }),
       nogain: () => svg("rect", { x: 2.5, y: 2.5, width: 13, height: 7, fill: "none", class: "nogain" }),
@@ -586,6 +609,7 @@ td.nowrap { white-space: nowrap; }
     S.rows.forEach((r) => bump(minutesOf(r.ts)));
     sm.phases.forEach((p) => bump(minutesOf(p.end ?? p.start)));
     sm.costs.burn.forEach((b) => bump(minutesOf(b.ts)));
+    if (S.lanes && S.lanes.end) bump(minutesOf(S.lanes.end));
     if (sm.run.running) bump(minutesOf(nowTs()));
     return end;
   }
@@ -784,15 +808,18 @@ td.nowrap { white-space: nowrap; }
     const last = proj[proj.length - 1];
     if (y != null) d += `H${xs(Math.max(lineEnd, last.t))}`;
     g.append(svg("path", { class: "projected", d }));
-    shown.slice(1).forEach((p) => g.append(dot(xs(p.t), ys(p.ms), 3, "projected-dot")));
     if (proj.length > 1) {  // at the end of the line: its last projectable value
       const end = shown[shown.length - 1], stop = proj[proj.indexOf(end) + 1];
       const text = `projected ${fmt.ms(end.ms)}` + (last.ms == null ? ", then not projectable" : "");
       g.append(label(xs(stop ? stop.t : Math.max(lineEnd, last.t)), ys(end.ms) - 6, text, "end", "strong"));
     }
-    measured.filter((m) => m.row.status === "discard").forEach((m) => g.append(diamond(xs(m.t), ys(m.row.new_ms), 5.5, "discard")));
-    measured.filter((m) => m.row.status === "keep").forEach((m) => g.append(diamond(xs(m.t), ys(m.row.new_ms), 6.5, "keep")));
-    failed.forEach((m) => g.append(cross(xs(m.t), f.y1 + 6, 3.5)));
+    if (measured.length) {  // every measured run: a thin, light line; the best so far: a step line
+      g.append(svg("path", { class: "each-line", d: through(measured.map((m) => ({ x: xs(m.t), y: ys(m.row.new_ms) }))) }));
+      let bd = `M${xs(measured[0].t)},${ys(base)}`;
+      for (const m of measured) if (m.row.status === "keep") bd += `H${xs(m.t)}V${ys(m.row.new_ms)}`;
+      g.append(svg("path", { class: "best-line", d: `${bd}H${xs(Math.max(lineEnd, measured[measured.length - 1].t))}` }));
+    }
+    failed.forEach((m) => g.append(failTick(xs(m.t), f.y1, f.y1 + 9)));  // ticks at the top
     f.root.append(g);
 
     // label the integrated result (else the running best measurement)
@@ -821,8 +848,8 @@ td.nowrap { white-space: nowrap; }
     }
     hover(f, points);
     $("e2e-note").textContent = `${S.rows.length - sm.counts.e2e} kernel evaluations · ${sm.counts.e2e} end-to-end runs`;
-    const keys = [key("projected", "projected (kernels)"), key("dkeep", "measured, new best"),
-      key("ddiscard", "measured, no gain"), key("fail", "failed"), key("ref", "baseline")];
+    const keys = [key("projected", "projected (kernels)"), key("best", "measured, best so far"),
+      key("each", "each measured run"), key("failtick", "failed"), key("ref", "baseline")];
     if (comp) keys.push(key("compile", "torch.compile"));
     $("legend-e2e").replaceChildren(...keys);
   }
@@ -830,8 +857,8 @@ td.nowrap { white-space: nowrap; }
   // ------------------------------------------------------------ per-target small multiples
   function drawTargets() {
     const host = $("multiples"), sm = S.summary;
-    $("legend-targets").replaceChildren(key("keep", "kept"), key("discard", "discarded"),
-      key("fail", "failed (on the floor)"), key("best", "running best"), key("ref", "reference 1.0×"));
+    $("legend-targets").replaceChildren(key("best", "running best"), key("each", "each evaluation"),
+      key("failtick", "failed (ticks on the axis)"), key("ref", "reference 1.0×"));
     if (!sm.targets.length) return empty(host, "No kernel targets yet: the planner picks them after the profile.");
     const charts = [];
     host.replaceChildren(...sm.targets.map((t) => {
@@ -872,8 +899,8 @@ td.nowrap { white-space: nowrap; }
     const xs = linear(0.5, n + 0.5, f.x0 + 2, f.x1), ys = linear(lo, hi, f.y0, f.y1);
     axes(f, xs, ys, ticks(1, n, 5).filter((v) => Number.isInteger(v) && v >= 1), ticks(lo, hi, 3),
       (v) => `${v}`, (v) => `${+v.toFixed(2)}×`, null);
-    const g = svg("g", {});
-    g.append(svg("line", { class: "ref", x1: f.x0, x2: f.x1, y1: ys(1), y2: ys(1) }));
+    const g = svg("g", {}), under = svg("g", {});
+    g.append(svg("line", { class: "ref", x1: f.x0, x2: f.x1, y1: ys(1), y2: ys(1) }), under);
     let best = 1, d = `M${xs(0.5)},${ys(1)}`;
     rows.forEach((r, i) => {
       if (r.status === "keep" && r.speedup != null) {
@@ -893,15 +920,112 @@ td.nowrap { white-space: nowrap; }
         [good && r.new_ms != null ? `${fmt.ms(r.new_ms, 4)} vs ${fmt.ms(r.ref_ms, 4)} per run` : null,
           `${r.snapshot}${r.parent ? ` (parent ${r.parent})` : ""}`, r.time], r.hypothesis) };
     });
-    points.filter((p) => p.data.status === "discard").forEach((p) => g.append(dot(p.x, p.y, 3.8, "discard")));
-    points.filter((p) => kindOf(p.data.status) === "fail").forEach((p) => g.append(cross(p.x, p.y, 3.2)));
-    points.filter((p) => p.data.status === "keep").forEach((p) => g.append(dot(p.x, p.y, 4.6, "keep")));
+    // every evaluation: a thin, light line under the running best (one dash pattern per worker)
+    const good = points.filter((p) => p.data.status === "keep" || p.data.status === "discard");
+    for (const w of [...new Set(good.map((p) => p.data.worker || ""))]) {
+      const dash = w ? DASHES[(Number(w) - 1) % DASHES.length] : null;
+      under.append(svg("path", { class: "each-line", d: through(good.filter((p) => (p.data.worker || "") === w)),
+        "stroke-dasharray": dash }));
+    }
+    points.filter((p) => kindOf(p.data.status) === "fail").forEach((p) => g.append(failTick(p.x, f.y0 - 9, f.y0)));
     if (best > 1) {
       const x = xs(rows.length + 0.5);
       g.append(label(Math.min(x, f.x1), ys(best) - 6, fmt.x(best), "end", "strong"));
     }
     f.root.append(g);
     hover(f, points);
+  }
+
+  // ------------------------------------------------------------ agent swimlanes (sessions.py)
+  // a state's part of the time split (sessions.PART) and the parts' names (sessions.TITLES)
+  const PART_OF = { starting: "idle", thinking: "model", helper: "model", tool: "tools",
+    evaluating: "eval", queued: "queued", on_gpu: "gpu", limited: "idle", idle: "idle" };
+  const PARTS = ["model", "gpu", "queued", "eval", "tools", "idle"];
+  const PART_TITLE = { model: "model", gpu: "GPU held", queued: "waiting for the GPU",
+    eval: "evaluation off the GPU", tools: "own runs", idle: "idle" };
+  function stateText(state, detail) {  // sessions.describe
+    switch (state) {
+      case "tool": return detail ? `running ${detail}` : "running a tool";
+      case "evaluating": return `${detail || "evaluating"} (off the GPU)`;
+      case "queued": return detail ? `waiting for the GPU (${detail})` : "waiting for the GPU";
+      case "on_gpu": return detail ? `on the GPU (${detail})` : "on the GPU";
+      case "helper": return detail ? `helper (${detail})` : "helper";
+      case "limited": return "usage limit";
+      default: return state;
+    }
+  }
+  function splitText(split) {
+    const total = PARTS.reduce((a, p) => a + (split[p] || 0), 0);
+    return total > 0 ? PARTS.filter((p) => split[p] > 0)
+      .map((p) => `${PART_TITLE[p]} ${Math.round((100 * split[p]) / total)} %`).join(" · ") : "";
+  }
+  function swatchKey(cls, text) {
+    const icon = svg("svg", { width: 14, height: 12, viewBox: "0 0 14 12", "aria-hidden": "true" },
+      svg("rect", { x: 1, y: 2, width: 12, height: 8, rx: 2, class: cls }));
+    return h("span", { class: "key" }, icon, text);
+  }
+  function drawLanes() {
+    const host = $("chart-lanes"), L = S.lanes, sm = S.summary;
+    $("legend-lanes").replaceChildren();
+    $("lanes-note").textContent = "";
+    const sessions = (L && L.sessions) || [], holds = (L && L.gpu) || [];
+    if ((!sessions.length && !holds.length) || sm.run.start_ts == null) {
+      return empty(host, "Appears when the first agent session starts (sessions.jsonl).");
+    }
+    const tEnd = timeExtent(), tMax = tEnd * 1.03, narrow = host.clientWidth < 560;
+    const lanes = sessions.length ? L.lanes : 0, rows = lanes + (holds.length ? 1 : 0), rowH = 26;
+    const f = frame(host, "lanes", "Agent sessions over wall-clock time; arrow keys walk the sessions",
+      { height: rows * rowH + 40, left: narrow ? 50 : 62, top: 6, bottom: 30, right: 16 });
+    const xs = linear(0, tMax, f.x0, f.x1), ta = timeAxis(tMax, narrow ? 4 : 8);
+    axes(f, xs, () => 0, ta.ticks, [], ta.fmt, null, ta.label);
+    const now = sm.run.running ? Math.max(minutesOf(nowTs()), 0) : tEnd;
+    const g = svg("g", {}), points = [];
+    const rowY = (i) => f.y1 + i * rowH;
+    const rowName = (i, text) => g.append(svg("text", { class: "tick", x: f.x0 - 6,
+      y: rowY(i) + rowH / 2 + 3.5, "text-anchor": "end" }, text));
+    for (let i = 0; i < lanes; i++) rowName(i, `agent ${i + 1}`);
+    for (const s of sessions) {
+      const y = rowY(s.lane) + 3, hgt = rowH - 6;
+      const end = s.end != null ? minutesOf(s.end) : now;
+      for (const [a, b, state] of s.segments) {
+        const x0 = xs(minutesOf(s.start + a)), x1 = xs(b == null ? end : minutesOf(s.start + b));
+        g.append(svg("rect", { class: `st-${PART_OF[state] || "idle"}`, x: x0, y, width: Math.max(x1 - x0, 0.6), height: hgt }));
+      }
+      const x0 = xs(minutesOf(s.start)), x1 = xs(end);
+      g.append(svg("rect", { class: "sess", x: x0, y, width: Math.max(x1 - x0, 0.6), height: hgt, rx: 2 }));
+      if (x1 - x0 > textWidth(s.label, 10.5) + 10) {
+        g.append(svg("text", { class: "lane-label", x: x0 + 4, y: y + hgt / 2 + 3.5 }, s.label));
+      }
+      const minutes = ((s.end ?? (sm.run.running ? nowTs() : s.since)) - s.start) / 60;
+      points.push({ x: (x0 + x1) / 2, y: y + hgt / 2, r: 8, tip: () => tipContent(s.label,
+        `${s.role}${s.arm ? ` on ${s.arm}` : ""} · ${fmt.dur(minutes * 60)} · `
+          + (s.end == null ? `now ${stateText(s.state, s.detail)}` : s.status || "ended"),
+        [splitText(s.split), `${s.evaluations} evaluation${s.evaluations === 1 ? "" : "s"}`
+          + (s.usd != null ? ` · ${fmt.usd(s.usd)}` : "")]) });
+    }
+    if (holds.length) {
+      rowName(lanes, "GPU");
+      const y = rowY(lanes) + 6, hgt = rowH - 12;
+      for (const [a, b, group, kind, session] of holds) {
+        const x0 = xs(minutesOf(L.start + a)), x1 = xs(b == null ? now : minutesOf(L.start + b));
+        g.append(svg("rect", { class: group === "agent" ? "gpu-agent" : "gpu-bg", x: x0, y, width: Math.max(x1 - x0, 0.8), height: hgt }));
+        points.push({ x: (x0 + x1) / 2, y: y + hgt / 2, r: 6, tip: () => tipContent(kind || "GPU job",
+          session ? `for ${session}` : group === "agent" ? "the agents' jobs" : "background work",
+          [b == null ? "holds the GPU now" : `${fmt.dur(b - a)} on the GPU`]) });
+      }
+    }
+    if (sm.run.running) {
+      const x = xs(now);
+      g.append(svg("line", { class: "now", x1: x, x2: x, y1: f.y1, y2: f.y0 }));
+    }
+    f.root.append(g);
+    hover(f, points);
+    const open = sessions.filter((s) => s.end == null).length;
+    $("lanes-note").textContent = [`${sessions.length} sessions`, open && sm.run.running ? `${open} running` : null,
+      splitText(L.split || {}), L.busy != null ? `GPU busy ${Math.round(100 * L.busy)} %` : null]
+      .filter(Boolean).join(" · ");
+    $("legend-lanes").replaceChildren(...PARTS.map((p) => swatchKey(`st-${p}`, PART_TITLE[p])),
+      swatchKey("gpu-bg", "GPU: background (integration)"));
   }
 
   // ------------------------------------------------------------ cost burn
@@ -933,7 +1057,6 @@ td.nowrap { white-space: nowrap; }
     g.append(svg("path", { class: "cost-line", d }));
     const points = burn.map((b) => {
       const x = xs(minutesOf(b.ts)), y = ys(b.usd);
-      g.append(dot(x, y, 4, "cost-dot"));
       return { x, y, r: 7, tip: () => tipContent(fmt.usd(b.usd), `total after ${b.agent} finished`,
         [`${b.agent}: +${fmt.usd(b.add)}`, `${num(minutesOf(b.ts), 0)} min into the run`]) };
     });
@@ -984,7 +1107,7 @@ td.nowrap { white-space: nowrap; }
         const delta = s.ms - s.from;
         note = `no gain`; noteX = xs(b) + 6; value = `${fmt.ms(s.ms)} (${delta >= 0 ? "+" : "−"}${num(Math.abs(delta))} ms)`;
       } else {
-        g.append(cross(xs(level), mid, 4.5));
+        g.append(failTick(xs(level), mid - 7, mid + 7));
         note = "failed"; noteX = xs(level) + 9; value = "failed";
       }
       g.append(svg("text", { x: noteX, y: mid + 4, class: s.kind === "keep" ? "strong" : "tick" }, note));
@@ -998,7 +1121,7 @@ td.nowrap { white-space: nowrap; }
     });
     hover(f, points, { axis: "y", reach: 0 });
     $("legend-int").replaceChildren(key("total", "end-to-end total"), key("gain", "accepted (ms saved)"),
-      key("nogain", "rejected, no gain"), key("fail", "failed"));
+      key("nogain", "rejected, no gain"), key("failtick", "failed"));
   }
 
   // ------------------------------------------------------------ feeds
@@ -1013,6 +1136,9 @@ td.nowrap { white-space: nowrap; }
         const bits = [e.usd != null ? fmt.usd(e.usd) : "", e.minutes != null ? `${e.minutes} min` : "", e.error ? "error" : ""];
         return [`${data("agent")} finished`, bits.filter(Boolean).join(" · ")];
       }
+      case "gpu_job":
+        return [`${data("kind")}${e.session ? ` of ${data("session")}` : ""} waited ${fmt.dur(e.wait_s)} for the GPU`,
+          data("class")];
       case "evaluation": {
         const r = byExp.get(e.exp);
         const extra = r && r.speedup != null && kindOf(r.status) !== "fail" ? ` · ${fmt.x(r.speedup)}` : "";
@@ -1169,7 +1295,7 @@ td.nowrap { white-space: nowrap; }
       ? document.activeElement.dataset.key : null;
     tip.hidden = true;
     renderHeader();
-    for (const draw of [drawE2E, drawTargets, drawCost, drawIntegration]) {
+    for (const draw of [drawE2E, drawTargets, drawLanes, drawCost, drawIntegration]) {
       try { draw(); } catch (err) { console.error(err); }
     }
     renderFeeds();
@@ -1194,7 +1320,7 @@ td.nowrap { white-space: nowrap; }
     es.addEventListener("error", () => { ui.conn = "retry"; if (S.summary) renderLive(); });
     es.addEventListener("state", (ev) => {
       const data = JSON.parse(ev.data);
-      S.rows = data.rows; S.events = data.events; S.logs = data.logs;
+      S.rows = data.rows; S.events = data.events; S.logs = data.logs; S.lanes = data.lanes || null;
       receive(data.summary);
       ui.conn = "open";
       schedule();
@@ -1204,13 +1330,14 @@ td.nowrap { white-space: nowrap; }
       if (data.rows) { S.rows.push(...data.rows); ui.filesStale = true; }
       if (data.events) S.events = S.events.concat(data.events).slice(-MAX_EVENTS);
       if (data.logs) S.logs = S.logs.concat(data.logs).slice(-MAX_LOGS);
+      if (data.lanes) S.lanes = data.lanes;
       receive(data.summary);
       schedule();
     });
   }
 
   const initial = JSON.parse($("initial-state").textContent);
-  S.rows = initial.rows; S.events = initial.events; S.logs = initial.logs;
+  S.rows = initial.rows; S.events = initial.events; S.logs = initial.logs; S.lanes = initial.lanes || null;
   receive(initial.summary);
   render();
   let lastWidth = document.body.clientWidth;

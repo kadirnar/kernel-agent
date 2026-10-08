@@ -4,8 +4,10 @@
 Start it before, during or after a run: it only reads files, so the
 optimisation process never notices it.
 
-* ``results.tsv`` (ledger rows), ``events.jsonl`` and ``logs/agent-*.jsonl`` are
-  tailed by byte offset; a partly written last line is left for the next poll.
+* ``results.tsv`` (ledger rows), ``events.jsonl``, ``logs/agent-*.jsonl``,
+  ``sessions.jsonl`` (the agent sessions' states) and ``gpu_queue.jsonl`` (the GPU
+  job queue) are tailed by byte offset; a partly written last line is left for the
+  next poll.
 * ``run.json``, ``baseline.json``, ``toolchain.json``, ``costs.json``,
   ``integration.json``, the profile and the target list are re-read when their
   size or mtime changes.
@@ -16,11 +18,13 @@ Endpoints:
                    the current state embedded, so it renders before the stream connects
 * ``/api/state``   JSON snapshot: run header, baselines (eager + compiled),
                    per-target summary, ledger rows, events and agent-log tails,
-                   costs, integration
+                   costs, integration, and ``lanes``: the agent sessions' swimlanes
+                   and the GPU strip (``sessions.lanes``, issue #184)
 * ``/api/files``   the run's text files, for the file browser
 * ``/events``      SSE: ``state`` on connect, then ``delta`` (new rows, events,
-                   agent-log lines and the recomputed summary) after a poll that
-                   found something new; ``: ping`` keep-alives in between
+                   agent-log lines and the recomputed summary; the lanes, at most
+                   every ``LANES_S``) after a poll that found something new;
+                   ``: ping`` keep-alives in between
 * ``/file?path=``  read-only text viewer, confined to the run directory
 
 Only loopback ``Host`` headers are accepted unless ``--host`` binds a wildcard
@@ -42,7 +46,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from kernel_agent import charts, ledger, objective, projection
+from kernel_agent import charts, gpuqueue, ledger, objective, projection, sessions
 from kernel_agent.ledger import E2E, FAILURES, KEEP
 from kernel_agent.workspace import TRUTH_DIR, RunDir
 
@@ -54,6 +58,8 @@ LOG_TAIL = 200  # agent-log lines sent with a snapshot
 LOG_BYTES = 256 * 1024  # read this much from the end of each agent log on connect
 MAX_FILE_BYTES = 512 * 1024  # /file returns at most this much of a file
 MAX_FILES = 4000  # /api/files lists at most this many files
+LANES_S = 5.0  # the swimlanes go out with a delta at most this often
+FEED_HIDDEN = frozenset({"session_state"})  # in the swimlanes, not the events feed
 TEXT_SUFFIXES = frozenset(
     {".py", ".cu", ".cuh", ".cpp", ".cc", ".c", ".h", ".hpp", ".diff", ".patch"}
     | {".md", ".txt", ".log", ".json", ".jsonl", ".tsv", ".csv", ".toml", ".yaml", ".yml"}
@@ -215,6 +221,13 @@ class Watcher:
         self.signature: Any = None
         self.files: dict[str, Any] = {}
         self.activity: float | None = None
+        # the agent sessions' states and the GPU queue (the swimlanes, sessions.lanes)
+        self.sessions_tail = Tail(self.run.root / sessions.FILE)
+        self.gpu_tail = Tail(self.run.root / gpuqueue.FILE)
+        self.session_records: list[dict[str, Any]] = []
+        self.gpu_records: list[dict[str, Any]] = []
+        self.lanes_dirty = False
+        self.lanes_at = -math.inf  # time.monotonic() the lanes last went out
 
     # -------------------------------------------------------------- reading
 
@@ -262,6 +275,28 @@ class Watcher:
             if isinstance(record, dict):
                 out.append(_clean(record))
         return out, reset
+
+    @staticmethod
+    def _read_records(tail: Tail) -> tuple[list[dict[str, Any]], bool]:
+        lines, reset = tail.read()
+        out = []
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and "ts" in record:
+                out.append(_clean(record))
+        return out, reset
+
+    def lanes(self) -> dict[str, Any]:
+        """The swimlanes: every agent session's states and the GPU's holds
+        (``sessions.lanes``); while a phase runs they reach to now."""
+        spans = ledger.phase_spans(self.run, self.events)
+        running = any(end is None for _, _, end in spans)
+        now = time.time() if running else None
+        self.lanes_at, self.lanes_dirty = time.monotonic(), False
+        return _clean(sessions.lanes(self.session_records, self.gpu_records, now=now))
 
     def _read_logs(self, live: bool) -> list[dict[str, Any]]:
         log_dir = self.run.root / "logs"
@@ -341,40 +376,52 @@ class Watcher:
             self.backfilled = True
         self.events, _ = self._read_events()
         self.log_lines = self._read_logs(live=False)[-LOG_TAIL:]
+        self.session_records, _ = self._read_records(self.sessions_tail)
+        self.gpu_records, _ = self._read_records(self.gpu_tail)
         self._refresh_files()
         log_dir = self.run.root / "logs"
         watched = [self.run.ledger, self.run.events, self.run.root / "costs.json"]
+        watched += [self.sessions_tail.path, self.gpu_tail.path]
         watched += list(log_dir.glob("agent-*.jsonl")) if log_dir.is_dir() else []
         self.activity = max((t for t in map(_mtime, watched) if t is not None), default=None)
         return {
             "summary": self.summary(),
             "rows": self.rows,
-            "events": self.events[-EVENTS_TAIL:],
+            "events": _feed(self.events)[-EVENTS_TAIL:],
             "logs": self.log_lines,
+            "lanes": self.lanes(),
         }
 
     def poll(self) -> tuple[str, dict[str, Any]] | None:
         """``("delta", new data + summary)``, ``("state", snapshot)`` after a reset, or None."""
         rows, rows_reset = self._read_rows()
         events, events_reset = self._read_events()
-        if rows_reset or events_reset or (rows and self.backfilled):
+        states, states_reset = self._read_records(self.sessions_tail)
+        jobs, jobs_reset = self._read_records(self.gpu_tail)
+        if rows_reset or events_reset or states_reset or jobs_reset or (rows and self.backfilled):
             return "state", self.snapshot()
         logs = self._read_logs(live=True)
         changed = self._refresh_files()
-        if not (rows or events or logs or changed):
+        self.session_records += states
+        self.gpu_records += jobs
+        self.lanes_dirty = self.lanes_dirty or bool(states or jobs)
+        lanes = self.lanes_dirty and time.monotonic() - self.lanes_at >= LANES_S
+        if not (rows or events or logs or changed or lanes):
             return None
         self.rows += rows
         self.events += events
         self.log_lines = (self.log_lines + logs)[-LOG_TAIL:]
-        if rows or events or logs:
+        if rows or events or logs or states or jobs:
             self.activity = time.time()
         delta: dict[str, Any] = {"summary": self.summary()}
         if rows:
             delta["rows"] = rows
-        if events:
-            delta["events"] = events[-EVENTS_TAIL:]
+        if feed := _feed(events):
+            delta["events"] = feed[-EVENTS_TAIL:]
         if logs:
             delta["logs"] = logs[-LOG_TAIL:]
+        if lanes:
+            delta["lanes"] = self.lanes()
         return "delta", delta
 
     def summary(self) -> dict[str, Any]:
@@ -556,6 +603,11 @@ class Watcher:
                 }
             )
         return out
+
+
+def _feed(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The events the page's feed shows (the sessions' states are in its swimlanes)."""
+    return [e for e in events if e.get("event") not in FEED_HIDDEN]
 
 
 def _shown(path: Path) -> str:

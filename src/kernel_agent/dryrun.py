@@ -68,7 +68,17 @@ from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import AssistantMessage, TextBlock
 
-from kernel_agent import board, gpuqueue, interrupt, ledger, pivot, program, truth, workers
+from kernel_agent import (
+    board,
+    gpuqueue,
+    interrupt,
+    ledger,
+    pivot,
+    program,
+    sessions,
+    truth,
+    workers,
+)
 from kernel_agent.agent import auth, runner
 from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import SessionBinding, record_candidate, record_e2e_result, snapshot
@@ -88,6 +98,10 @@ HOOK_OVERHEAD = 2086.0 / BASELINE_MS  # profiled (hooked) time / real time
 GPU_BUSY = 0.453
 KERNEL_EFFICIENCY = 0.9  # share of a module's saving that shows up end to end
 FIRST_MESSAGE_S = 12.0  # a simulated session's first streamed message (virtual time)
+# virtual time: the share of a session's work that is its own runs (Bash: compiling,
+# checks), not the model; docs/MULTIAGENT-DATA.md measured 46 % for kernel sessions
+OWN_RUNS = 0.45
+EVALUATION_TOOLS = {"eval": "evaluate_candidate", "e2e": "evaluate_e2e"}
 
 HEADERS = {
     "triton": "import torch\nimport triton\nimport triton.language as tl\n",
@@ -701,7 +715,11 @@ class World:
         if not self.virtual:
             self.clock.advance(seconds)
             return
-        await asyncio.sleep(seconds)
+        own = seconds * OWN_RUNS if sessions.current() is not None else 0.0
+        await asyncio.sleep(seconds - own)  # the model (sessions.py: thinking)
+        if own:
+            with sessions.tool("Bash"):  # its own runs
+                await asyncio.sleep(own)
         if self.limit is not None:
             at, lasts = self.limit
             if at <= self.clock.now() - self.clock.t0 < at + lasts:
@@ -719,12 +737,14 @@ class World:
     async def _evaluate(self, kind: str, seconds: float, target: str | None = None) -> float | None:
         """The GPU job of a simulated evaluation (``eval``, ``e2e``): in virtual time it goes
         through the GPU queue as the session's job and holds the GPU for ``seconds`` (its
-        ``eval_s``); returns its wait (``queue_s``). Without virtual time it takes no time."""
-        if not self.virtual:
-            return None
-        job = gpuqueue.Job.of(self.run, kind, target)
-        await self._held(job, seconds)
-        return job.queue_s
+        ``eval_s``); returns its wait (``queue_s``). Without virtual time it takes no time.
+        Either way it is the session's evaluation tool call (its states, ``sessions.py``)."""
+        with sessions.tool(EVALUATION_TOOLS[kind]):
+            if not self.virtual:
+                return None
+            job = gpuqueue.Job.of(self.run, kind, target)
+            await self._held(job, seconds)
+            return job.queue_s
 
     @staticmethod
     async def _held(job: gpuqueue.Job, seconds: float) -> None:
@@ -770,6 +790,7 @@ class World:
         result = result or AgentResult(name=name)
         result.is_error, result.usage_limit = False, None  # a resumed one: as runner.run_agent
         self.sessions.append({"name": name, "prompt": prompt, "system": system_append})
+        sessions.thinking()  # its first turn (sessions.py; a real one's after its init message)
         result.session_id = resume or f"dry-{name}-{len(self.sessions)}"
         start = self.clock.now()
         rng = _rng(self.seed, "session", name, len(ledger.rows(self.run)))

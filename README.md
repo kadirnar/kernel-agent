@@ -3143,8 +3143,7 @@ model and starts a new round (`kernel_agent/improve.py`,
     failed pauses for 30 min, and 3 failed slices in a row of different arms (6 of
     one arm) stop the loop. Not yet: the agents' own GPU runs in Bash do not go
     through the queue, so with N > 1 a session's benchmark script can overlap
-    another session's timed evaluation (clean timing under load: #185), and the
-    per-session view in `status` / `watch` comes with #184.
+    another session's timed evaluation (clean timing under load: #185).
   * *Board* (`--board auto`: with `--agents` above 1; `on`, `off`; issue #187,
     `kernel_agent/board.py`). The sessions share conclusions in `board.jsonl`, never
     progress (KernelArc's wins and traps: two agents that shared them beat one by
@@ -3166,6 +3165,48 @@ model and starts a new round (`kernel_agent/improve.py`,
     target's board history, the librarian's prompt the run's insights and traps, and the
     report counts the entries and how many posted winners another session built on. The
     board is advice: nothing on it is scored, and the ledger stays the truth.
+  * *What each session does* (issue #184, `kernel_agent/sessions.py`). Every agent
+    session (with any `--agents`) is in one state at a time: `thinking` (a model call of
+    its own is in flight), `helper` (a subagent it delegated to works), `tool` (its own
+    Bash, file and search tools), `evaluating` (an evaluation tool, off the GPU),
+    `queued` (one of its GPU jobs waits, with the job's class), `on_gpu` (one holds the
+    GPU), `limited` (a usage-limit wait) or `idle` (its turn ended). The tool states come
+    from PreToolUse / PostToolUse hooks that `runner.run_agent` installs on every tool
+    (a denied call is closed by its tool result), the GPU states from the GPU job queue.
+    Their time is the measured split of docs/MULTIAGENT-DATA.md, from now on in every
+    run: model, GPU held, waiting for the GPU, evaluation off the GPU, own runs, idle.
+    * `sessions.jsonl` has every state change of every session; `events.jsonl` only
+      a `session_state` event when a session starts and ends (with its split) and at
+      most one per 5 min in between, and a `gpu_job` event for a GPU job that waited
+      30 s or more, so the event log stays small.
+    * `improve.json` → `sessions` (the running ones: state, since, evaluations, the
+      USD reserved, split so far) and `gpu` (who holds the GPU, the queue by class,
+      the busy share and waits p50 / p95 over the last hour), saved at most every 2 s;
+      `costs.json` → `time`: each session's split.
+    * `kernel-agent status` has an Agents table and the GPU queue's busy share and
+      waits (here from a `--dry-run --agents 3`, 2 h in; `$`: the USD reserved):
+
+      ```
+      agents: 3 running (--agents 3)
+      session        role     arm          for  evals      $  state
+      systems#6      systems  systems  1.7 min      3  ≤2.38  running Bash
+      kernel-mlp#7   kernel   mlp         34 s      1  ≤1.74  waiting for the GPU (eval)
+      kernel-attn#8  kernel   attn         0 s      2  ≤1.76  thinking
+      agent time (8 sessions, 3.2 h): model 40%, GPU held 13%, waiting for the GPU 15%, own runs 32%
+
+      GPU queue: 35 jobs, 52.7 min on the GPU, 44.3 min waiting (max 4.5 min)
+        eval 19 (waited 20.5 min), e2e 7 (waited 7.2 min), background 9 (waited 16.5 min)
+        waiting (2): background integration 63 s; eval (mlp, kernel-mlp#7) 34 s
+        queue by class: background 1 (longest 63 s), eval 1 (longest 34 s)
+        last hour of the queue: GPU busy 89%, waits p50 52 s, p95 3.5 min (35 jobs)
+      ```
+
+    * `kernel-agent watch` draws a swimlane per session running at the same time,
+      coloured by state, and a GPU strip (the agents' jobs and the background
+      integration); `improve.png` stacks the sessions of a slice that ran at once in
+      sub-lanes and adds the GPU's busy strip; `report.md` gets a "Concurrency"
+      section: the sessions at once, the GPU's busy share (agents' jobs and background
+      work) and the agents' waits, and the time split per role.
   * *Records.* A slice record names its sessions (`sessions`) and their GPU waits
     (`queue_s`); its evaluations, keeps and `improved` come from its own sessions'
     ledger rows, not from what the arm did meanwhile. `improve.json` → `coordinator`
@@ -3212,9 +3253,11 @@ model and starts a new round (`kernel_agent/improve.py`,
 ![improve progress](docs/images/example-improve-progress.png)
 
 `improve.png` has one lane per arm and a bar per slice: green when the slice
-found a new best, grey when it did not. Dashed lines are the re-integrations,
+found a new best, grey when it did not. Sessions of one slice that ran at once
+(its workers) are sub-lanes of its arm's lane. Dashed lines are the re-integrations,
 labelled with the measured end-to-end speedup. Diamonds are research sessions
-that wrote a plan.
+that wrote a plan. The last lane shows who held the GPU (the agents' jobs, and the
+integration's and other background work) and the subtitle its busy share.
 
 ![improve slices](docs/images/example-improve-slices.png)
 
@@ -3532,7 +3575,9 @@ measurement holds the lock of one GPU while its subprocess runs
   meaning the evaluation's own time. `gpu_queue.jsonl` in the run directory
   logs every tagged job (`queued` when it had to wait, `start`, `done`,
   `withdrawn`, with class, kind, session, target, wait and hold), and
-  `kernel-agent status` summarises it.
+  `kernel-agent status` summarises it: jobs and waits per class, what holds the GPU
+  and what waits, the queue by class, and the busy share and waits p50 / p95 over
+  the last hour.
 * **Child processes.** A subprocess started under the lock gets
   `KERNEL_AGENT_LOCK_HELD=1` (it does not wait for its parent) and, when more
   than one GPU is visible, `CUDA_VISIBLE_DEVICES=<i>` with
@@ -3927,16 +3972,21 @@ runs/<org>--<name>/<timestamp>/
   board.jsonl                 improve --agents N / --board on: the sessions' notes (insight,
                               trap, winner, claim, question) and kernel-agent's posts
                               (winner, integration, round, claim, release)
+  sessions.jsonl              every agent session's state changes (thinking, tools, queued,
+                              on the GPU, ...) and, at its end, its time split (sessions.py)
   progress.png  amdahl.png  integration.png  dashboard.html
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md, artifacts.jsonl:
                               kernel_agent.artifacts lookups, export_checks.jsonl)
-  improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds
+  improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds;
+                              the running sessions and the GPU queue (sessions, gpu)
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, role, model, effort, usage
                               and first_usage (input, cache write, cache read, output
                               tokens), models ($ and tokens per model), session_id,
                               program_sha256, auth, api_key_source, billing (+
-                              usage_limit_waits, web, gpu_wait_s)
+                              usage_limit_waits, web, gpu_wait_s); time: seconds of
+                              model, GPU held, waiting for the GPU, evaluation off the
+                              GPU, own runs and idle
   research/sources.jsonl      every WebFetch / WebSearch: time, URL or query, outcome, sha256;
                               every doc_search / doc_read: query and ids, chunk and its source
   .coordinator.lock           flock + pid of the one kernel-agent process working on the run
@@ -4046,12 +4096,17 @@ drawn, and the ledger, `status` and the dashboard tables still work. The charts
 and `dashboard.html` are redrawn after every phase and by `kernel-agent report`, and
 after evaluations by one background thread per run, at most every 5 s (requests
 coalesce; an evaluation never waits for its charts). `report.md` embeds them. The colours mean the same thing
-in every chart: green = kept, grey = discarded, red = failed.
+in every chart: green = kept, grey = discarded, red = failed. Progress is drawn as
+lines, never as scattered points: a prominent line for the best so far, a thin grey
+line through every individual result, and the failures as short red ticks on the
+axis (the legends show the same samples).
 
 `progress.png`: end-to-end latency over wall-clock time. The blue step line
 is the projection from the best kernels (baseline − Σ est. saved ms of each
-target's best kept candidate, in the metric's ms: see "What faster means"). Diamonds are measured end-to-end runs
-(transforms and integration steps). Dashed lines mark the baseline and, when it
+target's best kept candidate, in the metric's ms: see "What faster means"). The green
+step line is the best measured end-to-end run so far, and the thin grey line goes through
+every measured run (transforms and integration steps); failed runs are ticks at the top.
+Dashed lines mark the baseline and, when it
 is known, the `torch.compile` baseline. The shaded bands are the pipeline phases.
 The end labels of the projection and of the highlighted measurement are placed
 so that they overlap neither each other nor the other labels.
@@ -4100,9 +4155,11 @@ alone next to it.
 
 ![run progress](docs/images/example-progress.png)
 
-`targets/<id>/progress.png`: module speedup per evaluation. Each kept
-candidate is labelled with its hypothesis. Failures sit on the floor. The
-step line is the running best, and the dashed line is the reference module.
+`targets/<id>/progress.png`: module speedup per evaluation. The green step line
+is the running best, and each kept candidate is labelled with its hypothesis where
+the line steps up. The thin grey line goes through every evaluation's speedup (one
+dash pattern per worker with `--seeds-per-target`), failures are red ticks on the
+x axis, and the dashed line is the reference module.
 
 ![target progress](docs/images/example-target-progress.png)
 
@@ -4188,16 +4245,20 @@ view of a run on http://127.0.0.1:8765. It needs only the standard library
 (`http.server` + Server-Sent Events) and only reads the run directory, so it
 can be started before, during or after a run. Every second it reads what was
 appended to `results.tsv`, `events.jsonl` and `logs/agent-*.jsonl` since the
-last byte offset (a half-written last line waits for the next poll) and
+last byte offset (a half-written last line waits for the next poll), the same for
+`sessions.jsonl` and `gpu_queue.jsonl`, and
 re-reads `costs.json`, `integration.json` and `baseline.json` when they
 change. The page updates without reloading.
 
 The page shows the model, GPU, eager and `torch.compile` baselines, the best
 measured and projected end-to-end latency, elapsed time, USD spent, the
 pipeline phases and the agents that are running. Below that: a
-speedup-per-evaluation chart per target (running best as a step line,
-hypothesis on hover), projected and measured end-to-end latency over
-wall-clock time, cumulative agent cost, the integration waterfall, the latest
+speedup-per-evaluation chart per target (the running best as a step line, a thin
+line through every evaluation, failures as ticks; hypothesis on hover), projected and
+measured end-to-end latency over wall-clock time (lines, no points), the agents'
+swimlanes (one row per session running at the same time, coloured by its state:
+model, GPU held, waiting for the GPU, evaluation off the GPU, own runs, idle; and a
+GPU row with who held it), cumulative agent cost, the integration waterfall, the latest
 events and agent tool calls, the ledger (filter by target and status, search
 the hypotheses) and a read-only file browser for candidates, snapshots,
 `NOTES.md` and `program.md`. The charts are inline SVG drawn in the browser
@@ -4210,7 +4271,8 @@ phone width.
 
 Endpoints: `/` the page, `/api/state` a JSON snapshot, `/events` the SSE
 stream (a `state` event on connect, then `delta` events with new ledger rows,
-events, agent-log lines and the updated summary), `/api/files` and
+events, agent-log lines and the updated summary, and the swimlanes at most every
+5 s), `/api/files` and
 `/file?path=` (text files inside the run directory only, at most 512 KB). The
 server binds to localhost by default and rejects requests whose `Host` header
 is not a local name. `--host 0.0.0.0` exposes the run, read-only, to your
