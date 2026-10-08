@@ -1658,10 +1658,16 @@ class Orchestrator:
         return f"{target_id}={snap}", best.get("snapshot_sha256")
 
     def _integration_call(
-        self, command: str, combo: list[tuple[str, str]], cli: list[str], note: str
+        self,
+        command: str,
+        combo: list[tuple[str, str]],
+        cli: list[str],
+        note: str,
+        title: str = "",
     ) -> dict[str, Any]:
         """One integration measurement (``e2e`` / ``e2e_ab`` of ``combo``) and its ledger row
-        (none when an A/B could not run in-process: nothing was measured)."""
+        (none when an A/B could not run in-process: nothing was measured); ``title``: the
+        row's (``ledger.integration_title``), its ``files`` the combination's items."""
         start = ledger.clock()  # simulated in a dry run, like the worker's measurements
         with self._gpu_job("integration") as job:  # one A/B step: one turn in the GPU queue
             r = self._worker(command, *cli, *self.truth.worker_args())
@@ -1679,6 +1685,8 @@ class Orchestrator:
             # improve.py's integration estimate: the hold, without its queue wait
             eval_s=round(ledger.clock() - start - job.wait_s, 1),
             queue_s=job.queue_s,
+            title=title,
+            files=ledger.item_files(self.run, [a for _, a in combo]),
         )
         gpu = r.get("gpu") or (r.get("ab") or {}).get("gpu")
         if message := telemetry.warning(gpu):
@@ -1702,6 +1710,7 @@ class Orchestrator:
         those sets goes to two processes at once."""
         why = "an item cannot be undone in-process"
         a_items, b_items = {x for _, x in a}, {x for _, x in b}
+        title = ledger.integration_title([x for _, x in b], [x for _, x in a])
         full = next((c for c in crowded or [] if c <= a_items and c <= b_items), None)
         oom = full is not None
         if full is not None:
@@ -1713,7 +1722,7 @@ class Orchestrator:
             if self.cfg.early_stop:  # stop the rounds once the verdict is decided (#190)
                 cli += ["--sequential", "--ab-min-win-rate", str(self.cfg.ab_min_win_rate)]
                 cli += ["--ab-min-gain", str(self.cfg.ab_min_gain)]
-            r = self._integration_call("e2e_ab", b, cli, note)
+            r = self._integration_call("e2e_ab", b, cli, note, title)
             if r.get("status") not in abtest.FALLBACK:
                 return r
             irreversible.update(r.get("irreversible") or [])
@@ -1730,8 +1739,9 @@ class Orchestrator:
             a,
             [*_cli(a, iters=iters), *flags, "--no-diverse"],
             " (A of an A/B in separate processes)",
+            ledger.integration_title([x for _, x in a], [x for _, x in a]),  # A again
         )
-        rb = self._integration_call("e2e", b, [*_cli(b, iters=iters), *flags], note)
+        rb = self._integration_call("e2e", b, [*_cli(b, iters=iters), *flags], note, title)
         rb["ab"] = {
             "mode": "separate",
             "a_ms": ra.get("times_ms") or [],

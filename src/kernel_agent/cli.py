@@ -1085,6 +1085,10 @@ def main(argv: list[str] | None = None) -> int:
 
     suite.add_parser(sub).set_defaults(func=suite.main)  # bench-suite (KernelBench)
 
+    from kernel_agent import experiments
+
+    experiments.add_parser(sub).set_defaults(func=experiments.main)  # exp: the ledger (#222)
+
     ns = parser.parse_args(argv)
     return int(ns.func(ns))
 

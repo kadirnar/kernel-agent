@@ -39,6 +39,13 @@ QUICK_NOTE = (
 )
 # (run, target, source key) of evaluations in flight: the same source waits for the first one
 _inflight: dict[tuple[str, str, str], asyncio.Event] = {}
+#: ``title`` of the evaluation tools (issue #222): the experiment's name in the ledger
+TITLE_SCHEMA = {
+    "type": "string",
+    "description": f"at most {ledger.TITLE_MAX} characters in a commit subject's words: what "
+    "this version changes, e.g. `split-K=4, RED epilogue` (its name in the ledger, the "
+    "charts and `kernel-agent exp`)",
+}
 ASYNC_TOOLS = ("submit_evaluation", "evaluation_result")  # --async-evals (issue #191)
 ASYNC_NEXT = (
     "Write your next candidate now; then call evaluation_result with this ticket and follow "
@@ -421,6 +428,7 @@ def record_candidate(
     queue_s: float | None = None,
     session: str | None = None,
     review: str | None = None,
+    title: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
 
@@ -436,6 +444,7 @@ def record_candidate(
     is the evaluation's own time).
     ``session``: the agent session that evaluated it (:class:`SessionBinding` ``label``).
     ``review``: the critic's verdict on it (``critic.cell``, issue #188).
+    ``title``: the agent's name of this version (``ledger.title``, issue #222).
     """
     target_dir = run.target(target_id)
     quick = mode == dedup.QUICK
@@ -457,6 +466,7 @@ def record_candidate(
         queue_s=queue_s,
         session=session,
         review=review,
+        title=title,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -469,6 +479,7 @@ def record_candidate(
         "exp": row["exp"],
         "ledger_status": row["status"],
         "backend": row["backend"],
+        **({"title": row["title"]} if row.get("title") else {}),
         "hypothesis": hypothesis,
         "parent": parent,
         "idea": idea or None,
@@ -575,12 +586,14 @@ def record_e2e_result(
     queue_s: float | None = None,
     session: str | None = None,
     review: str | None = None,
+    title: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append an ``evaluate_e2e`` measurement to the transforms' ``results.jsonl`` and the
     ledger; ``transforms_sha256`` holds the digests of the snapshots it measured; a run
     with a project bundle or a native stage target is the native arm's (``native/engine.py``);
     ``session``: the agent session that ran it (:class:`SessionBinding` ``label``);
-    ``review``: the critic's verdict on it (``critic.cell``, issue #188)."""
+    ``review``: the critic's verdict on it (``critic.cell``, issue #188); ``title``: the
+    agent's name of it (``ledger.title``, issue #222)."""
     row = ledger.record_e2e(
         run,
         result,
@@ -592,6 +605,8 @@ def record_e2e_result(
         queue_s=queue_s,
         session=session,
         review=review,
+        title=title,
+        files=ledger.item_files(run, [*map(str, snaps), *kernels]),
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -601,6 +616,7 @@ def record_e2e_result(
         **result,
         "exp": row["exp"],
         "ledger_status": row["status"],
+        **({"title": row["title"]} if row.get("title") else {}),
         "hypothesis": hypothesis,
         **({"queue_s": queue_s} if queue_s is not None else {}),
         **({"session": session} if session else {}),
@@ -815,6 +831,7 @@ def build_server(
             worker=worker,
             status=ledger.DUPLICATE,
             session=session,
+            title=str(args.get("title") or ""),
         )
         refresh(run, target_id)
         out = compact(cached)
@@ -847,6 +864,7 @@ def build_server(
                     "type": "string",
                     "description": "one sentence: what changed and why it should be faster",
                 },
+                "title": TITLE_SCHEMA,
                 "parent": {
                     "type": "string",
                     "description": "snapshot (history/...) or candidate this one builds on",
@@ -1042,6 +1060,7 @@ def build_server(
                 queue_s=job.queue_s,
                 session=session,
                 review=critic.cell(review),
+                title=str(args.get("title") or ""),
             )
             critic.outcome(review, row)  # the critic's label: what the evaluator said
         finally:
@@ -1210,6 +1229,12 @@ def build_server(
                     "type": "string",
                     "description": "one sentence: which parameters you sweep and why they matter",
                 },
+                "title": {
+                    "type": "string",
+                    "description": f"{TITLE_SCHEMA['description']}; the row's title ends with "
+                    "` [cfg k]`, k: the index of the best config among the swept ones (a grid "
+                    "expanded, duplicates dropped)",
+                },
                 "idea_id": {"type": "string", "description": "the idea these configs tune"},
                 "expected_speedup": {"type": "number"},
                 "parent": {"type": "string"},
@@ -1289,6 +1314,8 @@ def build_server(
         config = data["config"]
         result = {**result, "config": config, "sweep": {**info, "notes": notes}}
         tag = f"{sweep_mod.label(config)}; best of {info['passed']}/{info['configs']} configs"
+        k = next((r.get("index") for r in info["table"] if r.get("config") == config), None)
+        title = ledger.clean_title(args.get("title"), f" [cfg {k}]" if k is not None else "")
         _, row = record_candidate(
             run,
             target_id,
@@ -1305,6 +1332,7 @@ def build_server(
             worker=worker,
             queue_s=job.queue_s,
             session=session,
+            title=title,
         )
         refresh(run, target_id)
         out = compact(result)
@@ -1362,6 +1390,7 @@ def build_server(
                                 "type": "string",
                                 "description": "one sentence: what this variant changes",
                             },
+                            "title": TITLE_SCHEMA,
                             "parent": {"type": "string"},
                             "expected_speedup": {"type": "number"},
                         },
@@ -1446,6 +1475,7 @@ def build_server(
                 cached = dedup.find(run, target_id, slot[2], keeper, compile_check=check)
                 if cached is not None:  # evaluated before: that result, nothing runs
                     given_args = {"target_id": target_id, "parent": item.get("parent")}
+                    given_args["title"] = item.get("title")
                     dup = await _duplicate(cached, given_args, hypothesis, source, idea, worker)
                     out[k] |= {key: v for key, v in dup.items() if key != "best_so_far"}
                     continue
@@ -1472,6 +1502,7 @@ def build_server(
                         "snap": snap,
                         "sha256": sha256_file(snap),
                         "hypothesis": hypothesis,
+                        "title": str(item.get("title") or ""),
                         "parent": item.get("parent"),
                         "expected": _expected(item.get("expected_speedup")),
                         "review": review,
@@ -1524,6 +1555,7 @@ def build_server(
                     queue_s=job.queue_s,
                     session=session,
                     review=critic.cell(t["review"]),
+                    title=t["title"],
                 )
                 critic.outcome(t["review"], row)
                 rows.append(row)
@@ -1610,6 +1642,7 @@ def build_server(
                     "type": "string",
                     "description": "one sentence: what this combination tests",
                 },
+                "title": TITLE_SCHEMA,
                 "force": {
                     "type": "boolean",
                     "description": "evaluate even when the critic rejects it (it was "
@@ -1678,6 +1711,7 @@ def build_server(
             queue_s=job.queue_s,
             session=session,
             review=critic.cell(review),
+            title=str(args.get("title") or ""),
         )
         critic.outcome(review, row)  # the critic's label: what the evaluator said
         refresh(run)
@@ -1751,6 +1785,7 @@ def build_server(
                                 "type": "string",
                                 "description": "one sentence: what this set tests",
                             },
+                            "title": TITLE_SCHEMA,
                         },
                     },
                 },
@@ -1822,6 +1857,7 @@ def build_server(
                 queue_s=job.queue_s,
                 session=session,
                 review=critic.cell(t["review"]),
+                title=str(t["raw"].get("title") or ""),
             )
             critic.outcome(t["review"], row)
             # the full record (patches, every check's metrics) is in transforms/results.jsonl

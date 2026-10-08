@@ -54,10 +54,20 @@ full) and an integration A/B that stopped before its last round (``abtest.sequen
 
 ``results.jsonl`` (``RunDir.results_file``) keeps the full records; the TSV is the readable
 summary that the charts, ``kernel-agent status`` and ``dashboard.html`` read.
+
+Every row is one experiment (issue #222, :mod:`kernel_agent.experiments`): ``exp`` numbers
+the rows in the order they were recorded (an evaluation that started earlier can get a
+later number), ``kind`` says what was measured (:func:`kind`: ``kernel``, ``e2e``, an
+``integration`` step or an integration ``probe`` of one item alone) and ``title`` names
+it in a commit subject's words (:func:`title`: the agent's, a generated one for the
+integration's, else one made from the hypothesis). The ``evaluation`` event of a row lists
+the run-relative ``files`` it measured, so every experiment can be reproduced from the run
+directory.
 """
 
 from __future__ import annotations
 
+import fcntl
 import math
 import re
 import statistics
@@ -79,6 +89,7 @@ COLUMNS = (
     "snapshot",
     "parent",
     "status",
+    "kind",
     "correct",
     "speedup",
     "ref_ms",
@@ -95,6 +106,7 @@ COLUMNS = (
     "worker",
     "session",
     "idea",
+    "title",
     "hypothesis",
 )
 KEEP = "keep"
@@ -119,6 +131,12 @@ REEVALUATED = "re-evaluated"
 # rows that are not the agents' benchmark evaluations
 UNMEASURED = (QUICK_OK, QUICK_FAIL, DUPLICATE, REEVALUATED)
 E2E = "e2e"
+# What a row measured (the ``kind`` column, :func:`kind`): a kernel target's candidate, an
+# agent's evaluate_e2e, a combination step of the integration, one of its items alone.
+KERNEL, INTEGRATION, PROBE = "kernel", "integration", "probe"
+KINDS = (KERNEL, E2E, INTEGRATION, PROBE)
+INTEGRATE = "integrate"  # the ``backend`` of the integration's rows
+TITLE_MAX = 72  # a title is a commit subject
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 _FLOATS = {
@@ -346,6 +364,159 @@ def labelled(row: dict[str, Any]) -> str:
     return f"[{row['idea']}] {hypothesis}".strip() if row.get("idea") else hypothesis
 
 
+# ------------------------------------------------------------------ experiments (#222)
+
+
+def kind(row: dict[str, Any]) -> str:
+    """What a row measured (:data:`KINDS`): its ``kind`` cell, else (rows of ledgers from
+    before the column) derived: a target other than ``e2e`` is a ``kernel``; an integration
+    row (``backend`` ``integrate``) is a ``probe`` when it measured one item alone (or the
+    unmodified model again: the A of such an A/B in processes of its own), else an
+    ``integration`` step; any other ``e2e`` row is an agent's ``e2e``."""
+    if row.get("kind") in KINDS:
+        return str(row["kind"])
+    if row.get("target") != E2E:
+        return KERNEL
+    if row.get("backend") == INTEGRATE:
+        alone = str(row.get("hypothesis") or "").endswith(" alone")
+        return PROBE if alone or row.get("snapshot") == "baseline" else INTEGRATION
+    return E2E
+
+
+def cut(text: str, limit: int) -> str:
+    """``text`` on one line, at most ``limit`` characters: cut at a word boundary + ``…``."""
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    head = text[: limit - 1]
+    space = head.rfind(" ")
+    head = head[:space] if space > limit // 2 else head  # one long word: cut inside it
+    return head.rstrip(" ,;:-") + "…"
+
+
+def clean_title(text: Any, suffix: str = "") -> str:
+    """An agent's title as stored: one line of at most :data:`TITLE_MAX` characters,
+    ``suffix`` (a sweep's ``[cfg k]``) kept whole ("" when no title is given)."""
+    text = " ".join(str(text or "").split())
+    return cut(text, TITLE_MAX - len(suffix)) + suffix if text else ""
+
+
+def _first_clause(text: str) -> str:
+    """``text`` up to its first clause break outside brackets: ``,`` ``;`` ``:`` or a
+    sentence end, never the point of a number or an abbreviation (``17.5``, ``excl. x``)."""
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += (ch in "([{") - (ch in ")]}")
+        if depth > 0 or i + 1 >= len(text) or text[i + 1] != " ":
+            continue
+        if ch in ",;:!?" or (ch == "." and text[i + 2 : i + 3].isupper()):
+            return text[:i]
+    return text
+
+
+def title(row: dict[str, Any]) -> str:
+    """A row's title: its ``title`` cell, else made up for an older row: an integration
+    row's from its hypothesis (:func:`integration_title` in words), else ``[idea]`` and the
+    hypothesis' first clause (cut at a word boundary at 60 characters), else the stem of the
+    snapshot it measured."""
+    if row.get("title"):
+        return str(row["title"])
+    hypothesis = " ".join(str(row.get("hypothesis") or "").split())
+    if kind(row) in (INTEGRATION, PROBE) and hypothesis.startswith("integration: "):
+        return _integration_fallback(hypothesis.removeprefix("integration: "))
+    clause = cut(_first_clause(hypothesis), 60)
+    if clause:
+        return cut(f"[{row['idea']}] {clause}" if row.get("idea") else clause, TITLE_MAX)
+    stems = [snapshot_stem(s) for s in str(row.get("snapshot") or "").split("+") if s]
+    return cut("+".join(stems), TITLE_MAX)
+
+
+_INTEGRATION_NOTE = re.compile(r"^(?P<names>.*?)(?P<alone> alone)?(?: \((?P<note>.*)\))?$")
+_SNAPSHOT_NAME = re.compile(r"\b(\d{3,})_\S*?\.py\b")  # history/012_cuda_v17_a20565c5.py
+
+
+def _integration_fallback(text: str) -> str:
+    """The title of an integration row recorded without one, from its hypothesis
+    ``<item> + <item> ...`` (``alone``, or a note in brackets)."""
+    m = _INTEGRATION_NOTE.match(text)
+    names = (m["names"] if m else text).split(" + ")
+    note = _SNAPSHOT_NAME.sub(r"#\1", (m["note"] if m else None) or "")  # its versions
+    if m and m["alone"]:
+        return cut(f"probe {names[0]} alone", TITLE_MAX)
+    if note.startswith("A of an A/B"):
+        if names == ["baseline"]:
+            return "measure the baseline again"
+        return cut(f"measure A again: {' + '.join(names)}", TITLE_MAX)
+    if note.startswith("swap "):
+        return cut(f"integrate {note.removeprefix('swap ')}", TITLE_MAX)
+    if note:  # "<item> instead of <items>", "the combination of exp N"
+        return cut(f"integrate {note}", TITLE_MAX)
+    return cut(f"integrate +{names[-1]}", TITLE_MAX)  # a greedy step adds its last item
+
+
+def integration_title(items: list[str], base: list[str]) -> str:
+    """The generated title of an integration measurement of ``items`` (B) against ``base``
+    (A): ``probe <item> <version> alone`` for one item against the unmodified model, else
+    what B changes in A (``integrate +enc_stack (#013)``, ``-old (#004)``, a version swap
+    ``dit_layer #012 -> #001``); ``measure A again`` when B is A (A of an A/B measured in
+    a process of its own)."""
+    if not base and len(items) == 1:
+        return cut(f"probe {item_label(items[0])} {item_version(items[0])} alone", TITLE_MAX)
+    added = [x for x in items if x not in base]
+    removed = [x for x in base if x not in items]
+    if not added and not removed:
+        names = " + ".join(item_label(x) for x in items)
+        again = f"measure A again: {names}" if names else "measure the baseline again"
+        return cut(again, TITLE_MAX)
+    parts = []
+    for x in added:
+        old = next((y for y in removed if item_label(y) == item_label(x)), None)
+        if old is not None:  # another version of the same target or idea
+            removed.remove(old)
+            parts.append(f"{item_label(x)} {item_version(old)} -> {item_version(x)}")
+        else:
+            parts.append(f"+{item_label(x)} ({item_version(x)})")
+    parts += [f"-{item_label(x)} ({item_version(x)})" for x in removed]
+    return cut("integrate " + " ".join(parts), TITLE_MAX)
+
+
+def relative(run: RunDir, path: str | Path) -> str:
+    """``path`` relative to the run directory (as given when it is outside)."""
+    p = Path(path)
+    if p.is_absolute():
+        for root in dict.fromkeys((run.root, run.root.resolve())):
+            if p.is_relative_to(root):
+                return str(p.relative_to(root))
+    return str(p)
+
+
+def kernel_files(run: RunDir, target_id: str, snapshot: str) -> list[str]:
+    """The run-relative files a kernel row measured: the snapshot in the target's history
+    and, for a region target, the sealed ``rewrite.py`` that applies it."""
+    history = run.history_dir(target_id)
+    files = [relative(run, history / Path(snapshot).name)]
+    if (rewrite := history / "rewrite.py").is_file():  # region.verified_rewrite
+        files.append(relative(run, rewrite))
+    return files
+
+
+def item_files(run: RunDir, items: Iterable[str]) -> list[str]:
+    """The run-relative files of end-to-end or integration items: a transform's path,
+    ``target=path`` of a kernel (the target's history snapshot of that name when there is
+    one: an agent passes its own copy, the integration the snapshot)."""
+    out = []
+    for item in items:
+        target, sep, path = str(item).partition("=")
+        if not sep or "/" in target:  # a transform (its path may hold "=")
+            out.append(relative(run, item))
+            continue
+        where = run.history_dir(target) / Path(path).name
+        if not where.is_file():  # not a snapshot: the file given (relative: to the target)
+            where = Path(path) if Path(path).is_absolute() else run.target(target) / path
+        out.append(f"{target}={relative(run, where)}")
+    return out
+
+
 # ------------------------------------------------------------------ the TSV
 
 
@@ -413,21 +584,24 @@ def read_tsv(path: Path) -> list[dict[str, Any]]:
 
 
 def append(run: RunDir, row: dict[str, Any]) -> dict[str, Any]:
-    """Append a row (``exp`` is assigned here) and return it."""
-    with _lock:
-        path = run.ledger
-        exists = path.exists() and path.stat().st_size > 0
-        count = 0
-        columns: tuple[str, ...] = COLUMNS
-        if exists:
-            with path.open() as fh:
-                columns = tuple(fh.readline().rstrip("\n").split("\t"))  # older runs: fewer
-                count = sum(1 for line in fh if line.strip())
-        row = {**row, "exp": count + 1}
-        with path.open("a") as fh:
-            if not exists:
+    """Append a row (``exp`` is assigned here) and return it. The number is taken and the
+    line written under the file's ``flock`` too: a second writer process (none today: the
+    coordinator lock's holder records every row) never reuses a number."""
+    with _lock, run.ledger.open("a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.seek(0)
+            header = fh.readline()
+            # older runs: fewer columns, and the file keeps its own (``title``, ``kind``...)
+            columns = tuple(header.rstrip("\n").split("\t")) if header else COLUMNS
+            count = sum(1 for line in fh if line.strip())
+            row = {**row, "exp": count + 1}
+            if not header:
                 fh.write("\t".join(columns) + "\n")
             fh.write("\t".join(_cell(row.get(c)) for c in columns) + "\n")
+            fh.flush()
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     return row
 
 
@@ -448,13 +622,16 @@ def record_kernel(
     queue_s: float | None = None,
     session: str | None = None,
     review: str | None = None,
+    title: str = "",
 ) -> dict[str, Any]:
     """Classify a kernel evaluation against the target's running best and append it.
 
     ``status``: a status of :data:`UNMEASURED` instead of the classification;
     ``worker``: the target's worker that ran it (:mod:`kernel_agent.workers`); ``queue_s``:
     the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`); ``session``: the agent
-    session that ran it (its label); ``review``: the critic's verdict (``critic.cell``)."""
+    session that ran it (its label); ``review``: the critic's verdict (``critic.cell``);
+    ``title``: the agent's name of this version (:func:`clean_title`). Its ``evaluation``
+    event lists the ``files`` it measured (:func:`kernel_files`)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == target_id])
         row = append(
@@ -466,6 +643,7 @@ def record_kernel(
                 "snapshot": Path(snapshot).name,
                 "parent": parent or "",
                 "status": status or classify(result, best),
+                "kind": KERNEL,
                 "correct": bool(result.get("correct")),
                 "speedup": _num(result.get("speedup")),
                 "ref_ms": _num(result.get("ref_ms_weighted")),
@@ -476,6 +654,7 @@ def record_kernel(
                 "eval_s": eval_s if eval_s is not None else _num(result.get("eval_seconds")),
                 "queue_s": queue_s,
                 "idea": idea,
+                "title": clean_title(title),
                 "hypothesis": hypothesis,
                 "worker": worker,
                 "session": session,
@@ -485,8 +664,16 @@ def record_kernel(
         )
     tag: dict[str, Any] = {"worker": worker} if worker else {}
     tag |= {"session": session} if session else {}
+    files = kernel_files(run, target_id, snapshot)
     event(
-        run, "evaluation", when=when, target=target_id, exp=row["exp"], status=row["status"], **tag
+        run,
+        "evaluation",
+        when=when,
+        target=target_id,
+        exp=row["exp"],
+        status=row["status"],
+        **tag,
+        files=files,
     )
     return row
 
@@ -504,10 +691,15 @@ def record_e2e(
     queue_s: float | None = None,
     session: str | None = None,
     review: str | None = None,
+    title: str = "",
+    files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Classify an end-to-end measurement (transform or integration step) and append it;
     ``session``: the agent session that ran it (its label; none for the integration's);
-    ``review``: the critic's verdict (``critic.cell``)."""
+    ``review``: the critic's verdict (``critic.cell``); ``title``: its name
+    (:func:`clean_title`); ``files``: the run-relative files it measured (:func:`item_files`),
+    for its ``evaluation`` event. Its ``kind`` follows from ``backend`` and ``hypothesis``
+    (:func:`kind`)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == E2E])
         status = classify(result, best, e2e=True)
@@ -521,6 +713,14 @@ def record_e2e(
                 "snapshot": snapshot,
                 "parent": parent or "",
                 "status": status,
+                "kind": kind(
+                    {
+                        "target": E2E,
+                        "backend": backend,
+                        "snapshot": snapshot,
+                        "hypothesis": hypothesis,
+                    }
+                ),
                 "correct": bool(result.get("passed")),
                 "speedup": _num(result.get("speedup")),
                 "ref_ms": base,
@@ -533,6 +733,7 @@ def record_e2e(
                 "queue_s": queue_s,
                 "diverse_speedup": diversity.median_speedup(result),
                 "flags": diversity.flags(result),
+                "title": clean_title(title),
                 "hypothesis": hypothesis,
                 "session": session,
                 "review": review,
@@ -540,7 +741,8 @@ def record_e2e(
                 "early": True if (result.get("ab") or {}).get("stopped") else None,
             },
         )
-    tag = {"session": session} if session else {}
+    tag: dict[str, Any] = {"session": session} if session else {}
+    tag |= {"files": list(files)} if files else {}
     event(run, "evaluation", when=when, target=E2E, exp=row["exp"], status=row["status"], **tag)
     return row
 

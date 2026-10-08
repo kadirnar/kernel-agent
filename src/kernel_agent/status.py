@@ -226,9 +226,9 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
 
     recent = s["rows"][-last:]
     if recent:
-        lines += ["", f"last {len(recent)} evaluations"]
+        lines += ["", f"last {len(recent)} evaluations (hypotheses: kernel-agent exp show)"]
         lines += _table(
-            ["#", "time", "target", "backend", "status", "speedup", "hypothesis"],
+            ["#", "time", "target", "backend", "status", "speedup", "title"],
             [
                 [
                     str(r["exp"]),
@@ -242,7 +242,7 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
                         else ""
                     ),
                     _x(r["speedup"]),
-                    ledger.labelled(r) or r["snapshot"] or "",
+                    ledger.title(r),  # the hypothesis: `kernel-agent exp show` (#222)
                 ]
                 for r in recent
             ],
