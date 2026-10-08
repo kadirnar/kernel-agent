@@ -1,0 +1,8 @@
+========= COMPUTE-SANITIZER
+========= Error: Race reported between Write access at ka_race(int *)+0x90 in probe.cu:13
+=========     and Read access at ka_race(int *)+0xa0 in probe.cu:14 [2048 hazards]
+========= 
+========= Error: Race reported between Write access at ka_divergent(int *)+0xa0 in probe.cu:19
+=========     and Read access at ka_divergent(int *)+0xd0 in probe.cu:21 [1024 hazards]
+========= 
+========= RACECHECK SUMMARY: 2 hazards displayed (2 errors, 0 warnings)

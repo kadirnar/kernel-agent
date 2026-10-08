@@ -12,7 +12,9 @@ inside a loop. A native engine rewrites such a part of the inference path as nat
 C++ / CuTe code, keeps the weights streaming, fuses across module boundaries and runs the
 part in one persistent kernel or a few launches.
 
-Project layout, building and timing: [projects.md](projects.md).
+Project layout, building and timing: [projects.md](projects.md). A stage as one launch with
+counter dependencies instead of grid barriers (the megakernel kit, its milestone ladder):
+[megakernel.md](megakernel.md).
 
 ## Scopes (what you may replace)
 
@@ -81,6 +83,12 @@ boundaries when the time sits between them.
    relaxed run, the perceptual gate.
 3. The integration re-checks kernels in fresh processes and runs them under
    compute-sanitizer memcheck (odd-size variants included): bounds-check every tail tile.
+   A native kernel also runs under racecheck (shared-memory hazards) and synccheck
+   (barriers some threads miss); errors of either refuse it.
+4. Every case runs twice from the same inputs and state: a native candidate must give the
+   same bits both times (a race on global memory, a counter that orders too little). Only
+   when float atomics sum in a varying order on purpose, declare it in the entry:
+   `ORDER_DEPENDENT_ATOMICS = "<why>"`.
 
 ## Integration and ownership
 
@@ -107,6 +115,6 @@ cannot read the run directory.
 
 ## Examples and sources
 
-* Examples: `examples/native_project`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Examples: `examples/native_project`, `examples/native_megakernel` (the megakernel kit). All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
 * Sources: the `documentation-sources` skill's `sources.md`, sections "CUDA C++ and PTX"; "CUTLASS / CuTe".
 * Related skills: `cuda-kernels`, `cute-dsl`, `cuda-graphs-streams-pdl`, `systems-patterns`; design document `docs/NATIVE.md` in the repository.

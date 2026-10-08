@@ -45,13 +45,15 @@ have been compiled; ``KERNEL_AGENT_NATIVE_REBUILD=1`` ignores the cache).
 
 * ``torch_extension`` (default): ``torch.utils.cpp_extension.load`` over ``sources`` (globs)
   with ``include_dirs`` (the project root and kernel-agent's toolkit headers,
-  :func:`toolkit_include`: ``ka_launch.cuh`` for PDL / cooperative launches, are always
-  on the path), ``cflags``, ``cuda_cflags`` and ``ldflags``; loaded as a Python module
+  :func:`toolkit_includes`: ``ka_launch.cuh`` for PDL / cooperative launches and the
+  megakernel kit's ``ka_mk.cuh``, are always on the path), ``cflags``, ``cuda_cflags`` and
+  ``ldflags``; loaded as a Python module
   (``PYBIND11_MODULE``) or, with ``load = "torch_ops"``, as ``TORCH_LIBRARY`` ops.
 * ``command``: ``command`` (e.g. ``["bash", "{src}/build.sh"]``; ``{src}``, ``{build}``,
   ``{python}`` are substituted) runs in the build directory with ``KA_SRC_DIR``,
   ``KA_BUILD_DIR``, ``KA_PYTHON``, ``KA_TORCH_CMAKE_PREFIX`` and the toolchain's environment
-  (CMake, make, nvcc directly; ``KA_TOOLKIT_INCLUDE``: the toolkit headers) and must
+  (CMake, make, nvcc directly; ``KA_TOOLKIT_INCLUDE``: the toolkit headers,
+  ``KA_MK_INCLUDE``: the megakernel kit's) and must
   produce ``outputs`` (shared libraries, relative to
   the build directory), loaded per ``load``: ``torch_ops`` (``torch.ops.load_library``),
   ``python`` (extension modules) or ``none`` (``Built.libraries``, e.g. for ctypes).
@@ -561,13 +563,21 @@ def toolkit_include() -> Path:
     return Path(__file__).resolve().parent.parent / "include"
 
 
+def toolkit_includes() -> list[Path]:
+    """Every toolkit include directory of a build: :func:`toolkit_include` and the
+    megakernel kit's (``ka_mk.cuh``, :mod:`kernel_agent.native.megakernel`, issue #225)."""
+    from kernel_agent.native import megakernel
+
+    return [toolkit_include(), megakernel.include_dir()]
+
+
 def _toolkit_digest() -> str:
     """sha256 of the toolkit headers: a changed header rebuilds every project."""
     h = hashlib.sha256()
-    root = toolkit_include()
-    for path in sorted(root.glob("*")) if root.is_dir() else []:
-        if path.is_file():
-            h.update(path.name.encode() + b"\0" + path.read_bytes())
+    for root in toolkit_includes():
+        for path in sorted(root.glob("*")) if root.is_dir() else []:
+            if path.is_file():
+                h.update(path.name.encode() + b"\0" + path.read_bytes())
     return h.hexdigest()[:16]
 
 
@@ -744,7 +754,7 @@ def _compile_extension(project: Project, src: Path, out: Path, name: str) -> tup
         extra_include_paths=[
             str(src),
             *(str(src / d) for d in m.include_dirs),
-            str(toolkit_include()),
+            *(str(d) for d in toolkit_includes()),
         ],
         extra_cflags=list(m.cflags),
         extra_cuda_cflags=list(m.cuda_cflags),
@@ -775,6 +785,7 @@ def _run_command(project: Project, src: Path, out: Path) -> list[str]:
         KA_PYTHON=sys.executable,
         KA_TORCH_CMAKE_PREFIX=str(getattr(torch.utils, "cmake_prefix_path", "")),
         KA_TOOLKIT_INCLUDE=str(toolkit_include()),
+        KA_MK_INCLUDE=str(toolkit_includes()[1]),
         KA_PROJECT_NAME=m.name,
         KA_PROJECT_DIGEST=project.digest,
     )

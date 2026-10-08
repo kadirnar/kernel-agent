@@ -122,6 +122,7 @@ FAILURES = (
     "crash",
     "timeout",
     "oom",
+    "hang",  # a megakernel's watchdog stopped it (kernels/evaluate.py, issue #225)
 )
 STATUSES = (KEEP, DISCARD, *FAILURES)
 QUICK_OK = "quick_ok"

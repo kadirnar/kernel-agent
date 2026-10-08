@@ -279,6 +279,71 @@ def make_chain_capture(
     return path
 
 
+class NormGemvChain(nn.Module):
+    """``x = x + W_l rmsnorm_l(x)`` for ``layers`` layers (bias-free square projections): a
+    stack of decode layers, the reference of the megakernel example (issue #225)."""
+
+    def __init__(self, hidden: int, layers: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.norms = nn.ModuleList(RMSNorm(hidden, eps) for _ in range(layers))
+        self.layers = nn.ModuleList(nn.Linear(hidden, hidden, bias=False) for _ in range(layers))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for norm, layer in zip(self.norms, self.layers, strict=True):
+            x = x + layer(norm(x))
+        return x
+
+
+#: The megakernel example (kernel_agent.native.megakernel) and its capture: hidden, layers,
+#: (leading shape, calls per run).
+MEGAKERNEL_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "native_megakernel": (1024, 8, [((1,), 64), ((4,), 0)]),
+}
+
+
+def make_norm_chain_capture(
+    path: Path, hidden: int, layers: int, calls: list[tuple[tuple[int, ...], int]]
+) -> Path:
+    """A bf16 :class:`NormGemvChain` (projections ~ N(0, hidden ** -0.5), norm weights
+    ~ N(1, 0.1)) and its calls."""
+    from kernel_agent.profiling.capture import capture_calls
+
+    torch.manual_seed(0)
+    module = NormGemvChain(hidden, layers).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        for name, weight in module.named_parameters():
+            if name.startswith("norms."):
+                weight.normal_(1.0, 0.1)
+            else:  # the projections
+                weight.normal_(0.0, hidden**-0.5)
+    cases: list[tuple[Any, ...]] = [
+        ((torch.randn(*shape, hidden, device="cuda", dtype=torch.bfloat16),), {}, count)
+        for shape, count in calls
+    ]
+    capture_calls(module.eval(), cases, path)
+    return path
+
+
+def smoke_megakernel(tmp: Path, verbose: bool = False) -> bool:
+    """The megakernel example passes the evaluator (its default mode)."""
+    from kernel_agent.kernels.evaluate import run_evaluation
+
+    ok = True
+    for name, (hidden, layers, calls) in MEGAKERNEL_EXAMPLES.items():
+        capture = make_norm_chain_capture(tmp / f"{name}.pt", hidden, layers, calls)
+        result = run_evaluation(capture, EXAMPLES_DIR / name)
+        passed = bool(result.get("correct"))
+        ok &= passed
+        if verbose:
+            detail = (
+                f"speedup {result.get('speedup')}x over {layers} eager layers"
+                if passed
+                else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+            )
+            print(f"  {name:22s} {'OK ' if passed else 'FAIL'} {detail}")
+    return ok
+
+
 def example_skip(name: str, tc: object, backend: str | None = None) -> str | None:
     """Why the bundled example ``name`` does not run with toolchain ``tc``: ``backend`` is
     not available, or this GPU is not one of its ``ARCHS`` (:func:`gpu_arch.example_skip`);
@@ -777,6 +842,8 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_fp4(Path(tmp), verbose)
         if runs(PDL_EXAMPLES, "cuda"):
             ok &= smoke_pdl(Path(tmp), verbose)
+        if runs(MEGAKERNEL_EXAMPLES, "cuda"):
+            ok &= smoke_megakernel(Path(tmp), verbose)
         if runs(W8A8_EXAMPLES, "triton"):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8")
             ok &= smoke_block_scale(tuple(tc.gpu.capability) if tc.gpu else (0, 0), verbose)
