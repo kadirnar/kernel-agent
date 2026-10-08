@@ -728,7 +728,8 @@ def self_check(path: Path, device: str | None = None) -> dict[str, Any]:
         except Exception as exc:
             failures.append({**where, "error": f"{type(exc).__name__}: {exc}"[:300]})
             continue
-        checks = compare_structures(case["output"], out, "output", tier=tier)
+        inputs = (case["args"], case["kwargs"])
+        checks = compare_structures(case["output"], out, "output", inputs=inputs, tier=tier)
         checks += compare_side_effects(case["args"], case["post_args"], args, "args", tier=tier)
         checks += compare_side_effects(
             case["kwargs"], case["post_kwargs"], kwargs, "kwargs", tier=tier

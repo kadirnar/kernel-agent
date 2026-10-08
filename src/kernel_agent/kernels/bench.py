@@ -446,7 +446,9 @@ def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> d
         expected = reference(*ref_args, **ref_kwargs)
     torch.cuda.synchronize()
     new_args, new_kwargs = kept["post"]
-    checks = compare_structures(expected, kept["output"], "output", perturbed=True)
+    checks = compare_structures(
+        expected, kept["output"], "output", inputs=kept["pre"], perturbed=True
+    )
     checks += compare_side_effects(pre_args, ref_args, new_args, "args", perturbed=True)
     checks += compare_side_effects(pre_kwargs, ref_kwargs, new_kwargs, "kwargs", perturbed=True)
     return {"iteration": kept["iteration"], "failures": [c for c in checks if not c.get("ok")]}

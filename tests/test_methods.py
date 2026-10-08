@@ -414,6 +414,7 @@ def test_side_effects_compare_only_the_update():
     assert not check((stray, pre[1].clone()))[0]["ok"]
     grown = compare_side_effects((torch.zeros(2),), (torch.zeros(3),), (torch.zeros(3),), "a")
     assert grown[0]["ok"] and "changed_elements" not in grown[0]
+    assert grown[0]["grown"] == {"dim": 0, "kept": 2, "appended": 1}  # #202: tests/test_grown_cache
 
 
 def test_detach_copies_views_of_large_storages_compactly():

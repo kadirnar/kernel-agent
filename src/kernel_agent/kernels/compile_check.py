@@ -116,7 +116,8 @@ def check(
             with torch.inference_mode():
                 out = compiled[case.get("method", "forward")](*args, **kwargs)
             synchronize()
-            checks = compare_structures(case["output"], out, "output")
+            inputs = (case["args"], case["kwargs"])
+            checks = compare_structures(case["output"], out, "output", inputs=inputs)
             checks += compare_side_effects(case["args"], case["post_args"], args, "args")
             checks += compare_side_effects(case["kwargs"], case["post_kwargs"], kwargs, "kwargs")
             bad = [c for c in checks if not c.get("ok")]

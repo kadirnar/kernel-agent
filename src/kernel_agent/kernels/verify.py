@@ -338,7 +338,7 @@ def _against_reference(
     if finite and not _finite((expected, ref_args, ref_kwargs)):
         return None
     kw: dict[str, Any] = {"perturbed": True, "input_scale": input_scale}
-    checks = compare_structures(expected, out, "output", **kw)
+    checks = compare_structures(expected, out, "output", inputs=(pre_args, pre_kwargs), **kw)
     checks += compare_side_effects(pre_args, ref_args, args, "args", **kw)
     checks += compare_side_effects(pre_kwargs, ref_kwargs, kwargs, "kwargs", **kw)
     return checks
@@ -363,7 +363,7 @@ def reverify_case(
     pre_args, pre_kwargs = pristine
     args, kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
     out = _call(new_fn, args, kwargs, sync)
-    checks = compare_structures(case["output"], out, "output")
+    checks = compare_structures(case["output"], out, "output", inputs=pristine)
     checks += compare_side_effects(pre_args, case["post_args"], args, "args")
     checks += compare_side_effects(pre_kwargs, case["post_kwargs"], kwargs, "kwargs")
     runs: list[tuple[str, list[dict[str, Any]] | None]] = [("fresh_addresses", checks)]
