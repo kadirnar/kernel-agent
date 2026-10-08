@@ -315,21 +315,25 @@ keeper). Sketch:
 
 ```python
 async def _loop(self) -> str:
-    async with asyncio.TaskGroup() as tg:          # failure isolation: see 3.8
+    async with asyncio.TaskGroup() as tg:  # failure isolation: see 3.8
         while True:
-            interrupt.check(); self._keep_time()
-            if reason := self._stop_reason():      # budget, max_slices, every arm stopped
-                if not self.running: return reason
-                self.draining = True               # start nothing; wait for the rest
+            interrupt.check()
+            self._keep_time()
+            if reason := self._stop_reason():  # budget, max_slices, every arm stopped
+                if not self.running:
+                    return reason
+                self.draining = True  # start nothing; wait for the rest
             else:
-                for job in self.assign(self.free_slots()):    # slices, research, dossiers
+                for job in self.assign(self.free_slots()):  # slices, research, dossiers
                     self.running[job.label] = tg.create_task(self._run(job))
                 self._maybe_background_integration(tg)
             if not self.running and not self.background:
-                if await self._next_round(self._pickable()): continue
+                if await self._next_round(self._pickable()):
+                    continue
                 return self._why_none()
-            await self._wake.wait(); self._wake.clear()       # set by task done, eval recorded,
-                                                              # rate gate open, integration done
+            await self._wake.wait()
+            self._wake.clear()  # set by task done, eval recorded,
+            # rate gate open, integration done
 ```
 
 **Slot assignment** (`scheduler.assign(arms, slots, running, policy, gpu)`), in order:
@@ -902,20 +906,20 @@ coordinator relies on, so the three can land in any order.
 ```python
 @dataclass(frozen=True)
 class RoleSpec:
-    name: str                    # "kernel", "systems", "native", "research", "dossier",
-                                 # "planner", "critic", "librarian", subagents: "doc-lookup", ...
-    description: str             # AgentDefinition.description (when delegation applies)
-    model: str = "inherit"       # alias or full id; "inherit" = cfg.claude_model
+    name: str  # "kernel", "systems", "native", "research", "dossier",
+    # "planner", "critic", "librarian", subagents: "doc-lookup", ...
+    description: str  # AgentDefinition.description (when delegation applies)
+    model: str = "inherit"  # alias or full id; "inherit" = cfg.claude_model
     effort: str | None = "high"
     max_turns: int | None = None
     builtin_tools: tuple[str, ...] = runner.BASE_TOOLS
-    mcp_tools: tuple[str, ...] = ()       # tool_names(...), incl. doc_search/doc_read (#177)
+    mcp_tools: tuple[str, ...] = ()  # tool_names(...), incl. doc_search/doc_read (#177)
     skills: Callable[[dict], list[str]] = lambda spec: []  # #176 skill names for this session
-    subagents: tuple[str, ...] = ()       # RoleSpec names it may delegate to
+    subagents: tuple[str, ...] = ()  # RoleSpec names it may delegate to
     writable: Callable[[RunDir, "SessionBinding"], WritePolicy] | None = None  # §3.6
-    needs_gpu: bool = True                # coordinator: GPU-free roles fill slots on a saturated GPU
-    max_concurrent: int | None = None     # §3.2 caps
-    program_section: str | None = None    # program.md role (program.ROLES)
+    needs_gpu: bool = True  # coordinator: GPU-free roles fill slots on a saturated GPU
+    max_concurrent: int | None = None  # §3.2 caps
+    program_section: str | None = None  # program.md role (program.ROLES)
 ```
 
 * `roles.options_for(role, cfg, binding) -> dict` builds the per-session
