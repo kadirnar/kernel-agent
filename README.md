@@ -1993,8 +1993,9 @@ All limits are off by default (`kernel_agent/budget.py`).
   "Authentication and safety"). The wait counts against `--max-hours` but not
   against `--agent-minutes`. A limit that resets only after the time budget ends
   stops new agents like a spent budget (`usage_limit_stop`).
-* `--agent-minutes` stops an agent session after that many minutes. The Claude
-  Code subprocess is terminated. Its session id, turns and tool calls are still
+* `--agent-minutes` stops an agent session after that many minutes. The time
+  its evaluations wait for the GPU behind other jobs does not count (see "GPUs
+  and the GPU lock"). The Claude Code subprocess is terminated. Its session id, turns and tool calls are still
   written to `costs.json`. Its USD cost is not, because Claude Code reports cost
   only when a session ends.
 * `--eval-timeout` (default 300 s) limits one `evaluate_candidate` subprocess.
@@ -2526,7 +2527,9 @@ model and starts a new round (`kernel_agent/improve.py`,
   one needed 113 min and left the agents 56 of 180 min. A slice starts only when the
   time left for agents covers the agent's warm-up (4 min), one evaluation of
   that arm (the median `eval_s` of its evaluations, else 1 min for a kernel and
-  2 min end to end) and the 2-min wrap-up; else the next arm that fits gets it,
+  2 min end to end), the time that evaluation is expected to wait for the GPU
+  behind the jobs queued now (0 when nothing runs) and the 2-min wrap-up; else
+  the next arm that fits gets it,
   and when none fits the loop stops and goes to the final integration, logging
   why (`time left 75.4 min < one slice of rmsnorm (6.7 min: warm-up, one
   evaluation, wrap-up) + 72 min kept for the final integration (25 A/B
@@ -2925,6 +2928,36 @@ measurement holds the lock of one GPU while its subprocess runs
   fewest waiters (and stays with it); a nested lock in the same thread keeps
   its GPU. Without `nvidia-smi`, or with no GPU visible,
   the pool is GPU 0 alone (`gpu.lock`), as before.
+* **Job queue** (`kernel_agent/gpuqueue.py`). The threads of one process take
+  the lock in priority order, not first come. Each GPU job carries a kind and a
+  class (the evaluation tools and the orchestrator tag it before the job's
+  thread starts; an untagged call, such as a CLI command, ranks as an
+  evaluation). Classes, best first: `deadline` (the final integration once the
+  run is in its reserve window), `interactive` (`mode="quick"` checks,
+  `verify_rewrite`), `eval` (full kernel evaluations), `e2e`
+  (`evaluate_e2e`, `check_harness`), `sweep`, `dev` (agents' own GPU runs,
+  for #185) and `background` (integration A/B steps, re-checks, memchecks,
+  library seeding, captures, re-profiles). A waiting job moves up one class
+  per 10 min of waiting (never to `deadline`). Within a class the session
+  served least recently goes first, then the shortest job (the median `eval_s`
+  of that kind in the ledger, else the medians measured over earlier runs).
+  Each A/B step of an integration queues on its own, so a waiting evaluation
+  goes between two steps; a running step is never interrupted. While the final
+  integration's estimate fills its share of `--max-hours`, its steps run as
+  `eval`. The `flock` stays the outer layer, so another process still
+  excludes. Re-entrant locks and child processes skip the queue as they skip
+  the lock. Every timed job holds its GPU alone. A job marked non-exclusive
+  (correctness only, the `dev` hook) shares a GPU only with other
+  non-exclusive jobs whose memory estimates fit in 90 % of it.
+* **Waiting is not the agent's time.** While a session's evaluation waits
+  behind other jobs, its `--agent-minutes` timeout and the `minutes_left` of its
+  evaluation advice stop running, never past the run's time for agents
+  (`costs.json` `gpu_wait_s`). A queued job whose session ends leaves the queue
+  without running. Ledger rows record the wait in `queue_s`, and `eval_s` keeps
+  meaning the evaluation's own time. `gpu_queue.jsonl` in the run directory
+  logs every tagged job (`queued` when it had to wait, `start`, `done`,
+  `withdrawn`, with class, kind, session, target, wait and hold), and
+  `kernel-agent status` summarises it.
 * **Child processes.** A subprocess started under the lock gets
   `KERNEL_AGENT_LOCK_HELD=1` (it does not wait for its parent) and, when more
   than one GPU is visible, `CUDA_VISIBLE_DEVICES=<i>` with
@@ -3304,13 +3337,15 @@ runs/<org>--<name>/<timestamp>/
   transforms/                 model-level transforms (+ the agent's copies)
   results.tsv                 experiment ledger: one row per evaluation
   events.jsonl                phase changes, agent start/stop, evaluations
+  gpu_queue.jsonl             GPU job queue: queued / start / done / withdrawn per job
   progress.png  amdahl.png  integration.png  dashboard.html
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md, artifacts.jsonl:
                               kernel_agent.artifacts lookups, export_checks.jsonl)
   improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256,
-                              auth, api_key_source, billing (+ usage_limit_waits, web)
+                              auth, api_key_source, billing (+ usage_limit_waits, web,
+                              gpu_wait_s)
   research/sources.jsonl      every WebFetch / WebSearch: time, URL or query, outcome, sha256;
                               every doc_search / doc_read: query and ids, chunk and its source
   optimized/                  apply.py + manifest.json + kernels/ (+ rewrites/ of region targets)
@@ -3336,11 +3371,14 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  diverse_speedup  flags  worker  idea  hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  worker  idea
+hypothesis
 ```
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
-"Speed of light"). `diverse_speedup` is the median speedup of an `e2e` row over the
+"Speed of light"). `eval_s` is the time an evaluation took and `queue_s` the
+time it waited for the GPU behind other jobs before that (see "GPUs and the GPU
+lock"). `diverse_speedup` is the median speedup of an `e2e` row over the
 workload's diverse input set, and `flags` says `data_dependent` when that speedup
 changes with the input (see "Data-dependent speedups"). `worker` is the target's worker that evaluated a kernel
 candidate (empty without workers). `idea` is the `idea_id` of a kernel candidate. A ledger
@@ -3396,7 +3434,9 @@ end-to-end latency, the total cost from
 `costs.json`, a table per target (evaluations, keeps, failures, best speedup,
 its % of speed of light, estimated ms saved in the metric's ms, last hypothesis),
 the evaluations per backend (classified from each snapshot's source: targets
-tried and won, correct, kept, best speedup) and the last 10 ledger rows.
+tried and won, correct, kept, best speedup), the GPU queue (jobs, time on the
+GPU and waiting per class, what is on the GPU and what waits) and the last 10
+ledger rows.
 
 `dashboard.html` in the run directory is self-contained: charts inlined as
 PNG, the target table, the latest evaluations and the agent costs. It supports

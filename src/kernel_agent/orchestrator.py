@@ -11,7 +11,9 @@ an interrupted run can be resumed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
+import functools
 import json
 import re
 import sys
@@ -23,6 +25,7 @@ from typing import Any
 from kernel_agent import (
     abtest,
     diversity,
+    gpuqueue,
     hub,
     interrupt,
     ledger,
@@ -71,6 +74,15 @@ PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "r
 #: The dossier session (``Orchestrator.dossier``): cheap, so it delays a target's first
 #: engineer session by a few minutes at most.
 DOSSIER_CONFIG = {"effort": "low", "max_turns_per_agent": 20}
+#: The GPU job kind (``gpuqueue.py``) of the worker commands the coordinator runs
+WORKER_JOBS = {
+    "capture": "capture",
+    "analyze": "reprofile",
+    "e2e": "integration",
+    "e2e_ab": "integration",
+}
+#: The kinds of the integration's GPU jobs (``Orchestrator._gpu_job``)
+INTEGRATION_JOBS = frozenset({"integration", "recheck", "reevaluate", "memcheck"})
 
 
 def log(msg: str) -> None:
@@ -225,7 +237,26 @@ class Orchestrator:
         if command == "capture":  # a target's tolerance tier follows the run's quality mode
             allowed = ",".join(self.allowed_precisions())  # and its precision must be allowed
             args = (*args, "--quality", self.cfg.quality, "--precisions", allowed)
-        return (self.worker or call_worker)(self.run, command, *args)
+        # its kind in the GPU job queue; its class: the integration's (_gpu_job) inside one
+        with gpuqueue.tagged(WORKER_JOBS.get(command, "capture"), self.run):
+            return (self.worker or call_worker)(self.run, command, *args)
+
+    def _gpu_job(self, kind: str) -> contextlib.AbstractContextManager[gpuqueue.Job]:
+        """Tag the coordinator's GPU work of ``kind`` for the GPU job queue (``gpuqueue.py``):
+        background work, except the integration's jobs (:data:`INTEGRATION_JOBS`): class
+        ``deadline`` once the run is in the time kept for its final integration, ``eval``
+        while the final integration's estimate fills the share of ``--max-hours`` kept for it
+        (a re-integration's measurements then progress; the final one reuses them)."""
+        job_class = None
+        if kind in INTEGRATION_JOBS:
+            budget = self.budget
+            left = budget.agent_seconds_left()
+            share = scheduler.INTEGRATION_SHARE * (budget.max_hours or 0.0) * 3600
+            if left is not None and left < MIN_AGENT_SECONDS:
+                job_class = gpuqueue.DEADLINE
+            elif share and budget.final_reserve_s >= share:
+                job_class = gpuqueue.EVAL
+        return gpuqueue.tagged(kind, self.run, job_class=job_class)
 
     async def _agent(
         self,
@@ -258,10 +289,16 @@ class Orchestrator:
             hosts = web.domains(cfg.web_domains)
             doclib.prepare_in_background(fetch=cfg.allow_web, hosts=hosts, log=log)
         waits = 0
+        # the time its GPU jobs wait behind other jobs is not the session's (gpuqueue.py)
+        clock = gpuqueue.SessionClock(
+            label or name,
+            cap=self.budget.agent_seconds_left,
+            extend=functools.partial(self.budget.extend_deadline, name),
+        )
         while True:
             timer = asyncio.timeout(timeout)
             try:
-                async with timer:
+                async with timer, clock.running(timer):
                     result = await (self.agent_runner or run_agent)(
                         name,
                         cfg=cfg,
@@ -316,6 +353,7 @@ class Orchestrator:
             "api_key_source": result.api_key_source,
             "billing": auth.billing(result.api_key_source, self.env),
             **({"timed_out": True} if result.timed_out else {}),
+            **({"gpu_wait_s": round(clock.waited, 1)} if clock.waited else {}),
             **({"usage_limit_waits": waits} if waits else {}),
             **({"usage_limit": result.usage_limit.to_dict()} if result.usage_limit else {}),
             **({"web": web.summary(result.web)} if result.web else {}),
@@ -1096,7 +1134,8 @@ class Orchestrator:
                 return None
             checker = export_mod.check_export
         expected = final.get("patches")
-        result = checker(self.run, call_worker, self.truth.worker_args(), expected=expected)
+        with self._gpu_job("integration"):
+            result = checker(self.run, call_worker, self.truth.worker_args(), expected=expected)
         if result.get("passed"):
             again = " (the same package passed before)" if result.get("reused") else ""
             log(f"integrate: export self-test passed{again}: {result.get('reason')}")
@@ -1292,12 +1331,13 @@ class Orchestrator:
             check = {"status": "skipped", "reason": f"no capture file {capture}"}
         else:
             try:
-                check = (self.memchecker or memcheck.run_memcheck)(
-                    capture,
-                    snap,
-                    capture_sha256=self.truth.verify(capture),
-                    timeout=2 * self.budget.eval_timeout_s,
-                )
+                with self._gpu_job("memcheck"):
+                    check = (self.memchecker or memcheck.run_memcheck)(
+                        capture,
+                        snap,
+                        capture_sha256=self.truth.verify(capture),
+                        timeout=2 * self.budget.eval_timeout_s,
+                    )
             except Exception as exc:  # the check broke: recorded, the kernel is kept
                 check = {"status": "error", "reason": repr(exc)[:500]}
         log(f"integrate: memcheck {target_id} ({snap.name}): {memcheck.describe(check)}")
@@ -1350,13 +1390,14 @@ class Orchestrator:
 
         def run_recheck(verdict: dict[str, Any] | None) -> dict[str, Any]:
             try:
-                return (self.rechecker or recheck.run_recheck)(
-                    capture,
-                    snap,
-                    verdict=verdict,
-                    capture_sha256=capture_sha256,
-                    timeout=2 * self.budget.eval_timeout_s,
-                )
+                with self._gpu_job("recheck"):
+                    return (self.rechecker or recheck.run_recheck)(
+                        capture,
+                        snap,
+                        verdict=verdict,
+                        capture_sha256=capture_sha256,
+                        timeout=2 * self.budget.eval_timeout_s,
+                    )
             except Exception as exc:  # the re-check broke: the kernel is not confirmed
                 return {"status": "error", "passed": False, "reason": repr(exc)[:500]}
 
@@ -1406,15 +1447,16 @@ class Orchestrator:
             return changed
         sha = sha or truth.sha256_file(snap)
         start = time.perf_counter()
-        try:
-            result = (self.reevaluator or evaluate.run_evaluation)(
-                self.run.capture_file(target_id),
-                snap,
-                timeout=self.budget.eval_timeout_s,
-                capture_sha256=capture_sha256,
-            )
-        except Exception as exc:
-            result = {"status": "error", "correct": False, "error": repr(exc)[:500]}
+        with self._gpu_job("reevaluate") as job:
+            try:
+                result = (self.reevaluator or evaluate.run_evaluation)(
+                    self.run.capture_file(target_id),
+                    snap,
+                    timeout=self.budget.eval_timeout_s,
+                    capture_sha256=capture_sha256,
+                )
+            except Exception as exc:
+                result = {"status": "error", "correct": False, "error": repr(exc)[:500]}
         if truth.sha256_file(snap) != sha:
             self.truth.alarm(snap, "snapshot changed during its re-evaluation")
             return changed
@@ -1427,10 +1469,11 @@ class Orchestrator:
             result,
             hypothesis=f"re-evaluation of exp {rec.get('exp')} ({rec.get('speedup')}x): {why}",
             parent=rec.get("parent"),
-            eval_s=round(time.perf_counter() - start, 1),
+            eval_s=round(time.perf_counter() - start - job.wait_s, 1),
             snapshot_sha256=sha,
             keeper=self.truth,
             idea=str(rec.get("idea") or ""),
+            queue_s=job.queue_s,
             reevaluates={
                 "exp": rec.get("exp"),
                 "speedup": rec.get("speedup"),
@@ -1466,7 +1509,8 @@ class Orchestrator:
         """One integration measurement (``e2e`` / ``e2e_ab`` of ``combo``) and its ledger row
         (none when an A/B could not run in-process: nothing was measured)."""
         start = ledger.clock()  # simulated in a dry run, like the worker's measurements
-        r = self._worker(command, *cli, *self.truth.worker_args())
+        with self._gpu_job("integration") as job:  # one A/B step: one turn in the GPU queue
+            r = self._worker(command, *cli, *self.truth.worker_args())
         if command == "e2e_ab" and r.get("status") in abtest.FALLBACK:
             return r
         names = [ledger.item_label(a) for _, a in combo] or ["baseline"]
@@ -1478,7 +1522,9 @@ class Orchestrator:
             hypothesis="integration: "
             + " + ".join(names)
             + (" alone" if len(names) == 1 and not note else note),
-            eval_s=round(ledger.clock() - start, 1),  # improve.py's integration estimate
+            # improve.py's integration estimate: the hold, without its queue wait
+            eval_s=round(ledger.clock() - start - job.wait_s, 1),
+            queue_s=job.queue_s,
         )
         gpu = r.get("gpu") or (r.get("ab") or {}).get("gpu")
         if message := telemetry.warning(gpu):
@@ -1789,7 +1835,8 @@ class Orchestrator:
         for arg in kernels:
             cli += ["--kernel", arg]
         cli += ["--transform", str(strong_baseline.REFERENCE_TRANSFORM)]
-        r = self._worker("e2e", *cli, *self.truth.worker_args())
+        with self._gpu_job("integration"):
+            r = self._worker("e2e", *cli, *self.truth.worker_args())
         record = {"items": items, **strong_baseline.combination(r, compiled)}
         log(
             f"integrate: reference optimisations + {len(kernels)} kernel(s): "
@@ -2153,14 +2200,15 @@ class Orchestrator:
         for target_id in target_ids:
             if library.seeded(self.run, target_id) is not None or self._refused(target_id):
                 continue  # seeded, or at a precision the run does not allow
-            tried = await asyncio.to_thread(
-                library.seed_target,
-                self.run,
-                target_id,
-                arch=arch,
-                keeper=self.truth,
-                timeout=self.budget.eval_timeout_s,
-            )
+            with self._gpu_job("seed"):  # background work in the GPU queue
+                tried = await asyncio.to_thread(
+                    library.seed_target,
+                    self.run,
+                    target_id,
+                    arch=arch,
+                    keeper=self.truth,
+                    timeout=self.budget.eval_timeout_s,
+                )
             library.remember_seed(self.run, target_id, tried)
 
     def _prior_suffices(self, target_id: str) -> str | None:

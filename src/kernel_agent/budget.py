@@ -277,6 +277,17 @@ class Budget:
     def end_agent(self, name: str) -> None:
         self.deadlines.pop(name, None)
 
+    def extend_deadline(self, name: str, seconds: float) -> None:
+        """Push agent ``name``'s deadline back by ``seconds`` its GPU jobs waited behind other
+        jobs (:mod:`kernel_agent.gpuqueue`), so ``minutes_left`` and the ``stop`` advice leave
+        that time out; never past the run's agent time (nor earlier than it was)."""
+        if name not in self.deadlines or seconds <= 0:
+            return
+        when = self.deadlines[name] + seconds
+        if (left := self.agent_seconds_left()) is not None:
+            when = min(when, time.monotonic() + left)
+        self.deadlines[name] = max(self.deadlines[name], when)
+
     def agent_config(self, cfg: OptimizeConfig) -> OptimizeConfig:
         """``cfg`` with the per-agent USD cap lowered to what is left of ``max_usd``."""
         left = self.usd_left()

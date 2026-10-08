@@ -23,6 +23,14 @@ machine: always) still exclude each other; GPU ``i`` locks ``gpu{i}.lock``. With
 ``nvidia-smi`` (or with no GPU visible) the pool is GPU 0 alone and a child's
 environment only gains ``KERNEL_AGENT_LOCK_HELD``, as before the pool. A waiter stays
 with the GPU it chose, even if another one frees up first.
+
+The threads of this process take the lock in the order of the GPU job queue
+(:mod:`kernel_agent.gpuqueue`): :func:`_admit` lets a thread's job (the context's
+``gpuqueue.Job``) go when it is the queue's head and a GPU is free, then it takes the
+locks as above; a release wakes the queue. A re-entrant hold and a child process skip the
+queue as they skip the lock. A non-exclusive job (correctness only) shares its GPU with
+other non-exclusive jobs whose memory fits (``LOCK_SH``, no thread lock), never with an
+exclusive one, and another process's exclusive lock still excludes it.
 """
 
 from __future__ import annotations
@@ -35,12 +43,12 @@ import itertools
 import os
 import subprocess
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from kernel_agent import interrupt
+from kernel_agent import gpuqueue, interrupt
 from kernel_agent.toolchain import CACHE_DIR
 
 ENV = "KERNEL_AGENT_LOCK_HELD"
@@ -171,8 +179,25 @@ def _take(path: Path, lock: threading.Lock, *, wait: bool) -> IO[str] | None:
     return fh
 
 
-def _flock_wait(fh: IO[str]) -> None:
-    """``LOCK_EX`` on ``fh``, waited for until the run is stopping (``Interrupted``).
+def _take_shared(path: Path, on_wait: Callable[[], None]) -> IO[str]:
+    """``path`` open with a shared ``flock`` (a non-exclusive job, :mod:`gpuqueue`), waited
+    for while another process holds it exclusively (``on_wait`` first)."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "w")  # noqa: SIM115 - closed by the caller when it unlocks
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            on_wait()
+            _flock_wait(fh, fcntl.LOCK_SH)
+    except BaseException:
+        fh.close()
+        raise
+    return fh
+
+
+def _flock_wait(fh: IO[str], mode: int = fcntl.LOCK_EX) -> None:
+    """``mode`` (``LOCK_EX``) on ``fh``, waited for until the run is stopping (``Interrupted``).
 
     The blocking ``flock`` runs in a daemon thread on a duplicate of the descriptor, so
     waiters get the lock in the kernel's order (no polling against other processes'
@@ -185,7 +210,7 @@ def _flock_wait(fh: IO[str]) -> None:
 
     def wait() -> None:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, mode)
         except OSError as exc:
             error.append(exc)
         finally:
@@ -199,9 +224,11 @@ def _flock_wait(fh: IO[str]) -> None:
         raise error[0]
 
 
-def _acquire(name: str, gpus: tuple[GPU, ...]) -> tuple[int, threading.Lock, IO[str]]:
+def _acquire(
+    name: str, gpus: tuple[GPU, ...], on_wait: Callable[[], None] | None = None
+) -> tuple[int, threading.Lock, IO[str]]:
     """The first free GPU, else the one with the fewest waiters of this process (round
-    robin on ties), waited for."""
+    robin on ties), waited for (``on_wait`` first)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     files = [_lock_file(name, g.index) for g in gpus]
     with _guard:
@@ -209,6 +236,8 @@ def _acquire(name: str, gpus: tuple[GPU, ...]) -> tuple[int, threading.Lock, IO[
     for gpu, file, lock in zip(gpus, files, locks, strict=True):
         if (fh := _take(CACHE_DIR / file, lock, wait=False)) is not None:
             return gpu.index, lock, fh
+    if on_wait is not None:
+        on_wait()
     with _guard:
         turn = next(_turn)
         k = min(range(len(gpus)), key=lambda i: (_waiting[files[i]], (i - turn) % len(gpus)))
@@ -242,7 +271,26 @@ def gpu_lock(name: str = "gpu") -> Iterator[int]:
         yield _inherited_index()  # our parent process holds it
         interrupt.check()
         return
-    index, thread_lock, fh = _acquire(name, pool().gpus)
+    job = gpuqueue.current() or gpuqueue.Job()  # untagged: class "default"
+    wait, gate = gpuqueue.Wait(job), gpuqueue.gate(name)
+    try:
+        room = _admit(name, job, wait, pool().gpus)
+    except BaseException as exc:
+        wait.abandoned(exc)
+        raise
+    thread_lock: threading.Lock | None = None
+    try:
+        if job.exclusive:
+            index, thread_lock, fh = _acquire(name, room, wait.block)
+            gate.placed(job, index)
+        else:
+            index = room[0].index
+            fh = _take_shared(CACHE_DIR / _lock_file(name, index), wait.block)
+    except BaseException as exc:
+        gate.leave(job)
+        wait.abandoned(exc)
+        raise
+    wait.started(index)
     held[name] = index
     try:
         yield index
@@ -250,8 +298,43 @@ def gpu_lock(name: str = "gpu") -> Iterator[int]:
         del held[name]
         fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
-        thread_lock.release()
+        if thread_lock is not None:
+            thread_lock.release()
+        gate.leave(job)
+        wait.ended()
     interrupt.check()
+
+
+@functools.cache
+def _memory_table() -> dict[int, float]:
+    """GPU index -> its memory in GB (``nvidia-smi``; {} without it)."""
+    cmd = ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table: dict[int, float] = {}
+    for line in proc.stdout.splitlines() if proc.returncode == 0 else []:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit():
+            with contextlib.suppress(ValueError):
+                table[int(parts[0])] = float(parts[1]) / 1024  # MiB
+    return table
+
+
+def _memory_gb(index: int) -> float | None:
+    """Memory of GPU ``index`` in GB (None: unknown, so no job shares it)."""
+    return _memory_table().get(index)
+
+
+def _admit(
+    name: str, job: gpuqueue.Job, wait: gpuqueue.Wait, gpus: tuple[GPU, ...]
+) -> tuple[GPU, ...]:
+    """Wait until ``job`` is the head of the GPU job queue of lock ``name`` and a GPU of
+    ``gpus`` it may take is free (:meth:`gpuqueue.Gate.admit`); returns those GPUs."""
+    capacity = None if job.exclusive else {g.index: _memory_gb(g.index) for g in gpus}
+    room = gpuqueue.gate(name).admit(job, wait, tuple(g.index for g in gpus), capacity)
+    return tuple(g for g in gpus if g.index in room)
 
 
 def pinned(index: int) -> dict[str, str]:

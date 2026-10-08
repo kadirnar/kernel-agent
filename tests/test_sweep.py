@@ -168,9 +168,9 @@ def private_lock(tmp_path, monkeypatch):
     taken = []
     acquire = gpulock._acquire
 
-    def counted(name, gpus):
+    def counted(name, gpus, *args):
         taken.append(name)
-        return acquire(name, gpus)
+        return acquire(name, gpus, *args)
 
     monkeypatch.setattr(gpulock, "_acquire", counted)
     monkeypatch.setattr(sweep_mod, "ensure_peaks", lambda: None)

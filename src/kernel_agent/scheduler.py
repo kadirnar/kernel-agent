@@ -107,7 +107,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, precisions, projection, truth
+from kernel_agent import gpuqueue, ledger, precisions, projection, truth
 from kernel_agent.budget import (
     PLATEAU,
     PRIOR_HYPOTHESIS,
@@ -969,9 +969,13 @@ def median_eval_s(rows: Iterable[dict[str, Any]]) -> float | None:
 
 def slice_seconds(arm: Arm) -> float:
     """Time one slice of ``arm`` needs: the agent's warm-up, one evaluation of the arm (the
-    median ``eval_s`` of its evaluations, else :data:`EVAL_SECONDS`) and the wrap-up after
-    it (the evaluation advice says ``stop`` with less than ``WRAP_UP_SECONDS`` left)."""
-    return WARMUP_SECONDS + (median_eval_s(arm.rows) or EVAL_SECONDS[arm.kind]) + WRAP_UP_SECONDS
+    median ``eval_s`` of its evaluations, else :data:`EVAL_SECONDS`), the time it is
+    expected to wait for the GPU behind the jobs there now (``gpuqueue.expected_wait``; 0
+    when nothing runs) and the wrap-up after it (the evaluation advice says ``stop`` with
+    less than ``WRAP_UP_SECONDS`` left)."""
+    wait = gpuqueue.expected_wait(gpuqueue.EVAL if arm.kind == KERNEL else gpuqueue.E2E)
+    each = median_eval_s(arm.rows) or EVAL_SECONDS[arm.kind]
+    return WARMUP_SECONDS + each + wait + WRAP_UP_SECONDS
 
 
 def integration_estimate(
