@@ -159,6 +159,8 @@ class Rounds:
     b_ms: list[float] = field(default_factory=list)
     order: list[str] = field(default_factory=list)
     output: Any = None  # B's last output
+    #: the counters each timed run of B reported (``Workload.report_stats``; ``{}``: none)
+    b_stats: list[dict[str, Any]] = field(default_factory=list)
     #: per state: its warm-up output was bit-identical twice, so every round must match it
     reproducible: dict[str, bool] = field(default_factory=dict)
     mismatch: str | None = None
@@ -205,7 +207,7 @@ def alternate(
             try:
                 if session.to(state):
                     timed_run(session.workload, inputs)  # warm-up of a transform applied again
-                output, ms = timed_run(session.workload, inputs)
+                output, ms, detail = base.timed_run(session.workload, inputs)
             except Exception:
                 out.failed, out.error = state.name, traceback.format_exc()[-4000:]
                 return out
@@ -215,6 +217,7 @@ def alternate(
             out.order.append(state.name)
             if state is b:
                 out.output = output
+                out.b_stats.append(detail.get("decode_stats") or {})
             if reproducible.get(state.name) and not outputs_equal(reference[state.name], output):
                 other = b.name if state is a else a.name
                 out.mismatch = (

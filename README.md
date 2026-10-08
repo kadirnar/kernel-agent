@@ -34,6 +34,7 @@ HF URL ─► resolve (modality, arch, family, size)
         ─► analyze   load model, baseline latency, determinism check,
                      sensitivity probe, teacher-forcing self-check,
                      held-out input + natural-length (stop) baselines,
+                     diverse input set (outputs + per-input times),
                      perceptual baseline (--quality near-lossless),
                      module-level + kernel-level
                      profile, compiled baseline (the model's own
@@ -234,6 +235,38 @@ same time.
   the step where the decisions differ is a near-tie (`|margin| <=
   stop_near_tie`, default 0.5). Details are in `metrics.natural_length`;
   workloads without a stop condition are unaffected.
+* **Natural LLM prompts** (#170, `workloads/texts.py`): the built-in LLM
+  workload's prompt is `prompt_len` tokens of long, non-repeating text, the
+  first tokens of an essay (1,056 Qwen3 tokens) continued with a story (614);
+  the held-out prompt starts with the story. Until #170 it was one paragraph
+  repeated up to `prompt_len` (about six copies at 512 tokens): a greedy model
+  continuing it repeats it too, so outputs looked stable under any change and
+  prompt-lookup speculative decoding was right almost every time (65x on
+  Qwen3-0.6B, against 12x on the new prompt; "Data-dependent speedups" below).
+  New runs record `inputs_version: 2` in `run.json` (`WorkloadSpec`), so
+  **their baselines differ from older runs'**; a `run.json` written before
+  reads as version 1 and keeps the repeated paragraph, its recorded baselines
+  and no diverse set. `-o prompt=...` still repeats a prompt shorter than
+  `prompt_len`.
+* **Greedy tokens at near-ties**: on natural text, greedy tokens flip under
+  rounding-level changes where the baseline's choice was a near-tie. One bf16
+  rounding step per `nn.Linear` output (the sensitivity probe) diverges before
+  token 16 on 6 of the 14 natural prompts of Qwen3-0.6B (the main prompt at
+  token 4), each time where the baseline's top-1 minus top-2 logit was at most
+  0.125 (exact bf16 ties included). The LLM check therefore records those
+  margins in every baseline run (`margins`) and accepts an earlier divergence
+  at a margin of at most `near_tie` (default 0.5, `-o near_tie=`;
+  `metrics.divergence_margin`, `tolerated`); the first-step logits cosine (>=
+  0.99) still applies. Runs of inputs version 1 keep the strict prefix.
+* **Diverse input set** (#170, `workloads/diverse.py`): a candidate that passes
+  the checks above also runs the workload's diverse inputs
+  (`Workload.diverse_inputs()`: LLM 12 requests, TTS / VoxCPM a few texts; the
+  main input's shapes, other content). `analyze` stores the baseline's output
+  of each (`.truth/baseline_output_diverse.pt`) and its time (`baseline.json`
+  → `diverse`); `e2e` judges each output with the workload's check (teacher
+  forced where supported) and fails the candidate when one fails, and times
+  each input for the per-input speedups ("Data-dependent speedups" below).
+  Details are in `metrics.diverse`.
 
 ### Quality modes: exact and near-lossless
 
@@ -275,6 +308,47 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   (`generate_streaming`, the whole streamed audio with its chunk-wise AudioVAE
   decode), otherwise `generate`. A perceptual baseline recorded under another
   metric fails every candidate (re-run `analyze`).
+* **LLM gate: teacher forcing** (#170, `perceptual.score_llm` / `compare_llm`).
+  On natural prompts greedy text diverges within a few tokens under FP8
+  weights although every distribution stays close (FP8 e4m3 weight-only fake
+  quantisation of Qwen3-0.6B: first divergence before token 16 on 10 of 14
+  prompts, at token 0 on two), so free-running tokens cannot judge an LLM in
+  this mode. The samples are the main, held-out and 12 diverse prompts (14,
+  `prompt_len` tokens, `new_tokens` each). Each is scored by one forward of the
+  candidate (`model(input_ids)`, the patched model) over the prompt and eager's
+  continuation: per token the KL from eager's distribution (kept as its top 32
+  tokens plus the rest of its mass) and whether eager's most likely token is
+  still the candidate's; and by the likelihood of the candidate's own
+  free-running continuation under the candidate, which catches a decode loop
+  that writes wrong text while the forward is fine. Thresholds (`-o max_kl=`,
+  `max_kl_worst`, `min_top1`, `max_nll_increase`), calibrated on Qwen3-0.6B
+  over the 14 prompts (bf16 baseline; `fp8` = e4m3 weight-only fake
+  quantisation of every decoder `nn.Linear`):
+
+  | variant | mean KL | worst sample KL | top-1 agreement | NLL change (nats/token) | first-logits cosine (min) | gate |
+  |---|---|---|---|---|---|---|
+  | one bf16 rounding step per Linear output | 0.0046 | 0.0084 | 0.958 | -0.013 | 0.9995 | pass |
+  | fp8 per output channel | 0.0111 | 0.0429 | 0.951 | -0.068 | 0.9968 | pass |
+  | fp8 per tensor | 0.0091 | 0.0221 | 0.954 | +0.029 | 0.9954 | pass |
+  | fp8 per channel, scales x1.05 | 0.0307 | 0.0691 | 0.930 | +0.106 | 0.9815 | pass (borderline) |
+  | int4 weights, group 128 | 0.350 | 0.793 | 0.725 | +0.104 | 0.859 | fail |
+  | int4 weights, per channel | 0.841 | 1.742 | 0.619 | +0.317 | 0.719 | fail |
+  | fp8 per channel, scales x1.2 | 0.337 | 0.574 | 0.756 | +0.248 | 0.522 | fail |
+  | RMSNorm eps 1e-2 | 8.85 | 12.47 | 0.011 | +0.667 | 0.181 | fail |
+  | one KV head dropped | 0.507 | 0.988 | 0.698 | +0.284 | 0.755 | fail |
+  | decode loop writing the right tokens one place late | 0 | 0 | 1.000 | +0.384 | — | fail |
+
+  The limits: mean KL <= 0.05 (4.5x FP8's), worst sample <= 0.15, top-1
+  agreement >= 0.85 and NLL change <= +0.25. A 5 % scale error passes, like
+  a numerics change within FP8's spread; 20 % fails. The free-running tokens
+  are informational in this mode (`near_lossless_options`: `min_prefix` 0),
+  the first-step logits keep a cosine floor of 0.98. A transform that
+  replaces the decode loop must keep plain forward calls of the model working
+  (the gate's forward). The Qwen3 run's accepted FP8 megakernel with
+  prompt-lookup decoding passes: KL 0 (its verification runs the bf16
+  modules), NLL change -0.03 (its FP8 decode steps write plausible text).
+  Runs of inputs version 1 have no LLM gate (no perceptual baseline): they keep
+  the exact checks, as before.
 * **Sanity floor.** Teacher forcing, the held-out input and the stop check
   stay, with the workload's looser `near_lossless_options` (VoxCPM: mean step
   cosine >= 0.95, min >= 0.2; the stop check accepts ±1 patch at a near-tie of
@@ -883,6 +957,62 @@ scheduler's region arms) it is converted first by one helper,
 The ceilings table stays in the profiled window's own unit (per batched run for
 `throughput`). The improve scheduler converts its rows by the round's baseline ÷
 that window, and the time per run of an arm's best kernel by the helper above.
+
+### Data-dependent speedups: the diverse input set
+
+Some exact techniques are as fast as the *content* lets them be: speculative
+decoding (prompt-lookup / n-gram drafts, a draft model) is as fast as its drafts
+are right, an early exit as early as the input allows. They are welcome, but the
+benchmark input alone can overstate them (#170). In the Qwen3-0.6B run of
+2026-10-08 the systems agent's exact-greedy prompt-lookup decoding on top of an
+FP8 decode megakernel measured 66.98x eager on the prompt of that time, one
+paragraph repeated six times, which the greedy model kept repeating. Measured
+again with this library's code (`diverse.record_baseline` / `diverse.check`, RTX
+5070 Ti, 512-token prompts, 64 new tokens; scripts and outputs, with the LLM gate's
+calibration, in [`docs/research-scripts/llm-diverse-170/`](docs/research-scripts/llm-diverse-170/)):
+
+| prompt | run's transform (FP8 megakernel + prompt lookup) | eager prompt lookup, K=10 (acceptance) |
+|---|---|---|
+| repeated paragraph (inputs version 1) | 65.6x | 6.4x (93 %) |
+| new benchmark prompt (the essay) | 12.2x | 0.97x (0 %) |
+| diverse set: median (min .. max) | 14.7x (10.1x recipe .. 21.6x poem) | 1.21x (0.99x French .. 2.04x poem) |
+
+Both are labelled data-dependent; the eager one's decode steps per token range
+from 0.47 (code, poem) to 1.0 (French). So, for every workload that declares a
+diverse input set (`Workload.diverse_inputs()`):
+
+* **The set.** LLM: 12 requests of other kinds and languages (news, a dialogue,
+  Python code, a recipe, a poem, a question, a maths problem, a CSV table, German,
+  French, Spanish, Chinese; 25-222 tokens, `workloads/texts.py`) at the end of a
+  `prompt_len` prompt whose context is the essay, each starting 61 tokens later.
+  VoxCPM: a question, numbers, Chinese and German at the main input's patches and
+  seed; generic TTS: three sentences. The main input's shapes, so the set measures
+  how a speedup depends on the data, not the shapes (and compiles nothing new).
+  A serving benchmark (`-o serving=`) has none.
+* **Measured.** `analyze` runs the baseline on each input (one warm-up, two timed
+  runs) and stores its output and time; `e2e` and every A/B step of the integration
+  (state B) run a candidate that passed the main checks the same way, judge each
+  output (above) and report per input its time, its speedup against the
+  baseline's time of that input and its decode counters, plus the median, min and
+  max speedup (`metrics.diverse`; `--no-diverse` skips it, as the integration does
+  for the A of a separate-process A/B and the compiled-baseline combination).
+* **Data-dependent.** A candidate whose per-input speedups spread, (max − min) /
+  median, beyond both 10 % and 3x the timing noise (the largest run-to-run spread of
+  an input, the candidate's plus the baseline's), or whose decode steps per token
+  change with the input, is labelled `data_dependent` (`kernel_agent/diversity.py`):
+  in the ledger (`results.tsv` `flags`, next to `diverse_speedup`, the set's median),
+  in `kernel-agent status` (`keep (data-dependent)`, the set's median next to the
+  measured speedup), in `integration.json` (`data_dependent`: the items whose A/B
+  alone measured it, accepted or not; the final log line) and in `report.md` (the
+  set's median and range next to the benchmark speedup in the Result table, a
+  per-input table, the transforms table). It is never rejected for it: the keep rule
+  and the integration still rank by the benchmark input.
+* **Decode counters.** A generation loop reports what it did with
+  `workload.report_stats(steps=1, verifies=1, drafted=k, accepted=a, tokens=a + 1)`
+  per verification (`report_stats(steps=1, tokens=1)` per plain step); every timed
+  run starts from zero. `metric_detail.decode_stats` (benchmark input; B's rounds in
+  an A/B) and each diverse input hold the medians with `acceptance_rate`,
+  `tokens_per_verify` and `tokens_per_step`, and the report shows them.
 
 ### Integration: paired A/B with undo handles
 
@@ -3122,11 +3252,13 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  worker  idea  hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  diverse_speedup  flags  worker  idea  hypothesis
 ```
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
-"Speed of light"). `worker` is the target's worker that evaluated a kernel
+"Speed of light"). `diverse_speedup` is the median speedup of an `e2e` row over the
+workload's diverse input set, and `flags` says `data_dependent` when that speedup
+changes with the input (see "Data-dependent speedups"). `worker` is the target's worker that evaluated a kernel
 candidate (empty without workers). `idea` is the `idea_id` of a kernel candidate. A ledger
 written before a column existed keeps its own layout, and its rows have no
 value for that column.

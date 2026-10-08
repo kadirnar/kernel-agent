@@ -101,7 +101,8 @@ These change *how* the model runs, not the math, and often beat any kernel:
 * Precompute constant tensors (rotary tables, masks, positional embeddings).
 * Fusing linear layers that share an input (QKV, gate/up) — done in `build()`.
 * Avoid recomputation (cache encoder output, cross-attention K/V).
-* Exact speculative / lookahead decoding keeps greedy outputs identical.
+* Exact speculative / lookahead decoding keeps greedy outputs identical; its gain depends
+  on the content, so it is also timed on a diverse input set (`systems.md` §5).
 * Host syncs in a generation loop (the profile's "Host synchronisation" table: `.item()` /
   `.cpu()` of a stop flag, `torch.tensor(..., device=...)` per step, pageable copies, with
   call sites): read flags asynchronously (`Workload.async_flags()`), build constants once,

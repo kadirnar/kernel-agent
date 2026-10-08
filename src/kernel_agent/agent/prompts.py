@@ -1075,6 +1075,18 @@ runs (memoisation fails the evaluation). One profiled run checks that `run()`
 leaves no GPU work behind (`metrics.concurrency`): side streams are fine when
 joined before it returns (declare them with `kernel_agent.concurrency`), work
 from other threads, after it returns or on another GPU fails the evaluation.
+Data-dependent techniques are welcome: exact speculative decoding (prompt-lookup /
+n-gram drafts, a draft model), early exit, reuse of repeated content within a run. A
+passing candidate also runs the workload's diverse input set (`metrics.diverse`: other
+prompts / texts of other kinds and languages at the same shapes), judged like the main
+input and timed: per-input speedups, their median, min and max. One whose speedup varies
+across the set beyond the noise, or whose decode steps per token change with the input,
+is labelled `data_dependent` (never rejected for it); the report shows the set's median
+next to the benchmark number, so a gain that only the benchmark prompt shows is visible.
+Report a speculative loop's counters with `workload.report_stats(steps=1, verifies=1,
+drafted=k, accepted=a, tokens=a + 1)` per verification (`report_stats(steps=1,
+tokens=1)` per plain step): the acceptance rate and tokens per verification then show in
+`metric_detail.decode_stats` and the report.
 The integration switches one loaded model between the accepted set and the
 accepted set plus your transform (a paired A/B), undoing `apply` by restoring
 every attribute, module, `.data` binding and torch flag it changed. Change

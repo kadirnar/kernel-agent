@@ -21,6 +21,14 @@ Once a model runs near the memory-bandwidth floor of its bf16 weights, the next 
   ``Workload.run`` under the run's metric (:mod:`kernel_agent.objective`), so the gate
   judges the audio of the code path the objective times: with ``-o metric=ttfa`` VoxCPM's
   streaming path (the whole streamed output), otherwise ``generate``.
+* **LLM gate** (:func:`score_llm`, :func:`compare_llm`). On natural prompts greedy text
+  diverges within a few tokens under FP8 weights although every distribution stays close,
+  so free-running tokens cannot judge it. Each sample (the main, held-out and diverse
+  prompts) is scored teacher forced, one forward of the candidate over the prompt and
+  eager's continuation: per token the KL from eager's distribution and whether eager's top
+  token stays the candidate's; and the likelihood of the candidate's own continuation,
+  which catches a decode loop that writes wrong text while its forward is fine.
+  Thresholds: :data:`LLM_MAX_KL` and the lines after it (calibration: README).
 * **Sanity floor.** Teacher forcing, the held-out input and the stop check stay, with the
   workload's looser :attr:`~kernel_agent.workloads.base.Workload.near_lossless_options`
   (thresholds that FP8-weight variants pass and broken kernels still fail; the stop check
@@ -84,6 +92,27 @@ MIN_SPEAKER_SIMILARITY = 0.93
 MIN_SPEAKER_SIMILARITY_WORST = 0.85
 #: ... and the mean MOS may drop by at most this much.
 MAX_MOS_DROP = 0.3
+
+#: LLM gate (teacher forcing on eager's continuations, :func:`score_llm`): eager's
+#: distribution at every position is kept as its top this-many tokens plus the rest.
+LLM_TOPK = 32
+#: LLM gate thresholds, calibrated on Qwen3-0.6B (the 14 natural prompts of
+#: ``LLMWorkload.perceptual_samples``, 64 tokens each; README): FP8 e4m3 weight-only fake
+#: quantisation of every decoder Linear (per output channel / per tensor) reaches a mean KL
+#: of 0.011 / 0.009 (worst sample 0.043 / 0.022), top-1 agreement 0.95 and an NLL change
+#: of -0.07 / +0.03 nats per token; one bf16 rounding step per Linear output 0.005; int4
+#: weights (group 128, per channel), FP8 scales x1.2, RMSNorm eps 1e-2 and a dropped KV
+#: head reach a mean KL >= 0.34, worst sample >= 0.57 and top-1 <= 0.76, and a decode loop
+#: whose continuation is shifted by one token +0.38 nats per token. The mean KL over the
+#: samples may be at most this, ...
+LLM_MAX_KL = 0.05
+#: ... the worst sample's at most this, ...
+LLM_MAX_KL_WORST = 0.15
+#: ... eager's most likely token is the candidate's at this share of positions or more, ...
+LLM_MIN_TOP1 = 0.85
+#: ... and the candidate's own continuations are at most this many nats per token less
+#: likely (under the candidate) than eager's own (under eager), on average.
+LLM_MAX_NLL_INCREASE = 0.25
 
 
 def mode_of(value: Any) -> str:
@@ -337,6 +366,132 @@ def compare_tts(
     return Comparison(not problems, metrics, "; ".join(problems))
 
 
+# ------------------------------------------------------------------ LLM: teacher forcing
+
+
+def forced_logprobs(model: Any, prompt: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    """Log-probabilities ``[N, vocab]`` (float32) of the next token at every position of a
+    continuation ``tokens`` (``N``) of ``prompt``, teacher forced: one forward of the model
+    over prompt + continuation (``model(input_ids)``, the patched model of the process), so
+    position *i* sees the continuation's first *i* tokens."""
+    device = next(model.parameters()).device
+    ids = torch.cat([prompt.flatten().to(device), tokens.flatten().to(device)])[None]
+    n = int(tokens.numel())
+    try:  # only the logits that are needed (most transformers models take it)
+        out = model(input_ids=ids, use_cache=False, logits_to_keep=n + 1)
+        logits = out.logits[0, :n]
+    except TypeError:
+        logits = model(input_ids=ids, use_cache=False).logits[0, -n - 1 : -1]
+    return logits.float().log_softmax(-1)
+
+
+@torch.inference_mode()
+def score_llm(
+    model: Any, items: list[dict[str, Any]], *, topk: int = LLM_TOPK
+) -> list[dict[str, Any]]:
+    """Teacher-forced scores of generated continuations, one dict per item (``prompt``,
+    ``tokens``: 1-D token ids, ``reference``: the baseline's scores of the same sample or
+    None).
+
+    Every item: ``tokens``, ``nll`` (mean negative log-likelihood of its own continuation
+    under ``model``) and the ``topk`` most likely tokens of every position (``topk_ids``,
+    ``topk_logprobs``): for the baseline, the reference distributions. With a ``reference``
+    the model is also teacher forced on the *reference* continuation: ``kl`` (mean over
+    positions of KL(eager || model), eager's distribution as its top-k tokens plus the rest
+    of its mass, a lower bound of the full KL), ``kl_max`` (worst position), ``top1``
+    (positions whose most likely token is eager's) and ``reference_nll``."""
+    out = []
+    for it in items:
+        tokens = torch.as_tensor(it["tokens"]).flatten()
+        logp = forced_logprobs(model, torch.as_tensor(it["prompt"]), tokens)
+        dev = logp.device
+        own = logp.gather(1, tokens.to(dev)[:, None])[:, 0]
+        top = logp.topk(min(topk, logp.shape[-1]), dim=-1)
+        scores: dict[str, Any] = {
+            "tokens": tokens.tolist(),
+            "nll": round(float(-own.mean()), 5),
+            "topk_ids": top.indices.cpu(),
+            "topk_logprobs": top.values.cpu(),
+        }
+        ref = it.get("reference")
+        if ref is not None:
+            ref_tokens = torch.as_tensor(ref["tokens"]).flatten()
+            logq = forced_logprobs(model, torch.as_tensor(it["prompt"]), ref_tokens)
+            ids = torch.as_tensor(ref["topk_ids"]).to(logq.device)
+            p_logp = torch.as_tensor(ref["topk_logprobs"]).float().to(logq.device)
+            q_logp = logq.gather(1, ids)
+            p, q = p_logp.exp(), q_logp.exp()
+            p_rest = (1.0 - p.sum(1)).clamp_min(1e-12)
+            q_rest = (1.0 - q.sum(1)).clamp_min(1e-12)
+            kl = (p * (p_logp - q_logp)).sum(1) + p_rest * (p_rest.log() - q_rest.log())
+            kl = kl.clamp_min(0.0)
+            agree = q_logp[:, 0] >= logq.max(-1).values  # eager's top token is the model's (ties)
+            scores.update(
+                kl=round(float(kl.mean()), 6),
+                kl_max=round(float(kl.max()), 5),
+                top1=round(float(agree.float().mean()), 4),
+                reference_nll=round(
+                    float(-logq.gather(1, ref_tokens.to(logq.device)[:, None]).mean()), 5
+                ),
+            )
+        out.append(scores)
+    return out
+
+
+def compare_llm(
+    reference: list[dict[str, Any]],
+    candidate: list[dict[str, Any]],
+    *,
+    max_kl: float = LLM_MAX_KL,
+    max_kl_worst: float = LLM_MAX_KL_WORST,
+    min_top1: float = LLM_MIN_TOP1,
+    max_nll_increase: float = LLM_MAX_NLL_INCREASE,
+) -> Comparison:
+    """Paired comparison of :func:`score_llm` results (the candidate's with a
+    ``reference``): teacher forced on eager's continuations, the mean KL over the samples
+    and the worst sample's stay within ``max_kl`` / ``max_kl_worst`` and the share of
+    positions whose most likely token is eager's at or above ``min_top1``; free running,
+    the negative log-likelihood of the candidate's own continuations (under the candidate)
+    may exceed eager's of its own by at most ``max_nll_increase`` nats per token on average
+    (a broken decode loop writes text no model finds likely)."""
+    if len(reference) != len(candidate) or not reference:
+        return Comparison(
+            False,
+            {"samples": len(candidate), "reference_samples": len(reference)},
+            f"{len(candidate)} candidate samples for {len(reference)} eager samples",
+        )
+    if any(c.get("kl") is None for c in candidate):
+        return Comparison(False, {"samples": len(candidate)}, "not teacher forced on eager's")
+    kls = [float(c["kl"]) for c in candidate]
+    top1 = [float(c["top1"]) for c in candidate]
+    nll = [float(c["nll"]) - float(r["nll"]) for r, c in zip(reference, candidate, strict=True)]
+    worst = max(range(len(kls)), key=kls.__getitem__)
+    kl, agree, increase = statistics.fmean(kls), statistics.fmean(top1), statistics.fmean(nll)
+    metrics: dict[str, float | int | str] = {
+        "samples": len(candidate),
+        "kl": round(kl, 6),
+        "kl_worst": round(kls[worst], 6),
+        "worst_sample": worst,
+        "top1": round(agree, 4),
+        "top1_worst": round(min(top1), 4),
+        "nll_increase": round(increase, 4),
+        "nll_increase_worst": round(max(nll), 4),
+    }
+    problems = []
+    if kl > max_kl:
+        problems.append(f"mean KL {kl:.4f} > {max_kl:g}")
+    if kls[worst] > max_kl_worst:
+        problems.append(f"KL of sample {worst} {kls[worst]:.4f} > {max_kl_worst:g}")
+    if agree < min_top1:
+        problems.append(f"top-1 agreement {agree:.3f} < {min_top1:g}")
+    if increase > max_nll_increase:
+        problems.append(
+            f"own continuations {increase:+.3f} nats/token less likely than eager's "
+            f"(allowed +{max_nll_increase:g})"
+        )
+    return Comparison(not problems, metrics, "; ".join(problems))
+
+
 # ------------------------------------------------------------------ generate + score
 
 
@@ -370,7 +525,7 @@ def score(
 
 def _brief(options: dict[str, Any], scores: dict[str, Any]) -> dict[str, Any]:
     """One sample for ``baseline.json`` / the e2e metrics: scalar scores only."""
-    what = " ".join(str(options[k]) for k in ("language", "seed") if k in options)
+    what = " ".join(str(options[k]) for k in ("sample", "language", "seed") if k in options)
     return {"sample": what, **{k: v for k, v in scores.items() if isinstance(v, int | float | str)}}
 
 
@@ -456,6 +611,8 @@ def check(
         }
     try:
         generated, gen_s = generate(workload, [s["options"] for s in samples])
+        for g, s in zip(generated, samples, strict=True):  # paired scoring (LLM: forced on it)
+            g["reference"] = s["scores"]
         if before_scoring is not None:
             before_scoring()
         scores, score_s = score(workload, generated)
@@ -533,10 +690,11 @@ def summary_lines(baseline: dict[str, Any]) -> list[str]:
         "* **quality mode: near-lossless.** Numerics-changing optimisations (FP8 weights, "
         "...) are allowed when the perceptual quality stays within the noise of eager: "
         f"every candidate also generates {info.get('samples')} held-out samples (free "
-        "running, natural length, untimed), scored and compared paired with eager's "
-        f"(eager: {_fmt(info.get('mean'))}). Teacher forcing, the held-out input and the "
-        "stop check stay, with looser thresholds (a sanity floor that catches broken "
-        "kernels).",
+        "running, untimed), scored and compared paired with eager's (TTS: transcript error "
+        "rate, speaker similarity, MOS; LLM: teacher forced on eager's continuation, KL and "
+        "top-1 agreement per token, and the likelihood of its own continuation; eager: "
+        f"{_fmt(info.get('mean'))}). Teacher forcing, the held-out input and the stop check "
+        "stay, with looser thresholds (a sanity floor that catches broken kernels).",
     ]
 
 
@@ -544,7 +702,10 @@ def summary_text(result: dict[str, Any]) -> str:
     """One phrase for reports: the ``metrics.perceptual`` of an ``e2e`` run."""
     if result.get("skipped"):
         return f"perceptual gate skipped ({result['skipped']})"
-    keys = ("error_rate", "eager_error_rate", "speaker_similarity", "mos", "eager_mos")
+    keys = (
+        *("error_rate", "eager_error_rate", "speaker_similarity", "mos", "eager_mos"),
+        *("kl", "kl_worst", "top1", "nll_increase"),  # LLM: teacher forced (score_llm)
+    )
     found = {k: result[k] for k in keys if k in result}
     if not result.get("passed"):
         return f"perceptual gate FAILED: {result.get('reason')} ({_fmt(found)})"

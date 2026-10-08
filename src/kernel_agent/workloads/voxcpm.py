@@ -64,6 +64,14 @@ HOLDOUT_TEXT = (
 )
 #: Extra capture setting (``variants``): another LM prefill length, few patches.
 SHORT_TEXT = "Short sentences matter too."
+#: Diverse input set (``diverse_inputs``): texts of other kinds and languages, the main
+#: input's patches and seed.
+DIVERSE_TEXTS = {
+    "question": "Could you tell me how late the museum stays open on public holidays?",
+    "numbers": "Your booking code is four seven two nine; the train leaves from platform 11.",
+    "chinese": "今天下午三点，我们在图书馆门口见面，然后一起去看电影。",
+    "german": "Bitte schließen Sie alle Fenster, bevor Sie am Abend das Haus verlassen.",
+}
 #: Natural-length run (``natural_length_run``): VoxCPM2 stops it after about 30 patches
 #: (seed 0), with a clear stop logit margin at the stop and before it.
 NATURAL_TEXT = "When the sentence is finished, the speaker stops talking and waits for the reply."
@@ -172,6 +180,10 @@ class VoxCPMWorkload(Workload):
 
     def variants(self) -> list[dict[str, Any]]:
         return [{"text": SHORT_TEXT, "patches": min(int(self.options["patches"]), 8)}]
+
+    def diverse_inputs(self) -> dict[str, dict[str, Any]]:
+        """:data:`DIVERSE_TEXTS`: a question, numbers, Chinese, German; the same patches."""
+        return {label: {"text": text} for label, text in DIVERSE_TEXTS.items()}
 
     def natural_length_run(self, reference: Any = None) -> dict[str, Any]:
         """``natural_text`` with the stop head live (``min_len`` 2, ``max_len``

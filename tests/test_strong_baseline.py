@@ -367,17 +367,18 @@ def test_integrate_tries_reference_plus_kernels(tmp_path, monkeypatch):
     ref = data["reference"]
     assert ref["items"] == [item, strong_baseline.REFERENCE_LABEL]
     assert ref["verdict"] == "breaks" and "Graph break" in ref["error"]
-    assert calls[-1][:8] == [
+    assert calls[-1][:9] == [
         "--warmup",
         "2",
         "--iters",
         "5",
+        "--no-diverse",  # the diverse set is measured with the items, not here
         "--kernel",
         item,
         "--transform",
         str(strong_baseline.REFERENCE_TRANSFORM),
     ]
-    assert calls[-1][8:] == orch.truth.worker_args()  # verified baseline, like every e2e
+    assert calls[-1][9:] == orch.truth.worker_args()  # verified baseline, like every e2e
     assert "--baseline-ms" in calls[-1]
     assert len(calls) == 2  # the kernel alone, then reference optimisations + kernel
     assert any(e["event"] == "reference_combination" for e in ledger.events(orch.run))

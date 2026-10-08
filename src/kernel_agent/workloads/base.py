@@ -53,6 +53,15 @@ DTYPES = {
 }
 #: :func:`compare_stop`: a baseline stop logit margin this close to zero is a near-tie.
 STOP_NEAR_TIE = 0.5
+#: Version of the built-in workloads' inputs a new run records (``WorkloadSpec.inputs_version``):
+#: 2 = long non-repeating LLM prompts (#170). A ``run.json`` from before the field existed
+#: loads as 1 and keeps the inputs its baseline was recorded with.
+INPUTS_VERSION = 2
+#: Counters a generation loop reports per run (:meth:`Workload.report_stats`), summed over
+#: the run: ``steps`` (forward passes of the loop: decode steps and verifications),
+#: ``verifies`` (verifications of a draft), ``drafted`` (draft tokens proposed),
+#: ``accepted`` (draft tokens accepted) and ``tokens`` (tokens emitted). Others are kept too.
+DECODE_COUNTERS = ("steps", "verifies", "drafted", "accepted", "tokens")
 
 
 @dataclass
@@ -67,6 +76,9 @@ class WorkloadSpec:
     options: dict[str, Any] = field(default_factory=dict)
     #: Model family with a dedicated built-in workload (``hub.detect_family``).
     family: str | None = None
+    #: Which inputs the built-in workloads build (:data:`INPUTS_VERSION`); recorded in
+    #: ``run.json``, so a run keeps the inputs of its baseline when the defaults change.
+    inputs_version: int = INPUTS_VERSION
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -77,7 +89,8 @@ class WorkloadSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkloadSpec:
-        return cls(**data)
+        """A recorded spec; one from before ``inputs_version`` existed is version 1."""
+        return cls(**{"inputs_version": 1, **data})
 
 
 @dataclass
@@ -126,6 +139,8 @@ class Workload(ABC):
         self.options = {**self.defaults, **spec.options}
         #: ``(time.perf_counter(), audio ms)`` of every chunk since the last timed run.
         self.chunk_marks: list[tuple[float, float | None]] = []
+        #: Counters of the current run (:meth:`report_stats`), reset by every timed run.
+        self.run_stats: dict[str, float] = {}
 
     @property
     def device(self) -> torch.device:
@@ -205,6 +220,37 @@ class Workload(ABC):
         checked by the evaluator, not timed, not weighted. Keep them short (few
         decode steps); only calls with shapes the main run lacks are kept."""
         return []
+
+    def diverse_inputs(self) -> dict[str, dict[str, Any]]:
+        """The diverse input set (:mod:`kernel_agent.workloads.diverse`): option overrides
+        by label, plain JSON-able values, content of different styles, languages and
+        lengths (LLM: requests of 12 kinds at the end of the prompt; TTS: a few texts).
+        Keep the main input's shapes where the content allows (the same ``prompt_len``,
+        patches and seed): the set measures how a candidate's speedup depends on the
+        *data*, not on the shapes, and new shapes would recompile or recapture.
+
+        ``analyze`` times the baseline on every input (a warm-up and two timed runs) and
+        records it in ``baseline.json`` ``diverse``; ``e2e`` times every candidate that
+        passes its checks the same way and reports the per-input speedups (median, min,
+        max). A candidate whose speedup varies across the set beyond the noise, or whose
+        decode steps per token (:meth:`report_stats`) change with the input, is labelled
+        *data-dependent* (speculative decoding, early exit): reported, never rejected.
+        ``{}`` (the default): no diverse set."""
+        return {}
+
+    def report_stats(self, **counters: float) -> None:
+        """Add counters of the current run, e.g. one verification of a speculative decoding
+        loop: ``workload.report_stats(steps=1, verifies=1, drafted=k, accepted=a,
+        tokens=a + 1)`` (:data:`DECODE_COUNTERS`; a plain decode step:
+        ``report_stats(steps=1, tokens=1)``). Transforms call it from the loop they replace;
+        every timed run starts from zero. The medians over the timed runs land in
+        ``metric_detail.decode_stats`` with the acceptance rate, tokens per verification and
+        tokens per step (:func:`decode_stats`), and the reports show them. Steps per token
+        that change with the input label a candidate data-dependent
+        (:mod:`kernel_agent.workloads.diverse`)."""
+        stats = self.__dict__.setdefault("run_stats", {})
+        for key, value in counters.items():
+            stats[key] = stats.get(key, 0) + value
 
     def natural_length_run(self, reference: Any = None) -> dict[str, Any] | None:
         """Optional hook for autoregressive models that decide their own output length
@@ -385,10 +431,12 @@ class Workload(ABC):
 
     def perceptual_quality(self, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Scores of generated samples (``{"options", "output"}`` each: the overrides of
-        :meth:`perceptual_samples` and the output of :meth:`run` under them), one dict per
-        sample, plain data (TTS: transcript + error rate against the text, speaker
-        embedding, MOS; LLM: tokens + log-likelihood of held-out text). Load scoring models
-        here, lazily, and free them before returning."""
+        :meth:`perceptual_samples` and the output of :meth:`run` under them; in ``e2e`` also
+        ``reference``, the baseline's scores of the same sample), one dict per sample, plain
+        data (TTS: transcript + error rate against the text, speaker embedding, MOS; LLM:
+        teacher forced on the baseline's continuation, KL and top-1 agreement, and the
+        log-likelihood of its own continuation). Load scoring models here, lazily, and free
+        them before returning."""
         raise NotImplementedError(f"{type(self).__name__} has no perceptual gate")
 
     def compare_perceptual(
@@ -426,9 +474,11 @@ def synchronize() -> None:
 
 def timed_run(workload: Workload, inputs: Any) -> tuple[Any, float, dict[str, Any]]:
     """One GPU-synchronised run of ``workload.run``: ``(output, value of the workload's
-    metric in ms, its per-run details)`` (:meth:`Workload.metric_value`). The clock starts
+    metric in ms, its per-run details)`` (:meth:`Workload.metric_value`; with the counters
+    the run reported, :meth:`Workload.report_stats`, as ``decode_stats``). The clock starts
     before ``workload.run`` is called, so whatever a transform does around it counts."""
     workload.chunk_marks.clear()
+    workload.run_stats = {}
     with torch.inference_mode():
         synchronize()
         start = time.perf_counter()
@@ -436,14 +486,37 @@ def timed_run(workload: Workload, inputs: Any) -> tuple[Any, float, dict[str, An
         synchronize()
         end = time.perf_counter()
     ms, detail = workload.metric_value(start, end)
+    if workload.run_stats:
+        detail = {**detail, "decode_stats": dict(workload.run_stats)}
     return output, ms, detail
+
+
+def decode_stats(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The counters of a few runs (:meth:`Workload.report_stats`; one dict per run, ``{}``
+    where a run reported none) as their medians, plus ``acceptance_rate`` (accepted /
+    drafted), ``tokens_per_verify`` (the accepted drafts plus the model's own token of each
+    verification, per verification) and ``tokens_per_step``. None: no run reported any."""
+    runs = [r for r in runs if r]
+    if not runs:
+        return None
+    out: dict[str, Any] = objective.aggregate(runs)
+    num = {k: float(v) for k, v in out.items() if isinstance(v, int | float)}
+    if num.get("drafted"):
+        out["acceptance_rate"] = round(num.get("accepted", 0.0) / num["drafted"], 4)
+    if num.get("verifies"):
+        verifies = num["verifies"]
+        out["tokens_per_verify"] = round((num.get("accepted", 0.0) + verifies) / verifies, 3)
+    if num.get("steps") and num.get("tokens"):
+        out["tokens_per_step"] = round(num["tokens"] / num["steps"], 3)
+    return out
 
 
 def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3) -> dict[str, Any]:
     """The workload's metric over ``iters`` GPU-synchronised runs after ``warmup`` untimed
     ones, in milliseconds: the wall-clock latency of ``workload.run`` by default, the time
     to first audio for ``metric=ttfa`` (:mod:`kernel_agent.objective`). ``median_ms`` is
-    the optimiser's objective; other metrics add ``metric_detail`` (medians over the runs)."""
+    the optimiser's objective; other metrics add ``metric_detail`` (medians over the runs),
+    and so do counters the runs reported (``metric_detail.decode_stats``, :func:`decode_stats`)."""
     output = None
     if torch.cuda.is_available():
         # Same clock warm-up for baseline and optimised runs (fair comparison).
@@ -454,12 +527,13 @@ def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3)
         for _ in range(warmup):
             output = workload.run(inputs)
         synchronize()
-    times, details = [], []
+    times, details, counters = [], [], []
     for _ in range(iters):
         output, ms, detail = timed_run(workload, inputs)
         times.append(ms)
+        counters.append(detail.pop("decode_stats", {}))
         details.append(detail)
-    result = {
+    result: dict[str, Any] = {
         "median_ms": statistics.median(times),
         "min_ms": min(times),
         "times_ms": times,
@@ -471,6 +545,8 @@ def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3)
     }
     if workload.metric != objective.LATENCY:
         result["metric_detail"] = objective.aggregate(details)
+    if (stats := decode_stats(counters)) is not None:  # Workload.report_stats
+        result["metric_detail"] = {**result.get("metric_detail", {}), "decode_stats": stats}
     return result
 
 
@@ -511,10 +587,16 @@ def compare_tokens(
     *,
     min_prefix: int,
     min_cosine: float,
+    ref_margins: torch.Tensor | None = None,
+    near_tie: float = 0.0,
 ) -> Comparison:
     """Greedy-decoding comparison: first-step logits must agree and the first
     ``min_prefix`` generated tokens must be identical.  Later divergence is
-    tolerated because low-precision kernels legitimately flip near-ties."""
+    tolerated because low-precision kernels legitimately flip near-ties.
+
+    ``ref_margins`` (the baseline's top-1 minus top-2 logit of every step): an earlier
+    divergence passes too when it happens at a near-tie of the baseline (a margin at most
+    ``near_tie``), a choice that rounding flips; after it nothing more can be compared."""
     ref = ref_tokens.flatten().tolist()
     new = new_tokens.flatten().tolist()
     prefix = 0
@@ -530,6 +612,14 @@ def compare_tokens(
     }
     passed = prefix >= min(min_prefix, len(ref))
     reason = "" if passed else f"tokens diverge at position {prefix}"
+    margins = ref_margins.flatten() if ref_margins is not None else None
+    if not passed and margins is not None and prefix < min(len(ref), margins.numel()):
+        margin = float(margins[prefix])
+        metrics["divergence_margin"] = round(margin, 4)
+        reason += f" (baseline top-2 logit margin {margin:.3f} there)"
+        if margin <= near_tie and len(new) >= len(ref):
+            passed, reason = True, ""
+            metrics["tolerated"] = f"a near-tie of the baseline (margin <= {near_tie:g})"
     if ref_logits is not None and new_logits is not None:
         cos = cosine(ref_logits, new_logits)
         metrics["first_logits_cosine"] = round(cos, 6)

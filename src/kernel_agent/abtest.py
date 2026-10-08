@@ -47,11 +47,12 @@ _OOM = re.compile(
     r"OutOfMemoryError|CUDA out of memory|CUDA error: out of memory|CUBLAS_STATUS_ALLOC_FAILED"
 )
 #: The checks of an ``e2e`` verdict that catch their own errors, a failed run being their
-#: verdict (``metrics.<key>``: workloads/holdout.py, stopping.py, perceptual.py). Out of GPU
-#: memory in one is no verdict either: the step is ``oom`` (#137).
+#: verdict (``metrics.<key>``: workloads/holdout.py, stopping.py, diverse.py, perceptual.py).
+#: Out of GPU memory in one is no verdict either: the step is ``oom`` (#137).
 CHECKS = {
     "holdout": "the held-out input",
     "natural_length": "the natural-length run",
+    "diverse": "the diverse input set",
     "perceptual": "the perceptual gate",
 }
 
