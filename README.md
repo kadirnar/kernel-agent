@@ -25,7 +25,7 @@ backends on sm_120](docs/RESEARCH-TRITON.md) · [parallelisation: measured
 overlap opportunities and design](docs/PARALLEL.md) · [FP8 on sm_120: blockwise /
 MXFP8, fused FP8 activations, FP8 attention, scales, host cost](docs/FP8.md) ·
 [native engines: multi-file CUDA projects and the systems-native agent](docs/NATIVE.md) ·
-[references: what was taken from which project or paper](docs/REFERENCES.md).
+[multi-agent architecture](docs/MULTIAGENT.md) · [references: what was taken from which project or paper](docs/REFERENCES.md).
 
 ## How it works
 
