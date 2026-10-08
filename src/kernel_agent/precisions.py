@@ -20,6 +20,11 @@ phase and the improve scheduler (such a target gets no session, its arm stops), 
 integration (its kernels are skipped; the reason is in ``integration.json`` → ``skipped``
 and ``report.md``) and the ceilings table (only the allowed floors are shown and drive the
 expected gains).
+
+The GPU decides too (issue #165): a precision whose math needs tensor cores the GPU lacks
+(:data:`kernel_agent.gpu_arch.PRECISION_NEEDS`: ``fp8_w8a8`` sm_89+, ``fp8_mx`` sm_100+) is
+not allowed on it (:func:`allowed` and :func:`refusal` with the GPU's ``capability``;
+:func:`unsupported` says why); a run records the list its GPU allows in ``run.json``.
 """
 
 from __future__ import annotations
@@ -87,20 +92,43 @@ def check(quality: str | None, requested: Iterable[str] | None) -> str | None:
     return None
 
 
-def allowed(quality: str | None, precisions: Iterable[str] | None = None) -> tuple[str, ...]:
+def allowed(
+    quality: str | None,
+    precisions: Iterable[str] | None = None,
+    capability: tuple[int, ...] | None = None,
+) -> tuple[str, ...]:
     """The precisions a run allows: ``precisions`` (its ``--precisions``; None: the
-    :func:`default` of ``quality``), never a reduced one outside ``near-lossless``."""
-    if precisions is None:
-        return default(quality)
-    try:
-        wanted = set(parse(precisions))
-    except ValueError:  # an edited run.json: what the quality mode allows by default
-        return default(quality)
+    :func:`default` of ``quality``), never a reduced one outside ``near-lossless``, nor
+    one a GPU of ``capability`` cannot run (None: no GPU check)."""
     from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER
 
-    return tuple(
-        p for p in names() if p in wanted and (quality == NEAR_LOSSLESS_TIER or p == "exact")
-    )
+    found = default(quality)
+    if precisions is not None:
+        try:
+            wanted = set(parse(precisions))
+        except ValueError:  # an edited run.json: what the quality mode allows by default
+            wanted = set(found)
+        found = tuple(
+            p for p in names() if p in wanted and (quality == NEAR_LOSSLESS_TIER or p == "exact")
+        )
+    return tuple(p for p in found if unsupported(p, capability) is None)
+
+
+def unsupported(precision: str | None, capability: tuple[int, ...] | None) -> str | None:
+    """Why a GPU of ``capability`` cannot run target ``precision`` (None: it can, or no
+    capability is known; :func:`kernel_agent.gpu_arch.precision_unsupported`)."""
+    from kernel_agent.gpu_arch import precision_unsupported
+
+    return precision_unsupported(precision, capability)
+
+
+def gpu_refused(
+    quality: str | None, precisions: Iterable[str] | None, capability: tuple[int, ...] | None
+) -> dict[str, str]:
+    """The precisions ``--precisions`` (None: the quality mode's default) would allow that a
+    GPU of ``capability`` cannot run, each with the reason."""
+    found = {p: unsupported(p, capability) for p in allowed(quality, precisions)}
+    return {p: why for p, why in found.items() if why is not None}
 
 
 def of_config(config: Mapping[str, Any] | None) -> tuple[str, ...]:
@@ -124,11 +152,15 @@ def reduced(allowed: Iterable[str]) -> list[str]:
     return [p for p in allowed if p != "exact"]
 
 
-def refusal(precision: str | None, allowed: Iterable[str]) -> str | None:
+def refusal(
+    precision: str | None, allowed: Iterable[str], capability: tuple[int, ...] | None = None
+) -> str | None:
     """Why a target at ``precision`` (None: ``exact``) is refused in a run that allows
-    ``allowed``, or None."""
+    ``allowed`` on a GPU of ``capability`` (None: no GPU check), or None."""
     allowed = tuple(allowed)
     name = str(precision or "exact")
+    if (why := unsupported(name, capability)) is not None:
+        return f"precision {name!r} cannot run on this GPU: {why}"
     if name in allowed:
         return None
     opt_in = " (4-bit precisions are opt-in)" if name in FOUR_BIT else ""
@@ -150,11 +182,16 @@ def tier_allowed(tier: str | None, allowed: Iterable[str]) -> bool:
     return tier == EXACT_TIER or tier in {tier_for(NEAR_LOSSLESS_TIER, p) for p in allowed}
 
 
-def describe(allowed: Iterable[str]) -> str:
-    """``exact, fp8_weights, fp8_w8a8, reduced (4-bit not allowed: fp4_weights)``."""
+def describe(allowed: Iterable[str], capability: tuple[int, ...] | None = None) -> str:
+    """``exact, fp8_weights, fp8_w8a8, reduced (4-bit not allowed: fp4_weights)``; with a
+    GPU's ``capability``, also the precisions it cannot run (``; not on sm_86: fp8_w8a8``)."""
+    from kernel_agent.gpu_arch import PRECISION_NEEDS, arch_of
+
     allowed = tuple(allowed)
     text = ", ".join(allowed)
     missing = [p for p in FOUR_BIT if p not in allowed]
-    return text + (
-        f" (4-bit not allowed: {', '.join(missing)})" if missing and reduced(allowed) else ""
-    )
+    text += f" (4-bit not allowed: {', '.join(missing)})" if missing and reduced(allowed) else ""
+    gpu = [p for p in PRECISION_NEEDS if unsupported(p, capability) is not None]
+    if gpu and capability is not None and reduced(allowed):
+        text += f"; not on {arch_of(capability)}: {', '.join(gpu)}"
+    return text

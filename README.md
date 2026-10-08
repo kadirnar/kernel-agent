@@ -518,7 +518,7 @@ mode:
   e4m3 codes upcast in registers). Both pass the evaluator in the
   near-lossless tier and fail the exact tier (relative L2 ~0.026 > 0.02, ~20 %
   of the elements outside the bf16 tolerance); `doctor --smoke` checks both
-  on sm_89+ GPUs.
+  on sm_80+ GPUs (below sm_89 the e4m3 codes are converted in software).
 * **Speed of light.** For a `fp8_weights` target the 2-D weights count at one
   byte per element plus 4 bytes of scale per output channel, so `pct_of_sol`
   measures the FP8 kernel against the bytes it must stream. For a `fp8_w8a8`
@@ -745,7 +745,7 @@ from the measured research code, not yet run on a GPU (`doctor --smoke` and
   per-token (or `fp8_mx`'s MXFP8) scales in their epilogue (+0.1 us instead of +1.3 us
   for a separate pass), and a gated MLP whose SiLU-mul feeds `down_proj` in e4m3.
 * `examples/triton_fp8_w8a8_gemm.py` now multiplies with `tl.dot_scaled` and unit
-  ue8m0 scales on sm_100+ / sm_120 (the block-scaled MMA, `QMMA.SF`: 416 vs 208
+  ue8m0 scales on sm_120 / sm_121 (the block-scaled MMA, `QMMA.SF`: 416 vs 208
   TFLOP/s for `tl.dot`'s `QMMA.F32`; bit-identical); `doctor --smoke` compiles it and
   requires `block_scale` in its PTX.
 * **`fp8_kv`** (opt-in precision, near-lossless tier): the KV cache in e4m3 with one
@@ -1604,7 +1604,9 @@ precision or another algorithm moves.
   `kernel_agent/kernels/mma_peaks.py`): a register-only `mma.sync` loop per
   instruction compiled with NVRTC, bf16 `HMMA.F32`, plain e4m3 `QMMA.F32`, the
   block-scaled `QMMA.SF` (`kind::mxf8f6f4.block_scale`, sm_120a) and e4m3 with fp16
-  accumulation (on the RTX 5070 Ti 104 / 208 / 416 / 416 TFLOP/s,
+  accumulation; an instruction the GPU lacks is listed with the reason (e4m3
+  `mma.sync` is not measured on sm_90 / sm_100, where it is emulated through fp16
+  and `wgmma` / `tcgen05` reach the FP8 peak) (on the RTX 5070 Ti 104 / 208 / 416 / 416 TFLOP/s,
   docs/RESEARCH-TRITON.md §1.1: a hand-written kernel on `QMMA.F32` is capped at
   208, below cuBLASLt's 333). `kernel-agent doctor` measures and prints them
   (`--remeasure-peaks` measures again); a cache from before the FP8 / FP4 peaks
@@ -2574,6 +2576,69 @@ problems 1, 19 and 36 takes 27 s. The sizes are scaled to N 1024, ReLU
 and runs at 0.71× eager and 0.84× torch.compile, because the dry run's adapter
 copies the features to the last dimension first.
 
+### Any NVIDIA GPU
+
+kernel-agent runs on whatever NVIDIA GPU torch sees: Turing, Ampere, Ada, Hopper,
+datacenter and GeForce Blackwell. Nothing assumes the RTX 5070 Ti (sm_120) it was
+developed on; what differs per architecture is decided from what is detected and
+measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
+
+| family | archs | what reaches the tensor-core peak | FP8 math | block-scaled (MXFP8) | copies / launches |
+|---|---|---|---|---|---|
+| Turing / Volta | sm_75 (sm_70) | `mma.sync` fp16 (Triton `tl.dot` runs on FMA units) | no | no | — |
+| Ampere | sm_80, sm_86, sm_87 | `mma.sync` bf16 / fp16 | no (weight-only FP8 / FP4 in software) | no | `cp.async` |
+| Ada | sm_89 | `mma.sync`, e4m3 QMMA | yes | no | `cp.async` |
+| Hopper | sm_90 | `wgmma` (e4m3 `mma.sync` is emulated) | yes | no | TMA, clusters, PDL |
+| Blackwell (datacenter) | sm_100, sm_103 | `tcgen05.mma` + TMEM | yes | yes | TMA multicast, clusters, PDL |
+| Blackwell (GeForce / RTX PRO) | sm_120, sm_121 | `mma.sync`; FP8 via block-scaled `QMMA.SF` | yes (fp32-acc at half rate on GeForce) | yes | TMA (no multicast), clusters, PDL |
+
+* **Detected and measured.** `toolchain.GPUInfo` has the name, compute capability, SMs,
+  memory, L2 and shared memory per block / per SM; the peaks the copy bandwidth, matmul
+  TFLOP/s per dtype, launch floor and `mma.sync` instruction rates. `kernel-agent
+  doctor`, `toolchain.json` and every agent prompt carry them with the family, what
+  reaches the peak there, the precisions the GPU cannot run and the bf16 ridge
+  (`GPU ... smem per block`, `arch: ...`, `tensor cores: ...`, `precisions this GPU
+  cannot run: ...`, `bf16 ridge: ...`).
+* **Precisions by GPU.** `fp8_w8a8` needs FP8 tensor cores (sm_89+) and `fp8_mx`
+  block-scaled ones (sm_100+); weight-only `fp8_weights` / `fp4_weights` and the
+  `fp8_kv` cache run everywhere (dequantised in registers; below sm_89 the e4m3
+  conversion is CUDA's software routine and Triton has no e4m3 type, as vLLM runs FP8
+  checkpoints weight-only on Ampere). A run records in `run.json` only the precisions
+  its GPU can run (each refused one is logged with the reason, also when
+  `--precisions` names it); the planner's precision policy says why, the plan schema
+  offers only the rest, a target at another one is refused (`precision 'fp8_mx' cannot
+  run on this GPU: needs block-scaled FP8 tensor cores ...`), the ceilings table omits
+  W8A8 before sm_89 and MXFP8 / W4A4 before sm_100 (`gpu_hidden`), and `report.md`
+  names them.
+* **Backend policy by GPU.** The compute-bound FP8 GEMM row follows the family (plain
+  e4m3 `mma.sync` on Ada, `wgmma` on Hopper, `tcgen05.mma` on datacenter Blackwell,
+  the block-scaled `QMMA.SF` on GeForce Blackwell with this GPU's measured
+  `QMMA.F32` / `QMMA.SF` rates, the half-rate rule dropped where both measure the
+  same); a class whose precision the GPU cannot run is left out; each family adds what
+  it needs for the peak (`backends.ARCH_POLICY`, `ARCH_RULES`). The other rows keep
+  their evidence, labelled as measured on the RTX 5070 Ti. The ceilings table's *FP8
+  MMA* column appears only where two FP8 `mma.sync` forms exist (sm_12x); the
+  `mma.sync` e4m3 rates are not measured on sm_90 / sm_100, where they are emulated.
+* **Knowledge per GPU.** `knowledge/gpus.md` has one section per family (what is fast,
+  what to avoid, shared memory, FP8 accumulation, sources: CUDA Programming Guide, PTX
+  ISA target notes, tuning guides, cuBLAS scale modes, Triton's lowering, CUTLASS,
+  papers); every prompt gets its GPU's section under "# This GPU", with the note that
+  numbers measured on another GPU are evidence from that GPU. The RTX 5070 Ti
+  measurements in the other guides stay, labelled with the GPU.
+* **Examples and doctor.** Every architecture-dependent example declares `ARCHS`
+  (`"sm_89+"`, `"sm_12x"`, ...) and `ARCHS_WHY`; `doctor --smoke` runs those this GPU
+  supports and lists the rest (`skipped here (...): triton_fp8_w8a8_gemm needs
+  sm_89+ (e4m3 tensor cores ...); this GPU is sm_86`). The doctor probes skip what the
+  GPU lacks (the block-scaled `tl.dot_scaled` lowering outside sm_12x, TMA and PDL before sm_90) and
+  the CuTe DSL check names the family's peak MMA.
+* **Builds.** `load_inline` compiles for the GPU's arch (`TORCH_CUDA_ARCH_LIST`, unless
+  set); on Hopper and datacenter Blackwell for the arch-specific target (`9.0a`,
+  `10.0a`), where `wgmma` / `tcgen05` and CUTLASS's sm_90 / sm_100 kernels live.
+* **Tested** on the CPU with faked GPUs (sm_80, sm_86, sm_89, sm_90, sm_100, sm_120:
+  `tests/test_gpu_arch.py`) and run on an RTX 5070 Ti. The CUDA weight-only examples
+  were compiled for sm_80 / 86 / 89 / 90 / 100 / 120 on the CPU; on other GPUs nothing
+  has run yet: `kernel-agent doctor --smoke` is the first check there.
+
 ### GPUs and the GPU lock
 
 Every evaluation, worker command (`analyze`, `capture`, `e2e`) and peak
@@ -2739,7 +2804,7 @@ There are verified example kernels for every backend in
 playbook in `src/kernel_agent/agent/knowledge/`. Both are fed to the agents.
 The FP8 weight-only examples (`cuda_fp8_gemv.py`, `cuda_fp8_skinny_gemm.py`)
 and `low_precision.md` go to the engineer of an `fp8_weights` target (see
-"Low-precision weights"); `doctor --smoke` also runs them (sm_89+), in the
+"Low-precision weights"); `doctor --smoke` also runs them (sm_80+), in the
 near-lossless tier and against the exact tier, which must reject them. The FP4
 example (`cuda_fp4_gemv.py`) goes to an `fp4_weights` target; the smoke test
 runs it in the near-lossless-fp4 tier and against the FP8 tier, which must
@@ -2781,10 +2846,12 @@ decoder layer, bf16 GEMM, norm / glue) with the first and second backend of
 each and the measured evidence (docs/RESEARCH-TRITON.md §5.1), and each engineer
 gets its target's row (`kernel_agent/backends.py`). Classes are read from the
 module family, the rows `M` of the dominant captured case, the sequence length
-and the precision, never from a model's module names. On sm_120 a compute-bound
-FP8 GEMM goes to the block-scaled MMA (`QMMA.SF`, 416 TFLOP/s on an RTX 5070 Ti)
-and never to plain e4m3 `mma.sync` (`QMMA.F32`, Triton `tl.dot`, row-wise
-`_scaled_mm`: half rate). `report.md` ("Backends") and `status` show the run's
+and the precision, never from a model's module names. The rows follow the GPU
+("Any NVIDIA GPU" below): on sm_120 a compute-bound FP8 GEMM goes to the
+block-scaled MMA (`QMMA.SF`, 416 TFLOP/s on an RTX 5070 Ti) and never to plain
+e4m3 `mma.sync` (`QMMA.F32`, Triton `tl.dot`, row-wise `_scaled_mm`: half rate);
+on sm_89 to plain e4m3 `mma.sync` (its only FP8 instruction), on sm_90 to
+`wgmma`, on sm_100 to `tcgen05.mma`. `report.md` ("Backends") and `status` show the run's
 evaluations per backend, classified from each snapshot's source (what it runs:
 `@triton.jit`, `load_inline`, `T.prim_func`, `cutlass.cute`; a CUDA kernel that
 imports `tilelang` only for its CUTLASS headers counts as CUDA), and per target

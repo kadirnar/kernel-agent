@@ -24,7 +24,7 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html — PDL: overlap a kernel's prologue with the previous kernel.
 * https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html — CUDA graphs: capture, update, launch cost.
 * https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html — L2 persistence / access policy windows.
-* https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html — per-architecture limits (sm_120: smem, registers, features).
+* https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html — per-architecture limits (smem, registers, features); `gpus.md` lists the per-architecture sources (tuning guides, PTX target notes, cuBLAS scale modes per compute capability).
 * https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html — coalescing, occupancy, memory optimisations.
 * https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html — Blackwell tuning (L2, smem, tensor cores).
 * https://docs.nvidia.com/cuda/parallel-thread-execution/index.html — PTX ISA (only up to §9.7.9 via WebFetch; see above).
@@ -49,6 +49,8 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://github.com/NVIDIA/cutlass/blob/main/examples/94_ada_fp8_blockwise/ada_fp8_blockwise.cu — sm_89-class (mma.sync) FP8 blockwise GEMM.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/blackwell_geforce/kernel — CuTe DSL sm_120 kernels: `dense_gemm`, `blockscaled_gemm`.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/ampere — CuTe DSL mma.sync kernels (`dense_gemm`, `attention`, `elementwise`) and a tutorial.
+* https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/hopper/kernel — CuTe DSL sm_90 kernels: warpgroup MMA (wgmma), TMA, warp specialisation.
+* https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/blackwell — CuTe DSL sm_100 kernels: tcgen05 / TMEM, persistent and block-scaled GEMMs.
 * https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html — CuTe DSL documentation.
 * https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_warp.html — CuTe DSL warp MMA ops: `MmaFP8Op` (sm_89+), `MmaMXF8Op` / `MmaMXF8F6F4Op` / `MmaMXF4NVF4Op` (sm_120a).
 * https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/guides/tvm_ffi_compilation.html — CuTe DSL with TVM-FFI: lower host overhead per launch.

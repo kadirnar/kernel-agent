@@ -34,6 +34,8 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   ``ceilings.json`` has every floor; the markdown shows the ``columns`` of the precisions
   the run allows (``--precisions``, :mod:`kernel_agent.precisions`: exact; near-lossless
   FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with 4-bit allowed), and only they rank a row.
+  A column whose tensor cores the peaks' GPU lacks (W8A8 before sm_89, MXFP8 and W4A4
+  before sm_100: :data:`kernel_agent.gpu_arch.COLUMN_NEEDS`) is never shown (``gpu_hidden``).
 * **bound**: the term that sets the exact floor (``compute``, ``memory`` or ``launch``).
 * **FP8 instruction** (``fp8_mma``, with the tensor-core instruction rates measured,
   :mod:`kernel_agent.kernels.mma_peaks`): the W8A8 floor assumes the FP8 GEMM peak, which
@@ -42,7 +44,9 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   ``tl.dot``, DeepSeek-style blockwise) runs at half of it. ``needs`` is ``QMMA.SF`` (the
   block-scaled instruction: Triton ``tl.dot_scaled``, MXFP8) when the row's W8A8 floor at
   the ``QMMA.F32`` rate is compute bound and above the W8A8 floor (``f32_floor_ms``), else
-  ``any``.
+  ``any``. Only where both FP8 ``mma.sync`` forms were measured (GeForce Blackwell): Ada
+  has one FP8 instruction, Hopper / datacenter Blackwell reach the FP8 peak with ``wgmma``
+  / ``tcgen05`` (``gpu_arch.py``).
 * **now**: hooked inclusive ms scaled to the unhooked run (× baseline / hooked wall
   ms); **saves** = now − floor. Rows rank by the exact one; a row already below its exact
   floor (an optimised model that runs it at a lower precision) by its best lower-precision
@@ -260,10 +264,12 @@ F32_MARGIN = 1.05
 def fp8_instruction(row: Mapping[str, Any], peaks: Mapping[str, Any]) -> dict[str, Any] | None:
     """Which FP8 tensor-core instruction a W8A8 kernel for ``row`` needs to reach its floor
     (module docstring); None without the instruction rates or the FP8 peak."""
-    rate = ((peaks.get("mma_tflops") or {}) if peaks else {}).get(FP8_F32)
+    mma = (peaks.get("mma_tflops") or {}) if peaks else {}
+    rate = mma.get(FP8_F32)
     w8a8 = floor(row, PRECISIONS["w8a8"], peaks)
-    if not rate or w8a8 is None:
-        return None
+    if not rate or not mma.get(FP8_SF) or w8a8 is None:
+        return None  # one FP8 instruction only (sm_89), or wgmma / tcgen05 (#165): no choice
+
     capped = {**peaks, "tflops": {**(peaks.get("tflops") or {}), FP8: rate}}
     f32 = floor(row, PRECISIONS["w8a8"], capped)
     if f32 is None:
@@ -283,8 +289,13 @@ def build(
 ) -> dict[str, Any]:
     """The ceilings table of a profile (``baseline_ms``: the profiled window, unhooked).
     ``allowed``: the target precisions the run allows (``precisions.py``; None: every one):
-    its ``columns`` (every floor is in ``floors``; only these are shown and rank a row)."""
-    shown = columns(allowed)
+    its ``columns`` (every floor is in ``floors``; only these are shown and rank a row),
+    without the columns the peaks' GPU cannot run (``gpu_hidden``, #165)."""
+    from kernel_agent.gpu_arch import capability_of, column_unsupported
+
+    cap = capability_of(str((peaks or {}).get("arch") or ""))
+    gpu_hidden = {c: why for c in PRECISIONS if (why := column_unsupported(c, cap)) is not None}
+    shown = [c for c in columns(allowed) if c not in gpu_hidden]
     hooked = float(profile.get("hooked_wall_ms") or 0.0)
     scale = baseline_ms / hooked if hooked > 0 and baseline_ms > 0 else 1.0
     usable = bool(peaks and peaks.get("dram_gbps"))
@@ -351,6 +362,7 @@ def build(
         },
         "precisions": precisions,
         "columns": shown,
+        "gpu_hidden": gpu_hidden,
         "rows": rows,
         "e2e": {name: _e2e(rows, name, baseline_ms) for name in PRECISIONS} if usable else {},
         "unknown_work": [r["target"] for r in rows if not r["work_known"]],
@@ -490,7 +502,8 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
     precisions = table["precisions"]
     # the run's allowed precisions (build(allowed=...)); a table from before #131: every one
     cols = [c for c in table.get("columns") or list(PRECISIONS) if c in precisions]
-    hidden = [precisions[c]["label"] for c in precisions if c not in cols]
+    gpu_hidden = table.get("gpu_hidden") or {}  # tensor cores this GPU lacks (#165)
+    hidden = [precisions[c]["label"] for c in precisions if c not in cols and c not in gpu_hidden]
     shown = [r for r in table["rows"] if r["share"] >= min_share][:top]
     kv = any(r.get("kv_bytes") for r in shown)
     mma = (peaks or {}).get("mma_tflops") or {}
@@ -520,6 +533,11 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
                 f" (not shown: {', '.join(hidden)}, precisions this run does not allow, "
                 "`--precisions`)"
             )
+        if gpu_hidden:
+            legend[-1] += " (not on this GPU: " + "; ".join(
+                f"{precisions[c]['label']}, {why}" for c, why in gpu_hidden.items()
+            )
+            legend[-1] += ")"
         lines += [
             "What each module class could reach if its kernels ran at this GPU's roofline, "
             "at the shapes and call counts of this profile (every row: `profile/ceilings.json`). "

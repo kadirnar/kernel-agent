@@ -93,8 +93,11 @@ a power-of-two (e8m0) scale per 32.
   before the cast (`quantize_fp8` does). Merged weights (gate + up concatenated,
   QKV) keep their per-row scales: merge before quantising or after, the same.
 
-## Dequantise in registers (sm_89+, CUDA)
+## Dequantise in registers (CUDA; hardware conversion from sm_89)
 
+* Weight-only formats run on every GPU (the prompt's "This GPU" section says what yours
+  has): below sm_89 there is no FP8 hardware, the conversion below compiles to a software
+  routine and the bf16 math is unchanged (vLLM runs FP8 checkpoints on Ampere this way).
 * 128-bit loads = 16 e4m3 codes; stream them past L1 (`ld.global.nc.L1::no_allocate`).
 * `__nv_cvt_fp8x2_to_halfraw2(v, __NV_E4M3)` (`cuda_fp8.h`) converts two codes to
   `f16x2` exactly (the low byte is `.x`); `__half22float2` -> fp32 for FMA
@@ -110,8 +113,9 @@ a power-of-two (e8m0) scale per 32.
   consecutive k; mma j uses k 16t + 4j .. 16t + 4j + 3 of A and B). Several channel
   tiles per block divide the activation traffic from L2; split k across warps
   and reduce through shared memory.
-* Triton: load the codes from a `torch.float8_e4m3fn` tensor (`tl.float8e4nv`)
-  and `w.to(tl.bfloat16)` before `tl.dot(x, w, acc)` (verified on sm_120;
+* Triton (sm_89+: Triton has no e4m3 type below; there, load `uint8` codes and build
+  the bf16 bits with integer ops): load the codes from a `torch.float8_e4m3fn` tensor
+  (`tl.float8e4nv`) and `w.to(tl.bfloat16)` before `tl.dot(x, w, acc)` (verified on sm_120;
   [22, 1024] x [1024, 4096] in 5.6 us with a warm L2). Triton's host overhead
   (an eager call took ~30 us here, the CUDA examples ~19 us) dominates decode
   calls; under CUDA graphs it does not matter.
@@ -298,10 +302,13 @@ torch ops on an fp32 output the scales cost more than they save (gate|up
 rounding, 2^-9, next to FP8's ~3 %). Plain e4m3 `tl.dot` (~55 % of the FP8 peak)
 runs on `QMMA.F32`, capped at 208 TFLOP/s; `tl.dot_scaled` with unit ue8m0 scales
 (127) runs on `QMMA.SF` (416), bit-identical and 4-16 % faster at M = 352
-(docs/RESEARCH-TRITON.md §1.2). The example's GEMM uses `tl.dot_scaled` on sm_100+ /
-sm_120 (constant `tl.full((BM, BK // 32), 127, tl.uint8)` scales, row / column scales
-in the epilogue) and `tl.dot` on sm_89 / sm_90, where Triton would emulate the
-block-scaled form through bf16; check the lowering once per Triton version: the
+(docs/RESEARCH-TRITON.md §1.2). The example's GEMM uses `tl.dot_scaled` on sm_120 /
+sm_121 (constant `tl.full((BM, BK // 32), 127, tl.uint8)` scales, row / column scales
+in the epilogue) and `tl.dot` elsewhere: on sm_89 / sm_90 Triton would emulate the
+block-scaled form through bf16, and on sm_100 plain `tl.dot` on e4m3 is already
+full-rate `tcgen05.mma kind::f8f6f4` while `tl.dot_scaled` at 64-row tiles falls back to
+`kind::f16` (128-row tiles reach `kind::mxf8f6f4.block_scale`; Triton 3.8, compiled for
+sm_100 without a GPU); check the lowering once per Triton version: the
 compiled kernel's PTX must contain `mma ... kind::mxf8f6f4.block_scale`
 (`gemm_ptx(capability)` + `block_scale_mma(ptx)` in the example; compiling needs no
 GPU).

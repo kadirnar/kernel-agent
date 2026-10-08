@@ -5,7 +5,8 @@ and says whether it works here and how:
 
 * ``dot_scaled``: Triton lowers ``tl.dot_scaled`` (e4m3, ue8m0 scales) to the
   block-scaled ``mma ... block_scale`` (SASS ``QMMA.SF``), the full-rate FP8 instruction
-  on sm_120 (docs/RESEARCH-TRITON.md §1.1); a plain ``tl.dot`` on e4m3 runs at half rate.
+  on sm_120 (docs/RESEARCH-TRITON.md §1.1; a plain ``tl.dot`` on e4m3 runs at half rate
+  there; elsewhere plain e4m3 is the full-rate path).
 * ``tma``: Triton host TMA descriptors (``TensorDescriptor``) compile to
   ``cp.async.bulk.tensor`` and copy a tile correctly.
 * ``pdl``: a programmatic dependent launch (``griddepcontrol``; ``cuda.core``
@@ -17,7 +18,9 @@ and says whether it works here and how:
 :func:`run` records the results with :func:`versions` in
 ``<cache>/probes-<gpu>-torch<version>.json``. A probe that fails says why; none of them
 fails ``doctor``. Written for #146 and not yet run on a GPU (``kernel-agent doctor`` runs
-them).
+them). A probe whose feature the GPU lacks (:data:`ARCHS`: the block-scaled
+``tl.dot_scaled`` outside sm_12x, TMA and PDL before sm_90) is skipped with the reason,
+not failed (#165).
 """
 
 from __future__ import annotations
@@ -111,13 +114,17 @@ def probe_dot_scaled() -> Probe:
     )
     ptx = str(kernel.asm.get("ptx", ""))
     sass = _sass(kernel.asm["cubin"]) if "cubin" in kernel.asm else ""
-    ops = sorted(set(re.findall(r"\b(QMMA[.A-Z0-9_]*|HMMA[.A-Z0-9_]*|OMMA[.A-Z0-9_]*)", sass)))
+    ops = sorted(set(re.findall(r"\b((?:UTC)?[QHO]MMA[.A-Z0-9_]*|UTC\w*MMA[.A-Z0-9_]*)", sass)))
     block_scale = "block_scale" in ptx
-    full_rate = block_scale and (not sass or any(op.startswith("QMMA.SF") for op in ops))
+    # sm_12x: the block-scaled mma.sync is SASS QMMA.SF; sm_100: tcgen05.mma ... block_scale
+    geforce = torch.cuda.get_device_capability()[0] == 12
+    sf = any(op.startswith("QMMA.SF") for op in ops)
+    full_rate = block_scale and (not sass or not geforce or sf)
     detail = (
-        "tl.dot_scaled lowers to mma.sync ... block_scale"
+        "tl.dot_scaled lowers to a block_scale MMA"
         if block_scale
-        else "tl.dot_scaled does NOT lower to a block_scale mma (half-rate FP8 on sm_120)"
+        else "tl.dot_scaled does NOT lower to a block_scale MMA (Triton emulates it through "
+        "bf16: half-rate FP8 on sm_120)"
     )
     if ops:
         detail += f" (SASS {', '.join(ops[:3])})"
@@ -229,15 +236,38 @@ PROBES: dict[str, Callable[[], Probe]] = {
 }
 #: The package each probe needs (skipped without it).
 NEEDS = {"dot_scaled": "triton", "tma": "triton", "pdl": "cuda.core", "green_contexts": "torch"}
+#: The GPUs each probe's feature exists on (``gpu_arch.supports``) and what it is: skipped
+#: elsewhere with the reason, never reported as a failure (#165).
+ARCHS = {
+    "dot_scaled": ("sm_12x", "block-scaled mma.sync; plain e4m3 tl.dot is full rate elsewhere"),
+    "tma": ("sm_90+", "TMA (cp.async.bulk.tensor)"),
+    "pdl": ("sm_90+", "griddepcontrol"),
+}
 
 
-def run(gpu: bool, probes: dict[str, Callable[[], Probe]] | None = None) -> dict[str, Any]:
-    """Every probe (skipped without a GPU or its package), with :func:`versions`; written to
-    the cache next to the peaks."""
+def run(
+    gpu: bool,
+    probes: dict[str, Callable[[], Probe]] | None = None,
+    capability: tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    """Every probe (skipped without a GPU, its package, or on a GPU without its feature:
+    :data:`ARCHS`; ``capability`` None: this machine's GPU), with :func:`versions`; written
+    to the cache next to the peaks."""
+    from kernel_agent.gpu_arch import arch_of, supports
+
+    if gpu and capability is None:
+        found_gpu = getattr(toolchain.setup(), "gpu", None)
+        capability = tuple(found_gpu.capability) if found_gpu is not None else None
     found: list[Probe] = []
     for name, probe in (PROBES if probes is None else probes).items():
         if not gpu:
             found.append(Probe(name, None, "no CUDA GPU"))
+            continue
+        spec, what = ARCHS.get(name, (None, ""))
+        if capability is not None and not supports(spec, capability):
+            found.append(
+                Probe(name, None, f"needs {spec} ({what}), this GPU is {arch_of(capability)}")
+            )
             continue
         need = NEEDS.get(name)
         if need and not toolchain._module_available(need):

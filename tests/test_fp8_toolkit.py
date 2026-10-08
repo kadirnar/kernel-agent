@@ -297,8 +297,9 @@ def test_block_scale_parsing():
     plain = "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 { %f1, %f2, %f3, %f4 }, ..."
     assert w8a8.block_scale_mma(f"ld.global.b32 %r1;\n{scaled}\n")
     assert not w8a8.block_scale_mma(plain) and not w8a8.block_scale_mma("// block_scale\n")
-    assert w8a8.block_scale_capable((12, 0)) and w8a8.block_scale_capable((10, 0))
+    assert w8a8.block_scale_capable((12, 0)) and w8a8.block_scale_capable((12, 1))
     assert not w8a8.block_scale_capable((9, 0)) and not w8a8.block_scale_capable((8, 9))
+    assert not w8a8.block_scale_capable((10, 0))  # plain tl.dot is full rate on sm_100
     assert all(cfg[2] % 32 == 0 for cfg in (*w8a8.CONFIGS.values(), w8a8.DEFAULT))
     assert selftest.smoke_block_scale((8, 9))  # nothing to check below sm_100
 
@@ -311,6 +312,19 @@ def test_w8a8_example_lowers_to_the_block_scaled_mma():
     ada = w8a8.gemm_ptx((8, 9), w8a8.DEFAULT)
     assert not w8a8.block_scale_mma(ada) and "e4m3.e4m3.f32" in ada
     assert not w8a8.block_scale_mma(w8a8.gemm_ptx((12, 0), w8a8.DEFAULT, scaled=False))
+
+
+def test_w8a8_example_reaches_each_gpus_full_rate_fp8_mma():
+    """#165: compiled (no GPU) for Hopper the GEMM's ``tl.dot`` on e4m3 is ``wgmma``, for
+    datacenter Blackwell ``tcgen05.mma kind::f8f6f4``; ``tl.dot_scaled`` at the example's
+    64-row tiles would fall back to ``kind::f16`` there, so it is used on sm_12x only."""
+    w8a8 = _example("triton_fp8_w8a8_gemm.py")
+    hopper = w8a8.gemm_ptx((9, 0), w8a8.DEFAULT)
+    assert "wgmma.mma_async" in hopper and ".e4m3.e4m3" in hopper
+    blackwell = w8a8.gemm_ptx((10, 0), w8a8.DEFAULT)
+    assert "tcgen05.mma.cta_group::1.kind::f8f6f4" in blackwell
+    emulated = w8a8.gemm_ptx((10, 0), w8a8.DEFAULT, scaled=True)
+    assert "kind::f16" in emulated and not w8a8.block_scale_mma(emulated)
 
 
 def _compile(fn, signature, constexprs, warps=4):
@@ -366,13 +380,12 @@ def test_the_toolkit_examples_exist():
 # ---------------------------------------------------------------- GPU (written, not run here)
 
 
-def _gpu(backend: str = "triton") -> tuple[int, int]:
+def _gpu(backend: str = "triton", name: str = "triton_fp8_w8a8_gemm.py") -> tuple[int, int]:
     from kernel_agent import toolchain
 
     tc = toolchain.setup()
-    ready = selftest.fp8_supported(tc) if backend == "cuda" else selftest.w8a8_supported(tc)
-    if not ready or tc.gpu is None:
-        pytest.skip(f"needs the {backend} backend on sm_89+")
+    if (why := selftest.example_skip(name, tc, backend)) is not None or tc.gpu is None:
+        pytest.skip(f"{name}: {why or 'no GPU'}")
     return tuple(tc.gpu.capability)
 
 
@@ -381,7 +394,7 @@ def _gpu(backend: str = "triton") -> tuple[int, int]:
     "name", [*selftest.CUBLASLT_EXAMPLES, *selftest.PRODUCER_EXAMPLES, *selftest.FP8_KV_EXAMPLES]
 )
 def test_toolkit_example_on_the_evaluator(name, tmp_path):
-    _gpu("cuda" if name in selftest.CUBLASLT_EXAMPLES else "triton")
+    _gpu("cuda" if name in selftest.CUBLASLT_EXAMPLES else "triton", name)
     cuda = name in selftest.CUBLASLT_EXAMPLES
     assert selftest.smoke_fp8_toolkit(tmp_path, verbose=True, cuda=cuda, triton=not cuda)
 
@@ -406,7 +419,7 @@ def test_w8a8_dot_scaled_is_bit_identical_to_dot():
 
 @pytest.mark.gpu
 def test_cublaslt_helper_against_the_reference_math():
-    capability = _gpu("cuda")
+    capability = _gpu("cuda", "cuda_cublaslt_fp8.py")
     from kernel_agent.kernels.quant import fp8_w8a8_linear
 
     lt = _example("cuda_cublaslt_fp8.py")
@@ -447,7 +460,7 @@ def test_cublaslt_helper_against_the_reference_math():
 
 @pytest.mark.gpu
 def test_producers_against_the_reference_math():
-    _gpu()
+    _gpu(name="triton_fp8_producers.py")
     from kernel_agent.kernels.quant import quantize_fp8_activations
 
     prod = _example("triton_fp8_producers.py")
@@ -476,7 +489,7 @@ def test_producers_against_the_reference_math():
 
 @pytest.mark.gpu
 def test_fp8_kv_decode_against_the_reference_math():
-    _gpu()
+    _gpu(name="triton_fp8_kv_decode.py")
     kv = _example("triton_fp8_kv_decode.py")
     torch.manual_seed(0)
     shapes = ((4, 16, 2, 4096, 128, None), (3, 8, 8, 77, 64, [77, 1, 40]))

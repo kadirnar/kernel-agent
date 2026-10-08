@@ -44,6 +44,11 @@ from torch import nn
 
 from kernel_agent.kernels.kv_quant import fp8_kv_attention, quantize_fp8_kv
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_89+"
+ARCHS_WHY = "Triton's e4m3 type (fp8e4nv) needs sm_89+"
+
 BL = 64  # cached tokens per inner tile
 
 

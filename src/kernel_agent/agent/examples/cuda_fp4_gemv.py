@@ -31,6 +31,14 @@ from torch.utils.cpp_extension import load_inline
 
 from kernel_agent.kernels.quant import E2M1_VALUES, fp4_error, quantize_fp4
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_80+"
+ARCHS_WHY = (
+    "bf16 activations; e2m1 codes decoded with integer ops, e4m3 block scales converted in "
+    "registers (software conversion before sm_89)"
+)
+
 CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <cuda_bf16.h>

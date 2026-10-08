@@ -68,7 +68,16 @@ def _env_block(python: str, toolchain_summary: str) -> str:
 ```
 {toolchain_summary}
 ```
-"""
+{_gpu_block(toolchain_summary)}"""
+
+
+def _gpu_block(toolchain_summary: str) -> str:
+    """This GPU's facts and its architecture's section of ``knowledge/gpus.md`` (issue #165;
+    "" when the summary names no GPU)."""
+    from kernel_agent.gpu_arch import prompt_section
+
+    section = prompt_section(toolchain_summary)
+    return f"\n{section}" if section else ""
 
 
 COMMON_RULES = """## Rules
@@ -280,14 +289,21 @@ def plan_schema(precisions: Iterable[str] | None = None) -> dict[str, Any]:
     return schema
 
 
-def precision_policy(quality: str, precisions: Iterable[str] | None = None) -> str:
+def precision_policy(
+    quality: str,
+    precisions: Iterable[str] | None = None,
+    capability: tuple[int, ...] | None = None,
+) -> str:
     """The planner's precision rules for the run's ``--quality`` mode and the precisions it
-    allows (``--precisions``; None: the quality mode's default, without the 4-bit ones)."""
+    allows (``--precisions``; None: the quality mode's default, without the 4-bit ones) on
+    a GPU of ``capability`` (None: unknown; a precision it cannot run is refused, #165)."""
     from kernel_agent import precisions as allowed_precisions
 
     if quality == "near-lossless":
         allowed = tuple(allowed_precisions.default(quality) if precisions is None else precisions)
-        return _near_lossless_policy(allowed, allowed_precisions.FOUR_BIT)
+        gpu = allowed_precisions.gpu_refused(quality, None, capability)
+        allowed = tuple(p for p in allowed if p not in gpu)
+        return _near_lossless_policy(allowed, allowed_precisions.FOUR_BIT, gpu)
     return """
 # Precision (`--quality exact`)
 This run keeps full precision: do not set `precision` (a target with
@@ -296,11 +312,17 @@ must match eager within rounding noise.
 """
 
 
-def _near_lossless_policy(allowed: tuple[str, ...], four_bit: tuple[str, ...]) -> str:
-    """The near-lossless precision policy: a paragraph per precision in ``allowed``."""
+def _near_lossless_policy(
+    allowed: tuple[str, ...], four_bit: tuple[str, ...], gpu: dict[str, str] | None = None
+) -> str:
+    """The near-lossless precision policy: a paragraph per precision in ``allowed``; ``gpu``:
+    the precisions this GPU cannot run, with the reason (refused, never offered)."""
+    gpu = gpu or {}
     names = ", ".join(f"`{p}`" for p in allowed)
     refused = [
-        p for p in ("fp8_weights", "fp8_w8a8", "fp8_mx", "reduced", *four_bit) if p not in allowed
+        p
+        for p in ("fp8_weights", "fp8_w8a8", "fp8_mx", "reduced", *four_bit)
+        if p not in allowed and p not in gpu
     ]
     lines = [
         "",
@@ -317,6 +339,14 @@ def _near_lossless_policy(allowed: tuple[str, ...], four_bit: tuple[str, ...]) -
         )
         + ".",
     ]
+    if gpu:  # #165: never offered on this GPU, whatever --precisions says
+        lines.append(
+            "This GPU cannot run "
+            + "; ".join(f"`{p}` ({why})" for p, why in gpu.items())
+            + ": a target with "
+            + ("it" if len(gpu) == 1 else "one of them")
+            + " is refused; its *Ceilings* column is not shown."
+        )
     if any(p in refused for p in four_bit):
         lines.append(
             "No 4-bit weights or activations (FP4, NVFP4, MXFP4, int4) anywhere, also not in a "
@@ -367,8 +397,8 @@ power-of-two ue8m0 scale per 32 elements along K on both operands, applied by th
 block-scaled tensor cores of sm_100 / sm_120; the same tolerance tier as `fp8_w8a8`)
 instead of `fp8_w8a8` where its column of the *Ceilings* table, *MXFP8*, is known
 (a GPU with block-scaled MMA) and the target's GEMMs are compute bound with wide
-outputs: M >= ~64 rows per call (clearly from the bf16 ridge the *Ceilings* table
-names: M ~130 on an RTX 5070 Ti) and N >= ~2560
+outputs: M >= ~64 rows per call (clearly from the bf16 ridge of this GPU, which the
+toolchain block and the *Ceilings* table name; M ~130 on an RTX 5070 Ti) and N >= ~2560
 (measured on an RTX 5070 Ti at M = 352: cuBLASLt MXFP8 12-16 % faster than tensor-wise
 FP8 at N = 2560 / 8192, 239 TFLOP/s, and its output arrives scaled). Not for GEMMs with
 N <= ~1024 at that M: cuBLASLt has one MXFP8 algorithm and no split-K, so its large
@@ -439,7 +469,9 @@ def planner_prompt(
     """``backend_record``: which backend won which target class in earlier runs on this GPU
     (:func:`kernel_agent.backends.track_record_note`)."""
     from kernel_agent import backends as backend_policy
+    from kernel_agent.gpu_arch import from_summary
 
+    gpu = from_summary(toolchain)  # this GPU: its policy rows and precisions (#165)
     base = {k: baseline.get(k) for k in ("workload", "median_ms", "peak_mem_gb", "deterministic")}
     if "compiled_ms" in baseline:  # the strong baseline (strong_baseline.py)
         base["compiled_ms"] = baseline["compiled_ms"]
@@ -524,8 +556,8 @@ model. Specialist agents will then write custom kernels for each target you pick
    (`stages`: `scope` stage / group / loop, `group` = the instance group of the ceilings
    row, `idea`); a systems-native agent rewrites them as native CUDA projects once the
    module targets have plateaued. Leave it out when module kernels can reach the floors.
-{precision_policy(quality, precisions)}
-{backend_policy.policy_text(backends)}
+{precision_policy(quality, precisions, gpu.capability)}
+{backend_policy.policy_text(backends, gpu)}
 {backend_record}
 Return the plan as structured output.
 
@@ -533,13 +565,15 @@ Return the plan as structured output.
 
 
 def _backend_class_block(
-    target: dict[str, Any], capture_info: dict[str, Any], backends: list[str]
+    target: dict[str, Any], capture_info: dict[str, Any], backends: list[str], toolchain: str = ""
 ) -> str:
-    """The target's class in the backend policy (kernel_agent/backends.py) and its row."""
+    """The target's class in the backend policy (kernel_agent/backends.py) and its row, for
+    the GPU the toolchain summary names."""
     from kernel_agent import backends as backend_policy
+    from kernel_agent.gpu_arch import from_summary
 
     spec = {**target, "capture": capture_info}
-    return "\n" + backend_policy.engineer_note(spec, backends) + "\n"
+    return "\n" + backend_policy.engineer_note(spec, backends, from_summary(toolchain)) + "\n"
 
 
 def _entrypoints_block(capture_info: dict[str, Any], cls: str) -> str:
@@ -673,14 +707,22 @@ def reduced_precision(target: dict[str, Any], capture_info: dict[str, Any]) -> s
 
 
 def _precision_block(
-    precision: str | None, target: dict[str, Any], precisions: Iterable[str] | None = None
+    precision: str | None,
+    target: dict[str, Any],
+    precisions: Iterable[str] | None = None,
+    toolchain: str = "",
 ) -> str:
     """The reduced-precision contract of the engineer prompt (empty for exact targets);
-    ``precisions``: the ones the run allows (None: near-lossless's default, no 4-bit)."""
+    ``precisions``: the ones the run allows (None: near-lossless's default, no 4-bit);
+    ``toolchain``: the summary naming the GPU (what its architecture means for the
+    precision, :func:`kernel_agent.gpu_arch.precision_note`)."""
     from kernel_agent import precisions as allowed_precisions
+    from kernel_agent.gpu_arch import from_summary, precision_note
 
     if precision is None:
         return ""
+    gpu_note = precision_note(precision, from_summary(toolchain).capability)
+    gpu_line = f"\nOn this GPU: {gpu_note}\n" if gpu_note else ""
     allowed = allowed_precisions.default("near-lossless") if precisions is None else precisions
     four_bit = allowed_precisions.FOUR_BIT
     no_four = precision not in four_bit and any(p not in tuple(allowed) for p in four_bit)
@@ -790,7 +832,7 @@ The evaluator checks it in {_tier_bounds(precision)} (the exact tier would rejec
 low-precision weights). End to end, the run's perceptual gate decides. This replaces the "no
 fp8/int8" rule below for this target only.
 {contract}
-{no_four_note}"""
+{no_four_note}{gpu_line}"""
 
 
 def _tier_bounds(precision: str) -> str:
@@ -899,14 +941,14 @@ instances' configuration generically (read sizes from the module). Expose tuning
 parameters (block sizes, `num_warps`, `num_stages`, vector widths) as keyword
 arguments with defaults, `def build(reference, BLOCK=1024, num_warps=4)`, and
 tune them with `sweep_candidate`.
-{entrypoints}{_precision_block(precision, target, precisions)}
+{entrypoints}{_precision_block(precision, target, precisions, toolchain)}
 # Backends (in priority order)
 {backend_list}
 Start with the first. When it is correct and fast, try the next one only if
 you expect it to beat the current best (different algorithm, lower launch
 overhead). Verified examples of every backend are in `{EXAMPLES_DIR}` — copy
-their structure.
-{_backend_class_block(target, capture_info, backends)}
+their structure; an example's `ARCHS` names the GPUs it runs on.
+{_backend_class_block(target, capture_info, backends, toolchain)}
 # Tools
 * `evaluate_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py",
   hypothesis="...", idea_id="<slug>", expected_speedup=1.4,
@@ -1251,7 +1293,8 @@ direction.
 # Toolchain
 ```
 {toolchain}
-```"""
+```
+{_gpu_block(toolchain)}"""
 
 
 def _besides(dossier: Path | None) -> str:
@@ -1585,4 +1628,5 @@ Keep it under about 50 lines. Finish with one line: the top idea.
 # Toolchain
 ```
 {toolchain}
-```"""
+```
+{_gpu_block(toolchain)}"""

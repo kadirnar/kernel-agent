@@ -2,7 +2,10 @@
 
 The GEMM peaks of :func:`~kernel_agent.kernels.roofline.measure_peaks` are what a library
 GEMM reaches (cuBLAS / cuBLASLt). A hand-written kernel is capped by the instruction it
-issues instead, and on GeForce Blackwell (sm_120) the FP8 instructions differ by 2x
+issues instead. These are the ``mma.sync`` rates: the full-rate path on Ampere, Ada and
+GeForce Blackwell; on Hopper and datacenter Blackwell ``wgmma`` / ``tcgen05`` run faster
+(``kernel_agent/gpu_arch.py``) and e4m3 ``mma.sync`` is emulated (:func:`available`). On
+GeForce Blackwell (sm_120) the FP8 instructions differ by 2x
 (docs/RESEARCH-TRITON.md §1.1, RTX 5070 Ti): ``HMMA.16816.F32.BF16`` 104 TFLOP/s,
 ``QMMA.16832.F32.E4M3`` (plain e4m3, fp32 accumulation; both the sm_89 form and
 ``kind::f8f6f4``) 208, the block-scaled ``QMMA.SF.16832.F32.E4M3.E4M3.E8``
@@ -159,11 +162,22 @@ def arch(capability: tuple[int, int]) -> str:
     return f"sm_{major}{minor}" + ("a" if major >= 9 else "")
 
 
+#: Instructions on e4m3 operands (``mma.sync`` m16n8k32): native on sm_89 and sm_12x only.
+_E4M3 = (FP8_F32, FP8_SF, "e4m3_f16")
+
+
 def available(instruction: Instruction, capability: tuple[int, int]) -> str | None:
-    """Why ``instruction`` cannot run on a GPU of ``capability`` (None: it can)."""
+    """Why ``instruction`` cannot run on a GPU of ``capability`` (None: it can). e4m3
+    ``mma.sync`` compiles on sm_90 / sm_100 but runs there as fp16 upcasts + HMMA (Triton's
+    ``AccelerateMatmul.cpp``): its rate would be mistaken for an FP8 one, so it is not
+    measured; those GPUs reach their FP8 peak through ``wgmma`` / ``tcgen05`` (the FP8 GEMM
+    peak of ``roofline.measure_peaks``)."""
     cc = capability[0] * 10 + capability[1]
     if cc < instruction.capability:
         return f"needs sm_{instruction.capability}+, this GPU is sm_{cc}"
+    if instruction.key in _E4M3 and capability[0] in (9, 10, 11):
+        full = "wgmma" if capability[0] == 9 else "tcgen05.mma"
+        return f"e4m3 mma.sync is emulated through fp16 on sm_{cc} (its FP8 rate is {full}'s)"
     if instruction.key == FP8_SF and capability[0] != 12:
         return "mma.sync block_scale exists on sm_120a / sm_121a only"
     return None

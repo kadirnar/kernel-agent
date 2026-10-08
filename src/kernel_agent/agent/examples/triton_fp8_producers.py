@@ -47,6 +47,11 @@ from torch import nn
 
 from kernel_agent.kernels.quant import fp8_error, fp8_w8a8_linear, quantize_fp8
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_89+"
+ARCHS_WHY = "Triton's e4m3 type (fp8e4nv) needs sm_89+"
+
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)
 

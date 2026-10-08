@@ -1,5 +1,5 @@
-"""CuTe DSL (``nvidia-cutlass-dsl``) toolchain: the install / sm_120 check of ``doctor`` and
-a compile cache for CuTe DSL kernels across evaluations.
+"""CuTe DSL (``nvidia-cutlass-dsl``) toolchain: the install / architecture check of
+``doctor`` and a compile cache for CuTe DSL kernels across evaluations.
 
 **Check** (:func:`check`, static: imports and metadata, no GPU launch): the DSL version and
 its library wheels, whether it imports, the architecture it compiles for
@@ -96,6 +96,21 @@ def _probe() -> dict[str, Any]:
     return info
 
 
+#: The CuTe DSL MMA that reaches the tensor-core peak, per architecture family
+#: (``gpu_arch.Family.key``) where the warp-level block-scaled ``MmaMXF8Op`` does not apply.
+FAMILY_MMA = {
+    "pre_ampere": "warp MMA on fp16 only (no bf16 / FP8 tensor cores)",
+    "ampere": "warp MMA (`MmaF16BF16Op`, mma.sync); no FP8 tensor cores",
+    "ada": "warp MMA incl. FP8 (`MmaFP8Op`, the full FP8 rate here); no block-scaled MMA",
+    "hopper": "warpgroup MMA (`cute.nvgpu.warpgroup`, wgmma) for the peak, FP8 included; "
+    "no block-scaled MMA",
+    "blackwell": "tcgen05 MMA (`cute.nvgpu.tcgen05`, block-scaled MXF8 / NVF4 included) for "
+    "the peak; the warp-level `MmaMXF8Op` is sm_120-only",
+    "blackwell_geforce": "no block-scaled MMA for this arch (FP8 only via `MmaFP8Op`)",
+    "newer": "check the DSL's MMA ops for this arch",
+}
+
+
 @dataclass
 class Status:
     """CuTe DSL install and support on this GPU (``doctor``)."""
@@ -130,7 +145,10 @@ class Status:
         if self.block_scaled:
             mma = "block-scaled MMA `MmaMXF8Op` (QMMA.SF, full-rate FP8 with fp32 accumulation)"
         else:
-            mma = "no block-scaled MMA for this arch (FP8 only via `MmaFP8Op`)"
+            from kernel_agent.gpu_arch import capability_of, family
+
+            fam = family(capability_of(self.arch))
+            mma = FAMILY_MMA.get(fam.key if fam else "", FAMILY_MMA["blackwell_geforce"])
         return [f"{head}: {self.arch} supported, {mma}", *self._tail()]
 
     def _tail(self) -> list[str]:

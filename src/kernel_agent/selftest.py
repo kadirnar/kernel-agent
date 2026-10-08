@@ -4,17 +4,23 @@ exact tier, MXFP8 with the OCP floor scale rule by the scale-rule guard; the FP4
 near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+; the
 Triton toolkit examples, cached launches and short-sequence attention:
 :func:`smoke_triton_tools`; on sm_120 the CuTe DSL block-scaled W8A8 GEMM and the fused FP8
-decoder block)."""
+decoder block).
+
+Every example declares the GPUs it runs on (its ``ARCHS``, ``kernel_agent/gpu_arch.py``):
+:func:`smoke_backends` runs those this GPU supports and lists the others with the reason
+(:func:`example_skip`), so ``doctor --smoke`` passes on any GPU."""
 
 from __future__ import annotations
 
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 
+from kernel_agent import gpu_arch
 from kernel_agent.agent.prompts import EXAMPLES_DIR
 
 
@@ -235,12 +241,26 @@ def make_chain_capture(
     return path
 
 
+def example_skip(name: str, tc: object, backend: str | None = None) -> str | None:
+    """Why the bundled example ``name`` does not run with toolchain ``tc``: ``backend`` is
+    not available, or this GPU is not one of its ``ARCHS`` (:func:`gpu_arch.example_skip`);
+    None: it runs."""
+    gpu = getattr(tc, "gpu", None)
+    if backend is not None and not (getattr(tc, "backends", {}) or {}).get(backend):
+        return f"the {backend} backend is not available"
+    cap = tuple(gpu.capability) if gpu is not None else None
+    return gpu_arch.example_skip(EXAMPLES_DIR / name, cap)
+
+
+def examples_run(names: Iterable[str], tc: object, backend: str) -> bool:
+    """Whether every example of ``names`` runs with ``tc`` (:func:`example_skip`)."""
+    return all(example_skip(name, tc, backend) is None for name in names)
+
+
 def pdl_supported(tc: object) -> bool:
     """Whether the PDL examples can run: the ``cuda`` backend on sm_90 or newer
-    (``griddepcontrol``)."""
-    gpu = getattr(tc, "gpu", None)
-    backends = getattr(tc, "backends", {}) or {}
-    return bool(backends.get("cuda")) and gpu is not None and tuple(gpu.capability) >= (9, 0)
+    (``griddepcontrol``; their ``ARCHS``)."""
+    return examples_run(PDL_EXAMPLES, tc, "cuda")
 
 
 def smoke_pdl(tmp: Path, verbose: bool = False) -> bool:
@@ -289,31 +309,21 @@ def make_linear_capture(
 
 
 def fp8_supported(tc: object) -> bool:
-    """Whether the FP8 examples can run: the ``cuda`` backend on sm_89 or newer (hardware
-    e4m3 conversion)."""
-    gpu = getattr(tc, "gpu", None)
-    backends = getattr(tc, "backends", {}) or {}
-    return bool(backends.get("cuda")) and gpu is not None and tuple(gpu.capability) >= (8, 9)
+    """Whether the FP8 weight-only examples can run: the ``cuda`` backend on a GPU of their
+    ``ARCHS`` (sm_80+: e4m3 converted in registers, in software before sm_89)."""
+    return examples_run(FP8_EXAMPLES, tc, "cuda")
 
 
 def w8a8_supported(tc: object) -> bool:
     """Whether the W8A8 examples can run: the ``triton`` backend on sm_89 or newer (e4m3
-    tensor cores)."""
-    gpu = getattr(tc, "gpu", None)
-    backends = getattr(tc, "backends", {}) or {}
-    return bool(backends.get("triton")) and gpu is not None and tuple(gpu.capability) >= (8, 9)
+    tensor cores; their ``ARCHS``)."""
+    return examples_run(W8A8_EXAMPLES, tc, "triton")
 
 
 def mxfp8_supported(tc: object) -> bool:
     """Whether the MXFP8 examples can run: the ``triton`` backend on a GPU with block-scaled
-    tensor cores (sm_100 or newer) and a torch with ``F.scaled_mm``."""
-    gpu = getattr(tc, "gpu", None)
-    return (
-        w8a8_supported(tc)
-        and gpu is not None
-        and tuple(gpu.capability) >= (10, 0)
-        and hasattr(torch.nn.functional, "scaled_mm")
-    )
+    tensor cores (sm_100 or newer: their ``ARCHS``) and a torch with ``F.scaled_mm``."""
+    return examples_run(MX_EXAMPLES, tc, "triton") and hasattr(torch.nn.functional, "scaled_mm")
 
 
 def floor_rule_variant(tmp: Path, name: str) -> Path:
@@ -328,12 +338,9 @@ def floor_rule_variant(tmp: Path, name: str) -> Path:
 
 
 def cute_fp8_supported(tc: object) -> bool:
-    """Whether the CuTe DSL FP8 examples can run: the ``cute`` backend on sm_120 / sm_121
-    (the block-scaled MMA the GEMM example uses exists only there)."""
-    gpu = getattr(tc, "gpu", None)
-    backends = getattr(tc, "backends", {}) or {}
-    major = tuple(gpu.capability)[:1] if gpu is not None else ()
-    return bool(backends.get("cute")) and major == (12,)
+    """Whether the CuTe DSL FP8 GEMM example can run: the ``cute`` backend on sm_120 /
+    sm_121 (the block-scaled ``mma.sync`` it uses exists only there; its ``ARCHS``)."""
+    return examples_run(CUTE_W8A8_EXAMPLES, tc, "cute")
 
 
 class GatedMLP(nn.Module):
@@ -477,11 +484,12 @@ def cheap_launch_check() -> dict[str, Any]:
     return {"passed": same and hits >= 2, "bit_identical": same, "hits": hits}
 
 
-def smoke_triton_tools(tmp: Path, verbose: bool = False) -> bool:
+def smoke_triton_tools(tmp: Path, verbose: bool = False, *, attention: bool = True) -> bool:
     """The Triton toolkit examples (#148): ``triton_cheap_launch.py`` passes the evaluator on
     every block of :data:`MLP_BLOCKS` and its cached launches match the JIT's
-    (:func:`cheap_launch_check`); ``triton_short_attention.py`` passes on
-    :func:`make_attention_capture` and traces without a graph break (``compile_check``)."""
+    (:func:`cheap_launch_check`); ``triton_short_attention.py`` (``attention``: on a GPU of
+    its ``ARCHS``) passes on :func:`make_attention_capture` and traces without a graph
+    break (``compile_check``)."""
     from kernel_agent.kernels.evaluate import run_evaluation
 
     rows: list[tuple[str, bool, str]] = []
@@ -500,18 +508,21 @@ def smoke_triton_tools(tmp: Path, verbose: bool = False) -> bool:
     except Exception as exc:
         check = {"passed": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     rows.append(("cheap_launch cache", bool(check["passed"]), str(check)))
-    capture = make_attention_capture(tmp / "attention.pt")
-    example = EXAMPLES_DIR / "triton_short_attention.py"
-    result = run_evaluation(capture, example, compile_check=True)
-    compiled = result.get("compile_check") or {}
-    passed = bool(result.get("correct") and compiled.get("passed") and compiled.get("fullgraph_ok"))
-    detail = (
-        f"speedup {result.get('speedup')}x, compiled {compiled.get('passed')}, "
-        f"fullgraph {compiled.get('fullgraph_ok')}"
-        if result.get("correct")
-        else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
-    )
-    rows.append(("short_attention", passed, detail))
+    if attention:
+        capture = make_attention_capture(tmp / "attention.pt")
+        example = EXAMPLES_DIR / "triton_short_attention.py"
+        result = run_evaluation(capture, example, compile_check=True)
+        compiled = result.get("compile_check") or {}
+        passed = bool(
+            result.get("correct") and compiled.get("passed") and compiled.get("fullgraph_ok")
+        )
+        detail = (
+            f"speedup {result.get('speedup')}x, compiled {compiled.get('passed')}, "
+            f"fullgraph {compiled.get('fullgraph_ok')}"
+            if result.get("correct")
+            else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+        )
+        rows.append(("short_attention", passed, detail))
     ok = True
     for name, passed, detail in rows:
         ok &= passed
@@ -571,7 +582,7 @@ def make_decode_attention_capture(
 
 def smoke_block_scale(capability: tuple[int, ...], verbose: bool = False) -> bool:
     """The Triton W8A8 example's GEMM lowers to the block-scaled MMA (PTX ``block_scale``,
-    ``QMMA.SF``) on a GPU that has it (sm_100+): compiled for ``capability``, not run."""
+    ``QMMA.SF``) on the GPUs it uses it on (sm_12x): compiled for ``capability``, not run."""
     from kernel_agent.kernels.evaluate import load_candidate_module
 
     module = load_candidate_module(EXAMPLES_DIR / "triton_fp8_w8a8_gemm.py")
@@ -661,25 +672,43 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
                     else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
                 )
                 print(f"  {'project':9s} {'OK ' if passed else 'FAIL'} {detail}")
-        if fp8_supported(tc) and (backends is None or "cuda" in backends):
+        skipped: dict[str, str] = {}
+
+        def runs(names: Iterable[str], backend: str) -> bool:
+            """Whether the examples ``names`` run here (``backend`` asked for, every one's
+            ``ARCHS`` holds this GPU); the reason of each that does not is listed."""
+            if backends is not None and backend not in backends:
+                return False
+            why = {name: example_skip(name, tc, backend) for name in names}
+            skipped.update({k: v for k, v in why.items() if v is not None})
+            return all(v is None for v in why.values())
+
+        if runs(FP8_EXAMPLES, "cuda"):
             ok &= smoke_fp8(Path(tmp), verbose)
+        if runs(FP4_EXAMPLES, "cuda"):
             ok &= smoke_fp4(Path(tmp), verbose)
-        if pdl_supported(tc) and (backends is None or "cuda" in backends):
+        if runs(PDL_EXAMPLES, "cuda"):
             ok &= smoke_pdl(Path(tmp), verbose)
-        if w8a8_supported(tc) and (backends is None or "triton" in backends):
+        if runs(W8A8_EXAMPLES, "triton"):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8")
             ok &= smoke_block_scale(tuple(tc.gpu.capability) if tc.gpu else (0, 0), verbose)
-        if mxfp8_supported(tc) and (backends is None or "triton" in backends):
+        if runs(MX_EXAMPLES, "triton") and mxfp8_supported(tc):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
         if tc.backends.get("triton") and (backends is None or "triton" in backends):
-            ok &= smoke_triton_tools(Path(tmp), verbose)
-        if cute_fp8_supported(tc) and (backends is None or "cute" in backends):
+            attention = runs(["triton_short_attention.py"], "triton")
+            ok &= smoke_triton_tools(Path(tmp), verbose, attention=attention)
+        if runs(CUTE_W8A8_EXAMPLES, "cute"):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8", examples=CUTE_W8A8_EXAMPLES)
+        if runs(CUTE_BLOCK_EXAMPLES, "cute"):
             ok &= smoke_fp8(
                 Path(tmp), verbose, examples=CUTE_BLOCK_EXAMPLES, capture=make_mlp_capture
             )
-        cuda = fp8_supported(tc) and (backends is None or "cuda" in backends)
-        triton = w8a8_supported(tc) and (backends is None or "triton" in backends)
+        cuda = runs(CUBLASLT_EXAMPLES, "cuda")
+        triton = runs([*PRODUCER_EXAMPLES, *FP8_KV_EXAMPLES], "triton")
         if cuda or triton:
             ok &= smoke_fp8_toolkit(Path(tmp), verbose, cuda=cuda, triton=triton)
+        if verbose and skipped:
+            print(f"  skipped here ({gpu_arch.from_toolchain(tc).label}):")
+            for name, why in skipped.items():
+                print(f"    {name.removesuffix('.py'):28s} {why}")
     return ok

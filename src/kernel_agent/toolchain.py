@@ -38,6 +38,8 @@ class GPUInfo:
     memory_gb: float
     sm_count: int
     l2_cache_mb: float
+    smem_per_block_kb: float = 0.0  # opt-in maximum per block (0: unknown)
+    smem_per_sm_kb: float = 0.0
 
     @property
     def arch(self) -> str:
@@ -66,9 +68,10 @@ class Toolchain:
         lines = []
         if self.gpu:
             g = self.gpu
+            smem = f", {g.smem_per_block_kb:.0f} KB smem per block" if g.smem_per_block_kb else ""
             lines.append(
                 f"GPU: {g.name} ({g.arch}, {g.memory_gb:.1f} GB, {g.sm_count} SMs, "
-                f"L2 {g.l2_cache_mb:.0f} MB)"
+                f"L2 {g.l2_cache_mb:.0f} MB{smem})"
             )
         else:
             lines.append("GPU: none detected")
@@ -83,6 +86,9 @@ class Toolchain:
             lines.append(f"measured peaks: {format_peaks(self.peaks)}")
         elif self.gpu:
             lines.append("measured peaks: not yet (`kernel-agent doctor` measures them)")
+        from kernel_agent.gpu_arch import summary_lines
+
+        lines.extend(summary_lines(self.gpu, self.peaks))  # family, full rate, precisions
         lines.extend(f"note: {n}" for n in self.notes)
         return "\n".join(lines)
 
@@ -102,6 +108,8 @@ def gpu_info() -> GPUInfo | None:
         memory_gb=props.total_memory / 1024**3,
         sm_count=props.multi_processor_count,
         l2_cache_mb=l2 / 1024**2,
+        smem_per_block_kb=(getattr(props, "shared_memory_per_block_optin", 0) or 0) / 1024,
+        smem_per_sm_kb=(getattr(props, "shared_memory_per_multiprocessor", 0) or 0) / 1024,
     )
 
 
@@ -213,6 +221,19 @@ def _gcc_major() -> int | None:
     return int(match.group(1)) if match else None
 
 
+#: Capabilities whose peak MMA (``wgmma`` on sm_90, ``tcgen05`` on sm_100 / sm_103 /
+#: sm_110) exists only in the architecture-specific target (``sm_90a``): ``load_inline``
+#: builds for it there (#165). sm_12x keeps the plain target its examples were verified
+#: with (the block-scaled ones ask for ``sm_120a`` themselves).
+ARCH_SPECIFIC = {(9, 0), (10, 0), (10, 3), (11, 0)}
+
+
+def cuda_arch_list(capability: tuple[int, int]) -> str:
+    """``TORCH_CUDA_ARCH_LIST`` for a GPU of ``capability`` (``9.0a`` on Hopper)."""
+    major, minor = int(capability[0]), int(capability[1])
+    return f"{major}.{minor}" + ("a" if (major, minor) in ARCH_SPECIFIC else "")
+
+
 # Newest GCC major officially accepted by nvcc, per CUDA major version.  Forcing
 # a newer host compiler is harmless when nvcc would have accepted it anyway.
 _MAX_GCC = {12: 14, 13: 15}
@@ -267,7 +288,7 @@ def setup(apply_env: bool = True) -> Toolchain:
         if flags:
             env["NVCC_APPEND_FLAGS"] = " ".join(dict.fromkeys(flags))
         if gpu is not None and "TORCH_CUDA_ARCH_LIST" not in os.environ:
-            env["TORCH_CUDA_ARCH_LIST"] = f"{gpu.capability[0]}.{gpu.capability[1]}"
+            env["TORCH_CUDA_ARCH_LIST"] = cuda_arch_list(gpu.capability)
 
     has_ninja = _module_available("ninja") or shutil.which("ninja") is not None
     if apply_env and shutil.which("ninja") is None and _module_available("ninja"):
