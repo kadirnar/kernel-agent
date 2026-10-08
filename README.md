@@ -3177,8 +3177,8 @@ model and starts a new round (`kernel_agent/improve.py`,
     run: model, GPU held, waiting for the GPU, evaluation off the GPU, own runs, idle.
     * `sessions.jsonl` has every state change of every session; `events.jsonl` only
       a `session_state` event when a session starts and ends (with its split) and at
-      most one per 5 min in between, and a `gpu_job` event for a GPU job that waited
-      30 s or more, so the event log stays small.
+      most one per 10 min in between, and a `gpu_job` event for a GPU job that waited
+      a minute or more, so the event log stays small.
     * `improve.json` → `sessions` (the running ones: state, since, evaluations, the
       USD reserved, split so far) and `gpu` (who holds the GPU, the queue by class,
       the busy share and waits p50 / p95 over the last hour), saved at most every 2 s;
