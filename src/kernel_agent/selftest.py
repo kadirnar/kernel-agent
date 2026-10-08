@@ -5,7 +5,7 @@ by the scale-rule guard; the FP4 one in the
 near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+; the
 Triton toolkit examples, cached launches and short-sequence attention:
 :func:`smoke_triton_tools`; on sm_120 the CuTe DSL block-scaled W8A8 GEMM and the fused FP8
-decoder block).
+decoder block; on sm_90 / sm_100 the CuTe DSL ``wgmma`` / ``tcgen05`` W8A8 GEMM templates).
 
 Every example declares the GPUs it runs on (its ``ARCHS``, ``kernel_agent/gpu_arch.py``):
 :func:`smoke_backends` runs those this GPU supports and lists the others with the reason
@@ -204,6 +204,13 @@ CUTE_W8A8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]
 #: a tail; 40 rows, correctness only: the fallback past 16 rows).
 CUTE_BLOCK_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     "cute_fp8_decoder_block.py": (1024, 4096, [((16, 1), 100), ((3,), 0), ((40,), 0)]),
+}
+#: The CuTe DSL W8A8 GEMM templates of Hopper (``wgmma``) and datacenter Blackwell
+#: (``tcgen05.mma``, #228), as :data:`CUTE_W8A8_EXAMPLES`; on sm_90 also 16 rows
+#: (correctness only), the swap-AB kernel. Each runs only on its own family (its ``ARCHS``).
+CUTE_ARCH_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cute_sm90_gemm_ws.py": (1024, 8192, [((4, 176), 100), ((300,), 0), ((16,), 0)]),
+    "cute_sm100_gemm_tcgen05.py": (1024, 8192, [((4, 176), 100), ((300,), 0)]),
 }
 
 
@@ -737,6 +744,9 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_fp8(
                 Path(tmp), verbose, examples=CUTE_BLOCK_EXAMPLES, capture=make_mlp_capture
             )
+        for name, spec in CUTE_ARCH_EXAMPLES.items():  # wgmma / tcgen05 templates (#228)
+            if runs([name], "cute"):
+                ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8", examples={name: spec})
         cuda = runs(CUBLASLT_EXAMPLES, "cuda")
         triton = runs([*PRODUCER_EXAMPLES, *FP8_KV_EXAMPLES], "triton")
         if cuda or triton:

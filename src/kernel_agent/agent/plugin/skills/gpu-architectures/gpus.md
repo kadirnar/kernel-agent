@@ -82,6 +82,10 @@ block's measured peaks and instruction rates are the numbers to use.
 * FP8 wgmma accumulates with fewer bits than fp32 (DeepSeek-V3: about 14 bits): promote
   to fp32 every 128 along K (4 wgmmas) for long reductions.
 * FlashAttention-3 (Hopper-only, wgmma + TMA, FP8 attention) is the reference attention.
+* CuTe DSL template: `examples/cute_sm90_gemm_ws.py` (bf16 / W8A8 GEMM: TMA, wgmma,
+  producer / consumer warpgroups, persistent, fused epilogue, swap-AB for M ≤ 64), with
+  the `cute-dsl` skill's `sm90-wgmma.md` (mbarrier phases, `setmaxnreg`, clusters). Compiled
+  for sm_90a on the CPU; not run on an H100 yet.
 * INT8 (`int8_w8a8`): `wgmma` on s8 with int32 accumulators at the FP8 rate (Triton
   `tl.dot` on int8, CUTLASS sm_90); a `mma.sync` s8 kernel stops below it.
 
@@ -99,7 +103,13 @@ block's measured peaks and instruction rates are the numbers to use.
   rate) and `tl.dot_scaled` (`kind::mxf8f6f4.block_scale` with 128-row tiles; 64-row
   tiles fall back to `kind::f16`, an upcast: Triton 3.8, compiled for sm_100 here), CuTe
   DSL `cute.nvgpu.tcgen05` (CUTLASS's Blackwell CuTe DSL examples: dense, persistent,
-  block-scaled GEMMs), CUTLASS sm_100 kernels.
+  block-scaled GEMMs), CUTLASS sm_100 kernels. Triton stays first for GEMM-shaped glue
+  (`tl.dot` lowers to tcgen05 here).
+* CuTe DSL template: `examples/cute_sm100_gemm_tcgen05.py` (bf16 / W8A8 GEMM: TMA,
+  `tcgen05.mma` into TMEM, warp roles, persistent, optional 2-CTA pairs, fused epilogue),
+  with the `cute-dsl` skill's `sm100-tcgen05.md` (the 512-column TMEM budget,
+  `tcgen05.alloc` / `dealloc`, 2-CTA pairs, cluster launch control). Compiled for sm_100a
+  on the CPU; not run on a B200 yet.
 * Shared memory 227 KB per block (deeper pipelines and larger tiles than the 99 KB of the
   sm_120 examples), clusters, PDL. L2: 126 MB on GB200.
 * INT8 (`int8_w8a8`): `tcgen05.mma kind::i8` on sm_100 (B200: INT8 at the FP8 rate).

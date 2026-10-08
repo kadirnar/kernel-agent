@@ -103,9 +103,10 @@ FAMILY_MMA = {
     "ampere": "warp MMA (`MmaF16BF16Op`, mma.sync); no FP8 tensor cores",
     "ada": "warp MMA incl. FP8 (`MmaFP8Op`, the full FP8 rate here); no block-scaled MMA",
     "hopper": "warpgroup MMA (`cute.nvgpu.warpgroup`, wgmma) for the peak, FP8 included; "
-    "no block-scaled MMA",
+    "no block-scaled MMA (template: examples/cute_sm90_gemm_ws.py)",
     "blackwell": "tcgen05 MMA (`cute.nvgpu.tcgen05`, block-scaled MXF8 / NVF4 included) for "
-    "the peak; the warp-level `MmaMXF8Op` is sm_120-only",
+    "the peak; the warp-level `MmaMXF8Op` is sm_120-only (template: "
+    "examples/cute_sm100_gemm_tcgen05.py)",
     "blackwell_geforce": "no block-scaled MMA for this arch (FP8 only via `MmaFP8Op`)",
     "newer": "check the DSL's MMA ops for this arch",
 }

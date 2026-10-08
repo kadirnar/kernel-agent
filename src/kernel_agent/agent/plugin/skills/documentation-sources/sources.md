@@ -51,6 +51,8 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/ampere — CuTe DSL mma.sync kernels (`dense_gemm`, `attention`, `elementwise`) and a tutorial.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/hopper/kernel — CuTe DSL sm_90 kernels: warpgroup MMA (wgmma), TMA, warp specialisation.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/blackwell — CuTe DSL sm_100 kernels: tcgen05 / TMEM, persistent and block-scaled GEMMs.
+* https://github.com/Dao-AILab/quack — QuACK (Apache-2.0): CuTe DSL sm_90 / sm_100 GEMMs with epilogue fusions, reductions and norms.
+* https://arxiv.org/abs/2603.05451 — FlashAttention-4 in CuTe DSL on B200 (tcgen05, TMEM, 2-CTA): its pipelines and its compile times.
 * https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html — CuTe DSL documentation.
 * https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_warp.html — CuTe DSL warp MMA ops: `MmaFP8Op` (sm_89+), `MmaMXF8Op` / `MmaMXF8F6F4Op` / `MmaMXF4NVF4Op` (sm_120a).
 * https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/guides/tvm_ffi_compilation.html — CuTe DSL with TVM-FFI: lower host overhead per launch.
