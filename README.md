@@ -3248,7 +3248,7 @@ model and starts a new round (`kernel_agent/improve.py`,
   agent finds is incompatible with the MLP kernel, and round 2 finds a new
   target. Time is simulated too, so `--max-hours` counts simulated hours. The
   images below come from `kernel-agent improve Qwen/Qwen3-0.6B --dry-run
-  --rounds 2`.
+  --rounds 2 --agents 3` (the watch screenshot under "Live dashboard" too).
 
 ![improve progress](docs/images/example-improve-progress.png)
 

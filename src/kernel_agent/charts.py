@@ -55,7 +55,17 @@ OTHER_COLOR = "#d9d8d1"
 # and red are left out so they keep meaning "kept" and "failed".
 TARGET_COLORS = ("#2a78d6", "#eb6834", "#4a3aa7", "#eda100", "#e87ba4", "#008300")
 # Marker of each parallel worker of a target (workers.py); the colour stays kept / discarded.
-WORKER_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*")
+# a worker's evaluations in progress.png: one line style each (no point markers)
+WORKER_STYLES: tuple[Any, ...] = (
+    "-",
+    (0, (5, 2)),
+    (0, (1, 1.5)),
+    (0, (6, 2, 1.5, 2)),
+    (0, (10, 3)),
+    (0, (3, 1, 1, 1, 1, 1)),
+)
+BEST_LW = 2.4  # the running best: the improvement as one prominent line
+EACH_LW = 1.1  # every evaluation: a thin, light line through its results
 
 _RC: dict[Any, Any] = {  # matplotlib types its rc keys as literals
     "font.family": "DejaVu Sans",
@@ -352,8 +362,9 @@ def _thousands() -> Any:
 def target_progress(
     run: RunDir, target_id: str, rows: list[dict[str, Any]] | None = None
 ) -> Path | None:
-    """``targets/<id>/progress.png``: speedup per evaluation with the running best (benchmark
-    evaluations only: no quick checks or duplicates; one marker shape per worker)."""
+    """``targets/<id>/progress.png``: the running best speedup as a line, a thin light line
+    through every evaluation's speedup (benchmark evaluations only: no quick checks or
+    duplicates; one line style per worker) and the failures as ticks on the x axis."""
     rows = [r for r in (ledger.rows(run) if rows is None else rows) if r["target"] == target_id]
     rows = ledger.measured(rows)
     if not rows or not available():
@@ -401,7 +412,7 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
 
     xs = [0] + [i for i, _ in kept] + [n]
     ys = [1.0] + [r["speedup"] for _, r in kept] + [best or 1.0]
-    ax.step(xs, ys, where="post", color=KEEP_COLOR, lw=2.0, zorder=3)
+    ax.step(xs, ys, where="post", color=KEEP_COLOR, lw=BEST_LW, zorder=4)
     taken = [_label_box(ax, reference)]
     if best is not None:
         best_label = ax.annotate(
@@ -419,31 +430,27 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
 
     team = sorted({str(r["worker"]) for r in rows if r.get("worker")}, key=int)
 
-    def marker(row: dict[str, Any]) -> str:
-        worker = str(row.get("worker") or "")
-        return WORKER_MARKERS[(int(worker) - 1) % len(WORKER_MARKERS)] if worker else "o"
+    def style(worker: str) -> Any:
+        return WORKER_STYLES[(int(worker) - 1) % len(WORKER_STYLES)] if worker else "-"
 
-    def scatter(points: list[tuple[int, dict[str, Any]]], **style: Any) -> None:
-        for shape in dict.fromkeys(marker(r) for _, r in points):
-            mine = [(i, r) for i, r in points if marker(r) == shape]
-            ax.scatter([i for i, _ in mine], [r["speedup"] for _, r in mine], marker=shape, **style)
-
-    if discarded:
-        scatter(discarded, s=34, color=DISCARD_COLOR, edgecolors=SURFACE, linewidths=1.0, zorder=4)
-    if kept:
-        scatter(kept, s=62, color=KEEP_COLOR, edgecolors=INK, linewidths=0.8, zorder=5)
-    if failed:
-        ax.scatter(
-            [i for i, _ in failed],
-            [0.035] * len(failed),
-            transform=ax.get_xaxis_transform(),
-            marker="x",
-            s=38,
-            color=FAIL_COLOR,
-            linewidths=1.8,
-            zorder=5,
-            clip_on=False,
+    measured = sorted(kept + discarded, key=lambda p: p[0])
+    for worker in dict.fromkeys(str(r.get("worker") or "") for _, r in measured):
+        mine: list[tuple[float, float]] = [
+            (i, r["speedup"]) for i, r in measured if str(r.get("worker") or "") == worker
+        ]
+        if len(mine) == 1:  # one result: a short dash where it is
+            mine = [(mine[0][0] - 0.3, mine[0][1]), (mine[0][0] + 0.3, mine[0][1])]
+        ax.plot(
+            [i for i, _ in mine],
+            [v for _, v in mine],
+            color=DISCARD_COLOR,
+            lw=EACH_LW,
+            ls=style(worker),
+            solid_joinstyle="round",
+            zorder=3,
         )
+    if failed:  # ticks on the x axis
+        _fail_ticks(ax, [i for i, _ in failed])
 
     # Kept points carry their hypothesis; the biggest steps win when labels collide.
     items = []
@@ -498,28 +505,38 @@ def _draw_target(ax: Any, target_id: str, spec: dict[str, Any], rows: list[dict[
     _legend(
         ax,
         [
-            Line2D([], [], ls="", marker="o", ms=8, mfc=KEEP_COLOR, mec=INK, mew=0.8, label="kept"),
-            Line2D(
-                [], [], ls="", marker="o", ms=6, mfc=DISCARD_COLOR, mec=SURFACE, label="discarded"
-            ),
-            Line2D([], [], ls="", marker="x", ms=7, mec=FAIL_COLOR, mew=1.8, label="failed"),
-            Line2D([], [], color=KEEP_COLOR, lw=2, label="running best"),
+            Line2D([], [], color=KEEP_COLOR, lw=BEST_LW, label="running best"),
+            Line2D([], [], color=DISCARD_COLOR, lw=EACH_LW, label="each evaluation"),
+            _fail_key(),
             Line2D([], [], color=INK_2, lw=1, ls=(0, (5, 4)), label="reference module"),
             *(
-                Line2D(
-                    [],
-                    [],
-                    ls="",
-                    marker=marker({"worker": w}),
-                    ms=6,
-                    mfc="none",
-                    mec=INK_2,
-                    label=f"worker {w}",
-                )
+                Line2D([], [], color=MUTED, lw=EACH_LW, ls=style(w), label=f"worker {w}")
                 for w in team
             ),
         ],
     )
+
+
+def _fail_ticks(ax: Any, xs: list[float], top: bool = False) -> None:
+    """Failed evaluations as short ticks on the x axis (at the top with ``top``)."""
+    lo, hi = (0.965, 1.0) if top else (0.0, 0.035)
+    ax.vlines(
+        xs,
+        lo,
+        hi,
+        transform=ax.get_xaxis_transform(),
+        color=FAIL_COLOR,
+        lw=1.8,
+        zorder=5,
+        clip_on=False,
+    )
+
+
+def _fail_key(label: str = "failed") -> Any:
+    """The legend's sample of :func:`_fail_ticks`: a short vertical tick."""
+    from matplotlib.lines import Line2D
+
+    return Line2D([], [], ls="", marker="|", ms=9, mew=1.8, mec=FAIL_COLOR, label=label)
 
 
 # ------------------------------------------------------------------ run level
@@ -651,37 +668,25 @@ def _draw_run(
     px.append(end)
     py.append(py[-1])
     line = [math.nan if y is None else y for y in py]
-    ax.step(px, line, where="post", color=PROJECTED_COLOR, lw=2.0, zorder=3)
-    if len(px) > 2:
-        ax.scatter(px[1:-1], line[1:-1], s=16, color=PROJECTED_COLOR, zorder=3, lw=0)
+    ax.step(px, line, where="post", color=PROJECTED_COLOR, lw=BEST_LW, zorder=3)
     # where the line ends: its last step, at the last projectable value (py[0]: the baseline)
     stop, tail = [(i, y) for i, y in enumerate(py[:-1]) if y is not None][-1]
 
-    for status, color, size in ((DISCARD, DISCARD_COLOR, 40), (KEEP, KEEP_COLOR, 70)):
-        pts = [(t, r) for t, r in measured if r["status"] == status]
-        if pts:
-            ax.scatter(
-                [t for t, _ in pts],
-                [r["new_ms"] for _, r in pts],
-                marker="D",
-                s=size,
-                color=color,
-                edgecolors=INK if status == KEEP else SURFACE,
-                linewidths=0.8,
-                zorder=5,
-            )
-    if failed:
-        ax.scatter(
-            [t for t, _ in failed],
-            [0.965] * len(failed),
-            transform=ax.get_xaxis_transform(),
-            marker="x",
-            s=38,
-            color=FAIL_COLOR,
-            linewidths=1.8,
-            zorder=5,
-            clip_on=False,
+    if measured:  # every measured run: a thin, light line; the best so far: a step line
+        ax.plot(
+            [t for t, _ in measured],
+            [r["new_ms"] for _, r in measured],
+            color=DISCARD_COLOR,
+            lw=EACH_LW,
+            solid_joinstyle="round",
+            zorder=4,
         )
+        best_ms = [r["new_ms"] for _, r in measured if r["status"] == KEEP]
+        bx = [measured[0][0], *(t for t, r in measured if r["status"] == KEEP), end]
+        by = [base_ms, *best_ms, best_ms[-1] if best_ms else base_ms]
+        ax.step(bx, by, where="post", color=KEEP_COLOR, lw=BEST_LW, zorder=5)
+    if failed:  # ticks at the top of the plot (the labels keep the bottom)
+        _fail_ticks(ax, [t for t, _ in failed], top=True)
     # Highlight the integrated result, else the running best measurement.
     final = (read_json(run.root / "integration.json", {}) or {}).get("final") or {}
     kept = [(t, r) for t, r in measured if r["status"] == KEEP]
@@ -694,7 +699,7 @@ def _draw_run(
     # overlap each other, the baseline labels, the projected line or the markers.
     (x0, y0), (x1, _) = ax.transData.transform([(px[stop], tail), (px[stop + 1], tail)])
     avoid = [_box(x0, y0 - 2, x1 - x0, 4, 0.0, "left")]  # the last step of the projection
-    half = 4.5 * ax.figure.dpi / 72  # of a diamond
+    half = 4.5 * ax.figure.dpi / 72  # around a measured run on its line
     for t, r in measured:
         cx, cy = ax.transData.transform((t, r["new_ms"]))
         avoid.append(_box(cx - half, cy - half, 2 * half, 2 * half, 0.0, "left"))
@@ -763,29 +768,10 @@ def _draw_run(
         subtitle += "\n" + "\n".join(textwrap.wrap("; ".join(notes), 125, max_lines=2))
     _header(ax, f"{repo}: {headline}", subtitle, raise_pt=14 if spans else 0)
     handles = [
-        Line2D([], [], color=PROJECTED_COLOR, lw=2, label="projected (kernels)"),
-        Line2D(
-            [],
-            [],
-            ls="",
-            marker="D",
-            ms=7,
-            mfc=KEEP_COLOR,
-            mec=INK,
-            mew=0.8,
-            label="measured, new best",
-        ),
-        Line2D(
-            [],
-            [],
-            ls="",
-            marker="D",
-            ms=6,
-            mfc=DISCARD_COLOR,
-            mec=SURFACE,
-            label="measured, no gain",
-        ),
-        Line2D([], [], ls="", marker="x", ms=7, mec=FAIL_COLOR, mew=1.8, label="failed"),
+        Line2D([], [], color=PROJECTED_COLOR, lw=BEST_LW, label="projected (kernels)"),
+        Line2D([], [], color=KEEP_COLOR, lw=BEST_LW, label="measured, best so far"),
+        Line2D([], [], color=DISCARD_COLOR, lw=EACH_LW, label="each measured run"),
+        _fail_key(),
         Line2D([], [], color=INK_2, lw=1, ls=(0, (5, 4)), label="baseline"),
     ]
     if compiled:
@@ -1252,7 +1238,9 @@ def _draw_integration(
                 color=MUTED,
             )
         else:
-            ax.scatter([x], [level], marker="x", s=60, color=FAIL_COLOR, linewidths=2.2, zorder=4)
+            ax.plot(  # a failed item: a red line at the level it did not change
+                [x - width / 2, x + width / 2], [level, level], color=FAIL_COLOR, lw=2.6, zorder=4
+            )
             reason = "\n".join(textwrap.wrap(s["reason"], 18)[:3]) or s["reason"]
             ax.text(
                 x,
@@ -1316,7 +1304,7 @@ def _draw_integration(
             Patch(
                 facecolor="none", edgecolor=DISCARD_COLOR, hatch="////", label="rejected, no gain"
             ),
-            Line2D([], [], ls="", marker="x", ms=7, mec=FAIL_COLOR, mew=1.8, label="failed"),
+            Line2D([], [], color=FAIL_COLOR, lw=2.6, label="failed"),
         ],
         below_pt=24 + 11 * max(n.count("\n") + 1 for n in names),
     )
