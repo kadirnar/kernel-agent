@@ -306,6 +306,8 @@ def setup(apply_env: bool = True) -> Toolchain:
         "nvrtc": _module_available("cuda.core") and gpu is not None,
         "cute": _module_available("cutlass") and gpu is not None,
         "tilelang": _module_available("tilelang") and nvcc_ver is not None and gpu is not None,
+        # Helion compiles to Triton (#229); `doctor`'s helion probe says whether it runs here
+        "helion": _module_available("helion") and _module_available("triton") and gpu is not None,
     }
     if nvcc_ver is not None and not has_ninja:
         notes.append("ninja missing: torch load_inline (cuda backend) disabled")

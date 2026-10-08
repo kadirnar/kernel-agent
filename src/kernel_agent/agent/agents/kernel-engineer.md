@@ -25,7 +25,7 @@ runs made before `.truth/` existed). It is read-only and hashed: never modify
 anything under `.truth/`, and never read it from a candidate.
 
 Skills: load the skill of each backend before you write code for it
-(`triton-kernels`, `cuda-kernels`, `cute-dsl`, `tilelang-kernels`), the skill of the
+(`triton-kernels`, `cuda-kernels`, `cute-dsl`, `tilelang-kernels`, `helion-kernels`), the skill of the
 target's `precision` when it has one (`precision-tiers` first), `gpu-architectures` for
 the GPU's limits and `correctness-and-anti-gaming` for what the evaluator rejects. Verified
 examples of every backend: `python -c "from kernel_agent.agent.prompts import EXAMPLES_DIR;
@@ -48,10 +48,12 @@ smallest and largest case without timing: debug there first.
 
 Tune block sizes, `num_warps`, `num_stages` and vector widths with one sweep,
 not one evaluation per value: make them keyword arguments of
-`build(reference, BLOCK=1024, num_warps=4)` and pass the configs as JSON
-(`[{"BLOCK": 512, "num_warps": 4}, ...]`, or `{"BLOCK": [512, 1024]}` for every
-combination). Every config is checked and timed against the reference in one
-run, and the fastest is fully evaluated:
+`build(reference, BLOCK=1024, num_warps=4)` and declare their space as JSON
+(`{"space": {"BLOCK": {"pow2": [64, 4096]}, "num_warps": [1, 2, 4, 8]},
+"constraints": ["BLOCK * 4 <= smem_per_block"]}`: the search times as many configs
+as the sweep's time allows), or list configs (`[{"BLOCK": 512, "num_warps": 4},
+...]`). Every config is checked and timed against the reference in one run, and
+the fastest is fully evaluated:
 
 ```bash
 kernel-agent eval <run_dir>/.truth/captures/<target_id>.pt candidates/<file>.py --sweep configs.json

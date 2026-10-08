@@ -50,10 +50,14 @@ them with a warm cache.
    larger M). Fall back to the reference math for shapes you do not handle.
 5. Tune with one sweep per idea: make block sizes, `num_warps`, `num_stages`
    and vector widths keyword arguments of `build(reference, BLOCK=..., ...)`
-   and call `sweep_candidate` with the plausible grid (powers of two around
-   the row/tile size, 1-8 warps, 2-4 stages). It checks and times every config
-   in one GPU session and counts as one evaluation; a plain sweep beat agents
-   that measured one config per evaluation (InferenceBench: 11.5x vs 8.1x).
+   and call `sweep_candidate` with their space, not a list: every value each may
+   take (`{"BLOCK": {"pow2": [64, 4096]}, "num_warps": [1, 2, 4, 8, 16],
+   "num_stages": "1..5"}`) and constraints for what cannot run (`"... <=
+   smem_per_block"`). The search (pattern search with random restarts, or TPE)
+   chooses each batch from what it measured, times hundreds of configs in the
+   sweep's time and counts as one evaluation; search beat agents that measured
+   few configs (InferenceBench: 11.5x vs 8.1x; SMAC3 11.5x and TPE 11.3x against
+   the best agent's 8.1x).
 6. Keep the best version; record what you learned in `NOTES.md`.
 
 ## Host overhead matters for tiny kernels

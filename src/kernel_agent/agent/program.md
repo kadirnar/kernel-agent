@@ -134,9 +134,12 @@ version is saved as `logs/program-<sha12>.md`.
   noise.
 * Tune parameters (block sizes, `num_warps`, `num_stages`, vector widths, tile
   shapes) with `sweep_candidate`, not with one evaluation per value: make them
-  keyword arguments of `build()` and sweep the plausible grid in one call (it
-  counts as one evaluation). One sweep per idea, once the kernel is correct; a
-  sweep tunes an idea, it is not a new one (same `idea_id`).
+  keyword arguments of `build()` and declare their space (every value each may
+  take, with constraints such as the shared memory a config needs `<=
+  smem_per_block`) in one call: the search times as many configs as the sweep's
+  time allows and counts as one evaluation. Declare spaces, not lists.
+  One sweep per idea, once the kernel is correct; a sweep tunes an idea, it is
+  not a new one (same `idea_id`).
 * Per-call host work is real latency at decode shapes. Do allocation,
   weight packing and shape logic once in `build()` or cache them per shape.
 

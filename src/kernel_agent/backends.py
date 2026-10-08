@@ -9,7 +9,8 @@ names) and records what each backend achieved, so the choice follows evidence ra
 habit:
 
 * :func:`classify` reads a candidate's backend from what its source runs (``@triton.jit``,
-  ``load_inline``, ``T.prim_func``, ``cutlass.cute``), not from its imports alone: a kernel
+  ``load_inline``, ``T.prim_func``, ``cutlass.cute``, ``@helion.kernel``), not from its
+  imports alone: a kernel
   that imports ``tilelang`` only to find the CUTLASS headers it ships is CUDA C++ (§4.1).
   Without any such marker it falls back to the imports
   (:func:`kernel_agent.ledger.detect_backend`, the ledger's ``backend`` column).
@@ -63,6 +64,14 @@ _USES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("cuda", re.compile(r"\bload_inline\s*\(|\bcpp_extension\.load\s*\(|\bload\s*\(\s*name=")),
     ("triton", re.compile(r"@triton\.(?:jit|autotune|heuristics)\b|\btriton\.jit\s*\(")),
+    # Helion ("PyTorch with tiles", compiled to Triton; issue #229): its kernel decorator, or
+    # the kernel a candidate makes in build (kernels/helion_tune.py)
+    (
+        "helion",
+        re.compile(
+            r"@helion\.(?:kernel|jit)\b|\bhelion\.(?:kernel|jit)\s*\(|\bhelion_tune\.kernel\s*\("
+        ),
+    ),
 )
 
 
