@@ -639,6 +639,7 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     from kernel_agent import abtest, telemetry
     from kernel_agent.integrate import ab, undo
+    from kernel_agent.workloads import base
     from kernel_agent.workloads.base import decode_stats
 
     try:
@@ -679,7 +680,7 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         a = states["A"] = session.build("A", a_kernels, a_transforms)
         if bad := a.irreversible(keep=session.shareable(a, b_kernels)):
             return _irreversible(bad)
-        reference["A"], reproducible["A"] = ab.warm(session, a, inputs, ns.warmup + 1)
+        reference["A"], reproducible["A"] = ab.warm(session, a, inputs, ns.warmup + 1, window=True)
     except Exception:
         return failed("undo_failed", "the accepted set A failed in-process")
     # No torch.cuda.empty_cache() between A and B: releasing the cached segments turned an
@@ -692,7 +693,7 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     if bad := b.irreversible():
         return _irreversible(bad)
     try:
-        reference["B"], reproducible["B"] = ab.warm(session, b, inputs, ns.warmup + 1)
+        reference["B"], reproducible["B"] = ab.warm(session, b, inputs, ns.warmup + 1, window=True)
     except Exception:
         return failed("runtime_error")
 
@@ -717,6 +718,14 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     if rounds.failed == "B":
         return failed("runtime_error", None, rounds.error or "")
     session.to(b)
+    output = rounds.output
+    detail: dict[str, Any] = {}
+    if workload.windowed:  # the rounds stopped at the window: one whole request to judge
+        try:
+            output, _, detail = base.timed_run(workload, inputs)
+        except Exception:
+            return failed("runtime_error")
+        detail.pop("decode_stats", None)
     released: list[int] = []
 
     def free_a() -> None:
@@ -730,7 +739,7 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         released.append(held - _allocated())
 
     b_ms = ab.median(rounds.b_ms)
-    base_ms, verdict = _judge(ns, workload, inputs, rounds.output, b_ms, truth_files, free_a)
+    base_ms, verdict = _judge(ns, workload, inputs, output, b_ms, truth_files, free_a)
     gpu = monitor.summary()
     if message := telemetry.warning(gpu):
         print(f"e2e_ab: WARNING {message}", file=sys.stderr, flush=True)
@@ -745,8 +754,10 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "peak_mem_gb": round(peak, 3),
         "patches": b.report.__dict__,
     }
+    if detail:  # B's whole request (metric=ttfa): the steady state and the full run
+        result["metric_detail"] = detail
     if (stats := decode_stats(rounds.b_stats)) is not None:  # Workload.report_stats of B
-        result["metric_detail"] = {"decode_stats": stats}
+        result["metric_detail"] = {**result.get("metric_detail", {}), "decode_stats": stats}
     result["ab"] = {
         **abtest.paired(rounds.a_ms, rounds.b_ms),
         **rounds.ab(),

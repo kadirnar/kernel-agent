@@ -16,6 +16,13 @@ first audio chunk of a streaming run for ``metric=ttfa``, the wall time per seco
 generated audio for ``metric=throughput``. :func:`measure` returns its value as
 ``median_ms`` (lower is better for every metric).
 
+A metric whose value is known before the run ends (``ttfa``: at the first chunk) is timed
+inside :meth:`Workload.metric_window`: the timed requests stop there, and one request per
+measurement streams to the end for the output the quality checks judge and the full-run
+details (:func:`measure`). A request up to the first chunk costs a fraction of a streamed
+run (VoxCPM2: 98 ms of 5.8 s eager), so every time-to-first-audio check is that much
+cheaper with the same number of requests.
+
 Generation loops get generic serving hooks (:mod:`.serving`): :meth:`Workload.async_flags`
 (stop flags read on the host without draining the GPU), :meth:`Workload.serving` (the
 ``-o serving=static|continuous`` opt-in for a request queue with continuous batching and a
@@ -138,6 +145,9 @@ class Workload(ABC):
     #: relaxed error budgets (about twice near-lossless's), still failing broken kernels.
     #: Empty: the near-lossless floor (with the relaxed gate thresholds).
     relaxed_options: ClassVar[dict[str, Any]] = {}
+    #: Inside :meth:`metric_window` with a windowed metric (``ttfa``): a streaming
+    #: :meth:`run` returns after its first chunk (check it after every :meth:`mark_chunk`).
+    in_window: bool = False
 
     def __init__(self, spec: WorkloadSpec) -> None:
         self.spec = spec
@@ -294,13 +304,29 @@ class Workload(ABC):
         """Raise ``ValueError`` when this workload cannot time ``self.metric``."""
         objective.check(self.metric, type(self).metrics, type(self).__name__)
 
+    @property
+    def windowed(self) -> bool:
+        """The metric's value is known before the run ends (``ttfa``: at the first chunk),
+        so :meth:`metric_window` may shorten a run."""
+        return self.metric == objective.TTFA
+
     @contextlib.contextmanager
     def metric_window(self) -> Iterator[None]:
-        """Context in which :meth:`run` may stop once the metric's value is known (a
-        streaming workload: after the first chunk for ``metric=ttfa``). ``analyze``
-        profiles inside it, so the profile shows where the *metric's* time goes. The
-        default is the whole run."""
-        yield
+        """Context in which :meth:`run` may stop once the metric's value is known: with
+        ``metric=ttfa`` :attr:`in_window` is set, and a streaming run returns after its
+        first chunk. ``analyze`` profiles inside it, so the profile shows where the
+        *metric's* time goes, and the timed requests of every measurement but one run
+        inside it (:func:`measure`, the A/B rounds, the diverse set), so a time to first
+        audio costs the request up to its first chunk, not a whole streamed run. Other
+        metrics: the whole run."""
+        if not self.windowed:
+            yield
+            return
+        saved, self.in_window = self.in_window, True
+        try:
+            yield
+        finally:
+            self.in_window = saved
 
     def mark_chunk(self, audio_ms: float | None = None) -> None:
         """Streaming workloads: an output chunk is available now (call it when the chunk
@@ -355,7 +381,8 @@ class Workload(ABC):
 
         ``ttfa``: the first mark minus ``start``; the details hold the median latency of
         the next ``steady_chunks`` chunks (``chunk_ms``), its real-time factor (``rtf``)
-        and the full run (``run_ms``).
+        and the full run (``run_ms``), none for a run inside :meth:`metric_window` (it
+        stopped at its first chunk: the full request of the measurement reports them).
 
         ``throughput``: the run's wall time per second of generated audio
         (:meth:`output_seconds`), i.e. ``1000 / throughput`` ms, so that lower is better
@@ -391,6 +418,8 @@ class Workload(ABC):
                 "metric=ttfa: the run produced no audio chunk (Workload.mark_chunk was never "
                 "called): the streaming path was bypassed"
             )
+        if self.in_window:  # stopped at its first chunk: no steady state, no full run
+            return (marks[0][0] - start) * 1000, {}
         k = int(self.options.get("steady_chunks", objective.STEADY_CHUNKS))
         steady = marks[: k + 1]
         gaps = [(b[0] - a[0]) * 1000 for a, b in itertools.pairwise(steady)]
@@ -477,21 +506,27 @@ def synchronize() -> None:
         torch.cuda.synchronize()
 
 
-def timed_run(workload: Workload, inputs: Any) -> tuple[Any, float, dict[str, Any]]:
+def timed_run(
+    workload: Workload, inputs: Any, *, window: bool = False
+) -> tuple[Any, float, dict[str, Any]]:
     """One GPU-synchronised run of ``workload.run``: ``(output, value of the workload's
     metric in ms, its per-run details)`` (:meth:`Workload.metric_value`; with the counters
     the run reported, :meth:`Workload.report_stats`, as ``decode_stats``). The clock starts
-    before ``workload.run`` is called, so whatever a transform does around it counts."""
+    before ``workload.run`` is called, so whatever a transform does around it counts.
+    ``window``: inside :meth:`Workload.metric_window` (``ttfa``: the request up to its first
+    chunk; the output is the window's, the full-run details are missing)."""
     workload.chunk_marks.clear()
     workload.run_stats = {}
-    with torch.inference_mode():
-        synchronize()
-        start = time.perf_counter()
-        output = workload.run(inputs)
-        synchronize()
-        end = time.perf_counter()
-    ms, detail = workload.metric_value(start, end)
-    if workload.run_stats:
+    with workload.metric_window() if window else contextlib.nullcontext():
+        with torch.inference_mode():
+            synchronize()
+            start = time.perf_counter()
+            output = workload.run(inputs)
+            synchronize()
+            end = time.perf_counter()
+        ms, detail = workload.metric_value(start, end)
+        short = workload.in_window
+    if workload.run_stats and not short:  # a request stopped at the window: partial counts
         detail = {**detail, "decode_stats": dict(workload.run_stats)}
     return output, ms, detail
 
@@ -521,7 +556,13 @@ def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3)
     ones, in milliseconds: the wall-clock latency of ``workload.run`` by default, the time
     to first audio for ``metric=ttfa`` (:mod:`kernel_agent.objective`). ``median_ms`` is
     the optimiser's objective; other metrics add ``metric_detail`` (medians over the runs),
-    and so do counters the runs reported (``metric_detail.decode_stats``, :func:`decode_stats`)."""
+    and so do counters the runs reported (``metric_detail.decode_stats``, :func:`decode_stats`).
+
+    A windowed metric (``ttfa``, :attr:`Workload.windowed`): the first warm-up and the last
+    timed run are whole requests (every step warmed up; the ``output`` the quality checks
+    judge and the full-run details), the other runs stop at the end of the
+    :meth:`~Workload.metric_window`. Still ``iters`` samples of the metric, for one
+    streamed request and ``iters - 1`` short ones. Other metrics: every run is whole."""
     output = None
     if torch.cuda.is_available():
         # Same clock warm-up for baseline and optimised runs (fair comparison).
@@ -529,12 +570,16 @@ def measure(workload: Workload, inputs: Any, *, warmup: int = 1, iters: int = 3)
 
         warm_gpu(500.0)
     with torch.inference_mode():
-        for _ in range(warmup):
-            output = workload.run(inputs)
+        for i in range(warmup):
+            # the first warm-up runs every step (lazy init, graph capture, compilation);
+            # the others warm up what the windowed runs time
+            short = i > 0 and iters > 0
+            with workload.metric_window() if short else contextlib.nullcontext():
+                output = workload.run(inputs)
         synchronize()
     times, details, counters = [], [], []
-    for _ in range(iters):
-        output, ms, detail = timed_run(workload, inputs)
+    for i in range(iters):
+        output, ms, detail = timed_run(workload, inputs, window=i < iters - 1)
         times.append(ms)
         counters.append(detail.pop("decode_stats", {}))
         details.append(detail)

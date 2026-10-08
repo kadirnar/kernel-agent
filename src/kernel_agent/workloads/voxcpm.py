@@ -137,7 +137,6 @@ class VoxCPMWorkload(Workload):
     sanity_rms_tolerance = {"audio": 0.6}
     # `-o metric=ttfa`: the streaming path (`_stream`), time to the first audio chunk.
     metrics = (objective.LATENCY, objective.TTFA)
-    _first_chunk_only = False  # inside `metric_window()` (metric=ttfa)
 
     def load(self) -> None:
         from huggingface_hub import snapshot_download
@@ -270,22 +269,12 @@ class VoxCPMWorkload(Workload):
         name = self.options.get("reference_wav")
         return {"reference_wav_path": str(ASSETS / name)} if name else {}
 
-    @contextlib.contextmanager
-    def metric_window(self) -> Iterator[None]:
-        """``metric=ttfa``: :meth:`run` stops after the first audio chunk."""
-        if self.metric != objective.TTFA:
-            yield
-            return
-        self._first_chunk_only = True
-        try:
-            yield
-        finally:
-            self._first_chunk_only = False
-
     def _stream(self, **kwargs: Any) -> torch.Tensor:
         """``metric=ttfa``: ``model.generate_streaming(**kwargs)``, every chunk marked on
         arrival (:meth:`mark_chunk`; VoxCPM hands it over on the host). Returns the chunks
-        concatenated. The streaming path must yield one chunk per generated patch."""
+        concatenated. The streaming path must yield one chunk per generated patch. Inside
+        :meth:`metric_window` (the timed requests) the stream is closed after its first
+        chunk, as a client that stops listening closes it."""
         chunks: list[torch.Tensor] = []
         patches = 0
 
@@ -300,7 +289,7 @@ class VoxCPMWorkload(Workload):
                 for chunk in stream:
                     chunks.append(chunk)
                     self.mark_chunk(audio_ms=1000.0 * chunk.shape[-1] / self.sampling_rate)
-                    if self._first_chunk_only:
+                    if self.in_window:
                         break
             except torch.OutOfMemoryError:
                 raise  # the GPU, not the streaming path
@@ -310,7 +299,7 @@ class VoxCPMWorkload(Workload):
                 stream.close()
         if not chunks:
             raise RuntimeError("metric=ttfa: the streaming path yielded no audio chunk")
-        if patches and len(chunks) != patches and not self._first_chunk_only:
+        if patches and len(chunks) != patches and not self.in_window:
             raise RuntimeError(
                 f"metric=ttfa: the streaming path yielded {len(chunks)} audio chunk(s) for "
                 f"{patches} generated patches: `_inference(streaming=True)` must yield every "
