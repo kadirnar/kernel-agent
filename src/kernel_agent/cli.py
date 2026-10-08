@@ -145,15 +145,20 @@ def _integration_reserve(raw: str) -> float | None:
     return minutes
 
 
-def _agents(raw: str) -> int:
-    """``--agents``: concurrent agent sessions (a positive count)."""
+def _agents(raw: str) -> int | str:
+    """``--agents``: concurrent agent sessions (a positive count), or ``auto`` / ``auto:N``
+    (the governor decides, up to N: ``governor.parse_agents``)."""
+    from kernel_agent.governor import parse_agents
+
     try:
-        n = int(raw)
+        n = parse_agents(raw)[0]
     except ValueError:
         n = 0
     if n < 1:
-        raise argparse.ArgumentTypeError(f"expected a positive number of sessions, got {raw!r}")
-    return n
+        raise argparse.ArgumentTypeError(
+            f"expected a positive number of sessions, auto or auto:N, got {raw!r}"
+        )
+    return raw.strip().lower() if raw.strip().lower().startswith("auto") else n
 
 
 def _count(raw: str) -> int:
@@ -373,9 +378,11 @@ def cmd_integrate(ns: argparse.Namespace) -> int:
 
 def cmd_improve(ns: argparse.Namespace) -> int:
     from kernel_agent import interrupt
+    from kernel_agent.governor import parse_agents
     from kernel_agent.improve import ImproveConfig, improve
     from kernel_agent.scheduler import Policy
 
+    agents, governed = parse_agents(ns.agents)  # --agents N | auto | auto:N
     icfg = ImproveConfig(
         slice=ns.slice,
         rounds=ns.rounds,
@@ -383,7 +390,9 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         max_slices=ns.max_slices,
         research_every=ns.research_every,
         integration_reserve=ns.integration_reserve,
-        agents=ns.agents,
+        agents=agents,
+        governor=governed,
+        async_evals=ns.async_evals,
         **({"role_max": ns.role_max} if ns.role_max else {}),
         overlap=ns.overlap,
         board=ns.board,
@@ -877,14 +886,23 @@ def main(argv: list[str] | None = None) -> int:
         "--agents",
         type=_agents,
         default=3,
-        metavar="N",
+        metavar="N|auto",
         help="agent sessions at once (default 3; 1: one at a time, the sequential loop). "
         "With N > 1 the slots go to the arms that pay (slices, research sessions, dossiers), "
         "the GPU evaluations take turns in the GPU job queue with clean timing (the agents' "
         "GPU scripts through run_on_gpu, timing cores, builds before the lock, dirty "
         "timings re-run), the re-integration runs in the background and a usage limit "
         "pauses every session once (docs/MULTIAGENT.md); k = 3-4 is the measured sweet "
-        "spot on one GPU",
+        "spot on one GPU. auto (auto:N: at most N, default 6): the governor keeps as many "
+        "as make the run fastest: up to the GPU's measured knee, and no more than the usage "
+        "windows sustain until they reset (a spent window pauses every session); the "
+        "host's memory too, and USD only with --max-usd",
+    )
+    p.add_argument(
+        "--async-evals",
+        action="store_true",
+        help="kernel and native sessions also get submit_evaluation / evaluation_result: "
+        "an evaluation runs while the agent writes its next candidate",
     )
     p.add_argument(
         "--role-max",

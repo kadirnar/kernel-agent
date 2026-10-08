@@ -61,7 +61,17 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import board, interrupt, ledger, objective, pivot, projection, research, workers
+from kernel_agent import (
+    board,
+    governor,
+    interrupt,
+    ledger,
+    objective,
+    pivot,
+    projection,
+    research,
+    workers,
+)
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
@@ -126,6 +136,13 @@ class ImproveConfig:
     integration_reserve: float | None = None
     # agent sessions at once (--agents, coordinator.py, issue #183; 1: the sequential loop)
     agents: int = 1
+    # --agents auto (governor.py, issue #191): up to ``agents`` sessions, as many as make the
+    # run fastest (the GPU's knee; the usage windows only so they do not run out; the host's
+    # memory; USD only with --max-usd)
+    governor: bool = False
+    # --async-evals (issue #191): submit_evaluation / evaluation_result beside
+    # evaluate_candidate, so a session writes its next candidate while one is evaluated
+    async_evals: bool = False
     # sessions of a role at once (--role-max) over the role registry's max_concurrent
     # (roles.REGISTRY: kernel 4, systems 1, native 1; scheduler.role_caps)
     role_max: dict[str, int] = field(default_factory=dict)
@@ -153,6 +170,11 @@ class ImproveConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def concurrent(self) -> bool:
+        """The coordinator runs the loop (``--agents`` above 1, or ``auto``)."""
+        return self.agents > 1 or self.governor
 
 
 # ------------------------------------------------------------------ state
@@ -609,7 +631,7 @@ class Improver:
         self.no_round: str | None = None  # why the loop started no new round (_next_round)
         # concurrent sessions (--agents > 1, coordinator.py): slices are attributed by the
         # ledger rows of their own sessions (their labels, ``sessions``)
-        self.concurrent = icfg.agents > 1
+        self.concurrent = icfg.concurrent
 
     # -------------------------------------------------------- helpers
 
@@ -865,6 +887,8 @@ class Improver:
         self.state["config"] = self.icfg.to_dict()
         self.state.pop("finished", None)
         self.state.pop("coordinator", None)  # of an earlier invocation with --agents N
+        self.state.pop("governor", None)  # ... with --agents auto
+        self.orch.async_evals = self.icfg.async_evals  # --async-evals (agent/tools.py)
         self.save()
         ledger.event(self.run, "phase_start", phase="improve")
         if board.enabled(self.icfg.board, self.icfg.agents):  # the blackboard (board.py, #187)
@@ -894,6 +918,7 @@ class Improver:
             board.close(self.run)
             self.orch.observer.detach()
             critic.close(self.run)
+            self.orch.async_evals = False
         ledger.event(self.run, "phase_done", phase="improve")
         return reason
 
@@ -1817,11 +1842,20 @@ def _concurrency_lines(state: dict[str, Any]) -> list[str]:
     if not done:
         return []
     waited = sum(float(s.get("queue_s") or 0.0) for s in state["slices"])
-    return [
-        f"* --agents {done['agents']}: at most {done['peak']} sessions at once; their "
+    gov = done.get("governor")  # --agents auto (governor.py, #191)
+    agents = f"auto (up to {done['agents']})" if gov else done["agents"]
+    lines = [
+        f"* --agents {agents}: at most {done['peak']} sessions at once; their "
         f"evaluations waited {waited / 60:.0f} min for the GPU in all; "
         f"{done['rate_limit_waits']} shared usage-limit wait(s)"
     ]
+    if gov:
+        lines.append(
+            f"* governor: k between {gov['low']} and {gov['high']} (mean {gov['mean']:.1f}), "
+            f"changed {gov['changes']} times (`governor` events)"
+            + (f"; last: {line}" if (line := governor.status_line(state.get("governor"))) else "")
+        )
+    return lines
 
 
 def _island_lines(run: RunDir, state: dict[str, Any]) -> list[str]:
@@ -2158,7 +2192,7 @@ async def improve(
         orch.budget.max_usd = orch.budget.spent_usd() + cfg.max_usd
     log(f"run directory: {orch.run.root}")
     # concurrent simulated sessions run in virtual time (dryrun.VirtualClock)
-    world = dryrun.World(orch, virtual=icfg.agents > 1) if dry_run else None
+    world = dryrun.World(orch, virtual=icfg.concurrent) if dry_run else None
     with (
         coordinator_lock(orch.run),  # one process per run: its truth is in our memory
         _interrupt_note(orch.run),

@@ -49,12 +49,14 @@ from kernel_agent import (
 from kernel_agent.agent import auth, prompts, web
 from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import (
+    ASYNC_TOOLS,
     SessionBinding,
     best_for_target,
     build_server,
     current_records,
     ranked_for_target,
     record_candidate,
+    settle,
     tool_names,
 )
 from kernel_agent.budget import MIN_AGENT_SECONDS, MIN_AGENT_USD, SOL_STOP_PCT, Budget
@@ -130,6 +132,9 @@ class Orchestrator:
         # Concurrent sessions (improve --agents N, coordinator.py): every engineer session may
         # write only in its own directory (:meth:`_owned`, docs/MULTIAGENT.md §3.6).
         self.ownership = False
+        # improve --async-evals (issue #191): the sessions with evaluate_candidate also get
+        # submit_evaluation / evaluation_result (agent/tools.py)
+        self.async_evals = False
         # What every agent session is doing and the GPU's queue (sessions.py, issue #184):
         # sessions.jsonl, session_state events, improve.json sessions / gpu, costs.json time
         self.observer = sessions.Observer(
@@ -336,7 +341,11 @@ class Orchestrator:
         spec = roles.get(role)
         binding = kwargs.pop("binding", None) or SessionBinding()
         binding = dataclasses.replace(binding, label=label or name, role=binding.role or role or "")
-        server = build_server(self.run, self.budget, self.truth, binding, env=self.env)
+        # --async-evals (#191): a session that evaluates kernels may submit them, too
+        async_evals = self.async_evals and "evaluate_candidate" in spec.mcp_tools
+        server = build_server(
+            self.run, self.budget, self.truth, binding, env=self.env, async_evals=async_evals
+        )
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
         ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)
@@ -353,6 +362,9 @@ class Orchestrator:
         if board.active(self.run) is not None and role in board.ROLES:  # the blackboard (#187)
             kwargs["mcp_tools"] = [*kwargs["mcp_tools"], *tool_names(*board.TOOLS)]
             kwargs["system_append"] += prompts.board_note(name)
+        if async_evals:  # submit_evaluation / evaluation_result and their advice semantics
+            kwargs["mcp_tools"] = [*kwargs["mcp_tools"], *tool_names(*ASYNC_TOOLS)]
+            kwargs["system_append"] += prompts.async_note()
         budget = self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
         # the session's own part, after everything its role's sessions share
         kwargs["prompt"] = prompts.first_message((context, budget), kwargs["prompt"])
@@ -411,6 +423,8 @@ class Orchestrator:
             cfg = self._session_config(role, config, label or name)
             if result.session_id:  # continue it (else the same prompt in a new session)
                 kwargs.update(prompt=auth.RESUME_PROMPT, resume=result.session_id)
+        if async_evals and (left := await settle(self.run, label or name)):
+            log(f"agent {name}: {left} submitted evaluation(s) finished after it ended")
         timing = tracker.close(result)
         self.agent_results.append(result)
         if self.budget.gate is not None and result.usage_limit is None:

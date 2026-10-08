@@ -2941,6 +2941,7 @@ librarian's model) live in one place, and `program.md`'s sections are its roles.
 ```bash
 kernel-agent improve <run_dir | hf-url> [--max-hours 6] [--max-usd 60] [--slice 4] [--rounds R]
 kernel-agent improve <run_dir | hf-url> --agents 1   # one session at a time (default: 3 at once)
+kernel-agent improve <run_dir | hf-url> --agents auto   # as many as make the run fastest
 kernel-agent improve Qwen/Qwen3-0.6B --dry-run     # simulated: no GPU, no Claude
 ```
 
@@ -3332,11 +3333,78 @@ model and starts a new round (`kernel_agent/improve.py`,
     `review` column and `critic` events, the model's cost in `costs.json`. The evaluator's
     own checks stay the gate (LLM verifiers measured 0.73-0.82 accurate): the critic saves
     the GPU time and the turn a refused candidate costs, and never passes one.
+  * *Governor* (`--agents auto`, or `auto:N` for at most N, default 6; issue #191,
+    `kernel_agent/governor.py`). **Its objective is the run's wall-clock speed**: as many
+    sessions as make the optimisation progress faster. It never throttles to save money
+    (USD bounds it only when you give `--max-usd`), and a usage window bounds it only so the
+    window does not run out before it resets (a spent window pauses every session until
+    then, which is slower). The coordinator decides again at every wake-up how many
+    sessions may run, the smallest of:
+    * the GPU's knee `1 + Z/S`, rounded up, plus one: `Z` is the time the GPU roles'
+      sessions work off the GPU per evaluation (`sessions.py`), `S` the GPU time per
+      evaluation (every job that held the GPU, the re-integration's A/B steps too); the
+      extra session keeps the GPU busy while one thinks longer than the average. It starts
+      at 3 and follows the measurements; it binds only the roles that need the GPU, so a
+      research session or a dossier may still start;
+    * per usage window (`five_hour`, `seven_day`, and `seven_day_opus` / `_sonnet` for the
+      sessions of that model only; read from every session's rate-limit events), AIMD on
+      the utilization projected for its reset or the run's end, whichever is first: the
+      window's measured rise per session-second times the sessions it will count (k times
+      the measured share of the allowed slots that ran a session). It grows by one every
+      quiet 15 min while the projection with one more session stays under 95 %, holds
+      between 95 and 100 %, and only once the window would run out goes down just enough,
+      to what fits under 95 % (at least halved when far over, or on a rejection);
+    * the host's memory (each session's CLI and its builds next to one evaluator: 3 GB
+      a session, 6 GB for the evaluator, 2 GB reserve, out of what other programs leave);
+    * with `--max-usd` only: what it has left after the running sessions' reservations.
+
+    Lowering k never stops a session, and the first session always starts. Each change
+    is a `governor` event that says why, `improve.json` → `governor` has the live terms,
+    `kernel-agent status` a line such as `governor: k = 2 of 6: GPU knee 4 (1 + Z/S =
+    2.6), five_hour 2 (42% used, 93% projected), seven_day 4 (55% used, 71% projected)`,
+    and the report the range and mean of k. In a 10-hour dry run with simulated usage
+    windows (`dryrun.SimUsage`; the 5-hour window resets 4 h in; seeds 0-4, means;
+    `docs/research-scripts/agents-191/`):
+
+    | scenario | `--agents` | evaluations | 5-hour window max | account spent | sessions stopped at the limit |
+    |---|---|---:|---:|---:|---:|
+    | median rate, 10 % used | 1 / 2 / 3 / 4 | 75 / 118 / 137 / 152 | 46 / 68 / 80 / 87 % | 0 h | 0 |
+    | | auto | 121 | 71 % | 0 h | 0 |
+    | 40 % used before the run | 1 / 2 / 3 / 4 | 75 / 118 / 125 / 135 | 76 / 98 / 100 / 100 % | 0 / 0.1 / 0.63 / 1.35 h | 0 / 0.4 / 1.6 / 1.8 |
+    | | auto | 118 | 92 % | 0 h | 0 |
+    | p90 usage rate | 1 / 2 / 3 / 4 | 75 / 106 / 106 / 106 | 74 / 99 / 100 / 100 % | 0 / 0.74 / 1.46 / 2.05 h | 0 / 3.0 / 4.4 / 3.8 |
+    | | auto | 102 | 95 % | 0 h | 0 |
+
+    `auto` beats one session by 36-61 % and never spends a window, where fixed `--agents
+    2`-`4` run it dry when it binds (every session waits up to 2 h for the reset). It is
+    not the fastest everywhere: where a window binds, fixed counts that spend it make up
+    to 15 % more evaluations from the same windows (the stall costs less than the margin
+    `auto` keeps), and where none binds (the first rows) its projection, which counts
+    every allowed session as busy until the reset, holds it at 2 sessions for the first
+    hours of a fresh window, so `--agents 4` makes 25 % more. A fixed `--agents 3` stays
+    the default to try; `auto` is the one for a subscription whose window may run out.
+  * *Evaluations in flight* (`--async-evals`, issue #191). Kernel and native sessions also
+    get `submit_evaluation` (the arguments of `evaluate_candidate`; it returns a ticket as
+    soon as the candidate is snapshotted and reviewed, and the evaluation queues, runs and
+    is recorded while the agent writes its next candidate) and `evaluation_result` (waits
+    and returns exactly what `evaluate_candidate` would have). The advice comes with the
+    result and counts that evaluation: collect it before the next submission (`stop`: the
+    candidate written meanwhile is not evaluated). One evaluation in flight per session (a
+    `mode="quick"` check may run meanwhile; a full `evaluate_candidate` is refused until it
+    is collected); a result known at once (a duplicate, a critic's reject, an input error)
+    comes back from `submit_evaluation` itself. The session's clock runs while it works
+    and stops only while `evaluation_result` waits for the GPU (`gpuqueue.Job.attach`), and
+    an evaluation still in flight when the session ends is recorded as its own. Off by
+    default: in the dry run it adds 1-2 % evaluations and costs more of the usage window
+    per evaluation (the candidate written while the last evaluation ran is thrown away
+    when the advice says stop): `--agents 3` 137 → 139 evaluations but 80 → 96 % of the
+    5-hour window, and where the window binds, fewer evaluations (125 → 118). It pays when
+    evaluations wait long for the GPU and the window has room.
   * *Records.* A slice record names its sessions (`sessions`) and their GPU waits
     (`queue_s`); its evaluations, keeps and `improved` come from its own sessions'
     ledger rows, not from what the arm did meanwhile. `improve.json` → `coordinator`
-    has the most sessions at once and the rate-gate waits; `interrupted` lists every
-    activity that was running.
+    has the most sessions at once and the rate-gate waits (and with `--agents auto` the
+    governor's range of k); `interrupted` lists every activity that was running.
   * *Dry run.* `--dry-run --agents N` runs in virtual time
     (`dryrun.VirtualClock`): the event loop's clock is simulated, the simulated
     sessions are concurrent and think in simulated seconds, and every evaluation,
@@ -4133,6 +4201,11 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
                                        the move-on rules retire a target for one round
   --integration-reserve auto|MINUTES   time kept for the final integration (auto: its
                                        estimate, at most a third of --max-hours; 0: none)
+  --agents N|auto|auto:N               agent sessions at once (default 1); auto: the governor
+                                       keeps as many as make the run fastest (GPU knee, usage
+                                       windows, host memory; see "Governor")
+  --async-evals                        submit_evaluation / evaluation_result for kernel and
+                                       native sessions (see "Evaluations in flight")
   --board auto|on|off                  the sessions' blackboard (auto: with --agents > 1)
   --critic off|static|model            review every full evaluation before the GPU (static
                                        checks; model: + a cheap model while it waits,

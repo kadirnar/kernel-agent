@@ -53,6 +53,11 @@ rate gate opens, a role's first session streams, a breaker's pause ends (and eve
   starts and its ``release`` when it ends; a ``claim`` its agent posts (``post_note``: a
   systems agent before a transform that replaces a module) joins its claims, which
   ``--overlap`` then weighs.
+* **Governor** (``--agents auto``, ``governor.py``, issue #191): the slots are the governor's
+  k, decided again at every wake-up from the GPU's knee, each usage window's projected
+  utilization (every session's rate-limit events), the host's memory and the USD left; a
+  session of a role that needs the GPU starts only below the knee, one of a model with a
+  window of its own only below that window's k. Lowering k stops no session.
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -67,7 +73,7 @@ from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import AssistantMessage, RateLimitEvent
 
-from kernel_agent import board, gpuqueue, interrupt, ledger, roles, scheduler
+from kernel_agent import board, governor, gpuqueue, interrupt, ledger, roles, scheduler
 from kernel_agent.agent import runner
 from kernel_agent.improve import MAX_FAILED_SLICES, _ts, log, slices_chart
 from kernel_agent.native import engine as native_engine
@@ -257,6 +263,7 @@ class Coordinator:
         self.draining: str | None = None
         self.peak = 0  # most sessions at once
         self.gate = RateGate()
+        self.governor: governor.Governor | None = None  # --agents auto (run)
         self.wake: asyncio.Event | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.tg: asyncio.TaskGroup | None = None
@@ -272,7 +279,20 @@ class Coordinator:
         self.gate = RateGate(clock=self.orch.clock, sleep=self.orch.sleep, on_change=self._gated)
         budget.gate = self.gate
         self.orch.ownership = True  # every engineer session writes only in its own directory
-        log(f"--agents {self.slots}: up to {self.slots} agent sessions at once")
+        unlisten: Callable[[], None] | None = None
+        if self.icfg.governor:  # --agents auto: the governor decides how many (governor.py)
+            self.governor = governor.Governor(
+                self.slots,
+                clock=self.orch.clock,
+                time_left=budget.agent_seconds_left,
+                work=self.orch.observer.work,
+                memory=None if self.orch.simulated else governor.host_memory,
+                on_change=self._governed,
+            )
+            unlisten = gpuqueue.listen(self.governor.gpu)
+            log(f"--agents auto: up to {self.slots} agent sessions at once, as the governor says")
+        else:
+            log(f"--agents {self.slots}: up to {self.slots} agent sessions at once")
         posts = board.active(self.imp.run)
         if posts is not None:  # an agent's claim joins its session's claims
             posts.listen(self._posted)
@@ -288,6 +308,8 @@ class Coordinator:
         finally:
             if posts is not None:
                 posts.unlisten(self._posted)
+            if unlisten is not None:
+                unlisten()
             self.gate.stop()
             budget.gate = None
             self.orch.ownership = False
@@ -296,6 +318,7 @@ class Coordinator:
                 "agents": self.slots,
                 "peak": self.peak,
                 "rate_limit_waits": self.gate.closings,
+                **({"governor": self._governor_summary()} if self.governor else {}),
             }
             self.imp.save()
 
@@ -323,6 +346,38 @@ class Coordinator:
                     if idle:  # a new round started: decide at once
                         continue
             await self._sleep()
+
+    def _governed(self, decision: dict[str, Any]) -> None:
+        """The governor changed k or one of its terms: a ``governor`` event, the live terms in
+        ``improve.json``, a log line."""
+        ledger.event(self.imp.run, governor.EVENT, **decision)
+        self.imp.state["governor"] = {k: v for k, v in decision.items() if k != "why"}
+        self.imp.save()
+        log(f"governor: k = {decision['k']} ({decision['why']})")
+
+    def _governor_summary(self) -> dict[str, Any]:
+        """``improve.json`` → ``coordinator`` → ``governor``: k's range, mean and changes."""
+        assert self.governor is not None
+        gov = self.governor
+        return {
+            "low": gov.low,
+            "high": gov.high,
+            "mean": round(gov.mean_k(), 2),
+            "changes": gov.changes,
+        }
+
+    def _slots(self) -> int:
+        """The sessions that may run now: ``--agents N``, or the governor's k (``auto``)."""
+        if self.governor is None:
+            return self.slots
+        free = self.orch.budget.free_usd()
+        k_usd = None
+        if free is not None:  # the running sessions and as many more as the USD left covers
+            k_usd = len(self.jobs) + math.floor(max(free, 0.0) / max(self._usd(KERNEL), 0.01))
+        return self.governor.update(k_usd)
+
+    def _model(self, role: str) -> str:
+        return roles.model_for(role, self.orch.cfg)
 
     def _gated(self, state: str) -> None:
         """The rate gate closed or opened: an event (``rate_gate``), and decide again."""
@@ -388,7 +443,7 @@ class Coordinator:
 
     def _fill(self) -> int:
         """Start sessions in the free slots (module docstring); returns how many started."""
-        free = self.slots - len(self.jobs)
+        free = self._slots() - len(self.jobs)
         budget = self.orch.budget
         if free <= 0 or budget.waiting() is not None:
             return 0
@@ -433,11 +488,16 @@ class Coordinator:
 
     def _ok(self, arm: Arm) -> bool:
         """The coordinator's conditions for the next session of ``arm`` now: its role is not
-        paused by its breaker, its expected USD is covered (or nothing runs), and with
+        paused by its breaker, the governor allows one more of its model and role
+        (``--agents auto``), its expected USD is covered (or nothing runs), and with
         ``--overlap avoid`` no running session works on the same modules."""
         assert self.loop is not None
         kind, role, _ = self._next(arm)
         if self.paused.get(role, 0.0) > self.loop.time():
+            return False
+        if self.governor is not None and self.governor.refuses(
+            self._model(role), roles.get(role).needs_gpu
+        ):
             return False
         free = self.orch.budget.free_usd()
         if free is not None and self.jobs and free < self._usd(role):
@@ -488,6 +548,8 @@ class Coordinator:
         job.usd = self._usd(role)
         job.started = self.loop.time()
         self.orch.budget.reserve_usd(job.label, job.usd)
+        if self.governor is not None:
+            self.governor.started(job.label, self._model(role), roles.get(role).needs_gpu)
         if self.icfg.stagger and not any(j.role == role for j in self.jobs.values()):
             self.loop.call_later(STAGGER_S, self._warmed, job)  # the first of its role now
         self.jobs[job.label] = job
@@ -508,6 +570,8 @@ class Coordinator:
             self._warmed(job)
         elif isinstance(message, RateLimitEvent):
             self.gate.see(message.rate_limit_info)
+            if self.governor is not None:  # every window's utilization (--agents auto)
+                self.governor.see(message.rate_limit_info)
 
     # -------------------------------------------------------- sessions
 
@@ -538,6 +602,8 @@ class Coordinator:
         finally:
             self.jobs.pop(job.label, None)
             self.orch.budget.release_usd(job.label)
+            if self.governor is not None:
+                self.governor.ended(job.label)
             if job.claimed or job.claims:  # its modules are free again (board.py)
                 board.release(self.imp.run, job.label, job.arm.id, job.claims)
             if not any(j.role == job.role for j in self.jobs.values()):

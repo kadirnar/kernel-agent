@@ -10,6 +10,7 @@ from typing import Any
 from kernel_agent import (
     backends,
     diversity,
+    governor,
     gpuqueue,
     ledger,
     objective,
@@ -63,13 +64,18 @@ def _agents(run: RunDir, width: int, running: bool) -> list[str]:
     lines = []
     now = time.time()
     if live:
-        config = (read_json(run.root / "improve.json", {}) or {}).get("config") or {}
+        state = read_json(run.root / "improve.json", {}) or {}
+        config = state.get("config") or {}
         n = config.get("agents") if isinstance(config, dict) else None
+        if isinstance(config, dict) and config.get("governor"):
+            n = f"auto, up to {n}"
         lines.append(
             f"agents: {len(live)} running"
-            + (f" (--agents {n})" if isinstance(n, int) and n > 1 else "")
+            + (f" (--agents {n})" if isinstance(n, str) or (isinstance(n, int) and n > 1) else "")
             + ("" if running else " (the run is not running: left open)")
         )
+        if line := governor.status_line(state.get("governor")):  # --agents auto (#191)
+            lines.append(line[:width])
         rows = [
             [
                 a.label,

@@ -70,7 +70,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_agent_sdk import AssistantMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, RateLimitEvent, RateLimitInfo, TextBlock
 
 from kernel_agent import (
     board,
@@ -533,7 +533,104 @@ class _Lineage:
 
 
 class _Limited(Exception):
-    """A simulated session reached the simulated usage limit (:attr:`World.limit`)."""
+    """A simulated session reached the simulated usage limit (:attr:`World.limit`, or a
+    window of :attr:`World.usage` that is spent): it resets at ``resets_at`` (unix time)."""
+
+    def __init__(self, resets_at: float, kind: str = "five_hour") -> None:
+        super().__init__(kind)
+        self.resets_at, self.kind = resets_at, kind
+
+
+@dataclass
+class SimWindow:
+    """One simulated usage window (:class:`SimUsage`): ``per_hour``: the utilization one
+    session uses per hour it works; ``resets_at``: simulated seconds after the start."""
+
+    name: str
+    length_s: float
+    per_hour: float
+    utilization: float = 0.0
+    resets_at: float = 0.0
+
+
+class SimUsage:
+    """A subscription's usage windows in virtual time (:attr:`World.usage`, issue #191).
+
+    Every second a simulated session works (its model and its own runs: ``World._think``,
+    not its GPU waits) uses ``per_hour / 3600`` of each window; a window resets to 0 every
+    ``length_s``. After each piece of work the session's stream carries a rate-limit event
+    (``runner.heard``) as Claude Code's do: every window's utilization and reset in
+    ``raw["unifiedWindows"]``, the status of the fullest (``allowed_warning`` from
+    :data:`WARN_AT`, ``rejected`` once spent). A session that works while a window is spent
+    stops at the limit until that window resets (the coordinator's rate gate holds the
+    others). ``peak``: the most each window reached; ``limited``: the sessions stopped."""
+
+    WARN_AT = 0.75  # Claude Code's surpassedThreshold of the warnings in our runs
+
+    def __init__(self, windows: list[SimWindow]) -> None:
+        self.windows = {w.name: w for w in windows}
+        self.peak = {w.name: w.utilization for w in windows}
+        self.limited = 0
+        self._n = 0
+
+    @classmethod
+    def subscription(
+        cls,
+        five_hour: float = 0.1,
+        seven_day: float = 0.3,
+        *,
+        five_hour_reset_h: float = 5.0,
+        seven_day_reset_h: float = 72.0,
+        per_hour: tuple[float, float] = (0.12, 0.028),
+    ) -> SimUsage:
+        """A Max subscription's 5-hour and 7-day windows, ``five_hour`` / ``seven_day`` used,
+        resetting in ``*_reset_h`` hours. ``per_hour`` per working hour: a simulated session
+        works about 85 % of its time, so about the measured 10 and 2.3 points per
+        session-hour (docs/MULTIAGENT-DATA.md §7)."""
+        return cls(
+            [
+                SimWindow(
+                    "five_hour", 5 * 3600.0, per_hour[0], five_hour, five_hour_reset_h * 3600
+                ),
+                SimWindow(
+                    "seven_day", 7 * 86400.0, per_hour[1], seven_day, seven_day_reset_h * 3600
+                ),
+            ]
+        )
+
+    def use(self, at: float, seconds: float) -> SimWindow | None:
+        """``seconds`` of one session's work that ended ``at`` (simulated seconds after the
+        start); returns the window it found spent (None: none)."""
+        spent = None
+        for w in self.windows.values():
+            while at >= w.resets_at:  # a new window
+                w.utilization, w.resets_at = 0.0, w.resets_at + w.length_s
+            w.utilization += w.per_hour * seconds / 3600
+            self.peak[w.name] = max(self.peak[w.name], min(w.utilization, 1.0))
+            if w.utilization >= 1.0 and spent is None:
+                spent = w
+        return spent
+
+    def event(self, t0: float) -> RateLimitEvent:
+        """The rate-limit event a session's stream carries now (``t0``: the start, unix)."""
+        top = max(self.windows.values(), key=lambda w: w.utilization)
+        used = round(min(top.utilization, 1.0), 2)
+        status = "rejected" if used >= 1.0 else "allowed"
+        status = "allowed_warning" if status == "allowed" and used >= self.WARN_AT else status
+        unified = {
+            w.name: {"utilization": round(min(w.utilization, 1.0), 2), "resetsAt": t0 + w.resets_at}
+            for w in self.windows.values()
+        }
+        raw = {"status": status, "rateLimitType": top.name, "unifiedWindows": unified}
+        info = RateLimitInfo(
+            status=status,  # type: ignore[arg-type]
+            resets_at=int(t0 + top.resets_at),
+            rate_limit_type=top.name,  # type: ignore[arg-type]
+            utilization=None if status == "allowed" else used,  # as Claude Code's events
+            raw=raw,
+        )
+        self._n += 1
+        return RateLimitEvent(info, uuid=f"sim-{self._n}", session_id="dry-run")
 
 
 @dataclass
@@ -726,6 +823,9 @@ class World:
         # virtual time: a usage limit of the account, (seconds after the start, seconds until
         # it resets); every session that thinks inside it stops at it (the rate gate)
         self.limit: tuple[float, float] | None = None
+        # virtual time: a subscription's usage windows that the sessions' work fills, with the
+        # rate-limit events Claude Code sends (issue #191: the governor's input)
+        self.usage: SimUsage | None = None
         # virtual time: what each session wrote (label, file), its span and write policy
         self.writes: list[tuple[str, Path]] = []
         self.spans: dict[str, tuple[float, float]] = {}
@@ -798,7 +898,13 @@ class World:
         if self.limit is not None:
             at, lasts = self.limit
             if at <= self.clock.now() - self.clock.t0 < at + lasts:
-                raise _Limited
+                raise _Limited(self.clock.t0 + at + lasts)
+        if self.usage is not None and sessions.current() is not None:
+            spent = self.usage.use(self.clock.now() - self.clock.t0, seconds)
+            runner.heard(self.usage.event(self.clock.t0))  # its stream's rate-limit event
+            if spent is not None:
+                self.usage.limited += 1
+                raise _Limited(self.clock.t0 + spent.resets_at, spent.name)
 
     async def _read(self, seconds: float) -> None:
         """A session reads its digest and files; in virtual time its first message streams
@@ -899,13 +1005,13 @@ class World:
             elif name.startswith("dossier-"):  # no web in a dry run: a dossier from the spec
                 self._dossier(name.removeprefix("dossier-"), writable or [], bound)
                 result.cost_usd = 0.15 * rng.uniform(0.8, 1.2)
-        except _Limited:  # stopped at the simulated usage limit: resumed after it resets
-            assert self.limit is not None
+        except _Limited as limited:  # stopped at the simulated usage limit: resumed after it
             evals = self.orch.budget.evals.get(name, 0)
             result.cost_usd = 0.25 + 0.35 * evals
-            resets = self.clock.t0 + sum(self.limit)
             message = "You've hit your limit (simulated)"
-            result.usage_limit = auth.UsageLimit(message, resets_at=resets, kind="five_hour")
+            result.usage_limit = auth.UsageLimit(
+                message, resets_at=limited.resets_at, kind=limited.kind
+            )
             result.is_error = True
         if self.virtual and cfg is not None and cfg.budget_usd_per_agent is not None:
             result.cost_usd = min(result.cost_usd, cfg.budget_usd_per_agent)  # max_budget_usd
@@ -960,35 +1066,31 @@ class World:
             _Lineage.of(self.run, target_id, system) if workers.ISLAND_MARK in system else None
         )
         used = 0
-        while True:
-            rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
-            k = len(rows)
-            rng = _rng(self.seed, "kernel", target_id, k)
-            kept = [r for r in rows if r["status"] == ledger.KEEP]
-            best = ledger.best_kept(rows)
-            if lineage is None:  # the target's best, the backends in turn
-                backend = sim.backends[(k // 5 + (worker or 1) - 1) % len(sim.backends)]
-                parent = f"history/{kept[-1]['snapshot']}" if kept else None
-                level, model = best, sim
-            else:  # its lineage's, toward its backend's ceiling
-                backend, parent, level = lineage.backend, lineage.parent, lineage.level
-                model = dataclasses.replace(sim, ceiling=sim.ceiling_of(backend))
-            idea, hypothesis = _next_idea(sim, rows, plan)
-            expected = level * _rng(self.seed, "expect", target_id, k).uniform(1.05, 1.4)
-            outcome = self._kernel_outcome(model, level, rng)
-            await self._think(rng.uniform(150, 330))
-            src = home / "candidates" / f"{backend}_v{k + 1}.py"
-            header = HEADERS.get(backend, "import torch\n")
-            self._write(
-                bound,
-                src,
-                f'{header}\n"""{hypothesis}"""\n\n\ndef build(reference):\n    return reference\n',
-            )
-            snap = snapshot(self.run, src, target_id)
-            result = kernel_result(outcome, ref_ms, instances, sim)
-            result["tolerance_tier"] = tier_of(spec.get("capture"))  # as the evaluator's
-            eval_s = round(rng.uniform(25, 70), 1)
-            queue_s = await self._evaluate("eval", eval_s, target_id)
+        assert bound is not None
+        binding = bound
+
+        async def evaluated(
+            job: gpuqueue.Job | None,
+            k: int,
+            rows: list[dict[str, Any]],
+            rng: random.Random,
+            src: Path,
+            snap: Path,
+            result: dict[str, Any],
+            eval_s: float,
+            idea: str,
+            hypothesis: str,
+            parent: str | None,
+            expected: float,
+            backend: str,
+        ) -> bool:
+            """Its evaluation (``job``: a submitted one's), record and advice: whether the
+            agent stops after it."""
+            if job is None:
+                queue_s = await self._evaluate("eval", eval_s, target_id)
+            else:
+                await self._held(job, eval_s)
+                queue_s = job.queue_s
             _, row = record_candidate(
                 self.run,
                 target_id,
@@ -1003,23 +1105,83 @@ class World:
                 expected_speedup=round(expected, 2),
                 worker=worker,
                 queue_s=queue_s,
-                session=bound.label or None,
+                session=binding.label or None,
             )
             if lineage is not None:
                 lineage.saw(row)
-            used += 1
             _note(home / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
-            self._wrote(bound, home / "NOTES.md")
-            self._post(bound, target_id, sim, row, rows, backend)
-            self._news(bound)
+            self._wrote(binding, home / "NOTES.md")
+            self._post(binding, target_id, sim, row, rows, backend)
+            self._news(binding)
             if self.hook:
                 self.hook(agent, used)
             results = self.run.results_file(target_id)
-            stop = self._advice(
-                agent, results, bound.evaluations, rng, sol_signal(result), bound.label
+            return self._advice(
+                agent, results, binding.evaluations, rng, sol_signal(result), binding.label
             )
-            if stop:
-                return used
+
+        # --async-evals (issue #191): the agent submits each evaluation and writes the next
+        # candidate while it waits for the GPU and runs; it collects the result (its advice)
+        # before it submits the next
+        overlap = self.virtual and self.orch.async_evals
+        pending: tuple[asyncio.Task[bool], gpuqueue.Job] | None = None
+        try:
+            while True:
+                rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
+                if pending is not None:  # the next one is written while it is evaluated
+                    write = _rng(self.seed, "write", target_id, len(rows) + 1).uniform(150, 330)
+                    await self._think(write)
+                    with sessions.tool("evaluation_result"):
+                        task, job = pending
+                        job.attach(gpuqueue.session())  # its waits are the session's now
+                        stop = await task
+                    pending = None
+                    if stop:
+                        return used
+                    rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
+                k = len(rows)
+                rng = _rng(self.seed, "kernel", target_id, k)
+                kept = [r for r in rows if r["status"] == ledger.KEEP]
+                best = ledger.best_kept(rows)
+                if lineage is None:  # the target's best, the backends in turn
+                    backend = sim.backends[(k // 5 + (worker or 1) - 1) % len(sim.backends)]
+                    parent = f"history/{kept[-1]['snapshot']}" if kept else None
+                    level, model = best, sim
+                else:  # its lineage's, toward its backend's ceiling
+                    backend, parent, level = lineage.backend, lineage.parent, lineage.level
+                    model = dataclasses.replace(sim, ceiling=sim.ceiling_of(backend))
+                idea, hypothesis = _next_idea(sim, rows, plan)
+                expected = level * _rng(self.seed, "expect", target_id, k).uniform(1.05, 1.4)
+                outcome = self._kernel_outcome(model, level, rng)
+                think = rng.uniform(150, 330)
+                if not overlap or used == 0:  # (else written while the last one ran)
+                    await self._think(think)
+                src = home / "candidates" / f"{backend}_v{k + 1}.py"
+                header = HEADERS.get(backend, "import torch\n")
+                self._write(
+                    binding,
+                    src,
+                    f'{header}\n"""{hypothesis}"""\n\n\ndef build(reference):\n'
+                    "    return reference\n",
+                )
+                snap = snapshot(self.run, src, target_id)
+                result = kernel_result(outcome, ref_ms, instances, sim)
+                result["tolerance_tier"] = tier_of(spec.get("capture"))  # as the evaluator's
+                eval_s = round(rng.uniform(25, 70), 1)
+                used += 1
+                given = (k, rows, rng, src, snap, result, eval_s, idea, hypothesis, parent)
+                if overlap:  # submit_evaluation: its GPU waits are not the session's
+                    with sessions.tool("submit_evaluation"):
+                        job = gpuqueue.Job.of(self.run, "eval", target_id, detached=True)
+                    task = asyncio.ensure_future(evaluated(job, *given, expected, backend))
+                    pending = (task, job)
+                    continue
+                if await evaluated(None, *given, expected, backend):
+                    return used
+        finally:
+            if pending is not None:  # still in flight: measured and recorded as the session's
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(pending[0])
 
     @staticmethod
     def _kernel_outcome(sim: SimTarget, best: float, rng: random.Random) -> float | str:
