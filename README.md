@@ -3813,6 +3813,23 @@ measurement holds the lock of one GPU while its subprocess runs
     candidate-free re-time confirms counts too. A dirty measurement is measured once
     more, first of its class in the queue: the record is the second one (`retimed`:
     why the first did not count; `timing_dirty`: the second was dirty too).
+  * *A/A validation* (`docs/research-scripts/clean-timing-185/`): one fixed candidate
+    (Qwen3-0.6B's decoder layer as one cooperative CUDA kernel; its reference is
+    launch-bound, so CPU contention shows in it first), evaluated in alternating blocks
+    with nothing else running and beside 3 simulated agents that build `load_inline`
+    extensions and run their own GPU scripts, on the RTX 5070 Ti:
+
+    | condition | evaluations | speedup | sd (CV) | min - max | measured twice |
+    |---|---:|---:|---:|---:|---:|
+    | N = 1, nothing else (`--agents 1`) | 12 | 8.008x | 0.089 (1.1 %) | 7.90 - 8.15 | 0 |
+    | N = 3, clean timing (`--agents 3`) | 12 | 8.028x | 0.058 (0.7 %) | 7.93 - 8.11 | 6 |
+    | N = 3, without it | 8 | 8.128x | 0.406 (5.0 %) | 7.80 - 9.11 | 0 |
+
+    The first measurements that did not count: the host swapped (2), another user's
+    process computed on the GPU outside the lock (3), others used the timing cores (1).
+    Without the quiet timing phases builds on the other cores still read the reference
+    8 % slow, and without clean timing an earlier round read 4.07x and a false integrity
+    violation.
 * **Child processes.** A subprocess started under the lock gets
   `KERNEL_AGENT_LOCK_HELD=1` (it does not wait for its parent) and, when more
   than one GPU is visible, `CUDA_VISIBLE_DEVICES=<i>` with
