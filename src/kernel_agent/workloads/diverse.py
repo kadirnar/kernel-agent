@@ -9,7 +9,8 @@ besides the benchmark input:
 
 * ``analyze`` runs the baseline on every input of
   :meth:`~kernel_agent.workloads.base.Workload.diverse_inputs` (:data:`WARMUP` untimed run
-  and :data:`ITERS` timed runs each), records the times in ``baseline.json`` ``diverse``
+  and :data:`ITERS` timed runs each; with ``metric=ttfa`` all but the last timed one stop at
+  the first chunk), records the times in ``baseline.json`` ``diverse``
   and the outputs as ``baseline_output_diverse.pt`` (hashed and read-only in ``.truth/``).
 * ``e2e`` runs every candidate that passed the main checks the same way
   (``metrics.diverse``; ``e2e_ab``: state B of every integration step): each input's output
@@ -64,15 +65,19 @@ def run_input(
 ) -> tuple[Any, Any, dict[str, Any]]:
     """``(inputs, last output, timing)`` of one input: ``warmup`` untimed and ``iters`` timed
     runs of the workload's metric under the option overrides; ``timing`` holds ``ms`` (the
-    median), ``times_ms``, ``spread`` and the decode counters (``decode_stats``)."""
+    median), ``times_ms``, ``spread`` and the decode counters (``decode_stats``). A windowed
+    metric (``ttfa``): every run but the last timed one stops at the end of the metric's
+    window (the time to first audio is known there); the last is a whole request, the output
+    the quality check judges."""
     with workload.with_options(options):
         inputs = workload.make_inputs()
-        with torch.inference_mode():
+        with torch.inference_mode(), workload.metric_window():
             for _ in range(warmup):
                 workload.run(inputs)
         times, counters, output = [], [], None
-        for _ in range(max(iters, 1)):
-            output, ms, detail = timed_run(workload, inputs)
+        iters = max(iters, 1)
+        for i in range(iters):
+            output, ms, detail = timed_run(workload, inputs, window=i < iters - 1)
             times.append(ms)
             counters.append(detail.get("decode_stats") or {})
     timing: dict[str, Any] = {

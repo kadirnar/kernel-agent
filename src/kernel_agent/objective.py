@@ -7,7 +7,10 @@
   ``metric_detail`` also reports the steady state: the median latency of the next
   ``steady_chunks`` chunks (default :data:`STEADY_CHUNKS`) and their real-time factor
   (chunk latency / chunk audio duration; below 1 the stream keeps up with playback),
-  and the full streamed run. Quality is judged on the full streamed output.
+  and the full streamed run. Quality is judged on the full streamed output. The timed
+  requests stop at the first chunk (``Workload.metric_window``) but for one whole request
+  per measurement, which gives the judged output and those details: a check costs
+  requests up to their first chunk, not streamed runs.
 * ``throughput``: seconds of audio generated per wall second by a batch of requests
   (VoxCPM: ``-o batch_size=N``, :mod:`kernel_agent.workloads.voxcpm_batch`). A rate is
   higher-is-better, so the value the optimiser sees is its reciprocal, the wall time per
@@ -232,6 +235,11 @@ def summary_section(baseline: dict[str, Any]) -> str:
             "* quality is judged on the full streamed output, as for the non-streaming run "
             "(teacher forcing on the latents, the audio of every chunk decoded by the "
             "stateful streaming decoder).",
+            "* every measurement (`evaluate_e2e`, the A/B rounds, the diverse set) times "
+            "several requests that stop at their first chunk (the stream is closed there, as "
+            "a client that stops listening closes it) and one whole request whose output is "
+            "judged: a transform must leave the model ready for the next request after a "
+            "stream closed early (no state that only the end of a run resets).",
         ]
     if metric.name == THROUGHPUT:
         lines += [

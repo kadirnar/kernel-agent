@@ -144,10 +144,11 @@ class Session:
         return handles[0]
 
 
-def timed_run(workload: Any, inputs: Any) -> tuple[Any, float]:
+def timed_run(workload: Any, inputs: Any, *, window: bool = False) -> tuple[Any, float]:
     """One synchronised end-to-end run: (output, value of the workload's metric in ms;
-    the latency by default, see ``objective.py``)."""
-    output, ms, _ = base.timed_run(workload, inputs)
+    the latency by default, see ``objective.py``). ``window``: inside the metric's window
+    (``ttfa``: the request up to its first chunk, :func:`base.timed_run`)."""
+    output, ms, _ = base.timed_run(workload, inputs, window=window)
     return output, ms
 
 
@@ -158,7 +159,7 @@ class Rounds:
     a_ms: list[float] = field(default_factory=list)
     b_ms: list[float] = field(default_factory=list)
     order: list[str] = field(default_factory=list)
-    output: Any = None  # B's last output
+    output: Any = None  # B's last output (inside the metric's window, as timed)
     #: the counters each timed run of B reported (``Workload.report_stats``; ``{}``: none)
     b_stats: list[dict[str, Any]] = field(default_factory=list)
     #: per state: its warm-up output was bit-identical twice, so every round must match it
@@ -182,11 +183,15 @@ class Rounds:
         }
 
 
-def warm(session: Session, state: State, inputs: Any, runs: int) -> tuple[Any, bool]:
+def warm(
+    session: Session, state: State, inputs: Any, runs: int, *, window: bool = False
+) -> tuple[Any, bool]:
     """``runs`` (>= 2) untimed runs of ``state``: (last output, whether the last two
-    outputs were bit-identical)."""
+    outputs were bit-identical). ``window``: each inside the metric's window, as the
+    rounds of :func:`alternate` run (their outputs are compared with this one)."""
     session.to(state)
-    outputs = [timed_run(session.workload, inputs)[0] for _ in range(max(runs, 2))]
+    runs = max(runs, 2)
+    outputs = [timed_run(session.workload, inputs, window=window)[0] for _ in range(runs)]
     return outputs[-1], outputs_equal(outputs[-2], outputs[-1])
 
 
@@ -205,7 +210,12 @@ def alternate(
     ones. Stops at the first output of a reproducible state that differs from its warm-up
     output (``mismatch``: a switch did not restore the state) or at an error (``failed``);
     ``stop`` (the sequential A/B, ``abtest.sequential``) is asked after every round whether
-    the verdict is decided (``stopped``: its answer)."""
+    the verdict is decided (``stopped``: its answer).
+
+    Every run is inside the metric's window (``ttfa``: the request up to its first chunk;
+    other metrics: the whole run), the ``reference`` outputs too (:func:`warm` with
+    ``window``): the rounds time the metric, and B's judged output is one whole request
+    after them (``worker e2e_ab``)."""
     a, b = states
     out = Rounds(reproducible=dict(reproducible))
     for i in range(rounds):
@@ -214,9 +224,9 @@ def alternate(
             return out
         for state in (a, b) if i % 2 == 0 else (b, a):
             try:
-                if session.to(state):
-                    timed_run(session.workload, inputs)  # warm-up of a transform applied again
-                output, ms, detail = base.timed_run(session.workload, inputs)
+                if session.to(state):  # warm-up of a transform applied again
+                    timed_run(session.workload, inputs, window=True)
+                output, ms, detail = base.timed_run(session.workload, inputs, window=True)
             except Exception:
                 out.failed, out.error = state.name, traceback.format_exc()[-4000:]
                 return out

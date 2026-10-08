@@ -1334,7 +1334,21 @@ rounds of the integration, the memoisation probe and every speedup use it.
 latency of the next `steady_chunks` (8) chunks, their real-time factor (chunk
 latency / chunk audio; below 1 the stream keeps up with playback) and the full
 streamed run, reported but not optimised. Quality is judged on the full
-streamed output with the usual checks. The `analyze` profile covers the window
+streamed output with the usual checks. The time to first audio is known at the
+first chunk, so a measurement's timed requests stop there
+(`Workload.metric_window`: the stream is closed, as a client that stops
+listening closes it) and only one request per measurement streams to the end:
+`measure()` (the baseline, `e2e`, the compiled baseline) runs one whole warm-up,
+`iters - 1` short timed requests and a whole last one, which gives the output
+the checks judge and the steady state and full-run details; the paired A/B
+rounds of the integration time short requests for both states (warm-ups and
+undo checks included) and judge one whole request of B after them; the diverse
+set times short requests and judges a whole last one per input. The same number
+of requests, each a fraction of a streamed run (VoxCPM2 eager: 98 ms of
+5,835 ms; an A/B against the unmodified model took 8 rounds of two streamed
+runs), so every time-to-first-audio check costs the window, not the stream.
+The held-out input, the memoisation probe, teacher forcing, the natural-length
+run and the perceptual gate still run whole requests. The `analyze` profile covers the window
 the metric times (for `ttfa`, up to the first chunk), `profile/summary.md` gets
 an *Objective* section for the agents, and reports, charts, `status` and
 `watch` name the metric ("time to first audio" instead of "latency per run").
@@ -2570,7 +2584,10 @@ arrival; the output (the chunks concatenated, plus the latents) goes through
 teacher forcing, the held-out input and the natural-length run like the
 non-streaming one, and equals the non-streaming audio (waveform cosine 1.0000).
 `analyze` profiles the run up to the first chunk: the prefill, one LocDiT solve
-and one chunk of AudioVAE decode. RTX 5070 Ti, 60 patches, medians of 3–5 runs:
+and one chunk of AudioVAE decode. Every measurement times requests that close
+`generate_streaming` after their first chunk and judges one whole streamed
+request (see `-o metric=` above): a timed request costs the first column of the
+table below, not the last. RTX 5070 Ti, 60 patches, medians of 3–5 runs:
 
 | | time to first audio | steady state per chunk (RTF) | full streamed run |
 |---|---|---|---|
@@ -4755,9 +4772,11 @@ above and `workloads/voxcpm.py`). `compare_natural_length` defaults to
 
 Streaming TTS harnesses can support `-o metric=ttfa`: list it in
 `metrics = ("latency", "ttfa")`, call `self.mark_chunk(audio_ms=...)` in `run`
-whenever an audio chunk reaches the caller, and optionally implement
-`metric_window()` (a context in which `run` stops after the first chunk) so the
-profile covers the time-to-first-audio window. Batch harnesses can support
+whenever an audio chunk reaches the caller, and stop the stream after that call
+while `self.in_window` is true (set by `metric_window()` with `metric=ttfa`), so
+the profile covers the time-to-first-audio window and the timed requests stop
+at the first chunk. A harness that streams on is timed the same, at the cost of
+whole requests. Batch harnesses can support
 `-o metric=throughput`: list it in `metrics`, call `self.mark_chunk(audio_ms=...)`
 when each request's output is ready (its latency; the audio seconds default to
 the sum of the marks), or override `output_seconds()` when the options fix the
