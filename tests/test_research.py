@@ -114,7 +114,7 @@ def test_ledger_idea_column_and_old_ledgers(tmp_path):
     new = ledger.record_kernel(run, "t", result, snapshot="001_a.py", hypothesis="h", idea="splitk")
     assert new["idea"] == "splitk" and ledger.rows(run)[0]["idea"] == "splitk"
     header = run.ledger.read_text().splitlines()[0].split("\t")
-    assert header[-2:] == ["idea", "hypothesis"] and tuple(header) == ledger.COLUMNS
+    assert header[-3:] == ["idea", "title", "hypothesis"] and tuple(header) == ledger.COLUMNS
     assert "[splitk] h" in status.render(run, width=200)
 
     # a ledger written before the column existed keeps its own layout

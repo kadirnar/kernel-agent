@@ -280,7 +280,7 @@ def write_dashboard(run: RunDir) -> Path:
             _x(r["speedup"]),
             _ms(r["new_ms"], 3) if r["target"] != ledger.E2E else _ms(r["new_ms"]),
             _ms(s["units"].of_row(r)),  # a kernel's estimate in the metric's ms, as e2e rows
-            _e(ledger.labelled(r)),
+            f'<span title="{_e(ledger.labelled(r))}">{_e(ledger.title(r))}</span>',  # hover
         ]
         for r in reversed(s["rows"][-30:])
     ]
@@ -333,7 +333,7 @@ def write_dashboard(run: RunDir) -> Path:
     sections.append(
         "<section><h2>Latest evaluations</h2>"
         + _table(
-            ["#", "time", "target", "backend", "status", "speedup", "new", "saved", "hypothesis"],
+            ["#", "time", "target", "backend", "status", "speedup", "new", "saved", "title"],
             ledger_rows,
             {0, 5, 6, 7},
         )

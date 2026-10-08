@@ -4310,6 +4310,11 @@ kernel-agent bench-suite [--kernelbench-level 1] [--n 20 | --problems 1,19,36] [
   [--max-usd U] [--agent-minutes 30] [--program FILE]   KernelBench fast_p (see above)
 kernel-agent report <run_dir>          report.md + charts + dashboard.html
 kernel-agent status <run_dir> [--watch 10]   per-target progress, e2e, cost, last evaluations
+kernel-agent exp <run_dir>             N experiments, K kept improvements: lineages, top hits
+kernel-agent exp list <run_dir> [--lineage ID|model] [--status keep|discard|failed] [--kind K]
+  [--session S] [--last N] [--tsv]     the experiments (see "Experiment ledger")
+kernel-agent exp show <run_dir> N      one experiment: row, record, files, diff to its parent
+kernel-agent exp diff <run_dir> A [B]  A's code against B (default: A's parent experiment)
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
 kernel-agent library list|show <id>|prune [--older-than DAYS]|path   cross-run kernel library
 kernel-agent library import-memory DIR [--write]   Claude Code memory notes → lessons
@@ -4374,8 +4379,8 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/history/ results.jsonl   the agent's copies (never read back)
   targets/<id>/progress.png   speedup per evaluation (see "Charts")
   transforms/                 model-level transforms (+ the agent's copies)
-  results.tsv                 experiment ledger: one row per evaluation
-  events.jsonl                phase changes, agent start/stop, evaluations
+  results.tsv                 experiment ledger: one row per evaluation (kernel-agent exp)
+  events.jsonl                phase changes, agent start/stop, evaluations (+ files measured)
   gpu_queue.jsonl             GPU job queue: queued / start / done / withdrawn per job
   board.jsonl                 improve --agents N / --board on: the sessions' notes (insight,
                               trap, winner, claim, question) and kernel-agent's posts
@@ -4424,10 +4429,38 @@ Every evaluation of a run is one row of `results.tsv`: kernel candidates,
 model-level transforms and integration steps (`target = e2e`).
 
 ```
-exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
+exp  time  target  backend  snapshot  parent  status  kind  correct  speedup  ref_ms  new_ms
 est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  review  early
-worker  session  idea  hypothesis
+worker  session  idea  title  hypothesis
 ```
+
+Every row is one experiment, as in autoresearch's `results.tsv`:
+
+* `exp` numbers the rows in the order they were **recorded**, not started: each is
+  numbered and classified under the ledger's lock in the one process that holds the
+  run's coordinator lock (and under an `flock` of `results.tsv`), so a row's `status` is
+  relative to every row with a smaller `exp` and a lineage's kept values improve along
+  `exp`. With asynchronous evaluations (`--async-evals`) an evaluation that started
+  earlier can get a later number.
+* `kind` is what was measured: `kernel` (a target's candidate), `e2e` (an agent's
+  `evaluate_e2e`: transforms, native projects, kernels), `integration` (a combination step
+  of the integration) or `probe` (one item measured alone by the integration, or the
+  unmodified model again as the A of such an A/B). Probes stay `discard` rows against the
+  model's best; counts and charts tell them apart by `kind`. Rows of older ledgers get it
+  from `target`, `backend` and the hypothesis.
+* `title` names the experiment in a commit subject's words, at most 72 characters: what
+  this version changes (`split-K=4, RED epilogue`). `evaluate_candidate`,
+  `evaluate_candidates`, `sweep_candidate` (which appends ` [cfg k]`, the best config's
+  index), `evaluate_e2e` and `evaluate_e2e_batch` take it; the integration generates its
+  own (`integrate +enc_dit_stack_fp8 (#013)`, `probe dit_layer_fp8 #012 alone`,
+  `integrate dit_layer_fp8 #012 -> #001`). A row without one (an older run, an agent
+  that gave none) shows `[idea]` and the hypothesis' first clause, cut at a word
+  boundary at 60 characters, else its snapshot's stem.
+* The `evaluation` event of every row in `events.jsonl` lists the run-relative `files` it
+  measured: a kernel row's history snapshot (and the sealed `rewrite.py` of a region
+  target), an `e2e` row's transform snapshots and `target=<history path>` per kernel, an
+  integration step's or probe's items. Every experiment can be reproduced from the run
+  directory, also after later re-integrations replaced `integration.json`.
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
 "Speed of light"). `eval_s` is the time an evaluation took and `queue_s` the
@@ -4467,7 +4500,7 @@ value for that column.
   it is dropped, and "abandoned after N attempts: <why>" instead of "X doesn't
   work". The CUDA and CuTe DSL guides describe plan amnesia and false
   infeasibility. `status`, `dashboard.html` and `kernel-agent watch` show the
-  idea next to the hypothesis.
+  row's title (`[idea]` and the hypothesis' first clause when it has none).
 * `status` is `keep` when the result is correct and beats the best kept result
   by more than the noise: speedup > best × (1 + max(1 %, 2 × timing spread)).
   Kernels start from the reference module (1.0×), `e2e` rows from the baseline.
@@ -4488,9 +4521,51 @@ value for that column.
   there is no custom kernel). The report's and `status`'s per-backend tables read
   what the snapshot runs instead (see Backends).
 * `results.jsonl` (in `.truth/`) still has the full records (cases, errors)
-  plus `exp`, `ledger_status`, `hypothesis` and the snapshot's sha256. For
+  plus `exp`, `ledger_status`, `title`, `hypothesis` and the snapshot's sha256. For
   runs that predate the ledger, the rows are rebuilt from the `results.jsonl`
   files.
+
+`kernel-agent exp <run_dir>` reads the ledger as experiments (`experiments.py`; read
+only, no lock, safe on a live run: a row still being written is left out):
+
+```
+$ kernel-agent exp runs/openbmb--VoxCPM2/20261005-192504
+openbmb/VoxCPM2: 82 experiments, 27 kept improvements
+(+25 integration probes; 12 rows not measured: 7 quick_fail, 4 re-evaluated, 1 duplicate)
+kinds: 35 kernel, 14 e2e, 33 integration, 25 probe
+status: 27 keep (33%), 43 discard, 12 failed (15%): 7 incorrect, 3 incorrect_timed_output, 2 oom
+model: end-to-end latency per run, in ms; kernels: module speedup
+
+lineage                   start → best           exps  kept  failed  since keep  best
+model                     5,476.4 ms → 488.4 ms    47     6       9          12  exp 104
+dit_layer_fp8             1.00× → 12.24×           13     8       1           1  exp 34
+...
+kept improvements, ranked by gain
+exp  lineage                   before → after            gain  title
+ 13  dit_layer_fp8             1.00× → 9.32×          +831.6%  [fp8_fused5] FP8 e4m3 per-row…
+...
+```
+
+N counts the measured rows without the integration's probes, K the new bests; the
+probes and the rows that measured nothing (quick checks, duplicates, re-evaluations)
+are reported next to them. Each lineage (a kernel target, or `model` for everything
+measured end to end) shows its start → best, its experiments, keeps, failures and the
+experiments since its last keep (the plateau streak); the kept improvements are ranked
+by their gain over the best before them.
+
+* `kernel-agent exp list <run_dir> [--lineage ID|model] [--status keep|discard|failed]
+  [--kind K] [--session S] [--last N] [--tsv]` lists the experiments: exp, time, kind,
+  lineage, status, value (× of a kernel, the metric's ms of the model), gain over the
+  best before it and title (`--tsv`: every field, the files and the parent too).
+* `kernel-agent exp show <run_dir> N` prints one: the row, the full hypothesis and the
+  critic's review, its `results.jsonl` record in short (the evaluator's status, the first
+  correctness stage that failed, the failed quality checks, the timing spread, an early
+  stop, the error's tail), the files it measured, its parent experiment (the `parent`
+  snapshot's, else the lineage's standing best when it was recorded) and the diff
+  against it.
+* `kernel-agent exp diff <run_dir> A [B]` prints a unified diff of what B measured to
+  what A measured (B: A's parent experiment by default), file by file: a kernel's
+  snapshot by target, transforms by their file stem.
 
 `kernel-agent status <run_dir> [--watch SECONDS]` prints the current phase, the
 baseline, the projected (nested targets counted once, see Charts) and measured
@@ -4500,10 +4575,11 @@ its % of speed of light, estimated ms saved in the metric's ms, last hypothesis)
 the evaluations per backend (classified from each snapshot's source: targets
 tried and won, correct, kept, best speedup), the GPU queue (jobs, time on the
 GPU and waiting per class, what is on the GPU and what waits) and the last 10
-ledger rows.
+ledger rows with their titles (the hypothesis: `kernel-agent exp show`).
 
 `dashboard.html` in the run directory is self-contained: charts inlined as
-PNG, the target table, the latest evaluations and the agent costs. It supports
+PNG, the target table, the latest evaluations (their titles, the hypothesis on
+hover) and the agent costs. It supports
 light and dark mode and reloads every 30 s while the run is going.
 
 ## Charts
@@ -4677,8 +4753,9 @@ measured end-to-end latency over wall-clock time (lines, no points), the agents'
 swimlanes (one row per session running at the same time, coloured by its state:
 model, GPU held, waiting for the GPU, evaluation off the GPU, own runs, idle; and a
 GPU row with who held it), cumulative agent cost, the integration waterfall, the latest
-events and agent tool calls, the ledger (filter by target and status, search
-the hypotheses) and a read-only file browser for candidates, snapshots,
+events and agent tool calls, the ledger (each row's title, its idea and hypothesis on
+hover; filter by target and status, search titles and hypotheses) and a read-only file
+browser for candidates, snapshots,
 `NOTES.md` and `program.md`. The charts are inline SVG drawn in the browser
 (no CDN, works offline) in the same colours as the PNG charts. Light and dark
 mode follow the system (`?theme=dark` forces dark), tooltips also work from

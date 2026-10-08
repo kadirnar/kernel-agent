@@ -11,6 +11,8 @@ GPU wait for each other, not the math, so they are exact when done right.
 
 Data-dependent speedups (speculative decoding, early exit) are in the `speculative-decoding` skill; overlap inside kernels (PDL, streams in CUDA graphs) in `cuda-graphs-streams-pdl`.
 
+Give every `evaluate_e2e` (and every set of `evaluate_e2e_batch`) a `title`: a commit subject of at most 72 characters saying what this combination changes (`graph the decode step, static KV cache`). It names the experiment in the ledger, the charts and `kernel-agent exp`; the `hypothesis` says why.
+
 ## Host synchronisation
 
 A loop that reads a device value on the host every step makes the host wait until the GPU

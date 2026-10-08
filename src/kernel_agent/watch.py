@@ -244,9 +244,11 @@ class Watcher:
         return out, reset
 
     def _row(self, row: dict[str, Any]) -> dict[str, Any]:
-        """A ledger row for the page: epoch ``ts`` and the snapshot ``file`` if it exists."""
+        """A ledger row for the page: epoch ``ts``, its ``title`` and ``kind`` (an older row's
+        made up, issue #222) and the snapshot ``file`` if it exists."""
         row = _clean(row)
         row["ts"] = ledger.epoch(row.get("time"))
+        row["title"], row["kind"] = ledger.title(row), ledger.kind(row)
         snapshot = str(row.get("snapshot") or "")
         rel = None
         if row.get("target") != E2E and snapshot:

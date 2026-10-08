@@ -335,7 +335,8 @@ def test_ledger_rows_leave_out_a_row_still_being_written(tmp_path):
         fh.write("\n")
     assert [r["exp"] for r in ledger.rows(run)] == [1, 2]
     header = run.ledger.read_text().splitlines()[0].split("\t")
-    assert header[-4:] == ["worker", "session", "idea", "hypothesis"] and "queue_s" in header
+    assert header[-5:] == ["worker", "session", "idea", "title", "hypothesis"]
+    assert "queue_s" in header
 
 
 def test_ledger_rows_and_appends_from_threads(tmp_path):

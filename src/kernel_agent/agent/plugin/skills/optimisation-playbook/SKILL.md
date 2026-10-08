@@ -39,7 +39,10 @@ them with a warm cache.
 
 1. Read the captured module's source (`spec.json → source_file`) and the
    captured shapes/dtypes. Write down the exact math, including dtype casts.
-2. First candidate: simplest correct fused kernel. Evaluate.
+2. First candidate: simplest correct fused kernel. Evaluate. Give every evaluation a
+   `title`, a commit subject of at most 72 characters saying what this version changes
+   (`split-K=4, RED epilogue`): it names the experiment in the ledger, the charts and
+   `kernel-agent exp`; the `hypothesis` says why it should be faster.
 3. Then optimise with evidence: run `evaluate_candidate` with `profile=true`
    to see which kernels remain and how long each takes.
 4. Cover every captured case (prefill AND decode shapes). Specialise per shape

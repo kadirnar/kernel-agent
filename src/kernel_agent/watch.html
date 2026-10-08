@@ -329,7 +329,7 @@ td.nowrap { white-space: nowrap; }
   <div class="filters">
     <label>Target <select id="f-target"></select></label>
     <label>Status <select id="f-status"></select></label>
-    <label>Search <input id="f-query" type="search" placeholder="idea, hypothesis, snapshot, backend"></label>
+    <label>Search <input id="f-query" type="search" placeholder="title, idea, hypothesis, snapshot, backend"></label>
     <span class="count" id="f-count" aria-live="polite"></span>
   </div>
   <div class="scroll">
@@ -337,7 +337,7 @@ td.nowrap { white-space: nowrap; }
       <thead><tr>
         <th class="num">#</th><th>time</th><th>target</th><th>backend</th><th>status</th>
         <th class="num">speedup</th><th class="num">new</th><th class="num">saved</th>
-        <th>hypothesis</th><th>file</th>
+        <th>title</th><th>file</th>
       </tr></thead>
       <tbody id="ledger-body"></tbody>
     </table>
@@ -1189,7 +1189,7 @@ td.nowrap { white-space: nowrap; }
     const q = ui.query.trim().toLowerCase();
     const rows = S.rows.filter((r) => (!ui.target || r.target === ui.target)
       && (!ui.status || r.status === ui.status || (ui.status === "failed" && FAILURES.includes(r.status)))
-      && (!q || `${r.idea || ""} ${r.hypothesis} ${r.snapshot} ${r.backend} ${r.target}`.toLowerCase().includes(q)));
+      && (!q || `${r.title || ""} ${r.idea || ""} ${r.hypothesis} ${r.snapshot} ${r.backend} ${r.target}`.toLowerCase().includes(q)));
     const shown = rows.slice(-ui.limit).reverse();
     const colors = new Map(sm.targets.map((t) => [t.id, t.color]));
     $("ledger-body").replaceChildren(...shown.map((r) => {
@@ -1205,8 +1205,9 @@ td.nowrap { white-space: nowrap; }
         h("td", { class: "num" }, fmt.x(r.speedup)),
         h("td", { class: "num" }, r.target === "e2e" ? fmt.ms(r.new_ms) : fmt.ms(r.new_ms, 3)),
         h("td", { class: "num" }, fmt.ms(savedOf(r))),
-        h("td", { class: "hyp" }, r.idea ? [h("code", { title: "idea_id" }, r.idea), " "] : null,
-          r.hypothesis || r.snapshot || ""),
+        // the title (issue #222), the [idea] and hypothesis on hover
+        h("td", { class: "hyp", title: `${r.idea ? `[${r.idea}] ` : ""}${r.hypothesis || ""}` || null },
+          r.title || r.hypothesis || r.snapshot || ""),
         h("td", {}, r.file ? h("button", { class: "linkish", type: "button", title: r.file,
           onclick: () => openFile(r.file, true) }, "view") : ""));
     }));
