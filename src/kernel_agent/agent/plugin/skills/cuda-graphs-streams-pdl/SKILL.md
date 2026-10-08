@@ -55,6 +55,9 @@ side streams with `kernel_agent.concurrency` (`cc`).
 
 * Static KV cache + `torch.compile(mode="reduce-overhead")` / CUDA graphs for decode loops, graphs on a diffusion denoiser: `optimisation-playbook` (`model-transforms.md`, `model-families.md`; the VoxCPM2 entry also says which graphs teacher forcing allows).
 * Multi-stream capture of a side stage and its rules: `systems-patterns`.
+* A whole generation loop in one graph (conditional WHILE / IF nodes through `cuda.core`,
+  the stop checked on the device; K-step unrolled graphs where the driver lacks them):
+  `systems-patterns`, `kernel_agent.graphloop`.
 * Host time does not count under graphs (Triton launches, `torch._scaled_mm`, cuBLASLt): `triton-kernels`, `fp8-w8a8`.
 
 ## Examples and sources

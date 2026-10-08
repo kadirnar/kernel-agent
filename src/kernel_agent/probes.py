@@ -18,6 +18,10 @@ and says whether it works here and how:
   refused: installing it must not change torch), and the bundled ``helion_rmsnorm.py``
   example compiles with Helion's default config and computes the reference's RMSNorm. Not
   installed: skipped with that reason (the ``helion`` backend is then unavailable).
+* ``graph_conditional``: conditional graph nodes (CUDA 12.4+ driver, ``cuda.core``): a
+  :func:`kernel_agent.graphloop.device_loop` WHILE graph with a chunk IF node runs its steps
+  on the device and stops on its own flag (skipped where they are unavailable: loops use
+  the K-step unrolled graphs there).
 
 :func:`run` records the results with :func:`versions` in
 ``<cache>/probes-<gpu>-torch<version>.json``. A probe that fails says why; none of them
@@ -270,15 +274,30 @@ def probe_helion() -> Probe:
     )
 
 
+def probe_graph_conditional() -> Probe:
+    """A three-step device loop through a WHILE graph (:func:`kernel_agent.graphloop.probe`)."""
+    from kernel_agent import graphloop
+
+    ok, detail = graphloop.probe()
+    return Probe("graph_conditional", ok, detail)
+
+
 PROBES: dict[str, Callable[[], Probe]] = {
     "dot_scaled": probe_dot_scaled,
     "tma": probe_tma,
     "pdl": probe_pdl,
     "green_contexts": probe_green_contexts,
     "helion": probe_helion,
+    "graph_conditional": probe_graph_conditional,
 }
 #: The package each probe needs (skipped without it; ``helion`` says why itself).
-NEEDS = {"dot_scaled": "triton", "tma": "triton", "pdl": "cuda.core", "green_contexts": "torch"}
+NEEDS = {
+    "dot_scaled": "triton",
+    "tma": "triton",
+    "pdl": "cuda.core",
+    "green_contexts": "torch",
+    "graph_conditional": "cuda.core",
+}
 #: The GPUs each probe's feature exists on (``gpu_arch.supports``) and what it is: skipped
 #: elsewhere with the reason, never reported as a failure (#165).
 ARCHS = {
