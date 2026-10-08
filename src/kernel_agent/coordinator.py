@@ -48,6 +48,10 @@ rate gate opens, a role's first session streams, a breaker's pause ends (and eve
   (``Orchestrator.ownership``, ``runner.write_guard``). With ``--overlap avoid`` no two
   sessions work on overlapping modules at once; with ``warn`` (default) a session's digest
   names the concurrent sessions that do.
+* **Board** (``board.py``, issue #187): a slice's modules are posted as its ``claim`` when it
+  starts and its ``release`` when it ends; a ``claim`` its agent posts (``post_note``: a
+  systems agent before a transform that replaces a module) joins its claims, which
+  ``--overlap`` then weighs.
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import AssistantMessage, RateLimitEvent
 
-from kernel_agent import gpuqueue, interrupt, ledger, roles, scheduler
+from kernel_agent import board, gpuqueue, interrupt, ledger, roles, scheduler
 from kernel_agent.agent import runner
 from kernel_agent.improve import MAX_FAILED_SLICES, _ts, log, slices_chart
 from kernel_agent.native import engine as native_engine
@@ -207,6 +211,7 @@ class Job:
     why: str = ""  # a research session's reason
     evaluations: int = 0  # it is expected to make (its virtual pull)
     claims: list[Claim] = field(default_factory=list)
+    claimed: bool = False  # its claims are on the board (board.py): released when it ends
     usd: float = 0.0  # reserved
     note: str = ""  # appended to its digest
     started: float = 0.0  # the loop's time
@@ -264,6 +269,9 @@ class Coordinator:
         budget.gate = self.gate
         self.orch.ownership = True  # every engineer session writes only in its own directory
         log(f"--agents {self.slots}: up to {self.slots} agent sessions at once")
+        posts = board.active(self.imp.run)
+        if posts is not None:  # an agent's claim joins its session's claims
+            posts.listen(self._posted)
         try:
             async with asyncio.TaskGroup() as tg:
                 self.tg = tg
@@ -274,6 +282,8 @@ class Coordinator:
                 first = first.exceptions[0]
             raise first from group
         finally:
+            if posts is not None:
+                posts.unlisten(self._posted)
             self.gate.stop()
             budget.gate = None
             self.orch.ownership = False
@@ -468,6 +478,7 @@ class Coordinator:
             rec, evaluations = imp._open_dossier(arm), 0
         job = Job(kind, arm, role, rec, arms, why=why, evaluations=evaluations)
         job.claims = self._claims_of(arm) if kind == SLICE else []
+        job.claimed = board.claim(self.imp.run, job.label, role, arm.id, job.claims)
         job.note = self._note(job)
         job.usd = self._usd(role)
         job.started = self.loop.time()
@@ -522,6 +533,8 @@ class Coordinator:
         finally:
             self.jobs.pop(job.label, None)
             self.orch.budget.release_usd(job.label)
+            if job.claimed or job.claims:  # its modules are free again (board.py)
+                board.release(self.imp.run, job.label, job.arm.id, job.claims)
             if not any(j.role == job.role for j in self.jobs.values()):
                 self.warm.discard(job.role)  # the next batch of the role staggers again
             self.poke()
@@ -571,6 +584,8 @@ class Coordinator:
                     job.rec.update(status="interrupted", ended=_ts())
                     self.imp.save()
             self.orch.budget.release_usd(job.label)
+            if job.claimed or job.claims:
+                board.release(self.imp.run, job.label, job.arm.id, job.claims)
         self.jobs.clear()
 
     # -------------------------------------------------------- breakers and claims
@@ -616,6 +631,19 @@ class Coordinator:
                     claims = [(stage.module_class, None)]
         self._claims[arm.id] = claims
         return claims
+
+    def _posted(self, entry: dict[str, Any]) -> None:
+        """A board entry (``board.Board.listen``, from the thread that posted it): a
+        ``claim`` an agent posted adds its module class to its session's claims, so
+        ``--overlap`` weighs the modules the agent said it will change (§3.6)."""
+        tags = entry.get("tags") or {}
+        author, cls = str(entry.get("author")), tags.get("module_class")
+        if entry.get("kind") != board.CLAIM or author == board.COORDINATOR or not cls:
+            return
+        for job in list(self.jobs.values()):
+            if author in job.rec.get("sessions", [job.label]) and (cls, None) not in job.claims:
+                job.claims = [*job.claims, (str(cls), None)]
+                self.poke()
 
     def _note(self, job: Job) -> str:
         """The digest section of a slice that starts beside other sessions: who runs and

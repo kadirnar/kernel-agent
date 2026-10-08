@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, truth
+from kernel_agent import board, ledger, truth
 from kernel_agent.agent.prompts import DOSSIER_FILE
 from kernel_agent.agent.tools import best_for_target, idea_rows
 from kernel_agent.truth import TamperError, Truth
@@ -187,7 +187,8 @@ def transforms_section(run: RunDir, top: int = TRANSFORM_ROWS) -> str:
 
 def evidence(run: RunDir, target_id: str, reason: str, keeper: Truth | None = None) -> str:
     """The ``# Evidence`` of a research session: why it runs, the best result with its
-    speed of light per case, the per-idea aggregates and the target's ledger rows."""
+    speed of light per case, the per-idea aggregates and the target's ledger rows (and its
+    board history: the conclusions the sessions posted about it, ``board.py``)."""
     rows = ledger.measured(r for r in ledger.rows(run) if r["target"] == target_id)
     stats = target_ideas(run, target_id, keeper)
     kept = sum(r["status"] == ledger.KEEP for r in rows)
@@ -229,4 +230,5 @@ def evidence(run: RunDir, target_id: str, reason: str, keeper: Truth | None = No
             f"`{PLAN_FILE}` already holds an earlier research plan: check which of its "
             "directions were tried (checklist item 7) before you replace it.",
         ]
+    lines += board.history_lines(run, target_id)  # the sessions' conclusions on it (#187)
     return "\n".join(lines)

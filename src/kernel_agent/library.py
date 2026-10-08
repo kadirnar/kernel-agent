@@ -33,8 +33,9 @@ definition + solution + evaluation per kernel)::
   with their numbers (:func:`prompt_note`), followed by the lessons for the target's
   backends and module family (at most :data:`LESSONS_CHARS` characters).
 * **Lessons** (:func:`librarian_prompt`, :func:`write_lessons`): after the report a
-  cheap agent turns the run's ``NOTES.md`` files and ledger rows into short validity
-  rules and merges them into ``lessons/``, pruning duplicates and stale rules.
+  cheap agent turns the run's ``NOTES.md`` files and ledger rows (and the insights and
+  traps its sessions posted to the board, ``board.py``) into short validity rules and
+  merges them into ``lessons/``, pruning duplicates and stale rules.
 * **Claude Code memory** (:func:`cmd_import_memory`): agent sessions run without Claude
   Code's auto memory (``runner.SESSION_ENV``), so what they learn lands here, not in the
   user's ``~/.claude/projects/<project>/memory/``. ``kernel-agent library import-memory DIR``
@@ -62,7 +63,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import ledger, truth, workers
+from kernel_agent import board, ledger, truth, workers
 from kernel_agent.budget import PRIOR_HYPOTHESIS
 from kernel_agent.toolchain import CACHE_DIR
 from kernel_agent.truth import TamperError, Truth, read_verified, sha256_bytes, sha256_file
@@ -853,6 +854,7 @@ def librarian_prompt(run: RunDir, names: dict[str, str], *, arch: str | None = N
             notes or "(empty)",
             "```",
         ]
+    lines += board.lessons_lines(run)  # the sessions' insights and traps (#187)
     lines += ["", "# Current lessons files (merge into these)"]
     for name in names:
         current = rules(name)

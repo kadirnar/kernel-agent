@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from kernel_agent import (
+    board,
     charts,
     cli,
     coordinator,
@@ -213,6 +214,74 @@ def test_staggered_starts_and_digests_name_the_other_sessions(three):
     assert kernel[0]["system"] == kernel[1]["system"]  # one cached prefix for the role (#181)
 
 
+# ------------------------------------------------------------------ the board (#187)
+
+
+def test_board_winners_reach_the_other_arms(three):
+    """A kernel arm's new best, posted by kernel-agent, is in the next digest of the systems
+    agent and rides on the evaluation results of a systems session running meanwhile; the
+    simulated engineers post notes through post_note's checks, and every slice claims and
+    releases its modules."""
+    orch, world, *_ = three
+    entries = board.load(orch.run)
+    kernel_targets = set(orch.run.target_ids())
+    winners = {
+        e["id"]: e
+        for e in entries
+        if e["author"] == board.COORDINATOR
+        and e["kind"] == board.WINNER
+        and set(e["tags"]["targets"]) <= kernel_targets
+    }
+    assert winners and all(e["ts"] >= world.clock.t0 for e in entries)
+    systems = [s for s in world.sessions if s["name"] == "systems"]
+    shown = {w for s in systems for w in winners if f"#{w} winner [" in s["prompt"]}
+    assert shown  # in a digest of another arm, as its first line
+    first = min(shown)
+    later = next(s for s in systems if f"#{first} winner [" in s["prompt"])
+    assert later["at"] >= winners[first]["ts"]
+    seen = {i for label, ids in world.seen.items() if label.startswith("systems") for i in ids}
+    assert seen & set(winners) - shown  # live: on its results, not only in its digest
+    notes = [e for e in entries if e["author"] != board.COORDINATOR]
+    assert {e["kind"] for e in notes} >= {board.WINNER, board.TRAP}
+    assert all(e["author"].startswith("kernel-") for e in notes)
+    posts: dict[str, int] = {}
+    for e in notes:
+        posts[e["author"]] = posts.get(e["author"], 0) + 1
+    assert max(posts.values()) <= board.POSTS_PER_SESSION
+    state = read_json(orch.run.root / "improve.json")
+    kernel_slices = {s["label"] for s in state["slices"] if s["arm"] in kernel_targets}
+    claimed = {e["tags"]["session"] for e in entries if e["kind"] == board.CLAIM}
+    released = {e["tags"]["session"] for e in entries if e["kind"] == board.RELEASE}
+    assert kernel_slices <= claimed == released
+    systems_prompt = next(s["system"] for s in systems)
+    assert "# Board (post_note / read_board)" in systems_prompt
+    planner = next(s for s in world.sessions if s["name"] == "planner")
+    assert "# Board" not in planner["system"]
+    report = orch.run.report.read_text()
+    assert "* board (`board.jsonl`):" in report and "posted winners built on" in report
+
+
+def test_an_agents_claim_joins_its_sessions_claims(tmp_path):
+    orch, _ = make(tmp_path)
+    improver = Improver(orch, ImproveConfig(agents=2), require_capture=False, live_charts=False)
+    coord = coordinator.Coordinator(improver)
+    arm = Arm(SYSTEMS, SYSTEMS, 100.0)
+    rec = {"label": "systems#4", "sessions": ["systems#4"]}
+    job = coordinator.Job(coordinator.SLICE, arm, SYSTEMS, rec, [arm])
+    coord.jobs[job.label] = job
+    with board.opened(orch.run) as found:
+        found.listen(coord._posted)
+        found.post(board.COORDINATOR, board.CLAIM, "not an agent's", tags={"module_class": "X"})
+        mine = board.Reader.of(orch.run, "systems#4", SYSTEMS, SYSTEMS)
+        args = {"kind": "claim", "text": "static KV cache", "target": "Qwen3Attention"}
+        found.note(orch.run, mine, args)
+        assert job.claims == [("Qwen3Attention", None)]
+        attn = Arm("attn", KERNEL, 100.0)
+        other = coordinator.Job(coordinator.SLICE, attn, KERNEL, {"label": "k#5"}, [attn])
+        other.claims = [("Qwen3Attention", "model.layers.0.self_attn")]
+        assert coordinator.overlaps(job.claims, other.claims)  # --overlap weighs it now
+
+
 def test_virtual_dry_run_is_reproducible(tmp_path):
     def key(orch):
         rows = [
@@ -222,13 +291,14 @@ def test_virtual_dry_run_is_reproducible(tmp_path):
         state = read_json(orch.run.root / "improve.json")
         t0 = min(s["started"] for s in state["slices"])
         slices = [(s["label"], s["evals"], round(s["started"] - t0, 3)) for s in state["slices"]]
-        return rows, slices
+        notes = [(e["id"], e["author"], e["kind"], e["text"]) for e in board.load(orch.run)]
+        return rows, slices, notes
 
     a, world = make(tmp_path / "a")
     concurrent(a, world, max_slices=10)
     b, world = make(tmp_path / "b")
     concurrent(b, world, max_slices=10)
-    assert key(a) == key(b)
+    assert key(a) == key(b) and key(a)[2]  # the board too
     assert len(read_json(a.run.root / "improve.json")["slices"]) == 10  # starts counted
 
 
@@ -245,6 +315,8 @@ def test_agents_one_is_the_sequential_loop(tmp_path, monkeypatch):
         assert asyncio.run(improver.improve()) == "--max-slices 2 reached"
     slices = read_json(orch.run.root / "improve.json")["slices"]
     assert not any("sessions" in s or "queue_s" in s for s in slices)  # records as before
+    assert not (orch.run.root / board.FILE).exists()  # no board (--board auto)
+    assert not any("# Board" in s["system"] or "## Board" in s["prompt"] for s in world.sessions)
 
 
 # ------------------------------------------------------------------ budgets and breakers

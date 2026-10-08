@@ -17,7 +17,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from kernel_agent import dashboard, dedup, gpuqueue, ledger, region, truth, workers
+from kernel_agent import board, dashboard, dedup, gpuqueue, ledger, region, truth, workers
 from kernel_agent.budget import Budget
 from kernel_agent.kernels import sweep as sweep_mod
 from kernel_agent.kernels.evaluate import run_evaluation
@@ -342,6 +342,8 @@ def record_candidate(
     if isinstance(record.get("error"), str):
         record["error"] = record["error"][-1500:]
     _append(run, target_id, record, keeper, quick=quick)
+    if row["status"] == ledger.KEEP:  # a new best: on the board for every session (#187)
+        board.kernel_winner(run, target_id, row, hypothesis=hypothesis, session=session)
     return record, row
 
 
@@ -430,6 +432,8 @@ def record_e2e_result(
         **({"session": session} if session else {}),
     }
     _append(run, None, record, keeper)
+    if row["status"] == ledger.KEEP:  # a new end-to-end best: on the board (#187)
+        board.e2e_winner(run, row, snaps, kernels, hypothesis=hypothesis, session=session)
     return record, row
 
 
@@ -516,6 +520,19 @@ def build_server(
     keeper = keeper or truth.of(run)
     bound = binding or SessionBinding()
     cwd, session = bound.cwd, bound.label or None
+    # the run's blackboard (board.py, #187): the subscription of a session of a role with the
+    # board; what is on it now is in its digest, what is posted later rides on its results
+    posts = board.active(run)
+    reader = board.Reader.of_session(run, bound) if posts is not None else None
+    if posts is None or reader is None or reader.role not in board.ROLES:
+        reader = None
+    else:
+        posts.join(reader.label)
+
+    def _news() -> dict[str, Any]:
+        """``board``: the first lines of the board's new entries for this session ({}: none)."""
+        found = board.active(run)
+        return found.piggyback(reader) if found is not None and reader is not None else {}
 
     def _path(base: Path, path: str) -> Path:
         """``path`` relative to the session's ``cwd`` when it exists there, else to ``base``."""
@@ -684,6 +701,7 @@ def build_server(
                 return _text(
                     await _duplicate(cached, args, hypothesis, source, idea, worker)
                     | _uncounted(budget, name, evals_budget)
+                    | _news()
                 )
         _inflight[slot] = done = asyncio.Event()
         try:
@@ -750,7 +768,8 @@ def build_server(
             )
         if quick:
             out["mode"], out["not_a_benchmark"] = dedup.QUICK, QUICK_NOTE
-            return _text(out | _best_so_far(target_id) | _uncounted(budget, name, evals_budget))
+            out |= _best_so_far(target_id) | _uncounted(budget, name, evals_budget)
+            return _text(out | _news())
         if idea or expected is not None:
             try:
                 records = keeper.records(run.results_file(target_id))
@@ -764,7 +783,7 @@ def build_server(
             evals_budget,
             pct_of_sol=sol_signal(result),
         )
-        return _text(out)
+        return _text(out | _news())
 
     @tool(
         "sweep_candidate",
@@ -920,7 +939,7 @@ def build_server(
             evals_budget,
             pct_of_sol=sol_signal(result),
         )
-        return _text(out)
+        return _text(out | _news())
 
     @tool(
         "best_result",
@@ -1028,7 +1047,7 @@ def build_server(
         result |= budget.feedback(
             bound.e2e_agent(), run.results_file(), bound.evaluations, ok_key="passed"
         )
-        return _text(result)
+        return _text(result | _news())
 
     @tool(
         "check_harness",
@@ -1077,22 +1096,100 @@ def build_server(
         result = await gpuqueue.run(job, region.check, run, target_id, keeper, timeout=timeout)
         return _text(result)
 
-    doc_search, doc_read = doc_tools()
-    return create_sdk_mcp_server(
-        SERVER_NAME,
-        version="0.1.0",
-        tools=[
-            evaluate_candidate,
-            sweep_candidate,
-            best_result,
-            evaluate_e2e,
-            check_harness,
-            run_info,
-            verify_rewrite,
-            doc_search,
-            doc_read,
-        ],
+    @tool(
+        "post_note",
+        "Post a conclusion to the run's board, which the other agent sessions read (advice, "
+        "never scored): why a kept result of yours wins (winner: its exp:N or snapshot in "
+        "refs), a dead end and the error or measurement that proves it (trap), a fact that "
+        "holds beyond your kernel (insight), a module you are about to change (claim), a "
+        "question for another arm (question, with `to`). Conclusions only, never progress.",
+        {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": list(board.AGENT_KINDS)},
+                "text": {
+                    "type": "string",
+                    "description": "the conclusion with its numbers; the first line is what the "
+                    f"others see first (at most {board.TEXT_CHARS} characters)",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "the target id (or systems, native, a module class) it is "
+                    "about; omit it for a note that holds for every target",
+                },
+                "refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "what it rests on: history/<snapshot>, exp:<N>, a file path",
+                },
+                "to": {
+                    "type": "string",
+                    "description": 'only for "arm:<target, systems or native>", "role:<role>" '
+                    'or "session:<label>"',
+                },
+                "reply_to": {"type": "integer", "description": "the id of the note it answers"},
+            },
+            "required": ["kind", "text"],
+        },
     )
+    async def post_note(args: dict[str, Any]) -> dict[str, Any]:
+        found = board.active(run)
+        if found is None or reader is None:
+            return _text({"status": "error", "error": "this session has no board"})
+        try:
+            out = found.note(run, reader, args)
+        except board.Refused as exc:
+            return _text({"status": "refused", "error": str(exc)})
+        return _text({"status": "posted", **out})
+
+    @tool(
+        "read_board",
+        "Read the run's board with the full text of its entries: by default those for this "
+        "session (about your target or module class, notes for every target, what is "
+        "addressed to you; every winner for the systems and native agents) after `since` or "
+        "of the last `minutes`; or filtered by kinds and target, or all of them. Advice, "
+        "never scored.",
+        {
+            "type": "object",
+            "properties": {
+                "since": {"type": "integer", "description": "entries after this id"},
+                "minutes": {"type": "integer", "description": "entries of the last N minutes"},
+                "kinds": {"type": "array", "items": {"type": "string", "enum": list(board.KINDS)}},
+                "target": {"type": "string", "description": "a target id or module class"},
+                "all": {"type": "boolean", "description": "every entry, not only yours"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": board.READ_MAX,
+                    "default": board.READ_ITEMS,
+                },
+            },
+        },
+    )
+    async def read_board(args: dict[str, Any]) -> dict[str, Any]:
+        found = board.active(run)
+        if found is None or reader is None:
+            return _text({"status": "error", "error": "this session has no board"})
+        try:
+            return _text(found.read(reader, args))
+        except board.Refused as exc:
+            return _text({"status": "error", "error": str(exc)})
+
+    doc_search, doc_read = doc_tools()
+    tools = [
+        evaluate_candidate,
+        sweep_candidate,
+        best_result,
+        evaluate_e2e,
+        check_harness,
+        run_info,
+        verify_rewrite,
+        doc_search,
+        doc_read,
+    ]
+    if reader is not None:  # a session of a role with the board (board.ROLES)
+        tools += [post_note, read_board]
+    return create_sdk_mcp_server(SERVER_NAME, version="0.1.0", tools=tools)
 
 
 def doc_tools() -> tuple[Any, Any]:

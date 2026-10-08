@@ -2019,6 +2019,59 @@ Programming Guide, the whole PTX ISA, cuBLAS, CUTLASS, Triton and TileLang web d
   `[source] doc:<id> <source> — <the fact you took>`."""
 
 
+_BOARD_ROLE = {
+    "kernel": """
+A `winner` of another target with your module class or precision is a recipe to try; a
+`trap` is a dead end to skip unless you have new evidence.""",
+    "systems": """
+Every new best of a kernel target arrives as a `winner` with its snapshot: combine the live
+ones in evaluate_e2e (`kernels: ["<target>=history/..."]`), not only those your session
+started with. Post a `claim` (target: the module class) before a transform that replaces a
+module a kernel target works on.""",
+    "native": """
+Every new best of a kernel target arrives as a `winner` with its snapshot: your building
+blocks are live, not only those your session started with; evaluate_e2e takes one as
+`kernels: ["<target>=history/..."]`.""",
+    "research": """
+Your target's board history is in the evidence. Post what the sessions of other targets
+should know as an `insight` or a `trap`; your plan stays the place for this target's
+directions.""",
+}
+
+
+def board_note(agent: str) -> str:
+    """``# Board`` section of an agent's system prompt (``board.py``, issue #187: ``improve``
+    with ``--agents N`` or ``--board on``): what to post and when (conclusions only, the
+    artifacts in refs), that notes are advice and never scored, where new ones arrive; ""
+    for a role without the board. The same for every session of a role (the stable prefix);
+    the board's entries are in the digest and on the evaluation results."""
+    from kernel_agent import board
+
+    role = agent.split("#", 1)[0].split("-", 1)[0].lower()
+    if role not in board.ROLES:
+        return ""
+    return f"""
+
+# Board (post_note / read_board)
+Other sessions work beside yours (other targets, the systems and native agents) and after
+it; the run's board is where each one leaves its conclusions for the others. Post with
+`post_note` only what another session can act on, once you have concluded it:
+* `winner`: why a kept result of yours wins (its `exp:N` or snapshot in `refs`);
+* `trap`: a dead end and the error or measurement that proves it;
+* `insight`: a fact that holds beyond your kernel (a GPU, compiler or library behaviour, a
+  layout or precision that pays), with its numbers;
+* `claim`: a module you are about to change (`target`: its target id or module class);
+* `question`: for another arm (`to: "arm:<id>"`); answer one with `reply_to`.
+One conclusion per note, its numbers in it and the files it rests on in `refs`
+(`history/...`, `exp:N`): the artifacts are on disk, the note points at them. Never post
+progress, plans or what the ledger already shows; at most {board.POSTS_PER_SESSION} notes
+a session. Notes are advice, never scored: nothing on the board replaces an evaluation, so
+check a note before you build on it. New notes for you ride on your evaluation results
+(`board`: their first lines); `read_board` has the full text. kernel-agent itself posts every
+new best (`winner`), each integration and round, and the modules each running session works
+on (`claim` / `release`).{_BOARD_ROLE[role]}"""
+
+
 def dossier_prompt(
     target: dict[str, Any], capture_info: dict[str, Any], dossier: Path, toolchain: str
 ) -> str:
