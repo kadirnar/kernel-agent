@@ -1688,7 +1688,7 @@ def _plan_md(target_id: str, sim: SimTarget, rows: list[dict[str, Any]]) -> str:
     failed = sum(r["status"] in ledger.FAILURES for r in recent)
     fresh = [(_idea_of(h), h) for h in sim.hypotheses if _idea_of(h) not in tried]
     buggy = [s for s in stats if s["verdict"] == "buggy"]
-    slow = [s for s in stats if s["verdict"] == "slow"]
+    slow = [s for s in stats if s["verdict"] in ("slow", "refuted")]
     repeated = [f"`{s['idea']}` ×{s['tries']}" for s in stats if s["tries"] >= 3]
     ranked = (
         fresh[:3]

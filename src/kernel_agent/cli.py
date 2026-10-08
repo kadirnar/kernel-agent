@@ -279,6 +279,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         ab_rounds=ns.ab_rounds,
         ab_min_win_rate=ns.ab_min_win_rate,
         ab_min_gain=ns.ab_min_gain,
+        early_stop=ns.early_stop != "off",
         recheck=not ns.no_recheck,
         export_check=not ns.no_export_check,
         quality=ns.quality,
@@ -693,6 +694,15 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         type=float,
         default=0.01,
         help="integration: the 95%% CI of an item's A/B gain must start above this",
+    )
+    p.add_argument(
+        "--early-stop",
+        choices=["on", "off"],
+        default="on",
+        help="early termination of hopeless measurements (on, default): an evaluation stops "
+        "timing a correct candidate that cannot beat the best so far, a sweep stops timing "
+        "configs clearly slower than its leader, an A/B stops once its verdict is decided; "
+        "correctness is always checked in full. off: every measurement runs all its rounds",
     )
     p.add_argument(
         "--librarian-model", help="model of the librarian (= --role-model librarian=MODEL)"

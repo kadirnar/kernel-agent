@@ -105,8 +105,10 @@ TITLES = {
 GPU_TOOLS = frozenset(
     {
         "evaluate_candidate",
+        "evaluate_candidates",
         "sweep_candidate",
         "evaluate_e2e",
+        "evaluate_e2e_batch",
         "check_harness",
         "verify_rewrite",
         "run_on_gpu",
@@ -116,7 +118,14 @@ GPU_TOOLS = frozenset(
 )
 #: ... and those whose call is an evaluation (a ledger row; not with ``mode="quick"``)
 EVAL_TOOLS = frozenset(
-    {"evaluate_candidate", "sweep_candidate", "evaluate_e2e", "submit_evaluation"}
+    {
+        "evaluate_candidate",
+        "evaluate_candidates",
+        "sweep_candidate",
+        "evaluate_e2e",
+        "evaluate_e2e_batch",
+        "submit_evaluation",
+    }
 )
 #: the tool that waits for a submitted evaluation (--async-evals): while it runs, the GPU
 #: states of the session's detached jobs are its own (before, the session works meanwhile)

@@ -314,6 +314,13 @@ def kernel_digest(
     if stats := research.target_ideas(run, arm.id)[-LAST_ROWS:]:
         lines += ["", "## Ideas so far (`idea_id`; buggy = never correct: retry, not refuted)", ""]
         lines += research.ideas_table(stats)
+        if refuted := [f"`{s['idea']}`" for s in stats if s["verdict"] == "refuted"]:
+            lines += [
+                "",
+                f"Refuted: {', '.join(refuted)} ({ledger.REFUTED_TRIES} or more correct tries, "
+                "none within the noise of the best): stop variations of them and take the next "
+                "open idea; a variant needs force=true past the critic",
+            ]
     lines += research.plan_section(run, arm.id)
     lines += _notes(workers.notes_file(run, arm.id, worker), "NOTES.md")
     lines += [
@@ -2171,7 +2178,7 @@ async def improve(
             },
             **{
                 k: False
-                for k in ("use_library", "librarian", "allow_web", "dossier")
+                for k in ("use_library", "librarian", "allow_web", "dossier", "early_stop")
                 if not getattr(cfg, k)
             },
             **({"web_domains": cfg.web_domains} if cfg.web_domains else {}),

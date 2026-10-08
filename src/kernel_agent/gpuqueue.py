@@ -17,6 +17,14 @@ Every acquisition queues on its own, so a long sequence of acquisitions (an inte
 one A/B step each) lets waiting jobs of a better class go between its steps; a step that
 runs is never interrupted. A measurement found dirty (``hygiene.py``: a foreign GPU process
 or CPU contention during its timing) queues again first of its class (:meth:`Job.requeue`).
+
+**Lease batching** (docs/MULTIAGENT.md §3.12.6, issue #190): once a job of a target took the
+GPU, the waiting jobs of the same target and class go next, before the rest of their class
+(never before a better class), up to :data:`LEASE_JOBS` jobs and :data:`LEASE_S` estimated
+seconds per lease: comparable measurements of one target (the islands' evaluations, quick
+checks) run back to back at steady clocks and share the evaluator's clean reference timing
+of the capture. A job of another target or class ends the lease (``lease`` in ``start``
+events).
 The ``flock`` stays the outer, cross-process layer: another process still excludes, and the
 queue orders this process's jobs. A coroutine of the event loop's thread waits its turn
 without blocking the loop (:meth:`Gate.admit_async`, :func:`holding`): the simulated
@@ -71,6 +79,8 @@ RANK = {c: i for i, c in enumerate(CLASSES)} | {DEFAULT: CLASSES.index(EVAL)}
 AGE_S = 600.0  # a waiting job's class improves one step per this many seconds
 MEM_SHARE = 0.9  # non-exclusive jobs share a GPU while their memory fits in this share of it
 WAIT_S = 0.25  # a waiter re-checks its turn (aging) and whether the run is stopping this often
+LEASE_JOBS = 4  # jobs of one target and class back to back (lease batching)
+LEASE_S = 120.0  # ... while their estimates add up to at most this many seconds
 FILE = "gpu_queue.jsonl"  # in the run directory
 
 #: kind -> (class, seconds a job of that kind takes before the run has timed one). The
@@ -146,6 +156,7 @@ class Job:
     # its waits stop the session's clock only once the session waits for it (attach)
     detached: bool = False
     waiting: bool = False  # it waits for the GPU now (under _attach)
+    lease: int | None = None  # the lease it last took the GPU in (lease batching, #190)
 
     @classmethod
     def of(
@@ -364,6 +375,28 @@ def rank(job: Job, now: float) -> int:
 # ------------------------------------------------------------------ admission
 
 
+@dataclass
+class Lease:
+    """Jobs of one ``target`` and ``job_class`` that took the GPU back to back (lease
+    batching): how many and their estimated seconds so far."""
+
+    id: int
+    target: str
+    job_class: str
+    jobs: int = 0
+    seconds: float = 0.0
+
+    def admits(self, job: Job) -> bool:
+        """Whether ``job`` may go next in this lease."""
+        return (
+            job.exclusive
+            and job.target == self.target
+            and job.job_class == self.job_class
+            and self.jobs < LEASE_JOBS
+            and self.seconds + job.estimate_s <= LEASE_S
+        )
+
+
 class Gate:
     """The admission controller of one lock (``gpulock``): the waiting jobs and the jobs on
     each GPU of this process. :meth:`admit` blocks until a job may take a GPU and returns
@@ -378,12 +411,15 @@ class Gate:
         self.served: dict[str | None, int] = {}  # session -> turn it was last admitted in
         self.gpus = 1  # GPUs of the pool at the last admission
         self.wakers: list[Callable[[], None]] = []  # the coroutines that wait (admit_async)
+        self.lease: Lease | None = None  # the jobs of one target and class back to back
         self._seq = itertools.count()
         self._turn = itertools.count()
+        self._leases = itertools.count(1)
 
-    def _key(self, job: Job, now: float) -> tuple[int, bool, int, float, int]:
+    def _key(self, job: Job, now: float) -> tuple[int, bool, bool, int, float, int]:
         served = self.served.get(job.session, -1)
-        return (rank(job, now), not job.front, served, job.estimate_s, job.seq)
+        member = self.lease is not None and self.lease.admits(job)  # lease batching
+        return (rank(job, now), not job.front, not member, served, job.estimate_s, job.seq)
 
     def head(self, now: float | None = None) -> Job | None:
         """The job that goes next (None: nothing waits)."""
@@ -494,9 +530,22 @@ class Gate:
         job.front = False
         if job.exclusive:
             self.unplaced.append(job)
+            self._lease(job)
         else:
             self.holders.setdefault(room[0], []).append(job)
         return room
+
+    def _lease(self, job: Job) -> None:
+        """An exclusive ``job`` took the GPU: it joins the lease, or starts the next one (a
+        job without a target ends it)."""
+        if job.target is None:
+            self.lease, job.lease = None, None
+            return
+        if self.lease is None or not self.lease.admits(job):
+            self.lease = Lease(next(self._leases), job.target, job.job_class)
+        self.lease.jobs += 1
+        self.lease.seconds += job.estimate_s
+        job.lease = self.lease.id
 
     def _notify(self) -> None:
         """Wake every waiter (under ``cond``): threads and coroutines check their turn."""
@@ -617,6 +666,7 @@ class Wait:
         self.job.started = clock()
         self.job.add(holds=1)
         mem = {"mem_gb": self.job.mem_gb} if self.job.mem_gb is not None else {}
+        mem |= {"lease": self.job.lease} if self.job.lease is not None else {}
         _event(self.job, "start", gpu=gpu, wait_s=round(self.waited, 2), **mem)
 
     def ended(self) -> None:

@@ -21,15 +21,17 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from kernel_agent import board, critic, dashboard, dedup, gpuqueue, ledger, region, truth, workers
 from kernel_agent.budget import Budget
 from kernel_agent.kernels import sweep as sweep_mod
-from kernel_agent.kernels.evaluate import run_evaluation
+from kernel_agent.kernels.evaluate import run_evaluation, run_evaluations
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.native import engine as native_engine
 from kernel_agent.native import project as native_project
 from kernel_agent.truth import TamperError, Truth, sha256_file
-from kernel_agent.worker import call_worker
+from kernel_agent.worker import call_worker, e2e_batch
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, write_json
 
 SERVER_NAME = "ka"
+#: Candidates of one evaluate_candidates call, sets of one evaluate_e2e_batch call (#190)
+BATCH_MAX = 8
 QUICK_NOTE = (
     "quick check: correctness only, on the smallest and the largest captured case. NOT a "
     "benchmark: no timing, no speedup, never a new best, not counted against your evaluation "
@@ -289,6 +291,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "sol_note",
             "sol_error",
             "peak_memory",  # the per-call peak vs the reference's (kernels/evaluate.py)
+            "early",  # an early discard: timing stopped, it cannot be a new best (#190)
         )
         if k in result
     }
@@ -506,26 +509,55 @@ def idea_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "expected_speedup": r.get("expected_speedup"),
             "hypothesis": r.get("hypothesis"),
             "exp": r.get("exp"),
+            "snapshot": r.get("snapshot"),  # a re-evaluation replaces its snapshot's record
+            "spread": ledger.kernel_spread(r),  # the noise of "within the noise of the best"
         }
         for r in records
     ]
 
 
+def idea_stats(records: list[dict[str, Any]], idea: str) -> dict[str, Any] | None:
+    """``ledger.ideas`` of ``idea`` over a target's records (None: no try of it yet)."""
+    if not idea:
+        return None
+    return next((s for s in ledger.ideas(idea_rows(records)) if s["idea"] == idea), None)
+
+
+#: Session advice (docs/MULTIAGENT.md §3.12.5): this many build errors in a row on one idea
+BUILD_ERRORS = 3
+
+
 def idea_feedback(
     records: list[dict[str, Any]], idea: str, expected: float | None, row: dict[str, Any]
 ) -> dict[str, Any]:
-    """``idea`` part of an ``evaluate_candidate`` result: expected vs measured, the idea so far."""
+    """``idea`` part of an ``evaluate_candidate`` result: expected vs measured, the idea so far
+    (a refuted idea says so: stop its variations; :data:`BUILD_ERRORS` build errors in a row
+    on it advise compile triage or another idea)."""
     out: dict[str, Any] = {"id": idea or None, "expected_speedup": expected}
     out["speedup"] = row["speedup"] if row["correct"] else None
     if row["correct"] and expected and row["speedup"]:
         out["vs_expected"] = f"{row['speedup']:.3f}x measured vs {expected:.3f}x expected"
-    stats = next((s for s in ledger.ideas(idea_rows(records)) if s["idea"] == idea), None)
+    stats = idea_stats(records, idea)
     if stats:
         out |= {k: stats[k] for k in ("tries", "best", "kept", "slow", "bugs", "verdict")}
+    if stats and stats["verdict"] == "refuted":
+        out["note"] = (
+            f"refuted: stop variations of {idea!r}. {stats['slow']} correct tries, none a new "
+            f"best or within the noise of the best ({stats['refuted']['target_best']}x): take "
+            "the next open idea (a variant of this one needs force=true past the critic)"
+        )
     if not row["correct"] and idea:
         out["note"] = (
             f"a {row['status']} is a bug in this attempt, not evidence against the idea: "
             f"fix it and evaluate again with idea_id={idea!r} before you drop the idea"
+        )
+    mine = [r for r in records if r.get("idea") == idea and r.get("mode") != dedup.QUICK]
+    recent = [r.get("ledger_status") or r.get("status") for r in mine[-BUILD_ERRORS:]]
+    if idea and len(recent) == BUILD_ERRORS and set(recent) == {"build_error"}:
+        out["advice"] = (
+            f"{BUILD_ERRORS} build errors in a row on {idea!r}: give the compiler output to "
+            "the compile-triage helper (Agent tool) instead of reading it here, or switch to "
+            "another idea and come back to this one later"
         )
     return out
 
@@ -740,6 +772,27 @@ def build_server(
             else None
         }
 
+    def _bar(target_id: str) -> dict[str, Any]:
+        """``early_best`` for the evaluator: the speedup a new best of ``target_id`` must beat
+        (the ledger's keep bar, at least the reference's 1.0), so a correct candidate that
+        cannot reach it stops timing early (``kernels/early.py``, #190); {} when
+        ``--early-stop off``."""
+        if not budget.early_stop:
+            return {}
+        rows = [r for r in ledger.rows(run) if r["target"] == target_id]
+        return {"early_best": ledger.best_kept(rows)}
+
+    def _refuted(target_id: str, idea: str) -> dict[str, Any] | None:
+        """``ledger.ideas``' ``refuted`` of ``idea`` on ``target_id`` (None: not refuted)."""
+        if not idea:
+            return None
+        try:
+            records = keeper.records(run.results_file(target_id))
+        except TamperError:
+            return None
+        stats = idea_stats(records, idea)
+        return stats.get("refuted") if stats else None
+
     async def _duplicate(
         cached: dict[str, Any],
         args: dict[str, Any],
@@ -933,6 +986,7 @@ def build_server(
                     snapshot=f"history/{snap.name}",
                     parent=_parent(target_dir, args.get("parent")),
                     idea=idea,
+                    refuted=_refuted(target_id, idea),  # a variant of a refuted idea (#190)
                 )
             if critic.blocks(review):  # a static reject: withdrawn before it is queued
                 uncounted = _uncounted(budget, name, evals_budget)
@@ -955,7 +1009,7 @@ def build_server(
                         timeout=budget.eval_timeout_s,
                         capture_sha256=capture_sha256,
                         **({"compile_check": True} if args.get("compile_check") else {}),
-                        **({"quick": True} if quick else {}),
+                        **({"quick": True} if quick else _bar(target_id)),
                     ),
                 )
             if result is None:  # the critic withdrew it while it waited for the GPU
@@ -1218,6 +1272,7 @@ def build_server(
             capture_sha256=capture_sha256,
             compile_check=bool(args.get("compile_check")),
             prepare=prepare,
+            race=budget.early_stop,  # racing of the configs (kernels/early.py, #190)
         )
         snap, snap_sha256 = snaps[0]
         result = data["evaluation"]
@@ -1257,7 +1312,7 @@ def build_server(
         out["sweep"] = {
             k: info[k] for k in ("configs", "passed", "failed", "skipped", "seconds") if k in info
         }
-        for key in ("rounds", "cases", "timing", "note", "sol_note"):
+        for key in ("rounds", "raced", "cases", "timing", "note", "sol_note"):
             if info.get(key):
                 out["sweep"][key] = info[key]
         if notes:
@@ -1278,6 +1333,228 @@ def build_server(
             pct_of_sol=sol_signal(result),
         )
         return _text(out | _news())
+
+    @tool(
+        "evaluate_candidates",
+        f"Evaluate 2 to {BATCH_MAX} variants of ONE idea of yours on one target in one go: one "
+        "evaluator process loads the capture once and runs each candidate through the full "
+        "evaluation (its own build, every correctness check, its own timing against the "
+        "reference), so it takes less GPU time than separate evaluate_candidate calls. Each "
+        "is snapshotted, recorded as its own ledger row and counts as one evaluation of your "
+        "budget; the results come back in order.",
+        {
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "string"},
+                "candidates": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": BATCH_MAX,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "candidate": {
+                                "type": "string",
+                                "description": "path to the candidate .py (relative to your "
+                                "working dir)",
+                            },
+                            "hypothesis": {
+                                "type": "string",
+                                "description": "one sentence: what this variant changes",
+                            },
+                            "parent": {"type": "string"},
+                            "expected_speedup": {"type": "number"},
+                        },
+                        "required": ["candidate", "hypothesis"],
+                    },
+                },
+                "idea_id": {"type": "string", "description": "the idea these variants implement"},
+                "compile_check": {"type": "boolean", "default": False},
+                "force": {
+                    "type": "boolean",
+                    "description": "evaluate even what the critic rejects",
+                    "default": False,
+                },
+            },
+            "required": ["target_id", "candidates"],
+        },
+    )
+    async def evaluate_candidates(args: dict[str, Any]) -> dict[str, Any]:
+        target_id = args["target_id"]
+        target_dir = run.target(target_id)
+        capture = run.capture_file(target_id)
+        if not capture.exists():
+            return _text({"status": "error", "error": f"unknown target {target_id}"})
+        worker = bound.worker if bound.mine(target_id) else None
+        if worker is not None:
+            target_dir = workers.directory(run, target_id, worker)
+        items = args.get("candidates")
+        if not isinstance(items, list) or not 1 <= len(items) <= BATCH_MAX:
+            error = f"candidates is a list of 1 to {BATCH_MAX} {{candidate, hypothesis}} objects"
+            return _text({"status": "error", "error": error})
+        if (flying := tickets.pending()) is not None:  # --async-evals: collect it first
+            error = f"evaluation {flying.id} ({flying.candidate}) is in flight: collect it first"
+            return _text({"status": "error", "error": error})
+        idea = ledger.idea_slug(args.get("idea_id"))
+        name, evals_budget = bound.kernel_agent(target_id), bound.evaluations
+        try:
+            capture_sha256 = keeper.expect(capture)
+        except TamperError as exc:
+            return _text({"status": "error", "error": str(exc)})
+        refuted = _refuted(target_id, idea)
+        job = gpuqueue.Job.of(run, "eval", target_id)
+        out: list[dict[str, Any]] = [{} for _ in items]
+        todo: list[dict[str, Any]] = []  # what goes to the evaluator, in order
+        claimed: list[tuple[tuple[str, str, str], asyncio.Event]] = []
+        valid: list[tuple[int, dict[str, Any], Path, str, str, tuple[str, str, str]]] = []
+        for k, item in enumerate(items):  # what each is, before any waits or claims
+            item = item if isinstance(item, dict) else {}
+            given = str(item.get("candidate") or "")
+            out[k] = {"candidate": given}
+            hypothesis = str(item.get("hypothesis") or "").strip()
+            src = _path(target_dir, given)
+            if (refused := _in_truth(run, src)) is not None:
+                out[k] |= refused
+                continue
+            if not given or not hypothesis:
+                out[k] |= {"status": "error", "error": "candidate and hypothesis are required"}
+                continue
+            if not src.exists():
+                out[k] |= {"status": "error", "error": f"{src} does not exist"}
+                continue
+            try:
+                source = native_project.source_of(src)
+            except (native_project.ProjectError, OSError) as exc:
+                out[k] |= {"status": "error", "error": f"{src}: {exc}"}
+                continue
+            slot = (str(run.root), target_id, dedup.source_key(source))
+            if any(slot == v[-1] for v in valid):
+                out[k] |= {"status": "error", "error": "the same code as an earlier candidate"}
+                continue
+            valid.append((k, item, src, source, hypothesis, slot))
+        # the same sources evaluated by another session right now: wait for them, holding none
+        while busy := [e for v in valid if (e := _inflight.get(v[-1])) is not None]:
+            await busy[0].wait()
+        for *_, slot in valid:  # all at once: no await between the check and the claims
+            claimed.append((slot, asyncio.Event()))
+            _inflight[slot] = claimed[-1][1]
+        start = time.perf_counter()
+        try:
+            for k, item, src, source, hypothesis, slot in valid:
+                given = out[k]["candidate"]
+                check = bool(args.get("compile_check"))
+                cached = dedup.find(run, target_id, slot[2], keeper, compile_check=check)
+                if cached is not None:  # evaluated before: that result, nothing runs
+                    given_args = {"target_id": target_id, "parent": item.get("parent")}
+                    dup = await _duplicate(cached, given_args, hypothesis, source, idea, worker)
+                    out[k] |= {key: v for key, v in dup.items() if key != "best_so_far"}
+                    continue
+                snap = snapshot(run, src, target_id)
+                review = await _review(
+                    critic.KERNEL,
+                    [(src.name, source, critic.KERNEL)],
+                    job,
+                    {"hypothesis": hypothesis, "force": args.get("force")},
+                    target=target_id,
+                    candidate=given,
+                    snapshot=f"history/{snap.name}",
+                    parent=_parent(target_dir, item.get("parent")),
+                    idea=idea,
+                    refuted=refuted,
+                )
+                if critic.blocks(review):  # a static reject: withdrawn, nothing runs
+                    out[k] |= critic.withdrawn_result(review)
+                    continue
+                todo.append(
+                    {
+                        "k": k,
+                        "src": src,
+                        "snap": snap,
+                        "sha256": sha256_file(snap),
+                        "hypothesis": hypothesis,
+                        "parent": item.get("parent"),
+                        "expected": _expected(item.get("expected_speedup")),
+                        "review": review,
+                        # a project compiles outside the GPU lock first: an error is its result
+                        "result": await asyncio.to_thread(_prebuilt, snap),
+                    }
+                )
+            batch = [t for t in todo if t["result"] is None]
+            if batch:
+                job.estimate_s *= len(batch)
+                measured = await gpuqueue.run(
+                    job,
+                    run_evaluations,
+                    capture,
+                    [t["snap"] for t in batch],
+                    timeout=budget.eval_timeout_s,
+                    capture_sha256=capture_sha256,
+                    compile_check=bool(args.get("compile_check")),
+                    **_bar(target_id),
+                )
+                for t, result in zip(batch, measured, strict=True):
+                    t["result"] = result
+            share = (time.perf_counter() - start - job.wait_s) / max(len(batch), 1)
+            rows = []
+            for t in todo:
+                result = t["result"]
+                if result.get("status") == "tampered":  # the evaluator refused the capture
+                    keeper.alarm(capture, str(result.get("error")))
+                elif sha256_file(t["snap"]) != t["sha256"]:
+                    keeper.alarm(t["snap"], "snapshot changed during its evaluation")
+                    result = {
+                        "status": "tampered",
+                        "correct": False,
+                        "error": f"{t['snap'].name} changed while it was evaluated; discarded",
+                    }
+                _, row = record_candidate(
+                    run,
+                    target_id,
+                    t["src"],
+                    t["snap"],
+                    result,
+                    hypothesis=t["hypothesis"],
+                    parent=t["parent"],
+                    eval_s=round(share, 1),
+                    snapshot_sha256=t["sha256"],
+                    keeper=keeper,
+                    idea=idea,
+                    expected_speedup=t["expected"],
+                    worker=worker,
+                    queue_s=job.queue_s,
+                    session=session,
+                    review=critic.cell(t["review"]),
+                )
+                critic.outcome(t["review"], row)
+                rows.append(row)
+                entry = compact(result) | {"snapshot": f"history/{t['snap'].name}"}
+                entry["ledger"] = {"exp": row["exp"], "status": row["status"]}
+                out[t["k"]] |= entry | critic.annotation(t["review"])
+        finally:
+            for slot, done in claimed:
+                _inflight.pop(slot, None)
+                done.set()
+        refresh(run, target_id)
+        if idea and todo:
+            try:
+                records = keeper.records(run.results_file(target_id))
+            except TamperError:
+                records = []
+            for t, row in zip(todo, rows, strict=True):
+                out[t["k"]]["idea"] = idea_feedback(records, idea, t["expected"], row)
+        report: dict[str, Any] = {"results": out} | _best_so_far(target_id)
+        if todo:  # one evaluation per candidate that ran (budget honesty)
+            signals = [s for t in todo if (s := sol_signal(t["result"])) is not None]
+            report |= budget.feedback(
+                name,
+                run.results_file(target_id),
+                evals_budget,
+                pct_of_sol=max(signals, default=None),
+                evaluations=len(todo),
+            )
+        else:
+            report |= _uncounted(budget, name, evals_budget)
+        return _text(report | _news())
 
     @tool(
         "best_result",
@@ -1413,6 +1690,158 @@ def build_server(
         )
         return _text(result | _news())
 
+    def _e2e_set(given: dict[str, Any]) -> dict[str, Any]:
+        """One set of an ``evaluate_e2e_batch`` call: its transform snapshots (``snaps``),
+        kernel files (``kernels``) and worker items (``items``), or its ``error``."""
+        snaps: list[Path] = []
+        items: dict[str, list[str]] = {"kernel": [], "transform": []}
+        for t in given.get("transforms") or []:
+            src = _path(run.transforms_dir, str(t))
+            if (refused := _in_truth(run, src)) is not None:
+                return refused
+            if not src.exists():
+                return {"status": "error", "error": f"{src} does not exist"}
+            try:  # a project directory: its bundle (native/project.py)
+                snaps.append(snapshot(run, src))
+            except native_project.ProjectError as exc:
+                return {"status": "error", "error": f"{src}: {exc}"}
+            items["transform"].append(str(snaps[-1]))
+        kernels: list[Path] = []
+        for k in given.get("kernels") or []:
+            target_id, _, path = str(k).partition("=")
+            kernel = _path(run.target(target_id), path)
+            if (refused := _in_truth(run, kernel)) is not None:
+                return refused
+            kernels.append(kernel)
+            items["kernel"].append(f"{target_id}={kernel}")
+        if not snaps and not kernels:
+            return {"status": "error", "error": "an empty set: give transforms and/or kernels"}
+        return {"snaps": snaps, "kernels": kernels, "items": items}
+
+    @tool(
+        "evaluate_e2e_batch",
+        f"Evaluate 2 to {BATCH_MAX} sets of transforms and/or kernels end to end with ONE "
+        "model load: each set is applied to the unmodified model, timed and judged exactly "
+        "as evaluate_e2e does, then undone in-process (a set that cannot be undone, or that "
+        "runs out of memory, is measured in a process of its own). Each set is recorded as "
+        "its own ledger row and counts as one evaluation; the results come back in order. "
+        "Use it to compare variants of one transform, or a transform with and without kernels.",
+        {
+            "type": "object",
+            "properties": {
+                "sets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": BATCH_MAX,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "transforms": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "transform .py paths (relative to the run's "
+                                "transforms dir)",
+                            },
+                            "kernels": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "TARGET_ID=path/to/candidate.py entries",
+                            },
+                            "hypothesis": {
+                                "type": "string",
+                                "description": "one sentence: what this set tests",
+                            },
+                        },
+                    },
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "evaluate even the sets the critic rejects",
+                    "default": False,
+                },
+            },
+            "required": ["sets"],
+        },
+    )
+    async def evaluate_e2e_batch(args: dict[str, Any]) -> dict[str, Any]:
+        given = args.get("sets")
+        if not isinstance(given, list) or not 1 <= len(given) <= BATCH_MAX:
+            error = f"sets is a list of 1 to {BATCH_MAX} {{transforms, kernels, hypothesis}}"
+            return _text({"status": "error", "error": error})
+        job = gpuqueue.Job.of(run, "e2e")
+        out: list[dict[str, Any]] = []
+        todo: list[dict[str, Any]] = []
+        for k, raw in enumerate(given):
+            raw = raw if isinstance(raw, dict) else {}
+            names = [*(raw.get("transforms") or []), *(raw.get("kernels") or [])]
+            out.append({"set": [str(n) for n in names]})
+            found = _e2e_set(raw)
+            if "items" not in found:
+                out[k] |= found
+                continue
+            snaps, kernels = found["snaps"], found["kernels"]
+            texts = [(f"transforms/{s.name}", _source(s), critic.E2E) for s in snaps]
+            named = zip(raw.get("kernels") or [], kernels, strict=False)
+            texts += [(str(item), _source(path), critic.KERNEL) for item, path in named]
+            review = await _review(
+                critic.E2E,
+                texts,
+                job,
+                {"hypothesis": raw.get("hypothesis"), "force": args.get("force")},
+                candidate=" ".join(str(n) for n in names),
+                snapshot=ledger.e2e_snapshot(snaps, raw.get("kernels") or []),
+            )
+            if critic.blocks(review):  # a static reject: withdrawn, nothing runs
+                out[k] |= critic.withdrawn_result(review)
+                continue
+            result: dict[str, Any] | None = None
+            for file in [*snaps, *kernels]:  # projects compile outside the GPU lock, first
+                if result is None:
+                    result = await asyncio.to_thread(_prebuilt, file)
+            todo.append({"k": k, "raw": raw, "review": review, "result": result, **found})
+        start = time.perf_counter()
+        batch = [t for t in todo if t["result"] is None]
+        if batch:
+            job.estimate_s *= len(batch)
+            common = ["--warmup", "2", *keeper.worker_args()]
+            sets = [t["items"] for t in batch]
+            measured = await gpuqueue.run(job, e2e_batch, run, sets, common)
+            for t, result in zip(batch, measured, strict=True):
+                t["result"] = result
+        share = (time.perf_counter() - start - job.wait_s) / max(len(batch), 1)
+        for t in todo:
+            result = t["result"]
+            _, row = record_e2e_result(
+                run,
+                result,
+                t["snaps"],
+                [str(x) for x in t["raw"].get("kernels") or []],
+                hypothesis=str(t["raw"].get("hypothesis") or ""),
+                eval_s=round(share, 1),
+                keeper=keeper,
+                queue_s=job.queue_s,
+                session=session,
+                review=critic.cell(t["review"]),
+            )
+            critic.outcome(t["review"], row)
+            # the full record (patches, every check's metrics) is in transforms/results.jsonl
+            entry = {key: v for key, v in result.items() if key not in ("patches", "metrics")}
+            if isinstance(entry.get("error"), str):
+                entry["error"] = entry["error"][-1500:]
+            entry["ledger"] = {"exp": row["exp"], "status": row["status"]}
+            out[t["k"]] |= entry | critic.annotation(t["review"])
+        refresh(run)
+        report: dict[str, Any] = {"results": out}
+        if todo:  # one evaluation per set that ran (budget honesty)
+            report |= budget.feedback(
+                bound.e2e_agent(),
+                run.results_file(),
+                bound.evaluations,
+                ok_key="passed",
+                evaluations=len(todo),
+            )
+        return _text(report | _news())
+
     @tool(
         "check_harness",
         "Load harness.py from the run directory, run it twice and report latency, output "
@@ -1543,9 +1972,11 @@ def build_server(
     doc_search, doc_read = doc_tools()
     tools = [
         evaluate_candidate,
+        evaluate_candidates,
         sweep_candidate,
         best_result,
         evaluate_e2e,
+        evaluate_e2e_batch,
         check_harness,
         run_info,
         verify_rewrite,

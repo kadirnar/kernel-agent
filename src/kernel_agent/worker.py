@@ -8,6 +8,9 @@ orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
                                           [--no-diverse]
     python -m kernel_agent.worker e2e_ab  --run-dir R [A: --kernel ... --transform ...]
                                           [B: --b-kernel ... --b-transform ...] [--rounds K]
+                                          [--sequential --ab-min-win-rate W --ab-min-gain G]
+    python -m kernel_agent.worker e2e_batch --run-dir R --sets FILE [--baseline-ms MS]
+                                          [--verify REL=SHA256 ...]
     python -m kernel_agent.worker export_check --run-dir R --package DIR [--verify ...]
 
 A step that runs out of GPU memory has status ``oom`` (``abtest.OOM``), also when a check
@@ -312,10 +315,7 @@ def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> 
 
 
 def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
-    from kernel_agent import hygiene, telemetry
     from kernel_agent.integrate.patcher import PatchReport, apply_kernels, apply_transforms
-    from kernel_agent.telemetry import Monitor
-    from kernel_agent.workloads.base import measure
 
     try:
         truth_files = _truth_files(run, ns)
@@ -329,8 +329,23 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         apply_transforms(workload, [Path(p) for p in ns.transform or []], report)
     except Exception:
         return _failed("patch_error", patches=report.__dict__)
+    return _measured(ns, workload, workload.make_inputs(), report, truth_files)
 
-    inputs = workload.make_inputs()
+
+def _measured(
+    ns: argparse.Namespace,
+    workload: Any,
+    inputs: Any,
+    report: Any,
+    truth_files: tuple[bytes, ...],
+) -> dict[str, Any]:
+    """The ``e2e`` result of the model as it is now (its items applied, ``report``): timed
+    (``--warmup``, ``--iters``) and judged (:func:`_judge`; ``ns``: its items, for the
+    concurrency check)."""
+    from kernel_agent import hygiene, telemetry
+    from kernel_agent.telemetry import Monitor
+    from kernel_agent.workloads.base import measure
+
     monitor = Monitor()  # GPU clocks / temperature / power before and after the timing
     monitor.sample("before", loaded=False)  # the clocks may still be idling
     sched = telemetry.schedstat()  # how long this thread waits for a CPU while it times
@@ -680,8 +695,21 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         reference["B"], reproducible["B"] = ab.warm(session, b, inputs, ns.warmup + 1)
     except Exception:
         return failed("runtime_error")
+
+    def stop(a_ms: list[float], b_ms: list[float]) -> dict[str, Any] | None:
+        """``--sequential``: the timed rounds stop once the verdict is decided (abtest.py)."""
+        rule = {"min_win_rate": ns.ab_min_win_rate, "min_gain": ns.ab_min_gain}
+        return abtest.sequential(a_ms, b_ms, ns.rounds, **rule)
+
     rounds = ab.alternate(
-        session, (a, b), inputs, reference, reproducible, rounds=ns.rounds, sample=monitor.sample
+        session,
+        (a, b),
+        inputs,
+        reference,
+        reproducible,
+        rounds=ns.rounds,
+        sample=monitor.sample,
+        stop=stop if ns.sequential else None,
     )
     if rounds.failed == "A" or rounds.mismatch:
         why = rounds.mismatch or "A failed after a switch from B"
@@ -729,6 +757,149 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         **({"gpu": gpu} if gpu else {}),
     }
     return result
+
+
+#: ``e2e_batch`` status of a set it did not measure (the batch stopped before it); its
+#: caller measures such sets, and those of :data:`abtest.FALLBACK`, in ``e2e`` processes
+NOT_RUN = "not_run"
+
+
+def cmd_e2e_batch(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    """``e2e`` of several sets of items in one process (``--sets FILE``: a JSON list of
+    ``{"kernel": [...], "transform": [...]}``; the ``evaluate_e2e_batch`` tool, issue #190):
+    the model is loaded once (the dominant cost of an ``e2e``), then each set is applied to
+    the unmodified model with undo handles (``integrate/ab.Session``, as the paired A/B),
+    timed and judged exactly as ``e2e`` does, and undone. After each undo the unmodified
+    model must give its warm-up output again when that is bit-reproducible.
+
+    ``sets``: one ``e2e`` result per set. A set that declares ``undo = False`` is not run
+    here (``irreversible``); a set that cannot be undone, whose undo fails or leaves the model
+    changed, or that breaks the CUDA context still has its own result, but the sets after
+    it are :data:`NOT_RUN`: the caller (:func:`e2e_batch`) measures those in processes of
+    their own."""
+    import torch
+
+    from kernel_agent.integrate import ab, undo
+    from kernel_agent.workloads.holdout import outputs_equal
+
+    try:
+        truth_files = _truth_files(run, ns)
+    except truth.TamperError as exc:
+        return {"status": "tampered", "passed": False, "error": str(exc)}
+    sets = json.loads(Path(ns.sets).read_text())
+    results: list[dict[str, Any] | None] = [None] * len(sets)
+    for i, items in enumerate(sets):
+        declared = [t for t in items.get("transform") or [] if undo.declaration(Path(t)) is False]
+        if declared:
+            results[i] = _irreversible([([t], "it declares undo = False") for t in declared])
+    workload = _workload(run)
+    session = ab.Session(workload, lambda items: _kernel_patches(run, items))
+    unmodified = ab.State("unmodified", [], [])
+    inputs = workload.make_inputs()
+    if torch.cuda.is_available():
+        from kernel_agent.kernels.bench import warm_gpu
+
+        warm_gpu(500.0)  # the same clock warm-up as `e2e_ab`
+    reference, reproducible = ab.warm(session, unmodified, inputs, 2)
+    stop: str | None = None
+    for i, items in enumerate(sets):
+        if results[i] is not None:
+            continue
+        if stop is not None:
+            results[i] = {"status": NOT_RUN, "passed": False, "reason": stop}
+            continue
+        mine = argparse.Namespace(**{**vars(ns), **items})  # its items: the concurrency check
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()  # peak_mem_gb: this set's (the model resident)
+        try:
+            state = session.build(
+                f"set{i}", items.get("kernel") or [], items.get("transform") or []
+            )
+        except Exception:
+            built = session.built.report.__dict__ if session.built is not None else None
+            results[i] = _failed("patch_error", patches=built)
+        else:
+            try:
+                results[i] = _measured(mine, workload, inputs, state.report, truth_files)
+            except Exception:  # in its own process then (abtest.FALLBACK)
+                results[i] = _failed("error", patches=state.report.__dict__)
+            if bad := state.irreversible(keep=0):
+                stop = f"set {i + 1} cannot be undone in-process: " + _irreversible(bad)["reason"]
+        if stop is None:  # back to the unmodified model, and check it is
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()  # a broken CUDA context ends the batch
+                session.to(unmodified)
+                if reproducible:
+                    again = ab.timed_run(workload, inputs)[0]
+                    if not outputs_equal(reference, again):
+                        stop = f"the unmodified model's output changed after set {i + 1} was undone"
+            except Exception as exc:
+                stop = f"set {i + 1} could not be undone: {type(exc).__name__}: {exc}"[:500]
+    return {
+        "status": "ok",
+        "sets": results,
+        "undo_check": "identical" if reproducible else "skipped",
+    }
+
+
+def _set_flags(items: dict[str, list[str]]) -> list[str]:
+    """``e2e`` worker flags of a set of items (``{"kernel": [...], "transform": [...]}``)."""
+    flags: list[str] = []
+    for kind in ("kernel", "transform"):
+        for item in items.get(kind) or []:
+            flags += [f"--{kind}", item]
+    return flags
+
+
+def e2e_batch(
+    run: RunDir,
+    sets: list[dict[str, list[str]]],
+    common: list[str],
+    *,
+    timeout: float = 3600.0,
+    cwd: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """``e2e`` results of several sets of items (``{"kernel": [TARGET=PATH, ...],
+    "transform": [PATH, ...]}``; ``common``: the other worker flags) under one hold of the
+    GPU: one ``e2e_batch`` process (:func:`cmd_e2e_batch`: one model load for all of them),
+    and an ``e2e`` process of its own for each set the batch could not measure (it cannot be
+    undone in-process, ran out of memory, the batch stopped before it or died: as the
+    integration falls back from its paired A/B), and for each whose timing was dirty
+    (``hygiene.py``). One set alone is an ``e2e``. ``batch``: whether a result was measured
+    in the shared process (``batch_fallback``: why not)."""
+    import tempfile
+
+    from kernel_agent import abtest, hygiene, telemetry
+
+    results: dict[int, dict[str, Any]] = {}
+    why: dict[int, str] = {}
+    with gpu_lock():  # one hold: the batch and the sets measured on their own
+        if len(sets) > 1:
+            with tempfile.TemporaryDirectory(prefix="ka-e2e-batch-") as tmp:
+                spec = Path(tmp) / "sets.json"
+                spec.write_text(json.dumps(sets))
+                args = ("--sets", str(spec), *common)
+                out = call_worker(run, "e2e_batch", *args, timeout=timeout * len(sets), cwd=cwd)
+            measured = out.get("sets") if out.get("status") == "ok" else None
+            if not isinstance(measured, list) or len(measured) != len(sets):
+                reason = out.get("reason") or out.get("error") or out.get("status")
+                why = dict.fromkeys(range(len(sets)), f"the batch failed: {str(reason)[-300:]}")
+                measured = []
+            for i, result in enumerate(measured):
+                status = result.get("status")
+                dirty = telemetry.dirty(None, result) if hygiene.current() is not None else None
+                if status in (*abtest.FALLBACK, NOT_RUN):
+                    why[i] = str(result.get("reason") or status)
+                elif status == "ok" and dirty is not None:
+                    why[i] = f"timing dirty in the batch: {dirty}"
+                else:
+                    results[i] = {**result, "batch": True, "gpu_index": out.get("gpu_index")}
+        for i, items in enumerate(sets):
+            if i not in results:
+                result = call_worker(run, "e2e", *_set_flags(items), *common, timeout=timeout)
+                results[i] = {**result, **({"batch_fallback": why[i]} if i in why else {})}
+    return [results[i] for i in range(len(sets))]
 
 
 def _allocated() -> int:
@@ -788,10 +959,11 @@ COMMANDS = {
     "capture": cmd_capture,
     "e2e": cmd_e2e,
     "e2e_ab": cmd_e2e_ab,
+    "e2e_batch": cmd_e2e_batch,
     "export_check": cmd_export_check,
 }
 #: Commands that apply the run's items: their ``kernel_agent.artifacts`` lookups are recorded.
-RECORDED = ("analyze", "e2e", "e2e_ab")
+RECORDED = ("analyze", "e2e", "e2e_ab", "e2e_batch")
 
 
 @contextlib.contextmanager
@@ -825,6 +997,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--b-kernel", action="append", help="e2e_ab: a kernel of state B")
     parser.add_argument("--b-transform", action="append", help="e2e_ab: a transform of B")
     parser.add_argument("--rounds", type=int, default=8, help="e2e_ab: timed A/B rounds")
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="e2e_ab: stop the rounds once the verdict is decided (abtest.sequential)",
+    )
+    parser.add_argument("--ab-min-win-rate", type=float, default=0.8, help="e2e_ab --sequential")
+    parser.add_argument("--ab-min-gain", type=float, default=0.01, help="e2e_ab --sequential")
+    parser.add_argument("--sets", type=Path, help="e2e_batch: JSON list of {kernel, transform}")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--no-profile", action="store_true")
@@ -863,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
 
 #: Worker commands whose result is a timed measurement: with clean timing on (``hygiene.py``)
 #: a dirty one is measured once more (:func:`call_worker`)
-TIMED_COMMANDS = frozenset({"e2e"})
+TIMED_COMMANDS = frozenset({"e2e", "e2e_batch"})
 
 
 def call_worker(

@@ -470,13 +470,17 @@ def median_round(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     return best
 
 
+#: Interleaved timing rounds of :func:`compare_timing` (the evaluator's)
+ROUNDS = 3
+
+
 def compare_timing(
     reference: Callable[..., Any],
     candidate: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     *,
-    rounds: int = 3,
+    rounds: int = ROUNDS,
     l2_flush: bool = False,
     verify: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -489,6 +493,29 @@ def compare_timing(
     one random timed call of the candidate's last round runs on redrawn inputs
     and its output is checked against a fresh reference call on the same inputs
     (``candidate_result["timed_output"]``: the iteration and failing checks)."""
+    ref_rounds, new_rounds, timed = timing_rounds(
+        reference, candidate, args, kwargs, rounds=rounds, l2_flush=l2_flush, verify=verify
+    )
+    ref_t, new_t = median_round(ref_rounds), median_round(new_rounds)
+    if timed is not None:
+        new_t["timed_output"] = timed
+    return ref_t, new_t
+
+
+def timing_rounds(
+    reference: Callable[..., Any],
+    candidate: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    rounds: int,
+    l2_flush: bool = False,
+    verify: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    """The rounds of :func:`compare_timing` (reference's and candidate's :func:`time_call`
+    results) and, with ``verify``, the check of the candidate's kept timed call of the last
+    of them (None without ``verify``). The evaluator times a case in two such calls when it
+    may stop early (``kernels/early.py``): the median of all its rounds is the result."""
     warm_gpu()
     ref_rounds: list[dict[str, Any]] = []
     new_rounds: list[dict[str, Any]] = []
@@ -504,8 +531,5 @@ def compare_timing(
                 keep=verify and i == rounds - 1,
             )
         )
-    kept = new_rounds[-1].pop("kept", None)
-    ref_t, new_t = median_round(ref_rounds), median_round(new_rounds)
-    if kept is not None:
-        new_t["timed_output"] = check_timed_output(reference, kept)
-    return ref_t, new_t
+    kept = new_rounds[-1].pop("kept", None) if new_rounds else None
+    return ref_rounds, new_rounds, check_timed_output(reference, kept) if kept else None

@@ -35,7 +35,11 @@ Stages and their failure statuses:
    round runs at full GPU clocks (:func:`kernels.bench.time_call`; ``clock`` per case:
    the lowest DRAM bandwidth probe around its rounds, about 1 at full clocks), and
    before the profiled activity pass below (its CUPTI subscription stays: every later
-   launch of the process is 1.5-3 us slower).
+   launch of the process is 1.5-3 us slower). With a bar to beat (``early_best``: the
+   ``evaluate_candidate`` tool passes the target's best kept speedup) every case first gets
+   2 of its 3 rounds, and a candidate that cannot be a new best whatever the third rounds
+   measure is timed no further (an early discard, ``early`` in the result:
+   :mod:`kernels.early`, issue #190); every check before and after timing still runs.
 4. ``incorrect_perturbed``: re-verification after timing (on CPU right after
    stage 2) at fresh addresses, with redrawn inputs and with the captured inputs
    scaled by 3, 0.01 and −1 (:mod:`kernels.verify`; ``redraws`` in the result: the
@@ -86,6 +90,7 @@ import argparse
 import collections
 import contextlib
 import copy
+import dataclasses
 import functools
 import hashlib
 import importlib.util
@@ -98,6 +103,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -393,6 +399,24 @@ def _hidden_work(wall: dict[str, float]) -> bool:
     return wall["hidden_ms"] > max(HIDDEN_WORK_MS, HIDDEN_WORK_SHARE * wall["new_event_ms"])
 
 
+def _ms(rounds: list[dict[str, Any]]) -> list[float]:
+    """The medians of timing rounds (``bench.time_call`` results)."""
+    return [float(r["median_ms"]) for r in rounds]
+
+
+@dataclasses.dataclass
+class _Rounds:
+    """A timed case of :func:`evaluate`: its index, report and case, the reference's and the
+    candidate's entrypoints and their timing rounds so far."""
+
+    index: int
+    report: dict[str, Any]
+    case: dict[str, Any]
+    fns: tuple[Any, Any]
+    ref: list[dict[str, Any]]
+    new: list[dict[str, Any]]
+
+
 @functools.cache
 def _code_dirs(candidate_path: Path) -> tuple[Path, ...]:
     """Where the candidate's code lives: its directory, and a project's source directory in
@@ -473,6 +497,7 @@ def evaluate(
     save_outputs: Path | None = None,
     config: dict[str, Any] | None = None,
     session: dict[str, Any] | None = None,
+    early_best: float | None = None,
 ) -> dict[str, Any]:
     """Build, check and time one candidate.  ``device`` defaults to CUDA when
     available; on CPU only correctness is checked (timing needs CUDA events).
@@ -485,33 +510,55 @@ def evaluate(
     the configs of one sweep share (:mod:`kernels.sweep`): the loaded ``capture``, the
     candidate ``module`` and a deepcopy ``memo`` (weights shared, not copied per
     config); a passing quick check leaves its built ``candidate`` there.
+    ``early_best``: the speedup a new best must beat (the target's best kept one): a
+    correct candidate that cannot reach it stops timing after the first rounds
+    (``early`` in the result, :func:`kernels.early.discard`); None: every round.
     Global state the candidate changed is restored on return."""
     guards: list[Any] = []
     try:
-        return _evaluate(
-            capture_path,
-            candidate_path,
-            guards,
-            profile=profile,
-            l2_flush=l2_flush,
-            compile_baseline=compile_baseline,
-            device=device,
-            capture_sha256=capture_sha256,
-            compile_check=compile_check,
-            quick=quick,
-            save_outputs=save_outputs,
-            config=config or {},
-            session=session if session is not None else {},
+        return _finish(
+            _stages(
+                capture_path,
+                candidate_path,
+                guards,
+                profile=profile,
+                l2_flush=l2_flush,
+                compile_baseline=compile_baseline,
+                device=device,
+                capture_sha256=capture_sha256,
+                compile_check=compile_check,
+                quick=quick,
+                save_outputs=save_outputs,
+                config=config or {},
+                session=session if session is not None else {},
+                early_best=early_best,
+            )
         )
     finally:
-        for guard in guards:
-            guard.restore()
-        from kernel_agent.kernels import compare
-
-        compare.TIER = compare.EXACT_TIER  # _evaluate set it from the capture
+        _restore(guards)
 
 
-def _evaluate(
+def _restore(guards: list[Any]) -> None:
+    """Global state candidates changed back as it was (their integrity snapshots), and the
+    comparator's tolerance tier (:func:`_stages` set it from the capture)."""
+    for guard in guards:
+        guard.restore()
+    from kernel_agent.kernels import compare
+
+    compare.TIER = compare.EXACT_TIER
+
+
+def _finish(stages: Generator[None, None, dict[str, Any]]) -> dict[str, Any]:
+    """The result of a candidate's :func:`_stages`, run to the end."""
+    try:
+        while True:
+            next(stages)
+    except StopIteration as done:
+        result: dict[str, Any] = done.value
+        return result
+
+
+def _stages(
     capture_path: Path,
     candidate_path: Path,
     guards: list[Any],
@@ -526,7 +573,12 @@ def _evaluate(
     save_outputs: Path | None,
     config: dict[str, Any],
     session: dict[str, Any],
-) -> dict[str, Any]:
+    early_best: float | None = None,
+) -> Generator[None, None, dict[str, Any]]:
+    """The stages of :func:`evaluate`; the result is the generator's return value. It
+    pauses once (a ``yield``) after timing, before the profiled activity pass, so a batch
+    (:func:`_batch_main`) times every candidate before any profiler's CUPTI subscription
+    slows the launches of its process."""
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -537,8 +589,15 @@ def _evaluate(
 
     from kernel_agent import concurrency
     from kernel_agent.kernels import compare as comparator
-    from kernel_agent.kernels import integrity, weights
-    from kernel_agent.kernels.bench import compare_timing, peak_memory, time_call, wall_check
+    from kernel_agent.kernels import early, integrity, weights
+    from kernel_agent.kernels.bench import (
+        ROUNDS,
+        median_round,
+        peak_memory,
+        time_call,
+        timing_rounds,
+        wall_check,
+    )
     from kernel_agent.kernels.compare import compare_side_effects, compare_structures
     from kernel_agent.kernels.verify import alias_errors
     from kernel_agent.profiling.capture import load_capture
@@ -556,6 +615,7 @@ def _evaluate(
         capture = session.get("capture") or load_capture(
             capture_path, device=device, sha256=capture_sha256
         )
+        session["capture"] = capture  # the next candidates of a batch (evaluate_candidates)
     except TamperError as exc:
         result.update(status="tampered", error=str(exc))
         return result
@@ -756,14 +816,19 @@ def _evaluate(
     new_total = 0.0
     covered = 0.0  # calls per run of the target's instances the timed cases stand for
     users = capture.get("method_instances") or {}
+    # with a bar to beat (early discard, kernels/early.py) every case first gets the rounds
+    # after which the median of all of them is bounded, the rest only if it can still win
+    first = early.min_rounds(ROUNDS) if early_best is not None else ROUNDS
+    timed: list[_Rounds] = []
     for i, (report, case) in enumerate(zip(case_reports, cases, strict=True)):
-        method = case["method"]
         if not case["count"]:  # correctness-only case (another workload setting): not timed
             continue
         try:
             # every call from the case's module state (restored outside the timed region)
             fns = (replay.call(case, reference), replay.call(case, *holders))
-            ref_t, new_t = compare_timing(*fns, case["args"], case["kwargs"], l2_flush=l2_flush)
+            ref_r, new_r, checked = timing_rounds(
+                *fns, case["args"], case["kwargs"], rounds=first, l2_flush=l2_flush
+            )
             wall = wall_check(*fns, case["args"], case["kwargs"])
             if _hidden_work(wall):  # confirm: other processes can delay one measurement
                 again = wall_check(*fns, case["args"], case["kwargs"])
@@ -794,19 +859,45 @@ def _evaluate(
                 **{k: round(v, 4) for k, v in wall.items()},
             )
             return result
-        timed = new_t.get("timed_output") or {}
-        if timed.get("failures"):
+        checked = checked or {}  # the kept timed call (always in the first rounds)
+        if checked.get("failures"):
             result.update(
                 status="incorrect_timed_output",
                 stage="timed_output",
-                failed_check={"case": i, "check": "timed_output", **timed},
+                failed_check={"case": i, "check": "timed_output", **checked},
                 error=f"case {i} ({case['signature']}): the output of timed call "
-                f"#{timed['iteration']} differs from the reference on the same inputs "
-                f"({_first_error(timed['failures'])}); correctness was checked on the first "
+                f"#{checked['iteration']} differs from the reference on the same inputs "
+                f"({_first_error(checked['failures'])}); correctness was checked on the first "
                 "call only, so the candidate must compute every call (no caching by "
                 "address, shape or call count, no skipped work)",
             )
             return result
+        timed.append(_Rounds(i, report, case, fns, ref_r, new_r))
+    stop = None
+    if early_best is not None:  # stop timing a candidate that cannot be a new best
+        sofar = [early.Timed(t.case["count"], _ms(t.ref), _ms(t.new)) for t in timed]
+        stop = early.discard(sofar, max(float(early_best), 1.0), ROUNDS)
+    for t in timed if stop is None and first < ROUNDS else ():
+        try:  # the rest of the rounds (the timed output was checked in the first ones)
+            more = timing_rounds(
+                *t.fns,
+                t.case["args"],
+                t.case["kwargs"],
+                rounds=ROUNDS - first,
+                l2_flush=l2_flush,
+                verify=False,
+            )
+        except Exception:
+            result.update(status="runtime_error", error=_short_tb(), failed_case=t.index)
+            return result
+        t.ref += more[0]
+        t.new += more[1]
+    if stop is not None:
+        result["early"] = stop
+    for t in timed:
+        report, case = t.report, t.case
+        method = case["method"]
+        ref_t, new_t = median_round(t.ref), median_round(t.new)
         report["ref_ms"] = round(ref_t["median_ms"], 5)
         report["new_ms"] = round(new_t["median_ms"], 5)
         report["speedup"] = round(ref_t["median_ms"] / max(new_t["median_ms"], 1e-9), 3)
@@ -843,6 +934,7 @@ def _evaluate(
 
     if not _intact(result, guard, candidate_path, "after timing"):
         return result
+    yield  # a batch times its other candidates now (its CUPTI tax comes after them all)
     # One profiled pass over the dominant case: threads, unjoined streams, fallback.
     main = integrity.main_case(cases, case_reports)
     try:
@@ -959,10 +1051,11 @@ def run_evaluation(
     capture_sha256: str | None = None,
     compile_check: bool = False,
     quick: bool = False,
+    early_best: float | None = None,
 ) -> dict[str, Any]:
-    """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``, ``quick``:
-    see :func:`evaluate`; the subprocess checks the bytes it loads), then check its
-    result outside the candidate's process (:func:`_check_reference_timing`,
+    """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``, ``quick``,
+    ``early_best``: see :func:`evaluate`; the subprocess checks the bytes it loads), then
+    check its result outside the candidate's process (:func:`_check_reference_timing`,
     :func:`_check_outputs`). The result says on which GPU of the pool it ran
     (``gpu_index``, :mod:`kernel_agent.gpulock`) and which evaluator measured it
     (``evaluator_version``, set here: the candidate's process cannot choose it).
@@ -996,6 +1089,7 @@ def run_evaluation(
             compile_check=compile_check,
             quick=quick,
             watch=timed,
+            early_best=early_best,
         )
         if why is None:
             break
@@ -1012,6 +1106,214 @@ def run_evaluation(
     return data
 
 
+#: Subprocesses of one :func:`run_evaluations` (a crash or a timeout starts the next one
+#: after the candidate it happened in); what is left after them is evaluated one by one.
+BATCH_RUNS = 3
+
+
+def run_evaluations(
+    capture_path: Path,
+    candidate_paths: list[Path],
+    *,
+    timeout: float = 300.0,
+    capture_sha256: str | None = None,
+    compile_check: bool = False,
+    early_best: float | None = None,
+) -> list[dict[str, Any]]:
+    """Evaluate several candidates of one capture (one agent's variants of one idea: the
+    ``evaluate_candidates`` tool, issue #190) in one subprocess under one GPU-lock
+    acquisition: the capture loads once and the process starts once, and each candidate goes
+    through every stage of :func:`evaluate` with its own build, its own integrity snapshot
+    and its own timing interleaved with the reference, then the checks outside its process
+    (:func:`_check_reference_timing`, :func:`_check_outputs`); one result per candidate, in
+    order, each what :func:`run_evaluation` would return. ``timeout`` is per candidate.
+
+    A candidate that kills the subprocess (or runs out of its time) gets ``crash`` (or
+    ``timeout``) and the candidates after it go on in a new subprocess (at most
+    :data:`BATCH_RUNS`, then one by one). With clean timing on, the candidates are built
+    off the GPU first and those whose timing was dirty are measured once more, as
+    :func:`run_evaluation` does."""
+    from kernel_agent import hygiene
+
+    paths = list(candidate_paths)
+    if len(paths) <= 1:
+        return [
+            run_evaluation(
+                capture_path,
+                path,
+                timeout=timeout,
+                capture_sha256=capture_sha256,
+                compile_check=compile_check,
+                early_best=early_best,
+            )
+            for path in paths
+        ]
+    timed = hygiene.current() is not None
+    pre: dict[int, dict[str, Any]] = {}
+    if timed and not holding():
+        from kernel_agent.kernels import prebuild
+
+        inputs = prebuild.inputs_capture(capture_path)
+        pre = {i: prebuild.prebuild(path, inputs) for i, path in enumerate(paths)}
+    results: dict[int, dict[str, Any]] = {}
+    first: dict[int, str] = {}
+    todo = list(range(len(paths)))
+    for attempt in range(2 if timed else 1):
+        measured = _evaluate_batch(
+            capture_path,
+            paths,
+            todo,
+            timeout=timeout,
+            capture_sha256=capture_sha256,
+            compile_check=compile_check,
+            watch=timed,
+            early_best=early_best,
+        )
+        todo = []
+        for i, (data, why) in measured.items():
+            if why is not None and not attempt:
+                first[i] = why
+                todo.append(i)
+            elif why is not None:
+                data["timing_dirty"] = why
+            results[i] = data
+        if not todo:
+            break
+        if (job := gpuqueue.current()) is not None:
+            job.requeue()  # measured again at once: first of its class
+    for i, why in first.items():
+        results[i]["retimed"] = why
+    for i, built in pre.items():
+        if built.get("built"):
+            results[i]["prebuild"] = {k: built[k] for k in ("seconds", "built") if k in built}
+    return [results[i] for i in range(len(paths))]
+
+
+def _evaluate_batch(
+    capture_path: Path,
+    paths: list[Path],
+    indices: list[int],
+    *,
+    timeout: float,
+    capture_sha256: str | None,
+    compile_check: bool,
+    watch: bool,
+    early_best: float | None,
+) -> dict[int, tuple[dict[str, Any], str | None]]:
+    """The candidates ``paths[i]`` of ``indices`` in batch subprocesses under one hold of the
+    GPU (:func:`run_evaluations`): ``{i: (result, why its timing was dirty)}``."""
+    version = {"evaluator_version": evaluator_version()}
+    workdir = Path(tempfile.mkdtemp(prefix="ka-evals-"))
+    out: dict[int, dict[str, Any]] = {}
+    whys: dict[int, str | None] = {}
+    flags = _flags(
+        capture_sha256=capture_sha256, compile_check=compile_check, early_best=early_best
+    )
+    try:
+        with gpu_lock() as gpu:
+            ensure_peaks()
+            hold = _watch(gpu) if watch else None
+            with hold or contextlib.nullcontext():
+                left, runs = list(indices), 0
+                while left and runs < BATCH_RUNS:
+                    runs += 1
+                    outputs = workdir / f"run{runs}"
+                    outputs.mkdir()
+                    batch = [paths[i] for i in left]
+                    done, culprit, stopped = _spawn_batch(
+                        capture_path, batch, outputs, flags, timeout
+                    )
+                    for k, data in done.items():
+                        data.update(gpu_index=gpu, **version)
+                        data["outputs_file"] = str(outputs / f"{k}.pt")
+                        _check_reference_timing(
+                            data, capture_path, capture_sha256, l2_flush=False, gpu=gpu
+                        )
+                        out[left[k]] = data
+                    if culprit is not None:  # it died (or ran out of time) in this one
+                        out[left[culprit]] = {**stopped, "gpu_index": gpu, **version}
+                    left = [left[k] for k in range(len(left)) if left[k] not in out]
+                for i in left:  # after BATCH_RUNS processes: one by one
+                    out[i] = run_evaluation(
+                        capture_path,
+                        paths[i],
+                        timeout=timeout,
+                        capture_sha256=capture_sha256,
+                        compile_check=compile_check,
+                        early_best=early_best,
+                    )
+                    whys[i] = None  # measured (and re-measured) by run_evaluation already
+            for i, data in out.items():
+                if i not in whys:
+                    whys[i] = _dirty(hold, data) if watch else None
+        for data in out.values():
+            if saved := data.pop("outputs_file", None):
+                _check_outputs(data, capture_path, capture_sha256, Path(saved))  # CPU only
+        return {i: (out[i], whys[i]) for i in indices}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _spawn_batch(
+    capture_path: Path, paths: list[Path], outputs: Path, flags: list[str], timeout: float
+) -> tuple[dict[int, dict[str, Any]], int | None, dict[str, Any]]:
+    """One batch subprocess (:func:`main` with ``--also``): the results it reported by their
+    place in ``paths``, the place of the candidate it died (or ran out of time) in (None: it
+    finished) and why it stopped (crash or timeout)."""
+    nonce = secrets.token_hex(16)  # on stdin, read before any candidate is imported
+    cmd = [sys.executable, "-m", "kernel_agent.kernels.evaluate", str(capture_path), str(paths[0])]
+    for path in paths[1:]:
+        cmd += ["--also", str(path)]
+    cmd += ["--json", "-", "--outputs-dir", str(outputs), "--nonce-stdin", *flags]
+    limit = timeout * len(paths)
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=nonce + "\n",
+            capture_output=True,
+            text=True,
+            timeout=limit,
+            env=child_env(),
+        )
+        stdout, stopped = proc.stdout, None
+    except subprocess.TimeoutExpired as exc:
+        text = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
+        stdout, stopped = text or "", _timeout_result(limit, exc.stderr)
+    done, running = _parse_batch(stdout, nonce, len(paths))
+    if len(done) == len(paths):
+        return done, None, {}
+    if stopped is None:
+        tail = (proc.stderr or proc.stdout)[-4000:]
+        stopped = {"status": "crash", "correct": False, "returncode": proc.returncode}
+        stopped["error"] = tail
+    culprit = running if running is not None and running not in done else None
+    if culprit is None:  # no candidate ran: the first without a result
+        culprit = min(k for k in range(len(paths)) if k not in done)
+    return done, culprit, stopped
+
+
+def _parse_batch(stdout: str, nonce: str, n: int) -> tuple[dict[int, dict[str, Any]], int | None]:
+    """The ``result`` lines of a batch subprocess of ``n`` candidates by ``index`` (the last
+    line of each counts, as :func:`_parse_result` takes the last line of one evaluation)
+    and the candidate of its last ``running`` line."""
+    marker = f"{RESULT_MARKER}{nonce}@@"
+    out: dict[int, dict[str, Any]] = {}
+    running: int | None = None
+    for line in stdout.splitlines():
+        if not line.startswith(marker):
+            continue
+        with contextlib.suppress(ValueError):
+            data = json.loads(line[len(marker) :])
+            index = data.pop("index", None) if isinstance(data, dict) else None
+            if not isinstance(index, int) or not 0 <= index < n:
+                continue
+            if data.pop("event", None) == "running":
+                running = index
+            else:
+                out[index] = data
+    return out, running
+
+
 def _dirty(watch: Any, data: dict[str, Any]) -> str | None:
     """Why a timed evaluation is not clean (``telemetry.dirty``: another process on the GPU,
     a contended CPU), or a reference slowdown the candidate-free re-time confirmed: measured
@@ -1023,6 +1325,27 @@ def _dirty(watch: Any, data: dict[str, Any]) -> str | None:
     if data.get("stage") == "reference_timing":
         return "the reference ran slower next to the candidate than in a candidate-free process"
     return None
+
+
+def _flags(
+    *,
+    profile: bool = False,
+    l2_flush: bool = False,
+    compile_baseline: bool = False,
+    capture_sha256: str | None = None,
+    compile_check: bool = False,
+    quick: bool = False,
+    early_best: float | None = None,
+) -> list[str]:
+    """The evaluator subprocess's flags for these options (:func:`main`)."""
+    cmd = ["--profile"] if profile else []
+    cmd += ["--l2-flush"] if l2_flush else []
+    cmd += ["--compile-baseline"] if compile_baseline else []
+    cmd += ["--capture-sha256", capture_sha256] if capture_sha256 else []
+    cmd += ["--compile-check"] if compile_check else []
+    cmd += ["--quick"] if quick else []
+    cmd += ["--early-best", repr(float(early_best))] if early_best is not None else []
+    return cmd
 
 
 def _evaluate_once(
@@ -1037,6 +1360,7 @@ def _evaluate_once(
     compile_check: bool,
     quick: bool,
     watch: bool,
+    early_best: float | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """One evaluation (:func:`run_evaluation`) and, with ``watch``, why its timing was dirty
     (None: clean, or not watched)."""
@@ -1056,18 +1380,15 @@ def _evaluate_once(
         str(outputs),
         "--nonce-stdin",
     ]
-    if profile:
-        cmd.append("--profile")
-    if l2_flush:
-        cmd.append("--l2-flush")
-    if compile_baseline:
-        cmd.append("--compile-baseline")
-    if capture_sha256:
-        cmd += ["--capture-sha256", capture_sha256]
-    if compile_check:
-        cmd.append("--compile-check")
-    if quick:
-        cmd.append("--quick")
+    cmd += _flags(
+        profile=profile,
+        l2_flush=l2_flush,
+        compile_baseline=compile_baseline,
+        capture_sha256=capture_sha256,
+        compile_check=compile_check,
+        quick=quick,
+        early_best=early_best,
+    )
     try:
         with gpu_lock() as gpu:  # reference and candidate run on this GPU, in one process
             ensure_peaks()  # measured once per GPU + torch version, outside the evaluation
@@ -1300,6 +1621,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capture-sha256", help="refuse a capture without this digest")
     parser.add_argument("--compile-check", action="store_true", help="torch.compile compat")
     parser.add_argument("--quick", action="store_true", help="smallest + largest case, untimed")
+    parser.add_argument(
+        "--early-best",
+        type=float,
+        help="stop timing a correct candidate that cannot beat this speedup (kernels/early.py)",
+    )
     parser.add_argument("--json", default=None, help="write result JSON ('-' = stdout marker)")
     parser.add_argument("--outputs", type=Path, help="save the candidate's outputs here")
     parser.add_argument(
@@ -1312,6 +1638,15 @@ def main(argv: list[str] | None = None) -> int:
         "--ncu-mode", action="store_true", help="run the candidate for ncu only (kernels/ncu.py)"
     )
     parser.add_argument("--ncu-calls", type=int, default=3, help="--ncu-mode: profiled calls")
+    parser.add_argument(
+        "--also",
+        type=Path,
+        action="append",
+        help="a batch (run_evaluations): another candidate, evaluated after the ones before",
+    )
+    parser.add_argument(
+        "--outputs-dir", type=Path, help="a batch: save candidate i's outputs as DIR/i.pt"
+    )
     ns = parser.parse_args(argv)
     if ns.candidate is None and not ns.reference_timing:
         parser.error("a candidate is required")
@@ -1323,6 +1658,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     # Read before the candidate is imported; it never sees the nonce in its environment.
     tag = (sys.stdin.readline().strip() + "@@") if ns.nonce_stdin else ""
+    if ns.also:
+        return _batch_main(ns, tag)
     try:
         if ns.reference_timing:
             result = reference_timing(
@@ -1339,6 +1676,7 @@ def main(argv: list[str] | None = None) -> int:
                 compile_check=ns.compile_check,
                 quick=ns.quick,
                 save_outputs=ns.outputs,
+                early_best=ns.early_best,
             )
     except Exception:
         result = {"status": "harness_error", "correct": False, "error": _short_tb()}
@@ -1351,6 +1689,80 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("correct") else 1
+
+
+def _batch_main(ns: argparse.Namespace, tag: str) -> int:
+    """``--also``: the candidates of a batch (:func:`run_evaluations`) in this process, the
+    capture loaded once, each through every stage of :func:`evaluate` with its own build
+    and integrity snapshot, in two passes: build, correctness and timing of each candidate
+    in turn (:func:`_stages` up to its pause), then for each the profiled activity pass,
+    the re-verification and the rest. So no candidate is timed after a profiler's CUPTI
+    subscription made the process's launches slower. Lines (``index``): ``running`` before
+    each pass of a candidate, ``result`` when it is done."""
+    import gc
+
+    from kernel_agent import concurrency
+
+    def emit(event: dict[str, Any]) -> None:
+        payload = _dumps(event, default=str)
+        if ns.json == "-":
+            _stdout.write(RESULT_MARKER + tag + payload + "\n")
+            _stdout.flush()
+        else:
+            print(payload, flush=True)
+
+    shared: dict[str, Any] = {}
+    paused: dict[int, tuple[Generator[None, None, dict[str, Any]], list[Any]]] = {}
+    for i, path in enumerate([ns.candidate, *ns.also]):  # 1. build, check and time each
+        emit({"index": i, "event": "running", "stage": "timing"})
+        concurrency.reset()  # the named streams it uses are its own
+        session: dict[str, Any] = {k: shared[k] for k in ("capture", "replay") if k in shared}
+        guards: list[Any] = []
+        stages = _stages(
+            ns.capture,
+            path,
+            guards,
+            profile=False,
+            l2_flush=ns.l2_flush,
+            compile_baseline=False,
+            device=None,
+            capture_sha256=ns.capture_sha256,
+            compile_check=ns.compile_check,
+            quick=False,
+            save_outputs=ns.outputs_dir / f"{i}.pt" if ns.outputs_dir else None,
+            config={},
+            session=session,
+            early_best=ns.early_best,
+        )
+        result: dict[str, Any] | None = None
+        try:
+            next(stages)
+            paused[i] = (stages, guards)  # timed: the rest after the others' timing
+        except StopIteration as done:  # it failed or is not timed (CPU): done now
+            result = done.value
+        except Exception:
+            result = {"status": "harness_error", "correct": False, "error": _short_tb()}
+        shared.update({k: session[k] for k in ("capture", "replay") if k in session})
+        if result is not None:
+            for guard in guards:  # before the next candidate is imported
+                guard.restore()
+            emit({"index": i, "event": "result", **result})
+    for i in sorted(paused):  # 2. the profiled passes and the re-verification
+        emit({"index": i, "event": "running", "stage": "checks"})
+        concurrency.reset()
+        stages, guards = paused.pop(i)
+        try:
+            result = _finish(stages)
+        except Exception:
+            result = {"status": "harness_error", "correct": False, "error": _short_tb()}
+        finally:
+            for guard in guards:
+                guard.restore()
+        emit({"index": i, "event": "result", **result})
+        del stages
+        gc.collect()
+    _restore([])  # the comparator's tier
+    return 0
 
 
 if __name__ == "__main__":

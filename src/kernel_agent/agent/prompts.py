@@ -1337,8 +1337,17 @@ tune them with `sweep_candidate`.
   speedup (`speedup_per_case`, `pct_of_sol`). A sweep counts as ONE evaluation:
   tune block sizes, `num_warps`, `num_stages` and vector widths with one sweep per
   idea, never with one evaluation per value.
+* `evaluate_candidates(target_id="<target>", candidates=[{{"candidate":
+  "candidates/<a>.py", "hypothesis": "..."}}, ...], idea_id="<slug>")`: 2 to 8
+  variants of one idea (different code; configs of one file are a sweep) in one
+  evaluator process: each is evaluated in full, snapshotted and recorded as its own
+  row and counts as one evaluation, for less GPU time than one call each.
 * `best_result(target_id="<target>")`: best correct result so far, and per
   idea: tries, best speedup, bugs (failed attempts) vs slow (correct, not faster).
+A correct candidate that cannot beat the best so far stops timing after 2 of its 3
+rounds (`early` in the result: a `discard`, every correctness check still ran). An
+idea with 3 correct tries, none within the noise of the best, is `refuted`: stop its
+variations and take your next idea.
 Every timed result reports the roofline of each case for the current
 recipe: `sol_ms` = max(FLOPs / peak FLOP/s, `min_bytes` / peak bandwidth) with peaks
 measured on this GPU, `pct_of_sol` = 100 × sol_ms / new_ms, and `bound`
@@ -1487,6 +1496,10 @@ that cannot be undone that way sets `undo = False` or defines `undo(workload)`.
   the full model in a fresh process, applies the transforms, runs the workload,
   compares against the baseline output and reports latency + speedup. Give a
   one-sentence `hypothesis`; it is recorded in the run's ledger.
+* `evaluate_e2e_batch(sets=[{{"transforms": [...], "kernels": [...], "hypothesis":
+  "..."}}, ...])`: 2 to 8 sets with one model load (each applied, measured and
+  undone in-process; one evaluation and one ledger row per set): compare variants
+  of a transform this way.
 
 {COMMON_RULES}
 

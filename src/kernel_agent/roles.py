@@ -61,8 +61,8 @@ WEB_TOOLS = ("WebFetch", "WebSearch")
 #: accounting and makes no evaluation the engineer does not see.
 HELPER_TOOLS = (*READ_TOOLS, "Skill", *WEB_TOOLS, *DOC_TOOLS)
 #: kernel-agent's evaluation tools of the kernel and the end-to-end sessions (short names).
-KERNEL_TOOLS = ("evaluate_candidate", "sweep_candidate", "best_result")
-E2E_TOOLS = ("evaluate_e2e", "run_info")
+KERNEL_TOOLS = ("evaluate_candidate", "evaluate_candidates", "sweep_candidate", "best_result")
+E2E_TOOLS = ("evaluate_e2e", "evaluate_e2e_batch", "run_info")
 #: An agent's own GPU scripts through the GPU job queue (#185): every role whose Bash may need
 #: the GPU (with ``--agent-gpu tool`` its Bash commands see none).
 DEV_TOOLS = ("run_on_gpu",)

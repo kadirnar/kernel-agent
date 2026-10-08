@@ -1052,7 +1052,7 @@ class Orchestrator:
         integration = self.run.root / "integration.json"
         previous = self.truth.load_json(integration) if reuse else {}
         # by content, not by snapshot name: every evaluation snapshots its files anew (#93)
-        keys = reuse_cache.Keys(self.run, self._reuse_context(base_ms))
+        keys = reuse_cache.Keys(self.run, self._reuse_context(base_ms), self._ab_rule())
         known, migrated = self._reusable(previous or {}, keys)  # a pre-#93 file: migrated
         if migrated:
             log(f"integrate: {migrated}")
@@ -1084,7 +1084,10 @@ class Orchestrator:
             its history entry)."""
             a_items = [x for _, x in a]
             key = keys.step(a, b)
+            early = keys.step(a, b, ruled=True)  # stopped early under the stop rule (#190)
             hit = paired.get(key) if key is not None else None
+            if hit is None and early is not None:
+                hit = paired.get(early)
             counts["measured" if hit is None else "reused"] += 1
             if hit is not None:
                 names = " + ".join(ledger.item_label(x) for _, x in b)
@@ -1102,6 +1105,8 @@ class Orchestrator:
                 record.update(accepted=False, why=why)
             r["ab"] = record
             entry = {**swap, "items": [x for _, x in b], **_short(r), "ab": record}
+            if record.get("stopped"):  # its rounds depend on the stop rule
+                key = early
             history.append({**entry, "reuse_key": key} if key is not None else entry)
             return r
 
@@ -1303,14 +1308,21 @@ class Orchestrator:
             "ab_rounds": self.cfg.ab_rounds,
         }
 
+    def _ab_rule(self) -> dict[str, Any] | None:
+        """The stop rule of the sequential A/B (``abtest.stop_rule``; None: ``--early-stop
+        off``, every A/B runs its ``--ab-rounds``)."""
+        if not self.cfg.early_stop:
+            return None
+        return abtest.stop_rule(self.cfg.ab_min_win_rate, self.cfg.ab_min_gain)
+
     def reusable(self) -> tuple[list[dict[str, Any]], str]:
         """What a re-integration now could take from the last integration
         (:meth:`_reusable`; the improve loop's estimate of its final integration)."""
         previous = self.truth.load_json(self.run.root / "integration.json") or {}
         if not previous.get("history"):
             return [], ""
-        keys = reuse_cache.Keys(self.run, self._reuse_context(self.truth.baseline_ms()))
-        return self._reusable(previous, keys)
+        context = self._reuse_context(self.truth.baseline_ms())
+        return self._reusable(previous, reuse_cache.Keys(self.run, context, self._ab_rule()))
 
     def _reusable(
         self, previous: dict[str, Any], keys: reuse_cache.Keys
@@ -1698,6 +1710,9 @@ class Orchestrator:
         elif not irreversible.intersection(a_items | b_items):
             cli = [*_cli(a, warmup=2), *_cli(b, prefix="--b-")]
             cli += ["--rounds", str(self.cfg.ab_rounds)]
+            if self.cfg.early_stop:  # stop the rounds once the verdict is decided (#190)
+                cli += ["--sequential", "--ab-min-win-rate", str(self.cfg.ab_min_win_rate)]
+                cli += ["--ab-min-gain", str(self.cfg.ab_min_gain)]
             r = self._integration_call("e2e_ab", b, cli, note)
             if r.get("status") not in abtest.FALLBACK:
                 return r

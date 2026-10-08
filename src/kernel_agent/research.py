@@ -86,7 +86,11 @@ def ideas_table(stats: list[dict[str, Any]]) -> list[str]:
         failed = {k: v for k, v in s["statuses"].items() if k in ledger.FAILURES}
         if failed:
             bugs += " (" + ", ".join(f"{k} {v}" for k, v in failed.items()) + ")"
-        verdict = {"buggy": "buggy: retry", "slow": "slow"}.get(s["verdict"], s["verdict"])
+        verdict = {
+            "buggy": "buggy: retry",
+            "slow": "slow",
+            "refuted": "refuted: stop variations",  # ledger.REFUTED_TRIES correct, none near
+        }.get(s["verdict"], s["verdict"])
         lines.append(
             f"| `{s['idea']}` | {s['tries']} | "
             + ("" if s["best"] is None else f"{s['best']:.3f}x")

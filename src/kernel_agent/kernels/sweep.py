@@ -24,7 +24,12 @@ tries a list of configs while it holds one GPU of the pool:
    every timed case.  One timed call of each config's first round runs on redrawn
    inputs and is checked against the reference (``incorrect_timed_output``).  The
    table is sorted by weighted speedup (calls per run x time) and has the
-   speedup and ``pct_of_sol`` of every case.
+   speedup and ``pct_of_sol`` of every case.  **Racing** (``--early-stop on``, issue #190,
+   :func:`kernels.early.race`): after each round but the last, the configs beyond the
+   noise of the leader (more than 50 % slower after the first round, certainly slower
+   after the second) drop out, at most half of those still timed per round (successive
+   halving); their rows keep the speedups of the rounds they had and say why
+   (``raced``).
 3. **Evaluate** the best config with the full evaluator (:func:`run_evaluation`
    in a fresh process: every stage and anti-gaming guard, the checks outside the
    candidate's process included), with its config bound into the file
@@ -243,6 +248,8 @@ def compact_row(row: dict[str, Any]) -> dict[str, Any]:
     for flag in ("suspicious_faster_than_sol", "sol_unreliable"):
         if row.get(flag):
             out[flag] = True
+    if raced := row.get("raced"):  # racing (kernels/early.py): the rounds it had
+        out["raced"] = raced["why"]
     return out
 
 
@@ -252,7 +259,7 @@ def format_table(data: dict[str, Any]) -> str:
     head = (
         f"sweep: {info['configs']} configs, {info['passed']} passed, {info['failed']} "
         f"rejected, {info['skipped']} skipped, {info.get('rounds') or 0} timing rounds, "
-        f"{info['seconds']} s"
+        f"{info['seconds']} s" + (f", {info['raced']} raced out" if info.get("raced") else "")
     )
     lines = [head]
     for case in info.get("cases") or []:
@@ -264,7 +271,8 @@ def format_table(data: dict[str, Any]) -> str:
             speedup = f"{row['speedup']:.3f}x" if row.get("speedup") is not None else "untimed"
             sol = f"{row['pct_of_sol']:.1f}" if row.get("pct_of_sol") is not None else "-"
             cases = " ".join(f"{c.get('speedup')}x" for c in row.get("cases") or [])
-            lines.append(f"  {speedup:>8}  {sol:>6}  {cases:<24}  {label(row['config'])}")
+            raced = f" (raced out after round {row['raced']['after']})" if row.get("raced") else ""
+            lines.append(f"  {speedup:>8}  {sol:>6}  {cases:<24}  {label(row['config'])}{raced}")
         else:
             error = (row.get("error") or "").strip().splitlines() or [""]
             lines.append(f"  {row['status']:>16}  {label(row['config'])}: {error[-1][:120]}")
@@ -328,11 +336,15 @@ def _time_configs(
     deadline: float | None,
     emit: Callable[[dict[str, Any]], None],
     replay: Any,
+    race: bool = False,
 ) -> tuple[int, dict[int, float]]:
     """Interleaved timing rounds of the passing configs (``(row, (candidate, the reference
     copy it was built from))``); fills their rows (speedup per case and weighted). Every
-    call runs from its case's module state (``replay``, profiling/state.py). Returns the
+    call runs from its case's module state (``replay``, profiling/state.py). With ``race``
+    the configs beyond the noise of the leader drop out after each round (``raced`` in their
+    row: :func:`kernels.early.race`; their speedups are of the rounds they had). Returns the
     number of whole rounds and the reference's time per timed case."""
+    from kernel_agent.kernels import early
     from kernel_agent.kernels.bench import median_round
 
     ref_rounds: dict[int, list[dict[str, Any]]] = {ci: [] for ci in timed}
@@ -354,7 +366,7 @@ def _time_configs(
                 timer(ref_fn, args, kwargs, l2_flush=l2_flush, target_ms=TARGET_MS)
             )
             for row, holders in order:
-                if not row["correct"]:
+                if not row["correct"] or row.get("raced"):
                     continue
                 emit({"event": "running", "index": row["index"]})
                 try:
@@ -392,6 +404,23 @@ def _time_configs(
                 new_rounds[row["index"]][ci].append(t)
         done += 1
         round_s = time.monotonic() - began
+        if race:  # successive halving: the configs clearly slower than the leader drop out
+            refs = {ci: [x["median_ms"] for x in ref_rounds[ci]] for ci in timed}
+            still = {
+                row["index"]: [
+                    early.Timed(
+                        cases[ci]["count"],
+                        refs[ci],
+                        [x["median_ms"] for x in new_rounds[row["index"]][ci]],
+                    )
+                    for ci in timed
+                ]
+                for row, _ in passing
+                if row["correct"] and not row.get("raced")
+            }
+            rows = {row["index"]: row for row, _ in passing}
+            for index, why in early.race(still, done, ROUNDS).items():
+                rows[index]["raced"] = why
     emit({"event": "running", "index": None})
 
     ref = {ci: median_round(ref_rounds[ci]) for ci in timed}
@@ -475,6 +504,7 @@ def sweep(
     deadline: float | None = None,
     emit: Callable[[dict[str, Any]], None] = _ignore,
     timer: Callable[..., dict[str, Any]] | None = None,
+    race: bool = True,
 ) -> dict[str, Any]:
     """Steps 1 and 2 of the module docstring, in this process: the sorted ``table``.
 
@@ -482,7 +512,7 @@ def sweep(
     ``index``); ``deadline`` (``time.monotonic()``): no new work after it; ``emit``
     gets progress events (``running`` before a config's check or timing, ``row``
     after its check).  Timing needs CUDA, or ``timer``: a stand-in for
-    :func:`kernels.bench.time_call` (tests)."""
+    :func:`kernels.bench.time_call` (tests). ``race``: racing (``--early-stop``)."""
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -586,7 +616,10 @@ def sweep(
             deadline=deadline,
             emit=emit,
             replay=replay,
+            race=race,
         )
+        if raced := sum(bool(row.get("raced")) for row in rows):
+            out["raced"] = raced
         for case in out["cases"]:
             case["ref_ms"] = ref_ms[case["case"]]
         precision = capture_precision(capture)  # reduced-precision weights: their own bytes
@@ -612,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--capture-sha256", help="refuse a capture without this digest")
     parser.add_argument("--nonce-stdin", action="store_true", help="tag result lines")
+    parser.add_argument("--no-race", action="store_true", help="time every config every round")
     ns = parser.parse_args(argv)
     tag = (sys.stdin.readline().strip() + "@@") if ns.nonce_stdin else ""
 
@@ -631,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
             capture_sha256=ns.capture_sha256,
             deadline=deadline,
             emit=emit,
+            race=not ns.no_race,
         )
     except BrokenContext as exc:
         emit({"event": "broken_context", "index": exc.index, "error": exc.error})
@@ -658,6 +693,7 @@ def _spawn(
     hard_s: float,
     l2_flush: bool,
     capture_sha256: str | None,
+    race: bool = True,
 ) -> dict[str, Any]:
     """One sweep subprocess: its checked ``rows``, final ``result`` (None if it did not
     finish) and the ``culprit``: the config that ran when it died."""
@@ -680,6 +716,8 @@ def _spawn(
         cmd.append("--l2-flush")
     if capture_sha256:
         cmd += ["--capture-sha256", capture_sha256]
+    if not race:
+        cmd.append("--no-race")
     timed_out, code = False, None
     try:
         proc = subprocess.run(
@@ -730,6 +768,7 @@ def _check_and_time(
     budget_s: float,
     l2_flush: bool,
     capture_sha256: str | None,
+    race: bool = True,
 ) -> dict[str, Any]:
     """Steps 1 and 2 in subprocesses (another one without a config that crashed); every
     config gets a row."""
@@ -753,6 +792,7 @@ def _check_and_time(
             hard_s=left,
             l2_flush=l2_flush,
             capture_sha256=capture_sha256,
+            race=race,
         )
         checked = run["rows"]
         if run["result"] is not None:
@@ -832,13 +872,15 @@ def run_sweep(
     l2_flush: bool = False,
     compile_check: bool = False,
     prepare: Callable[[Path], Path] | None = None,
+    race: bool = True,
 ) -> dict[str, Any]:
     """Sweep ``configs`` of a candidate and fully evaluate the best one, all under one
     GPU-lock acquisition (see the module docstring); ``timeout``: the evaluation timeout.
 
     ``prepare`` turns the file of the config that stands for the sweep (the best one
     bound into the source, :func:`bind_config`) into the file that is evaluated and
-    recorded (the tool: its snapshot).  Returns ``evaluation`` (the full evaluator's
+    recorded (the tool: its snapshot).  ``race``: racing of the configs (``--early-stop``,
+    :func:`kernels.early.race`).  Returns ``evaluation`` (the full evaluator's
     result, or the first failure when no config passed), ``config``, ``evaluated``
     (that file), ``sweep`` (counts, ``cases``, the sorted ``table``) and ``gpu_index``."""
     from kernel_agent.native import project
@@ -862,6 +904,7 @@ def run_sweep(
                 budget_s=TIMEOUT_FACTOR * timeout,
                 l2_flush=l2_flush,
                 capture_sha256=capture_sha256,
+                race=race,
             )
             seconds = round(time.monotonic() - start, 1)
             top = data["table"][0]
