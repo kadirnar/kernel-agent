@@ -152,11 +152,12 @@ def test_engineer_prompt_states_the_w8a8_contract():
         "quantize_fp8, fp8_w8a8_linear, fp8_w8a8_error",
         "accumulate in fp32",
         "triton_fp8_w8a8_gemm.py",
-        "# Low-precision weights",
-        "## FP8 W8A8",
+        "`kernel-agent:fp8-w8a8`",  # the skills to load (#176)
+        "`kernel-agent:precision-tiers`",
         "torch._scaled_mm",
     ):
         assert needle in text, needle
+    assert "# FP8 W8A8 (`precision: fp8_w8a8`)" in prompts.knowledge("fp8-w8a8")
     assert "FP8 weight-only:" not in text
 
 

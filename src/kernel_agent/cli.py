@@ -379,15 +379,26 @@ def cmd_memcheck(ns: argparse.Namespace) -> int:
 
 
 def cmd_install_claude_code(ns: argparse.Namespace) -> int:
+    """``/optimize-model``, the agent definitions of every role and the skills (#176) into
+    ``<project>/.claude/`` (``commands/``, ``agents/``, ``skills/<name>/``)."""
     import shutil
 
-    src = Path(__file__).parent / "claude_code"
+    from kernel_agent import roles, skills
+
     dst = Path(ns.project) / ".claude"
-    for kind in ("commands", "agents"):
-        (dst / kind).mkdir(parents=True, exist_ok=True)
-        for file in (src / kind).glob("*.md"):
-            shutil.copy2(file, dst / kind / file.name)
-            print(f"installed {dst / kind / file.name}")
+    commands = sorted((Path(__file__).parent / "claude_code" / "commands").glob("*.md"))
+    copies = [(file, dst / "commands" / file.name) for file in commands]
+    copies += [(r.path, dst / "agents" / r.path.name) for r in roles.definitions().values()]
+    for skill in skills.index().values():
+        for file in (skill.path, *skill.resources):
+            copies.append((file, dst / "skills" / skill.name / file.relative_to(skill.dir)))
+    for file, target in copies:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file, target)
+    print(f"installed into {dst}:")
+    print(f"  commands: {', '.join('/' + f.stem for f in commands)}")
+    print(f"  agents:   {', '.join(roles.definitions())}")
+    print(f"  skills:   {', '.join(skills.index())}")
     return 0
 
 
@@ -787,7 +798,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_memcheck)
 
     p = sub.add_parser(
-        "install-claude-code", help="add /optimize-model + kernel-engineer subagent to a project"
+        "install-claude-code",
+        help="add /optimize-model, kernel-agent's subagents and skills to a project's .claude/",
     )
     p.add_argument("project", nargs="?", default=".")
     p.set_defaults(func=cmd_install_claude_code)

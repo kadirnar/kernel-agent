@@ -459,7 +459,7 @@ def test_dry_run_reaches_the_native_arm_after_the_module_arms(tmp_path):
     sessions = [s for s in world.sessions if s["name"] == "native"]
     assert sessions and all("# Improve slice" in s["system"] for s in sessions)
     assert "## Where the native engine stands" in sessions[0]["system"]
-    assert "native.md" in sessions[0]["system"]
+    assert "kernel-agent:native-engines" in sessions[0]["system"]
     rows = [r for r in ledger.rows(orch.run) if engine.is_native(r)]
     assert rows and all(r["snapshot"].split("_")[1] == "loop" for r in rows)
     history = orch.run.history_dir()
@@ -591,16 +591,17 @@ def test_plan_schema_and_prompts_know_the_native_engine():
         why="--native on",
         blocks=["* this run: `attn` 2.00x: `x.py`"],
     )
-    assert "native.md" in text and "native_project" in text and "`attn` 2.00x" in text
-    assert "about 5 evaluations" in text
-    assert (prompts.KNOWLEDGE_DIR / "native.md").is_file()
+    assert "kernel-agent:native-engines" in text and "native_project" in text
+    assert "`attn` 2.00x" in text and "about 5 evaluations" in text
+    assert (prompts.KNOWLEDGE_DIR / "native-engines" / "SKILL.md").is_file()
     assert "6 lookups" in prompts.web_note("native", ["docs.nvidia.com"])
     assert program.role_of("native") == "native"
 
 
 def test_library_code_names_no_model():
     """The native engine is model-agnostic: no model-specific names in its code or prompts."""
-    sources = [engine.__file__, proj.__file__, prompts.KNOWLEDGE_DIR / "native.md"]
+    sources = [engine.__file__, proj.__file__]
     text = "\n".join(Path(p).read_text() for p in sources).lower()
+    text += prompts.knowledge("native-engines").lower()
     for name in ("voxcpm", "locdit", "minicpm", "locenc", "audiovae", "llama", "qwen"):
         assert name not in text, name

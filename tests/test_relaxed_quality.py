@@ -161,7 +161,7 @@ def test_prompts_of_a_relaxed_run():
     assert f"cosine >= {cosine:g}, relative L2 error <= {rel_l2:g}" in text
     assert f"±{norm * 100:g} %" in text and f"{a:g} x RMS + {r:g} x |reference|" in text
     research = prompts.research_prompt(target, capture, "evidence", Path("/r/plan.md"), "tc")
-    assert "(relaxed tolerance tier; low_precision.md)" in research
+    assert "(relaxed tolerance tier; skill `kernel-agent:fp8-weights`)" in research  # #176
     near = prompts.engineer_prompt(
         target, {**capture, "tier": "near-lossless"}, ["triton"], "python", "toolchain", 10, None
     )

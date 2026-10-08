@@ -3,7 +3,7 @@ cache, and the byte share that decides whether the class can pay.
 
 A target whose spec says ``"precision": "fp8_kv"`` (opt-in: ``--precisions ...,fp8_kv`` in a
 ``--quality near-lossless`` run, ``kernel_agent/precisions.py``; near-lossless tier) may keep
-its attention's KV cache in e4m3. The contract (``agent/knowledge/low_precision.md``, "FP8 KV
+its attention's KV cache in e4m3. The contract (skill ``fp8-kv-cache``, "FP8 KV
 cache"): K and V get one fp32 scale per (token, KV head) (``amax`` over the head dimension /
 448, dynamic), written once when tokens are appended and never re-quantised per step; the
 attention reads codes + scales (dequantised in registers, or the K scale folded into the

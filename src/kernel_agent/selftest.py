@@ -147,7 +147,7 @@ def make_rmsnorm_capture(path: Path, hidden: int = 2048) -> Path:
     return path
 
 
-#: The FP8 weight-only examples (``precision: fp8_weights``, knowledge/low_precision.md) and
+#: The FP8 weight-only examples (``precision: fp8_weights``, skill fp8-weights) and
 #: the ``nn.Linear`` they are checked on: in / out features and the captured calls
 #: (input shape without the feature dimension, calls per run), on VoxCPM2 shapes.
 FP8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {

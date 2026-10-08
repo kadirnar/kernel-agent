@@ -1,3 +1,8 @@
+---
+name: tilelang-kernels
+description: TileLang kernels — a verified GEMM template, buffers, pipelined copies, parallel loops, reductions, the FlashAttention structure, per-shape compilation, autotuning, host overhead. Use when a target's backend is tilelang.
+---
+
 # TileLang backend (`import tilelang, tilelang.language as T`)
 
 Verified example: `examples/tilelang_rmsnorm.py`; a verified GEMM:
@@ -47,3 +52,8 @@ Key facts
 * Uses nvcc: the toolchain adds `-allow-unsupported-compiler` and the CCCL
   compatibility override automatically when needed.
 * Per-call host overhead ≈ 30 us (measured); fuse more work per kernel.
+
+## Examples and sources
+
+* Examples: `examples/tilelang_rmsnorm.py`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Sources: the `documentation-sources` skill's `sources.md`, sections "TileLang".

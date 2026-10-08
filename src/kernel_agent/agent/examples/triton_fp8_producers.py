@@ -3,7 +3,7 @@ e4m3 codes plus their scales in the epilogue, so the next W8A8 GEMM reads one by
 activation and no separate quantisation pass runs.
 
 Reduced precision: ``"precision": "fp8_w8a8"`` (a ``--quality near-lossless`` run,
-knowledge/low_precision.md); the exact tier rejects it. The numerics are the class's: the
+skill fp8-w8a8); the exact tier rejects it. The numerics are the class's: the
 producer computes its output as eager does (bf16 roundings included), then quantises it per
 token (``scale = amax / 448``, dynamic, every call; ``quant.quantize_fp8_activations``) or,
 with ``mx=True``, per 32 elements with a power-of-two ue8m0 scale (MXFP8, the

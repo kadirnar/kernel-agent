@@ -446,7 +446,7 @@ def test_write_guard_and_restricted_tools(tmp_path, monkeypatch):
 
     run_agent(mcp_tools=tools_mod.tool_names("best_result"), tools=[*runner.READ_TOOLS, "Write"])
     restricted = seen[-1]
-    assert restricted.tools == ["Read", "Glob", "Grep", "Write"]
+    assert restricted.tools == ["Read", "Glob", "Grep", "Write", "Skill"]  # + skills (#176)
     assert len(restricted.hooks["PreToolUse"]) == 1  # only the Claude files guard (#126)
     assert set(restricted.allowed_tools) == {
         "Read",
@@ -474,9 +474,12 @@ def test_engineer_prompt_ideas_and_research_prompt():
     assert 'idea_id="<slug>", expected_speedup=1.4' in text and "# Ideas" in text
     assert "3-5 distinct ideas" in text and "abandoned after N attempts" in text
     assert "`plan.md` (when present)" in text and "bugs (failed attempts) vs slow" in text
-    assert "Plan amnesia" in text and "False infeasibility" in text  # cuda.md + cute_dsl.md
-    for guide in ("cuda.md", "cute_dsl.md"):
+    # the backend skills the prompt names (#176) hold the process traps of long debug loops
+    assert "`kernel-agent:cuda-kernels`" in text and "`kernel-agent:cute-dsl`" in text
+    for guide in ("cuda.md", "cute_dsl.md", "cuda-kernels", "cute-dsl"):
         assert "abandoned after N" in prompts.knowledge(guide)
+        assert "Plan amnesia" in prompts.knowledge(guide)
+        assert "False infeasibility" in prompts.knowledge(guide)
 
     review = prompts.research_prompt(target, info, "EVIDENCE", Path("/r/plan.md"), "GPU: x")
     assert "EVIDENCE" in review and "`/r/plan.md`" in review and "`a0[1, 1, 8]`" in review

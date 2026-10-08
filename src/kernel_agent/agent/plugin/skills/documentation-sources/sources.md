@@ -24,7 +24,7 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html — PDL: overlap a kernel's prologue with the previous kernel.
 * https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html — CUDA graphs: capture, update, launch cost.
 * https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html — L2 persistence / access policy windows.
-* https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html — per-architecture limits (smem, registers, features); `gpus.md` lists the per-architecture sources (tuning guides, PTX target notes, cuBLAS scale modes per compute capability).
+* https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html — per-architecture limits (smem, registers, features); `gpus.md` (skill `gpu-architectures`) lists the per-architecture sources (tuning guides, PTX target notes, cuBLAS scale modes per compute capability).
 * https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html — coalescing, occupancy, memory optimisations.
 * https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html — Blackwell tuning (L2, smem, tensor cores).
 * https://docs.nvidia.com/cuda/parallel-thread-execution/index.html — PTX ISA (only up to §9.7.9 via WebFetch; see above).

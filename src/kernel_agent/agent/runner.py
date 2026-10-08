@@ -26,6 +26,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookEvent
 
+from kernel_agent import roles, skills
 from kernel_agent.agent import auth, web
 from kernel_agent.config import OptimizeConfig
 
@@ -63,7 +64,8 @@ def _log(msg: str) -> None:
 
 def _brief(block_input: Any, limit: int = 110) -> str:
     if isinstance(block_input, dict):
-        for key in ("candidate", "file_path", "command", "pattern", "url", "transforms"):
+        keys = ("candidate", "file_path", "command", "pattern", "url", "transforms", "skill")
+        for key in (*keys, "subagent_type"):
             if key in block_input:
                 return f"{key}={str(block_input[key])[:limit]}"
     return str(block_input)[:limit]
@@ -174,8 +176,13 @@ async def run_agent(
     """
     builtin = list(BASE_TOOLS if tools is None else tools)
     builtin += (WEB_TOOLS if cfg.allow_web else []) + list(extra_tools or [])
+    helpers = roles.subagents(name, web=cfg.allow_web)  # the role's delegates (#176)
     options = ClaudeAgentOptions(
-        system_prompt={"type": "preset", "preset": "claude_code", "append": system_append},
+        system_prompt={
+            "type": "preset",
+            "preset": "claude_code",
+            "append": system_append + roles.delegation_note(helpers),
+        },
         cwd=str(cwd),
         add_dirs=[str(d) for d in (add_dirs or [])],
         allowed_tools=builtin + mcp_tools + web.DOC_TOOLS,  # doc library: every session
@@ -185,13 +192,16 @@ async def run_agent(
         max_turns=cfg.max_turns_per_agent,
         max_budget_usd=cfg.budget_usd_per_agent,
         setting_sources=[],  # no user/project settings, hooks or CLAUDE.md files (#126)
+        plugins=[skills.plugin()],  # kernel-agent's skills, by explicit path (#176)
+        skills=skills.session_skills(),  # those (+ Workflow's): no other bundled or user skill
+        agents=helpers or None,
         env={**env, **SESSION_ENV},
         output_format=output_format,
     )
     if cfg.effort:
         options.effort = cfg.effort  # type: ignore[assignment]
     if tools is not None:  # a restricted session: no other built-in tool exists at all
-        options.tools = builtin
+        options.tools = [*builtin, "Skill", *(["Agent"] if helpers else [])]
     hooks = write_guard(writable, cwd) if writable is not None else {}
     hooks.setdefault("PreToolUse", []).append(claude_files_guard(cwd))
     options.hooks = hooks
@@ -237,10 +247,14 @@ async def run_agent(
                         if why := auth.session_problem(cfg.auth, result.api_key_source, env):
                             raise auth.AuthError(why)  # before the session's first request
                     elif isinstance(message, ResultMessage):
-                        result.text = message.result or ""
-                        result.structured = message.structured_output
+                        # a session whose background subagent or task finishes after its
+                        # turn ends gets another turn and another result: the USD covers
+                        # the session so far, the turns and the output only that turn (#176)
+                        result.text = message.result or result.text
+                        if message.structured_output is not None:
+                            result.structured = message.structured_output
                         result.cost_usd = usd + (message.total_cost_usd or 0.0)
-                        result.turns = turns_before + message.num_turns
+                        result.turns = max(result.turns, turns_before + message.num_turns)
                         result.is_error = message.is_error
                         result.session_id = message.session_id
             except ClaudeSDKError as exc:  # Claude Code exits 1 after an error result
