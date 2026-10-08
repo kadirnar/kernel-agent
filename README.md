@@ -4343,6 +4343,9 @@ kernel-agent exp list <run_dir> [--lineage ID|model] [--status keep|discard|fail
   [--session S] [--last N] [--tsv]     the experiments (see "Experiment ledger")
 kernel-agent exp show <run_dir> N      one experiment: row, record, files, diff to its parent
 kernel-agent exp diff <run_dir> A [B]  A's code against B (default: A's parent experiment)
+kernel-agent exp git <run_dir> [--sync | --rebuild [--out DIR]] [-- GIT ARGS]
+                                       experiments.git: one commit per experiment, best/<lineage>
+                                       branches (see "Git history")
 kernel-agent watch <run_dir> [--port 8765]   live dashboard in the browser (see "Live dashboard")
 kernel-agent library list|show <id>|prune [--older-than DAYS]|path   cross-run kernel library
 kernel-agent library import-memory DIR [--write]   Claude Code memory notes → lessons
@@ -4408,6 +4411,8 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/progress.png   speedup per evaluation (see "Charts")
   transforms/                 model-level transforms (+ the agent's copies)
   results.tsv                 experiment ledger: one row per evaluation (kernel-agent exp)
+  experiments.git/            the experiments as a bare git repository, derived from the ledger
+                              (kernel-agent exp git; see "Git history")
   events.jsonl                phase changes, agent start/stop, evaluations (+ files measured)
   gpu_queue.jsonl             GPU job queue: queued / start / done / withdrawn per job
   board.jsonl                 improve --agents N / --board on: the sessions' notes (insight,
@@ -4593,7 +4598,8 @@ by their gain over the best before them.
   against it.
 * `kernel-agent exp diff <run_dir> A [B]` prints a unified diff of what B measured to
   what A measured (B: A's parent experiment by default), file by file: a kernel's
-  snapshot by target, transforms by their file stem.
+  snapshot by target, transforms by their file stem (`git diff exp/B exp/A` once both are
+  in `experiments.git`, see "Git history").
 
 `kernel-agent status <run_dir> [--watch SECONDS]` prints the current phase, the
 baseline, the projected (nested targets counted once, see Charts) and measured
@@ -4609,6 +4615,72 @@ ledger rows with their titles (the hypothesis: `kernel-agent exp show`).
 PNG, the target table, the latest evaluations (their titles, the hypothesis on
 hover) and the agent costs. It supports
 light and dark mode and reloads every 30 s while the run is going.
+
+### Git history
+
+`<run>/experiments.git` is the ledger as a bare git repository (`expgit.py`): one commit per
+experiment, so `git log` is the kept line and `git diff` shows each change, as in autoresearch
+and AutoKernel, except that discarded and failed code stays reachable as evidence.
+
+* **Commits**, in `exp` order. A commit's tree is what the experiment measured, at stable
+  paths so that consecutive versions diff: a kernel snapshot is `targets/<id>/candidate.py`
+  (a region target's `rewrite.py` beside it), a transform `transforms/<stem>.py`, a native
+  project's bundle is unpacked into `native/<project>/…`, and an end-to-end row's kernel
+  items are their targets' `candidate.py`. The subject reads
+  `exp 42 [dit_layer_fp8] keep 12.11× (+1.1 %): <title>`; the body holds the hypothesis and
+  the files measured, then the trailers `Exp`, `Lineage`, `Kind`, `Status`, `Value`, `Unit`,
+  `Snapshot`, `Snapshot-Sha256`, `Idea`, `Session`, `Worker` and `Review`. The author is
+  `kernel-agent (<session>)`, dated by the row's `time`. Quick checks and duplicates get no
+  commit.
+* **Parents.** The commit of the row's `parent` snapshot, else its lineage's standing best
+  when it was recorded. `exp 0` is the baseline (its value, metric, GPU and workload); a
+  target's first experiment starts from its `reference` commit (`reference_source.py`, a
+  child of `exp 0`). An end-to-end commit also has its kernel items' commits as parents, so
+  `git log --graph best/model` shows the kernel lines merging into the model's. A
+  `re-evaluated` row is a child of the experiment it re-evaluates, with the same tree.
+* **Refs.** The tag `exp/<N>` marks every experiment and `reference/<id>` the roots. The
+  branch `best/<lineage>` (`model` and every kernel target) is the lineage's standing best:
+  it advances on `keep` and moves back when a re-evaluation demotes the best. `HEAD` is
+  `best/model`.
+
+```bash
+git --git-dir runs/<...>/experiments.git show exp/42                 # what exp 42 measured
+git --git-dir runs/<...>/experiments.git log --oneline best/dit_layer_fp8   # the kept line
+git --git-dir runs/<...>/experiments.git diff exp/33 exp/34          # what exp 34 changed
+kernel-agent exp git <run_dir> -- log --oneline --graph best/model   # git, --git-dir set
+kernel-agent exp git <run_dir> --rebuild --out /tmp/x.git   # e.g. an archived run, not written
+```
+
+It is derived data. The evaluator, the integration and the winner selection never read it
+(they use the `.truth/` records and their sha256). It is written with git plumbing only
+(`hash-object`, `mktree`, `commit-tree`, `update-ref`; no working tree, index or checkout),
+so it never touches `.truth/`. The run's dashboard thread syncs it before it redraws the
+charts (after evaluations, at phase ends, in `kernel-agent report`), so no evaluation waits
+for git. A sync commits every row from the first one without its tag on, strictly in `exp`
+order, and moves the refs in one compare-and-swap transaction, under an `flock` of
+`experiments.git/ka-sync.lock`: `kernel-agent exp git <run_dir> --sync` from another process
+waits for the run's writer. An end-to-end row is committed once its `evaluation` event lists
+its files. Older runs take an integration step's files from `integration.json` (the last
+integration's steps only); a commit whose files were not recorded keeps its parent's tree and
+says so. The hashes are deterministic: the dates are the ledger's wall clock written as UTC
+and git's own configuration is ignored, so `--rebuild` (or `--rebuild --out DIR`) recreates
+the same SHAs, and deleting the repository loses nothing. Without git, or when git fails, an
+`exp_git` event records the error once, and the run goes on. `kernel-agent exp diff` shows
+`git diff exp/B exp/A` once both are committed.
+
+`kernel-agent exp git <run_dir>` prints the repository, how far it is synced and every
+`best/<lineage>` with its tip, the tip's experiment and the keeps along its first parents
+(measured on `runs/openbmb--VoxCPM2/20261005-192504`, rebuilt with `--out` in 2.0 s:
+116 commits, `best/model` at exp 104, 488.4 ms):
+
+```
+branch                         tip      exp  kept  subject
+best/model (HEAD)              2c73e0e  104     6  exp 104 [model] keep 488.4 ms (+2.1 %): loop_body…
+best/dit_layer_fp8             acf73b3   34     8  exp 34 [dit_layer_fp8] keep 12.24× (+1.1 %): [fp8_…
+best/enc_dit_stack_fp8         35a390d   70     5  exp 70 [enc_dit_stack_fp8] keep 10.19× (+6.6 %): …
+best/lm_step_fp8               e77038b   25     5  exp 25 [lm_step_fp8] keep 10.39× (+1.8 %): [o_wind…
+best/lm_step_fp8__fp4_weights  75c4230   57     3  exp 57 [lm_step_fp8__fp4_weights] keep 15.57× (+…
+```
 
 ## Charts
 
