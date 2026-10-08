@@ -251,6 +251,12 @@ class Orchestrator:
         kwargs["system_append"] += prog.prompt_note(name)
         if cfg.allow_web:  # when to look things up, where, citations (issue #125)
             kwargs["system_append"] += prompts.web_note(name, web.domains(cfg.web_domains))
+        kwargs["system_append"] += prompts.docs_note(name)  # doc_search / doc_read (#177)
+        if self.agent_runner is None:  # real sessions: build the doc library meanwhile, once
+            from kernel_agent import doclib
+
+            hosts = web.domains(cfg.web_domains)
+            doclib.prepare_in_background(fetch=cfg.allow_web, hosts=hosts, log=log)
         waits = 0
         while True:
             timer = asyncio.timeout(timeout)

@@ -12,6 +12,10 @@ Agent sessions have ``WebFetch`` / ``WebSearch`` unless ``--no-web``
   tool, URL or query, outcome (``ok``, ``denied``, ``error``), the HTTP code, and the
   size and sha256 of what the agent got back.
 
+:meth:`Lookups.see` also records every session's lookups in the local doc library
+(``doc_search`` / ``doc_read``, ``doclib``, issue #177): the query and the ids found, or
+the chunk read with its title, library, version and source.
+
 The orchestrator appends a session's lookups to ``research/sources.jsonl`` of the run
 (:func:`record`), counts them in ``costs.json`` (:func:`summary`) and lists the sources
 used in ``report.md`` (:func:`report_lines`). A lookup is a GET of a public page or a
@@ -22,6 +26,7 @@ that nothing of the run goes into a URL or a query.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -41,6 +46,8 @@ from claude_agent_sdk import (
 from kernel_agent.workspace import append_jsonl, read_jsonl
 
 FETCH, SEARCH = "WebFetch", "WebSearch"
+DOC_SEARCH, DOC_READ = "doc_search", "doc_read"  # the doc library's MCP tools (#177)
+DOC_TOOLS = [f"mcp__ka__{DOC_SEARCH}", f"mcp__ka__{DOC_READ}"]  # every session has them
 #: Hosts ``WebFetch`` may reach by default, each with its subdomains: documentation,
 #: reference code and papers (``knowledge/sources.md`` uses only these).
 DOMAINS = (
@@ -114,11 +121,15 @@ def _links(result: Any) -> int | None:
 
 
 class Lookups:
-    """The WebFetch / WebSearch calls of one agent session, appended to ``items``."""
+    """The WebFetch / WebSearch calls (``web``: the session has the web tools) and the doc
+    library lookups of one agent session, appended to ``items``."""
 
-    def __init__(self, items: list[dict[str, Any]], extra_domains: Iterable[str] = ()) -> None:
+    def __init__(
+        self, items: list[dict[str, Any]], extra_domains: Iterable[str] = (), web: bool = True
+    ) -> None:
         self.items = items
         self.hosts = domains(extra_domains)
+        self.web = web
         self.pending: dict[str, dict[str, Any]] = {}
         self.denied: dict[str, str] = {}  # tool_use_id -> why the guard refused it
 
@@ -162,7 +173,9 @@ class Lookups:
         """Record the lookups a message starts (tool calls) or finishes (tool results)."""
         if isinstance(message, AssistantMessage):
             for block in message.content:
-                if isinstance(block, ToolUseBlock) and block.name in (FETCH, SEARCH):
+                if isinstance(block, ToolUseBlock) and block.name in DOC_TOOLS:
+                    self._doc_call(block)
+                elif isinstance(block, ToolUseBlock) and self.web and block.name in (FETCH, SEARCH):
                     item: dict[str, Any] = {"time": _now(), "tool": block.name}
                     if block.name == FETCH:
                         item["url"] = str(block.input.get("url") or "")
@@ -180,8 +193,45 @@ class Lookups:
                     if found is not None:
                         self._finish(found, block, message.tool_use_result)
 
+    def _doc_call(self, block: ToolUseBlock) -> None:
+        tool = block.name.rsplit("__", 1)[-1]
+        item: dict[str, Any] = {"time": _now(), "tool": tool}
+        if tool == DOC_SEARCH:
+            item["query"] = str(block.input.get("query") or "")
+            if block.input.get("library"):
+                item["library"] = str(block.input["library"])
+        else:
+            item["id"] = str(block.input.get("id") or "")
+        item["status"] = "no result"  # until its result arrives
+        self.pending[block.id] = item
+        self.items.append(item)
+
+    def _finish_doc(self, item: dict[str, Any], text: str, is_error: bool | None) -> None:
+        """A doc library result: the ids found, or the chunk read and where it is from."""
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = {"error": text}
+        if is_error or not isinstance(data, dict) or data.get("error"):
+            reason = data.get("error") if isinstance(data, dict) else text
+            item.update(status="error", reason=str(reason or text)[:300])
+            return
+        item["status"] = "ok"
+        if item["tool"] == DOC_SEARCH:
+            hits = data.get("results") or []
+            item["results"] = len(hits)
+            item["hits"] = [h.get("id") for h in hits[:8] if isinstance(h, dict)]
+            return
+        for key in ("title", "library", "version", "origin", "source", "fetched", "read"):
+            if data.get(key):
+                item[key] = data[key]
+        item["chars"] = len(str(data.get("text") or ""))
+
     def _finish(self, item: dict[str, Any], block: ToolResultBlock, result: Any) -> None:
         text = _text(block.content)
+        if item["tool"] in (DOC_SEARCH, DOC_READ):
+            self._finish_doc(item, text, block.is_error)
+            return
         item["chars"] = len(text)
         item["sha256"] = hashlib.sha256(text.encode()).hexdigest()
         if why := self.denied.pop(block.tool_use_id, None):
@@ -203,14 +253,27 @@ class Lookups:
 
 def summary(items: list[dict[str, Any]]) -> dict[str, int]:
     """A session's lookups for ``costs.json``: fetches, searches, denied fetches and the
-    distinct pages fetched."""
+    distinct pages fetched; with doc library lookups also ``doc_searches``, ``doc_reads``
+    and ``doc_chunks`` (distinct chunks read)."""
     fetches = [i for i in items if i.get("tool") == FETCH]
-    return {
+    out = {
         "fetches": len(fetches),
         "searches": sum(i.get("tool") == SEARCH for i in items),
         "denied": sum(i.get("status") == "denied" for i in items),
         "pages": len({i.get("url") for i in fetches if i.get("status") == "ok"}),
     }
+    reads = [i for i in items if i.get("tool") == DOC_READ]
+    if searches := sum(i.get("tool") == DOC_SEARCH for i in items):
+        out["doc_searches"] = searches
+    if reads:
+        out["doc_reads"] = len(reads)
+        out["doc_chunks"] = len({c for i in reads if i.get("status") == "ok" for c in _ids(i)})
+    return out
+
+
+def _ids(item: dict[str, Any]) -> list[str]:
+    """The chunks a ``doc_read`` returned (the one asked for and those read on)."""
+    return [str(c) for c in item.get("read") or [item.get("id")] if c]
 
 
 def record(run_root: Path, agent: str, items: list[dict[str, Any]]) -> None:
@@ -241,10 +304,13 @@ def _cited(run_root: Path) -> dict[str, str]:
 
 def report_lines(run_root: Path) -> list[str]:
     """``## Sources used`` of report.md: the pages agents fetched, by whom and where they
-    are cited; searches and refused fetches in a line each ([] without lookups)."""
-    items = read_jsonl(run_root / SOURCES_FILE)
+    are cited; searches and refused fetches in a line each; the doc library chunks read
+    (:func:`doc_report_lines`). [] without lookups."""
+    every = read_jsonl(run_root / SOURCES_FILE)
+    items = [i for i in every if i.get("tool") not in (DOC_SEARCH, DOC_READ)]
     if not items:
-        return []
+        docs = doc_report_lines(run_root, every)
+        return ["", "## Sources used", *docs, ""] if docs else []
     fetched: dict[str, dict[str, Any]] = {}
     for i in items:
         if i.get("tool") == FETCH and i.get("status") == "ok" and i.get("url"):
@@ -283,4 +349,44 @@ def report_lines(run_root: Path) -> list[str]:
     if denied:
         urls = ", ".join(f"<{str(i.get('url'))[:100]}>" for i in denied[:5])
         lines += ["", f"Refused fetches: {urls}"]
-    return [*lines, ""]
+    return [*lines, *doc_report_lines(run_root, every), ""]
+
+
+def doc_report_lines(run_root: Path, items: list[dict[str, Any]]) -> list[str]:
+    """The doc library part of ``## Sources used``: the searches and reads, and each chunk
+    read with its library version, the sessions that read it and the files that cite it
+    (by its id or its source). [] without doc lookups."""
+    searches = [i for i in items if i.get("tool") == DOC_SEARCH]
+    reads = [i for i in items if i.get("tool") == DOC_READ and i.get("status") == "ok"]
+    if not searches and not reads:
+        return []
+    chunks: dict[str, dict[str, Any]] = {}
+    for i in reads:
+        entry = chunks.setdefault(str(i.get("id")), {**i, "agents": []})
+        if i.get("agent") not in entry["agents"]:
+            entry["agents"].append(i.get("agent"))
+    sessions = len({i.get("agent") for i in [*searches, *reads]})
+    lines = [
+        "",
+        f"* doc library (`doc_search` / `doc_read`): {len(searches)} searches, "
+        f"{len(reads)} reads of {len(chunks)} chunks in {sessions} agent sessions",
+    ]
+    if chunks:
+        texts = _cited(run_root)
+        lines += ["", "| doc chunk | version | read by | cited in |", "|---|---|---|---|"]
+        for cid, entry in list(chunks.items())[:REPORT_ROWS]:
+            source = str(entry.get("source") or "")
+            cited = [n for n, t in texts.items() if cid in t or (source and source in t)]
+            agents = ", ".join(f"`{a}`" for a in entry["agents"][:4])
+            title = " ".join(str(entry.get("title") or "").split()).replace("|", "/")[:90]
+            version = f"{entry.get('library', '')} {entry.get('version', '')}".strip()
+            lines.append(
+                f"| `{cid}` {title} ({source[-80:]}) | {version} ({entry.get('origin', '')}) "
+                f"| {agents} | " + (", ".join(f"`{c}`" for c in cited[:4]) or "—") + " |"
+            )
+        if len(chunks) > REPORT_ROWS:
+            lines.append(f"\n… and {len(chunks) - REPORT_ROWS} more chunks")
+    if searches:
+        queries = "; ".join(f"“{str(i.get('query'))[:60]}”" for i in searches[:8])
+        lines += ["", f"Doc searches: {queries}" + (" …" if len(searches) > 8 else "")]
+    return lines

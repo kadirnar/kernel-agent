@@ -989,6 +989,7 @@ def build_server(
         result = await asyncio.to_thread(region.check, run, target_id, keeper, timeout=timeout)
         return _text(result)
 
+    doc_search, doc_read = doc_tools()
     return create_sdk_mcp_server(
         SERVER_NAME,
         version="0.1.0",
@@ -1000,8 +1001,74 @@ def build_server(
             check_harness,
             run_info,
             verify_rewrite,
+            doc_search,
+            doc_read,
         ],
     )
+
+
+def doc_tools() -> tuple[Any, Any]:
+    """``doc_search`` / ``doc_read``: the local doc library (``doclib``, issue #177) of
+    every session. No network; the first call builds what is missing (seconds)."""
+    from kernel_agent import doclib
+
+    @tool(
+        "doc_search",
+        "Search the local documentation library (no network) of the tools installed here, "
+        "at their installed versions: Triton (triton.language, Gluon), CuTe DSL / CUTLASS, "
+        "TileLang, PyTorch (cpp_extension, torch.cuda), the CUDA headers (runtime and "
+        "driver API, launch attributes, FP8 / FP4 conversions) and cuBLASLt; plus the CUDA "
+        "Programming Guide, PTX ISA, cuBLAS, CUTLASS, Triton and TileLang web docs. Query "
+        "with the identifier and a few words (`tl.dot_scaled scale layout`, "
+        "`cp.async.bulk.tensor`, `cudaLaunchAttributeProgrammaticStreamSerialization`). "
+        "Returns the k best chunks: id, title, library, version, origin (installed / web), "
+        "source and a snippet; read one with doc_read.",
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "identifiers and a few words"},
+                "library": {
+                    "type": "string",
+                    "description": "only these libraries (comma-separated): cuda, ptx, "
+                    "cublas, cutlass, triton, tilelang, torch",
+                },
+                "k": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
+            },
+            "required": ["query"],
+        },
+    )
+    async def doc_search(args: dict[str, Any]) -> dict[str, Any]:
+        query, library = str(args.get("query") or ""), args.get("library")
+        try:
+            out = await asyncio.to_thread(doclib.search, query, library, args.get("k") or 8)
+        except Exception as exc:  # a broken library never fails the session
+            out = {"error": f"the doc library is not available: {exc!r}"}
+        return _text(out)
+
+    @tool(
+        "doc_read",
+        "Read a chunk of the documentation library by its id (from doc_search) and the "
+        "chunks after it in the same page or file, up to max_chars. Returns the text with "
+        "its title, library, version and source (an installed file:line or a URL): cite "
+        "that source. `next`: the id to read on from.",
+        {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "max_chars": {"type": "integer", "minimum": 500, "maximum": 20000},
+            },
+            "required": ["id"],
+        },
+    )
+    async def doc_read(args: dict[str, Any]) -> dict[str, Any]:
+        chars = args.get("max_chars") or doclib.store.READ_CHARS
+        try:
+            out = await asyncio.to_thread(doclib.read, str(args.get("id") or ""), chars)
+        except Exception as exc:
+            out = {"error": f"the doc library is not available: {exc!r}"}
+        return _text(out)
+
+    return doc_search, doc_read
 
 
 def tool_names(*names: str) -> list[str]:
