@@ -369,6 +369,8 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         **({"role_max": ns.role_max} if ns.role_max else {}),
         overlap=ns.overlap,
         board=ns.board,
+        critic=ns.critic,
+        critic_wait=ns.critic_wait,
         policy=Policy(
             patience=ns.patience,
             sol_stop=ns.sol_stop or None,
@@ -879,6 +881,24 @@ def main(argv: list[str] | None = None) -> int:
         "wins, traps, insights, claims, questions) and read the others' in their digests and "
         "on their evaluation results; kernel-agent posts every new best, integration and "
         "round. auto (default): with --agents above 1",
+    )
+    p.add_argument(
+        "--critic",
+        choices=["off", "static", "model"],
+        default="static",
+        help="the critic of every full evaluation: static (default) checks the candidate for "
+        "known ways to game the evaluator (fallback to the reference, try/except fallbacks, "
+        "outputs cached by address, unjoined streams, threads, frame reads, patches) and "
+        "withdraws a confident reject before it reaches the GPU (force=true overrides); "
+        "model also asks a cheap model (the critic role: Haiku, escalated to Sonnet) about "
+        "inconclusive ones while their job waits for the GPU (with --agents above 1)",
+    )
+    p.add_argument(
+        "--critic-wait",
+        type=float,
+        default=30.0,
+        metavar="S",
+        help="--critic model: ask the model only when the job is expected to wait this long",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="simulated agents and GPU (no Claude, no GPU)"

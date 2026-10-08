@@ -15,8 +15,8 @@ INHERIT = "inherit"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 #: The model of each role (#181, docs/MULTIAGENT.md §3.12.1; ``roles.py`` is the registry):
 #: the creative work and the planning on ``--claude-model``, high-volume retrieval and
-#: distillation on Sonnet, the critic's static triage on Haiku. ``--role-model ROLE=MODEL``
-#: changes one (``inherit``: back to ``--claude-model``).
+#: distillation on Sonnet, the critic's triage on Haiku and its escalation on Sonnet.
+#: ``--role-model ROLE=MODEL`` changes one (``inherit``: back to ``--claude-model``).
 ROLE_MODELS = {
     "planner": INHERIT,
     "kernel": INHERIT,
@@ -28,6 +28,7 @@ ROLE_MODELS = {
     "dossier": SONNET_MODEL,
     "librarian": SONNET_MODEL,
     "critic": HAIKU_MODEL,
+    "critic-escalation": SONNET_MODEL,  # an unsure triage, once (critic.py, #188)
     "doc-lookup": SONNET_MODEL,
     "profile-analyst": SONNET_MODEL,
     "compile-triage": SONNET_MODEL,
@@ -41,6 +42,7 @@ ROLE_EFFORTS: dict[str, str | None] = {
     "dossier": "low",
     "librarian": "low",
     "critic": None,
+    "critic-escalation": "low",
     "doc-lookup": "low",
     "profile-analyst": "medium",
     "compile-triage": "medium",
