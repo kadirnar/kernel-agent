@@ -1,0 +1,55 @@
+/home/kadir/kadir_projects/kernel-agent/.venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+LocDiT layer: cases [(32, 11, 1024), (16, 11, 1024)]
+
+## each nn.Linear alone (captured input, rel L2 vs bf16)
+| linear (rows, act crest) | int8 W8A8 (per channel x per token) | int8 weights only | int8 W8A8 + SmoothQuant a=0.4 | fp8 W8A8 (per channel x per token) |
+| self_attn.q_proj (352, 24) | 0.0066 | 0.0025 | 0.0040 | 0.0079 |
+| self_attn.k_proj (352, 24) | 0.0111 | 0.0039 | 0.0043 | 0.0123 |
+| self_attn.v_proj (352, 24) | 0.0180 | 0.0054 | 0.0082 | 0.0204 |
+| self_attn.o_proj (352, 23) | 0.0066 | 0.0027 | 0.0062 | 0.0068 |
+| mlp.gate_proj (352, 29) | 0.0594 | 0.0084 | 0.0132 | 0.0191 |
+| mlp.up_proj (352, 29) | 0.0596 | 0.0085 | 0.0116 | 0.0181 |
+| mlp.down_proj (352, 49) | 0.0220 | 0.0037 | 0.0044 | 0.0068 |
+
+## LocDiT decoder layer, M = 352 (outputs: hidden, k, v)
+int8 W8A8 (per channel x per token)            cap pass cos 0.99984 rel 0.0229 elem 0.23 norm 2.10% | redrawn 0/30 fail, max rel 0.0598 elem 0.28 norm 1.43% | x3:ok x0.01:ok x-1:ok (worst rel 0.0546 elem 0.22 norm 3.99%)
+int8 weights only                              cap pass cos 0.99999 rel 0.0054 elem 0.06 norm 0.07% | redrawn 0/30 fail, max rel 0.0119 elem 0.05 norm 0.10% | x3:ok x0.01:ok x-1:ok (worst rel 0.0065 elem 0.04 norm 0.25%)
+int8 W8A8 + SmoothQuant a=0.4                  cap pass cos 0.99997 rel 0.0082 elem 0.07 norm 0.24% | redrawn 0/30 fail, max rel 0.0212 elem 0.12 norm 0.27% | x3:ok x0.01:ok x-1:ok (worst rel 0.0169 elem 0.10 norm 0.10%)
+fp8 W8A8 (per channel x per token)             cap pass cos 0.99979 rel 0.0204 elem 0.14 norm 0.21% | redrawn 0/30 fail, max rel 0.0336 elem 0.12 norm 1.05% | x3:ok x0.01:ok x-1:ok (worst rel 0.0226 elem 0.10 norm 0.67%)
+fp8 weights only                               cap pass cos 0.99989 rel 0.0151 elem 0.10 norm 0.34% | redrawn 0/30 fail, max rel 0.0246 elem 0.08 norm 0.90% | x3:ok x0.01:ok x-1:ok (worst rel 0.0152 elem 0.06 norm 0.63%)
+BUG weight scales x1.05                        cap FAIL cos 0.99984 rel 0.1330 elem 1.07 norm 13.25% | redrawn 0/7 fail, max rel 0.0785 elem 0.31 norm 5.20% | x3:FAIL x0.01:FAIL x-1:FAIL (worst rel 0.1404 elem 0.65 norm 12.83%)
+      first failure: out[0]: an element is 1.07x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1
+BUG neighbour channel's scale                  cap FAIL cos 0.77026 rel 0.8954 elem 6.89 norm 85.83% | redrawn 7/7 fail, max rel 0.7682 elem 2.98 norm 57.13% | x3:FAIL x0.01:FAIL x-1:FAIL (worst rel 3.5060 elem 54.68 norm 247.03%)
+      first failure: out[0]: an element is 6.89x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0
+BUG first token's scale                        cap FAIL cos 0.98073 rel 0.7846 elem 5.97 norm 77.92% | redrawn 6/7 fail, max rel 0.4820 elem 1.11 norm 40.70% | x3:FAIL x0.01:FAIL x-1:ok (worst rel 0.6932 elem 1.25 norm 67.22%)
+      first failure: out[0]: an element is 5.97x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0
+BUG per-tensor activation scale                cap pass cos 0.99915 rel 0.0413 elem 0.63 norm 1.92% | redrawn 0/7 fail, max rel 0.1183 elem 0.39 norm 2.95% | x3:ok x0.01:FAIL x-1:ok (worst rel 0.1425 elem 0.23 norm 12.65%)
+      first failure: scaled_x0.01: out[0]: norm x1.1265 (allowed ±6%): a systematic error, not rounding noise
+BUG zeroed output channel                      cap FAIL cos 0.99944 rel 0.0333 elem 1.17 norm 2.00% | redrawn 7/7 fail, max rel 0.0805 elem 1.51 norm 1.25% | x3:ok x0.01:ok x-1:ok (worst rel 0.0603 elem 0.94 norm 4.05%)
+      first failure: out[1][0]: an element is 1.17x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|)
+BUG static activation scale (calibrated)       cap pass cos 0.99916 rel 0.0411 elem 0.66 norm 2.08% | redrawn 7/7 fail, max rel 0.1315 elem 0.49 norm 8.71% | x3:ok x0.01:FAIL x-1:FAIL (worst rel 0.5969 elem 2.91 norm 44.34%)
+      first failure: out[0]: norm x0.9155 (allowed ±6%): a systematic error, not rounding noise
+BUG clipped activations (99.9th percentile)    cap FAIL cos 0.99790 rel 0.1346 elem 1.12 norm 13.30% | redrawn 7/7 fail, max rel 0.1797 elem 1.07 norm 11.65% | x3:FAIL x0.01:FAIL x-1:ok (worst rel 0.4408 elem 0.74 norm 31.84%)
+      first failure: out[0]: an element is 1.12x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0
+
+## LocDiT decoder layer, M = 176 (outputs: hidden, k, v)
+int8 W8A8 (per channel x per token)            cap pass cos 0.99984 rel 0.0207 elem 0.22 norm 1.89% | redrawn 0/30 fail, max rel 0.0594 elem 0.27 norm 1.58% | x3:ok x0.01:ok x-1:ok (worst rel 0.0567 elem 0.27 norm 4.08%)
+int8 weights only                              cap pass cos 0.99999 rel 0.0053 elem 0.06 norm 0.12% | redrawn 0/30 fail, max rel 0.0119 elem 0.05 norm 0.17% | x3:ok x0.01:ok x-1:ok (worst rel 0.0062 elem 0.03 norm 0.10%)
+int8 W8A8 + SmoothQuant a=0.4                  cap pass cos 0.99997 rel 0.0083 elem 0.08 norm 0.10% | redrawn 0/30 fail, max rel 0.0215 elem 0.10 norm 0.25% | x3:ok x0.01:ok x-1:ok (worst rel 0.0175 elem 0.09 norm 0.19%)
+fp8 W8A8 (per channel x per token)             cap pass cos 0.99979 rel 0.0204 elem 0.13 norm 0.24% | redrawn 0/30 fail, max rel 0.0337 elem 0.11 norm 1.05% | x3:ok x0.01:ok x-1:ok (worst rel 0.0251 elem 0.11 norm 0.83%)
+fp8 weights only                               cap pass cos 0.99989 rel 0.0150 elem 0.09 norm 0.29% | redrawn 0/30 fail, max rel 0.0247 elem 0.08 norm 0.96% | x3:ok x0.01:ok x-1:ok (worst rel 0.0151 elem 0.06 norm 0.33%)
+BUG weight scales x1.05                        cap FAIL cos 0.99984 rel 0.1321 elem 1.07 norm 13.15% | redrawn 0/7 fail, max rel 0.0795 elem 0.29 norm 5.20% | x3:FAIL x0.01:FAIL x-1:ok (worst rel 0.1403 elem 0.63 norm 12.53%)
+      first failure: out[0]: an element is 1.07x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1
+BUG neighbour channel's scale                  cap FAIL cos 0.77045 rel 0.8953 elem 6.89 norm 85.81% | redrawn 7/7 fail, max rel 0.7785 elem 2.94 norm 58.34% | x3:FAIL x0.01:FAIL x-1:FAIL (worst rel 3.5260 elem 54.71 norm 249.14%)
+      first failure: out[0]: an element is 6.89x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0
+BUG first token's scale                        cap FAIL cos 0.98114 rel 0.7818 elem 5.95 norm 77.64% | redrawn 6/7 fail, max rel 0.4984 elem 1.12 norm 42.33% | x3:FAIL x0.01:FAIL x-1:ok (worst rel 0.6937 elem 1.25 norm 67.27%)
+      first failure: out[0]: an element is 5.95x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0
+BUG per-tensor activation scale                cap pass cos 0.99916 rel 0.0409 elem 0.62 norm 1.82% | redrawn 0/7 fail, max rel 0.1186 elem 0.35 norm 3.35% | x3:ok x0.01:FAIL x-1:ok (worst rel 0.1434 elem 0.21 norm 12.66%)
+      first failure: scaled_x0.01: out[0]: norm x1.1266 (allowed ±6%): a systematic error, not rounding noise
+BUG zeroed output channel                      cap FAIL cos 0.99940 rel 0.0346 elem 1.12 norm 1.90% | redrawn 7/7 fail, max rel 0.0825 elem 1.45 norm 1.54% | x3:ok x0.01:ok x-1:ok (worst rel 0.0634 elem 0.89 norm 3.94%)
+      first failure: out[1][0]: an element is 1.12x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|)
+BUG static activation scale (calibrated)       cap pass cos 0.99916 rel 0.0410 elem 0.65 norm 2.02% | redrawn 7/7 fail, max rel 0.1369 elem 0.50 norm 8.73% | x3:ok x0.01:FAIL x-1:FAIL (worst rel 0.5964 elem 2.90 norm 47.08%)
+      first failure: out[0]: norm x0.9127 (allowed ±6%): a systematic error, not rounding noise
+BUG clipped activations (99.9th percentile)    cap FAIL cos 0.99788 rel 0.1321 elem 1.10 norm 13.04% | redrawn 7/7 fail, max rel 0.1848 elem 1.03 norm 10.97% | x3:FAIL x0.01:FAIL x-1:ok (worst rel 0.4447 elem 0.74 norm 32.19%)
+      first failure: out[0]: an element is 1.1x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0.

@@ -9,7 +9,7 @@
   1. ``fresh_addresses``: the captured inputs, deep-copied to new addresses,
      against the captured outputs and side effects;
   2. ``perturbed_same_addresses``: the floating-point tensors of those same input
-     objects redrawn in place from a normal distribution with each tensor's own
+     objects redrawn in place from a normal distribution with each channel's own
      mean and std, so an output cached by input address, shape or call count no
      longer matches;
   3. ``perturbed_mixed``: a fresh copy redrawn from a random mix of uniform,
@@ -28,29 +28,40 @@
   Perturbed draws are compared with the reference called live on copies of the
   same inputs (outputs, in-place side effects and aliasing), a reduced-precision
   tier with its bounds for redrawn inputs (:data:`kernels.compare.PERTURBED_BOUNDS`:
-  redrawn inputs have no outlier channels; the scaled checks too: a sign flip moves a
-  massive activation to other channels).  The candidate
+  a single token is redrawn without its outlier channels; the scaled checks too: a sign
+  flip moves a massive activation to other channels).  The candidate
   always runs first and its output is copied right away, so it cannot return
   memory that the reference's call just freed.
 
 What is redrawn: every floating-point tensor in the arguments (KV-cache contents
-too), with mean and std taken over its non-zero finite elements (unused cache
-slots are zero).  Integer and boolean tensors (ids, positions, masks), additive
-masks (any value <= -1e4) and tensors with non-finite values are left alone.
+too, every slot), each channel (one position of the last dimension) from its own
+mean and std over its non-zero elements (unused cache slots are zero), a tensor with
+too few rows for that (a single token) from the tensor's (:func:`redraw_stats`, #198).
+Integer and boolean tensors (ids, positions, masks), additive masks (any value <= -1e4),
+tensors with non-finite values and rotary tables (cos / sin of the positions,
+:func:`rotary_tables`) are left alone.
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 import math
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
-from kernel_agent.kernels.compare import compare_side_effects, compare_structures, flatten
+from kernel_agent.kernels.compare import (
+    CHANNEL_MIN_ROWS,
+    compare_side_effects,
+    compare_structures,
+    flatten,
+)
 
 MASKED = -1e4  # additive masks use values at or below this: never redrawn
+#: Rotary tables (:func:`rotary_tables`): ``cos² + sin²`` within this share of its mean.
+ROTARY_TOL = 0.02
 MIX = ("uniform", "laplace", "lognormal")
 #: (check, factor) of the scaled checks: the captured floating-point inputs times the factor.
 SCALED = (("scaled_x3", 3.0), ("scaled_x0.01", 0.01), ("sign_flipped", -1.0))
@@ -128,12 +139,94 @@ def _perturbable(t: torch.Tensor) -> bool:
     return bool(torch.isfinite(values).all()) and float(values.min()) > MASKED
 
 
+def rotary_tables(tensors: list[torch.Tensor]) -> set[int]:
+    """``id`` of the rotary tables among ``tensors`` (in flattening order): two consecutive
+    floating-point tensors of one shape whose squares sum to the same positive value at
+    every element (within :data:`ROTARY_TOL`): the cos and sin of the positions, scaled
+    or not (``(cos, sin)`` of HF's ``position_embeddings``, VoxCPM's ``position_emb``).
+    They are a function of the positions, which stay as captured (integer), so they stay
+    too: drawn independently they are no rotation, and a model whose keys have huge
+    low-frequency channels (Qwen3: ``sin`` ≈ 0 there at every position) gets them leaked
+    into the other channels of the query and key (#198)."""
+    floats = [
+        t
+        for t in tensors
+        if t.is_floating_point() and t.numel() and t.dim() and t.layout == torch.strided
+    ]
+    found: set[int] = set()
+    for a, b in itertools.pairwise(floats):
+        if a.shape != b.shape or a is b:
+            continue
+        x, y = a.detach(), b.detach()
+        row = (0,) * (x.dim() - 1)  # one row first: other pairs fail it at once
+        if _constant_norm(x[row], y[row]) and _constant_norm(x, y):
+            found |= {id(a), id(b)}
+    return found
+
+
+def _constant_norm(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether ``a² + b²`` is the same positive value at every element (:data:`ROTARY_TOL`)."""
+    r = a.float().pow(2) + b.to(a.device).float().pow(2)
+    level = float(r.mean())
+    return level > 0 and float((r - level).abs().max()) <= ROTARY_TOL * level
+
+
+def _global_stats(values: torch.Tensor) -> tuple[float, float]:
+    """Mean and std of the non-zero elements of ``values`` (0 and 1 when there are none;
+    a constant tensor gets a tenth of its magnitude as std)."""
+    nonzero = values[values != 0]
+    if nonzero.numel():
+        mean, std = float(nonzero.mean()), float(nonzero.std(unbiased=False))
+    else:
+        mean, std = 0.0, 1.0
+    return mean, std or abs(mean) * 0.1 or 1.0
+
+
+def redraw_stats(values: torch.Tensor) -> tuple[torch.Tensor | float, torch.Tensor | float]:
+    """The mean and std to redraw ``values`` (float, finite) from: per channel where it
+    has the rows for it, the tensor's own otherwise.
+
+    A channel is one position of the last dimension, its statistics taken over all the
+    other dimensions (as :func:`kernels.compare._channel_rms` defines it) and over its
+    non-zero elements only (unused cache slots are zero); a channel with fewer than
+    :data:`CHANNEL_MIN_ROWS` of them gets the tensor's statistics (every channel of a
+    single token or a short cache). So outlier channels keep their scale: Qwen3-0.6B's
+    K cache after ``k_norm`` (layer 0: channel RMS 225 and 69, the median 1.6), drawn from
+    the tensor's std (21), had every channel 13 times its size, attention logits far wider
+    than real ones, and the reference math of every reduced precision failed most draws
+    (#198)."""
+    mean, std = _global_stats(values)
+    if values.dim() < 2 or values.numel() < CHANNEL_MIN_ROWS * values.shape[-1]:
+        return mean, std
+    dims = tuple(range(values.dim() - 1))
+    used = values != 0
+    count = used.sum(dims, keepdim=True)
+    n = count.clamp_min(1)
+    ch_mean = torch.where(used, values, 0.0).sum(dims, keepdim=True) / n
+    ch_var = torch.where(used, values - ch_mean, 0.0).pow(2).sum(dims, keepdim=True) / n
+    ch_std = ch_var.sqrt()
+    ch_std = torch.where(ch_std > 0, ch_std, ch_mean.abs() * 0.1)
+    few = count < CHANNEL_MIN_ROWS
+    ch_mean = torch.where(few, torch.full_like(ch_mean, mean), ch_mean)
+    ch_std = torch.where(few, torch.full_like(ch_std, std), ch_std)
+    return ch_mean, ch_std
+
+
 def _draw(
-    t: torch.Tensor, kind: str, mean: float, std: float, gen: torch.Generator
+    t: torch.Tensor,
+    kind: str,
+    mean: torch.Tensor | float,
+    std: torch.Tensor | float,
+    gen: torch.Generator,
 ) -> torch.Tensor:
-    """Samples with the given mean and std (``kind`` sets the shape of the distribution),
-    drawn on the generator's device (an argument may live on another one)."""
+    """Samples with the given mean and std (``kind`` sets the shape of the distribution;
+    tensors broadcast against ``t``), drawn on the generator's device (an argument may
+    live on another one)."""
     shape, device = t.shape, gen.device
+    if isinstance(mean, torch.Tensor):
+        mean = mean.to(device)
+    if isinstance(std, torch.Tensor):
+        std = std.to(device)
     if kind == "normal":
         z = torch.randn(shape, generator=gen, device=device)
     elif kind == "uniform":
@@ -153,21 +246,17 @@ def _draw(
 
 def perturb_(value: Any, gen: torch.Generator, kind: str) -> int:
     """Redraw the floating-point tensors inside ``value`` in place (same shape, dtype,
-    strides and storage).  ``kind`` is ``normal`` or ``mix`` (one of :data:`MIX`
-    per tensor).  Returns the number of tensors redrawn."""
+    strides and storage) from their channels' statistics (:func:`redraw_stats`); rotary
+    tables stay (:func:`rotary_tables`).  ``kind`` is ``normal`` or ``mix`` (one of
+    :data:`MIX` per tensor).  Returns the number of tensors redrawn."""
     done = 0
+    tensors = [t for t in flatten(value).values() if isinstance(t, torch.Tensor)]
+    rotary = rotary_tables(tensors)
     with torch.inference_mode():
-        for t in flatten(value).values():
-            if not isinstance(t, torch.Tensor) or not _perturbable(t):
+        for t in tensors:
+            if id(t) in rotary or not _perturbable(t):
                 continue
-            values = t.detach().float()
-            nonzero = values[values != 0]
-            if nonzero.numel():
-                mean, std = float(nonzero.mean()), float(nonzero.std(unbiased=False))
-            else:
-                mean, std = 0.0, 1.0
-            if std == 0:
-                std = abs(mean) * 0.1 or 1.0
+            mean, std = redraw_stats(t.detach().float())
             shape = kind
             if kind == "mix":
                 pick = int(torch.randint(len(MIX), (1,), generator=gen, device=gen.device))
@@ -179,8 +268,10 @@ def perturb_(value: Any, gen: torch.Generator, kind: str) -> int:
 
 def scale_(value: Any, factor: float) -> int:
     """Multiply the floating-point tensors inside ``value`` by ``factor`` in place (the
-    tensors :func:`perturb_` would redraw: no additive masks, no non-finite tensors).
-    Returns the number of tensors scaled."""
+    tensors :func:`perturb_` would redraw, and rotary tables too: the scaled checks scale
+    the whole call's inputs, as calibrated in #175; with them kept the x 0.01 inputs of the
+    VoxCPM2 LocDiT layer move honest MXFP8's output norm by 6.8 %. No additive masks, no
+    non-finite tensors). Returns the number of tensors scaled."""
     done = 0
     with torch.inference_mode():
         for t in flatten(value).values():

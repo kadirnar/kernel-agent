@@ -144,12 +144,14 @@ same time.
   and side effects must match a fresh reference call
   (`incorrect_timed_output`). After timing, every case is re-run at fresh
   addresses (against the capture), then with its floating-point inputs redrawn
-  in place (same addresses, a normal draw from each tensor's own mean and std,
-  KV-cache contents included) and from a random mix of uniform, Laplace and
+  in place (same addresses, a normal draw from each channel's own mean and std,
+  KV-cache contents and unused slots included; a single token from the tensor's)
+  and from a random mix of uniform, Laplace and
   log-normal draws, each compared with the reference called live on the same
   inputs (`incorrect_perturbed`; a near-lossless tier uses its bounds for
   redrawn inputs, "Quality modes"). Integer and boolean tensors (ids, positions,
-  masks) and additive masks are kept. So a candidate must recompute every call
+  masks), additive masks and rotary tables (the cos / sin of the positions) are
+  kept. So a candidate must recompute every call
   for any input of the captured shapes: outputs cached by address, shape or
   call count, skipped work and reads of unused cache slots are rejected.
   Correctness-only cases are re-verified too. The result names the failed
@@ -382,7 +384,11 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   below). Other targets keep the exact tier.
 * **Redrawn inputs.** The evaluator's perturbed-input and timed-output checks
   and the integration's re-check compare a candidate with the reference on
-  inputs redrawn from each tensor's own mean and std. Those have no outlier
+  redrawn inputs: each channel (a position of the last dimension) from its own
+  mean and std over the other dimensions, so outlier channels such as a KV
+  cache's keep their scale (#198); a tensor with fewer than 16 rows (a single
+  decode token) from the tensor's mean and std; rotary tables (the cos / sin of
+  the positions) as captured. A single token then has no outlier
   channels, so a weight row that writes a massive activation carries its many
   times larger rounding error into a channel whose values now spread around
   zero (calibration below). There the tiers use their own bounds
@@ -531,19 +537,57 @@ So the relaxed mode lets FP4 weights on every layer of VoxCPM2 through end to
 end (with `--precisions ...,fp4_weights`: 4-bit stays opt-in), where
 near-lossless needed the LocDiT kept in FP8.
 
-Found while calibrating (both modes, not changed here): on the Qwen3-0.6B
-decoder layer at decode the redrawn-input check fails the reference math of
-every reduced precision on most draws (FP8 weights 70 of 80 in
-near-lossless, 54 in relaxed). It redraws the KV cache from the mean and std of
-the whole cache, and Qwen3's K cache (after its k_norm) has two channels far
-larger than the rest (layer 0: channel RMS 225 and 69, median 1.6, so the
-global std is 21): redrawn, every channel is 13 times its usual size, the
-attention logits spread widely and one FP8 rounding step moves the softmax's
-argmax (redrawing the cache per channel instead: 1 of 18 draws fail in
-relaxed, 9 in near-lossless).
-Exact-tier kernels are unaffected; FP8 kernels for whole Qwen3 attention or
-decoder layers are rejected there until the redraw keeps the cache's channel
-scales.
+**Per-channel redraw** (#198, `docs/research-scripts/per-channel-198/`:
+`calibrate_redraw.py` runs the calibration above with the old and the new redraw
+on the same seeds, `results.md`). The redrawn-input check used to draw every
+tensor from its global mean and std, rotary tables too. Qwen3-0.6B's K cache
+(after its k_norm) has two channels far larger than the rest (layer 0: channel
+RMS 225 and 69, median 1.6, so the global std is 21): redrawn, every channel was
+13 times its usual size, the attention logits spread widely and one FP8 rounding
+step moved the softmax's argmax, so the reference math of every reduced precision
+failed most draws of the Qwen3 decoder layer at decode, in both modes. Now each
+channel is drawn from its own mean and std over the other dimensions (a single
+token or a short cache still from the tensor's), and RoPE's cos / sin tables stay
+as captured, like the integer positions they come from: drawn independently they
+are no rotation, and the redrawn sin leaked the huge low-frequency K channels into
+the query (per-channel statistics alone left FP8 weights failing 50 and 3 of 80
+draws). The bounds are unchanged. Failed redrawn draws, near-lossless · relaxed,
+before → after:
+
+| numerics | Qwen3 decoder layer, decode (80 draws) | VoxCPM2 LocDiT layer (40) | VoxCPM2 base-LM decode layer (60) |
+|---|---|---|---|
+| FP8 weights | 70 · 54 → **4 · 0** | 0 · 0 → 0 · 0 | 0 · 0 → 0 · 0 |
+| FP8 W8A8 | 74 · 66 → 65 · **0** | 0 · 0 → 0 · 0 | 0 · 0 → 0 · 0 |
+| MXFP8 | 75 · 70 → 65 · **1** | 0 · 0 → 0 · 0 | 5 · 0 → 11 · 0 |
+| NVFP4 weights (FP4 tiers) | 71 · 59 → **0 · 0** | 0 · 0 → 0 · 0 | 0 · 0 → 0 · 0 |
+| MXFP4 weights (FP4 tiers) | 77 · 68 → **6 · 0** | 0 · 0 → 0 · 0 | 0 · 0 → 0 · 0 |
+| INT8 weights | 27 · 2 → **0 · 0** | 0 · 0 → 0 · 0 | 0 · 0 → 0 · 0 |
+| INT8 W8A8 | 64 · 38 → **4 · 0** | 0 · 0 → 0 · 0 | 1 · 0 → 2 · 0 |
+
+So in relaxed mode (the default) FP8-weight, INT8 and FP4 kernels of a whole Qwen3
+decoder layer pass the redraws; FP8 W8A8 and MXFP8 at decode (not decode
+precisions: `fp8_weights` is) still fail near-lossless's. The `fp8_kv` decode attention
+(synthetic, 192 draws) goes from 0 · 0 to 5 · 0 (norm 3.7-4.0 % against
+near-lossless's 3 %, from at most 2.9 %). The scaled checks do not redraw and
+are unchanged: on the Qwen3 layer x 0.01 leaves the grown V cache's 512 old rows
+tiny next to the new one (computed from normalised activations, so not scaled),
+and the element bound's RMS over the whole cache is far below the new row's, so
+FP8 weights fail 3 of 12 scaled checks in near-lossless (0 in relaxed, element
+ratio 0.97) and FP4 4 of 12 in both modes. Every broken variant is still
+rejected on every capture where it was before (activation scales cached from the
+first call: on all 40 LocDiT draws in both modes, from 37 and 14), except FP4
+weights with an unwritten output row on the LocDiT layer, which only the global
+redraw caught (23 of 40 near-lossless draws, 6 relaxed): realistic draws keep it
+within FP4's noise, as the captured inputs do. #178's INT8 calibration
+(`calib_int8.py`, `int8/`) gives the same verdicts: the INT8 recipes pass as before,
+the INT8 bugs fail more LocDiT redraws (a per-tensor activation scale 7 of 7, from 0),
+the Qwen3 MLP's single decode token is drawn as before; SmoothQuant: "INT8 W8A8" below.
+`tests/test_redraw_per_channel.py`
+checks a synthetic Qwen3-like decode step with such a cache on the CPU (the old
+redraw failed FP8 weights on 27 of 60 near-lossless draws, the new one on none;
+broken scales, an unwritten row, a skipped KV head, swapped heads and cached
+activation scales are rejected in both modes) and the real layer 0 on the GPU
+(11 of 20 relaxed draws before, none now).
 
 **Allowed precisions** (`--precisions`, `kernel_agent/precisions.py`). A run lists
 the target precisions it allows; `exact` is always one of them. `--quality exact`
@@ -1065,7 +1109,7 @@ near-lossless tier.
 | VoxCPM2 LocDiT layer (352) | INT8 weights | 0.0054 | 0.99999 | 0.07 % | 0 / 30 | pass |
 | VoxCPM2 LocDiT layer (352) | INT8 W8A8 | 0.0229 | 0.99984 | **2.10 %** (fails) | 0 / 30 | x 0.01 fails (norm 4.0 %) |
 | VoxCPM2 LocDiT layer (352) | INT8 W8A8 + SmoothQuant alpha 0.4 | 0.0082 | 0.99997 | 0.24 % | 0 / 60 | pass |
-| VoxCPM2 LocDiT layer (352) | INT8 W8A8 + SmoothQuant alpha 0.5 / 0.6 / 0.7 | 0.008-0.010 | 0.99997 | < 1 % | 1 / 10 / 60 of 60 | x 0.01 fails from 0.6 |
+| VoxCPM2 LocDiT layer (352) | INT8 W8A8 + SmoothQuant alpha 0.5 / 0.6 / 0.7 | 0.008-0.010 | 0.99997 | < 1 % | 1 / 10 / 60 of 60 (per-channel redraw, #198: 0 / 0 / 0 of 30) | x 0.01 fails from 0.6 |
 | VoxCPM2 LocDiT layer (352) | FP8 W8A8 / FP8 weights | 0.0204 / 0.0151 | 0.99979 | 0.21 % | 0 / 30 | pass |
 | VoxCPM2 base-LM decode layer (1, KV cache; 3 steps) | INT8 W8A8 / INT8 weights | <= 0.0070 / 0.0020 | 0.99998 | 0.02 % | 0 / 36 | pass |
 | Qwen3-0.6B MLP, decode (1) | INT8 W8A8 / INT8 weights | 0.060 / 0.014 | 0.99823 | 0.86 % | 0 / 24 | pass |
@@ -1084,8 +1128,9 @@ activations without outlier channels (the LocDiT's q / k / v / o projections, cr
 crest 29-49): int8's uniform step flushes the bulk's small values to zero, a biased loss
 (gate / up_proj 0.059 vs FP8's 0.019; down_proj norm -2.0 %). SmoothQuant with alpha ~0.4
 passes everything; a larger alpha, or factors from a single decode token, fits the captured
-outliers and fails the redrawn check, which judges static factors as it judges static
-scales. Broken INT8 kernels fail: weight scales x 1.05, a neighbour channel's scale, the
+outliers and fails the x 0.01 or the redrawn check, which judge static factors as they judge
+static scales (since the per-channel redraw of #198 keeps the outlier channels, alpha 0.6 /
+0.7 fail the LocDiT layer's x 0.01 check only; `docs/research-scripts/per-channel-198/int8`). Broken INT8 kernels fail: weight scales x 1.05, a neighbour channel's scale, the
 first token's scale, a zeroed output channel, a static calibrated activation scale,
 activations clipped at their 99.9th percentile, and a per-tensor activation scale (passes
 the captured LocDiT inputs at 0.041, fails the x 0.01 check). The CPU calibration test
@@ -1543,10 +1588,11 @@ repeats the evaluator's verdict from scratch, sharing nothing with the evaluatio
 
 1. A **reference process**, which never imports a candidate, draws `--seeds` fresh
    inputs per captured case with the captured shapes, dtypes, strides and
-   aliasing. Floating-point tensors are redrawn from each tensor's own mean and
+   aliasing. Floating-point tensors are redrawn from each channel's own mean and
    std (normal for the first seed, uniform / Laplace / log-normal for the
-   others). Integer and boolean tensors (ids, positions, masks), additive masks
-   and mutable state objects such as KV caches stay as captured. It computes the
+   others; "Quality modes", #198). Integer and boolean tensors (ids, positions,
+   masks), additive masks, rotary tables and mutable state objects such as KV
+   caches stay as captured. It computes the
    reference outputs and post-call state on them and times the reference on
    the timed cases.
 2. The parent keeps those expected results in memory and deletes them from disk.
