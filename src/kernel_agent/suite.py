@@ -361,9 +361,8 @@ def prepare_all(
             }
         finally:
             _free_gpu()
-    data = run.load()
-    data.setdefault("phases", {})["capture"] = {"done": True, "by": "bench-suite"}
-    write_json(run.run_json, data)
+    done = {"done": True, "by": "bench-suite"}
+    run.update(lambda data: data.setdefault("phases", {}).__setitem__("capture", done))
     return failed
 
 

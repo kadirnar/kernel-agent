@@ -46,6 +46,7 @@ from kernel_agent import (
 from kernel_agent.agent import auth, prompts, web
 from kernel_agent.agent.runner import READ_TOOLS, AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import (
+    SessionBinding,
     best_for_target,
     build_server,
     current_records,
@@ -69,7 +70,7 @@ from kernel_agent.worker import call_worker
 from kernel_agent.workloads import validate_metric
 from kernel_agent.workloads.base import WorkloadSpec
 from kernel_agent.workloads.quality import probe_messages
-from kernel_agent.workspace import RunDir, read_json, write_json
+from kernel_agent.workspace import RunDir, coordinator_lock, read_json, write_json
 
 PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"]
 #: The dossier session (``Orchestrator.dossier``): cheap, so it delays a target's first
@@ -97,7 +98,9 @@ class Orchestrator:
         self.tc = toolchain.setup()
         self.budget = Budget.from_config(run, cfg)
         self.truth = truth.of(run)  # digests of the evaluator's ground truth (truth.py)
-        self.server = build_server(run, self.budget, self.truth)
+        # The running agent sessions by agent name (unique among running sessions): what the
+        # tools of each are bound to (its own MCP server, :meth:`_agent`).
+        self.bindings: dict[str, SessionBinding] = {}
         self.env = agent_env(self.tc.env, cfg.auth)  # --auth subscription: no API key vars
         self.python = sys.executable
         self.agent_results: list[AgentResult] = []
@@ -192,8 +195,8 @@ class Orchestrator:
             if problem := precisions.check(quality, wanted):
                 raise SystemExit(problem)
             cap = getattr(getattr(toolchain.setup(), "gpu", None), "capability", None)  # #165
-            data["config"]["precisions"] = list(precisions.allowed(quality, wanted, cap))
-            write_json(run.run_json, data)
+            chosen = data["config"]["precisions"] = list(precisions.allowed(quality, wanted, cap))
+            run.update(lambda d: d["config"].__setitem__("precisions", chosen))
             log(f"precisions: {precisions.describe(data['config']['precisions'])} (run.json)")
         cfg = OptimizeConfig.from_dict({**data["config"], **overrides})
         if "dry_run" not in data:  # simulated runs have no agents
@@ -207,10 +210,20 @@ class Orchestrator:
         return bool(self.run.load().get("phases", {}).get(name, {}).get("done"))
 
     def _mark(self, name: str, **info: Any) -> None:
-        data = self.run.load()
-        phase = data.setdefault("phases", {}).setdefault(name, {})  # keep budget notes
-        phase.update(done=True, at=time.strftime("%H:%M:%S"), **info)
-        write_json(self.run.run_json, data)
+        done = {"done": True, "at": time.strftime("%H:%M:%S"), **info}
+
+        def mark(data: dict[str, Any]) -> None:  # keep budget notes
+            data.setdefault("phases", {}).setdefault(name, {}).update(done)
+
+        self.run.update(mark)  # under run.json's lock (workspace.update_json): threads write it
+
+    def _phase_list(self, phase: str, key: str, item: str) -> None:
+        """Append ``item`` to ``run.json`` ``phases[phase][key]`` (under the file's lock)."""
+
+        def add(data: dict[str, Any]) -> None:
+            data.setdefault("phases", {}).setdefault(phase, {}).setdefault(key, []).append(item)
+
+        self.run.update(add)
 
     def allowed_precisions(self) -> tuple[str, ...]:
         """The target precisions this run allows (``--precisions``, ``precisions.py``) on
@@ -269,11 +282,15 @@ class Orchestrator:
     ) -> AgentResult:
         """Run an agent session; ``label`` keys its ``costs.json`` entry (default: ``name``),
         ``config`` overrides fields of the run's config for this session (e.g. the model),
-        ``mcp_server`` (in ``kwargs``) replaces the run's tools (a worker's, ``workers.py``).
+        ``binding`` (in ``kwargs``, a :class:`~kernel_agent.agent.tools.SessionBinding`) is
+        what the session's own tools are bound to (its target, worker, evaluation budget;
+        labelled ``label``): every session gets its own MCP server (``build_server``).
         A session stopped at a usage limit is resumed once the limit resets
         (:meth:`_wait_for_limit`). A run that is stopping (Ctrl-C) starts none."""
         interrupt.check()
-        server = kwargs.pop("mcp_server", None) or self.server
+        binding = kwargs.pop("binding", None) or SessionBinding()
+        binding = dataclasses.replace(binding, label=label or name)
+        server = build_server(self.run, self.budget, self.truth, binding)
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
         ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)
@@ -299,6 +316,7 @@ class Orchestrator:
         )
         while True:
             timer = asyncio.timeout(timeout)
+            self.bindings[name] = binding
             try:
                 async with timer, clock.running(timer):
                     result = await (self.agent_runner or run_agent)(
@@ -324,6 +342,7 @@ class Orchestrator:
                 raise
             finally:
                 self.budget.end_agent(name)
+                self.bindings.pop(name, None)
             if result.usage_limit is None or result.timed_out:
                 break
             if not await self._wait_for_limit(name, result, waits):
@@ -394,11 +413,13 @@ class Orchestrator:
 
     async def analyze(self) -> None:
         log("analyze: loading model, measuring baseline, profiling")
-        result = call_worker(self.run, "analyze", "--iters", "3")
+        # GPU worker calls run off the event loop (as every one in a coroutine): other
+        # sessions and their tools keep going meanwhile
+        result = await asyncio.to_thread(call_worker, self.run, "analyze", "--iters", "3")
         if "error" in result and self.cfg.allow_harness_agent:
             log("analyze: built-in workload failed; asking Claude to write a harness")
             await self.write_harness(result["error"])
-            result = call_worker(self.run, "analyze", "--iters", "3")
+            result = await asyncio.to_thread(call_worker, self.run, "analyze", "--iters", "3")
         if "error" in result:
             raise SystemExit(f"analyze failed:\n{result['error']}")
         log(
@@ -428,9 +449,8 @@ class Orchestrator:
         )
         if not self.run.harness.exists():
             raise SystemExit("harness agent did not produce harness.py")
-        data = self.run.load()
-        data["workload"]["harness"] = str(self.run.harness)
-        write_json(self.run.run_json, data)
+        harness = str(self.run.harness)
+        self.run.update(lambda data: data["workload"].__setitem__("harness", harness))
 
     async def plan(self) -> None:
         data = self.run.load()
@@ -499,8 +519,9 @@ class Orchestrator:
         self._mark("capture", targets=await self.capture_targets(plan.get("targets", [])))
 
     async def capture_targets(self, targets: list[dict[str, Any]]) -> list[str]:
-        """:meth:`_capture`, then the refactor step of the region targets; returns the ids."""
-        kept = self._capture(targets)
+        """:meth:`_capture`, then the refactor step of the region targets; returns the ids.
+        The captures (GPU worker processes) run in a thread: not on the event loop."""
+        kept = await asyncio.to_thread(self._capture, targets)
         for t in targets:
             if region.is_region(t) and t["id"] in kept and not await self.refactor(t["id"]):
                 kept.remove(t["id"])
@@ -577,7 +598,7 @@ class Orchestrator:
         if result.get("verified"):
             how = "bitwise" if result.get("bitwise") else "within one ulp"
             log(f"refactor: {target_id}: rewrite verified ({how}); capture {spec['module_class']}")
-            info = self._worker("capture", "--target", target_id)
+            info = await asyncio.to_thread(self._worker, "capture", "--target", target_id)
             if "error" not in info:
                 self.truth.seal(self.run.capture_file(target_id))
                 cases = [(c["signature"], c["count"]) for c in info["cases"]]
@@ -641,6 +662,11 @@ class Orchestrator:
                             "evaluate_candidate", "sweep_candidate", "best_result"
                         ),
                         add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+                        binding=SessionBinding(
+                            role="kernel",
+                            target_id=target_id,
+                            evaluations=self.cfg.evaluations_per_target,
+                        ),
                     )
             if team:  # every worker session takes its own --parallel slot
                 await self._kernel_workers(target_id, team, sem)
@@ -649,10 +675,7 @@ class Orchestrator:
                 f"kernels: {target_id} best = "
                 + (f"{best['speedup']}x ({best['snapshot']})" if best else "none correct")
             )
-            data = self.run.load()
-            fin = data.setdefault("phases", {}).setdefault("kernels", {}).setdefault("finished", [])
-            fin.append(target_id)
-            write_json(self.run.run_json, data)
+            self._phase_list("kernels", "finished", target_id)
 
         await asyncio.gather(*(one(t) for t in pending))
         self._mark("kernels")  # `finished` lists the targets whose agent ran
@@ -688,6 +711,7 @@ class Orchestrator:
             cwd=self.run.transforms_dir,
             mcp_tools=tool_names("evaluate_e2e", "run_info"),
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
+            binding=SessionBinding(role="systems", evaluations=self.cfg.transform_evaluations),
         )
         self._mark("transforms")
 
@@ -741,7 +765,6 @@ class Orchestrator:
             + self._library_note(target_id, spec)
             + workers.prompt_note(target_id, seed, team)
         )
-        binding = workers.Binding(target_id, seed.worker, name, seed.evaluations)
         return await self._agent(
             name,
             label,
@@ -750,7 +773,13 @@ class Orchestrator:
             cwd=cwd,
             mcp_tools=tool_names("evaluate_candidate", "sweep_candidate", "best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
-            mcp_server=build_server(self.run, self.budget, self.truth, binding),
+            binding=SessionBinding(
+                role="kernel",
+                target_id=target_id,
+                worker=seed.worker,
+                agent=name,
+                evaluations=seed.evaluations,
+            ),
         )
 
     async def _kernel_workers(
@@ -780,10 +809,7 @@ class Orchestrator:
                     "`# Worker` section). Start by reading reference_source.py and spec.json, "
                     "then write and evaluate candidates in your candidates/.",
                 )
-            data = self.run.load()
-            kernels = data.setdefault("phases", {}).setdefault("kernels", {})
-            kernels.setdefault("workers", []).append(key)
-            write_json(self.run.run_json, data)
+            self._phase_list("kernels", "workers", key)
 
         await asyncio.gather(*(job(s, team, f"{target_id}/w{s.worker}") for s in team))
         _, second = workers.rounds(self.cfg.evaluations_per_target, self.cfg.reseed_workers)
@@ -842,6 +868,12 @@ class Orchestrator:
         return winners
 
     async def integrate(self, reuse: bool = False) -> None:
+        """:meth:`_integrate_sync` in a thread: its A/B steps (GPU worker processes, minutes
+        each, up to hours in all) do not hold the event loop, so other agent sessions and
+        their tools keep going meanwhile."""
+        await asyncio.to_thread(self._integrate_sync, reuse)
+
+    def _integrate_sync(self, reuse: bool = False) -> None:
         """Measure every candidate alone, then grow the best combination greedily.
 
         Ordering by *measured* end-to-end gain (not module-level estimates)
@@ -1864,7 +1896,6 @@ class Orchestrator:
         target_dir = self.run.target(target_id)
         spec = read_json(target_dir / "spec.json")
         (target_dir / "NOTES.md").touch()
-        self.budget.kernel_evals = evaluations  # evaluation advice says `stop` after these
         system = prompts.engineer_prompt(
             spec,
             spec.get("capture", {}),
@@ -1886,13 +1917,14 @@ class Orchestrator:
             cwd=target_dir,
             mcp_tools=tool_names("evaluate_candidate", "sweep_candidate", "best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
+            # evaluation advice says `stop` after these
+            binding=SessionBinding(role="kernel", target_id=target_id, evaluations=evaluations),
         )
 
     async def systems_slice(self, *, evaluations: int, digest: str, label: str) -> AgentResult:
         """A fresh systems-engineer session seeded with ``digest``."""
         plan = read_json(self.run.plan_json, {})
         self.run.transforms_dir.mkdir(parents=True, exist_ok=True)
-        self.budget.transform_evals = evaluations
         system = prompts.systems_prompt(
             self.run.load()["card"],
             read_json(self.run.baseline_json, {}),
@@ -1914,6 +1946,7 @@ class Orchestrator:
             cwd=self.run.transforms_dir,
             mcp_tools=tool_names("evaluate_e2e", "run_info"),
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
+            binding=SessionBinding(role="systems", evaluations=evaluations),
         )
 
     #: A native session gets this many times the turns of the others (and, without
@@ -1936,7 +1969,6 @@ class Orchestrator:
         cwd = native_engine.native_dir(self.run)
         cwd.mkdir(parents=True, exist_ok=True)
         (cwd / "NOTES.md").touch()
-        self.budget.transform_evals = evaluations
         if (minutes := self.native_minutes()) is not None:
             self.budget.minutes_by_agent["native"] = minutes
         why = native_engine.enabled(self.cfg.native, native_engine.plan_entry(self.run))
@@ -1951,9 +1983,6 @@ class Orchestrator:
             why=f"{why or 'opened by the scheduler'}; every module arm has plateaued",
             blocks=blocks,
         ) + prompts.precision_note(self.cfg.quality, self.allowed_precisions())
-        server = build_server(
-            self.run, self.budget, self.truth, agent="native", evaluations=evaluations, cwd=cwd
-        )
         return await self._agent(
             "native",
             label,
@@ -1968,7 +1997,7 @@ class Orchestrator:
                 "evaluate_candidate", "sweep_candidate", "best_result", "evaluate_e2e", "run_info"
             ),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR, prompts.WORKLOADS_DIR],
-            mcp_server=server,
+            binding=SessionBinding(role="native", agent="native", evaluations=evaluations, cwd=cwd),
         )
 
     async def research(
@@ -2539,4 +2568,5 @@ def _extract_json(text: str) -> Any:
 
 async def optimize(cfg: OptimizeConfig, until: str | None = None) -> RunDir:
     orch = Orchestrator.create(cfg)
-    return await orch.run_all(until=until)
+    with coordinator_lock(orch.run):  # one process per run (workspace.coordinator_lock)
+        return await orch.run_all(until=until)

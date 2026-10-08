@@ -78,7 +78,7 @@ from kernel_agent.scheduler import (
     slice_seconds,
     snapshot_record,
 )
-from kernel_agent.workspace import RunDir, read_json, write_json
+from kernel_agent.workspace import RunDir, coordinator_lock, read_json, write_json
 
 if TYPE_CHECKING:
     from kernel_agent.agent.runner import AgentResult
@@ -732,7 +732,6 @@ class Improver:
         if hint := projection.recapture_hint(self.run):  # estimates of a capture before #119
             log(f"improve: {hint}")
         self.orch.phase = "improve"
-        self.orch.budget.kernel_evals = self.orch.budget.transform_evals = self.icfg.slice
         self.state["config"] = self.icfg.to_dict()
         self.state.pop("finished", None)
         self.save()
@@ -1640,6 +1639,8 @@ async def improve(
 
     path = Path(ref).expanduser()
     if (path / "run.json").exists():
+        with coordinator_lock(RunDir(path.resolve())):  # another process on it: refused now
+            pass
         marked = bool(RunDir(path.resolve()).load().get("dry_run"))
         if marked != dry_run:
             raise SystemExit(
@@ -1678,7 +1679,11 @@ async def improve(
         orch.budget.max_usd = orch.budget.spent_usd() + cfg.max_usd
     log(f"run directory: {orch.run.root}")
     world = dryrun.World(orch) if dry_run else None
-    with _interrupt_note(orch.run), world.installed() if world else nullcontext():
+    with (
+        coordinator_lock(orch.run),  # one process per run: its truth is in our memory
+        _interrupt_note(orch.run),
+        world.installed() if world else nullcontext(),
+    ):
         if not all(orch._phase_done(p) for p in ("analyze", "plan", "capture")):
             await orch.run_all(until="capture")
         await Improver(orch, icfg, require_capture=not dry_run, live_charts=not dry_run).improve()

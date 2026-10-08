@@ -31,8 +31,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from kernel_agent.workspace import RunDir, write_json
+from kernel_agent.workspace import RunDir
 
 ROLES = ("planner", "kernel", "systems", "native", "harness", "research", "refactor")
 SECTIONS = ("all", *ROLES)
@@ -142,13 +143,16 @@ def install(run: RunDir, source: str | Path | None = None) -> Path:
     if not src.is_file():
         raise SystemExit(f"program file not found: {source}")
     shutil.copyfile(src, dst)
-    data["program"] = {
+    record = {
         "source": DEFAULT_SOURCE if source is None else str(src),
         "installed": time.strftime("%Y-%m-%d %H:%M:%S"),
         "sha256": Program.load(dst).sha256,
-        "versions": data.get("program", {}).get("versions", []),
     }
-    write_json(run.run_json, data)
+
+    def put(data: dict[str, Any]) -> None:
+        data["program"] = {**record, "versions": data.get("program", {}).get("versions", [])}
+
+    run.update(put)
     return dst
 
 
@@ -161,14 +165,22 @@ def for_agent(run: RunDir, agent: str, log: Callable[[str], None] = print) -> Pr
     """
     path = run.root / FILENAME
     program = Program.load(path)
-    data = run.load()
-    record = data.setdefault("program", {"source": None, "sha256": None, "versions": []})
-    versions = record.setdefault("versions", [])
-    previous = versions[-1]["sha256"] if versions else record.get("sha256")
-    if versions and previous == program.sha256:
+    seen: dict[str, Any] = {}
+
+    def note(data: dict[str, Any]) -> None:  # under run.json's lock (workspace.update_json)
+        record = data.setdefault("program", {"source": None, "sha256": None, "versions": []})
+        versions = record.setdefault("versions", [])
+        seen["previous"] = versions[-1]["sha256"] if versions else record.get("sha256")
+        if versions and seen["previous"] == program.sha256:
+            return
+        at = time.strftime("%H:%M:%S")
+        versions.append({"sha256": program.sha256, "agent": agent, "at": at})
+        seen["new"] = True
+
+    run.update(note)
+    if not seen.get("new"):
         return program
-    versions.append({"sha256": program.sha256, "agent": agent, "at": time.strftime("%H:%M:%S")})
-    write_json(run.run_json, data)
+    previous = seen["previous"]
     if program.sha256 is None:
         log(f"program: {path} is missing; agents get no program.md instructions")
         return program

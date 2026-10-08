@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Any
 
 from kernel_agent import ledger, pivot, program, truth, workers
 from kernel_agent.agent.runner import AgentResult
-from kernel_agent.agent.tools import record_candidate, record_e2e_result, snapshot
+from kernel_agent.agent.tools import SessionBinding, record_candidate, record_e2e_result, snapshot
 from kernel_agent.budget import Budget
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.kernels.roofline import sol_signal
@@ -460,19 +460,22 @@ class World:
         start = self.clock.now()
         rng = _rng(self.seed, "session", name, len(ledger.rows(self.run)))
         self.clock.advance(rng.uniform(40, 90))  # reading the digest and the files
+        # what the session's tools are bound to (Orchestrator._agent): its evaluation budget
+        # and the label its rows carry
+        bound = self.orch.bindings.get(name)
         evals = 0
         if name == "planner":
             result.structured = self._plan(Path(cwd))
             result.cost_usd = 0.4
         elif name == "systems":
-            evals = self._systems()
+            evals = self._systems(bound)
             result.cost_usd = 0.3 + 0.5 * evals * rng.uniform(0.8, 1.2)
         elif name == "native":
-            evals = self._native()
+            evals = self._native(bound)
             result.cost_usd = 0.8 + 1.2 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("kernel-"):
             target_id, worker = workers.parse_agent(name)
-            evals = self._kernel(target_id, system_append, worker=worker)
+            evals = self._kernel(target_id, system_append, worker=worker, bound=bound)
             result.cost_usd = 0.25 + 0.35 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("research-"):
             self._research(name.removeprefix("research-"), writable or [])
@@ -505,13 +508,19 @@ class World:
             return True
         return advice == "consider_stopping" and rng.random() < 0.5
 
-    def _kernel(self, target_id: str, system: str = "", worker: int | None = None) -> int:
+    def _kernel(
+        self,
+        target_id: str,
+        system: str = "",
+        worker: int | None = None,
+        bound: SessionBinding | None = None,
+    ) -> int:
         from kernel_agent.kernels.compare import tier_of
 
         target_dir = self.run.target(target_id)
         home = workers.directory(self.run, target_id, worker) if worker else target_dir
         agent = workers.agent_name(target_id, worker) if worker else f"kernel-{target_id}"
-        budget = re.search(r"budget in this session: (\d+) evaluations", system)
+        bound = bound or SessionBinding(evaluations=self.orch.cfg.evaluations_per_target)
         spec = read_json(target_dir / "spec.json", {}) or {}
         sim = sim_target(spec)
         ref_ms = self.ref_ms(sim.cls) or 10.0
@@ -550,14 +559,14 @@ class World:
                 idea=idea,
                 expected_speedup=round(expected, 2),
                 worker=worker,
+                session=bound.label or None,
             )
             used += 1
             _note(home / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
             if self.hook:
                 self.hook(agent, used)
             results = self.run.results_file(target_id)
-            evals = int(budget[1]) if budget else self.orch.budget.kernel_evals
-            if self._advice(agent, results, evals, rng, sol_signal(result)):
+            if self._advice(agent, results, bound.evaluations, rng, sol_signal(result)):
                 return used
 
     @staticmethod
@@ -570,7 +579,8 @@ class World:
             return best + gap * rng.uniform(0.2, 0.6)
         return best * rng.uniform(0.84, 1.006)
 
-    def _systems(self) -> int:
+    def _systems(self, bound: SessionBinding | None = None) -> int:
+        bound = bound or SessionBinding(evaluations=self.orch.cfg.transform_evaluations)
         used = 0
         while True:
             rows = systems_rows(ledger.rows(self.run))
@@ -606,20 +616,22 @@ class World:
                 hypothesis=hypothesis,
                 eval_s=round(rng.uniform(60, 110), 1),
                 when=self.clock.now(),
+                session=bound.label or None,
             )
             used += 1
             _note(self.run.transforms_dir / "NOTES.md", row, SYSTEM_TWEAKS[k % 3 :][:2])
             if self.hook:
                 self.hook("systems", used)
             results = self.run.results_file()
-            if self._advice("systems", results, self.orch.budget.transform_evals, rng):
+            if self._advice("systems", results, bound.evaluations, rng):
                 return used
 
-    def _native(self) -> int:
+    def _native(self, bound: SessionBinding | None = None) -> int:
         """A simulated systems-native session: per evaluation a multi-file project of the
         current stage (once the plan is done: its focus; ``loop`` without either),
         snapshotted as its bundle like a real one, measured end to end around the
         module-level bar."""
+        bound = bound or SessionBinding(evaluations=self.orch.cfg.transform_evaluations)
         used = 0
         while True:
             rows = ledger.rows(self.run)
@@ -651,12 +663,13 @@ class World:
                 hypothesis=hypothesis,
                 eval_s=round(rng.uniform(200, 400), 1),
                 when=self.clock.now(),
+                session=bound.label or None,
             )
             used += 1
             if self.hook:
                 self.hook("native", used)
             results = self.run.results_file()
-            if self._advice("native", results, self.orch.budget.transform_evals, rng):
+            if self._advice("native", results, bound.evaluations, rng):
                 return used
 
     def _research(self, target_id: str, writable: list[Path]) -> None:

@@ -14,6 +14,8 @@
   each agent's ``max_budget_usd`` is lowered to the USD that is left.
 * The evaluation tools append :meth:`Budget.feedback` to every result: the
   budget left and an ``advice`` (``continue`` / ``consider_stopping`` / ``stop``).
+  The evaluation budget is the session's own (``agent.tools.SessionBinding``: each
+  session's tools are bound to it), never a run-wide setting another session changes.
   A kernel evaluation within ``100 - SOL_STOP_PCT`` % of its recipe's roofline
   (weighted ``pct_of_sol``, :mod:`kernel_agent.kernels.roofline`) also means ``stop``:
   move on to another recipe (issue #166: a bound of the recipe, not of the model).
@@ -35,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent.config import OptimizeConfig
-from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl, write_json
+from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
 
 PLATEAU = 4  # this many non-improving evaluations in a row -> "consider_stopping"
 MIN_GAIN = 0.01  # an improvement beats the best by more than max(1 %, 2 x timing spread)
@@ -148,9 +150,11 @@ def results_streak(results: Path, *, ok_key: str = "correct") -> int:
 
 def note(run: RunDir, phase: str, key: str, item: dict[str, Any]) -> None:
     """Append ``item`` to ``run.json`` ``phases[phase][key]`` (and ``events.jsonl`` if present)."""
-    data = run.load()
-    data.setdefault("phases", {}).setdefault(phase, {}).setdefault(key, []).append(item)
-    write_json(run.run_json, data)
+
+    def add(data: dict[str, Any]) -> None:
+        data.setdefault("phases", {}).setdefault(phase, {}).setdefault(key, []).append(item)
+
+    run.update(add)  # under run.json's lock: threads note and seal truth files meanwhile
     events = run.root / "events.jsonl"
     if events.exists():
         append_jsonl(
@@ -169,8 +173,6 @@ class Budget:
     agent_minutes: float | None = None
     reserve: float = 0.15
     eval_timeout_s: float = 300.0
-    kernel_evals: int | None = None
-    transform_evals: int | None = None
     max_sessions: int | None = None
     started: float = field(default_factory=time.monotonic)
     deadlines: dict[str, float] = field(default_factory=dict)
@@ -195,8 +197,6 @@ class Budget:
             agent_minutes=cfg.agent_minutes,
             reserve=cfg.budget_reserve,
             eval_timeout_s=cfg.eval_timeout_s,
-            kernel_evals=cfg.evaluations_per_target,
-            transform_evals=cfg.transform_evaluations,
         )
 
     # -------------------------------------------------------- run level

@@ -260,7 +260,7 @@ def test_feedback_stops_near_speed_of_light(tmp_path):
     run = RunDir.create(tmp_path, "org/m")
     results = run.target("t") / "results.jsonl"
     append_jsonl(results, {"correct": True, "speedup": 1.5})
-    budget = Budget(run, kernel_evals=10)
+    budget = Budget(run)
     budget.start_agent("kernel-t")
     fb = budget.feedback("kernel-t", results, 10, pct_of_sol=SOL_STOP_PCT - 5)
     assert fb["advice"] == "continue"

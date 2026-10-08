@@ -97,10 +97,10 @@ def test_feedback_restart_counts_evaluations_only(tmp_path):
 def test_feedback_advice(tmp_path):
     run = RunDir.create(tmp_path, "org/m")
     results = run.target("t") / "results.jsonl"
-    budget = Budget(run, kernel_evals=PLATEAU + 2)
+    budget, evals = Budget(run), PLATEAU + 2  # the session's evaluation budget
     budget.start_agent("kernel-t")
     append_jsonl(results, {"correct": True, "speedup": 1.5})
-    fb = budget.feedback("kernel-t", results, budget.kernel_evals)
+    fb = budget.feedback("kernel-t", results, evals)
     assert fb["advice"] == "continue"
     assert fb["budget"] == {
         "evals_used": 1,
@@ -110,11 +110,11 @@ def test_feedback_advice(tmp_path):
     }
     for _ in range(PLATEAU):
         append_jsonl(results, {"correct": True, "speedup": 1.4})
-        fb = budget.feedback("kernel-t", results, budget.kernel_evals)
+        fb = budget.feedback("kernel-t", results, evals)
     assert fb["advice"] == "consider_stopping" and fb["budget"]["non_improving"] == PLATEAU
     assert results_streak(results) == PLATEAU
     append_jsonl(results, {"correct": True, "speedup": 2.0})
-    fb = budget.feedback("kernel-t", results, budget.kernel_evals)
+    fb = budget.feedback("kernel-t", results, evals)
     assert fb["advice"] == "stop" and fb["budget"]["evals_used"] == PLATEAU + 2
     assert "evaluation budget" in fb["advice_reason"]
 
@@ -210,8 +210,9 @@ def test_evaluate_candidate_carries_budget(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools_mod, "run_evaluation", fake_eval)
     monkeypatch.setattr(tools_mod, "create_sdk_mcp_server", lambda n, version, tools: tools)
-    budget = Budget(run, eval_timeout_s=123.0, kernel_evals=PLATEAU + 1)
-    server = {t.name: t for t in tools_mod.build_server(run, budget)}
+    budget = Budget(run, eval_timeout_s=123.0)
+    session = tools_mod.SessionBinding(evaluations=PLATEAU + 1)
+    server = {t.name: t for t in tools_mod.build_server(run, budget, binding=session)}
 
     async def evaluate(version: int) -> dict:
         # a new kernel each time: the same source again would be a duplicate (dedup.py)

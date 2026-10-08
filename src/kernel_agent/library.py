@@ -652,19 +652,23 @@ def seed_target(
 
 def remember_seed(run: RunDir, target_id: str, tried: list[dict[str, Any]]) -> None:
     """Record the seeding of a target in ``run.json`` → ``library.seeded``."""
-    data = run.load()
-    data.setdefault("library", {}).setdefault("seeded", {})[target_id] = tried
-    write_json(run.run_json, data)
+
+    def put(data: dict[str, Any]) -> None:
+        data.setdefault("library", {}).setdefault("seeded", {})[target_id] = tried
+
+    run.update(put)  # library.seed_target runs in a thread: run.json's lock (update_json)
 
 
 def remember_store(run: RunDir, stored: list[dict[str, Any]]) -> None:
     """Record stored entries in ``run.json`` → ``library.stored`` (latest per entry)."""
-    data = run.load()
-    section = data.setdefault("library", {})
-    known = {s["entry"]: s for s in section.get("stored") or []}
-    known.update({s["entry"]: s for s in stored})
-    section["stored"] = list(known.values())
-    write_json(run.run_json, data)
+
+    def put(data: dict[str, Any]) -> None:
+        section = data.setdefault("library", {})
+        known = {s["entry"]: s for s in section.get("stored") or []}
+        known.update({s["entry"]: s for s in stored})
+        section["stored"] = list(known.values())
+
+    run.update(put)
 
 
 def seeded(run: RunDir, target_id: str) -> list[dict[str, Any]] | None:
@@ -885,13 +889,12 @@ def librarian_due(run: RunDir) -> bool:
 
 def remember_librarian(run: RunDir, written: list[Path]) -> None:
     """Record the librarian's session in ``run.json`` → ``library.librarian``."""
-    data = run.load()
-    data.setdefault("library", {})["librarian"] = {
+    record = {
         "rows": len(ledger.rows(run)),
         "files": [str(p) for p in written],
         "at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    write_json(run.run_json, data)
+    run.update(lambda data: data.setdefault("library", {}).__setitem__("librarian", record))
 
 
 def _clean(rule: Any) -> str:

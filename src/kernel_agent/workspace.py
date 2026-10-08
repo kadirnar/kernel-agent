@@ -27,6 +27,7 @@ runs/<org>--<name>/<timestamp>/
   improve.json          `kernel-agent improve`: slices, re-integrations, rounds (+ improve.png)
   rounds/<n>/           improve --rounds: re-profile (baseline.json, profile/) + plan.json
   report.md             final report
+  .coordinator.lock     flock (+ pid) of the one process working on the run
 ```
 
 Runs created before ``.truth/`` existed (no ``truth`` in ``run.json``) keep
@@ -36,13 +37,20 @@ Runs created before ``.truth/`` existed (no ``truth`` in ``run.json``) keep
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
+import os
+import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 TRUTH_DIR = ".truth"
+#: ``flock`` of the one process that coordinates a run (:func:`coordinator_lock`).
+COORDINATOR_LOCK = ".coordinator.lock"
 
 
 def slug(repo_id: str) -> str:
@@ -55,11 +63,53 @@ def read_json(path: Path, default: Any = None) -> Any:
     return json.loads(path.read_text())
 
 
-def write_json(path: Path, data: Any) -> None:
+def _dump(data: Any) -> str:
+    return json.dumps(data, indent=2, default=str)
+
+
+def _write_text(path: Path, text: str) -> None:
+    """Replace ``path`` atomically, through a temporary file of this process and thread: two
+    writers of one file never share (and tear) a temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str))
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_native_id()}")
+    try:
+        tmp.write_text(text)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def write_json(path: Path, data: Any) -> None:
+    _write_text(path, _dump(data))
+
+
+_path_locks: dict[Path, threading.RLock] = {}
+_path_locks_lock = threading.Lock()
+
+
+def path_lock(path: Path) -> threading.RLock:
+    """The lock of ``path`` in this process (one per resolved path, re-entrant)."""
+    key = Path(path).resolve()
+    with _path_locks_lock:
+        return _path_locks.setdefault(key, threading.RLock())
+
+
+def update_json(path: Path, fn: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
+    """Read-modify-write the JSON object in ``path`` ({} when missing) under its lock
+    (:func:`path_lock`): ``fn`` changes the data in place (or returns the new data). Every
+    read-modify-write of a file that several threads write goes through here (``run.json``:
+    the truth digests, the phases, budget notes, ...), so none of them loses another's
+    update. Returns the data written; an unchanged file is not rewritten."""
+    with path_lock(path):
+        text = path.read_text() if path.exists() else None
+        data = json.loads(text) if text is not None else {}
+        assert isinstance(data, dict), f"{path}: not a JSON object"
+        out = fn(data)
+        data = data if out is None else out
+        if (new := _dump(data)) != text:
+            _write_text(path, new)
+        return data
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -203,3 +253,53 @@ class RunDir:
         data = read_json(self.run_json, {})
         assert isinstance(data, dict)
         return data
+
+    def update(self, fn: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
+        """Change ``run.json`` (:func:`update_json`: ``fn`` changes it in place)."""
+        return update_json(self.run_json, fn)
+
+
+_coordinators: dict[Path, list[int]] = {}  # run root -> [descriptor, depth] in this process
+_coordinators_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def coordinator_lock(run: RunDir) -> Iterator[None]:
+    """Hold ``<run>/.coordinator.lock`` (an ``flock``) while this process works on the run.
+
+    One process per run: the truth digests live in its memory (``truth.of``) and a second
+    process would overwrite them in ``run.json``. Re-entrant within a process; another
+    process gets ``SystemExit`` naming the pid that holds the run. The lock ends with the
+    process, however it ends (the kernel releases an ``flock`` with its descriptor)."""
+    key = run.root.resolve()
+    if not key.is_dir():  # no run there: whatever uses it reports that
+        yield
+        return
+    with _coordinators_lock:
+        held = _coordinators.get(key)
+        if held is not None:
+            held[1] += 1
+        else:
+            fd = os.open(key / COORDINATOR_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pid = os.pread(fd, 32, 0).decode(errors="replace").strip() or "?"
+                os.close(fd)
+                raise SystemExit(
+                    f"{key} is in use by another kernel-agent process (pid {pid}); one "
+                    "process per run: wait for it to end or stop it first"
+                ) from None
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+            _coordinators[key] = [fd, 1]
+    try:
+        yield
+    finally:
+        with _coordinators_lock:
+            held = _coordinators[key]
+            held[1] -= 1
+            if held[1] == 0:
+                del _coordinators[key]
+                fcntl.flock(held[0], fcntl.LOCK_UN)
+                os.close(held[0])

@@ -71,16 +71,6 @@ class Seed:
     parent_speedup: float | None = None
 
 
-@dataclass(frozen=True)
-class Binding:
-    """What the evaluation tools of one worker session are bound to (``tools.build_server``)."""
-
-    target_id: str
-    worker: int
-    agent: str
-    evaluations: int | None = None
-
-
 # ------------------------------------------------------------------ how many, which budget
 
 
