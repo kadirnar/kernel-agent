@@ -27,6 +27,11 @@
         profile shows still matter
     final integration + report (with the budget left unused and why)
 
+With ``--agents N`` (N > 1) :mod:`kernel_agent.coordinator` runs this loop with up to N
+sessions at once (slices, research sessions and dossiers of different arms; the
+re-integration in the background; a new round only once nothing runs); ``--agents 1`` is
+the sequential loop above.
+
 Slices go through ``Orchestrator.kernel_slice`` / ``systems_slice`` and so through
 ``Orchestrator._agent``: budgets, per-agent timeouts, ``program.md`` and the event
 log apply to every session. Each slice is a new session, so the context of an
@@ -117,6 +122,15 @@ class ImproveConfig:
     # minutes the time budget keeps for the final integration (None: its estimate, at most
     # INTEGRATION_SHARE of --max-hours; --integration-reserve)
     integration_reserve: float | None = None
+    # agent sessions at once (--agents, coordinator.py, issue #183; 1: the sequential loop)
+    agents: int = 1
+    # sessions of a role at once (--role-max) over the role registry's max_concurrent
+    # (roles.REGISTRY: kernel 4, systems 1, native 1; scheduler.role_caps)
+    role_max: dict[str, int] = field(default_factory=dict)
+    # sessions whose modules overlap (--overlap): allow, warn (a digest note) or avoid
+    overlap: str = "warn"
+    # a role's first session starts alone until it streams (its prompt cache), then the rest
+    stagger: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -506,8 +520,12 @@ class Improver:
         self.live_charts = live_charts
         self.kept = ""  # what the time budget keeps for the final integration (last logged)
         self.migrated = ""  # the migration of a pre-#93 integration.json (last logged)
-        self.doing: str | None = None  # what the loop is busy with (``_doing``)
+        # what the loop is busy with (``_doing``): the activities of each of its tasks
+        self.activities: dict[object, list[str]] = {}
         self.no_round: str | None = None  # why the loop started no new round (_next_round)
+        # concurrent sessions (--agents > 1, coordinator.py): slices are attributed by the
+        # ledger rows of their own sessions (their labels, ``sessions``)
+        self.concurrent = icfg.agents > 1
 
     # -------------------------------------------------------- helpers
 
@@ -528,7 +546,9 @@ class Improver:
         """Why the run has a native arm (``--native``, the plan's ``native`` entry), or None."""
         return native_engine.enabled(self.orch.cfg.native, native_engine.plan_entry(self.run))
 
-    def arms(self, rows: list[dict[str, Any]] | None = None) -> list[Arm]:
+    def arms(self, rows: list[dict[str, Any]] | None = None, *, relax: bool = False) -> list[Arm]:
+        """The arms (``relax``: the native arm held, not stopped, while kernel arms improve:
+        concurrent sessions, ``scheduler.assign``)."""
         return build_arms(
             self.run,
             dataclasses.replace(self.policy, native=self.native_why() is not None),
@@ -537,6 +557,7 @@ class Improver:
             rounds=self.state["rounds"],
             rows=rows,
             research=self.state["research"],
+            relax_native=relax,
         )
 
     def research_due(self, arm: Arm) -> str | None:
@@ -576,17 +597,24 @@ class Improver:
         earlier = [*self.state["slices"], *self.state.get("dossiers", [])]
         return not any(s["arm"] == arm.id for s in earlier)
 
-    def _pickable(self) -> list[Arm]:
+    def _pickable(self, *, relax: bool = False) -> list[Arm]:
         """The arms, ranked; an arm stopped by its plateau waits for its research session."""
-        arms = self.arms()
+        arms = self.arms(relax=relax)
         for arm in arms:
             if arm.stop and self.research_due(arm):
                 arm.stop = None
         return rank(arms, self.policy)
 
     def keeps_since_integration(self) -> int:
+        """Kept results the last integration did not take: since its end, or since its start
+        for one that ran in the background (sessions kept results meanwhile)."""
         done = self.state["integrations"]
-        start = int(done[-1]["exp_after"] if done else self.state.get("start_exp", 0))
+        last = done[-1] if done else {}
+        start = int(
+            last["exp_before" if last.get("background") else "exp_after"]
+            if done
+            else self.state.get("start_exp", 0)
+        )
         return sum(
             r["status"] == ledger.KEEP and r["backend"] != "integrate"
             for r in ledger.rows(self.run)
@@ -597,13 +625,24 @@ class Improver:
         refresh(self.run)
         slices_chart(self.run)
 
+    @property
+    def doing(self) -> str | None:
+        """What the loop is busy with: the innermost activity of each of its tasks (one with
+        one session; with concurrent sessions, each running one's), or None."""
+        now = [stack[-1] for stack in self.activities.values() if stack]
+        return "; ".join(now) or None
+
     @contextmanager
     def _doing(self, what: str) -> Iterator[None]:
-        """``what`` the loop is busy with, for the ``interrupted`` record (kept when the
-        body raises: that is what was interrupted)."""
-        outer, self.doing = self.doing, what
+        """``what`` the loop (this task of it) is busy with, for the ``interrupted`` record
+        (kept when the body raises: that is what was interrupted)."""
+        key: object = asyncio.current_task()
+        stack = self.activities.setdefault(key, [])
+        stack.append(what)
         yield
-        self.doing = outer
+        stack.pop()
+        if not stack:
+            self.activities.pop(key, None)
 
     def _interrupted(self) -> None:
         """Ctrl-C, SIGTERM or a cancellation: ``interrupted`` in ``improve.json`` says what
@@ -734,6 +773,7 @@ class Improver:
         self.orch.phase = "improve"
         self.state["config"] = self.icfg.to_dict()
         self.state.pop("finished", None)
+        self.state.pop("coordinator", None)  # of an earlier invocation with --agents N
         self.save()
         ledger.event(self.run, "phase_start", phase="improve")
         try:
@@ -749,6 +789,10 @@ class Improver:
         return reason
 
     async def _loop(self) -> str:
+        if self.concurrent:  # --agents N: up to N sessions at once (coordinator.py)
+            from kernel_agent.coordinator import Coordinator
+
+            return await Coordinator(self).run()
         done = failed = 0
         while True:
             interrupt.check()
@@ -821,6 +865,13 @@ class Improver:
     # -------------------------------------------------------- slices
 
     async def _slice(self, arm: Arm, arms: list[Arm]) -> dict[str, Any]:
+        rec = self._open_slice(arm, arms)
+        return await self._run_slice(rec, arm, arms)
+
+    def _open_slice(self, arm: Arm, arms: list[Arm]) -> dict[str, Any]:
+        """The record of a new slice of ``arm`` (``improve.json``, ``slice_start``); with
+        concurrent sessions it names its sessions (``sessions``: their labels, whose ledger
+        rows are its own)."""
         n = len(self.state["slices"]) + 1
         label = f"{arm.agent}#{n}"
         info = arm.summary()
@@ -837,6 +888,7 @@ class Improver:
             **{k: info[k] for k in ("remaining_ms", "headroom", "expected_ms", "index", "score")},
             "why": info["why"],  # the score's components (scheduler.Arm.why, issue #122)
             **self._session_time(arm),
+            **({"sessions": [label]} if self.concurrent else {}),
         }
         self.state["slices"].append(rec)
         self.save()
@@ -854,6 +906,14 @@ class Improver:
             expected_ms=info["expected_ms"],
             why=info["why"],
         )
+        return rec
+
+    async def _run_slice(
+        self, rec: dict[str, Any], arm: Arm, arms: list[Arm], beside: str = ""
+    ) -> dict[str, Any]:
+        """The sessions of the slice ``rec`` opened (:meth:`_open_slice`), then its record
+        closed; ``beside``: appended to its digest (the sessions running beside it)."""
+        n, label = rec["n"], rec["label"]
         evaluations = self.icfg.slice
         try:
             if arm.kind == NATIVE:
@@ -863,13 +923,14 @@ class Improver:
                     rec["note"] = note
                     log(f"slice {n}: native: {note}")
                 digest = native_digest(self.run, arm, n, evaluations, self.policy, stand, arms)
+                digest += beside
                 results = [
                     await self.orch.native_slice(
                         evaluations=evaluations, digest=digest, label=label
                     )
                 ]
             elif arm.kind == SYSTEMS:
-                digest = systems_digest(self.run, arm, n, evaluations, self.policy)
+                digest = systems_digest(self.run, arm, n, evaluations, self.policy) + beside
                 results = [
                     await self.orch.systems_slice(
                         evaluations=evaluations, digest=digest, label=label
@@ -877,11 +938,13 @@ class Improver:
                 ]
             elif team := self._team(arm, evaluations):
                 rec["workers"] = [s.worker for s in team]
+                if "sessions" in rec:  # each worker's session is the slice's
+                    rec["sessions"] = [f"{workers.agent_name(arm.id, s.worker)}#{n}" for s in team]
                 self.save()
-                results = await self._workers(arm, team, n, rec)
+                results = await self._workers(arm, team, n, rec, beside)
             else:
                 self._restart_advice(arm)
-                digest = kernel_digest(self.run, arm, n, evaluations, self.policy)
+                digest = kernel_digest(self.run, arm, n, evaluations, self.policy) + beside
                 results = [
                     await self.orch.kernel_slice(
                         arm.id, evaluations=evaluations, digest=digest, label=label
@@ -996,7 +1059,7 @@ class Improver:
         return team
 
     async def _workers(
-        self, arm: Arm, team: list[workers.Seed], n: int, rec: dict[str, Any]
+        self, arm: Arm, team: list[workers.Seed], n: int, rec: dict[str, Any], beside: str = ""
     ) -> list[AgentResult]:
         """One session per worker, concurrently up to ``--parallel``, each with its share of
         the slice's evaluations and a digest made when it starts (so a session that waited
@@ -1015,6 +1078,7 @@ class Improver:
                 digest = kernel_digest(
                     self.run, now, n, seed.evaluations, self.policy, worker=seed.worker
                 )
+                digest += beside
                 return await self.orch.worker_session(
                     arm.id,
                     seed,
@@ -1050,6 +1114,26 @@ class Improver:
             else:
                 self.orch.budget.restarted[agent] = done
 
+    def _own(self, rec: dict[str, Any]) -> tuple[Arm | None, list[dict[str, Any]], bool]:
+        """(the arm of slice ``rec``, its ledger rows, whether it found a new best). With
+        concurrent sessions (``sessions``) the rows its own sessions made and whether they
+        raised the arm's best beyond what the rows of everyone else reach (a re-integration
+        and the other sessions run meanwhile); else the arm's rows since the slice started
+        and whether its best rose."""
+        if "sessions" not in rec:
+            arm = next((a for a in self.arms() if a.id == rec["arm"]), None)
+            new = [r for r in (arm.rows if arm else []) if (r["exp"] or 0) > rec["exp_before"]]
+            return arm, new, (arm.best if arm else rec["best_before"]) > rec["best_before"]
+        mine = set(rec["sessions"])
+        rows = ledger.rows(self.run)
+        arm = next((a for a in self.arms(rows) if a.id == rec["arm"]), None)
+        new = [r for r in (arm.rows if arm else []) if r.get("session") in mine]
+        if not arm or not new:
+            return arm, new, False
+        others = [r for r in rows if r.get("session") not in mine]
+        rest = next((a for a in self.arms(others) if a.id == rec["arm"]), None)
+        return arm, new, arm.best > (rest.best if rest else rec["best_before"])
+
     def _close(
         self,
         rec: dict[str, Any],
@@ -1058,8 +1142,7 @@ class Improver:
         usd: float | None = None,
         ended: float | None = None,
     ) -> None:
-        arm = next((a for a in self.arms() if a.id == rec["arm"]), None)
-        new = [r for r in (arm.rows if arm else []) if (r["exp"] or 0) > rec["exp_before"]]
+        arm, new, improved = self._own(rec)
         ended = _ts() if ended is None else ended
         best = arm.best if arm else rec["best_before"]
         rec.update(
@@ -1070,8 +1153,10 @@ class Improver:
             keeps=sum(r["status"] == ledger.KEEP for r in new),
             failures=sum(r["status"] in ledger.FAILURES for r in new),
             best_after=best,
-            improved=best > rec["best_before"],
+            improved=improved,
         )
+        if "sessions" in rec:  # the time its evaluations waited for the GPU (gpuqueue.py)
+            rec["queue_s"] = round(sum(float(r.get("queue_s") or 0.0) for r in new), 1)
         if usd is not None:
             rec["usd"] = round(usd, 4)
         short = "limit_s" in rec and rec["limit_s"] < SHORT_SLICE * rec["need_s"]
@@ -1097,34 +1182,21 @@ class Improver:
             f"{rec['best_before']:.2f}x → {best:.2f}x"
         )
 
-    async def _research(self, arm: Arm, why: str) -> dict[str, Any]:
-        """A research session for a plateaued arm (``Orchestrator.research``) and its record.
+    async def _research(
+        self, arm: Arm, why: str, rec: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """A research session for a plateaued arm (``Orchestrator.research``) and its record
+        (``rec``: opened already, :meth:`_open_research`).
 
         ``plan`` in the record: whether the session wrote a new ``plan.md``; only
         then does the arm's count of evaluations without a new best restart. ``pivot``:
         what became of a precision pivot it proposed (``pivot.json``, ``pivot.py``): the
         new target, or why it was refused."""
-        n = len(self.state["slices"])
         plan = research.plan_path(self.run, arm.id)
         before = plan.read_bytes() if plan.is_file() else None
         proposal = pivot.proposal_path(self.run, arm.id)
         proposed = proposal.read_bytes() if proposal.is_file() else None
-        rec: dict[str, Any] = {
-            "n": len(self.state["research"]) + 1,
-            "arm": arm.id,
-            "round": self.round,
-            "after_slice": n,
-            "label": f"research-{arm.id}#{n}",
-            "why": why,
-            "status": "running",
-            "started": _ts(),
-            "exp": len(ledger.rows(self.run)),
-            "best": arm.best,
-        }
-        self.state["research"].append(rec)
-        self.save()
-        log(f"research: {arm.id} has plateaued ({why}); clean-context review of the target")
-        ledger.event(self.run, "research_start", arm=arm.id, why=why, label=rec["label"])
+        rec = self._open_research(arm, why) if rec is None else rec
         usd = None
         try:
             result = await self.orch.research(arm.id, reason=why, label=rec["label"])
@@ -1148,17 +1220,32 @@ class Improver:
             self.save()
         return rec
 
-    async def _dossier(self, arm: Arm) -> dict[str, Any]:
-        """The dossier session of a kernel arm before its first slice and its record
-        (``improve.json`` → ``dossiers``; ``file``: it wrote ``research.md``)."""
+    def _open_research(self, arm: Arm, why: str) -> dict[str, Any]:
+        """The record of a new research session of ``arm`` (``improve.json``)."""
+        n = len(self.state["slices"])
         rec: dict[str, Any] = {
+            "n": len(self.state["research"]) + 1,
             "arm": arm.id,
-            "label": f"dossier-{arm.id}",
+            "round": self.round,
+            "after_slice": n,
+            "label": f"research-{arm.id}#{n}",
+            "why": why,
             "status": "running",
             "started": _ts(),
+            "exp": len(ledger.rows(self.run)),
+            "best": arm.best,
         }
-        self.state.setdefault("dossiers", []).append(rec)
+        self.state["research"].append(rec)
         self.save()
+        log(f"research: {arm.id} has plateaued ({why}); clean-context review of the target")
+        ledger.event(self.run, "research_start", arm=arm.id, why=why, label=rec["label"])
+        return rec
+
+    async def _dossier(self, arm: Arm, rec: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The dossier session of a kernel arm before its first slice and its record
+        (``improve.json`` → ``dossiers``; ``file``: it wrote ``research.md``; ``rec``: opened
+        already, :meth:`_open_dossier`)."""
+        rec = self._open_dossier(arm) if rec is None else rec
         try:
             result = await self.orch.dossier(arm.id, label=rec["label"])
         except BaseException:  # Ctrl-C, cancellation (Orchestrator.dossier keeps the rest)
@@ -1177,6 +1264,18 @@ class Improver:
         ledger.event(self.run, "dossier_done", arm=arm.id, status=status, file=rec["file"])
         where = f"targets/{arm.id}/{research.DOSSIER_FILE}" if rec["file"] else "no dossier"
         log(f"dossier: {arm.id} {status} in {rec['seconds'] / 60:.1f} min; {where}")
+        return rec
+
+    def _open_dossier(self, arm: Arm) -> dict[str, Any]:
+        """The record of the dossier session of ``arm`` (``improve.json`` → ``dossiers``)."""
+        rec: dict[str, Any] = {
+            "arm": arm.id,
+            "label": f"dossier-{arm.id}",
+            "status": "running",
+            "started": _ts(),
+        }
+        self.state.setdefault("dossiers", []).append(rec)
+        self.save()
         return rec
 
     def _close_research(
@@ -1220,19 +1319,17 @@ class Improver:
         for rec in self.state["slices"]:
             if rec.get("status") != "running":
                 continue
-            arm = next((a for a in self.arms() if a.id == rec["arm"]), None)
-            times = [
-                t
-                for r in (arm.rows if arm else [])
-                if (r["exp"] or 0) > rec["exp_before"] and (t := ledger.epoch(r["time"]))
-            ]
+            _, new, _ = self._own(rec)  # its rows (of its own sessions, with several at once)
+            times = [t for r in new if (t := ledger.epoch(r["time"]))]
             log(f"slice {rec['n']} ({rec['arm']}) was interrupted; recording what it did")
             self._close(rec, "interrupted", ended=max([rec["started"], *times]))
 
     # -------------------------------------------------------- integration and rounds
 
-    async def reintegrate(self, why: str) -> dict[str, Any]:
-        """Measured end-to-end integration (``Orchestrator.integrate``) and its record."""
+    async def reintegrate(self, why: str, *, background: bool = False) -> dict[str, Any]:
+        """Measured end-to-end integration (``Orchestrator.integrate``) and its record;
+        ``background``: while agent sessions run (``coordinator.py``), whose kept results
+        after its start it did not take (:meth:`keeps_since_integration`)."""
         done = self.state["integrations"]
         before = max([1.0, *(float(i["speedup"]) for i in done)])
         exp_before = len(ledger.rows(self.run))
@@ -1261,6 +1358,7 @@ class Improver:
                 before,
                 ok_key="passed",
             ),
+            **({"background": True} if background else {}),
         }
         done.append(rec)
         self.save()
@@ -1403,6 +1501,7 @@ def report_lines(run: RunDir) -> list[str]:
         f"{len(state.get('integrations', []))} re-integrations, {len(state['rounds'])} round(s)",
         f"* stopped: {finished.get('reason', 'not finished (interrupted or running)')}",
         *_budget_lines(finished),
+        *_concurrency_lines(state),
         "",
         "| arm | precision | slices | evaluations | slices with a new best | best |",
         "|---|---|---|---|---|---|",
@@ -1468,6 +1567,20 @@ def _budget_lines(finished: dict[str, Any]) -> list[str]:
     left = float(used.get("unused_hours") or 0.0) * 60 >= 5.0  # more than a rounding error
     why = f"; unused because: {finished.get('reason')}" if left else ""
     return [f"* budget: {', '.join(parts)}{why}"]
+
+
+def _concurrency_lines(state: dict[str, Any]) -> list[str]:
+    """``--agents N`` (``coordinator.py``): the most sessions at once, the GPU waits of the
+    slices' evaluations and the shared usage-limit waits ([] with one session at a time)."""
+    done = state.get("coordinator")
+    if not done:
+        return []
+    waited = sum(float(s.get("queue_s") or 0.0) for s in state["slices"])
+    return [
+        f"* --agents {done['agents']}: at most {done['peak']} sessions at once; their "
+        f"evaluations waited {waited / 60:.0f} min for the GPU in all; "
+        f"{done['rate_limit_waits']} shared usage-limit wait(s)"
+    ]
 
 
 def slices_chart(run: RunDir) -> Path | None:
@@ -1692,11 +1805,13 @@ async def improve(
     if cfg.max_usd is not None:
         orch.budget.max_usd = orch.budget.spent_usd() + cfg.max_usd
     log(f"run directory: {orch.run.root}")
-    world = dryrun.World(orch) if dry_run else None
+    # concurrent simulated sessions run in virtual time (dryrun.VirtualClock)
+    world = dryrun.World(orch, virtual=icfg.agents > 1) if dry_run else None
     with (
         coordinator_lock(orch.run),  # one process per run: its truth is in our memory
         _interrupt_note(orch.run),
         world.installed() if world else nullcontext(),
+        world.driving() if world and world.virtual else nullcontext(),
     ):
         if not all(orch._phase_done(p) for p in ("analyze", "plan", "capture")):
             await orch.run_all(until="capture")

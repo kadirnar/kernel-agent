@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -40,6 +42,30 @@ WRITE_TOOLS = "Write|Edit|MultiEdit|NotebookEdit"
 #: claude.ai connectors of the login (they act on the user's account).
 SESSION_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md")
+#: Called with every message of the sessions this context runs (a coordinator's listener,
+#: ``coordinator.py``: a role's first streamed message, the rate-limit events); see
+#: :func:`listening`. The session's task copies the context, so each session has its own.
+_listener: ContextVar[Callable[[Any], None] | None] = ContextVar(
+    "kernel_agent_session_listener", default=None
+)
+
+
+@contextlib.contextmanager
+def listening(listener: Callable[[Any], None]) -> Iterator[None]:
+    """The agent sessions started in this context hand every message to ``listener``."""
+    token = _listener.set(listener)
+    try:
+        yield
+    finally:
+        _listener.reset(token)
+
+
+def heard(message: Any) -> None:
+    """Hand ``message`` of a session to the listener of this context, if any (a simulated
+    session, ``dryrun.py``, calls it too); a listener's error never ends the session."""
+    if (listener := _listener.get()) is not None:
+        with contextlib.suppress(Exception):
+            listener(message)
 
 
 @dataclass
@@ -94,23 +120,43 @@ def agent_env(extra: dict[str, str], mode: str = auth.AUTO) -> dict[str, str]:
     return auth.scrub(env) if mode == auth.SUBSCRIPTION else env
 
 
-def write_guard(writable: list[Path], cwd: Path) -> dict[HookEvent, list[HookMatcher]]:
-    """PreToolUse hook that lets the file-writing tools touch only ``writable``.
+def write_guard(
+    writable: list[Path],
+    cwd: Path,
+    *,
+    roots: list[Path] | None = None,
+    excluded: list[Path] | None = None,
+) -> dict[HookEvent, list[HookMatcher]]:
+    """PreToolUse hook that lets the file-writing tools touch only ``writable`` and the
+    files under ``roots`` that are not under ``excluded`` (a session's own directory among
+    concurrent sessions, docs/MULTIAGENT.md §3.6: the systems agent's ``transforms/`` without
+    the native agent's ``transforms/native/``).
 
     A hook, not ``can_use_tool``: with ``bypassPermissions`` the CLI never asks."""
     allowed = {p.resolve() for p in writable}
+    tops = [p.resolve() for p in roots or []]
+    outs = [p.resolve() for p in excluded or []]
+
+    def permitted(target: Path) -> bool:
+        if target in allowed:
+            return True
+        inside = any(target.is_relative_to(top) for top in tops)
+        return inside and not any(target.is_relative_to(out) for out in outs)
+
+    where = [str(p) for p in sorted(allowed)] + [f"{p}/" for p in tops]
+    if outs:
+        where[-1] += " (not " + ", ".join(f"{p}/" for p in outs) + ")"
 
     async def guard(data: Any, tool_use_id: str | None, context: Any) -> HookJSONOutput:
         tool_input = data.get("tool_input") or {}
         path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-        if path and _resolve(cwd, path) in allowed:
+        if path and permitted(_resolve(cwd, path)):
             return {}
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": "this session may write only "
-                + ", ".join(str(p) for p in sorted(allowed)),
+                "permissionDecisionReason": "this session may write only " + ", ".join(where),
             }
         }
 
@@ -170,6 +216,8 @@ async def run_agent(
     writable: list[Path] | None = None,
     resume: str | None = None,
     role: str | None = None,
+    roots: list[Path] | None = None,
+    excluded: list[Path] | None = None,
 ) -> AgentResult:
     """Run one agent session to completion.
 
@@ -180,7 +228,8 @@ async def run_agent(
     and helpers (``roles.options_for``; ``cfg``: the session's config, whose model, effort
     and turns it runs on); ``tools`` replaces the role's built-in tools (None:
     :data:`BASE_TOOLS` for most roles) as the ones the session has at all; with
-    ``writable`` the file-writing tools may touch only those files.
+    ``writable`` the file-writing tools may touch only those files, and with ``roots`` only
+    the files under them that are not under ``excluded`` (:func:`write_guard`).
 
     A session that stops at a usage limit returns with ``usage_limit`` set instead of
     raising (auth.py); ``resume`` (its session id) continues it, and the USD, tokens, turns
@@ -205,7 +254,8 @@ async def run_agent(
         output_format=output_format,
         **fields,  # model, effort, turns, tools, helpers, skills, no settings (roles.py)
     )
-    hooks = write_guard(writable, cwd) if writable is not None else {}
+    guarded = writable is not None or roots is not None
+    hooks = write_guard(writable or [], cwd, roots=roots, excluded=excluded) if guarded else {}
     hooks.setdefault("PreToolUse", []).append(claude_files_guard(cwd))
     options.hooks = hooks
     if resume:
@@ -233,6 +283,7 @@ async def run_agent(
                     _write(log, message)
                     watch.see(message)
                     lookups.see(message)
+                    heard(message)  # the coordinator's listener (rate limits, first message)
                     if isinstance(message, AssistantMessage):
                         result.session_id = result.session_id or message.session_id
                         if message.parent_tool_use_id is None:

@@ -145,6 +145,32 @@ def _integration_reserve(raw: str) -> float | None:
     return minutes
 
 
+def _agents(raw: str) -> int:
+    """``--agents``: concurrent agent sessions (a positive count)."""
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive number of sessions, got {raw!r}")
+    return n
+
+
+def _role_max(raw: str) -> dict[str, int]:
+    """``--role-max kernel=2,research=1``: sessions of a role at once (the roles not named
+    keep the role registry's ``max_concurrent``, ``roles.REGISTRY``)."""
+    roles = ("kernel", "systems", "native", "research", "dossier")
+    out: dict[str, int] = {}
+    for part in (p.strip() for p in raw.split(",") if p.strip()):
+        role, _, value = part.partition("=")
+        if role.strip() not in roles or not value.strip().isdigit():
+            raise argparse.ArgumentTypeError(
+                f"expected ROLE=N with ROLE one of {', '.join(roles)}, got {part!r}"
+            )
+        out[role.strip()] = int(value)
+    return out
+
+
 def _precisions(raw: str) -> list[str]:
     """``--precisions``: a comma list of target precisions (``exact`` is always added)."""
     from kernel_agent import precisions
@@ -339,6 +365,9 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         max_slices=ns.max_slices,
         research_every=ns.research_every,
         integration_reserve=ns.integration_reserve,
+        agents=ns.agents,
+        **({"role_max": ns.role_max} if ns.role_max else {}),
+        overlap=ns.overlap,
         policy=Policy(
             patience=ns.patience,
             sol_stop=ns.sol_stop or None,
@@ -815,6 +844,31 @@ def main(argv: list[str] | None = None) -> int:
         default=3,
         help="research session on a plateaued target at most once per this many of its "
         "slices (0: never)",
+    )
+    p.add_argument(
+        "--agents",
+        type=_agents,
+        default=1,
+        metavar="N",
+        help="agent sessions at once (default 1: one at a time, as before). With N > 1 the "
+        "slots go to the arms that pay (slices, research sessions, dossiers), the GPU "
+        "evaluations take turns in the GPU job queue, the re-integration runs in the "
+        "background and a usage limit pauses every session once (docs/MULTIAGENT.md); "
+        "k = 3-4 is the measured sweet spot on one GPU",
+    )
+    p.add_argument(
+        "--role-max",
+        type=_role_max,
+        default=None,
+        metavar="ROLE=N,...",
+        help="--agents N: sessions of a role at once (default kernel=4,systems=1,native=1)",
+    )
+    p.add_argument(
+        "--overlap",
+        choices=["allow", "warn", "avoid"],
+        default="warn",
+        help="--agents N: sessions working on the same modules at once: warn (default: their "
+        "digests name each other), avoid (one at a time) or allow",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="simulated agents and GPU (no Claude, no GPU)"
