@@ -24,7 +24,9 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
     query,
 )
 from claude_agent_sdk.types import HookEvent
@@ -91,6 +93,11 @@ class AgentResult:
     usage: dict[str, int] = field(default_factory=dict)
     first_usage: dict[str, int] = field(default_factory=dict)
     model_usage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # In-session helpers (#186): ``tool_calls`` and ``turns`` are the main thread's; per
+    # helper (the Agent call's ``subagent_type``) its delegations, tool calls (its messages:
+    # ``parent_tool_use_id`` set), seconds and models (:class:`Delegations`). Their tokens
+    # and USD are in ``cost_usd`` and ``model_usage``.
+    subagents: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _log(msg: str) -> None:
@@ -197,6 +204,60 @@ def _resolve(cwd: Path, path: str) -> Path:
     return (p if p.is_absolute() else cwd / p).resolve()
 
 
+#: The tool a session delegates to a helper with (Claude Code's ``Agent``, once ``Task``).
+AGENT_TOOLS = ("Agent", "Task")
+
+
+class Delegations:
+    """The helpers of one session's messages (#186): a main-thread ``Agent`` call names its
+    helper (``subagent_type``), the helper's own messages carry that call's id as their
+    ``parent_tool_use_id``, and the call's result says how it went. :meth:`see` keeps per
+    helper (``AgentResult.subagents``) its delegations (``calls``), its tool calls
+    (``tools``, counted by the runner), its seconds, the models it ran on and the
+    delegations that did not complete (``failed``). Its tokens and USD are in the
+    session's: ``ResultMessage.total_cost_usd`` and ``model_usage`` include them (checked
+    against the real CLI, tests/test_subagents.py)."""
+
+    def __init__(self) -> None:
+        self.helpers: dict[str, str] = {}  # an Agent call's id -> its helper
+
+    @staticmethod
+    def _row(out: dict[str, dict[str, Any]], helper: str) -> dict[str, Any]:
+        return out.setdefault(helper, {"calls": 0, "tools": {}, "seconds": 0.0, "models": []})
+
+    def see(self, message: Message, out: dict[str, dict[str, Any]]) -> str | None:
+        """The helper whose message ``message`` is (None: the main thread's or not an
+        assistant message), counted into ``out``."""
+        if isinstance(message, UserMessage) and message.parent_tool_use_id is None:
+            done = message.tool_use_result if isinstance(message.tool_use_result, dict) else {}
+            for block in message.content if isinstance(message.content, list) else []:
+                if not isinstance(block, ToolResultBlock) or block.tool_use_id not in self.helpers:
+                    continue
+                row = self._row(out, self.helpers[block.tool_use_id])
+                row["seconds"] = round(row["seconds"] + (done.get("totalDurationMs") or 0) / 1e3, 1)
+                if (model := done.get("resolvedModel")) and model not in row["models"]:
+                    row["models"].append(model)
+                if block.is_error or done.get("status") not in (
+                    None,
+                    "completed",
+                    "async_launched",
+                ):
+                    row["failed"] = row.get("failed", 0) + 1
+            return None
+        if not isinstance(message, AssistantMessage):
+            return None
+        if message.parent_tool_use_id is None:
+            for block in message.content:
+                if isinstance(block, ToolUseBlock) and block.name in AGENT_TOOLS:
+                    helper = str(block.input.get("subagent_type") or "general-purpose")
+                    self.helpers[block.id] = helper
+                    self._row(out, helper)["calls"] += 1
+            return None
+        helper = self.helpers.get(message.parent_tool_use_id, "subagent")
+        self._row(out, helper)
+        return helper
+
+
 async def run_agent(
     name: str,
     *,
@@ -277,6 +338,7 @@ async def run_agent(
     start = time.perf_counter()
     _log(f"agent {name}: started (cwd={cwd})")
     turns: set[str] = set()
+    delegations = Delegations()
     finished = False
     stream = query(prompt=prompt, options=options)
     try:
@@ -289,6 +351,7 @@ async def run_agent(
                     heard(message)  # the coordinator's listener (rate limits, first message)
                     if tracker is not None:  # its turns; tool results close denied calls
                         tracker.see(message)
+                    helper = delegations.see(message, result.subagents)  # None: main (#186)
                     if isinstance(message, AssistantMessage):
                         result.session_id = result.session_id or message.session_id
                         if message.parent_tool_use_id is None:
@@ -297,13 +360,16 @@ async def run_agent(
                             result.model = result.model or message.model
                             if not result.first_usage:  # the session's first request
                                 result.first_usage = roles.usage_of(message.usage)
+                        who = f"{name}/{helper}" if helper else name
+                        # the main thread's tool calls, and each helper's apart
+                        calls = result.subagents[helper]["tools"] if helper else result.tool_calls
                         for block in message.content:
                             if isinstance(block, ToolUseBlock):
                                 short = block.name.removeprefix("mcp__ka__")
-                                result.tool_calls[short] = result.tool_calls.get(short, 0) + 1
-                                _log(f"agent {name}: {short} {_brief(block.input)}")
+                                calls[short] = calls.get(short, 0) + 1
+                                _log(f"agent {who}: {short} {_brief(block.input)}")
                             elif isinstance(block, TextBlock) and cfg.verbose:
-                                _log(f"agent {name}: {block.text[:300]}")
+                                _log(f"agent {who}: {block.text[:300]}")
                     elif isinstance(message, SystemMessage) and message.subtype == "init":
                         result.session_id = message.data.get("session_id") or result.session_id
                         result.api_key_source = message.data.get("apiKeySource")
@@ -316,7 +382,7 @@ async def run_agent(
                         result.text = message.result or result.text
                         if message.structured_output is not None:
                             result.structured = message.structured_output
-                        result.cost_usd = usd + (message.total_cost_usd or 0.0)
+                        result.cost_usd = usd + _session_usd(message)
                         # so do the tokens (#181): the session so far, on top of a first run's
                         result.usage = roles.add_usage(usage, roles.usage_of(message.usage))
                         result.model_usage = _model_usage(by_model, message.model_usage)
@@ -354,6 +420,16 @@ _MODEL_USAGE = {
     "cacheReadInputTokens": "cache_read_input_tokens",
     "outputTokens": "output_tokens",
 }
+
+
+def _session_usd(message: ResultMessage) -> float:
+    """A result's USD with its helpers': ``total_cost_usd``, which Claude Code 2.1.286 sums
+    over the main thread and its subagents (#186, tests/test_subagents.py), or the sum of
+    ``model_usage``'s per-model USD should a CLI leave the helpers out of the total."""
+    models = (message.model_usage or {}).values()
+    by_model = [c.get("costUSD") for c in models if isinstance(c, Mapping)]
+    helpers_in = sum(float(usd) for usd in by_model if isinstance(usd, int | float))
+    return max(float(message.total_cost_usd or 0.0), helpers_in)
 
 
 def _model_usage(

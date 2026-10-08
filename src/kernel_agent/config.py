@@ -30,6 +30,7 @@ ROLE_MODELS = {
     "critic": HAIKU_MODEL,
     "doc-lookup": SONNET_MODEL,
     "profile-analyst": SONNET_MODEL,
+    "compile-triage": SONNET_MODEL,
     "reviewer": INHERIT,
 }
 #: The effort of each role (``--role-effort ROLE=LEVEL``; ``inherit``: ``--effort``; None:
@@ -42,6 +43,7 @@ ROLE_EFFORTS: dict[str, str | None] = {
     "critic": None,
     "doc-lookup": "low",
     "profile-analyst": "medium",
+    "compile-triage": "medium",
 }
 #: ``--quality`` (kernels/compare.py ``QUALITIES``, without importing torch) and the mode of
 #: a new run (#175).

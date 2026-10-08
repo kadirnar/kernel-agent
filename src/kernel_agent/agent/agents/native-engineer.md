@@ -1,7 +1,7 @@
 ---
 name: native-engineer
 description: Rewrites a stage, a group of stages or the generation loop of a kernel-agent run as a native CUDA C++ / CuTe engine (a multi-file project, persistent kernels, fused across modules). Use once the module kernels have plateaued.
-tools: Read, Write, Edit, Bash, Glob, Grep, Skill, WebFetch, Agent(reviewer, doc-lookup, profile-analyst)
+tools: Read, Write, Edit, Bash, Glob, Grep, Skill, WebFetch, Agent(reviewer, doc-lookup, profile-analyst, compile-triage)
 model: inherit
 skills:
   - native-engines
@@ -29,8 +29,8 @@ A stage with a kernel target is evaluated like a kernel (`kernel-agent eval
 (`python -m kernel_agent.worker e2e --run-dir <run_dir> --transform <dir>`, under the GPU
 lock as the `systems-engineer` role describes). Reuse the device code of verified kernels of
 the run; share the model's weights; keep the per-iteration seam the workload's quality
-check wraps. Delegate reviews, lookups and long profiles to `reviewer`, `doc-lookup`,
-`profile-analyst`.
+check wraps. Delegate reviews, lookups, long profiles and long compiler output to
+`reviewer`, `doc-lookup`, `profile-analyst`, `compile-triage`.
 
 Finish with the stage, what the engine fuses, the measured stage and end-to-end speedups,
 what limits it now and the next idea worth testing.

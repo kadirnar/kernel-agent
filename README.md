@@ -2277,6 +2277,14 @@ counters to admin users (`RmProfilingAdminOnly: 1`, ncu's `ERR_NVGPUCTRPERM`; se
 launch with caches flushed and base clocks (ncu's defaults): compare kernels
 with each other, not with the evaluator's timings.
 
+The tables do not stay in the session's context (#186): `evaluate_candidate` writes them
+(per-kernel times of candidate and reference, `compiler_stats`, the ncu report) to
+`profiles/<snapshot>.json` in the session's working directory and returns `profile`: the
+top 3 kernels of each side with their share of GPU time, the spill warnings, the top ncu
+kernels' bounds and the file's path, a few hundred characters instead of up to 24 KB. The
+engineer reads the file for a detail or hands its path to the `profile-analyst` helper.
+The `kernel-agent eval --profile` CLI still prints everything.
+
 ### Ceilings for the planner
 
 The speed of light above is per kernel evaluation, after the plan. `analyze`
@@ -2837,18 +2845,31 @@ guide in its prompt (`kernel_agent/skills.py`, `kernel_agent/roles.py`):
 * **Agent definitions** (`src/kernel_agent/agent/agents/<name>.md`, Claude Code subagent
   files): the roles `planner`, `kernel-engineer`, `systems-engineer`, `native-engineer`,
   `researcher`, `dossier-researcher`, `refactor-engineer`, `harness-author`, `librarian`,
-  and three helpers: `doc-lookup` (one documentation question, answered from the doc library
+  and four helpers: `doc-lookup` (one documentation question, answered from the doc library
   (`doc_search` / `doc_read`), local reference code and the web with cited
   sources), `profile-analyst` (profiles and result histories too long for the caller's
-  context) and `reviewer` (a critic: a candidate against the evaluator's rules and its
-  reference, before an evaluation is spent). `runner.run_agent` looks up a session's
+  context, e.g. the `profiles/<snapshot>.json` of an evaluation), `compile-triage` (#186:
+  a build or runtime error longer than a screen next to its candidate → the root cause and
+  a minimal patch as text, checked against the doc library) and `reviewer` (a critic: a
+  candidate against the evaluator's rules and its reference, before an evaluation is
+  spent). `runner.run_agent` looks up a session's
   role (`kernel-mlp` → `kernel-engineer`) and passes the helpers its definition lists
   (`Agent(...)` in its tools) to the SDK as agent definitions: kernel, systems and
-  native sessions may delegate to all three, the planner and research sessions to
+  native sessions may delegate to all four, the planner and research sessions to
   `doc-lookup` and `profile-analyst`. Helpers run on their role's model and effort (see
   "Roles, models and the prompt cache"), have
-  read-only tools (no web tools with `--no-web`), preload their skills and run under the
-  session's hooks (write guard, Claude files guard, WebFetch allowlist). A session that
+  read-only tools only (`roles.HELPER_TOOLS`: read, search, skills, the doc library and,
+  without `--no-web`, the web; `roles.problems()` rejects a helper that writes, runs
+  commands or delegates), so they need no ownership or GPU accounting and make no
+  evaluation the engineer does not see. They preload their skills and run under the
+  session's hooks (write guard, Claude files guard, WebFetch allowlist; the bundled CLI
+  test of `tests/test_subagents.py` has a test-only helper with Write denied outside the
+  session's files). The session's prompt says when delegating pays and when one or two
+  tool calls of its own are cheaper (`roles.WHEN_TO_DELEGATE`). The runner counts the main
+  thread's turns and tool calls apart from each helper's (`AgentResult.subagents`, from
+  the messages' `parent_tool_use_id`: delegations, tool calls, seconds, model; `costs.json`
+  `subagents`); the session's USD already includes its helpers' (Claude Code's
+  `total_cost_usd` and per-model usage, checked against the CLI). A session that
   ends a turn while a background helper still runs gets a second result; the runner
   keeps the first one's structured output. `roles.agent_definition(name)` is any role's SDK
   definition, for a coordinator to start roles uniformly (#174). A pipeline session's own
@@ -2882,7 +2903,8 @@ librarian's model) live in one place, and `program.md`'s sections are its roles.
   `run.json`): the creative and planning roles (kernel, systems, native, planner, research,
   refactor, harness, the `reviewer` helper) run on `--claude-model` at `--effort`; the
   dossier, the librarian and the `doc-lookup` helper on Sonnet 5.5 (`claude-sonnet-5-5`)
-  at effort `low`, `profile-analyst` on Sonnet at `medium`; the critic (#174, not run yet)
+  at effort `low`, `profile-analyst` and `compile-triage` on Sonnet at `medium`; the critic
+  (#174, not run yet)
   on Haiku 4.5. `--role-model ROLE=MODEL` and `--role-effort ROLE=LEVEL` change one
   (repeatable; `inherit` = `--claude-model` / `--effort`, an effort of `none` sets none);
   given to `improve` or `resume` on a run that exists, they replace those roles' settings
@@ -2909,7 +2931,8 @@ librarian's model) live in one place, and `program.md`'s sections are its roles.
 * **Tokens and cache per session**: `costs.json` records each session's role, model and
   effort, its tokens (`usage`: input, cache writes, cache reads, output; `first_usage`: the
   same for its first request, which shows what it read of a cache other sessions wrote) and
-  `$` and tokens per model (helpers included). The report's **Usage per role** table gives
+  `$` and tokens per model (helpers included; per helper its delegations, tool calls,
+  seconds and model in `subagents`). The report's **Usage per role** table gives
   sessions, model, `$` per session, input tokens, the share read from the cache over whole
   sessions and over first requests, and output tokens per role.
 
@@ -3021,7 +3044,16 @@ model and starts a new round (`kernel_agent/improve.py`,
   ideas, hypotheses and status, the per-idea table (see "Experiment ledger"),
   the best snapshot with its speedup (and % of SOL), the research `plan.md` if
   there is one, the `## Open ideas` section and the tail of `NOTES.md`, and how
-  far the target is from its stop rules. The agent is asked to keep `NOTES.md`
+  far the target is from its stop rules. Its `## Docs to read first` (#186; kernel and
+  native digests) lists the ids of the doc library's 5 best sections for the target,
+  found without a model (`doclib/reading.py`): one BM25 query per thing the target is
+  about (its precision, the operations its module class, approach and why name, a native
+  stage's pattern, the GPU's tensor-core instructions), searched in its backends'
+  libraries, taken in turn, each section once and only sections with more than half of
+  their query's words; nothing before the library is built (it never builds one). On the
+  VoxCPM2 run's `dit_layer__fp8_w8a8` target: Triton's Persistent Matmul (FP8), Layer
+  Normalization, Matrix Multiplication and Fused Attention tutorials and the PTX `mma`
+  section. The agent is asked to keep `NOTES.md`
   and its open ideas current for the next session. Slices run through the same
   code as `optimize` agents (budgets, timeouts, `program.md`, events). Their
   cost is in `costs.json` as `kernel-<target>#<slice>` and `systems#<slice>`.

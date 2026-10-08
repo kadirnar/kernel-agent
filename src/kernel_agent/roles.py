@@ -16,13 +16,14 @@ frontmatter (``name``, ``description``, ``tools``, ``model``, optional ``maxTurn
 ``skills``) and the role's prompt as the body. One file per pipeline role (planner, kernel
 engineer, systems, native, research, dossier, refactor, harness author, librarian) and per
 helper a session may delegate to (:data:`HELPERS`: ``doc-lookup``, ``profile-analyst``,
-``reviewer``). They serve three ways:
+``compile-triage``, ``reviewer``; read-only, :data:`HELPER_TOOLS`). They serve three ways:
 
 * the session runner (``runner.run_agent``) looks up the definition of a session's role
   (:func:`for_session`: ``kernel-mlp-w2`` → ``kernel-engineer``) and passes the helpers its
   ``tools`` list as ``Agent(...)`` to the SDK as agent definitions (``agents=``, with each
   helper's model and effort from the registry), so the session can hand a documentation
-  lookup, a profile analysis or a review to a subagent with its own context; the Skill tool
+  lookup, a profile analysis, a long compiler error or a review to a subagent with its own
+  context (:func:`delegation_note` says when that pays, #186); the Skill tool
   and kernel-agent's skills come with every session;
 * a coordinator (#174) starts any role uniformly from :func:`agent_definition` (and
   ``skills.for_role`` for the skills it loads first);
@@ -55,6 +56,10 @@ AGENTS_DIR = Path(__file__).parent / "agent" / "agents"
 BASE_TOOLS = ("Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite")
 READ_TOOLS = ("Read", "Glob", "Grep")
 WEB_TOOLS = ("WebFetch", "WebSearch")
+#: The only tools a helper may have (docs/MULTIAGENT.md §3.12.3): it reads, looks up and
+#: answers; it never writes, runs commands or GPU work, so it needs no ownership or GPU
+#: accounting and makes no evaluation the engineer does not see.
+HELPER_TOOLS = (*READ_TOOLS, "Skill", *WEB_TOOLS, *DOC_TOOLS)
 #: kernel-agent's evaluation tools of the kernel and the end-to-end sessions (short names).
 KERNEL_TOOLS = ("evaluate_candidate", "sweep_candidate", "best_result")
 E2E_TOOLS = ("evaluate_e2e", "run_info")
@@ -153,6 +158,7 @@ REGISTRY: dict[str, RoleSpec] = {
         RoleSpec("critic", max_turns=1, builtin_tools=READ_TOOLS, program=False),  # #174 PR 8
         RoleSpec("doc-lookup", "doc-lookup", helper=True, program=False),
         RoleSpec("profile-analyst", "profile-analyst", helper=True, program=False),
+        RoleSpec("compile-triage", "compile-triage", helper=True, program=False),  # #186
         RoleSpec("reviewer", "reviewer", helper=True, program=False),
     )
 }
@@ -280,10 +286,15 @@ def subagents(
 
 def delegation_note(helpers: Mapping[str, AgentDefinition]) -> str:
     """The ``# Helpers`` section of a session's prompt ("" without helpers): which subagents
-    it may hand work to and how (the Agent tool lists their descriptions)."""
+    it may hand work to, how, and when that pays (:data:`WHEN_TO_DELEGATE` of those it has,
+    #186; the Agent tool lists their descriptions). The same for every session of a role:
+    part of its prompt-cache prefix."""
     if not helpers:
         return ""
     names = ", ".join(f"`{name}`" for name in helpers)
+    when = "".join(
+        f"* `{name}`: {WHEN_TO_DELEGATE[name]}\n" for name in helpers if name in WHEN_TO_DELEGATE
+    )
     return f"""
 
 # Helpers (the Agent tool)
@@ -293,14 +304,36 @@ yours: a documentation question, a long profile or result history, a review of a
 before you spend an evaluation on it. They see nothing of this session: give each a
 self-contained task (the question, the file paths, what the answer is for). Pass
 `run_in_background: false` when your next step needs the answer. Their reports are advice:
-only the evaluation tools decide what is correct and faster.
-"""
+only the evaluation tools decide what is correct and faster. Helpers only read: they never
+edit files, run commands or GPU work.
+
+When delegating pays (a helper costs a session of its own: do yourself what takes one or
+two tool calls):
+{when}"""
+
+
+#: When each helper is worth its session (:func:`delegation_note`).
+WHEN_TO_DELEGATE = {
+    "doc-lookup": "an API, instruction, layout or limit you have not verified that needs "
+    "more than one `doc_search` + `doc_read` (several pages, a version or architecture "
+    "detail); a doc id you already have: `doc_read` it yourself.",
+    "profile-analyst": 'a `profile=true` / `"ncu"` result: give it the result\'s '
+    "`profile.file` (the full tables) and your question (which kernel to attack, what bounds "
+    "it); also a long `results.jsonl`, `profile/summary.md` or ceilings table.",
+    "compile-triage": "a build or runtime error longer than a screen (about 40 lines) or "
+    "one you cannot place at once: write the full output to a file (`... > build.log 2>&1; "
+    "tail -n 20 build.log`) and give it the candidate and the log's path, or the "
+    "evaluation's `error`; a one-line error you understand: fix it yourself.",
+    "reviewer": "before the full evaluation of a large change, or a failed check you cannot "
+    "explain: give it the candidate, the reference and the failed result.",
+}
 
 
 def problems() -> list[str]:
     """What is wrong with the agent definitions ([] when nothing): every role and helper has
     one, names match file names, descriptions exist, delegates are helpers, skills exist,
-    tools are known."""
+    tools are known, helpers are read-only (:data:`HELPER_TOOLS`) and the prompt says when
+    each pays."""
     known_tools = {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "Skill", *WEB_TOOLS}
     known_tools |= set(DOC_TOOLS)  # the doc library of every session (#177)
     out = []
@@ -308,6 +341,8 @@ def problems() -> list[str]:
     for name in (*ROLE_AGENTS.values(), *HELPERS):
         if name not in defs:
             out.append(f"no agent definition {name}.md")
+    if names := set(HELPERS) ^ set(WHEN_TO_DELEGATE):  # the prompt says when each one pays
+        out.append(f"roles.WHEN_TO_DELEGATE and the helpers differ in {sorted(names)}")
     for table in ("ROLE_MODELS", "ROLE_EFFORTS"):  # config.py's defaults: one per role
         if names := set(REGISTRY) ^ set(ROLE_MODELS if table == "ROLE_MODELS" else ROLE_EFFORTS):
             out.append(f"config.{table} and the registry differ in {sorted(names)}")
@@ -323,6 +358,10 @@ def problems() -> list[str]:
             out.append(f"{where}: unknown tools {sorted(unknown)}")
         if stray := set(role.delegates) - set(HELPERS):
             out.append(f"{where}: delegates to {sorted(stray)}, which are not helpers")
+        if role.name in HELPERS and (writes := set(role.tools) - set(HELPER_TOOLS)):
+            out.append(f"{where}: a helper is read-only, not {sorted(writes)}")
+        if role.name in HELPERS and role.delegates:
+            out.append(f"{where}: a helper does not delegate")
         for skill in role.skills:
             if skill not in skills.index():
                 out.append(f"{where}: no skill {skill}")
