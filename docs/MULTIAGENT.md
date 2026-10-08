@@ -980,7 +980,7 @@ not by the agent name prefixes `dryrun.World.run_agent` parses today.
 
 This is a closed queueing model: N agents think for `Z` per evaluation, then hold the
 GPU for `S` (exact MVA, one FCFS server plus a delay station; script in
-`(queueing model script, not committed)`).
+`docs/research-scripts/multiagent-174/mva.py`).
 
 Assumed `Z ≈ 300 s`: warm-up 240 s (`scheduler.WARMUP_SECONDS`) amortised over a 4-eval
 slice plus about 240 s of writing per candidate (the dry run's `uniform(150, 330)`).
