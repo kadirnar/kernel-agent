@@ -23,9 +23,13 @@ keeps the timed jobs clean:
   bandwidth and the package's clocks with the timing cores.
 * **Builds off the GPU lock**: ``run_evaluation`` and ``run_sweep`` compile a candidate's
   ``load_inline`` extensions first, in a process without a GPU (``kernels/prebuild.py``).
-* **Dirty-timing re-runs**: ``telemetry.HoldWatch`` around a timed job and the evaluator's
-  own CPU wait mark a measurement ``timing_dirty``; it is measured once more, first of its
-  class in the GPU queue, and the first result is not recorded.
+* **Dirty-timing re-runs** (``telemetry.dirty``): another process on the GPU
+  (``telemetry.HoldWatch``), a swapping host, the timed process's own CPU wait and other
+  processes on its timing cores make a measurement dirty; it is measured once more, first
+  of its class in the GPU queue, and the first result is not recorded.
+
+The A/A validation (``docs/research-scripts/clean-timing-185/``): beside 3 simulated agents
+the spread of a fixed candidate's speedup was no wider than with nothing else running.
 
 A child process gets its CPUs and nice value through the environment (:data:`CPUS_ENV`,
 :data:`NICE_ENV`): ``import kernel_agent`` applies them (:func:`apply_inherited`) before the
