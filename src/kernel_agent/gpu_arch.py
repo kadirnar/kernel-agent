@@ -10,9 +10,10 @@ RTX 5070 Ti, sm_120: its measurements stay in the skills as labelled evidence).
   instructions, the one a compute-bound kernel needs for the full rate, async copies,
   clusters / PDL, the typical shared memory per block.
 * :func:`precision_unsupported`: why a target precision cannot run on a capability
-  (:data:`PRECISION_NEEDS`: FP8 tensor-core math needs sm_89+, block-scaled MXFP8 sm_100+).
-  Weight-only and KV-cache formats dequantise in registers and run everywhere; before sm_89
-  without a hardware e4m3 conversion (:func:`precision_note`).
+  (:data:`PRECISION_NEEDS`: FP8 tensor-core math needs sm_89+, block-scaled MXFP8 sm_100+,
+  INT8 tensor-core math (IMMA) sm_75+). Weight-only and KV-cache formats dequantise in
+  registers and run everywhere; before sm_89 without a hardware e4m3 conversion, and INT8
+  W8A8's fast path differs per family (:func:`precision_note`).
 * :func:`supports` / :func:`example_requirement` / :func:`example_skip`: the ``ARCHS``
   declaration of a bundled example (``"sm_89+"``, ``"sm_12x"``) against a capability, and
   why it does not run here (``doctor --smoke``).
@@ -234,12 +235,14 @@ PRECISION_NEEDS: dict[str, tuple[tuple[int, int], str]] = {
         (10, 0),
         "block-scaled FP8 tensor cores (MXFP8): sm_100+ (Blackwell; cuBLASLt VEC32_UE8M0)",
     ),
+    "int8_w8a8": ((7, 5), "INT8 tensor cores (IMMA, `mma.sync` s8): sm_75+ (Turing and newer)"),
 }
 #: Ceilings columns (``profiling/ceilings.py``) whose floor needs such tensor cores.
 COLUMN_NEEDS: dict[str, tuple[tuple[int, int], str]] = {
     "w8a8": PRECISION_NEEDS["fp8_w8a8"],
     "mxfp8": PRECISION_NEEDS["fp8_mx"],
     "w4a4": ((10, 0), "FP4 tensor cores: sm_100+ (Blackwell)"),
+    "int8_w8a8": PRECISION_NEEDS["int8_w8a8"],
 }
 #: Weight-only / KV-cache formats: dequantised in registers, so any GPU runs them; below
 #: sm_89 there is no hardware e4m3 conversion.
@@ -272,9 +275,43 @@ def column_unsupported(column: str, capability: tuple[int, ...] | None) -> str |
     return f"needs {need[1]}"
 
 
+#: What INT8 W8A8 (``int8_w8a8``) needs per family for the INT8 tensor-core peak (#178).
+_INT8_PATH = {
+    "pre_ampere": (
+        "Turing's IMMA is `mma.sync` m8n8k16 (`m16n8k32` needs sm_80) and Triton's `tl.dot` "
+        "runs on CUDA cores below sm_80: cuBLASLt (`torch._int_mm`) or CUDA C++ m8n8k16 here"
+    ),
+    "hopper": (
+        "the INT8 peak needs `wgmma` s8 (Triton `tl.dot` on int8 emits it, CUTLASS sm_90); a "
+        "hand-written `mma.sync` s8 kernel stops below it"
+    ),
+    "blackwell": (
+        "the INT8 peak needs `tcgen05.mma kind::i8` (cuBLASLt via `torch._int_mm`, CUTLASS / "
+        "CuTe DSL sm_100); a hand-written `mma.sync` s8 kernel stops below it"
+    ),
+}
+#: Blackwell Ultra (sm_103: B300 / GB300) keeps INT8 tensor cores at about 1/30 of its FP8
+#: rate (NVIDIA's B300 specifications; B200 and H100 / H200: 1:1) and its PTX exposes no
+#: ``tcgen05.mma kind::i8`` (arXiv 2608.11693).
+_INT8_CUT = (
+    "Blackwell Ultra (sm_103) runs INT8 tensor-core math at a small fraction of its FP8 rate "
+    "(NVIDIA's B300 specification: ~1/30) and has no `tcgen05.mma kind::i8` (warp-level IMMA "
+    "only): compare the *INT8 W8A8* and *W8A8* floors of the *Ceilings* table (measured "
+    "peaks) and prefer FP8 W8A8 unless INT8 is measured faster"
+)
+
+
 def precision_note(precision: str | None, capability: tuple[int, ...] | None) -> str | None:
     """What an engineer of a ``precision`` target must know about this GPU (None: nothing)."""
-    if capability is None or precision not in ("fp8_weights", "fp4_weights", "fp8_kv"):
+    if capability is None:
+        return None
+    if precision == "int8_w8a8":
+        if tuple(int(c) for c in capability[:2]) == (10, 3):
+            return _INT8_CUT + "."
+        fam = family(capability)
+        why = _INT8_PATH.get(fam.key) if fam is not None else None
+        return why + "." if why else None
+    if precision not in ("fp8_weights", "fp4_weights", "fp8_kv"):
         return None
     if _below(capability, (8, 9)):
         return _SOFTWARE_FP8 + "."
@@ -455,6 +492,15 @@ def summary_lines(gpu: Any, peaks: Mapping[str, Any] | None) -> list[str]:
         lines.append("precisions this GPU cannot run: " + "; ".join(refused))
     if (note := precision_note("fp8_weights", capability)) is not None:
         lines.append(f"weight-only FP8 / FP4 and FP8 KV caches run, but {note}")
+    fp8_math = precision_unsupported("fp8_w8a8", capability) is None
+    if not fp8_math and precision_unsupported("int8_w8a8", capability) is None:
+        lines.append(
+            "8-bit tensor-core math here is INT8 (`int8_w8a8`: IMMA, s8 x s8 -> int32), and "
+            "`int8_weights` halves weight streams without an e4m3 conversion"
+        )
+    caveat = fam.key == "pre_ampere" or capability == (10, 3)  # no Triton IMMA / INT8 cut
+    if caveat and (note := precision_note("int8_w8a8", capability)) is not None:
+        lines.append(f"INT8 W8A8: {note}")
     tflops = (peaks or {}).get("tflops") or {}
     if peaks and tflops.get("bfloat16") and peaks.get("dram_gbps"):
         ridge = float(tflops["bfloat16"]) * 1000 / float(peaks["dram_gbps"])

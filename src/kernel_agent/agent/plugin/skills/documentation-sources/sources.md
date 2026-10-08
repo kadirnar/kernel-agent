@@ -108,6 +108,8 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://arxiv.org/abs/2310.10537 — Microscaling (MX) formats; spec: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 * https://arxiv.org/abs/2209.05433 — FP8 formats (e4m3 / e5m2) for deep learning.
 * https://arxiv.org/abs/2211.10438 — SmoothQuant: migrate activation outliers into the weights for W8A8.
+* https://arxiv.org/abs/2208.07339 — LLM.int8(): emergent outlier features break per-token INT8 activations past ~6.7B parameters.
+* https://arxiv.org/abs/2608.11693 — INT8 on Blackwell Ultra (B300, sm_103): ~30:1 FP8 to INT8 rate, no `tcgen05.mma kind::i8`, no CUTLASS / vLLM INT8 GEMMs there.
 * https://arxiv.org/abs/2412.19437 — DeepSeek-V3 §3.3: FP8 recipe (1x128 activation tiles, 128x128 weight blocks, promotion to fp32 every 128 along K, online scales).
 * https://arxiv.org/abs/2402.17762 — Massive activations: a few fixed channels / tokens 10^3-10^5 x the median, acting as biases.
 * https://arxiv.org/abs/2411.10958 — SageAttention2: INT4 / INT8 QKᵀ, FP8 PV, the FP22 accumulator of FP8 mma on Ada / Hopper.

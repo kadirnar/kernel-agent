@@ -45,7 +45,15 @@ from kernel_agent.profiling import ceilings
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 NEAR = "near-lossless"
-DEFAULT = ("exact", "fp8_weights", "reduced", "fp8_w8a8", "fp8_mx")  # near-lossless, no 4-bit
+DEFAULT = (  # near-lossless, no 4-bit
+    "exact",
+    "fp8_weights",
+    "reduced",
+    "fp8_w8a8",
+    "fp8_mx",
+    "int8_weights",
+    "int8_w8a8",
+)
 EVERY = tuple(compare.PRECISIONS)  # ... and with fp4_weights asked for
 WHY = "M=1 decode GEMVs stream 2 x 6 MB of bf16 weights: memory bound at 91 % of SOL"
 
@@ -243,7 +251,8 @@ def test_prompts_name_no_4bit_unless_allowed():
     only = prompts.precision_policy(NEAR, ("exact", "fp8_weights"))
     assert (
         '`precision: "fp8_w8a8"`' not in only
-        and "`fp8_w8a8`, `fp8_mx`, `reduced`, `fp4_weights` are" in only
+        and "`fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8`, `reduced`, `fp4_weights` are"
+        in only
     )
     card = {"repo_id": "org/m", "modality": "tts"}
     plan = prompts.planner_prompt(card, {"median_ms": 1.0}, "# P", ["cuda"], 2, "py", "tc", NEAR)
@@ -252,11 +261,16 @@ def test_prompts_name_no_4bit_unless_allowed():
     target = {"id": "lm", "precision": "fp8_weights", "pivot_of": None}
     block = prompts._pivot_block(target, Path("/r/pivot.json"))
     assert "4-bit precisions (`fp4_weights`) are not allowed" in block  # named as refused
-    assert "never propose them" in block and "<one of `reduced`, `fp8_w8a8`, `fp8_mx`>" in block
-    assert "streaming weights (`fp4_weights`" not in block
+    assert "never propose them" in block
+    assert "<one of `reduced`, `fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8`>" in block
+    assert "streaming weights (`int8_weights`)" in block  # no fp4_weights
     allowed = prompts._pivot_block(target, Path("/r/pivot.json"), EVERY)
-    assert "never propose" not in allowed and "streaming weights (`fp4_weights`)" in allowed
-    assert "<one of `reduced`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`, `fp8_kv`>" in allowed
+    assert "never propose" not in allowed
+    assert "streaming weights (`int8_weights`, `fp4_weights`)" in allowed
+    assert (
+        "<one of `reduced`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`, `fp8_kv`, `int8_weights`, "
+        "`int8_w8a8`>" in allowed
+    )
     assert prompts._pivot_block(target, Path("/r/p.json"), ("exact", "fp8_weights")) == ""
 
     spec = {"id": "lm", "module_class": "Linear", "why": "w", "approach": "a", "backends": ["cuda"]}
@@ -347,7 +361,8 @@ def test_research_and_replan_offer_only_allowed_pivots(tmp_path):
     text = improve.rounds_context(improver.run, improver.state, 2, [], arms, quality=NEAR)
     assert (
         "## Precision pivots" in text
-        and "`fp8_w8a8`, `fp8_mx` (the precisions this run allows)" in text
+        and "`fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8` (the precisions this run allows)"
+        in text
     )
     assert "fp4_weights" not in text
     exact_only = improve.rounds_context(
@@ -506,17 +521,17 @@ def test_ceilings_show_and_rank_by_the_allowed_floors_only():
     assert every["rows"][0]["saves_best"]["precision"] == "w4a4"  # the 4-bit floor
     text = ceilings.markdown(every)
     assert (
-        "| exact | FP8 w | W8A8 | MXFP8 | FP4 w | W4A4 | saves ms |" in text
+        "| exact | FP8 w | W8A8 | INT8 W8A8 | MXFP8 | FP4 w | W4A4 | saves ms |" in text
         and "not shown" not in text
     )
 
     table = ceilings.build(profile, peaks, 5000.0, allowed=DEFAULT)
-    assert table["columns"] == ["exact", "fp8_weights", "w8a8", "mxfp8"]
+    assert table["columns"] == ["exact", "fp8_weights", "w8a8", "int8_w8a8", "mxfp8"]
     assert table["rows"][0]["saves_best"]["precision"] == "w8a8"  # not W4A4
     assert table["rows"][0]["floors"]["w4a4"] is not None  # ceilings.json keeps every floor
     text = ceilings.markdown(table)
     header = next(line for line in text.splitlines() if line.startswith("| target"))
-    assert header.endswith("| bound | exact | FP8 w | W8A8 | MXFP8 | saves ms |")
+    assert header.endswith("| bound | exact | FP8 w | W8A8 | INT8 W8A8 | MXFP8 | saves ms |")
     row = next(line for line in text.splitlines() if line.startswith("| `UnifiedCFM`"))
     assert row.count("|") == header.count("|") and "(W8A8 " in row
     assert "not shown: FP4 w, W4A4, precisions this run does not allow" in text
@@ -525,9 +540,17 @@ def test_ceilings_show_and_rank_by_the_allowed_floors_only():
 
     exact = ceilings.markdown(ceilings.build(profile, peaks, 5000.0, allowed=("exact",)))
     assert "| bound | exact | saves ms |" in exact
-    assert "not shown: FP8 w, W8A8, MXFP8, FP4 w, W4A4," in exact and "W8A8 ≥" not in exact
+    assert (
+        "not shown: FP8 w, W8A8, INT8 W8A8, MXFP8, FP4 w, W4A4," in exact and "W8A8 ≥" not in exact
+    )
     assert ceilings.columns(("exact", "fp4_weights")) == ["exact", "fp4_weights", "w4a4"]
-    assert ceilings.target_columns(DEFAULT) == ["exact", "fp8_weights", "w8a8", "mxfp8"]
+    assert ceilings.target_columns(DEFAULT) == [
+        "exact",
+        "fp8_weights",
+        "w8a8",
+        "int8_w8a8",
+        "mxfp8",
+    ]
 
 
 # ------------------------------------------------------------------ integration and report
@@ -574,7 +597,10 @@ def test_an_old_runs_fp4_targets_stay_out_of_its_integration(tmp_path, monkeypat
     report = write_report(run).read_text()
     assert "* skipped `mlp__fp4_weights`: precision 'fp4_weights' is not allowed" in report
     assert "| `mlp__fp4_weights` (`fp4_weights`: not allowed, skipped) |" in report
-    assert "precisions allowed: exact, fp8_weights, reduced, fp8_w8a8, fp8_mx (4-bit not" in report
+    assert (
+        "precisions allowed: exact, fp8_weights, reduced, fp8_w8a8, fp8_mx, int8_weights, "
+        "int8_w8a8 (4-bit not"
+    ) in report
 
     again = orchestrator.Orchestrator.resume(run.root, {"precisions": list(EVERY)})
     assert run.load()["config"]["precisions"] == list(EVERY)

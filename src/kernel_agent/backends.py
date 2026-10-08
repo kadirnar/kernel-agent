@@ -19,7 +19,8 @@ habit:
   Both follow the GPU (issue #165, :class:`kernel_agent.gpu_arch.Facts`): the rows that
   differ by architecture (:data:`ARCH_POLICY`: compute-bound FP8 on Ada, Hopper and
   datacenter Blackwell; on GeForce Blackwell with this GPU's measured FP8 instruction
-  rates) replace :data:`POLICY`'s, whose evidence was measured on an RTX 5070 Ti (sm_120);
+  rates; compute-bound INT8 on Turing, Hopper and datacenter Blackwell) replace
+  :data:`POLICY`'s, whose evidence was measured on an RTX 5070 Ti (sm_120);
   a class whose precision the GPU cannot run is left out, and :data:`ARCH_RULES` adds what
   each family needs for the tensor-core peak.
 * :func:`outcomes` / :func:`by_backend` tabulate a run's kernel evaluations per target and
@@ -113,9 +114,26 @@ POLICY: tuple[TargetClass, ...] = (
         "CUTLASS `SM120_16x8x32_TN`) for compute-bound FP8: half rate",
     ),
     TargetClass(
+        "int8_gemm",
+        "Compute-bound INT8 GEMM (INT8 W8A8, M ≳ 128 rows)",
+        "Triton `tl.dot` on int8 tiles with an int32 accumulator, per-token quantisation in "
+        "a one-pass row kernel (or fused into the producer) and both scales + bias in the "
+        "epilogue (`examples/triton_int8_w8a8_gemm.py`)",
+        "s8 `mma.sync` (`IMMA.16832`) runs 410 TOPS on sm_120, twice the plain e4m3 "
+        "`QMMA.F32` and as fast as block-scaled `QMMA.SF` (RTX 5070 Ti; `torch._int_mm` 327 "
+        "TOPS): the example's gate|up at M = 352 runs 25 us vs 68 bf16, 32 for the FP8 example",
+        "cuBLASLt int8 (`torch._int_mm`) with the scales applied by the consumer, or CUDA C++ "
+        "`mma.sync` s8 inside a fused layer",
+        ("triton", "cuda", "cute"),
+        "never per-tensor or static (calibrated) activation scales, and never plain per-token "
+        "INT8 on activations with outlier channels (token crest > ~20): SmoothQuant, or keep "
+        "those GEMMs in FP8 / bf16",
+    ),
+    TargetClass(
         "small_m_gemm",
         "Small-M GEMV / skinny GEMM (M < 128 rows, weights streamed)",
-        "CUDA C++ (`load_inline`): the bundled FP8 GEMV / skinny GEMM examples",
+        "CUDA C++ (`load_inline`): the bundled FP8 GEMV / skinny GEMM examples (INT8: "
+        "`cuda_int8_gemv.py` weight-only, `cuda_int8_skinny_gemm.py` W8A8 on IMMA)",
         "memory bound: the weight bytes set the floor and ~19 us host per launch matters; "
         "every kept small-M kernel of the studied runs was CUDA C++ (up to 10.5x)",
         "Triton `tl.dot` with BM = 16 inside CUDA graphs (774 GB/s)",
@@ -183,6 +201,14 @@ _SIG = re.compile(r"\[([0-9, ]*)\]")
 #: per-channel scales and MXFP8 (one ue8m0 scale per 32 K-elements, ``fp8_mx``).
 _FP8 = ("fp8_w8a8", "fp8_mx")
 _FP8_LABEL = "Compute-bound FP8 GEMM (W8A8, M ≳ 128 rows)"
+#: Precisions whose GEMMs run on the INT8 tensor cores (IMMA: s8 x s8 -> int32, #178).
+_INT8 = ("int8_w8a8",)
+_INT8_LABEL = "Compute-bound INT8 GEMM (INT8 W8A8, M ≳ 128 rows)"
+_INT8_NEVER = (
+    "never per-tensor or static (calibrated) activation scales, and never plain per-token "
+    "INT8 on activations with outlier channels (token crest > ~20): SmoothQuant, or keep "
+    "those GEMMs in FP8 / bf16"
+)
 
 #: :data:`POLICY` rows that differ by architecture family (``gpu_arch.Family.key``): they
 #: replace the row of the same id on that family. :data:`POLICY`'s rows were measured on an
@@ -190,7 +216,53 @@ _FP8_LABEL = "Compute-bound FP8 GEMM (W8A8, M ≳ 128 rows)"
 #: (``gpu-architectures/gpus.md`` and its sources), and the GeForce Blackwell FP8 row the GPU's own
 #: measured rates (:func:`_geforce_fp8`).
 ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
+    "pre_ampere": {
+        "int8_gemm": TargetClass(
+            "int8_gemm",
+            _INT8_LABEL,
+            "cuBLASLt int8 (`torch._int_mm`: IMMA) with the per-token / per-channel scales in a "
+            "fused epilogue kernel, or CUDA C++ `mma.sync.m8n8k16.s32.s8.s8.s32` (sm_75's form)",
+            "Turing has IMMA (m8n8k16) but no bf16 tensor cores, and Triton's `tl.dot` runs on "
+            "CUDA cores below sm_80",
+            "CUTLASS sm_75 int8 GEMMs from C++",
+            ("cuda", "triton"),
+            "never Triton `tl.dot` for the GEMM on sm_75 (no tensor cores there); never the "
+            "`m16n8k32` s8 form (sm_80+)",
+        ),
+    },
+    "ampere": {
+        "int8_gemm": TargetClass(
+            "int8_gemm",
+            _INT8_LABEL,
+            "Triton `tl.dot` on int8 tiles (IMMA `mma.sync` m16n8k32 s8, int32 accumulators, "
+            "`cp.async` pipelines through `num_stages`) with per-token quantisation in a "
+            "one-pass row kernel and the scales + bias in the epilogue "
+            "(`examples/triton_int8_w8a8_gemm.py`); cuBLASLt int8 (`torch._int_mm`) as the "
+            "baseline",
+            "Ampere has no FP8 tensor cores: IMMA is its 8-bit compute path, 2x the bf16 rate "
+            "(A100: 624 vs 312 TOPS; GeForce RTX 30xx, whose fp32-accumulating bf16 runs at "
+            "half rate: 4x)",
+            "CUTLASS sm_80 int8 GEMMs from C++ when the epilogue fuses more; CUDA C++ "
+            "`mma.sync` s8 inside a fused layer",
+            ("triton", "cuda", "cute"),
+            _INT8_NEVER,
+        ),
+    },
     "ada": {
+        "int8_gemm": TargetClass(
+            "int8_gemm",
+            _INT8_LABEL,
+            "Triton `tl.dot` on int8 tiles (IMMA `mma.sync` m16n8k32 s8, int32 accumulators) "
+            "with per-token quantisation in a one-pass row kernel and the scales + bias in "
+            "the epilogue (`examples/triton_int8_w8a8_gemm.py`); cuBLASLt int8 "
+            "(`torch._int_mm`) as the baseline",
+            "Ada runs INT8 at the rate of FP8 with fp16 accumulation; GeForce Ada runs FP8 with "
+            "fp32 accumulation at half of it (RTX 4090: 661 INT8 TOPS vs 330 FP8 TFLOP/s), so "
+            "INT8 is the faster 8-bit path there where its accuracy holds",
+            "FP8 W8A8 (`fp8_w8a8`) where the activations have outlier channels",
+            ("triton", "cuda", "cute"),
+            _INT8_NEVER,
+        ),
         "fp8_gemm": TargetClass(
             "fp8_gemm",
             _FP8_LABEL,
@@ -208,6 +280,19 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
         ),
     },
     "hopper": {
+        "int8_gemm": TargetClass(
+            "int8_gemm",
+            _INT8_LABEL,
+            "`wgmma` s8 (int32 accumulators): Triton `tl.dot` on int8 tiles (it emits wgmma on "
+            "sm_90), cuBLASLt int8 (`torch._int_mm`) as the baseline, CUTLASS sm_90 int8 GEMMs "
+            "when the epilogue fuses scales, bias or quantisation",
+            "Hopper's INT8 peak equals its FP8 one (2x bf16) and needs `wgmma`: `mma.sync` s8 "
+            "reaches only part of it",
+            "FP8 W8A8 (`fp8_w8a8`) where the activations have outlier channels (same rate, "
+            "relative steps)",
+            ("triton", "cuda", "cute"),
+            "never a `mma.sync` kernel for a compute-bound INT8 GEMM on sm_90",
+        ),
         "fp8_gemm": TargetClass(
             "fp8_gemm",
             _FP8_LABEL,
@@ -228,6 +313,20 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
         ),
     },
     "blackwell": {
+        "int8_gemm": TargetClass(
+            "int8_gemm",
+            _INT8_LABEL,
+            "`tcgen05.mma kind::i8` (TMEM int32 accumulators): cuBLASLt int8 (`torch._int_mm`) "
+            "as the baseline, CuTe DSL / CUTLASS sm_100 GEMMs for fused epilogues, Triton "
+            "`tl.dot` on int8",
+            "B200 runs INT8 at its FP8 rate, but Blackwell Ultra (sm_103, B300) cuts INT8 "
+            "tensor throughput to ~1/30 of FP8 and has no `kind::i8` (NVIDIA's specifications, "
+            "arXiv 2608.11693): the measured INT8 peak (*Ceilings*: *INT8 W8A8*) decides, else "
+            "FP8 W8A8",
+            "FP8 W8A8 (`fp8_w8a8`) or MXFP8 (`fp8_mx`) where the run allows them",
+            ("triton", "cuda", "cute"),
+            "never a `mma.sync` kernel for a compute-bound INT8 GEMM on sm_100",
+        ),
         "fp8_gemm": TargetClass(
             "fp8_gemm",
             _FP8_LABEL,
@@ -258,7 +357,10 @@ ARCH_RULES: dict[str, tuple[str, ...]] = {
     "ampere": (
         "No FP8 tensor cores (sm_80 / sm_86): `fp8_weights`, `fp4_weights` and `fp8_kv` "
         "targets dequantise to bf16 in registers (software e4m3 conversion: CUDA C++, or "
-        "Triton on `uint8` codes); W8A8 / MXFP8 do not exist here.",
+        "Triton on `uint8` codes); FP8 W8A8 / MXFP8 do not exist here. The 8-bit compute "
+        "class is INT8 W8A8 (`int8_w8a8`: IMMA `mma.sync` m16n8k32 s8, Triton `tl.dot` on "
+        "int8, `torch._int_mm`), and `int8_weights` halves weight streams with a cheap int8 "
+        "conversion (no e4m3 emulation).",
         "No TMA, clusters or PDL: `cp.async` multi-stage pipelines (Triton `num_stages`).",
     ),
     "ada": (
@@ -336,6 +438,14 @@ def _fp8_runs(facts: Facts | None) -> bool:
     return facts is None or facts.family is None or facts.has("fp8_tc")
 
 
+def _int8_runs(facts: Facts | None) -> bool:
+    """Whether the GPU of ``facts`` has INT8 tensor cores (IMMA, sm_75+; unknown: assume so)."""
+    from kernel_agent.gpu_arch import precision_unsupported
+
+    cap = facts.capability if facts is not None else None
+    return precision_unsupported("int8_w8a8", cap) is None
+
+
 def _shape(signature: str) -> tuple[int, ...]:
     """Shape of the first tensor of a case signature (``a0[32, 11, 1024]:bfloat16``)."""
     match = _SIG.search(signature)
@@ -371,6 +481,7 @@ def target_class(spec: dict[str, Any]) -> str:
     rows = rows_of(shape)
     seq = shape[-2] if len(shape) >= 3 else None
     fp8 = precisions.of_spec(spec) in _FP8
+    int8 = precisions.of_spec(spec) in _INT8
     if family == "attention":
         return "short_attention" if seq is not None and seq <= 16 else "other"
     if family == "block" or spec.get("kind") == "region":
@@ -380,7 +491,7 @@ def target_class(spec: dict[str, Any]) -> str:
     if family in ("linear", "mlp"):
         if rows is not None and rows < 128:
             return "small_m_gemm"
-        return "fp8_gemm" if fp8 else "bf16_gemm"
+        return "fp8_gemm" if fp8 else "int8_gemm" if int8 else "bf16_gemm"
     if family in ("norm", "activation", "rope", "embedding"):
         return "elementwise"
     return "other"
@@ -417,6 +528,8 @@ def policy_text(available: Iterable[str] | None = None, facts: Facts | None = No
     for base in POLICY:
         c = policy(base.id, facts)
         if c.id == "other" or (c.id == "fp8_gemm" and not _fp8_runs(facts)):
+            continue
+        if c.id == "int8_gemm" and not _int8_runs(facts):
             continue
         if avail is not None and c.order and not set(c.order) & avail:
             continue
@@ -458,10 +571,12 @@ def engineer_note(
         lines.append(f"* {c.never}.")
     rows = rows_of(dominant_shape(target))
     fp8 = precisions.of_spec(target) in _FP8
-    if cid != "fp8_gemm" and fp8 and (rows or 0) >= 128:
-        gemm = policy("fp8_gemm", facts)
-        never = f" {gemm.never}." if gemm.never else ""
-        lines.append(f"* The GEMMs inside (M = {rows}): {gemm.first}.{never}")
+    int8 = precisions.of_spec(target) in _INT8
+    for inside, wanted in (("fp8_gemm", fp8), ("int8_gemm", int8)):
+        if cid != inside and wanted and (rows or 0) >= 128:
+            gemm = policy(inside, facts)
+            never = f" {gemm.never}." if gemm.never else ""
+            lines.append(f"* The GEMMs inside (M = {rows}): {gemm.first}.{never}")
     rules = ARCH_RULES.get(fam.key if fam else "blackwell_geforce", ())
     if fp8 and "triton" in planned:  # the family's Triton FP8 rule
         lines += [f"* {r}" for r in rules if r.startswith("Triton")]

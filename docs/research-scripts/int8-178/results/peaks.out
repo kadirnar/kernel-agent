@@ -1,0 +1,17 @@
+int8 _int_mm TOPS per shape:
+  (4096, 4096, 4096) 326.3
+  (8192, 8192, 8192) 326.5
+  (16384, 8192, 8192) 327.1
+fp8 _scaled_mm TFLOP/s: 331.1
+bf16 TFLOP/s: 98.6
+mma rates: {'bf16_f32': 103.8, 'e4m3_f32': 207.5, 'e4m3_sf_f32': 414.1, 'e4m3_f16': 414.1, 's8_s32': 411.3} {}
+mma.sync bf16 HMMA.F32 104 · e4m3 QMMA.F32 208 · e4m3 QMMA.SF 414 · e4m3 QMMA.F16 414 TFLOP/s · s8 IMMA.S32 411 TOPS
+exact (1, 4096, 1024) True
+exact (5, 2048, 6144) True
+exact (352, 1024, 8192) True
+exact (17, 8192, 1024) True
+M=352 N=8192 K=1024: int8 28.4 us (208 TOPS) bf16 68.5 us (86) fp8 29.6 us (200)
+M=704 N=8192 K=1024: int8 54.9 us (215 TOPS) bf16 127.0 us (93) fp8 48.6 us (243)
+M=352 N=1024 K=4096: int8 14.7 us (201 TOPS) bf16 39.3 us (75) fp8 17.9 us (165)
+M=352 N=2560 K=1024: int8 10.4 us (177 TOPS) bf16 26.2 us (70) fp8 14.2 us (130)
+M=4096 N=4096 K=4096: int8 423.1 us (325 TOPS) bf16 1428.6 us (96) fp8 421.6 us (326)

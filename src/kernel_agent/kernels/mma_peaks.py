@@ -12,7 +12,10 @@ GeForce Blackwell (sm_120) the FP8 instructions differ by 2x
 (``kind::mxf8f6f4.block_scale``) 416, and e4m3 with fp16 accumulation 416. Row-wise
 CUTLASS (``_scaled_mm`` with row-wise scales), Triton ``tl.dot`` on e4m3 and
 DeepSeek-style blockwise kernels use ``QMMA.F32``; Triton ``tl.dot_scaled`` and MXFP8 use
-``QMMA.SF``.
+``QMMA.SF``. The INT8 W8A8 kernels (``int8_w8a8``, issue #178: Triton ``tl.dot`` on int8,
+cuBLASLt's int8 GEMMs behind ``torch._int_mm``, CUDA ``mma.sync`` s8) use ``IMMA``: s8 x s8
+with int32 accumulation, ``m16n8k32`` from sm_80 (Turing's form is ``m8n8k16``), measured
+as :data:`S8_S32` in TOPS (one multiply-add = 2 ops, like the FLOP rates).
 
 :func:`measure` compiles one register-only kernel per instruction with NVRTC
 (``cuda.core``; each warp runs :data:`CHAINS` independent accumulator chains for
@@ -52,6 +55,7 @@ class Instruction:
 
 _F32_OUT = '"+f"(d[c][0]), "+f"(d[c][1]), "+f"(d[c][2]), "+f"(d[c][3])'
 _F16_OUT = '"+r"(h[c][0]), "+r"(h[c][1])'
+_S32_OUT = '"+r"(n[c][0]), "+r"(n[c][1]), "+r"(n[c][2]), "+r"(n[c][3])'
 _AB = '"r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)'
 
 
@@ -67,6 +71,7 @@ def _mma(ptx: str, out: str, f32: bool) -> str:
 FP8_F32 = "e4m3_f32"
 FP8_SF = "e4m3_sf_f32"
 BF16_F32 = "bf16_f32"
+S8_S32 = "s8_s32"
 INSTRUCTIONS = (
     Instruction(
         BF16_F32,
@@ -110,6 +115,15 @@ INSTRUCTIONS = (
         "e4m3 with fp16 accumulation (fp16 partial sums)",
         _mma("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16", _F16_OUT, False),
     ),
+    Instruction(
+        S8_S32,
+        "s8 IMMA.S32",
+        "IMMA.16832.S8.S8",
+        32,
+        80,
+        "INT8 W8A8 (int8_w8a8): Triton tl.dot on int8, cuBLASLt int8 (torch._int_mm), mma s8",
+        _mma("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", _S32_OUT, True),
+    ),
 )
 BY_KEY = {i.key: i for i in INSTRUCTIONS}
 
@@ -125,10 +139,12 @@ extern "C" __global__ void __launch_bounds__({THREADS}) mma_rate(float* out, uns
   b0 &= 0x3f3f3f3fu; b1 &= 0x3f3f3f3fu;
   float d[{CHAINS}][4];
   unsigned int h[{CHAINS}][2];
+  int n[{CHAINS}][4];
 #pragma unroll
   for (int c = 0; c < {CHAINS}; ++c) {{
     d[c][0] = d[c][1] = d[c][2] = d[c][3] = 0.f;
     h[c][0] = h[c][1] = 0u;
+    n[c][0] = n[c][1] = n[c][2] = n[c][3] = 0;
   }}
   unsigned int sfa = 127u, sfb = 127u;
   unsigned short z = 0;
@@ -143,7 +159,7 @@ extern "C" __global__ void __launch_bounds__({THREADS}) mma_rate(float* out, uns
 #pragma unroll
   for (int c = 0; c < {CHAINS}; ++c)
     s += d[c][0] + d[c][1] + d[c][2] + d[c][3] + __uint_as_float(h[c][0]) +
-         __uint_as_float(h[c][1]);
+         __uint_as_float(h[c][1]) + (float)(n[c][0] + n[c][1] + n[c][2] + n[c][3]);
   out[blockIdx.x * blockDim.x + threadIdx.x] = s + (float)(sfa + sfb + z);
 }}
 """
@@ -171,7 +187,9 @@ def available(instruction: Instruction, capability: tuple[int, int]) -> str | No
     ``mma.sync`` compiles on sm_90 / sm_100 but runs there as fp16 upcasts + HMMA (Triton's
     ``AccelerateMatmul.cpp``): its rate would be mistaken for an FP8 one, so it is not
     measured; those GPUs reach their FP8 peak through ``wgmma`` / ``tcgen05`` (the FP8 GEMM
-    peak of ``roofline.measure_peaks``)."""
+    peak of ``roofline.measure_peaks``). The s8 ``mma.sync`` (IMMA) is measured from sm_80
+    on: on sm_90 / sm_100 it is the ``mma.sync`` rate, below the ``wgmma`` / ``tcgen05.mma
+    kind::i8`` path that the INT8 GEMM peak (``torch._int_mm``) reaches."""
     cc = capability[0] * 10 + capability[1]
     if cc < instruction.capability:
         return f"needs sm_{instruction.capability}+, this GPU is sm_{cc}"
@@ -225,8 +243,15 @@ def measure() -> tuple[dict[str, float], dict[str, str]]:
 
 
 def describe(rates: dict[str, Any]) -> str:
-    """``mma.sync bf16 104 · e4m3 QMMA.F32 208 · e4m3 QMMA.SF 416 TFLOP/s``."""
+    """``mma.sync bf16 104 · e4m3 QMMA.F32 208 · e4m3 QMMA.SF 416 TFLOP/s`` (integer rates,
+    ``s8 IMMA.S32``, after them in TOPS)."""
     parts = [
-        f"{BY_KEY[k].label} {v:.0f}" if k in BY_KEY else f"{k} {v:.0f}" for k, v in rates.items()
+        f"{BY_KEY[k].label} {v:.0f}" if k in BY_KEY else f"{k} {v:.0f}"
+        for k, v in rates.items()
+        if k != S8_S32
     ]
-    return "mma.sync " + " · ".join(parts) + " TFLOP/s" if parts else ""
+    text = "mma.sync " + " · ".join(parts) + " TFLOP/s" if parts else ""
+    if rates.get(S8_S32):
+        ints = f"{BY_KEY[S8_S32].label} {float(rates[S8_S32]):.0f} TOPS"
+        text = f"{text} · {ints}" if text else f"mma.sync {ints}"
+    return text

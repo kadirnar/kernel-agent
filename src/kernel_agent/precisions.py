@@ -9,7 +9,8 @@ only, ``near-lossless`` and ``relaxed`` (the default of new runs, #175) every re
 precision but the opt-in ones (:data:`OPT_IN`: the
 4-bit ones, :data:`FOUR_BIT`, and ``fp8_kv``), which ``--precisions`` must name
 (``--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights``); the 8-bit classes
-(``fp8_weights``, ``fp8_w8a8``, MXFP8 ``fp8_mx``) are allowed by default. A run
+(``fp8_weights``, ``fp8_w8a8``, MXFP8 ``fp8_mx``, ``int8_weights``, ``int8_w8a8``) are
+allowed by default. A run
 continued with ``--precisions`` (``improve``, ``resume``, ``integrate``) records the new
 list in its ``run.json``.
 
@@ -23,9 +24,10 @@ and ``report.md``) and the ceilings table (only the allowed floors are shown and
 expected gains).
 
 The GPU decides too (issue #165): a precision whose math needs tensor cores the GPU lacks
-(:data:`kernel_agent.gpu_arch.PRECISION_NEEDS`: ``fp8_w8a8`` sm_89+, ``fp8_mx`` sm_100+) is
-not allowed on it (:func:`allowed` and :func:`refusal` with the GPU's ``capability``;
-:func:`unsupported` says why); a run records the list its GPU allows in ``run.json``.
+(:data:`kernel_agent.gpu_arch.PRECISION_NEEDS`: ``fp8_w8a8`` sm_89+, ``fp8_mx`` sm_100+,
+``int8_w8a8`` sm_75+) is not allowed on it (:func:`allowed` and :func:`refusal` with the GPU's
+``capability``; :func:`unsupported` says why); a run records the list its GPU allows in
+``run.json``.
 """
 
 from __future__ import annotations

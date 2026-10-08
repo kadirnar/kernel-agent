@@ -1,0 +1,24 @@
+
+## M = 352
+int8 W8A8 + SmoothQuant a=0.3            cap pass cos 0.99996 rel 0.0114 elem 0.12 norm 1.01% | redrawn 0/60 fail, max rel 0.0199 elem 0.29 norm 0.03% | x3:ok x0.01:ok x-1:ok
+int8 W8A8 + SmoothQuant a=0.4            cap pass cos 0.99997 rel 0.0082 elem 0.09 norm 0.24% | redrawn 0/60 fail, max rel 0.0204 elem 0.64 norm 0.03% | x3:ok x0.01:ok x-1:ok
+int8 W8A8 + SmoothQuant a=0.5            cap pass cos 0.99997 rel 0.0078 elem 0.08 norm 0.23% | redrawn 1/60 fail, max rel 0.0212 elem 1.13 norm 0.07% | x3:ok x0.01:ok x-1:ok
+      first failure: out[0]: an element is 1.13x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la
+int8 W8A8 + SmoothQuant a=0.6            cap pass cos 0.99997 rel 0.0079 elem 0.10 norm 0.13% | redrawn 10/60 fail, max rel 0.0503 elem 2.33 norm 0.69% | x3:ok x0.01:FAIL x-1:ok
+      first failure: out[0]: an element is 1.19x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la
+int8 W8A8 + SmoothQuant a=0.7            cap pass cos 0.99997 rel 0.0095 elem 0.15 norm 0.83% | redrawn 60/60 fail, max rel 0.1059 elem 2.95 norm 1.53% | x3:ok x0.01:FAIL x-1:FAIL
+      first failure: out[0]: an element is 1.82x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la
+int8 W8A8 + SmoothQuant a=0.8            cap FAIL cos 0.99996 rel 0.0209 elem 0.21 norm 2.03% | redrawn 60/60 fail, max rel 0.1590 elem 3.73 norm 2.10% | x3:ok x0.01:FAIL x-1:FAIL
+      first failure: out[0]: norm x0.9797 (allowed ±2%): a systematic error, not rounding noise
+
+## M = 176
+int8 W8A8 + SmoothQuant a=0.3            cap pass cos 0.99995 rel 0.0104 elem 0.12 norm 0.89% | redrawn 0/60 fail, max rel 0.0200 elem 0.32 norm 0.04% | x3:ok x0.01:ok x-1:ok
+int8 W8A8 + SmoothQuant a=0.4            cap pass cos 0.99997 rel 0.0083 elem 0.11 norm 0.10% | redrawn 0/60 fail, max rel 0.0208 elem 0.65 norm 0.05% | x3:ok x0.01:ok x-1:ok
+int8 W8A8 + SmoothQuant a=0.5            cap pass cos 0.99997 rel 0.0075 elem 0.10 norm 0.33% | redrawn 1/60 fail, max rel 0.0215 elem 1.01 norm 0.07% | x3:ok x0.01:ok x-1:ok
+      first failure: out[0]: an element is 1.01x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la
+int8 W8A8 + SmoothQuant a=0.6            cap pass cos 0.99997 rel 0.0076 elem 0.09 norm 0.04% | redrawn 6/60 fail, max rel 0.0556 elem 2.18 norm 0.74% | x3:ok x0.01:FAIL x-1:ok
+      first failure: out[0]: an element is 1.07x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la
+int8 W8A8 + SmoothQuant a=0.7            cap pass cos 0.99997 rel 0.0088 elem 0.12 norm 0.74% | redrawn 60/60 fail, max rel 0.1090 elem 2.79 norm 1.62% | x3:ok x0.01:FAIL x-1:FAIL
+      first failure: out[0]: an element is 1.11x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la
+int8 W8A8 + SmoothQuant a=0.8            cap pass cos 0.99996 rel 0.0184 elem 0.21 norm 1.77% | redrawn 60/60 fail, max rel 0.1671 elem 3.57 norm 2.33% | x3:ok x0.01:FAIL x-1:FAIL
+      first failure: out[0]: an element is 1.57x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the la

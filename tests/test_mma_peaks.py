@@ -25,6 +25,7 @@ def test_each_instruction_has_its_ptx_in_the_kernel():
         "e4m3_f32": "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32",
         "e4m3_sf_f32": "kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32",
         "e4m3_f16": "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16",
+        "s8_s32": "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32",
     }
     for instruction in mma_peaks.INSTRUCTIONS:
         src = mma_peaks.source(instruction)

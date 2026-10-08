@@ -51,6 +51,22 @@ docs/FP8.md §3):
 * :func:`mxfp8_saturation`, :func:`mxfp8_scale_problem`: a quantiser's scales against the
   block maxima (the evaluator's scale-rule guard, :mod:`kernel_agent.kernels.scale_guard`);
   :func:`mxfp8_stress_input`: blocks whose maxima sit where the OCP rule saturates.
+
+INT8 (issue #178: the 8-bit classes of GPUs without FP8 tensor cores, sm_75 / sm_80 / sm_86,
+and an option everywhere else): symmetric int8 codes in [-127, 127] (-128 unused), one fp32
+scale ``amax / 127`` (computed as ``amax * INT8_STEP``) per output channel of a weight and
+per token of the activations, codes ``round(x / scale)`` to nearest even.
+
+* ``"precision": "int8_weights"`` (weight-only, bf16 activations, dequantised in the kernel):
+  :func:`quantize_int8`, :func:`dequantize_int8`, :func:`int8_weights_linear` (the reference),
+  :func:`int8_error`.
+* ``"precision": "int8_w8a8"`` (INT8 tensor-core math: IMMA, int32 accumulation, both scales
+  in the epilogue): :func:`quantize_int8_activations` (dynamic, per token, every call),
+  :func:`int8_matmul` (the exact int32 products: ``torch._int_mm``, cuBLASLt's IMMA kernels,
+  where it applies), :func:`int8_w8a8_linear` (the reference and fallback),
+  :func:`int8_w8a8_error`, and SmoothQuant-style migration of activation outliers into the
+  weights (:func:`smoothquant_factors`: per input channel ``s``, activations ``x / s``,
+  weight columns ``W * s``; the same product in exact arithmetic).
 """
 
 from __future__ import annotations
@@ -695,3 +711,262 @@ def mxfp8_error(
         "output_cosine": round(cos, 6),
         "output_norm_ratio": round(new_norm / ref_norm, 5) if ref_norm else 1.0,
     }
+
+
+# ------------------------------------------------------------------ INT8 (int8_weights, int8_w8a8)
+
+#: Largest int8 code of the symmetric scheme: codes in [-127, 127], so -128 (no positive
+#: twin) is never produced and negation stays exact.
+INT8_MAX = 127.0
+#: ``1 / 127`` in fp32: a scale is ``amax * INT8_STEP`` (a product, the same on every device
+#: and in a kernel's ``amax * (1.0f / 127.0f)``; torch divides by a Python scalar through its
+#: reciprocal on the GPU but not on the CPU).
+INT8_STEP = float(torch.tensor(1.0 / 127.0, dtype=torch.float32))
+#: K per exact fp32 partial product of :func:`int8_matmul`'s fallback: 1024 x 127 x 127 is
+#: below 2^24, so every partial sum of int8 products is an exact fp32 integer.
+_INT8_EXACT_K = 1024
+
+
+def _int8_codes(v: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """int8 codes of fp32 ``v`` [rows, K] with one scale per row: ``round(v / scale)`` (an
+    IEEE division: ``__fdiv_rn`` / ``tl.div_rn`` in a kernel) to nearest even, clamped to
+    ±127."""
+    return torch.round(v / scale[:, None]).clamp(-INT8_MAX, INT8_MAX).to(torch.int8)
+
+
+def _row_scales(v: torch.Tensor) -> torch.Tensor:
+    """``amax(|row|) * (1 / 127)`` per row of fp32 ``v`` (1 for a row of zeros)."""
+    amax = v.abs().amax(dim=1)
+    return torch.where(amax > 0, amax * INT8_STEP, torch.ones_like(amax))
+
+
+def _smooth_of(smooth: torch.Tensor | None, k: int, device: torch.device) -> torch.Tensor | None:
+    if smooth is None:
+        return None
+    s = smooth.detach().float().to(device).reshape(-1)
+    if s.numel() != k:
+        raise ValueError(f"expected {k} smoothing factors (one per input channel), got {s.numel()}")
+    if not bool(torch.isfinite(s).all()) or not bool((s > 0).all()):
+        raise ValueError("smoothing factors must be finite and positive")
+    return s
+
+
+def quantize_int8(
+    weight: torch.Tensor, smooth: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(q, scale)`` of a 2-D weight ``[out, in]``: ``q`` int8 (same shape, contiguous) and
+    ``scale`` (fp32 ``[out]``) with ``weight ≈ q * scale[:, None]``.
+
+    Symmetric, per output channel (row), computed in fp32: ``scale = amax(|row|) / 127``,
+    codes rounded to nearest even and clamped to ±127; a row of zeros gets scale 1.
+    ``smooth`` (SmoothQuant, :func:`smoothquant_factors`): quantise ``weight * smooth[None,
+    :]`` instead, for activations divided by ``smooth``. Non-finite weights are refused."""
+    if weight.dim() != 2:
+        raise ValueError(f"expected a 2-D weight [out, in], got shape {tuple(weight.shape)}")
+    w = weight.detach().float()
+    if not bool(torch.isfinite(w).all()):
+        raise ValueError("the weight has non-finite values")
+    s = _smooth_of(smooth, w.shape[1], w.device)
+    if s is not None:
+        w = w * s[None, :]
+    scale = _row_scales(w)
+    return _int8_codes(w, scale).contiguous(), scale.contiguous()
+
+
+def dequantize_int8(
+    q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """``q * scale[:, None]`` in ``dtype`` (product in fp32, one rounding to ``dtype``)."""
+    return (q.float() * scale.float().to(q.device)[:, None]).to(dtype)
+
+
+def quantize_int8_activations(
+    x: torch.Tensor, smooth: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(q, scale)`` of activations ``x [..., in]``, per token: ``q`` int8 ``[tokens, in]``
+    (contiguous) and ``scale`` (fp32 ``[tokens]``) with ``x.reshape(-1, in) ≈ q *
+    scale[:, None]`` (with ``smooth``: ``≈ (q * scale[:, None]) * smooth``).
+
+    Dynamic: computed for every call from the row's ``amax / 127`` in fp32 (of ``x /
+    smooth`` with SmoothQuant factors), codes rounded to nearest even; a row of zeros gets
+    scale 1. The reference math of the per-token quantisation a W8A8 kernel does in its
+    prologue (or fuses into the producer of ``x``)."""
+    a = x.detach().reshape(-1, x.shape[-1]).float()
+    s = _smooth_of(smooth, a.shape[1], a.device)
+    if s is not None:
+        a = a / s[None, :]
+    scale = _row_scales(a)
+    return _int8_codes(a, scale).contiguous(), scale.contiguous()
+
+
+def _int_mm_ok(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether ``torch._int_mm`` (cuBLASLt int8 x int8 -> int32) takes ``a [M, K] @ b [N,
+    K]ᵀ`` on the GPU: CUDA tensors, K and N multiples of 8 (M is padded past 16)."""
+    return a.is_cuda and b.is_cuda and a.shape[1] % 8 == 0 and b.shape[0] % 8 == 0
+
+
+def int8_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a @ bᵀ`` of int8 ``a [M, K]`` and ``b [N, K]`` (an ``nn.Linear`` weight's layout) as
+    exact int32 ``[M, N]``: what the IMMA tensor cores accumulate.
+
+    Through ``torch._int_mm`` (cuBLASLt's int8 kernels; rows padded with zeros past its
+    M > 16 minimum) on the GPU where K and N are multiples of 8; otherwise in fp32 over
+    chunks of :data:`_INT8_EXACT_K` along K (every partial sum an exact integer) summed in
+    int32: the same integers on any device."""
+    if a.dtype != torch.int8 or b.dtype != torch.int8 or a.dim() != 2 or b.dim() != 2:
+        raise ValueError("int8_matmul takes 2-D int8 a [M, K] and b [N, K]")
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(f"K differs: a {tuple(a.shape)}, b {tuple(b.shape)}")
+    m, k = a.shape
+    b = b.to(a.device)
+    if m == 0:
+        return torch.zeros(0, b.shape[0], dtype=torch.int32, device=a.device)
+    if _int_mm_ok(a, b):
+        rows = max(m, 17)
+        rows += -rows % 8
+        padded = a if rows == m else torch.cat([a, a.new_zeros(rows - m, k)])
+        return torch._int_mm(padded.contiguous(), b.t())[:m]
+    acc = torch.zeros(m, b.shape[0], dtype=torch.int32, device=a.device)
+    for k0 in range(0, k, _INT8_EXACT_K):
+        part = a[:, k0 : k0 + _INT8_EXACT_K].float() @ b[:, k0 : k0 + _INT8_EXACT_K].float().T
+        acc += part.to(torch.int32)
+    return acc
+
+
+def int8_weights_linear(
+    x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ Wᵀ + bias`` with INT8 weight-only numerics (``int8_weights``), in ``x``'s dtype
+    and shape ``[..., out]``: the activations as they are, the int8 codes as values, fp32
+    accumulation, the per-channel scale (and the bias) once per output, one rounding."""
+    a = x.reshape(-1, x.shape[-1]).float()
+    y = (a @ q.to(a.device).float().T) * scale.float().to(a.device)[None, :]
+    if bias is not None:
+        y = y + bias.float().to(a.device)
+    return y.to(x.dtype).reshape(*x.shape[:-1], q.shape[0])
+
+
+def int8_w8a8_linear(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    smooth: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ Wᵀ + bias`` with INT8 W8A8 numerics, in ``x``'s dtype and shape ``[..., out]``.
+
+    ``(q, scale)``: the weight from :func:`quantize_int8` (one scale per output channel; with
+    ``smooth``, quantised with the same factors); ``x`` is quantised per token on every call
+    (:func:`quantize_int8_activations`), the int8 products accumulate exactly in int32
+    (:func:`int8_matmul`: ``torch._int_mm`` on the GPU), and ``acc * x_scale[m] *
+    w_scale[n] (+ bias[n])`` is computed once per output in fp32, one rounding to ``x``'s
+    dtype: the epilogue of an IMMA kernel. The fallback path of a W8A8 kernel and its
+    reference while debugging."""
+    xq, xs = quantize_int8_activations(x, smooth)
+    acc = int8_matmul(xq, q.to(xq.device))
+    y = acc.float() * xs[:, None] * scale.float().to(xq.device)[None, :]
+    if bias is not None:
+        y = y + bias.float().to(xq.device)
+    return y.to(x.dtype).reshape(*x.shape[:-1], q.shape[0])
+
+
+def int8_error(
+    weight: torch.Tensor,
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    x: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Numerical error of ``weight`` stored as :func:`quantize_int8`'s ``(q, scale)``: the
+    report of :func:`fp8_error` (``rel_l2``, ``worst_channel_rel_l2``, ``underflow``,
+    ``crest``, ``bytes``; with ``x``: ``output_rel_l2`` and ``output_cosine``). int8's step
+    is uniform (``amax / 127``): about 0.01 relative L2 on Gaussian-like rows (e4m3: 0.02-0.03),
+    but a row with an outlier (high ``crest``) loses its small weights (``underflow``), where
+    e4m3's relative step does not."""
+    w = weight.detach().float()
+    deq = dequantize_int8(q, scale, torch.float32).to(w.device)
+    return {
+        "format": "int8",
+        "granularity": "per output channel, symmetric (amax / 127)",
+        **_error_metrics(w, deq, x),
+        "bytes": {
+            "before": weight.numel() * weight.element_size(),
+            "after": q.numel() + scale.numel() * scale.element_size(),
+        },
+    }
+
+
+def int8_w8a8_error(
+    weight: torch.Tensor,
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    smooth: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Numerical error of an INT8 W8A8 layer (``(q, scale)`` from :func:`quantize_int8` with
+    the same ``smooth``): the weight report of :func:`int8_error` (of ``weight * smooth`` with
+    SmoothQuant), plus
+
+    * ``activation_rel_l2``: ``‖x − x̂‖ / ‖x‖`` of the per-token quantised activations;
+      ``activation_crest``: the largest ``amax / RMS`` of a token (an outlier channel sets the
+      token's step: at crest 30 the other values keep ~4 int8 steps per RMS, where e4m3 keeps
+      its relative step, so activation outliers cost INT8 more than FP8);
+      ``activation_underflow``: share of the non-zero activations that became 0;
+    * ``output_rel_l2``, ``output_cosine`` and ``output_norm_ratio`` of the W8A8 output against
+      ``x @ Wᵀ`` in fp32: the module-level error the near-lossless tier bounds (cosine >=
+      0.996, relative L2 <= 0.08, norm within ±2 %)."""
+    w = weight.detach().float()
+    a = x.detach().float().reshape(-1, w.shape[1]).to(w.device)
+    s = _smooth_of(smooth, w.shape[1], w.device)
+    report = int8_error(w if s is None else w * s[None, :], q, scale)
+    xq, xs = quantize_int8_activations(a, s)
+    a_hat = xq.float() * xs[:, None]
+    if s is not None:
+        a_hat = a_hat * s[None, :]
+    a_norm = float(a.norm())
+    rms = a.pow(2).mean(dim=1).sqrt()
+    crest = a.abs().amax(dim=1) / rms.clamp_min(1e-30)
+    nonzero = a != 0
+    ref = a @ w.T
+    acc = int8_matmul(xq, q.to(xq.device)).double()
+    new = (acc * xs.double()[:, None] * scale.double().to(xq.device)[None, :]).float()
+    ref_norm, new_norm = float(ref.norm()), float(new.norm())
+    cos = float((ref.flatten() @ new.flatten()) / (ref_norm * new_norm)) if ref_norm else 1.0
+    report.update(
+        activations="int8 per token" + (" (SmoothQuant)" if s is not None else ""),
+        activation_rel_l2=_sig(float((a - a_hat).norm()) / a_norm if a_norm > 0 else 0.0),
+        activation_crest=_sig(float(crest[rms > 0].max()) if bool((rms > 0).any()) else 0.0),
+        activation_underflow=_sig(
+            float((nonzero & (a_hat == 0)).sum()) / max(int(nonzero.sum()), 1)
+        ),
+        output_rel_l2=_sig(float((ref - new).norm()) / ref_norm if ref_norm else 0.0),
+        output_cosine=round(cos, 6),
+        output_norm_ratio=round(new_norm / ref_norm, 5) if ref_norm else 1.0,
+    )
+    return report
+
+
+def smoothquant_factors(
+    act_amax: torch.Tensor, weight: torch.Tensor, alpha: float = 0.5
+) -> torch.Tensor:
+    """SmoothQuant's per-input-channel factors ``s_j = amax(|X_j|)^alpha / amax(|W_j|)^(1 -
+    alpha)`` (fp32 ``[in]``; Xiao et al. 2022): divide the activations by ``s`` and multiply
+    the weight's columns by it (:func:`quantize_int8` / :func:`quantize_int8_activations`
+    with ``smooth=s``), so an outlier channel's range moves into the weight, whose per-channel
+    scales absorb it. Exact in real arithmetic: only the rounding changes.
+
+    ``act_amax``: the largest ``|x|`` per input channel over calibration activations
+    (``x.reshape(-1, in).abs().amax(0)``: the captured inputs); ``alpha``: the share of the
+    range that moves (0.5 balances both operands; up to ~0.8 for strong outliers). A channel
+    that is zero in either operand gets 1. The factors are static: a target that uses them
+    must still pass the evaluator's redrawn-input check."""
+    a = act_amax.detach().float().reshape(-1)
+    w = weight.detach().float().abs().amax(dim=0).to(a.device)
+    if a.numel() != w.numel():
+        raise ValueError(f"{a.numel()} activation maxima for a weight with {w.numel()} inputs")
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+    ok = (a > 0) & (w > 0) & torch.isfinite(a)
+    s = a.clamp_min(1e-30).pow(alpha) / w.clamp_min(1e-30).pow(1.0 - alpha)
+    return torch.where(ok, s.clamp(1e-5, 1e5), torch.ones_like(s)).contiguous()

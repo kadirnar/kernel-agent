@@ -1,6 +1,7 @@
 """Backend smoke test: run every bundled example kernel through the evaluator (the FP8
-weight-only, W8A8 and MXFP8 examples in the near-lossless tier, and their rejection by the
-exact tier, MXFP8 with the OCP floor scale rule by the scale-rule guard; the FP4 one in the
+weight-only, W8A8 and MXFP8 examples and the INT8 weight-only and W8A8 ones in the
+near-lossless tier, and their rejection by the exact tier, MXFP8 with the OCP floor scale rule
+by the scale-rule guard; the FP4 one in the
 near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+; the
 Triton toolkit examples, cached launches and short-sequence attention:
 :func:`smoke_triton_tools`; on sm_120 the CuTe DSL block-scaled W8A8 GEMM and the fused FP8
@@ -172,7 +173,24 @@ W8A8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
 MX_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     "triton_mxfp8_gemm.py": (1024, 8192, [((64, 11), 540), ((32, 11), 0)]),
 }
-_EXAMPLES = {"fp8_w8a8": W8A8_EXAMPLES, "fp8_mx": MX_EXAMPLES}
+#: The INT8 W8A8 examples (``precision: int8_w8a8``, #178), as :data:`W8A8_EXAMPLES`: the
+#: Triton IMMA GEMM on the merged gate|up projection (704 rows, compute bound; 352 rows,
+#: correctness only) and the CUDA IMMA skinny GEMM at decode sizes (16 rows; a 3-row call,
+#: and 40 rows: groups of 32 tokens, correctness only).
+INT8_W8A8_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "triton_int8_w8a8_gemm.py": (1024, 8192, [((64, 11), 540), ((32, 11), 0)]),
+    "cuda_int8_skinny_gemm.py": (2048, 12288, [((16, 1), 28), ((3,), 0), ((40,), 0)]),
+}
+#: The INT8 weight-only examples (``precision: int8_weights``), as :data:`FP8_EXAMPLES`.
+INT8_WEIGHT_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cuda_int8_gemv.py": (2048, 12288, [((1,), 28), ((4,), 1), ((2, 11), 0)]),
+}
+_EXAMPLES = {
+    "fp8_w8a8": W8A8_EXAMPLES,
+    "fp8_mx": MX_EXAMPLES,
+    "int8_w8a8": INT8_W8A8_EXAMPLES,
+    "int8_weights": INT8_WEIGHT_EXAMPLES,
+}
 
 
 #: The CuTe DSL W8A8 example on sm_120's block-scaled MMA, as :data:`W8A8_EXAMPLES`: a
@@ -320,6 +338,14 @@ def w8a8_supported(tc: object) -> bool:
     return examples_run(W8A8_EXAMPLES, tc, "triton")
 
 
+def int8_supported(tc: object) -> bool:
+    """Whether every INT8 example can run here: the ``triton`` and ``cuda`` backends on a
+    GPU of their ``ARCHS`` (sm_80+: ``mma.sync`` m16n8k32 s8, Triton's int8 ``tl.dot``)."""
+    triton = [n for n in INT8_W8A8_EXAMPLES if n.startswith("triton_")]
+    cuda = [n for n in (*INT8_W8A8_EXAMPLES, *INT8_WEIGHT_EXAMPLES) if n.startswith("cuda_")]
+    return examples_run(triton, tc, "triton") and examples_run(cuda, tc, "cuda")
+
+
 def mxfp8_supported(tc: object) -> bool:
     """Whether the MXFP8 examples can run: the ``triton`` backend on a GPU with block-scaled
     tensor cores (sm_100 or newer: their ``ARCHS``) and a torch with ``F.scaled_mm``."""
@@ -390,8 +416,9 @@ def smoke_fp8(
     examples: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] | None = None,
     capture: Any = make_linear_capture,
 ) -> bool:
-    """Every FP8 example of ``precision`` (:data:`FP8_EXAMPLES`, :data:`W8A8_EXAMPLES`,
-    :data:`MX_EXAMPLES`, or ``examples`` captured with ``capture``) passes the evaluator in
+    """Every FP8 (or INT8) example of ``precision`` (:data:`FP8_EXAMPLES`,
+    :data:`W8A8_EXAMPLES`, :data:`MX_EXAMPLES`, :data:`INT8_W8A8_EXAMPLES`,
+    :data:`INT8_WEIGHT_EXAMPLES`, or ``examples`` captured with ``capture``) passes the evaluator in
     the near-lossless tier, and the exact tier (a quick check) rejects it; an MXFP8 example
     with the OCP floor scale rule fails the scale-rule guard."""
     from kernel_agent.kernels.evaluate import run_evaluation
@@ -694,6 +721,13 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_block_scale(tuple(tc.gpu.capability) if tc.gpu else (0, 0), verbose)
         if runs(MX_EXAMPLES, "triton") and mxfp8_supported(tc):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
+        for precision, found in (
+            ("int8_w8a8", INT8_W8A8_EXAMPLES),
+            ("int8_weights", INT8_WEIGHT_EXAMPLES),
+        ):  # INT8 (#178): each example with its own backend
+            for name, spec in found.items():
+                if runs([name], name.split("_", 1)[0]):
+                    ok &= smoke_fp8(Path(tmp), verbose, precision=precision, examples={name: spec})
         if tc.backends.get("triton") and (backends is None or "triton" in backends):
             attention = runs(["triton_short_attention.py"], "triton")
             ok &= smoke_triton_tools(Path(tmp), verbose, attention=attention)

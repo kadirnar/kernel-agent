@@ -17,6 +17,10 @@ block's measured peaks and instruction rates are the numbers to use.
   sm_70. CUDA 13 dropped sm_70 / sm_72 (Turing is its minimum).
 * Weight-only FP8 / FP4 and FP8 KV caches still run (software dequantisation, as on
   Ampere); W8A8 and MXFP8 do not.
+* INT8 tensor cores on sm_75 (IMMA, `mma.sync` m8n8k16 s8, 2x the fp16 rate): `int8_w8a8`
+  runs there through cuBLASLt (`torch._int_mm`) or CUDA C++ (Triton's `tl.dot` has no
+  tensor cores below sm_80; the `m16n8k32` form needs sm_80). sm_70 has no INT8 MMA:
+  `int8_w8a8` is refused there; `int8_weights` runs everywhere.
 
 ## [ampere] Ampere (sm_80: A100, A30; sm_86 / sm_87: A10, A40, RTX A6000, RTX 30xx, Orin)
 
@@ -29,6 +33,11 @@ block's measured peaks and instruction rates are the numbers to use.
   a few integer ops per value, hidden under the DRAM time of a GEMV), and Triton has no
   e4m3 type below sm_89 (load the codes as `uint8` and convert with bit operations). vLLM
   runs FP8 checkpoints on Ampere the same way (weight-only W8A16, FP8 Marlin kernels).
+* **INT8 is the 8-bit compute class here**: `int8_w8a8` (IMMA `mma.sync` m16n8k32 s8 with
+  int32 accumulation at twice the bf16 rate: A100 624 vs 312 TOPS dense; Triton `tl.dot` on
+  int8 tiles, `torch._int_mm`), and `int8_weights` for weight streams (int8 codes convert
+  in two ops per value, no e4m3 emulation). Activation outlier channels need SmoothQuant
+  or bf16 for those GEMMs (low_precision.md, "INT8").
 * No TMA, no clusters, no PDL (`griddepcontrol` needs sm_90): CUDA graphs are the way to
   cut launch gaps.
 * Shared memory: 163 KB per block on sm_80 (and sm_87), 99 KB on sm_86. L2: 40 MB on A100
@@ -47,6 +56,10 @@ block's measured peaks and instruction rates are the numbers to use.
 * The FP8 accumulator of `mma ... f32.e4m3.e4m3.f32` keeps fewer bits than fp32 (about
   FP22: SageAttention2) on long K: promote partial sums to fp32 every few K blocks when
   the tolerance tier is tight.
+* INT8 `mma.sync` (IMMA) runs at the rate of FP8 with fp16 accumulation; GeForce Ada runs
+  FP8 with fp32 accumulation at half of it, so INT8 W8A8 (`int8_w8a8`) can be the faster
+  8-bit path there where the activations suit it: the toolchain block's measured `s8 IMMA`
+  and `e4m3 QMMA.F32` rates say.
 * No TMA, clusters or PDL: `cp.async` pipelines, CUDA graphs for launch gaps.
   Shared memory 99 KB per block; large L2 (the AD102 die has 96 MB; products enable less:
   the toolchain block has this GPU's).
@@ -69,6 +82,8 @@ block's measured peaks and instruction rates are the numbers to use.
 * FP8 wgmma accumulates with fewer bits than fp32 (DeepSeek-V3: about 14 bits): promote
   to fp32 every 128 along K (4 wgmmas) for long reductions.
 * FlashAttention-3 (Hopper-only, wgmma + TMA, FP8 attention) is the reference attention.
+* INT8 (`int8_w8a8`): `wgmma` on s8 with int32 accumulators at the FP8 rate (Triton
+  `tl.dot` on int8, CUTLASS sm_90); a `mma.sync` s8 kernel stops below it.
 
 ## [blackwell] Blackwell, datacenter (sm_100 / sm_103 / sm_110: B200, GB200, B300, GB300)
 
@@ -87,6 +102,10 @@ block's measured peaks and instruction rates are the numbers to use.
   block-scaled GEMMs), CUTLASS sm_100 kernels.
 * Shared memory 227 KB per block (deeper pipelines and larger tiles than the 99 KB of the
   sm_120 examples), clusters, PDL. L2: 126 MB on GB200.
+* INT8 (`int8_w8a8`): `tcgen05.mma kind::i8` on sm_100 (B200: INT8 at the FP8 rate).
+  **Blackwell Ultra (sm_103: B300, GB300) keeps INT8 at about 1/30 of its FP8 rate**, the
+  PTX ISA exposes no `kind::i8` there (only warp-level IMMA) and CUTLASS generates no INT8
+  kernels for it: prefer FP8 W8A8 on sm_103 unless INT8 is measured faster.
 
 ## [blackwell_geforce] Blackwell GeForce / RTX PRO / DGX Spark (sm_120 / sm_121)
 
@@ -102,6 +121,9 @@ sm_120 sections hold them.
   TFLOP/s; RTX 5090: 510 vs 1014, flashinfer #5963). Compute-bound FP8: the block-scaled
   instruction (Triton `tl.dot_scaled` with unit scales, CuTe DSL `MmaMXF8Op`); the
   toolchain block's measured rates say whether this GPU (RTX PRO cards included) differs.
+* INT8 `mma.sync` (`IMMA.16832.S8.S8`, int32 accumulation) runs at the full rate: 410
+  TOPS on an RTX 5070 Ti, as fast as the block-scaled FP8 instruction and twice plain e4m3
+  with fp32 accumulation, so a plain Triton `tl.dot` on int8 reaches it (`int8_w8a8`).
 * TMA works without multicast (CUTLASS fixes the cluster shape to 1x1x1); PDL works.
   Shared memory 99 KB per block: Hopper / B200 tile configs do not fit (Triton raises
   `OutOfResources`). cuBLASLt has tensor-wise FP8 and MXFP8 here, but no row-wise or
@@ -132,4 +154,6 @@ instruction.
 * https://raw.githubusercontent.com/vllm-project/vllm/main/docs/features/quantization/llm_compressor/fp8.md — vLLM: W8A8 FP8 needs sm_89+; FP8 checkpoints run weight-only (W8A16, FP8 Marlin) from sm_75.
 * https://github.com/flashinfer-ai/flashinfer/issues/5963 — GeForce Blackwell: FP8 fp32-accumulate half rate, block-scaled MMA with unit scales at full rate.
 * https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/ — B200 / B300 dense FP8 and NVFP4 rates.
+* https://developer.nvidia.com/blog/nvidia-ampere-architecture-in-depth/ — A100: INT8 tensor cores at 624 TOPS dense, twice bf16's 312 TFLOP/s; IMMA `mma.sync` m16n8k32.
+* https://arxiv.org/abs/2608.11693 — INT8 on Blackwell Ultra (B300, sm_103): ~30:1 FP8 to INT8 dense rate (1:1 on H200 / B200), no `tcgen05.mma kind::i8` on sm_103a, no CUTLASS INT8 kernels for it.
 * https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html — CUDA 13 drops Maxwell / Pascal / Volta; SM101 renumbered SM110.

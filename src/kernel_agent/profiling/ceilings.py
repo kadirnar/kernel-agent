@@ -26,6 +26,9 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   - ``mxfp8``: MXFP8 weights (one byte + an e8m0 scale per 32), all FLOPs at the measured
     MXFP8 peak (the block-scaled tensor cores, cuBLASLt ``VEC32_UE8M0``; target precision
     ``fp8_mx``);
+  - ``int8_w8a8``: INT8 weights, all FLOPs at the measured INT8 tensor-core peak (IMMA,
+    ``torch._int_mm``; target precision ``int8_w8a8``, #178). INT8 weight-only
+    (``int8_weights``) has the ``fp8_weights`` floor (one byte per weight, math as profiled);
   - ``fp4_weights``: NVFP4 weights, 4.5 bits each (e2m1 + one e4m3 scale per 16), math
     as profiled;
   - ``w4a4``: NVFP4 weights, all FLOPs at the NVFP4 tensor-core peak.
@@ -35,7 +38,8 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   the run allows (``--precisions``, :mod:`kernel_agent.precisions`: exact; near-lossless
   FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with 4-bit allowed), and only they rank a row.
   A column whose tensor cores the peaks' GPU lacks (W8A8 before sm_89, MXFP8 and W4A4
-  before sm_100: :data:`kernel_agent.gpu_arch.COLUMN_NEEDS`) is never shown (``gpu_hidden``).
+  before sm_100, INT8 W8A8 before sm_75: :data:`kernel_agent.gpu_arch.COLUMN_NEEDS`) is never
+  shown (``gpu_hidden``).
 * **bound**: the term that sets the exact floor (``compute``, ``memory`` or ``launch``).
 * **FP8 instruction** (``fp8_mma``, with the tensor-core instruction rates measured,
   :mod:`kernel_agent.kernels.mma_peaks`): the W8A8 floor assumes the FP8 GEMM peak, which
@@ -88,7 +92,7 @@ from typing import Any
 
 from kernel_agent import projection
 from kernel_agent.kernels.mma_peaks import FP8_F32, FP8_SF
-from kernel_agent.kernels.roofline import FP4, FP8, MXFP8
+from kernel_agent.kernels.roofline import FP4, FP8, INT8, MXFP8
 
 
 @dataclass(frozen=True)
@@ -102,15 +106,18 @@ PRECISIONS = {
     "exact": Precision("exact", None, None),
     "fp8_weights": Precision("FP8 w", 1.0, None),
     "w8a8": Precision("W8A8", 1.0, FP8),
+    "int8_w8a8": Precision("INT8 W8A8", 1.0, INT8),
     "mxfp8": Precision("MXFP8", 1.0 + 1.0 / 32, MXFP8),
     "fp4_weights": Precision("FP4 w", 4.5 / 8, None),
     "w4a4": Precision("W4A4", 4.5 / 8, FP4),
 }
-_SHORT = {FP8: "FP8", FP4: "NVFP4", MXFP8: "block-scaled FP8"}
+_SHORT = {FP8: "FP8", FP4: "NVFP4", MXFP8: "block-scaled FP8", INT8: "INT8"}
+#: The unit of a peak (``peaks["tflops"]``): integer math counts operations, not FLOPs.
+_UNIT = {INT8: "TOPS"}
 #: What each precision's floor assumes, for the table's legend.
 _LEGEND = {
     "exact": "exact (as profiled)",
-    "fp8_weights": "FP8 w (1 byte per weight, bf16 math)",
+    "fp8_weights": "FP8 w (1 byte per weight, bf16 math; also INT8 weight-only's floor)",
     "fp4_weights": "FP4 w (NVFP4, 4.5 bits per weight, bf16 math)",
 }
 #: A target's ``precision`` (``kernels.compare.PRECISIONS``) → the column of its floor
@@ -121,6 +128,8 @@ TARGET_COLUMNS = {
     "fp8_w8a8": "w8a8",
     "fp8_mx": "mxfp8",
     "fp4_weights": "fp4_weights",
+    "int8_weights": "fp8_weights",  # one byte per weight, bf16 math: the same floor
+    "int8_w8a8": "int8_w8a8",
 }
 #: The 4-bit columns, and the target precision that allows them (W4A4: no target precision
 #: reaches it; shown when 4-bit weights are allowed).
@@ -411,6 +420,8 @@ TARGET_PRECISIONS = {
     "fp8_w8a8": PRECISIONS["w8a8"],
     "fp8_mx": PRECISIONS["mxfp8"],
     "fp4_weights": PRECISIONS["fp4_weights"],
+    "int8_weights": Precision("INT8 w", 1.0, None),  # the fp8_weights floor, its own label
+    "int8_w8a8": PRECISIONS["int8_w8a8"],
     "reduced": Precision("bf16", 2.0, "bfloat16"),
 }
 _SIBLINGS = re.compile(r"(.*)\.\{([^{}]*)\}")
@@ -526,7 +537,11 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             p = precisions[name]
             legend.append(
                 f"{p['label']} at {_SHORT.get(p['peak'], p['peak'])} "
-                + (f"{p['peak_tflops']:.0f} TFLOP/s" if p.get("peak_tflops") else "unknown")
+                + (
+                    f"{p['peak_tflops']:.0f} {_UNIT.get(p['peak'], 'TFLOP/s')}"
+                    if p.get("peak_tflops")
+                    else "unknown"
+                )
             )
         if hidden:
             legend[-1] += (

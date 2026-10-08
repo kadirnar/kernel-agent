@@ -5,9 +5,10 @@
   of a few large shapes; FP8 e4m3 via ``torch._scaled_mm`` and NVFP4 where torch
   has a kernel for the GPU, else ``tflops_unavailable`` says why) and the launch
   floor (median time of a module call that
-  launches one tiny kernel, timed like a candidate), and the tensor-core
+  launches one tiny kernel, timed like a candidate), the INT8 GEMM peak (``int8``:
+  ``torch._int_mm``, cuBLASLt's IMMA kernels, in TOPS), and the tensor-core
   instruction rates (``mma_tflops``, :mod:`.mma_peaks`: plain FP8 ``QMMA.F32``
-  vs block-scaled ``QMMA.SF`` vs bf16).  :func:`ensure_peaks`
+  vs block-scaled ``QMMA.SF`` vs bf16 vs s8 ``IMMA``).  :func:`ensure_peaks`
   measures them once per GPU + torch version in a subprocess under the GPU lock
   and caches them in ``<cache>/peaks-<gpu>-torch<version>.json``; they are never
   measured inside a timed evaluation.
@@ -38,6 +39,8 @@ an FP8 peak (none measured on this GPU, or a cache older than :data:`PEAKS_VERSI
 cases are flagged ``sol_unreliable`` with a ``sol_note``. An ``fp8_mx`` (MXFP8) target's
 weights count at one byte plus one scale byte per 32, its GEMMs at the measured MXFP8 peak
 (:data:`MXFP8`: the block-scaled tensor cores through ``F.scaled_mm`` ``BlockWise1x32``).
+INT8 (#178): an ``int8_weights`` or ``int8_w8a8`` target's weights count at one byte, and the
+GEMMs on the weights of an ``int8_w8a8`` target at the measured INT8 peak (:data:`INT8`).
 
 Limitations: bytes are what the reference touches.  Reads through gather ops
 (embedding, index, index_select, gather) count the gathered rows, and SDPA counts
@@ -72,7 +75,14 @@ MASKED = -1e4  # additive attention-mask values at or below this mask the positi
 #: the 2-D floating-point parameters the reference reads count at this width plus one fp32
 #: scale per output channel (row), so ``pct_of_sol`` of an FP8 kernel is measured against
 #: the bytes it must stream, not the bf16 weights it replaced.
-WEIGHT_BITS = {"fp8_weights": 8, "fp4_weights": 4, "fp8_w8a8": 8, "fp8_mx": 8}
+WEIGHT_BITS = {
+    "fp8_weights": 8,
+    "fp4_weights": 4,
+    "fp8_w8a8": 8,
+    "fp8_mx": 8,
+    "int8_weights": 8,
+    "int8_w8a8": 8,
+}
 #: ... or, for block-scaled formats, plus one 1-byte scale per this many elements and one
 #: fp32 scale per tensor (``fp4_weights``: NVFP4, an e4m3 scale per 16; ``fp8_mx``: MXFP8,
 #: an e8m0 scale per 32).
@@ -82,13 +92,17 @@ FP8, FP4 = "float8_e4m3fn", "float4_e2m1fn_x2"
 #: ... and MXFP8 (e4m3 with an e8m0 scale per 32 along K on both operands: the block-scaled
 #: MMA, ``kind::mxf8f6f4.block_scale``, sm_100 / sm_120; cuBLASLt ``VEC32_UE8M0``).
 MXFP8 = "mxfp8"
+#: ... and INT8 (s8 x s8 -> int32 on the IMMA tensor cores, ``torch._int_mm``; TOPS: one
+#: multiply-add = 2 ops, like a FLOP).
+INT8 = "int8"
 #: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks, 3 the MXFP8 one, 4 the
-#: tensor-core instruction rates (``mma_tflops``). :func:`ensure_peaks` measures an older
-#: cache again (once per process at most); until then it stays in use.
-PEAKS_VERSION = 4
+#: tensor-core instruction rates (``mma_tflops``), 5 the INT8 peak and the s8 IMMA rate.
+#: :func:`ensure_peaks` measures an older cache again (once per process at most); until then
+#: it stays in use.
+PEAKS_VERSION = 5
 #: The tensor-core math of a reduced-precision target: the FLOPs of every op that reads one
 #: of its narrowed weights count at this dtype's peak (W8A8: FP8), not at the reference's.
-MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8}
+MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8, "int8_w8a8": INT8}
 _MiB = 1024**2
 
 # Ops that look at a tensor argument's metadata only (no data read).
@@ -296,6 +310,27 @@ def _mxfp8_tflops(shapes: list[tuple[int, int, int]], free: int) -> float | None
     return None if best is None else round(best, 1)
 
 
+def _int8_tops(shapes: list[tuple[int, int, int]], free: int) -> float | None:
+    """Dense INT8 s8 x s8 -> int32 via ``torch._int_mm`` (cuBLASLt's IMMA kernels; the
+    weight-like operand column-major, as ``quant.int8_matmul`` passes it), in TOPS."""
+    import torch
+
+    best = None
+    for m, n, k in shapes:
+        if m * k + k * n + 4 * m * n > free // 2:
+            continue
+        a = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
+        b = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8).t()
+
+        def int_mm(a: Any = a, b: Any = b) -> Any:
+            return torch._int_mm(a, b)
+
+        tops = _gemm_tflops(int_mm, m, n, k)
+        best = tops if best is None else max(best, tops)
+        del a, b
+    return None if best is None else round(best, 1)
+
+
 def measure_peaks() -> dict[str, Any]:
     """Measure the roofline peaks of the current GPU (takes ~10-30 s; hold the GPU lock)."""
     import torch
@@ -345,7 +380,12 @@ def measure_peaks() -> dict[str, Any]:
     # Low-precision tensor cores: measured where torch has a kernel for this GPU, else the
     # reason is recorded (a ratio to bf16 is never assumed).
     unavailable: dict[str, str] = {}
-    for name, measure in ((FP8, _fp8_tflops), (FP4, _fp4_tflops), (MXFP8, _mxfp8_tflops)):
+    for name, measure in (
+        (FP8, _fp8_tflops),
+        (FP4, _fp4_tflops),
+        (MXFP8, _mxfp8_tflops),
+        (INT8, _int8_tops),
+    ):
         try:
             tflops = measure(big, free)
         except Exception as exc:  # no kernel for this GPU / torch build
@@ -723,9 +763,10 @@ def count_case(
     precision: str | None = None,
 ) -> CaseCost:
     """FLOPs (per dtype) and minimum bytes of one reference call (inputs are not mutated).
-    ``precision`` (``fp8_weights``, ``fp4_weights``, ``fp8_w8a8``): the weights count at
-    their reduced width (:data:`WEIGHT_BITS`, :data:`WEIGHT_SCALE_BLOCK`), and the GEMMs on
-    them at the FP8 peak for ``fp8_w8a8`` (:data:`MATH_DTYPE`)."""
+    ``precision`` (``fp8_weights``, ``fp4_weights``, ``fp8_w8a8``, ``int8_w8a8``, ...): the
+    weights count at their reduced width (:data:`WEIGHT_BITS`, :data:`WEIGHT_SCALE_BLOCK`),
+    and the GEMMs on them at the FP8 peak for ``fp8_w8a8``, the INT8 one for ``int8_w8a8``
+    (:data:`MATH_DTYPE`)."""
     import torch
     from torch.utils.flop_counter import FlopCounterMode
 
