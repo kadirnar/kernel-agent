@@ -2,7 +2,7 @@
 (decode, M <= 4 rows): the weight streams at one byte per element, activations stay bf16.
 
 Reduced precision: only for a target whose spec says ``"precision": "int8_weights"`` (a
-``--quality near-lossless`` run, knowledge/low_precision.md, "INT8 weight-only"). The
+``--quality near-lossless`` or ``relaxed`` run, skill int8-weights). The
 evaluator checks it in the near-lossless tier; the exact tier rejects it.
 
 * ``build()`` quantises the weight once (``kernel_agent.kernels.quant.quantize_int8``:

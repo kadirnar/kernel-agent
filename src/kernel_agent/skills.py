@@ -54,6 +54,8 @@ LEGACY: dict[str, tuple[str, ...]] = {
         "mxfp8",
         "fp8-kv-cache",
         "fp4-weights",
+        "int8-weights",
+        "int8-w8a8",
     ),
     "systems.md": ("systems-patterns", "speculative-decoding"),
     "native.md": ("native-engines",),
@@ -76,6 +78,8 @@ PRECISION_SKILLS = {
     "fp8_mx": "mxfp8",
     "fp8_kv": "fp8-kv-cache",
     "fp4_weights": "fp4-weights",
+    "int8_weights": "int8-weights",
+    "int8_w8a8": "int8-w8a8",
     "reduced": "precision-tiers",
 }
 #: The skills a role loads first, before those of its target's backends and precision.

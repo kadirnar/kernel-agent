@@ -15,7 +15,7 @@ import pytest
 import torch
 from torch import nn
 
-from kernel_agent import backends, gpu_arch, pivot, precisions, selftest
+from kernel_agent import backends, gpu_arch, pivot, precisions, selftest, skills
 from kernel_agent.agent import prompts
 from kernel_agent.kernels import compare, mma_peaks, quant, roofline
 from kernel_agent.kernels.evaluate import evaluate, run_evaluation
@@ -266,6 +266,7 @@ def _target(precision: str) -> dict:
                 "smoothquant_factors",
                 "never one static or per-tensor scale",
                 "int8_w8a8_error(weight, q, scale, x)",
+                "`kernel-agent:int8-w8a8`",  # the skill the session loads (#176)
             ),
         ),
         (
@@ -274,6 +275,7 @@ def _target(precision: str) -> dict:
                 "INT8 weight-only",
                 "quantize_int8, int8_weights_linear, int8_error",
                 "cuda_int8_gemv",
+                "`kernel-agent:int8-weights`",
             ),
         ),
     ],
@@ -430,9 +432,22 @@ def test_examples_and_selftest_tables():
     assert "m16n8k32.row.col.s32.s8.s8.s32" in skinny and "__fdiv_rn" in skinny
     assert "__byte_perm" in (prompts.EXAMPLES_DIR / "cuda_int8_gemv.py").read_text()
     assert selftest._EXAMPLES["int8_w8a8"] is selftest.INT8_W8A8_EXAMPLES
-    text = prompts.knowledge("low_precision.md")
-    for needle in ("## INT8", "int8_w8a8", "int8_weights", "IMMA", "SmoothQuant", "410 TOPS"):
-        assert needle in text, needle
+    # the guides are Agent Skills (#176): one per INT8 class, named by precision-tiers
+    w8a8, weights = skills.get("int8-w8a8").text(), skills.get("int8-weights").text()
+    for needle in ("## The contract", "IMMA", "SmoothQuant", "410 TOPS", "kind::i8", "alpha 0.4"):
+        assert needle in w8a8, needle
+    for needle in ("## The contract", "__byte_perm", "cuda_int8_gemv.py", "0.0054"):
+        assert needle in weights, needle
+    tiers = skills.get("precision-tiers").path.read_text()
+    assert (
+        "| `int8_w8a8` | `int8-w8a8` |" in tiers and "| `int8_weights` | `int8-weights` |" in tiers
+    )
+    assert skills.PRECISION_SKILLS["int8_w8a8"] == "int8-w8a8"
+    assert {"int8-weights", "int8-w8a8"} <= set(skills.LEGACY["low_precision.md"])
+    assert "## INT8" not in prompts.knowledge("low_precision.md")  # no inlined guide
+    for precision, skill in (("int8_w8a8", "int8-w8a8"), ("int8_weights", "int8-weights")):
+        names = skills.for_role("kernel", backends=["triton"], precision=precision)
+        assert names[-2:] == ["kernel-agent:precision-tiers", f"kernel-agent:{skill}"]
 
 
 # ---------------------------------------------------------------- the tier on an INT8 candidate

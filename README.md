@@ -2651,7 +2651,8 @@ guide in its prompt (`kernel_agent/skills.py`, `kernel_agent/roles.py`):
   (`optimisation-playbook`, `profiling-and-roofline`, `correctness-and-anti-gaming`),
   backends (`triton-kernels`, `cuda-kernels`, `cute-dsl`, `tilelang-kernels`,
   `cuda-graphs-streams-pdl`), precisions (`precision-tiers`, `fp8-weights`, `fp8-w8a8`,
-  `mxfp8`, `fp8-kv-cache`, `fp4-weights`), systems (`systems-patterns`,
+  `mxfp8`, `fp8-kv-cache`, `fp4-weights`, `int8-weights`, `int8-w8a8`), systems
+  (`systems-patterns`,
   `speculative-decoding`, `native-engines`) and reference (`gpu-architectures`,
   `documentation-sources`). A session's context holds each skill's name and one-line
   description; the Skill tool loads a `SKILL.md` (with its directory) when the task

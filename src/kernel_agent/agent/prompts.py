@@ -997,7 +997,7 @@ def _precision_block(
   bf16 / fp16 for the tensor cores), accumulate in fp32, apply the scale (and bias) once
   per output in the epilogue, round to bf16 once;
 * verified example: `cuda_int8_gemv.py` (decode GEMV, M <= 4); reference:
-  `int8_weights_linear`; guide: "INT8" in "Low-precision weights" below;
+  `int8_weights_linear`; guide: skill `kernel-agent:int8-weights`;
 * report the numerical error in `NOTES.md`: `int8_error(weight, q, scale)` of the weights
   (its `crest`: rows with outliers lose their small weights) and the evaluator's per-case
   `min_cosine` / `max_rel_l2`."""
@@ -1022,8 +1022,8 @@ def _precision_block(
   producer), or keep those GEMMs in bf16 / FP8 (where the run allows it);
 * verified examples: `triton_int8_w8a8_gemm.py` (compute-bound GEMMs, M ≳ 64),
   `cuda_int8_skinny_gemm.py` (IMMA skinny GEMM, M <= 32 per weight read: decode); reference
-  and fallback: `int8_w8a8_linear` (`torch._int_mm`); guide: "INT8 W8A8" in "Low-precision
-  weights" below;
+  and fallback: `int8_w8a8_linear` (`torch._int_mm`); guide: skill
+  `kernel-agent:int8-w8a8`;
 * report the numerical error in `NOTES.md`: `int8_w8a8_error(weight, q, scale, x)` on
   captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     elif precision == "fp8_kv":

@@ -4,7 +4,7 @@ path of GPUs without FP8 tensor cores (Ampere sm_80 / sm_86), and an option on e
 from sm_80 on.
 
 Reduced precision: only for a target whose spec says ``"precision": "int8_w8a8"`` (a
-``--quality near-lossless`` run, knowledge/low_precision.md, "INT8 W8A8"); the exact tier
+``--quality near-lossless`` or ``relaxed`` run, skill int8-w8a8); the exact tier
 rejects it.
 
 * ``build()`` quantises the weight once (``kernel_agent.kernels.quant.quantize_int8``:

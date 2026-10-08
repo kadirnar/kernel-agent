@@ -1,7 +1,7 @@
 # INT8 W8A8 / weight-only: research scripts (issue #178)
 
-The scripts behind the INT8 numbers in the README ("INT8"), `knowledge/low_precision.md`
-("INT8") and `kernels/compare.py`, kept as they were run (RTX 5070 Ti, sm_120, torch
+The scripts behind the INT8 numbers in the README ("INT8"), the `int8-w8a8` / `int8-weights`
+skills and `kernels/compare.py`, kept as they were run (RTX 5070 Ti, sm_120, torch
 2.14.1+cu130, Triton 3.8.0), with their raw output in `results/`. One-off benchmarks, not
 part of the library (excluded from ruff). They import `kernel_agent` (put `src/` and this
 directory on `PYTHONPATH`) and read the VoxCPM2 / Qwen3 captures of `runs/` (read only).
