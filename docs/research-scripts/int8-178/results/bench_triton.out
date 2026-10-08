@@ -1,0 +1,8 @@
+N=8192 K=1024 M=352: int8 example 25.1 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0114) | _int_mm path 80.7 | bf16 68.4 | fp8 example 32.0
+N=8192 K=1024 M=704: int8 example 45.8 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0114) | _int_mm path 172.9 | bf16 126.6 | fp8 example 57.7
+N=1024 K=4096 M=352: int8 example 20.0 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0128) | _int_mm path 61.2 | bf16 39.0 | fp8 example 18.8
+N=1024 K=4096 M=704: int8 example 33.0 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0126) | _int_mm path 104.7 | bf16 67.7 | fp8 example 32.1
+N=2560 K=1024 M=352: int8 example 10.6 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0113) | _int_mm path 41.0 | bf16 25.5 | fp8 example 10.8
+N=2560 K=1024 M=704: int8 example 19.6 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0113) | _int_mm path 66.4 | bf16 43.7 | fp8 example 19.5
+N=1024 K=2048 M=352: int8 example 11.7 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0119) | _int_mm path 40.2 | bf16 22.6 | fp8 example 10.7
+N=1024 K=2048 M=704: int8 example 18.7 us (bit-exact vs _int_mm ref: True, rel L2 vs bf16 0.0120) | _int_mm path 64.2 | bf16 37.0 | fp8 example 17.9

@@ -1,0 +1,24 @@
+[1, 2048] x [2048, 6144]: bf16 32.3 us | int8 W8A8 skinny 17.2 (exact True, rel L2 0.0122) | fp8 skinny 16.2 | int8 gemv 16.5 (762 GB/s, vs ref 0.0e+00, rel L2 0.0085) | fp8 gemv 16.3
+[16, 2048] x [2048, 6144]: bf16 31.9 us | int8 W8A8 skinny 17.7 (exact True, rel L2 0.0119) | fp8 skinny 16.6
+[32, 2048] x [2048, 6144]: bf16 34.7 us | int8 W8A8 skinny 18.6 (exact True, rel L2 0.0120) | fp8 skinny 18.8
+[64, 2048] x [2048, 6144]: bf16 35.4 us | int8 W8A8 skinny 30.0 (exact True, rel L2 0.0120) | fp8 skinny 31.7
+[1, 2048] x [2048, 12288]: bf16 63.1 us | int8 W8A8 skinny 32.1 (exact True, rel L2 0.0118) | fp8 skinny 31.0 | int8 gemv 31.5 (799 GB/s, vs ref 4.9e-05, rel L2 0.0085) | fp8 gemv 31.2
+[16, 2048] x [2048, 12288]: bf16 66.1 us | int8 W8A8 skinny 33.0 (exact True, rel L2 0.0119) | fp8 skinny 31.5
+[32, 2048] x [2048, 12288]: bf16 62.8 us | int8 W8A8 skinny 33.7 (exact True, rel L2 0.0119) | fp8 skinny 35.7
+[64, 2048] x [2048, 12288]: bf16 68.4 us | int8 W8A8 skinny 64.5 (exact True, rel L2 0.0119) | fp8 skinny 65.2
+[1, 6144] x [6144, 2048]: bf16 31.5 us | int8 W8A8 skinny 18.8 (exact True, rel L2 0.0127) | fp8 skinny 17.0 | int8 gemv 16.8 (751 GB/s, vs ref 0.0e+00, rel L2 0.0092) | fp8 gemv 16.4
+[16, 6144] x [6144, 2048]: bf16 39.2 us | int8 W8A8 skinny 20.6 (exact True, rel L2 0.0131) | fp8 skinny 17.8
+[32, 6144] x [6144, 2048]: bf16 35.9 us | int8 W8A8 skinny 22.5 (exact True, rel L2 0.0130) | fp8 skinny 36.3
+[64, 6144] x [6144, 2048]: bf16 36.6 us | int8 W8A8 skinny 28.4 (exact True, rel L2 0.0130) | fp8 skinny 30.3
+[1, 1024] x [1024, 4096]: bf16 11.4 us | int8 W8A8 skinny 7.0 (exact True, rel L2 0.0109) | fp8 skinny 6.1 | int8 gemv 6.3 (668 GB/s, vs ref 0.0e+00, rel L2 0.0082) | fp8 gemv 6.1
+[16, 1024] x [1024, 4096]: bf16 12.0 us | int8 W8A8 skinny 7.3 (exact True, rel L2 0.0111) | fp8 skinny 6.5
+[32, 1024] x [1024, 4096]: bf16 12.2 us | int8 W8A8 skinny 8.8 (exact True, rel L2 0.0115) | fp8 skinny 8.0
+[64, 1024] x [1024, 4096]: bf16 12.6 us | int8 W8A8 skinny 11.8 (exact True, rel L2 0.0113) | fp8 skinny 12.6
+[1, 4096] x [4096, 1024]: bf16 12.2 us | int8 W8A8 skinny 7.8 (exact True, rel L2 0.0121) | fp8 skinny 6.4 | int8 gemv 6.3 (663 GB/s, vs ref 0.0e+00, rel L2 0.0089) | fp8 gemv 6.2
+[16, 4096] x [4096, 1024]: bf16 21.7 us | int8 W8A8 skinny 8.2 (exact True, rel L2 0.0126) | fp8 skinny 7.0
+[32, 4096] x [4096, 1024]: bf16 12.7 us | int8 W8A8 skinny 9.1 (exact True, rel L2 0.0125) | fp8 skinny 13.3
+[64, 4096] x [4096, 1024]: bf16 13.9 us | int8 W8A8 skinny 11.5 (exact True, rel L2 0.0127) | fp8 skinny 25.1
+[1, 2048] x [2048, 2048]: bf16 11.9 us | int8 W8A8 skinny 7.3 (exact True, rel L2 0.0121) | fp8 skinny 6.2 | int8 gemv 6.5 (645 GB/s, vs ref 0.0e+00, rel L2 0.0088) | fp8 gemv 6.3
+[16, 2048] x [2048, 2048]: bf16 12.8 us | int8 W8A8 skinny 7.4 (exact True, rel L2 0.0119) | fp8 skinny 6.4
+[32, 2048] x [2048, 2048]: bf16 12.7 us | int8 W8A8 skinny 8.0 (exact True, rel L2 0.0117) | fp8 skinny 11.4
+[64, 2048] x [2048, 2048]: bf16 14.3 us | int8 W8A8 skinny 10.5 (exact True, rel L2 0.0118) | fp8 skinny 11.5

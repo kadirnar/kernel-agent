@@ -5,7 +5,8 @@ with a massive-activation writer row (VoxCPM2's LocDiT o_proj / down_proj row 49
 bounds of the captured inputs would reject it on the redrawn ones, and broken scales fail.
 Both quality modes with reduced precision: ``near-lossless`` and ``relaxed`` (#175, about
 twice the error budgets), where blatant bugs (int4 per tensor, scales x 1.2, a skipped
-output row, gate / up swapped) still fail."""
+output row, gate / up swapped) still fail. INT8 (#178: ``int8_weights``, ``int8_w8a8``)
+shares the 8-bit tiers and is calibrated here the same way."""
 
 import pytest
 import torch
@@ -54,6 +55,20 @@ class Linear(torch.nn.Module):
             if BUG == "neighbour scale":
                 self.s = self.s.roll(1, dims=0)
             return
+        if PRECISION in ("int8_weights", "int8_w8a8"):
+            self.q, self.s = quant.quantize_int8(w)
+            if BUG == "scale x1.05":
+                self.s = self.s * 1.05
+            elif BUG == "scale x1.2":
+                self.s = self.s * 1.2
+            elif BUG == "neighbour scale":
+                self.s = self.s.roll(1)
+            elif BUG == "zeroed channel":
+                self.q = self.q.clone()
+                self.q[0] = 0
+            self.cache = {{}}
+            self.static = None
+            return
         if PRECISION == "fp4_weights":
             codes, scales, ts = quant.quantize_fp4(w)
             if BUG == "nibbles":
@@ -78,6 +93,10 @@ class Linear(torch.nn.Module):
             return torch.nn.functional.linear(x, self.w)
         if PRECISION == "fp8_mx":
             return quant.mxfp8_linear(x, self.q, self.s, rule=RULE)
+        if PRECISION == "int8_weights":
+            return quant.int8_weights_linear(x, self.q, self.s)
+        if PRECISION == "int8_w8a8":
+            return self.int8(x)
         if PRECISION != "fp8_w8a8":
             return torch.nn.functional.linear(x, self.w)
         if BUG not in ACTIVATION_BUGS:
@@ -98,6 +117,23 @@ class Linear(torch.nn.Module):
         y = (xq.float() * xs[:, None]) @ (self.q.float() * self.s[:, None]).T
         return y.to(x.dtype).reshape(*x.shape[:-1], -1)
 
+    def int8(self, x):
+        if BUG not in ACTIVATION_BUGS:
+            return quant.int8_w8a8_linear(x, self.q, self.s)
+        a = x.detach().reshape(-1, x.shape[-1]).float()
+        xq, xs = quant.quantize_int8_activations(x)
+        if BUG == "first token's scale":
+            xs = xs[:1].expand_as(xs)
+        elif BUG == "cached activation scales":  # the first call's, per input shape
+            xs = self.cache.setdefault(tuple(x.shape), xs)
+        elif BUG == "static activation scale":  # calibrated on the first call, 2x headroom
+            if self.static is None:
+                self.static = float(a.abs().max()) * 2 / 127
+            xs = torch.full((a.shape[0],), self.static, device=x.device)
+        xq = torch.round(a / xs[:, None]).clamp(-127, 127).to(torch.int8)
+        y = quant.int8_matmul(xq, self.q).float() * xs[:, None] * self.s[None, :]
+        return y.to(x.dtype).reshape(*x.shape[:-1], -1)
+
 
 class Mlp(torch.nn.Module):
     def __init__(self, ref):
@@ -114,7 +150,12 @@ class Mlp(torch.nn.Module):
 def build(reference):
     return Mlp(reference)
 """
-REFERENCE_MATH = ("fp8_weights", "fp8_w8a8", "fp4_weights", "fp8_mx")
+INT8 = ("int8_weights", "int8_w8a8")
+#: Broken variants caught on the captured inputs but not on every redrawn draw: INT8 clamps
+#: where e4m3 would round coarser, and the redrawn tokens' amax are within ~20 % of the
+#: first one's (the captured tokens' are not).
+CAPTURED_ONLY = {("int8_w8a8", "first token's scale")}
+REFERENCE_MATH = ("fp8_weights", "fp8_w8a8", "fp4_weights", "fp8_mx", "int8_weights", "int8_w8a8")
 
 
 class Mlp(nn.Module):
@@ -245,9 +286,12 @@ def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, pre
     if quality != "near-lossless":
         return
     # what #109 fixed: the bounds of captured inputs reject the same draws (output channel 0
-    # keeps 6x the rounding error of the others, its values are no longer massive)
+    # keeps 6x the rounding error of the others, its values are no longer massive). INT8's
+    # uniform step is ~3x finer than e4m3's on these outlier-free draws: they fit even the
+    # bounds of captured inputs (0 of 12 weight-only, 1 of 12 W8A8 fail them)
     old = _redrawn(writer, build, tier, perturbed=False)
-    assert sum(not r["ok"] for r in old) >= len(old) // 2
+    if precision not in INT8:
+        assert sum(not r["ok"] for r in old) >= len(old) // 2
     assert all("tolerance away" in r["error"] for r in old if not r["ok"])
 
 
@@ -262,6 +306,14 @@ def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, pre
         ("fp8_weights", "neighbour scale", "incorrect"),
         ("fp8_mx", "neighbour scale", "incorrect"),
         ("fp4_weights", "nibbles", "incorrect"),
+        ("int8_w8a8", "scale x1.05", "incorrect"),
+        ("int8_w8a8", "neighbour scale", "incorrect"),
+        ("int8_w8a8", "first token's scale", "incorrect"),
+        ("int8_w8a8", "zeroed channel", "incorrect"),
+        ("int8_w8a8", "cached activation scales", "incorrect_perturbed"),
+        ("int8_weights", "scale x1.05", "incorrect"),
+        ("int8_weights", "neighbour scale", "incorrect"),
+        ("int8_weights", "zeroed channel", "incorrect"),
     ],
 )
 @pytest.mark.parametrize("quality", QUALITIES)
@@ -270,7 +322,7 @@ def test_broken_scales_still_fail(tmp_path, writer, precision, bug, status, qual
     path, build = _candidate(tmp_path, precision, bug)
     result = evaluate(capture, path, device="cpu")
     assert result["status"] == status, result
-    if status == "incorrect":  # and on every redrawn input too
+    if status == "incorrect" and (precision, bug) not in CAPTURED_ONLY:  # every redrawn too
         assert not any(r["ok"] for r in _redrawn(writer, build, tier, perturbed=True))
 
 
@@ -286,7 +338,7 @@ def test_broken_scales_still_fail(tmp_path, writer, precision, bug, status, qual
         ("gate-up swapped", "incorrect"),  # a packed gate|up weight read in the wrong order
     ],
 )
-@pytest.mark.parametrize("precision", ("fp8_weights", "fp8_w8a8", "fp4_weights"))
+@pytest.mark.parametrize("precision", ("fp8_weights", "fp8_w8a8", "fp4_weights", *INT8))
 @pytest.mark.parametrize("quality", QUALITIES)
 def test_blatant_bugs_fail_the_relaxed_tiers_as_the_near_lossless_ones(
     tmp_path, writer, precision, bug, status, quality
@@ -319,13 +371,14 @@ def test_a_saturating_mxfp8_scale_rule_is_rejected_with_its_reason(tmp_path, wri
     assert report["stress"]["worst_ratio"] <= 448 and report["outliers"]["channel_ratio"] > 5
 
 
-def test_a_static_activation_scale_fails_the_scaled_check(tmp_path, writer, monkeypatch):
+@pytest.mark.parametrize("precision", ["fp8_w8a8", "int8_w8a8"])
+def test_a_static_activation_scale_fails_the_scaled_check(tmp_path, writer, monkeypatch, precision):
     """An activation scale calibrated on the first call with 2x headroom passes the captured
     inputs and most redrawn draws (no outlier channel there), and always saturates on the
     captured inputs x 3 (#148; x 0.01 pushes small values into e4m3's subnormals and often
-    fails too): the scales must follow the input."""
-    capture, tier = _capture(tmp_path, writer, "fp8_w8a8")
-    path, build = _candidate(tmp_path, "fp8_w8a8", "static activation scale")
+    fails too): the scales must follow the input. The same for INT8 (#178)."""
+    capture, tier = _capture(tmp_path, writer, precision)
+    path, build = _candidate(tmp_path, precision, "static activation scale")
     result = evaluate(capture, path, device="cpu")
     assert result["status"] == "incorrect_perturbed", result
 
@@ -340,7 +393,7 @@ def test_a_static_activation_scale_fails_the_scaled_check(tmp_path, writer, monk
             mlp, candidate, case, ((x,), {}), torch.Generator().manual_seed(0), lambda: None
         )
         checks = [f["check"] for f in failed]
-        assert "scaled_x3" in checks and "sign_flipped" not in checks  # e4m3 is symmetric
+        assert "scaled_x3" in checks and "sign_flipped" not in checks  # symmetric codes
     redrawn = _redrawn(writer, build, tier, perturbed=True, seeds=10)
     assert sum(not r["ok"] for r in redrawn) <= len(redrawn) // 4  # what the redraws miss
 

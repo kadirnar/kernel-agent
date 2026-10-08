@@ -366,8 +366,9 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   the stop logits, margins reported). Options set with `-o` win. A candidate
   below the floor is rejected without running the gate.
 * **Module tolerance tier.** A target whose spec allows reduced precision
-  (`"precision": "fp8_weights"`, `"fp8_w8a8"`, `"fp8_mx"` or `"reduced"` in the plan, see
-  "Low-precision weights" below) is captured with the `near-lossless` tier of
+  (`"precision": "fp8_weights"`, `"fp8_w8a8"`, `"fp8_mx"`, `"int8_weights"`,
+  `"int8_w8a8"` or `"reduced"` in the plan, see "Low-precision weights" below) is captured
+  with the `near-lossless` tier of
   `kernels/compare.py`, recorded in its sealed capture (an edited `spec.json`
   cannot change it, and a candidate that changes `compare.TIER` is an
   integrity violation): instead of
@@ -546,9 +547,9 @@ scales.
 
 **Allowed precisions** (`--precisions`, `kernel_agent/precisions.py`). A run lists
 the target precisions it allows; `exact` is always one of them. `--quality exact`
-allows `exact` only. `--quality near-lossless` and `--quality relaxed` allow `fp8_weights`, `fp8_w8a8`,
-`fp8_mx` (MXFP8, 8-bit) and `reduced` by default, but **not** the 4-bit
-`fp4_weights`: 4-bit is opt-in
+allows `exact` only. `--quality near-lossless` and `--quality relaxed` allow `fp8_weights`,
+`fp8_w8a8`, `fp8_mx` (MXFP8, 8-bit), `int8_weights`, `int8_w8a8` (INT8, 8-bit: "INT8"
+below) and `reduced` by default, but **not** the 4-bit `fp4_weights`: 4-bit is opt-in
 (`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights`). So is `fp8_kv`
 (an FP8 KV cache, "FP8 toolkit" below): it pays only on long caches. The list is
 recorded in `run.json` → `config.precisions`; a run whose `run.json` has none
@@ -721,7 +722,7 @@ speed, about 2.5 s for a candidate 7× faster, so +29 s and +14 s on top of the
 ~67 s of an eager-speed `e2e`. A candidate below the floor costs nothing extra.
 Peak memory is the candidate model plus Whisper-large-v3 in fp16 (3.1 GB).
 
-### Low-precision weights (FP8, FP4)
+### Low-precision weights (FP8, FP4, INT8)
 
 Decode GEMVs and skinny GEMMs stream their weights once per call, so storing
 the weights in FP8 halves their time. The precision policy follows the quality
@@ -990,6 +991,99 @@ from the measured research code, not yet run on a GPU (`doctor --smoke` and
   tokens and 1.2-1.3x from 512 to 8k (docs/FP8.md §5). Its reference math passes the
   tier on captured and redrawn decode-attention inputs; a V scale off by 5 % or one
   token's scale for all fail (`tests/test_fp8_toolkit.py`).
+
+#### INT8 (`int8_weights`, `int8_w8a8`): 8-bit without FP8 hardware
+
+GPUs without FP8 tensor cores (Turing sm_75, Ampere sm_80 / sm_86) had no 8-bit compute
+class: `fp8_w8a8` / `fp8_mx` are refused there and e4m3 weight codes convert in software.
+Two INT8 classes fill that gap (issue #178), and are an option on every other GPU (8-bit:
+allowed by default in near-lossless runs, in the near-lossless tier):
+
+* **`int8_weights`**: weight-only, symmetric int8 codes in [-127, 127] with one fp32 scale
+  `amax / 127` per output channel, bf16 activations, fp32 accumulation; the bytes and the
+  floor of `fp8_weights` (the ceilings' *FP8 w* column), converted in registers with two
+  ops per value (no e4m3 emulation). On Gaussian-like rows int8 per channel is ~2.5x more
+  accurate than e4m3 (relative L2 ~0.009 vs 0.026 per GEMM).
+* **`int8_w8a8`**: int8 weights per output channel and int8 activations per token on every
+  call, s8 x s8 products summed exactly in int32 on the IMMA tensor cores (`mma.sync`
+  m16n8k32 s8 from sm_80, m8n8k16 on Turing, `wgmma` s8 on Hopper, `tcgen05.mma kind::i8`
+  on B200; cuBLASLt via `torch._int_mm`), `acc * x_scale * w_scale (+ bias)` in the
+  epilogue, one rounding to bf16. Needs INT8 tensor cores (sm_75+: refused on sm_70, with
+  the reason); its *Ceilings* column is *INT8 W8A8* at the measured INT8 peak (`int8` in the
+  GPU peaks, `torch._int_mm`, in TOPS; peaks cache version 5 also measures the s8 `mma.sync`
+  rate, `s8 IMMA.S32`).
+* **Planner** (model-agnostic, per GPU): `int8_w8a8` for compute-bound GEMMs on GPUs
+  without FP8 tensor cores; on GPUs with both, INT8 where its measured floor is at or below
+  the W8A8 one and the GEMMs' input activations have no outlier channels, FP8 where they do
+  or where the INT8 peak is lower (Blackwell Ultra sm_103: ~1/30 of FP8, no `kind::i8`);
+  `int8_weights` like `fp8_weights` (preferred before sm_89). Activation scales stay
+  dynamic per token; outlier channels (token crest above ~20) need SmoothQuant
+  (`quant.smoothquant_factors`, alpha ~0.4 from many captured tokens) or FP8 / bf16 for
+  those GEMMs. The backend policy has an *INT8 GEMM* row per family.
+* **Contract and reference** (`kernels/quant.py`): `quantize_int8`, `quantize_int8_activations`
+  (scale `amax * (1 / 127)`, codes `round(x / scale)` to nearest even with an IEEE division:
+  kernels reproduce the codes bit for bit), `int8_matmul` (exact int32 products:
+  `torch._int_mm` on the GPU, padded past its M > 16 minimum; chunked exact fp32 elsewhere),
+  `int8_w8a8_linear`, `int8_weights_linear`, `int8_error`, `int8_w8a8_error`
+  (`activation_crest`, `activation_underflow`), `smoothquant_factors`.
+* **Examples** (verified on an RTX 5070 Ti; `ARCHS = "sm_80+"`, `doctor --smoke` runs them:
+  near-lossless pass, exact reject): `triton_int8_w8a8_gemm.py` (one-pass per-token
+  quantisation kernel + Triton `tl.dot` on int8 tiles with an int32 accumulator, scales and
+  bias in the epilogue, per-shape tiles, a `custom_op`; output equal to `int8_w8a8_linear`
+  bit for bit), `cuda_int8_skinny_gemm.py` (decode / M <= 32 per weight read: IMMA fragments
+  loaded straight from global memory, no conversion, exact int32 cross-warp reduction; bit
+  for bit too), `cuda_int8_gemv.py` (`int8_weights` decode GEMV, M <= 4).
+
+Measured on the RTX 5070 Ti (sm_120; `docs/research-scripts/int8-178`): s8 `mma.sync`
+(`IMMA.16832.S8.S8`) runs 411 TOPS, as fast as the block-scaled FP8 `QMMA.SF` (414) and
+twice plain e4m3 `QMMA.F32` (208, Triton's `tl.dot` on FP8), so a plain `tl.dot` on int8
+reaches the full tensor-core rate; `torch._int_mm` peaks at 327 TOPS (FP8 `_scaled_mm`
+331, bf16 99).
+
+| GEMM (CUDA graph; streamed where weights exceed L2) | bf16 | INT8 example | FP8 example |
+|---|---|---|---|
+| [352, 1024] x [1024, 8192] gate\|up, quantisation included | 68.4 us | Triton W8A8 25.1 | Triton W8A8 32.0 |
+| [704, 1024] x [1024, 8192] | 126.6 | 45.8 | 57.7 |
+| [352, 4096] x [4096, 1024] down / q\|k\|v [352, 1024] -> 2560 / o_proj [352, 2048] -> 1024 | 39.0 / 25.5 / 22.6 | 20.0 / 10.6 / 11.7 | 18.8 / 10.8 / 10.7 |
+| [1 / 16 / 32, 2048] x [2048, 12288] | 63.1 / 66.1 / 62.8 | skinny W8A8 32.1 / 33.0 / 33.7 | skinny weight-only 31.0 / 31.5 / 35.7 |
+| [32, 6144] x [6144, 2048] / [64, 4096] x [4096, 1024] | 35.9 / 13.9 | skinny W8A8 22.5 / 11.5 | 36.3 / 25.1 |
+| [1, 2048] x [2048, 12288] / [1, 6144] x [6144, 2048] | 63.1 / 31.5 | GEMV (weight-only) 31.5 / 16.8 (799 / 751 GB/s) | GEMV 31.2 / 16.4 |
+
+The module evaluator (eager, warm L2) measures 1.65x for the Triton example at M = 704
+(gate|up, 540 calls), 1.88x for the GEMV at M = 1 and 1.06x for the skinny W8A8 kernel at
+[32, 6144] x [6144, 2048] (two launches per call: host bound when timed eagerly, like the
+FP8 skinny kernel's 0.98x there).
+
+Tier calibration on real captures (every `nn.Linear` replaced by the reference math, on the
+GPU through `torch._int_mm`; captured inputs, then the evaluator's redrawn draws and the
+x 3 / x 0.01 / x -1 checks with the redrawn bounds): no new bounds, both classes share the
+near-lossless tier.
+
+| module (rows per call) | precision | rel L2 | min cosine | norm | redrawn draws failed | scaled checks |
+|---|---|---|---|---|---|---|
+| VoxCPM2 LocDiT layer (352) | INT8 weights | 0.0054 | 0.99999 | 0.07 % | 0 / 30 | pass |
+| VoxCPM2 LocDiT layer (352) | INT8 W8A8 | 0.0229 | 0.99984 | **2.10 %** (fails) | 0 / 30 | x 0.01 fails (norm 4.0 %) |
+| VoxCPM2 LocDiT layer (352) | INT8 W8A8 + SmoothQuant alpha 0.4 | 0.0082 | 0.99997 | 0.24 % | 0 / 60 | pass |
+| VoxCPM2 LocDiT layer (352) | INT8 W8A8 + SmoothQuant alpha 0.5 / 0.6 / 0.7 | 0.008-0.010 | 0.99997 | < 1 % | 1 / 10 / 60 of 60 | x 0.01 fails from 0.6 |
+| VoxCPM2 LocDiT layer (352) | FP8 W8A8 / FP8 weights | 0.0204 / 0.0151 | 0.99979 | 0.21 % | 0 / 30 | pass |
+| VoxCPM2 base-LM decode layer (1, KV cache; 3 steps) | INT8 W8A8 / INT8 weights | <= 0.0070 / 0.0020 | 0.99998 | 0.02 % | 0 / 36 | pass |
+| Qwen3-0.6B MLP, decode (1) | INT8 W8A8 / INT8 weights | 0.060 / 0.014 | 0.99823 | 0.86 % | 0 / 24 | pass |
+| Qwen3-0.6B MLP, decode (1) | FP8 W8A8 / FP8 weights | 0.052 / 0.038 | 0.99867 | 0.57 % | 0 / 24 | pass |
+| Qwen3-0.6B MLP, decode (1) | INT8 W8A8 + SmoothQuant from one decode token | 0.44 | 0.906 | 3.4 % | 12 / 12 | fail |
+
+INT8 weights are the most accurate 8-bit weight format here. INT8 W8A8 matches FP8 W8A8 on
+activations without outlier channels (the LocDiT's q / k / v / o projections, crest 23-24:
+0.007-0.018 vs 0.008-0.020 per `nn.Linear`) and fails the tier on the LocDiT MLP (token
+crest 29-49): int8's uniform step flushes the bulk's small values to zero, a biased loss
+(gate / up_proj 0.059 vs FP8's 0.019; down_proj norm -2.0 %). SmoothQuant with alpha ~0.4
+passes everything; a larger alpha, or factors from a single decode token, fits the captured
+outliers and fails the redrawn check, which judges static factors as it judges static
+scales. Broken INT8 kernels fail: weight scales x 1.05, a neighbour channel's scale, the
+first token's scale, a zeroed output channel, a static calibrated activation scale,
+activations clipped at their 99.9th percentile, and a per-tensor activation scale (passes
+the captured LocDiT inputs at 0.041, fails the x 0.01 check). The CPU calibration test
+(`tests/test_perturbed_calibration.py`) runs both classes' reference math and these
+broken variants on the synthetic massive-activation MLP.
 
 ### What "faster" means
 
@@ -3081,14 +3175,14 @@ datacenter and GeForce Blackwell. Nothing assumes the RTX 5070 Ti (sm_120) it wa
 developed on; what differs per architecture is decided from what is detected and
 measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
 
-| family | archs | what reaches the tensor-core peak | FP8 math | block-scaled (MXFP8) | copies / launches |
-|---|---|---|---|---|---|
-| Turing / Volta | sm_75 (sm_70) | `mma.sync` fp16 (Triton `tl.dot` runs on FMA units) | no | no | — |
-| Ampere | sm_80, sm_86, sm_87 | `mma.sync` bf16 / fp16 | no (weight-only FP8 / FP4 in software) | no | `cp.async` |
-| Ada | sm_89 | `mma.sync`, e4m3 QMMA | yes | no | `cp.async` |
-| Hopper | sm_90 | `wgmma` (e4m3 `mma.sync` is emulated) | yes | no | TMA, clusters, PDL |
-| Blackwell (datacenter) | sm_100, sm_103 | `tcgen05.mma` + TMEM | yes | yes | TMA multicast, clusters, PDL |
-| Blackwell (GeForce / RTX PRO) | sm_120, sm_121 | `mma.sync`; FP8 via block-scaled `QMMA.SF` | yes (fp32-acc at half rate on GeForce) | yes | TMA (no multicast), clusters, PDL |
+| family | archs | what reaches the tensor-core peak | FP8 math | block-scaled (MXFP8) | INT8 math (`int8_w8a8`) | copies / launches |
+|---|---|---|---|---|---|---|
+| Turing / Volta | sm_75 (sm_70) | `mma.sync` fp16 (Triton `tl.dot` runs on FMA units) | no | no | sm_75: `mma.sync` m8n8k16, cuBLASLt (sm_70: no) | — |
+| Ampere | sm_80, sm_86, sm_87 | `mma.sync` bf16 / fp16 | no (weight-only FP8 / FP4 in software) | no | yes: the 8-bit compute class (IMMA, 2x bf16) | `cp.async` |
+| Ada | sm_89 | `mma.sync`, e4m3 QMMA | yes | no | yes (IMMA) | `cp.async` |
+| Hopper | sm_90 | `wgmma` (e4m3 `mma.sync` is emulated) | yes | no | yes (`wgmma` s8) | TMA, clusters, PDL |
+| Blackwell (datacenter) | sm_100, sm_103 | `tcgen05.mma` + TMEM | yes | yes | sm_100 `kind::i8`; sm_103 ~1/30 of FP8 | TMA multicast, clusters, PDL |
+| Blackwell (GeForce / RTX PRO) | sm_120, sm_121 | `mma.sync`; FP8 via block-scaled `QMMA.SF` | yes (fp32-acc at half rate on GeForce) | yes | yes, full rate (IMMA 410 TOPS on an RTX 5070 Ti) | TMA (no multicast), clusters, PDL |
 
 * **Detected and measured.** `toolchain.GPUInfo` has the name, compute capability, SMs,
   memory, L2 and shared memory per block / per SM; the peaks the copy bandwidth, matmul
@@ -3097,17 +3191,18 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   reaches the peak there, the precisions the GPU cannot run and the bf16 ridge
   (`GPU ... smem per block`, `arch: ...`, `tensor cores: ...`, `precisions this GPU
   cannot run: ...`, `bf16 ridge: ...`).
-* **Precisions by GPU.** `fp8_w8a8` needs FP8 tensor cores (sm_89+) and `fp8_mx`
-  block-scaled ones (sm_100+); weight-only `fp8_weights` / `fp4_weights` and the
-  `fp8_kv` cache run everywhere (dequantised in registers; below sm_89 the e4m3
+* **Precisions by GPU.** `fp8_w8a8` needs FP8 tensor cores (sm_89+), `fp8_mx`
+  block-scaled ones (sm_100+) and `int8_w8a8` INT8 ones (IMMA, sm_75+: on Turing and
+  Ampere the 8-bit compute class, "INT8" above); weight-only `fp8_weights` /
+  `int8_weights` / `fp4_weights` and the `fp8_kv` cache run everywhere (dequantised in registers; below sm_89 the e4m3
   conversion is CUDA's software routine and Triton has no e4m3 type, as vLLM runs FP8
   checkpoints weight-only on Ampere). A run records in `run.json` only the precisions
   its GPU can run (each refused one is logged with the reason, also when
   `--precisions` names it); the planner's precision policy says why, the plan schema
   offers only the rest, a target at another one is refused (`precision 'fp8_mx' cannot
   run on this GPU: needs block-scaled FP8 tensor cores ...`), the ceilings table omits
-  W8A8 before sm_89 and MXFP8 / W4A4 before sm_100 (`gpu_hidden`), and `report.md`
-  names them.
+  W8A8 before sm_89, MXFP8 / W4A4 before sm_100 and INT8 W8A8 before sm_75
+  (`gpu_hidden`), and `report.md` names them.
 * **Backend policy by GPU.** The compute-bound FP8 GEMM row follows the family (plain
   e4m3 `mma.sync` on Ada, `wgmma` on Hopper, `tcgen05.mma` on datacenter Blackwell,
   the block-scaled `QMMA.SF` on GeForce Blackwell with this GPU's measured

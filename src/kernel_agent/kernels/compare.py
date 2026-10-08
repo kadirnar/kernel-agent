@@ -80,6 +80,21 @@ GLOBAL_TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
 #: <= 0.44). The OCP rule ``2^(floor(log2 amax) - 8)`` saturates block maxima above 448 x
 #: scale and fails on massive activations (o_proj: relative L2 0.041, norm 4.0 %); the
 #: evaluator's scale-rule guard names it (:mod:`kernel_agent.kernels.scale_guard`).
+#: INT8 (#178: symmetric int8, ``amax / 127`` per output channel; ``int8_w8a8`` also per
+#: token, int32 accumulation) shares these bounds too (README, "INT8 W8A8"; real VoxCPM2 /
+#: Qwen3 captures, ``torch._int_mm`` on the GPU, 12-90 redrawn and the three scaled draws per
+#: case). INT8 weight-only is the most accurate 8-bit class (LocDiT layer relative L2 0.0054,
+#: LM decode layer 0.0018, Qwen3 MLP 0.014; FP8 weights 0.015 / 0.004 / 0.038). INT8 W8A8
+#: matches FP8 W8A8 where the activations have no outlier channels (LM decode layer 0.0046-
+#: 0.0070, Qwen3 MLP 0.060 vs 0.050) and fails the tier where they do: on the LocDiT MLP
+#: (token crest 29-49) small activations underflow to 0, a biased loss (norm -2.1 % at
+#: M = 352, and the x0.01 check). SmoothQuant (``quant.smoothquant_factors``, alpha 0.4,
+#: factors from another captured call) passes there (relative L2 0.0082, norm 0.24 %, 0 of 120
+#: redrawn draws fail); alpha >= 0.5 fits the factors to the captured outliers and fails
+#: redrawn draws (1 of 60 at 0.5, 60 of 60 at 0.7), as do factors from a single decode token.
+#: Broken INT8 kernels fail: weight scales x 1.05, a neighbour channel's scale, the first
+#: token's scale, a zeroed output channel, a static (calibrated) activation scale, activations
+#: clipped at their 99.9th percentile, and a per-tensor activation scale (the x0.01 check).
 EXACT_TIER = "exact"
 NEAR_LOSSLESS_TIER = "near-lossless"
 #: ``near-lossless-fp4``: the near-lossless checks with the wider bounds of block-scaled FP4
@@ -126,8 +141,20 @@ DEFAULT_QUALITY = RELAXED_TIER
 #: (e4m3) KV cache, one scale per token and KV head, bf16 weights and math
 #: (kernels/kv_quant.py); opt-in (``precisions.OPT_IN``), in the near-lossless-kv tier: e4m3 K / V
 #: moved a decoder layer's output by <= 0.0011 relative L2 on real captures (docs/FP8.md §5).
-#: Anything else (``exact``, none) is the exact tier.
-REDUCED_PRECISIONS = ("fp8_weights", "reduced", "fp4_weights", "fp8_w8a8", "fp8_mx", "fp8_kv")
+#: ``int8_weights`` (INT8 weight-only: int8 codes per output channel, bf16 activations) and
+#: ``int8_w8a8`` (INT8 tensor-core math, IMMA: int8 weights per output channel and activations
+#: per token, int32 accumulation; the 8-bit compute class of GPUs without FP8 tensor cores),
+#: #178: the near-lossless tier. Anything else (``exact``, none) is the exact tier.
+REDUCED_PRECISIONS = (
+    "fp8_weights",
+    "reduced",
+    "fp4_weights",
+    "fp8_w8a8",
+    "fp8_mx",
+    "fp8_kv",
+    "int8_weights",
+    "int8_w8a8",
+)
 #: The tier of a reduced precision other than the near-lossless tier.
 PRECISION_TIERS = {"fp4_weights": NEAR_LOSSLESS_FP4_TIER, "fp8_kv": NEAR_LOSSLESS_KV_TIER}
 #: ... and other than the relaxed tier.

@@ -272,9 +272,10 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
-                    # fp8_weights / reduced / fp4_weights / fp8_w8a8 / fp8_mx / fp8_kv
-                    # (kernels.compare.PRECISIONS): --quality near-lossless / relaxed
-                    # captures the target with its tolerance tier; an exact run refuses it.
+                    # fp8_weights / reduced / fp4_weights / fp8_w8a8 / fp8_mx / fp8_kv /
+                    # int8_weights / int8_w8a8 (kernels.compare.PRECISIONS): --quality
+                    # near-lossless / relaxed captures the target with its tolerance tier;
+                    # an exact run refuses it.
                     # Default exact.
                     "precision": {
                         "type": "string",
@@ -286,6 +287,8 @@ PLAN_SCHEMA: dict[str, Any] = {
                             "fp8_w8a8",
                             "fp8_mx",
                             "fp8_kv",
+                            "int8_weights",
+                            "int8_w8a8",
                         ],
                     },
                     "precision_why": {"type": "string"},
@@ -400,8 +403,8 @@ def precision_policy(
     return """
 # Precision (`--quality exact`)
 This run keeps full precision: do not set `precision` (a target with
-`fp8_weights`, `fp4_weights`, `fp8_w8a8`, `fp8_mx` or `reduced` is refused); every kernel
-must match eager within rounding noise.
+`fp8_weights`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8` or `reduced`
+is refused); every kernel must match eager within rounding noise.
 """
 
 
@@ -418,7 +421,15 @@ def _near_lossless_policy(
     names = ", ".join(f"`{p}`" for p in allowed)
     refused = [
         p
-        for p in ("fp8_weights", "fp8_w8a8", "fp8_mx", "reduced", *four_bit)
+        for p in (
+            "fp8_weights",
+            "fp8_w8a8",
+            "fp8_mx",
+            "int8_weights",
+            "int8_w8a8",
+            "reduced",
+            *four_bit,
+        )
         if p not in allowed and p not in gpu
     ]
     lines = [
@@ -453,11 +464,22 @@ def _near_lossless_policy(
     lines.append(_POLICY["intro"])
     if quality == "relaxed":
         lines.append(RELAXED_POLICY)
-    for name in ("fp8_weights", "fp4_weights", "fp8_w8a8", "fp8_mx", "reduced", "fp8_kv"):
+    for name in (
+        "fp8_weights",
+        "int8_weights",
+        "fp4_weights",
+        "fp8_w8a8",
+        "int8_w8a8",
+        "fp8_mx",
+        "reduced",
+        "fp8_kv",
+    ):
         if name in allowed:
             lines.append(_POLICY[name])
     if "fp8_w8a8" in allowed or "fp8_mx" in allowed:
         lines.append(_POLICY["fp8_scales"])
+    if "int8_w8a8" in allowed:
+        lines.append(_POLICY["int8_scales"])
     lines.append(_POLICY["exact"])
     return "\n".join(lines) + "\n"
 
@@ -485,6 +507,13 @@ kernels then store the weights in FP8 e4m3 with one scale per output channel
 (activations stay bf16), the target is checked in the run's reduced-precision
 tolerance tier (near-lossless or relaxed), and every end-to-end evaluation in the run's
 perceptual gate.""",
+    "int8_weights": """`precision: "int8_weights"` (INT8 weight-only: int8 codes with one scale
+per output channel, bf16 activations; the bytes and the tier of `fp8_weights`) for the same
+memory-bound targets. Prefer it to `fp8_weights` on a GPU without hardware e4m3 conversion
+(before sm_89: e4m3 codes convert in software there, int8 in two cheap ops). Elsewhere it is
+the more accurate 8-bit weight format on rows without outliers (relative L2 ~0.01 per GEMM vs
+FP8's ~0.026, measured on VoxCPM2 and Qwen3 weights) at the same speed: either one per
+target, with a `precision_why` like `fp8_weights`'.""",
     "fp4_weights": """`precision: "fp4_weights"` (block-scaled FP4 weights, NVFP4: 4.5 bits per
 weight, about 4x FP8's error, its own looser tolerance tier) only for
 memory-bound decode GEMVs / skinny GEMMs where `fp8_weights` is already in use
@@ -502,6 +531,18 @@ cores, fp32 accumulation. Its `precision_why` names the FLOP-bound number (e.g.
 "LocDiT GEMMs at M=352: 80 TFLOP per run = 0.81 s at 99 bf16 TFLOP/s, compute
 bound"). Few rows per call stay `fp8_weights` (memory bound: quantising the
 activations saves nothing there and their outlier channels cost accuracy).""",
+    "int8_w8a8": """`precision: "int8_w8a8"` (INT8 W8A8: int8 weights per output channel and
+int8 activations per token on every call, s8 x s8 products summed exactly in int32 on the
+IMMA tensor cores, both scales in the epilogue) for compute-bound GEMMs, like `fp8_w8a8`
+(~64+ rows per call, the *Ceilings* table's *INT8 W8A8* floor well below the exact one). It
+is the 8-bit compute class of GPUs without FP8 tensor cores (Turing sm_75, Ampere sm_80 /
+sm_86, where `fp8_w8a8` does not exist). On a GPU with both, decide from the measured peaks
+and the activations: INT8 where its *INT8 W8A8* floor is at or below the *W8A8* one (on
+sm_120 s8 `mma.sync` runs at twice plain e4m3's rate) and the GEMMs' input activations have
+no outlier channels; FP8 where they do (a token's amax tens of times its RMS: int8's uniform
+step flushes the small values to zero, a biased error the tier rejects: VoxCPM2's LocDiT MLP,
+norm -2.1 %) or where the INT8 peak is the lower one (Blackwell Ultra, sm_103). Its
+`precision_why` names M, the FLOP-bound number and the activations' crest.""",
     "fp8_mx": """`precision: "fp8_mx"` (MXFP8 W8A8: e4m3 weights and activations with one
 power-of-two ue8m0 scale per 32 elements along K on both operands, applied by the
 block-scaled tensor cores of sm_100 / sm_120; the same tolerance tier as `fp8_w8a8`)
@@ -524,6 +565,13 @@ captured activations have outlier channels (a row's amax tens of times its RMS, 
 channel hundreds of times the median one: the `scale_rule` report of an `fp8_mx`
 evaluation measures both), finer scales (MXFP8, 1 x 128 groups) keep the bulk's
 precision; per-tensor scales do not.""",
+    "int8_scales": """INT8 activation scales stay dynamic, one per token (`amax / 127` on every
+call); never per-tensor or static (calibrated) ones: the evaluator's scaled and redrawn
+checks fail them. Activation outlier channels (crest above ~20) need SmoothQuant
+(`kernel_agent.kernels.quant.smoothquant_factors`: per-input-channel factors from many
+captured tokens, alpha ~0.4, folded into the producer and the weights; a larger alpha fits
+the captured outliers and fails the redrawn-input check) or those GEMMs in FP8 / bf16 inside
+the target.""",
     "reduced": """`precision: "reduced"` (also
 with `precision_why`) is for another numerics-changing idea.""",
     "fp8_kv": """`precision: "fp8_kv"` (an FP8 e4m3 KV cache, one scale per
@@ -936,6 +984,45 @@ def _precision_block(
   scales + `F.scaled_mm`); reference: `mxfp8_linear`; guide: skill
   `kernel-agent:mxfp8`;
 * report the numerical error in `NOTES.md`: `mxfp8_error(weight, q, scales, x)` on
+  captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
+    elif precision == "int8_weights":
+        contract = """INT8 weight-only:
+* quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
+  quantize_int8, int8_weights_linear, int8_error`): symmetric int8 codes in [-127, 127],
+  one fp32 scale `amax / 127` per output channel; keep no bf16 copy of a quantised weight;
+* activations stay bf16 (never quantise them: that is `int8_w8a8`); convert the codes in
+  registers (exact: `prmt` into the fp32 `2^23 + code + 128`, minus `2^23 + 128`; or to
+  bf16 / fp16 for the tensor cores), accumulate in fp32, apply the scale (and bias) once
+  per output in the epilogue, round to bf16 once;
+* verified example: `cuda_int8_gemv.py` (decode GEMV, M <= 4); reference:
+  `int8_weights_linear`; guide: "INT8" in "Low-precision weights" below;
+* report the numerical error in `NOTES.md`: `int8_error(weight, q, scale)` of the weights
+  (its `crest`: rows with outliers lose their small weights) and the evaluator's per-case
+  `min_cosine` / `max_rel_l2`."""
+    elif precision == "int8_w8a8":
+        contract = """INT8 W8A8 (INT8 tensor-core math, IMMA):
+* quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
+  quantize_int8, quantize_int8_activations, int8_matmul, int8_w8a8_linear,
+  int8_w8a8_error, smoothquant_factors`): int8 codes in [-127, 127], one fp32 scale per
+  output channel; keep no bf16 copy of a quantised weight;
+* quantise the activations per token on every call (dynamic: `scale = amax(|row|) * (1 /
+  127)`, codes `round(x / scale)` to nearest even with an IEEE division, clamped to ±127),
+  in a one-pass row kernel or fused into the op that produces them (RMSNorm, `silu(gate) *
+  up`); never one static or per-tensor scale;
+* s8 x s8 products on the tensor cores with an int32 accumulator (Triton `tl.dot(a, b, acc,
+  out_dtype=tl.int32)`, `mma.sync ... m16n8k32.s32.s8.s8.s32`, `torch._int_mm`), then `acc *
+  x_scale[m] * w_scale[n] (+ bias[n])` in fp32 once per output, one rounding to bf16 (that
+  is `int8_w8a8_linear`, bit for bit); norms, softmax / attention math and residual adds
+  stay as in eager;
+* activation outliers (`int8_w8a8_error(...)["activation_crest"]` above ~20): SmoothQuant
+  (`smoothquant_factors(amax_per_input_channel, weight, alpha=0.4)` from many captured
+  tokens; `smooth=` in the quantisers and `int8_w8a8_linear`; fold `1 / s` into the
+  producer), or keep those GEMMs in bf16 / FP8 (where the run allows it);
+* verified examples: `triton_int8_w8a8_gemm.py` (compute-bound GEMMs, M ≳ 64),
+  `cuda_int8_skinny_gemm.py` (IMMA skinny GEMM, M <= 32 per weight read: decode); reference
+  and fallback: `int8_w8a8_linear` (`torch._int_mm`); guide: "INT8 W8A8" in "Low-precision
+  weights" below;
+* report the numerical error in `NOTES.md`: `int8_w8a8_error(weight, q, scale, x)` on
   captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     elif precision == "fp8_kv":
         contract = """FP8 KV cache:
@@ -1471,7 +1558,13 @@ def _pivot_block(
         bounds.append("compute bound at the bf16 peak (W8A8: twice the FLOP rate, `fp8_w8a8`)")
     if "fp8_mx" in choices:
         bounds.append("compute bound with wide outputs (N >= ~2560: MXFP8, `fp8_mx`)")
-    streams = [f"`{p}`" for p in ("fp8_weights", "fp4_weights") if p in choices]
+    if "int8_w8a8" in choices:
+        bounds.append(
+            "compute bound where INT8's measured peak is at least FP8's or there are no FP8 "
+            "tensor cores (INT8 W8A8, `int8_w8a8`; activations without outlier channels or "
+            "with SmoothQuant)"
+        )
+    streams = [f"`{p}`" for p in ("fp8_weights", "int8_weights", "fp4_weights") if p in choices]
     if streams:
         bounds.append(f"bound by streaming weights ({', '.join(streams)})")
     why = f"the module's GEMMs are {' or '.join(bounds)}, " if bounds else ""
