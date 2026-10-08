@@ -37,6 +37,7 @@ Linux) only ``MAX_JOBS`` applies.
 from __future__ import annotations
 
 import atexit
+import collections
 import contextlib
 import os
 import signal
@@ -300,7 +301,9 @@ QUIET_POLL_S = 0.05  # how often a hold looks at its phase file
 
 _work: dict[interrupt.Proc, bool] = {}  # background work: (pid, start) -> pause the root too
 _work_lock = threading.Lock()
-_paused: set[interrupt.Proc] = set()  # paused now, by any hold (continued at exit too)
+#: paused now -> by how many holds (two GPUs' timed jobs may pause the same work; continued
+#: at exit too)
+_paused: collections.Counter[interrupt.Proc] = collections.Counter()
 
 
 def background(pid: int, *, itself: bool = True) -> None:
@@ -401,15 +404,19 @@ class Quiet:
             self._since = time.monotonic()
         with _work_lock:
             _paused.update(new)
-        interrupt.send(new, signal.SIGSTOP)
+            first = {p for p in new if _paused[p] == 1}  # not paused by another hold yet
+        interrupt.send(first, signal.SIGSTOP)
         self._mine |= new
 
     def _resume(self) -> None:
         if not self._mine:
             return
-        interrupt.send(self._mine, signal.SIGCONT)
         with _work_lock:
-            _paused.difference_update(self._mine)
+            _paused.subtract(self._mine)
+            last = {p for p in self._mine if _paused[p] <= 0}  # no other hold pauses it
+            for proc in last:
+                del _paused[proc]
+        interrupt.send(last, signal.SIGCONT)
         self._mine = set()
         self.paused_s += time.monotonic() - self._since
 

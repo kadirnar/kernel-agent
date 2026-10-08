@@ -199,6 +199,29 @@ def test_quiet_pauses_the_agents_work_while_a_timed_subprocess_times(tmp_path, m
     assert hygiene.work() == set()
 
 
+def test_work_paused_by_two_holds_goes_on_when_both_are_done(tmp_path, clean):
+    """Two GPUs' timed jobs at once: one ending its timing does not continue what the other
+    one still pauses."""
+    build = subprocess.Popen(["sleep", "30"])
+    first, second = tmp_path / "a", tmp_path / "b"
+    try:
+        hygiene.background(build.pid)
+        with hygiene.Quiet(first), hygiene.Quiet(second):
+            first.write_text(hygiene.TIMING)
+            second.write_text(hygiene.TIMING)
+            _until(lambda: _state(build.pid) == "T")
+            first.write_text("")
+            time.sleep(0.3)
+            assert _state(build.pid) == "T"  # the second still times
+            second.write_text("")
+            _until(lambda: _state(build.pid) != "T")
+    finally:
+        hygiene.done(build.pid)
+        build.kill()
+        build.wait()
+    assert not hygiene._paused
+
+
 def test_an_exclusive_hold_tells_its_subprocess_where_to_say_it_times(clean):
     with gpulock.gpu_lock():
         env = gpulock.child_env()
