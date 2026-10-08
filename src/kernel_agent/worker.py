@@ -334,12 +334,14 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     monitor = Monitor()  # GPU clocks / temperature / power before and after the timing
     monitor.sample("before", loaded=False)  # the clocks may still be idling
     sched = telemetry.schedstat()  # how long this thread waits for a CPU while it times
+    cores = telemetry.cores_busy()  # ... and how much others use its (timing) cores
     try:
         with hygiene.timing():  # the agents' builds pause meanwhile (several sessions)
             timing = measure(workload, inputs, warmup=ns.warmup, iters=ns.iters)
     except Exception:
         return _failed("runtime_error", patches=report.__dict__)
     cpu_wait = telemetry.cpu_wait_share(sched)
+    others = telemetry.others_share(cores)
     monitor.sample("after")
     output = timing.pop("output")
     base_ms, verdict = _judge(ns, workload, inputs, output, timing["median_ms"], truth_files)
@@ -357,6 +359,7 @@ def cmd_e2e(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "patches": report.__dict__,
         **({"gpu": gpu} if (gpu := monitor.summary()) else {}),
         **({"cpu_wait_share": cpu_wait} if cpu_wait is not None else {}),
+        **({"cpu_others_share": others} if others is not None else {}),
     }
 
 

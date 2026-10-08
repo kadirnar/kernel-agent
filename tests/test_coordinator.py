@@ -669,7 +669,7 @@ def test_cli_agents(monkeypatch, tmp_path):
     assert icfg.role_max == {KERNEL: 2, "research": 1}  # over the registry's caps
     assert scheduler.role_caps(icfg.role_max) == {KERNEL: 2, SYSTEMS: 1, NATIVE: 1, "research": 1}
     assert cli.main(["improve", "x/y", "--dry-run"]) == 0
-    assert seen["icfg"].agents == 1 and seen["icfg"].role_max == {}
+    assert seen["icfg"].agents == 3 and seen["icfg"].role_max == {}  # the default (#185)
     assert scheduler.role_caps() == {KERNEL: 4, SYSTEMS: 1, NATIVE: 1}  # max_concurrent
     for bad in (["--agents", "0"], ["--role-max", "critic=2"]):
         with pytest.raises(SystemExit):

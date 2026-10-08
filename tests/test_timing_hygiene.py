@@ -21,6 +21,7 @@ from kernel_agent.workspace import RunDir, read_jsonl
 POOL_ENV = (gpulock.ENV, gpulock.GPUS_ENV, gpulock.INDEX_ENV, "CUDA_VISIBLE_DEVICES")
 CPUS = sorted(os.sched_getaffinity(0))
 needs_cpus = pytest.mark.skipif(len(CPUS) < 2, reason="needs two CPUs")
+MEMORY_STALL = telemetry.memory_stall
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +39,7 @@ def lock_dir(tmp_path, monkeypatch, request):
     monkeypatch.setattr(gpulock, "_nvidia_smi", lambda: list(gpus))
     gpulock.pool.cache_clear()
     monkeypatch.setattr(gpuqueue, "_gates", {})
+    monkeypatch.setattr(telemetry, "memory_stall", lambda: None)  # this host's swapping
     yield locks
     gpulock.pool.cache_clear()
 
@@ -297,13 +299,25 @@ def test_hold_watch_counts_only_foreign_processes(monkeypatch):
 def test_cpu_wait_above_the_share_is_dirty():
     assert telemetry.dirty(None, {"cpu_wait_share": 0.01}) is None
     assert "waited for a CPU 20 %" in str(telemetry.dirty(None, {"cpu_wait_share": 0.2}))
+    assert "used 30 % of the timing cores" in str(telemetry.dirty(None, {"cpu_others_share": 0.3}))
     swapped = telemetry.HoldWatch(0, None, interval=0)
     swapped.memory_stall_share = 0.1  # every task stalled on memory a tenth of the hold
     assert "out of memory" in str(telemetry.dirty(swapped, {}))
-    assert telemetry.memory_stall() is None or telemetry.memory_stall() >= 0
+    stalled = MEMORY_STALL()  # this host's (the fixture fakes it for the other tests)
+    assert stalled is None or stalled >= 0
     before = telemetry.schedstat()
     sum(i * i for i in range(200_000))
     share = telemetry.cpu_wait_share(before)
+    assert share is None or 0.0 <= share <= 1.0
+
+
+def test_others_share_of_the_timing_cores(monkeypatch):
+    assert telemetry.cores_busy() is None  # not pinned: not measured
+    monkeypatch.setenv(hygiene.CPUS_ENV, ",".join(map(str, CPUS)))
+    before = telemetry.cores_busy()
+    assert before is not None
+    sum(i * i for i in range(300_000))
+    share = telemetry.others_share(before)
     assert share is None or 0.0 <= share <= 1.0
 
 

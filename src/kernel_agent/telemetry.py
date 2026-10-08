@@ -58,6 +58,9 @@ WATCH_S = 10.0
 #: A timed process whose main thread waited for a CPU longer than this share of its timing
 #: ran on a contended CPU (``cpu_wait_share``): the launches of its kernels were delayed
 CPU_WAIT_SHARE = 0.05
+#: A timed process pinned to the timing cores (``hygiene.py``) whose cores other processes used
+#: more than this share of its timing ran beside them (``cpu_others_share``)
+CPU_OTHERS_SHARE = 0.1
 #: A hold during which every task of the host stalled on memory (it swapped) longer than this
 #: share of it was not clean (``/proc/pressure/memory`` ``full``)
 MEMORY_STALL_SHARE = 0.02
@@ -380,6 +383,44 @@ def cpu_wait_share(before: tuple[int, int] | None) -> float | None:
     return round(waited / (ran + waited), 4) if ran + waited > 0 else None
 
 
+def cores_busy() -> tuple[float, int, int] | None:
+    """For a process pinned to its CPUs (``hygiene.CPUS_ENV``: a timed job on the timing
+    cores): now, the clock ticks those CPUs were busy (``/proc/stat``) and the ticks this
+    process ran (all its threads); None when it is not pinned or without ``/proc``."""
+    from kernel_agent.hygiene import CPUS_ENV
+
+    if not os.environ.get(CPUS_ENV):
+        return None
+    try:
+        cpus = {f"cpu{c}" for c in os.sched_getaffinity(0)}
+        busy = 0
+        for line in Path("/proc/stat").read_text().splitlines():
+            name, *ticks = line.split()
+            if name in cpus:  # user nice system idle iowait irq softirq steal ...
+                values = [int(t) for t in ticks]
+                busy += sum(values) - values[3] - values[4]
+        fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+        own = int(fields[11]) + int(fields[12])  # utime + stime of every thread
+    except (OSError, ValueError, IndexError):
+        return None
+    return time.monotonic(), busy, own
+
+
+def others_share(before: tuple[float, int, int] | None) -> float | None:
+    """The share of its CPUs' time since ``before`` (:func:`cores_busy`) that other processes
+    used them (another process on a timing core or on its hardware-thread sibling slows the
+    timed one down without making it wait); None: unknown."""
+    now = cores_busy()
+    if before is None or now is None:
+        return None
+    seconds = now[0] - before[0]
+    capacity = seconds * os.sysconf("SC_CLK_TCK") * len(os.sched_getaffinity(0))
+    if capacity <= 0:
+        return None
+    others = (now[1] - before[1]) - (now[2] - before[2])
+    return round(min(max(others / capacity, 0.0), 1.0), 4)
+
+
 def dirty(watch: HoldWatch | None, result: dict[str, Any]) -> str | None:
     """Why a timed ``result`` is not clean (None: it is): another process computed on the GPU
     during it (``watch``), the host swapped (all its tasks stalled on memory longer than
@@ -402,6 +443,13 @@ def dirty(watch: HoldWatch | None, result: dict[str, Any]) -> str | None:
         return (
             f"the timed process waited for a CPU {100 * share:.0f} % of its timing "
             f"(more than {100 * CPU_WAIT_SHARE:.0f} %): a contended CPU delayed its launches"
+        )
+    others = result.get("cpu_others_share")
+    if isinstance(others, int | float) and others > CPU_OTHERS_SHARE:
+        return (
+            f"other processes used {100 * others:.0f} % of the timing cores while it timed "
+            f"(more than {100 * CPU_OTHERS_SHARE:.0f} %; a process on a core's other hardware "
+            "thread slows it down too)"
         )
     return None
 

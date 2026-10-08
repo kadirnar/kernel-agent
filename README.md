@@ -2942,7 +2942,7 @@ librarian's model) live in one place, and `program.md`'s sections are its roles.
 
 ```bash
 kernel-agent improve <run_dir | hf-url> [--max-hours 6] [--max-usd 60] [--slice 4] [--rounds R]
-kernel-agent improve <run_dir | hf-url> --agents 3   # up to 3 agent sessions at once
+kernel-agent improve <run_dir | hf-url> --agents 1   # one session at a time (default: 3 at once)
 kernel-agent improve Qwen/Qwen3-0.6B --dry-run     # simulated: no GPU, no Claude
 ```
 
@@ -3188,8 +3188,9 @@ model and starts a new round (`kernel_agent/improve.py`,
   regions and the module calls that replay CUDA graphs (`module_gaps` in
   `profile.json`); their kernels are in the kernel view.
 * **Concurrent sessions** (`--agents N`, issue #183, [docs/MULTIAGENT.md](docs/MULTIAGENT.md)).
-  `--agents 1` (the default) is the loop above: one session at a time. With
-  `--agents N` the one coordinator process keeps up to N sessions running at once
+  `--agents 1` is the loop above: one session at a time. With `--agents N` (default
+  3, since clean timing under load, #185) the one coordinator process keeps up to N
+  sessions running at once
   (`kernel_agent/coordinator.py`): slices of different arms, research sessions and
   dossiers. Our runs put the sweet spot on one GPU at 3–4 sessions, and on a
   subscription the usage windows limit N more than the GPU does
@@ -3343,8 +3344,8 @@ model and starts a new round (`kernel_agent/improve.py`,
     sessions are concurrent and think in simulated seconds, and every evaluation,
     A/B step, capture and re-profile holds the GPU through the real GPU job queue
     for its simulated seconds. The same run with 1 to 4 sessions (means of seeds
-    0–4, `docs/research-scripts/agents-183/`; `1 (sequential)` is the loop without
-    `--agents`, in the same simulated time):
+    0–4, `docs/research-scripts/agents-183/`; `1 (sequential)` is the loop with
+    `--agents 1`, in the same simulated time):
 
     | `--agents` | `--rounds 2`: done after | evaluations / h | GPU busy | evaluation waits (mean / p95) | final speedup | `--max-hours 8`: evaluations / h, final speedup |
     |---|---:|---:|---:|---:|---:|---:|

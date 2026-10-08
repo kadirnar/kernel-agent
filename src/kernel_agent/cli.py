@@ -876,13 +876,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--agents",
         type=_agents,
-        default=1,
+        default=3,
         metavar="N",
-        help="agent sessions at once (default 1: one at a time, as before). With N > 1 the "
-        "slots go to the arms that pay (slices, research sessions, dossiers), the GPU "
-        "evaluations take turns in the GPU job queue, the re-integration runs in the "
-        "background and a usage limit pauses every session once (docs/MULTIAGENT.md); "
-        "k = 3-4 is the measured sweet spot on one GPU",
+        help="agent sessions at once (default 3; 1: one at a time, the sequential loop). "
+        "With N > 1 the slots go to the arms that pay (slices, research sessions, dossiers), "
+        "the GPU evaluations take turns in the GPU job queue with clean timing (the agents' "
+        "GPU scripts through run_on_gpu, timing cores, builds before the lock, dirty "
+        "timings re-run), the re-integration runs in the background and a usage limit "
+        "pauses every session once (docs/MULTIAGENT.md); k = 3-4 is the measured sweet "
+        "spot on one GPU",
     )
     p.add_argument(
         "--role-max",

@@ -747,6 +747,7 @@ def _evaluate(
     from kernel_agent import hygiene, telemetry
 
     sched = telemetry.schedstat()  # how long this thread waits for a CPU while it times
+    cores = telemetry.cores_busy()  # ... and how much others use its (timing) cores
     hygiene.phase(hygiene.TIMING)  # the agents' builds pause meanwhile (several sessions)
     compiled_ref = copy.deepcopy(reference) if compile_baseline else None
     compiled: dict[str, Any] = {}
@@ -837,6 +838,7 @@ def _evaluate(
         covered += weight
         saved += (ref_t["median_ms"] - new_t["median_ms"]) * weight
     cpu_wait = telemetry.cpu_wait_share(sched)
+    others = telemetry.others_share(cores)
     hygiene.phase("")
 
     if not _intact(result, guard, candidate_path, "after timing"):
@@ -897,6 +899,8 @@ def _evaluate(
     )
     if cpu_wait is not None:  # a contended CPU delays launches (telemetry.dirty)
         result["cpu_wait_share"] = cpu_wait
+    if others is not None:
+        result["cpu_others_share"] = others
     if (memory := peak_memory_summary(case_reports)) is not None:
         result["peak_memory"] = memory
     # speed of light per case (after timing, never inside it): sol_ms, pct_of_sol, bound
