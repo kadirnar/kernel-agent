@@ -3585,6 +3585,8 @@ runs/<org>--<name>/<timestamp>/
                               gpu_wait_s)
   research/sources.jsonl      every WebFetch / WebSearch: time, URL or query, outcome, sha256;
                               every doc_search / doc_read: query and ids, chunk and its source
+  .coordinator.lock           flock + pid of the one kernel-agent process working on the run
+                              (optimize, resume, integrate, improve): a second one is refused
   optimized/                  apply.py + manifest.json + kernels/ (+ rewrites/ of region targets)
                               + transforms/, the run files they load (manifest `needs`) and
                               export_check.json (the self-test, see above)
@@ -3608,8 +3610,8 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  worker  idea
-hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  worker  session
+idea  hypothesis
 ```
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
@@ -3618,7 +3620,10 @@ time it waited for the GPU behind other jobs before that (see "GPUs and the GPU
 lock"). `diverse_speedup` is the median speedup of an `e2e` row over the
 workload's diverse input set, and `flags` says `data_dependent` when that speedup
 changes with the input (see "Data-dependent speedups"). `worker` is the target's worker that evaluated a kernel
-candidate (empty without workers). `idea` is the `idea_id` of a kernel candidate. A ledger
+candidate (empty without workers). `session` is the agent session that ran the evaluation
+(its label, the `costs.json` key such as `kernel-attn#7`; empty for the integration's
+steps), also in its `results.jsonl` record and `evaluation` event: each session's tools
+are bound to it (its own MCP server and evaluation budget). `idea` is the `idea_id` of a kernel candidate. A ledger
 written before a column existed keeps its own layout, and its rows have no
 value for that column.
 
@@ -3684,8 +3689,9 @@ light and dark mode and reloads every 30 s while the run is going.
 The charts need matplotlib, which is in the optional `viz` extra:
 `uv sync --extra viz` (`all` includes it). Without matplotlib nothing is
 drawn, and the ledger, `status` and the dashboard tables still work. The charts
-and `dashboard.html` are redrawn after every evaluation and phase, and by
-`kernel-agent report`. `report.md` embeds them. The colours mean the same thing
+and `dashboard.html` are redrawn after every phase and by `kernel-agent report`, and
+after evaluations by one background thread per run, at most every 5 s (requests
+coalesce; an evaluation never waits for its charts). `report.md` embeds them. The colours mean the same thing
 in every chart: green = kept, grey = discarded, red = failed.
 
 `progress.png`: end-to-end latency over wall-clock time. The blue step line

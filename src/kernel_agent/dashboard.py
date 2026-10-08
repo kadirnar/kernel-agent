@@ -1,16 +1,22 @@
 """Self-contained ``dashboard.html`` of a run (charts inlined as base64 PNG + tables).
 
-Regenerated together with the charts after every evaluation and phase
-(:func:`refresh`), so it can be left open in a browser while a run is going;
-it reloads itself every 30 s until the report phase is done.
+Regenerated together with the charts after every phase (:func:`refresh`) and, through the
+run's :class:`Refresher` (one thread, debounced), after evaluations, so it can be left open
+in a browser while a run is going; it reloads itself every 30 s until the report phase is
+done.
 """
 
 from __future__ import annotations
 
+import atexit
 import base64
 import html
+import math
+import os
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +24,10 @@ from kernel_agent import charts, ledger
 from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
+#: After evaluations, a run's charts and dashboard are rewritten at most this often.
+INTERVAL_S = 5.0
 _warned = False
+_lock = threading.Lock()  # one rewrite at a time: the refreshers' threads, phases, the report
 
 
 def refresh(run: RunDir, target_id: str | None = None) -> None:
@@ -26,14 +35,124 @@ def refresh(run: RunDir, target_id: str | None = None) -> None:
 
     Never raises: monitoring must not break an optimisation run.
     """
+    _refresh(run, None if target_id is None else [target_id])
+
+
+def _refresh(run: RunDir, targets: list[str] | None) -> None:
+    """:func:`refresh` of the progress charts of ``targets`` (None: of every target)."""
     global _warned
     try:
-        charts.write_charts(run, targets=None if target_id is None else [target_id])
-        write_dashboard(run)
+        with _lock:
+            charts.write_charts(run, targets=targets)
+            write_dashboard(run)
     except Exception as exc:
         if not _warned:
             print(f"[kernel-agent] chart/dashboard refresh failed: {exc!r}", file=sys.stderr)
             _warned = True
+
+
+class Refresher:
+    """Rewrites one run's charts and dashboard in a background thread, at most once per
+    ``interval`` seconds, so evaluations (of any number of sessions) neither wait for the
+    charts nor race on their files.
+
+    Requests (:meth:`request`) coalesce until the thread gets to them: the progress charts
+    of every target asked for, of all targets once one request asks for all. The first
+    request after a quiet ``interval`` is served at once. The thread ends when nothing is
+    pending; the next request starts another. ``render`` (tests): what a rewrite does."""
+
+    def __init__(
+        self,
+        run: RunDir,
+        interval: float = INTERVAL_S,
+        render: Callable[[RunDir, list[str] | None], None] | None = None,
+    ) -> None:
+        self.run = run
+        self.interval = interval
+        self._render = render or _refresh
+        self._cond = threading.Condition()
+        self._targets: set[str] = set()
+        self._all = False  # a pending request for every target
+        self._pending = False
+        self._busy = False
+        self._now = False  # flush(): no waiting for the interval
+        self._closed = False
+        self._last = -math.inf  # time.monotonic() of the last rewrite
+        self._thread: threading.Thread | None = None
+
+    def request(self, target_id: str | None = None) -> None:
+        """Ask for a rewrite (only ``target_id``'s progress chart; None: every target's)."""
+        with self._cond:
+            if self._closed:
+                return
+            if target_id is None:
+                self._all = True
+            else:
+                self._targets.add(target_id)
+            self._pending = True
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._work, name="dashboard", daemon=True)
+                self._thread.start()
+
+    def _work(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    if not self._pending or self._closed:
+                        self._thread = None
+                        self._cond.notify_all()
+                        return
+                    wait = self._last + self.interval - time.monotonic()
+                    if wait <= 0 or self._now:
+                        break
+                    self._cond.wait(wait)
+                targets = None if self._all else sorted(self._targets)
+                self._targets, self._all, self._pending, self._now = set(), False, False, False
+                self._busy = True
+            try:
+                self._render(self.run, targets)
+            finally:
+                with self._cond:
+                    self._busy, self._last = False, time.monotonic()
+                    self._cond.notify_all()
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """Serve the pending requests now and wait for them (False: ``timeout`` passed)."""
+        with self._cond:
+            self._now = self._pending
+            self._cond.notify_all()
+            return self._cond.wait_for(lambda: not self._pending and not self._busy, timeout)
+
+    def close(self, timeout: float | None = None) -> None:
+        """Drop what is pending and wait (up to ``timeout``) for a rewrite in progress."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+
+_refreshers: dict[Path, Refresher] = {}
+_refreshers_lock = threading.Lock()
+
+
+def refresher(run: RunDir) -> Refresher:
+    """The :class:`Refresher` of ``run`` in this process (one per run)."""
+    key = run.root.resolve()
+    with _refreshers_lock:
+        found = _refreshers.get(key)
+        if found is None:
+            found = _refreshers[key] = Refresher(run)
+        return found
+
+
+@atexit.register
+def _close_refreshers() -> None:  # a rewrite in progress finishes, nothing new starts
+    with _refreshers_lock:
+        found = list(_refreshers.values())
+    for item in found:
+        item.close(timeout=30.0)
 
 
 def _e(value: Any) -> str:
@@ -307,7 +426,7 @@ code {{ background: var(--code); border-radius: 4px; padding: 1px 5px; font-size
 </body>
 </html>
 """
-    tmp = run.dashboard.with_name(".dashboard.tmp.html")
+    tmp = run.dashboard.with_name(f".dashboard.tmp.{os.getpid()}.{threading.get_native_id()}.html")
     tmp.write_text(page)
     tmp.replace(run.dashboard)
     return run.dashboard

@@ -221,8 +221,9 @@ def test_sweep_tool_records_the_best_config_as_one_evaluation(tmp_path, monkeypa
     monkeypatch.setattr(sweep_mod, "run_evaluation", run_evaluation)
     monkeypatch.setattr(tools_mod, "create_sdk_mcp_server", lambda n, version, tools: tools)
     monkeypatch.setattr(tools_mod, "refresh", lambda *a: None)
-    budget = Budget(run, kernel_evals=5, eval_timeout_s=60.0)
-    server = {t.name: t for t in tools_mod.build_server(run, budget, keeper)}
+    budget = Budget(run, eval_timeout_s=60.0)
+    session = tools_mod.SessionBinding(evaluations=5)
+    server = {t.name: t for t in tools_mod.build_server(run, budget, keeper, session)}
 
     def call(tool: str, **args: Any) -> dict[str, Any]:
         out = asyncio.run(server[tool].handler(args))

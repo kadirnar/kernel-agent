@@ -5,18 +5,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
+import threading
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from kernel_agent import dedup, gpuqueue, ledger, region, truth, workers
+from kernel_agent import dashboard, dedup, gpuqueue, ledger, region, truth, workers
 from kernel_agent.budget import Budget
-from kernel_agent.dashboard import refresh
 from kernel_agent.kernels import sweep as sweep_mod
 from kernel_agent.kernels.evaluate import run_evaluation
 from kernel_agent.kernels.roofline import sol_signal
@@ -36,6 +38,50 @@ QUICK_NOTE = (
 _inflight: dict[tuple[str, str, str], asyncio.Event] = {}
 
 
+@dataclass(frozen=True)
+class SessionBinding:
+    """What the tools of one agent session are bound to: each session gets its own MCP
+    server (:func:`build_server`), so nothing a tool decides depends on which session ran
+    last (the run-wide ``Budget`` holds no session's evaluation budget).
+
+    ``label``: the session (its ``costs.json`` key), stamped on its ledger rows and records
+    (``session``); ``role``: kernel, systems, native, ...; ``target_id`` / ``worker``: the
+    target and worker (island) of a kernel session (``workers.py``: a worker's directory and
+    the ``worker`` of its rows, for its own target); ``agent``: the name every evaluation's
+    budget advice is kept under (the native session's; a worker's, for its own target;
+    None: ``kernel-<target>`` for kernel evaluations, ``systems`` for ``evaluate_e2e``);
+    ``evaluations``: its evaluation budget (None: none); ``cwd``: its working directory,
+    where relative candidate, transform and project paths are looked up first."""
+
+    label: str = ""
+    role: str = ""
+    target_id: str | None = None
+    worker: int | None = None
+    agent: str | None = None
+    evaluations: int | None = None
+    cwd: Path | None = None
+
+    def mine(self, target_id: str) -> bool:
+        """Whether ``target_id`` is this worker session's own target."""
+        return self.worker is not None and self.target_id == target_id
+
+    def kernel_agent(self, target_id: str) -> str:
+        """The name a kernel evaluation of ``target_id``'s budget advice is kept under."""
+        if self.agent and (self.worker is None or self.mine(target_id)):
+            return self.agent
+        return f"kernel-{target_id}"
+
+    def e2e_agent(self) -> str:
+        """The name an ``evaluate_e2e`` result's budget advice is kept under."""
+        return self.agent if self.agent and self.worker is None else "systems"
+
+
+def refresh(run: RunDir, target_id: str | None = None) -> None:
+    """Charts and ``dashboard.html`` after an evaluation: asked of the run's refresher thread
+    (``dashboard.Refresher``: debounced, never waited for)."""
+    dashboard.refresher(run).request(target_id)
+
+
 def _text(data: Any) -> dict[str, Any]:
     body = data if isinstance(data, str) else json.dumps(data, indent=1, default=str)
     if len(body) > 24000:
@@ -48,24 +94,48 @@ def _resolve(base: Path, path: str) -> Path:
     return p if p.is_absolute() else (base / p)
 
 
+_history_locks: dict[Path, threading.Lock] = {}
+_history_locks_lock = threading.Lock()
+
+
+def _history_lock(history: Path) -> threading.Lock:
+    with _history_locks_lock:
+        return _history_locks.setdefault(history.resolve(), threading.Lock())
+
+
 def _snapshot(src: Path, history: Path) -> Path:
     """Copy ``src`` into ``history`` as ``NNN_<stem>_<sha1:8>.py``; a project directory
-    (``native/project.py``) as its bundle, named after the project."""
+    (``native/project.py``) as its bundle, named after the project. The number is taken
+    under the directory's lock and the file created exclusively (``O_EXCL``), so snapshots
+    taken at once (sessions, a sweep's thread) never share a number or overwrite a file."""
     history.mkdir(parents=True, exist_ok=True)
-    # after the highest number, not the count: a deleted snapshot must not cause a clash
-    numbers = [int(m[1]) for p in history.glob("*.py") if (m := re.match(r"(\d+)_", p.name))]
-    seq = 1 + max(numbers, default=0)
-    if src.is_dir():
+    project_dir = src.is_dir()
+    if project_dir:
         text, project = native_project.pack(src)
         data, stem = text.encode(), project.manifest.name
     else:
         data, stem = src.read_bytes(), src.stem
     digest = hashlib.sha1(data).hexdigest()[:8]
-    dst = history / f"{seq:03d}_{stem}_{digest}.py"
-    if src.is_dir():
-        dst.write_bytes(data)
-    else:
-        shutil.copy2(src, dst)
+    with _history_lock(history):
+        # after the highest number, not the count: a deleted snapshot must not cause a clash
+        names = (p.name for p in history.glob("*.py"))
+        numbers = [int(m[1]) for name in names if (m := re.match(r"(\d+)_", name))]
+        seq = 1 + max(numbers, default=0)
+        while True:
+            dst = history / f"{seq:03d}_{stem}_{digest}.py"
+            try:
+                fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                break
+            except FileExistsError:  # another process took the number
+                seq += 1
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)  # the bytes the digest is of
+    except BaseException:
+        dst.unlink(missing_ok=True)
+        raise
+    if not project_dir:
+        shutil.copystat(src, dst)  # as shutil.copy2: mode and times of the candidate
     return dst
 
 
@@ -211,6 +281,7 @@ def record_candidate(
     mode: str = dedup.FULL,
     reevaluates: dict[str, Any] | None = None,
     queue_s: float | None = None,
+    session: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append a kernel evaluation to ``results.jsonl`` and the run ledger.
 
@@ -224,6 +295,7 @@ def record_candidate(
     (its ``exp``, ``speedup``, why; a ``re-evaluated`` row, :func:`current_records`).
     ``queue_s``: the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`; ``eval_s``
     is the evaluation's own time).
+    ``session``: the agent session that evaluated it (:class:`SessionBinding` ``label``).
     """
     target_dir = run.target(target_id)
     quick = mode == dedup.QUICK
@@ -243,6 +315,7 @@ def record_candidate(
         worker=worker,
         status=ledger.REEVALUATED if reevaluates else status,
         queue_s=queue_s,
+        session=session,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -261,6 +334,7 @@ def record_candidate(
         "expected_speedup": expected_speedup,
         "source_key": dedup.source_key(source),
         **({"worker": worker} if worker else {}),
+        **({"session": session} if session else {}),
         **({"mode": dedup.QUICK} if quick else {}),
         **({"reevaluates": reevaluates} if reevaluates else {}),
         **({"queue_s": queue_s} if queue_s is not None else {}),
@@ -326,10 +400,12 @@ def record_e2e_result(
     when: float | None = None,
     keeper: Truth | None = None,
     queue_s: float | None = None,
+    session: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Append an ``evaluate_e2e`` measurement to the transforms' ``results.jsonl`` and the
     ledger; ``transforms_sha256`` holds the digests of the snapshots it measured; a run
-    with a project bundle or a native stage target is the native arm's (``native/engine.py``)."""
+    with a project bundle or a native stage target is the native arm's (``native/engine.py``);
+    ``session``: the agent session that ran it (:class:`SessionBinding` ``label``)."""
     row = ledger.record_e2e(
         run,
         result,
@@ -339,6 +415,7 @@ def record_e2e_result(
         eval_s=eval_s,
         when=when,
         queue_s=queue_s,
+        session=session,
     )
     record = {
         "time": time.strftime("%H:%M:%S", time.localtime(when)),
@@ -350,6 +427,7 @@ def record_e2e_result(
         "ledger_status": row["status"],
         "hypothesis": hypothesis,
         **({"queue_s": queue_s} if queue_s is not None else {}),
+        **({"session": session} if session else {}),
     }
     _append(run, None, record, keeper)
     return record, row
@@ -428,20 +506,16 @@ def build_server(
     run: RunDir,
     budget: Budget | None = None,
     keeper: Truth | None = None,
-    worker: workers.Binding | None = None,
-    *,
-    agent: str | None = None,
-    evaluations: int | None = None,
-    cwd: Path | None = None,
+    binding: SessionBinding | None = None,
 ) -> Any:
-    """Tools bound to one run directory (its budget: eval timeout + advice; its truth) and,
-    for a worker session, to that worker (its directory, agent name and evaluation budget).
-    ``agent`` / ``evaluations``: the session every evaluation's budget advice is for (the
-    native session, ``native/engine.py``; default: the target's kernel agent, ``systems``
-    for ``evaluate_e2e``); ``cwd``: its working directory, where relative candidate,
-    transform and project paths are looked up first."""
+    """Tools bound to one run directory (its budget: eval timeout + advice; its truth) and
+    to one agent session (:class:`SessionBinding`: its label, worker directory, the name its
+    budget advice is kept under, its evaluation budget and working directory). Build one
+    server per session (``Orchestrator._agent``)."""
     budget = budget or Budget(run)
     keeper = keeper or truth.of(run)
+    bound = binding or SessionBinding()
+    cwd, session = bound.cwd, bound.label or None
 
     def _path(base: Path, path: str) -> Path:
         """``path`` relative to the session's ``cwd`` when it exists there, else to ``base``."""
@@ -463,7 +537,7 @@ def build_server(
         hypothesis: str,
         source: str,
         idea: str,
-        mine: workers.Binding | None,
+        worker: int | None,
     ) -> dict[str, Any]:
         """The earlier result of a candidate evaluated before (``dedup.py``) + its ledger row."""
         target_id = args["target_id"]
@@ -476,10 +550,11 @@ def build_server(
             parent=args.get("parent"),
             source=source,
             idea=idea,
-            worker=mine.worker if mine else None,
+            worker=worker,
             status=ledger.DUPLICATE,
+            session=session,
         )
-        await asyncio.to_thread(refresh, run, target_id)
+        refresh(run, target_id)
         out = compact(cached)
         out["duplicate"] = (
             f"{dedup.label(cached)}: the same source up to comments and formatting, so it was "
@@ -557,9 +632,9 @@ def build_server(
         capture = run.capture_file(target_id)
         if not capture.exists():
             return _text({"status": "error", "error": f"unknown target {target_id}"})
-        mine = worker if worker is not None and worker.target_id == target_id else None
-        if mine is not None:  # a worker session: its own directory, name and budget
-            target_dir = workers.directory(run, target_id, mine.worker)
+        worker = bound.worker if bound.mine(target_id) else None
+        if worker is not None:  # a worker session: its own directory
+            target_dir = workers.directory(run, target_id, worker)
         src = _path(target_dir, args["candidate"])
         if (refused := _in_truth(run, src)) is not None:
             return _text(refused)
@@ -584,10 +659,7 @@ def build_server(
         quick = mode == dedup.QUICK
         idea = ledger.idea_slug(args.get("idea_id"))
         expected = _expected(args.get("expected_speedup"))
-        name = mine.agent if mine else agent or f"kernel-{target_id}"
-        evals_budget = budget.kernel_evals if evaluations is None else evaluations
-        if mine is not None and mine.evaluations is not None:
-            evals_budget = mine.evaluations
+        name, evals_budget = bound.kernel_agent(target_id), bound.evaluations
         try:
             capture_sha256 = keeper.expect(capture)
         except TamperError as exc:
@@ -610,7 +682,7 @@ def build_server(
                 except TamperError as exc:
                     return _text({"status": "tampered", "correct": False, "error": str(exc)})
                 return _text(
-                    await _duplicate(cached, args, hypothesis, source, idea, mine)
+                    await _duplicate(cached, args, hypothesis, source, idea, worker)
                     | _uncounted(budget, name, evals_budget)
                 )
         _inflight[slot] = done = asyncio.Event()
@@ -655,14 +727,15 @@ def build_server(
                 keeper=keeper,
                 idea=idea,
                 expected_speedup=expected,
-                worker=mine.worker if mine else None,
+                worker=worker,
                 mode=mode,
                 queue_s=job.queue_s,
+                session=session,
             )
         finally:
             _inflight.pop(slot, None)
             done.set()
-        await asyncio.to_thread(refresh, run, target_id)
+        refresh(run, target_id)
         out = compact(result)
         out["ledger"] = {"exp": row["exp"], "status": row["status"]}
         if str(args.get("profile")).lower() == "ncu" and not quick and result.get("correct"):
@@ -740,9 +813,9 @@ def build_server(
         capture = run.capture_file(target_id)
         if not capture.exists():
             return _text({"status": "error", "error": f"unknown target {target_id}"})
-        mine = worker if worker is not None and worker.target_id == target_id else None
-        if mine is not None:
-            target_dir = workers.directory(run, target_id, mine.worker)
+        worker = bound.worker if bound.mine(target_id) else None
+        if worker is not None:
+            target_dir = workers.directory(run, target_id, worker)
         src = _path(target_dir, args["candidate"])
         if (refused := _in_truth(run, src)) is not None:
             return _text(refused)
@@ -764,10 +837,7 @@ def build_server(
             return _text({"status": "error", "error": str(exc)})
         idea = ledger.idea_slug(args.get("idea_id"))
         expected = _expected(args.get("expected_speedup"))
-        name = mine.agent if mine else agent or f"kernel-{target_id}"
-        evals_budget = budget.kernel_evals if evaluations is None else evaluations
-        if mine is not None and mine.evaluations is not None:
-            evals_budget = mine.evaluations
+        name, evals_budget = bound.kernel_agent(target_id), bound.evaluations
         try:
             capture_sha256 = keeper.expect(capture)
         except TamperError as exc:
@@ -820,10 +890,11 @@ def build_server(
             keeper=keeper,
             idea=idea,
             expected_speedup=expected,
-            worker=mine.worker if mine else None,
+            worker=worker,
             queue_s=job.queue_s,
+            session=session,
         )
-        await asyncio.to_thread(refresh, run, target_id)
+        refresh(run, target_id)
         out = compact(result)
         out["config"], out["snapshot"] = config, f"history/{snap.name}"
         out["sweep"] = {
@@ -948,16 +1019,14 @@ def build_server(
             eval_s=round(time.perf_counter() - start - job.wait_s, 1),
             keeper=keeper,
             queue_s=job.queue_s,
+            session=session,
         )
-        await asyncio.to_thread(refresh, run)
+        refresh(run)
         result["ledger"] = {"exp": row["exp"], "status": row["status"]}
         if isinstance(result.get("error"), str):
             result["error"] = result["error"][-3000:]
         result |= budget.feedback(
-            agent or "systems",
-            run.results_file(),
-            budget.transform_evals if evaluations is None else evaluations,
-            ok_key="passed",
+            bound.e2e_agent(), run.results_file(), bound.evaluations, ok_key="passed"
         )
         return _text(result)
 
@@ -968,11 +1037,8 @@ def build_server(
         {"type": "object", "properties": {}},
     )
     async def check_harness(args: dict[str, Any]) -> dict[str, Any]:
-        cfg = run.load()
-        cfg["workload"]["harness"] = str(run.harness)
-        from kernel_agent.workspace import write_json
-
-        write_json(run.run_json, cfg)
+        harness = str(run.harness)
+        run.update(lambda cfg: cfg["workload"].__setitem__("harness", harness))
         job = gpuqueue.Job.of(run, "harness")
         result = await gpuqueue.run(job, call_worker, run, "analyze", "--no-profile")
         if "error" not in result:

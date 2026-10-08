@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger
-from kernel_agent.workspace import TRUTH_DIR, RunDir, write_json
+from kernel_agent.workspace import TRUTH_DIR, RunDir
 
 VERSION = 1
 #: Case fields of a capture that hold the answer key (reference outputs + side effects; a
@@ -184,13 +184,14 @@ class Truth:
                 return str(path)
 
     def _persist(self) -> None:
-        data = self.run.load()
-        data["truth"] = {
+        """Mirror the digests in ``run.json`` ``truth`` (under the file's lock: the other
+        sections that threads change meanwhile are kept, ``workspace.update_json``)."""
+        section = {
             "version": VERSION,
             "baseline_ms": self.recorded_baseline_ms,
-            "files": self.files,
+            "files": dict(self.files),
         }
-        write_json(self.run.run_json, data)
+        self.run.update(lambda data: data.__setitem__("truth", section))
 
     def alarm(self, path: Path | str, problem: str, action: str = "refused") -> None:
         """:func:`alarm`, once per file and problem in this process."""

@@ -134,7 +134,7 @@ def _server(run, monkeypatch, outcomes=None, *, binding=None, budget=None, delay
     monkeypatch.setattr(tools_mod, "run_evaluation", fake_eval)
     monkeypatch.setattr(tools_mod, "create_sdk_mcp_server", lambda n, version, tools: tools)
     monkeypatch.setattr(tools_mod, "refresh", lambda *a: None)
-    server = {t.name: t for t in tools_mod.build_server(run, budget or Budget(run), worker=binding)}
+    server = {t.name: t for t in tools_mod.build_server(run, budget or Budget(run), None, binding)}
 
     async def acall(tool, **args):
         out = await server[tool].handler(args)
@@ -158,8 +158,7 @@ def _target(run, target_id="t", spec=None):
 def test_duplicates_return_the_cached_result_and_cost_nothing(tmp_path, monkeypatch):
     run = RunDir.create(tmp_path, "org/m")
     tdir = _target(run)
-    budget = Budget(run, kernel_evals=3)
-    call, seen = _server(run, monkeypatch, budget=budget)
+    call, seen = _server(run, monkeypatch, binding=tools_mod.SessionBinding(evaluations=3))
     src = tdir / "candidates" / "v1.py"
     src.write_text("import triton\n\ndef build(r):\n    return r\n")
 
@@ -254,8 +253,8 @@ def test_quick_tier(tmp_path, monkeypatch):
             return result | {"quick": {"cases": [0, 2], "of": 3}, "timing": "skipped: quick"}
         return {"status": "ok", "correct": True, "speedup": 1.5, "cases": []}
 
-    budget = Budget(run, kernel_evals=2)
-    call, seen = _server(run, monkeypatch, outcome, budget=budget)
+    binding = tools_mod.SessionBinding(evaluations=2)
+    call, seen = _server(run, monkeypatch, outcome, binding=binding)
     src = tdir / "candidates" / "v1.py"
 
     def evaluate_candidate(code, **args):
@@ -343,7 +342,9 @@ def test_worker_tools_resolve_paths_label_rows_and_rank_across_workers(tmp_path,
     for k in (1, 2):
         home = workers.prepare(run, "t", k)
         (home / "candidates" / "v1.py").write_text(f"TAG = 'w{k}'\n\ndef build(r):\n    return r\n")
-        binding = workers.Binding("t", k, workers.agent_name("t", k), evaluations=2)
+        binding = tools_mod.SessionBinding(
+            target_id="t", worker=k, agent=workers.agent_name("t", k), evaluations=2
+        )
         calls[k], _ = _server(run, monkeypatch, outcome, binding=binding)
     one = calls[1](
         "evaluate_candidate", target_id="t", candidate="candidates/v1.py", hypothesis="a"

@@ -34,6 +34,8 @@ Kernel rows carry the ``idea`` the agent tagged the candidate with (``idea_id`` 
 ``evaluate_candidate``); :func:`ideas` aggregates a target's rows per idea, so that a
 buggy attempt is not mistaken for a refuted idea, and the ``worker`` that produced them
 when the target has parallel workers (:mod:`kernel_agent.workers`; empty otherwise).
+Rows of an agent's evaluation carry its ``session`` (the session's label, as in
+``costs.json``: its rows, whatever ran beside it).
 
 ``e2e`` rows carry the median speedup over the workload's diverse input set
 (``diverse_speedup``, :mod:`kernel_agent.workloads.diverse`) and ``flags``:
@@ -82,6 +84,7 @@ COLUMNS = (
     "diverse_speedup",
     "flags",
     "worker",
+    "session",
     "idea",
     "hypothesis",
 )
@@ -371,7 +374,12 @@ def parse_row(header: list[str], line: str) -> dict[str, Any]:
 
 
 def read_tsv(path: Path) -> list[dict[str, Any]]:
-    lines = path.read_text().splitlines() if path.exists() else []
+    """The rows of a TSV file; a last line without its newline is a row still being written
+    (by another process: ``status``, ``watch``) and left out."""
+    text = path.read_text() if path.exists() else ""
+    lines = text.splitlines()
+    if lines and not text.endswith("\n"):
+        lines.pop()
     if not lines:
         return []
     header = lines[0].split("\t")
@@ -412,12 +420,14 @@ def record_kernel(
     worker: int | None = None,
     status: str | None = None,
     queue_s: float | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Classify a kernel evaluation against the target's running best and append it.
 
     ``status``: a status of :data:`UNMEASURED` instead of the classification;
     ``worker``: the target's worker that ran it (:mod:`kernel_agent.workers`); ``queue_s``:
-    the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`)."""
+    the time it waited for the GPU (:mod:`kernel_agent.gpuqueue`); ``session``: the agent
+    session that ran it (its label)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == target_id])
         row = append(
@@ -441,9 +451,11 @@ def record_kernel(
                 "idea": idea,
                 "hypothesis": hypothesis,
                 "worker": worker,
+                "session": session,
             },
         )
-    tag = {"worker": worker} if worker else {}
+    tag: dict[str, Any] = {"worker": worker} if worker else {}
+    tag |= {"session": session} if session else {}
     event(
         run, "evaluation", when=when, target=target_id, exp=row["exp"], status=row["status"], **tag
     )
@@ -461,8 +473,10 @@ def record_e2e(
     eval_s: float | None = None,
     when: float | None = None,
     queue_s: float | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
-    """Classify an end-to-end measurement (transform or integration step) and append it."""
+    """Classify an end-to-end measurement (transform or integration step) and append it;
+    ``session``: the agent session that ran it (its label; none for the integration's)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == E2E])
         status = classify(result, best, e2e=True)
@@ -489,17 +503,21 @@ def record_e2e(
                 "diverse_speedup": diversity.median_speedup(result),
                 "flags": diversity.flags(result),
                 "hypothesis": hypothesis,
+                "session": session,
             },
         )
-    event(run, "evaluation", when=when, target=E2E, exp=row["exp"], status=row["status"])
+    tag = {"session": session} if session else {}
+    event(run, "evaluation", when=when, target=E2E, exp=row["exp"], status=row["status"], **tag)
     return row
 
 
 def rows(run: RunDir) -> list[dict[str, Any]]:
-    """All ledger rows of a run; reconstructed from ``results.jsonl`` for older runs."""
-    if run.ledger.exists():
-        return read_tsv(run.ledger)
-    return backfill(run)
+    """All ledger rows of a run; reconstructed from ``results.jsonl`` for older runs. Read
+    under the ledger's lock: never a row that a thread of this process is writing."""
+    with _lock:
+        if run.ledger.exists():
+            return read_tsv(run.ledger)
+        return backfill(run)
 
 
 def backfill(run: RunDir) -> list[dict[str, Any]]:
@@ -541,6 +559,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
                 "idea": rec.get("idea") or "",
                 "hypothesis": rec.get("hypothesis") or "",
                 "worker": rec.get("worker"),
+                "session": rec.get("session"),
             }
             kept.append(row)
             out.append(row)
@@ -564,6 +583,7 @@ def backfill(run: RunDir) -> list[dict[str, Any]]:
             "queue_s": _num(rec.get("queue_s")),
             "idea": "",
             "hypothesis": rec.get("hypothesis") or "",
+            "session": rec.get("session"),
         }
         kept.append(row)
         out.append(row)

@@ -241,18 +241,20 @@ def cmd_resume(ns: argparse.Namespace) -> int:
         overrides["auth"] = ns.auth
     if ns.precisions:  # recorded in run.json (precisions.py)
         overrides["precisions"] = ns.precisions
-    orch = Orchestrator.resume(Path(ns.run_dir), overrides)
-    if ns.redo:
-        data = orch.run.load()
-        phases = data.get("phases", {})
-        from kernel_agent.orchestrator import PHASES
+    from kernel_agent.workspace import RunDir, coordinator_lock
 
-        for phase in PHASES[PHASES.index(ns.redo) :]:
-            phases.pop(phase, None)
-        from kernel_agent.workspace import write_json
+    with coordinator_lock(RunDir(Path(ns.run_dir).resolve())):  # one process per run
+        orch = Orchestrator.resume(Path(ns.run_dir), overrides)
+        if ns.redo:
+            from kernel_agent.orchestrator import PHASES
 
-        write_json(orch.run.run_json, data)
-    run = asyncio.run(orch.run_all(until=ns.until))
+            def redo(data: dict[str, Any]) -> None:
+                phases = data.get("phases", {})
+                for phase in PHASES[PHASES.index(ns.redo) :]:
+                    phases.pop(phase, None)
+
+            orch.run.update(redo)
+        run = asyncio.run(orch.run_all(until=ns.until))
     print(run.report.read_text() if run.report.exists() else "")
     return 0
 
@@ -263,22 +265,24 @@ def cmd_integrate(ns: argparse.Namespace) -> int:
     from kernel_agent import interrupt
     from kernel_agent.orchestrator import Orchestrator
     from kernel_agent.report import write_report
+    from kernel_agent.workspace import RunDir, coordinator_lock
 
     overrides = {"precisions": ns.precisions} if ns.precisions else {}
-    orch = Orchestrator.resume(Path(ns.run_dir), overrides)  # --precisions: into run.json
-    if orch.simulated:
-        raise SystemExit(f"{ns.run_dir} is a dry-run run (improve --dry-run integrates it)")
+    with coordinator_lock(RunDir(Path(ns.run_dir).resolve())):  # one process per run
+        orch = Orchestrator.resume(Path(ns.run_dir), overrides)  # --precisions: into run.json
+        if orch.simulated:
+            raise SystemExit(f"{ns.run_dir} is a dry-run run (improve --dry-run integrates it)")
 
-    async def integrate() -> Path:
-        await orch.integrate(reuse=not ns.no_reuse)
-        path = write_report(orch.run)
-        orch._mark("report")
-        return path
+        async def integrate() -> Path:
+            await orch.integrate(reuse=not ns.no_reuse)
+            path = write_report(orch.run)
+            orch._mark("report")
+            return path
 
-    try:
-        report = interrupt.run(integrate())
-    except KeyboardInterrupt:
-        return interrupt.EXIT_CODE
+        try:
+            report = interrupt.run(integrate())
+        except KeyboardInterrupt:
+            return interrupt.EXIT_CODE
     print(f"\nreport: {report}\nrun directory: {orch.run.root}")
     return 0
 
