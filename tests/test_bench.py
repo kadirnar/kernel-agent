@@ -239,17 +239,18 @@ def test_evaluator_times_before_the_profiled_pass(tmp_path, monkeypatch):
     from kernel_agent.selftest import make_rmsnorm_capture
 
     order: list[str] = []
-    compare_timing, activity_check = bench.compare_timing, integrity.activity_check
+    # the evaluator times a case through bench.timing_rounds (#190: twice when it may stop early)
+    timing_rounds, activity_check = bench.timing_rounds, integrity.activity_check
 
     def timed(*args, **kwargs):
         order.append("timing")
-        return compare_timing(*args, **kwargs)
+        return timing_rounds(*args, **kwargs)
 
     def profiled(*args, **kwargs):
         order.append("profiler")
         return activity_check(*args, **kwargs)
 
-    monkeypatch.setattr(bench, "compare_timing", timed)  # before evaluate's snapshot
+    monkeypatch.setattr(bench, "timing_rounds", timed)  # before evaluate's snapshot
     monkeypatch.setattr(integrity, "activity_check", profiled)
     capture = make_rmsnorm_capture(tmp_path / "rms.pt", hidden=1024)
     result = evaluate(capture, EXAMPLES_DIR / "triton_rmsnorm.py")
