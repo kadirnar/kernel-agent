@@ -70,8 +70,8 @@ boundaries when the time sits between them.
    for module kernels, then times the stage against the reference stage. `mode="quick"`
    is free.
 2. End to end: `evaluate_e2e(transforms=["<dir>"], kernels=[...])` runs the full workload:
-   output comparison, the held-out input, the natural-length run and, in a near-lossless
-   run, the perceptual gate.
+   output comparison, the held-out input, the natural-length run and, in a near-lossless or
+   relaxed run, the perceptual gate.
 3. The integration re-checks kernels in fresh processes and runs them under
    compute-sanitizer memcheck (odd-size variants included): bounds-check every tail tile.
 

@@ -129,7 +129,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         # ... and the diverse input set: outputs and times (workloads/diverse.py)
         target = truth.replace(out.baseline_output_diverse())
         baseline["diverse"] = diverse.save_baseline(workload, target)
-        # ... and, with --quality near-lossless, the perceptual samples (workloads/perceptual.py)
+        # ... and, with --quality near-lossless / relaxed, the perceptual samples (perceptual.py)
         target = truth.replace(out.baseline_output_perceptual())
         mode = _quality(ns, run)
         baseline["perceptual"] = perceptual.save_baseline(workload, target, quality=mode)
@@ -259,8 +259,8 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     with __import__("torch").inference_mode():
         workload.run(inputs)  # warm-up so lazily-initialised state exists
     capture = truth.replace(capture)  # .truth/captures/ of a sealed run
-    # near-lossless tolerances for a target whose spec allows reduced precision, recorded
-    # in the sealed capture (kernels/compare.py): the agent's spec.json cannot change it
+    # near-lossless / relaxed tolerances for a target whose spec allows reduced precision,
+    # recorded in the sealed capture (kernels/compare.py): the agent's spec.json cannot change it
     tier = tier_for(_quality(ns, run), spec.get("precision")) if not parent else EXACT_TIER
     info = capture_module(
         workload,
@@ -360,9 +360,9 @@ def cmd_export_check(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     copy of ``optimized/`` outside the run directory) as a user would and apply it to the
     workload while no file of the run directory can be opened (but the harness), then judge
     one run's output with the workload's quality check against the baseline output (in a
-    near-lossless run with a perceptual baseline: its sanity floor, as ``e2e`` does before
-    the perceptual gate). ``missing``: the run files it tried to open and the files an
-    error names."""
+    near-lossless or relaxed run with a perceptual baseline: its sanity floor, as ``e2e``
+    does before the perceptual gate). ``missing``: the run files it tried to open and the
+    files an error names."""
     import torch
 
     from kernel_agent.integrate import export
@@ -381,7 +381,7 @@ def cmd_export_check(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     reference = torch.load(io.BytesIO(reference_bytes), weights_only=False)
     baseline = json.loads(baseline_bytes or b"{}")
     gate: Any = None
-    if perceptual_bytes and mode == perceptual.NEAR_LOSSLESS:
+    if perceptual_bytes and perceptual.gated(mode):
         gate = torch.load(io.BytesIO(perceptual_bytes), weights_only=False)
     with export.hidden(run.root, allow=[run.harness]) as refused:
         try:
@@ -455,10 +455,11 @@ def _judge(
 ) -> tuple[float, dict[str, Any]]:
     """(baseline ms, quality verdict) of a timed candidate output: ``status`` ok with
     ``passed`` / ``reason`` / ``metrics``, ``runtime_error`` when a check crashed, or
-    ``oom`` when one ran out of GPU memory (no verdict). ``--quality near-lossless`` with a
-    perceptual baseline: the checks of :func:`_checks` with the workload's sanity floor,
-    then the perceptual gate (workloads/perceptual.py; ``before_scoring`` runs after its
-    samples, the model's last run)."""
+    ``oom`` when one ran out of GPU memory (no verdict). ``--quality near-lossless`` or
+    ``relaxed`` with a perceptual baseline: the checks of :func:`_checks` with the
+    workload's sanity floor of the mode, then the perceptual gate with the mode's thresholds
+    (workloads/perceptual.py; ``before_scoring`` runs after its samples, the model's last
+    run)."""
     import torch
 
     from kernel_agent.workloads import perceptual
@@ -466,7 +467,7 @@ def _judge(
     *files, perceptual_bytes = truth_files
     mode = _quality(ns)
     reference: dict[str, Any] | None = None
-    if perceptual_bytes and mode == perceptual.NEAR_LOSSLESS:
+    if perceptual_bytes and perceptual.gated(mode):
         reference = torch.load(io.BytesIO(perceptual_bytes), weights_only=False)
     with perceptual.judging(workload, mode, reference) as gate:
         base_ms, verdict = _checks(ns, workload, inputs, output, median_ms, tuple(files))
@@ -479,7 +480,7 @@ def _judge(
     elif not verdict["passed"]:  # rejected already: spare the gate's runs
         result = {"passed": False, "reason": "", "skipped": "the other checks failed"}
     else:
-        result = perceptual.check(workload, reference, before_scoring=before_scoring)
+        result = perceptual.check(workload, reference, before_scoring=before_scoring, quality=mode)
     if result is not None:
         verdict["metrics"]["perceptual"] = result
         verdict["passed"] = verdict["passed"] and result["passed"]
@@ -826,7 +827,7 @@ def main(argv: list[str] | None = None) -> int:
         "--verify", action="append", help="e2e: REL=SHA256, refuse a run file without it"
     )
     parser.add_argument("--no-diverse", action="store_true", help="e2e: skip the diverse input set")
-    parser.add_argument("--quality", help="exact | near-lossless (default: run.json's)")
+    parser.add_argument("--quality", help="exact | near-lossless | relaxed (default: run.json's)")
     parser.add_argument(
         "--precisions", help="P,P,...: the precisions the run allows (default: run.json's)"
     )

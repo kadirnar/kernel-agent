@@ -31,6 +31,7 @@ def fast(monkeypatch):
 
 
 def make(tmp_path, seed=0, **cfg):
+    cfg.setdefault("quality", "exact")  # an exact run (new runs default to relaxed, #175)
     config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path, **cfg)
     orch = orchestrator.Orchestrator(dryrun.create_run(config, seed), config)
     return orch, dryrun.World(orch)

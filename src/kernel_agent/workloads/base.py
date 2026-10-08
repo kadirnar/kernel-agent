@@ -133,6 +133,11 @@ class Workload(ABC):
     #: thresholds that numerics-changing variants such as FP8 weights pass and broken
     #: kernels still fail, ``stop_tolerance``). Options the user set win.
     near_lossless_options: ClassVar[dict[str, Any]] = {}
+    #: ``--quality relaxed`` (#175): overrides on top of :attr:`near_lossless_options` and the
+    #: gate's ``perceptual.RELAXED_GATE``: the sanity floor loosened in proportion to the
+    #: relaxed error budgets (about twice near-lossless's), still failing broken kernels.
+    #: Empty: the near-lossless floor (with the relaxed gate thresholds).
+    relaxed_options: ClassVar[dict[str, Any]] = {}
 
     def __init__(self, spec: WorkloadSpec) -> None:
         self.spec = spec

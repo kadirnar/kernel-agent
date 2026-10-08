@@ -204,9 +204,9 @@ def build(reference):
 """
 
 
-@pytest.fixture(scope="module")
-def kv_capture(tmp_path_factory):
-    path = tmp_path_factory.mktemp("kv") / "decode.pt"
+@pytest.fixture(scope="module", params=[NEAR, "relaxed"])
+def kv_capture(tmp_path_factory, request):
+    path = tmp_path_factory.mktemp("kv") / f"decode.{request.param}.pt"
     gen = torch.Generator().manual_seed(3)
     cases = []
     for batch, tokens, count in ((2, 192, 28), (1, 33, 0)):
@@ -214,9 +214,9 @@ def kv_capture(tmp_path_factory):
         k = torch.randn(batch, 2, tokens, 64, generator=gen).to(torch.bfloat16)
         v = torch.randn(batch, 2, tokens, 64, generator=gen).to(torch.bfloat16)
         cases.append(((q, k, v), {}, count))
-    tier = compare.tier_for(NEAR, "fp8_kv")
+    tier = compare.tier_for(request.param, "fp8_kv")  # near-lossless-kv, relaxed-kv (#175)
     capture_calls(selftest.DecodeAttention(), cases, path, tier=tier, precision="fp8_kv")
-    return path
+    return path, tier
 
 
 @pytest.mark.parametrize(
@@ -225,12 +225,14 @@ def kv_capture(tmp_path_factory):
 )
 def test_the_fp8_kv_reference_math_fits_the_near_lossless_tier(tmp_path, kv_capture, bug, status):
     """e4m3 K / V with per-token scales pass captured and redrawn inputs; broken scales fail."""
+    capture, tier = kv_capture
     path = tmp_path / "fp8_kv.py"
     path.write_text(KV_CANDIDATE.format(bug=bug))
-    result = evaluate(kv_capture, path, device="cpu")
+    result = evaluate(capture, path, device="cpu")
     assert result["status"] == status, result
     if bug is None:
-        assert result["correct"] and result["tolerance_tier"] == compare.NEAR_LOSSLESS_KV_TIER
+        assert result["correct"] and result["tolerance_tier"] == tier
+        assert tier in (compare.NEAR_LOSSLESS_KV_TIER, compare.RELAXED_KV_TIER)
         assert "perturbed" in result["checks"]
         assert all(c["max_rel_l2"] < 0.04 for c in result["cases"])
 

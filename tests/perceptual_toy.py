@@ -1,4 +1,5 @@
-"""The chaotic toy (``chaotic_toy.py``) with a perceptual gate, for the near-lossless tests.
+"""The chaotic toy (``chaotic_toy.py``) with a perceptual gate, for the near-lossless and
+relaxed tests.
 
 Teacher-forcing thresholds are options (so ``near_lossless_options`` can loosen them), the
 perceptual samples are two short runs with other seeds, and the "scorer" is cheap: the RMS
@@ -31,6 +32,8 @@ class PerceptualToy(_toy.ChaoticToy):
         "max_rms_change": 0.1,
     }
     near_lossless_options = {"min_step_cosine": 0.9, "min_mean_step_cosine": 0.95}
+    # --quality relaxed (#175): twice the floor's budgets and twice the gate's
+    relaxed_options = {"min_step_cosine": 0.8, "min_mean_step_cosine": 0.9, "max_rms_change": 0.2}
 
     def compare_teacher_forced(self, reference: Any, candidate: Any) -> Comparison:
         return compare_steps(

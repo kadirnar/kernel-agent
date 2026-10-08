@@ -97,7 +97,8 @@ def test_modes_and_floor_options():
 def test_quality_flag_reaches_config_and_worker_args(tmp_path):
     ns = _parse(["analyze", "org/m", "--quality", "near-lossless"])
     assert cli._config(ns).quality == "near-lossless"
-    assert cli._config(_parse(["analyze", "org/m"])).quality == "exact"
+    assert cli._config(_parse(["analyze", "org/m"])).quality == "relaxed"  # new runs (#175)
+    assert cli._config(_parse(["analyze", "org/m", "--quality", "exact"])).quality == "exact"
     run = RunDir.create(tmp_path, "org/m")
     write_json(run.run_json, {"truth": truth.new_section(), "config": {"quality": "near-lossless"}})
     keeper = truth.Truth(run)
@@ -372,7 +373,7 @@ def test_report_shows_the_perceptual_metrics():
 
     gate = {"passed": False, "reason": "speaker similarity 0.7 < 0.9", "error_rate": 0.02}
     assert perceptual.summary_text(gate).startswith("perceptual gate FAILED: speaker")
-    assert _quality_lines({"config": {}}, {}) == []
+    assert _quality_lines({"config": {}}, {})[0].startswith("* quality: **exact**")
     base = {"perceptual": {"status": "ok", "samples": 8, "mean": {"error_rate": 0.01}}}
     line = _quality_lines({"config": {"quality": "near-lossless"}}, base)[0]
     assert "perceptual gate on 8 samples" in line and "error_rate=0.01" in line

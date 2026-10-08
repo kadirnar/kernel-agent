@@ -300,6 +300,7 @@ def test_building_blocks_list_this_run_and_the_library(tmp_path, monkeypatch):
 
 
 def make(tmp_path, **cfg):
+    cfg.setdefault("quality", "exact")  # an exact run (new runs default to relaxed, #175)
     config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path, dossier=False, **cfg)
     orch = orchestrator.Orchestrator(dryrun.create_run(config), config)
     return orch, dryrun.World(orch)

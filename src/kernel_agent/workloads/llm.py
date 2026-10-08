@@ -65,6 +65,10 @@ class LLMWorkload(Workload):
     #: on some natural prompts) and the first-step logits keep a sanity floor (calibration:
     #: README).
     near_lossless_options = {"min_prefix": 0, "min_cosine": 0.98}
+    #: ``--quality relaxed`` (#175): twice the first-step logits budget (1 - 0.98 -> 1 - 0.96);
+    #: FP8 scales x1.05 reach 0.98, int4 weights, scales x1.2, RMSNorm eps 1e-2 and a dropped
+    #: KV head <= 0.86 (README).
+    relaxed_options = {"min_cosine": 0.96}
 
     def load(self) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer

@@ -61,6 +61,7 @@ from kernel_agent.integrate import owners as owners_mod
 from kernel_agent.integrate import reuse as reuse_cache
 from kernel_agent.integrate.export import export_optimized
 from kernel_agent.kernels import evaluate, memcheck, recheck
+from kernel_agent.kernels.compare import allows_reduced
 from kernel_agent.native import engine as native_engine
 from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
@@ -139,6 +140,7 @@ class Orchestrator:
         for name, why in precisions.gpu_refused(cfg.quality, cfg.precisions, cap).items():
             log(f"precision {name}: not on this GPU: {why}")
         cfg.precisions = list(precisions.allowed(cfg.quality, cfg.precisions, cap))
+        log(f"quality: {cfg.quality}; precisions: {precisions.describe(cfg.precisions, cap)}")
         log(auth.preflight(cfg.auth))  # --auth: a login / API key exists (presence only)
         log(f"resolving {cfg.model_ref}")
         card = hub.resolve(cfg.model_ref, token=cfg.hf_token, modality=cfg.modality)
@@ -1196,7 +1198,7 @@ class Orchestrator:
             schema=evaluate.EVALUATOR_SCHEMA,
             baseline_ms=self.truth.baseline_ms(),
             ab_rounds=self.cfg.ab_rounds,
-            perceptual=self.truth.quality == "near-lossless",
+            perceptual=allows_reduced(self.truth.quality),
             verified=verified,
         )
         return migration.entries, migration.note()
@@ -1975,14 +1977,14 @@ class Orchestrator:
         """A clean-context research session on a plateaued target (``research.py``).
 
         Read-only tools plus ``best_result``; it may write ``targets/<id>/plan.md``
-        and, in a near-lossless run, a precision pivot proposal ``pivot.json``
+        and, in a near-lossless or relaxed run, a precision pivot proposal ``pivot.json``
         (``pivot.py``), nothing else (``run_agent(writable=...)``)."""
         from kernel_agent import pivot
 
         target_dir = self.run.target(target_id)
         spec = read_json(target_dir / "spec.json")
         plan = research.plan_path(self.run, target_id)
-        near = self.cfg.quality == "near-lossless"
+        near = allows_reduced(self.cfg.quality)
         allowed = self.allowed_precisions()  # a pivot only to another one of them
         others = [p for p in precisions.reduced(allowed) if p != precisions.of_spec(spec)]
         proposal = pivot.proposal_path(self.run, target_id) if near and others else None
@@ -2496,9 +2498,9 @@ def _precision(
     """Normalise a planned target's ``precision`` / ``precision_why`` in place; returns why
     the target is refused, or None. A reduced precision (``fp8_weights``, ``fp8_w8a8``,
     ``reduced``, ``fp4_weights``: ``kernels.compare.REDUCED_PRECISIONS``) needs ``--quality
-    near-lossless`` and must be one the run allows (``allowed``; None: the default of the
-    quality mode, without the 4-bit ones: ``precisions.py``)."""
-    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, PRECISIONS, REDUCED_PRECISIONS
+    near-lossless`` or ``relaxed`` and must be one the run allows (``allowed``; None: the
+    default of the quality mode, without the 4-bit ones: ``precisions.py``)."""
+    from kernel_agent.kernels.compare import PRECISIONS, REDUCED_PRECISIONS
 
     precision = target.pop("precision", None) or "exact"
     why = str(target.pop("precision_why", None) or "").strip()
@@ -2506,8 +2508,11 @@ def _precision(
         return f"unknown precision {precision!r}"
     if precision not in REDUCED_PRECISIONS:
         return None
-    if quality != NEAR_LOSSLESS_TIER:
-        return f"precision {precision!r} needs --quality near-lossless (this run: {quality})"
+    if not allows_reduced(quality):
+        return (
+            f"precision {precision!r} needs --quality near-lossless or relaxed "
+            f"(this run: {quality})"
+        )
     if problem := precisions.refusal(
         precision, precisions.default(quality) if allowed is None else allowed
     ):

@@ -178,8 +178,8 @@ def migrate(
     * the baseline: its ``baseline_ms`` is ``baseline_ms``. ``analyze`` measures the latency
       anew and seals it together with ``baseline.json`` and the baseline outputs
       (``Truth.seal_baseline``), so the digests the worker verifies are today's too; its
-      measurements carry ``metrics.perceptual`` exactly when the quality mode is
-      near-lossless (``perceptual``);
+      measurements carry ``metrics.perceptual`` exactly when the quality mode has the
+      perceptual gate (near-lossless, relaxed: ``perceptual``);
     * the A/B rounds: every paired A/B with timed rounds ran ``ab_rounds`` of them;
     * each item: its file is still the snapshot a verified record of the run evaluated
       (``verified``: the sha256 the record holds; the integration measured only such

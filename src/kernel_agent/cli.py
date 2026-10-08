@@ -10,7 +10,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from kernel_agent.config import ALL_BACKENDS, DEFAULT_MODEL, OptimizeConfig
+from kernel_agent.config import (
+    ALL_BACKENDS,
+    DEFAULT_MODEL,
+    DEFAULT_QUALITY,
+    QUALITIES,
+    OptimizeConfig,
+)
 
 
 def _parse_value(raw: str) -> Any:
@@ -579,11 +585,14 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--quality",
-        default="exact",
-        choices=["exact", "near-lossless"],
-        help="exact: numerics within rounding noise of eager; near-lossless: numerics-changing "
-        "optimisations (FP8 weights, ...) pass a perceptual gate instead (WER, speaker "
-        "similarity, MOS for TTS; workloads/perceptual.py)",
+        default=DEFAULT_QUALITY,
+        choices=list(QUALITIES),
+        help="relaxed (default): numerics-changing optimisations (FP8 weights, W8A8, fusions "
+        "that round differently, ...) pass module bounds about twice near-lossless's and a "
+        "perceptual gate that allows small measured drops; near-lossless: the same within the "
+        "noise of eager (WER, speaker similarity, MOS for TTS; teacher-forced KL for LLMs; "
+        "workloads/perceptual.py); exact: numerics within rounding noise of eager. Recorded "
+        "in run.json: a run keeps its mode",
     )
     _add_precisions_arg(p)
     p.add_argument("--verbose", "-v", action="store_true")
@@ -595,10 +604,10 @@ def _add_precisions_arg(p: argparse.ArgumentParser) -> None:
         type=_precisions,
         metavar="P,P,...",
         help="target precisions the run allows, recorded in run.json (exact is always "
-        "allowed): exact, fp8_weights, fp8_w8a8, fp8_mx, reduced, fp4_weights (needs --quality "
-        "near-lossless). Default: exact; near-lossless: all but the 4-bit fp4_weights, which "
-        "is opt-in. Given to a run that exists (improve, resume, integrate), it replaces "
-        "the run's list",
+        "allowed): exact, fp8_weights, fp8_w8a8, fp8_mx, reduced, fp4_weights, fp8_kv (needs "
+        "--quality relaxed or near-lossless). Default: relaxed and near-lossless allow all but "
+        "the 4-bit fp4_weights and fp8_kv, which are opt-in; exact allows exact. Given to a "
+        "run that exists (improve, resume, integrate), it replaces the run's list",
     )
 
 

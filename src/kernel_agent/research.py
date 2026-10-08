@@ -153,8 +153,8 @@ def _best(run: RunDir, target_id: str, keeper: Truth | None) -> list[str]:
 
 
 def transforms_section(run: RunDir, top: int = TRANSFORM_ROWS) -> str:
-    """``## End-to-end transforms`` of a near-lossless run's research evidence: the fastest
-    passing transform evaluations (a transform that already uses another precision on
+    """``## End-to-end transforms`` of a near-lossless or relaxed run's research evidence: the
+    fastest passing transform evaluations (a transform that already uses another precision on
     the target's modules is evidence for a precision pivot, ``pivot.py``)."""
     rows = [
         r

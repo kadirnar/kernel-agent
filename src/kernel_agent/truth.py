@@ -9,7 +9,7 @@ lives outside the agents' working directories, in ``<run>/.truth/``::
     .truth/baseline_output_natural.pt ... of the natural-length run (workloads/stopping.py)
     .truth/baseline_output_diverse.pt ... of the diverse input set (workloads/diverse.py)
     .truth/baseline_output_perceptual.pt samples + scores of the perceptual gate
-                                      (--quality near-lossless, workloads/perceptual.py)
+                                      (--quality near-lossless / relaxed, perceptual.py)
     .truth/captures/<id>.pt           module + inputs + reference outputs + post-call state
     .truth/targets/<id>/results.jsonl evaluation records (each with its snapshot's sha256)
     .truth/targets/<id>/history/      the evaluated snapshots
@@ -165,8 +165,8 @@ class Truth:
         self.files: dict[str, dict[str, Any]] = dict(section.get("files") or {})
         ms = section.get("baseline_ms")
         self.recorded_baseline_ms: float | None = float(ms) if ms else None
-        #: ``--quality`` of the run (exact / near-lossless): how e2e judges, so it is passed
-        #: to the worker from here, not read back from the agent-writable ``run.json``.
+        #: ``--quality`` of the run (exact / near-lossless / relaxed): how e2e judges, so it is
+        #: passed to the worker from here, not read back from the agent-writable ``run.json``.
         self.quality = str((data.get("config") or {}).get("quality") or "exact")
         self._lock = threading.RLock()
         self._reported: set[tuple[str, str]] = set()

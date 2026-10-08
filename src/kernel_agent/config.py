@@ -8,6 +8,18 @@ from typing import Any
 
 ALL_BACKENDS = ("cuda", "triton", "cute", "tilelang", "nvrtc")
 DEFAULT_MODEL = "claude-opus-5-5"
+#: ``--quality`` (kernels/compare.py ``QUALITIES``, without importing torch) and the mode of
+#: a new run (#175).
+QUALITIES = ("exact", "near-lossless", "relaxed")
+DEFAULT_QUALITY = "relaxed"
+#: One line per quality mode for ``status`` (the numbers: kernels/compare.py, perceptual.py).
+QUALITY_NOTES = {
+    "exact": "numerics within rounding noise of eager",
+    "near-lossless": "reduced precision within the noise of eager (per tensor cosine >= "
+    "0.996, relative L2 <= 0.08, norm ±2 %)",
+    "relaxed": "about twice near-lossless's error budgets (per tensor cosine >= 0.99, "
+    "relative L2 <= 0.16, norm ±4 %; small measured perceptual drops pass)",
+}
 
 
 @dataclass
@@ -51,12 +63,15 @@ class OptimizeConfig:
     #: Integration: import and apply the exported optimized/ in a fresh process outside the
     #: run directory (integrate/export.py, issue #171); a failure names the missing files.
     export_check: bool = True
-    #: "exact" (numerics within rounding noise) or "near-lossless": numerics-changing
-    #: optimisations pass when the perceptual quality stays within the noise of eager
-    #: (workloads/perceptual.py).
-    quality: str = "exact"
+    #: "exact" (numerics within rounding noise), "near-lossless" (numerics-changing
+    #: optimisations pass when the perceptual quality stays within the noise of eager,
+    #: workloads/perceptual.py) or "relaxed" (the default, #175: the same checks with about
+    #: twice near-lossless's error budgets, kernels/compare.py). A run.json without it was an
+    #: exact run (:meth:`from_dict`).
+    quality: str = DEFAULT_QUALITY
     #: The target precisions the run allows (``--precisions``, precisions.py, issue #131);
-    #: None: the default of ``quality`` (near-lossless: every reduced precision but 4-bit).
+    #: None: the default of ``quality`` (near-lossless, relaxed: every reduced precision but
+    #: the opt-in 4-bit and fp8_kv).
     precisions: list[str] | None = None
 
     claude_model: str = DEFAULT_MODEL
@@ -102,5 +117,6 @@ class OptimizeConfig:
     def from_dict(cls, data: dict[str, Any]) -> OptimizeConfig:
         data = dict(data)
         data["runs_dir"] = Path(data.get("runs_dir", "runs"))
+        data.setdefault("quality", "exact")  # made before --quality: an exact run
         known = cls.__dataclass_fields__
         return cls(**{k: v for k, v in data.items() if k in known})

@@ -90,6 +90,7 @@ class SuiteConfig:
             do_transforms=False,
             allow_harness_agent=False,
             recheck=False,
+            quality="exact",  # KernelBench's own correctness: numerics within rounding noise
             use_library=False,
             librarian=False,
             claude_model=self.claude_model,

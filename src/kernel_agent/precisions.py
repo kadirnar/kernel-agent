@@ -5,7 +5,8 @@ lists the precisions (a target's ``precision`` in ``spec.json``,
 :data:`kernel_agent.kernels.compare.PRECISIONS`) the run's targets may have; ``exact`` is
 always one of them. Without the option, and in a run whose ``run.json`` has none (made
 before it), the run's ``--quality`` decides (:func:`default`): ``exact`` allows ``exact``
-only, ``near-lossless`` every reduced precision but the opt-in ones (:data:`OPT_IN`: the
+only, ``near-lossless`` and ``relaxed`` (the default of new runs, #175) every reduced
+precision but the opt-in ones (:data:`OPT_IN`: the
 4-bit ones, :data:`FOUR_BIT`, and ``fp8_kv``), which ``--precisions`` must name
 (``--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights``); the 8-bit classes
 (``fp8_weights``, ``fp8_w8a8``, MXFP8 ``fp8_mx``) are allowed by default. A run
@@ -49,10 +50,10 @@ def names() -> tuple[str, ...]:
 
 def default(quality: str | None) -> tuple[str, ...]:
     """The precisions a run of ``quality`` allows without ``--precisions``: ``exact`` only,
-    or (``near-lossless``) every precision but the opt-in ones (:data:`OPT_IN`)."""
-    from kernel_agent.kernels.compare import EXACT_TIER, NEAR_LOSSLESS_TIER
+    or (``near-lossless``, ``relaxed``) every precision but the opt-in ones (:data:`OPT_IN`)."""
+    from kernel_agent.kernels.compare import EXACT_TIER, allows_reduced
 
-    if quality != NEAR_LOSSLESS_TIER:
+    if not allows_reduced(quality):
         return (EXACT_TIER,)
     return tuple(p for p in names() if p not in OPT_IN)
 
@@ -74,8 +75,8 @@ def parse(raw: str | Iterable[str]) -> list[str]:
 
 def check(quality: str | None, requested: Iterable[str] | None) -> str | None:
     """Why ``requested`` (``--precisions``) does not fit a run of ``quality``, or None: a
-    reduced precision needs ``--quality near-lossless``."""
-    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER
+    reduced precision needs ``--quality near-lossless`` or ``relaxed``."""
+    from kernel_agent.kernels.compare import allows_reduced
 
     if requested is None:
         return None
@@ -84,9 +85,9 @@ def check(quality: str | None, requested: Iterable[str] | None) -> str | None:
     except ValueError as exc:
         return str(exc)
     reduced = [p for p in wanted if p != "exact"]
-    if reduced and quality != NEAR_LOSSLESS_TIER:
+    if reduced and not allows_reduced(quality):
         return (
-            f"--precisions {','.join(reduced)} needs --quality near-lossless "
+            f"--precisions {','.join(reduced)} needs --quality near-lossless or relaxed "
             f"(this run: {quality or 'exact'})"
         )
     return None
@@ -98,9 +99,9 @@ def allowed(
     capability: tuple[int, ...] | None = None,
 ) -> tuple[str, ...]:
     """The precisions a run allows: ``precisions`` (its ``--precisions``; None: the
-    :func:`default` of ``quality``), never a reduced one outside ``near-lossless``, nor
-    one a GPU of ``capability`` cannot run (None: no GPU check)."""
-    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER
+    :func:`default` of ``quality``), never a reduced one outside ``near-lossless`` and
+    ``relaxed``, nor one a GPU of ``capability`` cannot run (None: no GPU check)."""
+    from kernel_agent.kernels.compare import allows_reduced
 
     found = default(quality)
     if precisions is not None:
@@ -109,7 +110,7 @@ def allowed(
         except ValueError:  # an edited run.json: what the quality mode allows by default
             wanted = set(found)
         found = tuple(
-            p for p in names() if p in wanted and (quality == NEAR_LOSSLESS_TIER or p == "exact")
+            p for p in names() if p in wanted and (allows_reduced(quality) or p == "exact")
         )
     return tuple(p for p in found if unsupported(p, capability) is None)
 
@@ -173,13 +174,14 @@ def refusal(
 
 def tier_allowed(tier: str | None, allowed: Iterable[str]) -> bool:
     """Whether an evaluation in the tolerance ``tier`` (its ``tolerance_tier``; None: not
-    recorded) is of a precision ``allowed`` holds: the exact tier, or the near-lossless tier
-    of one of them (``near-lossless-fp4``: ``fp4_weights``)."""
-    from kernel_agent.kernels.compare import EXACT_TIER, NEAR_LOSSLESS_TIER, TIERS, tier_for
+    recorded) is of a precision ``allowed`` holds: the exact tier, or the near-lossless or
+    relaxed tier of one of them (``near-lossless-fp4``, ``relaxed-fp4``: ``fp4_weights``)."""
+    from kernel_agent.kernels.compare import EXACT_TIER, REDUCED_QUALITIES, TIERS, tier_for
 
     if tier is None or tier not in TIERS:
         return True
-    return tier == EXACT_TIER or tier in {tier_for(NEAR_LOSSLESS_TIER, p) for p in allowed}
+    tiers = {tier_for(quality, p) for quality in REDUCED_QUALITIES for p in allowed}
+    return tier == EXACT_TIER or tier in tiers
 
 
 def describe(allowed: Iterable[str], capability: tuple[int, ...] | None = None) -> str:

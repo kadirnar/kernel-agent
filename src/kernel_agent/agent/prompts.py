@@ -181,8 +181,8 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
                     # fp8_weights / reduced / fp4_weights / fp8_w8a8 / fp8_mx / fp8_kv
-                    # (kernels.compare.PRECISIONS): --quality near-lossless captures the
-                    # target with a near-lossless tolerance tier; an exact run refuses it.
+                    # (kernels.compare.PRECISIONS): --quality near-lossless / relaxed
+                    # captures the target with its tolerance tier; an exact run refuses it.
                     # Default exact.
                     "precision": {
                         "type": "string",
@@ -225,7 +225,7 @@ PLAN_SCHEMA: dict[str, Any] = {
                 "required": ["id", "idea", "why"],
             },
         },
-        # round re-plans of a near-lossless run: move an existing target to another
+        # round re-plans of a near-lossless / relaxed run: move a target to another
         # precision tier (pivot.py); the first plan has no targets to move
         "pivots": {
             "type": "array",
@@ -298,12 +298,13 @@ def precision_policy(
     allows (``--precisions``; None: the quality mode's default, without the 4-bit ones) on
     a GPU of ``capability`` (None: unknown; a precision it cannot run is refused, #165)."""
     from kernel_agent import precisions as allowed_precisions
+    from kernel_agent.kernels.compare import allows_reduced
 
-    if quality == "near-lossless":
+    if allows_reduced(quality):
         allowed = tuple(allowed_precisions.default(quality) if precisions is None else precisions)
         gpu = allowed_precisions.gpu_refused(quality, None, capability)
         allowed = tuple(p for p in allowed if p not in gpu)
-        return _near_lossless_policy(allowed, allowed_precisions.FOUR_BIT, gpu)
+        return _near_lossless_policy(allowed, allowed_precisions.FOUR_BIT, gpu, quality)
     return """
 # Precision (`--quality exact`)
 This run keeps full precision: do not set `precision` (a target with
@@ -313,10 +314,14 @@ must match eager within rounding noise.
 
 
 def _near_lossless_policy(
-    allowed: tuple[str, ...], four_bit: tuple[str, ...], gpu: dict[str, str] | None = None
+    allowed: tuple[str, ...],
+    four_bit: tuple[str, ...],
+    gpu: dict[str, str] | None = None,
+    quality: str = "near-lossless",
 ) -> str:
-    """The near-lossless precision policy: a paragraph per precision in ``allowed``; ``gpu``:
-    the precisions this GPU cannot run, with the reason (refused, never offered)."""
+    """The precision policy of a near-lossless or relaxed run (``quality``): a paragraph per
+    precision in ``allowed``; ``gpu``: the precisions this GPU cannot run, with the reason
+    (refused, never offered); relaxed: also :data:`RELAXED_POLICY`."""
     gpu = gpu or {}
     names = ", ".join(f"`{p}`" for p in allowed)
     refused = [
@@ -326,7 +331,7 @@ def _near_lossless_policy(
     ]
     lines = [
         "",
-        "# Precision (`--quality near-lossless`)",
+        f"# Precision (`--quality {quality}`)",
         f"This run allows the precisions {names} (`--precisions`)"
         + (
             f"; {', '.join(f'`{p}`' for p in refused)} "
@@ -354,6 +359,8 @@ def _near_lossless_policy(
             "(where shown) are out of reach."
         )
     lines.append(_POLICY["intro"])
+    if quality == "relaxed":
+        lines.append(RELAXED_POLICY)
     for name in ("fp8_weights", "fp4_weights", "fp8_w8a8", "fp8_mx", "reduced", "fp8_kv"):
         if name in allowed:
             lines.append(_POLICY[name])
@@ -363,18 +370,29 @@ def _near_lossless_policy(
     return "\n".join(lines) + "\n"
 
 
+#: ``--quality relaxed`` (#175): what its looser bounds are for.
+RELAXED_POLICY = """This is a **relaxed** run (`--quality relaxed`): the module tolerance
+tiers allow about twice near-lossless's error (`relaxed`: cosine >= 0.99, relative L2 error
+<= 0.16, norm within ±4 % per output tensor) and the perceptual gate small measured drops
+(TTS: error rate +0.10, speaker similarity >= 0.90; LLM: mean KL <= 0.10, top-1 >= 0.80).
+Use that room for speed: reduced precision on every target whose time goes into
+weights or GEMMs (not only the largest ones), and fusions whose rounding differs from
+eager (bf16 intermediates between fused ops, fast `exp2` / `rsqrt` approximations, FP8
+activations produced by the previous kernel's epilogue) where the evaluator's bounds hold.
+Broken numerics still fail: a wrong scale, a skipped row or head, a wrong layout."""
 #: The paragraphs of the near-lossless precision policy, per allowed precision.
 _POLICY = {
     "intro": """Numerics-changing optimisations are allowed where the perceptual quality stays
-within the noise of eager.""",
+within the noise of eager (relaxed runs: within about twice that).""",
     "fp8_weights": """For a target whose time goes into streaming weights
 (decode GEMVs and skinny GEMMs: `nn.Linear` layers, MLP or attention projections
 at a few rows per call, memory or launch bound) set `precision: "fp8_weights"`
 and a one-line `precision_why` with the number that justifies it (e.g. "M=1
 decode GEMVs, 40 % of the run, memory bound: FP8 halves the bytes"). Its
 kernels then store the weights in FP8 e4m3 with one scale per output channel
-(activations stay bf16), the target is checked in the near-lossless tolerance
-tier, and every end-to-end evaluation in the run's perceptual gate.""",
+(activations stay bf16), the target is checked in the run's reduced-precision
+tolerance tier (near-lossless or relaxed), and every end-to-end evaluation in the run's
+perceptual gate.""",
     "fp4_weights": """`precision: "fp4_weights"` (block-scaled FP4 weights, NVFP4: 4.5 bits per
 weight, about 4x FP8's error, its own looser tolerance tier) only for
 memory-bound decode GEMVs / skinny GEMMs where `fp8_weights` is already in use
@@ -434,17 +452,27 @@ autoregressive models.""",
 
 
 def precision_note(quality: str, precisions: Iterable[str]) -> str:
-    """The precisions of a near-lossless run for the systems agent, whose transforms no
-    precision check sees ("" in an exact run: its checks reject any numerics change)."""
+    """The precisions of a near-lossless or relaxed run for the systems agent, whose
+    transforms no precision check sees ("" in an exact run: its checks reject any numerics
+    change)."""
     from kernel_agent import precisions as allowed_precisions
+    from kernel_agent.kernels.compare import allows_reduced
 
-    if quality != "near-lossless":
+    if not allows_reduced(quality):
         return ""
     allowed = tuple(precisions)
     no_four = [p for p in allowed_precisions.FOUR_BIT if p not in allowed]
+    relaxed = (
+        " This is a relaxed run (`--quality relaxed`): the gate allows small measured drops "
+        "(about twice near-lossless's budget), so more aggressive transforms (reduced "
+        "precision across more layers, fusions that round differently) can pass."
+        if quality == "relaxed"
+        else ""
+    )
     return (
         f"\n\n# Precision\nThis run allows the precisions {', '.join(f'`{p}`' for p in allowed)} "
         "(`--precisions`); the perceptual gate judges every numerics change."
+        + relaxed
         + (
             " No 4-bit weights or activations (FP4, NVFP4, MXFP4, int4) in any transform."
             if no_four
@@ -697,7 +725,7 @@ before calling a case of `capture_inputs.pt`.
 
 def reduced_precision(target: dict[str, Any], capture_info: dict[str, Any]) -> str | None:
     """The reduced precision a target may use: its spec's ``precision`` when its capture is
-    in the near-lossless tier (``--quality near-lossless``), else None."""
+    in a reduced-precision tier (``--quality near-lossless`` or ``relaxed``), else None."""
     from kernel_agent.kernels.compare import EXACT_TIER, REDUCED_PRECISIONS, tier_of
 
     precision = target.get("precision")
@@ -711,11 +739,13 @@ def _precision_block(
     target: dict[str, Any],
     precisions: Iterable[str] | None = None,
     toolchain: str = "",
+    tier: str | None = None,
 ) -> str:
     """The reduced-precision contract of the engineer prompt (empty for exact targets);
     ``precisions``: the ones the run allows (None: near-lossless's default, no 4-bit);
     ``toolchain``: the summary naming the GPU (what its architecture means for the
-    precision, :func:`kernel_agent.gpu_arch.precision_note`)."""
+    precision, :func:`kernel_agent.gpu_arch.precision_note`); ``tier``: the capture's
+    tolerance tier (None: the near-lossless one of ``precision``)."""
     from kernel_agent import precisions as allowed_precisions
     from kernel_agent.gpu_arch import from_summary, precision_note
 
@@ -828,15 +858,17 @@ allows, and report the numerical error (the evaluator's per-case `min_cosine` /
     return f"""
 # Precision: `{precision}`
 This target may change numerics{why}.
-The evaluator checks it in {_tier_bounds(precision)} (the exact tier would reject
+The evaluator checks it in {_tier_bounds(precision, tier)} (the exact tier would reject
 low-precision weights). End to end, the run's perceptual gate decides. This replaces the "no
 fp8/int8" rule below for this target only.
 {contract}
 {no_four_note}{gpu_line}"""
 
 
-def _tier_bounds(precision: str) -> str:
-    """The tolerance tier of a reduced precision and its bounds (kernels/compare.py)."""
+def _tier_bounds(precision: str, tier: str | None = None) -> str:
+    """The tolerance tier of a reduced precision (``tier``: the capture's; None or not a
+    reduced-precision tier: the near-lossless one of ``precision``) and its bounds
+    (kernels/compare.py)."""
     from kernel_agent.kernels.compare import (
         NEAR_LOSSLESS_BOUNDS,
         NEAR_LOSSLESS_TIER,
@@ -844,7 +876,8 @@ def _tier_bounds(precision: str) -> str:
         PRECISION_TIERS,
     )
 
-    tier = PRECISION_TIERS.get(precision, NEAR_LOSSLESS_TIER)
+    if tier not in NEAR_LOSSLESS_BOUNDS:
+        tier = PRECISION_TIERS.get(precision, NEAR_LOSSLESS_TIER)
     cosine, rel_l2, norm, (a, r) = NEAR_LOSSLESS_BOUNDS[tier]
     p_cosine, p_rel_l2, p_norm, (p_a, p_r) = PERTURBED_BOUNDS[tier]
     return (
@@ -873,6 +906,7 @@ def engineer_prompt(
     precision = reduced_precision(target, capture_info)
     if precision is not None:
         guides.append(knowledge("low_precision.md"))
+    tier = capture_info.get("tier")  # the capture's tolerance tier (near-lossless, relaxed)
     backend_list = "\n".join(
         f"  {i + 1}. `{b}` — {BACKEND_NAMES.get(b, b)}" for i, b in enumerate(backends)
     )
@@ -941,7 +975,7 @@ instances' configuration generically (read sizes from the module). Expose tuning
 parameters (block sizes, `num_warps`, `num_stages`, vector widths) as keyword
 arguments with defaults, `def build(reference, BLOCK=1024, num_warps=4)`, and
 tune them with `sweep_candidate`.
-{entrypoints}{_precision_block(precision, target, precisions, toolchain)}
+{entrypoints}{_precision_block(precision, target, precisions, toolchain, tier)}
 # Backends (in priority order)
 {backend_list}
 Start with the first. When it is correct and fast, try the next one only if
@@ -1198,8 +1232,8 @@ def research_prompt(
     precisions: Iterable[str] | None = None,
 ) -> str:
     """The research agent of a plateaued target: read-only, writes ``plan`` (``plan.md``)
-    and, with ``pivot`` (near-lossless runs), may propose a precision pivot there, to one of
-    the reduced ``precisions`` the run allows (None: near-lossless's default, no 4-bit); with
+    and, with ``pivot`` (near-lossless / relaxed runs), may propose a precision pivot there, to
+    one of the reduced ``precisions`` the run allows (None: near-lossless's default, no 4-bit); with
     ``dossier`` (the web tools on) it may also update the target's ``research.md``."""
     cases = "\n".join(
         f"  * `{c['signature']}` — {c['count']} calls per run per instance"
@@ -1208,7 +1242,8 @@ def research_prompt(
     precision = ""
     if reduced := reduced_precision(target, capture_info):  # knowledge/low_precision.md
         precision = (
-            f"* precision: `{reduced}` (near-lossless tolerance tier; low_precision.md): "
+            f"* precision: `{reduced}` ({capture_info.get('tier')} tolerance tier; "
+            "low_precision.md): "
             f"{target.get('precision_why', '')}\n"
         )
     return f"""You are a senior GPU performance researcher, brought in with a clean context.
@@ -1347,7 +1382,7 @@ def _pivot_block(
     )
     return f"""
 # Precision pivot (optional)
-This run allows reduced precision (`--quality near-lossless`: {others} besides
+This run allows reduced precision (`--quality near-lossless` / `relaxed`: {others} besides
 this target's) and this target is `{current}`. Its precision was fixed when it was
 planned.{no_four} If the evidence shows that the remaining gain lies in another
 precision tier, propose a pivot: {why}the current design sits near its ceiling at

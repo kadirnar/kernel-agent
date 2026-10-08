@@ -38,7 +38,8 @@ def fast(monkeypatch):
 
 
 def make(tmp_path):
-    config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path)
+    # an exact run: its records carry no perceptual gate (new runs default to relaxed, #175)
+    config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path, quality="exact")
     return orchestrator.Orchestrator(dryrun.create_run(config), config)
 
 

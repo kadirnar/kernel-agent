@@ -205,24 +205,63 @@ def _step_text(step: dict[str, Any]) -> str:
 def _quality_lines(
     data: dict[str, Any], baseline: dict[str, Any], gpu: dict[str, Any] | None = None
 ) -> list[str]:
-    """The quality mode, eager's perceptual scores next to it and the precisions the run
-    allows (``near-lossless``; with ``toolchain.json``'s ``gpu``, those it cannot run)."""
+    """The quality mode with its bounds (:func:`quality_bounds`), eager's perceptual scores
+    next to it and the precisions the run allows (``near-lossless``, ``relaxed``; with
+    ``toolchain.json``'s ``gpu``, those it cannot run)."""
     mode = (data.get("config") or {}).get("quality") or "exact"
     if mode == "exact":
-        return []
+        return ["* quality: **exact**: numerics within rounding noise of eager"]
     allowed = precisions.of_config(data.get("config"))
     cap = (gpu or {}).get("capability")
     cap = (int(cap[0]), int(cap[1])) if isinstance(cap, list | tuple) and len(cap) >= 2 else None
     line = f"* precisions allowed: {precisions.describe(allowed, cap)} (`--precisions`)"
+    bounds = f"* {mode} bounds: {quality_bounds(mode)}"
     info = baseline.get("perceptual") or {}
     if info.get("status") != "ok":
         why = info.get("reason") or info.get("status") or "analyze predates it"
-        return [f"* quality: **{mode}**, no perceptual baseline ({why}): exact checks", line]
+        return [
+            f"* quality: **{mode}**, no perceptual baseline ({why}): exact checks",
+            bounds,
+            line,
+        ]
     mean = ", ".join(f"{k}={v}" for k, v in (info.get("mean") or {}).items())
     return [
         f"* quality: **{mode}**: perceptual gate on {info.get('samples')} samples (eager: {mean})",
+        bounds,
         line,
     ]
+
+
+def quality_bounds(mode: str) -> str:
+    """The module tier and perceptual-gate thresholds of quality mode ``mode``
+    (``near-lossless``, ``relaxed``; kernels/compare.py, workloads/perceptual.py)."""
+    from kernel_agent.kernels.compare import NEAR_LOSSLESS_BOUNDS, PERTURBED_BOUNDS, tier_for
+    from kernel_agent.workloads import perceptual
+
+    tier = tier_for(mode, "fp8_weights")
+    if tier not in NEAR_LOSSLESS_BOUNDS:
+        return "exact checks"
+    cosine, rel_l2, norm, (a, r) = NEAR_LOSSLESS_BOUNDS[tier]
+    p_cosine, p_rel_l2, p_norm, (p_a, _) = PERTURBED_BOUNDS[tier]
+    gate = {
+        "max_error_increase": perceptual.MAX_ERROR_INCREASE,
+        "min_speaker_similarity": perceptual.MIN_SPEAKER_SIMILARITY,
+        "max_mos_drop": perceptual.MAX_MOS_DROP,
+        "max_kl": perceptual.LLM_MAX_KL,
+        "min_top1": perceptual.LLM_MIN_TOP1,
+        "max_nll_increase": perceptual.LLM_MAX_NLL_INCREASE,
+    }
+    if mode == perceptual.RELAXED:
+        gate = {k: perceptual.RELAXED_GATE[k] for k in gate}
+    return (
+        f"8-bit targets per output tensor cosine >= {cosine:g}, relative L2 <= {rel_l2:g}, "
+        f"norm ±{norm * 100:g} %, every element within {a:g} x RMS + {r:g} x |ref| (redrawn "
+        f"inputs: {p_cosine:g} / {p_rel_l2:g} / ±{p_norm * 100:g} % / {p_a:g} x RMS); "
+        f"perceptual gate: error rate +{gate['max_error_increase']:g}, speaker similarity >= "
+        f"{gate['min_speaker_similarity']:g}, MOS -{gate['max_mos_drop']:g} (TTS); mean KL <= "
+        f"{gate['max_kl']:g}, top-1 >= {gate['min_top1']:g}, NLL +{gate['max_nll_increase']:g} "
+        "nats/token (LLM)"
+    )
 
 
 def _export_check_lines(run: RunDir) -> list[str]:

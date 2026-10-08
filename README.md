@@ -35,7 +35,7 @@ HF URL ─► resolve (modality, arch, family, size)
                      sensitivity probe, teacher-forcing self-check,
                      held-out input + natural-length (stop) baselines,
                      diverse input set (outputs + per-input times),
-                     perceptual baseline (--quality near-lossless),
+                     perceptual baseline (--quality relaxed / near-lossless),
                      module-level + kernel-level
                      profile, compiled baseline (the model's own
                      torch.compile path)                           [GPU worker]
@@ -268,9 +268,20 @@ same time.
   each input for the per-input speedups ("Data-dependent speedups" below).
   Details are in `metrics.diverse`.
 
-### Quality modes: exact and near-lossless
+### Quality modes: exact, near-lossless and relaxed
 
-`--quality exact` (the default) is everything above: numerics within rounding
+Three modes (`--quality`, recorded in `run.json` → `config.quality`; a run keeps
+the mode it was created with, `improve <run_dir>` / `resume` / `integrate`
+included, and a `run.json` without one is an exact run). **`relaxed` is the
+default of new runs** (`optimize`, `improve` with a model, `analyze`; #175):
+
+| mode | a reduced-precision target's module tier (captured inputs; redrawn ones) | end to end |
+|---|---|---|
+| `exact` | none: every target in the exact tier (the checks above) | teacher forcing, held-out input, stop check within rounding noise |
+| `near-lossless` | `near-lossless`: cosine >= 0.996, relative L2 <= 0.08, norm ±2 %, every element within 0.5 x RMS + 0.125 x \|ref\| (redrawn: 0.996 / 0.08 / ±3 % / 0.75 x RMS) | the perceptual gate within the noise of eager, a looser sanity floor |
+| `relaxed` | `relaxed`: cosine >= 0.99, relative L2 <= 0.16, norm ±4 %, every element within 0.75 x RMS + 0.125 x \|ref\| (redrawn: 0.99 / 0.16 / ±6 % / 1.5 x RMS) | the perceptual gate allowing small measured drops, the sanity floor loosened in proportion |
+
+`--quality exact` is everything above: numerics within rounding
 noise of eager. Once a model runs near the memory-bandwidth floor of its bf16
 weights (VoxCPM2 after two `improve` rounds: 92–95 % of it), the next gains
 change numerics by design (FP8 weights first), and teacher forcing and the
@@ -386,9 +397,152 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   `analyze` ran in exact mode) a near-lossless run keeps the exact checks;
   `metrics.perceptual.skipped` says why.
 
+**Relaxed** (`--quality relaxed`, the default of new runs, #175). The checks of
+near-lossless with about twice their error budgets, so that more aggressive
+kernels and transforms pass: reduced precision on more layers, fusions whose
+rounding differs from eager (bf16 intermediates, fast `exp2` / `rsqrt`,
+FP8 activations written by the previous kernel's epilogue). The planner and
+systems prompts say so (`prompts.RELAXED_POLICY`). A target's tier follows its
+precision as in near-lossless (`compare.QUALITY_TIERS`: `relaxed`,
+`relaxed-fp4`, `relaxed-kv`); a target without a reduced precision keeps the
+exact tier. The numbers (`kernels/compare.py`, `perceptual.RELAXED_GATE`, the
+workloads' `relaxed_options`; `-o` options the user set still win):
+
+| check | near-lossless | relaxed |
+|---|---|---|
+| 8-bit and `reduced` tier, captured inputs: min cosine, max relative L2, max norm change, element bound `a` (`r`) | 0.996, 0.08, ±2 %, 0.5 (0.125) | 0.99, 0.16, ±4 %, 0.75 (0.125) |
+| ... redrawn and scaled inputs | 0.996, 0.08, ±3 %, 0.75 (0.125) | 0.99, 0.16, ±6 %, 1.5 (0.125) |
+| FP4 tier (`fp4_weights`, opt-in), captured | 0.96, 0.28, ±4 %, 1.25 (0.25) | 0.94, 0.36, ±6 %, 1.75 (0.25) |
+| ... redrawn and scaled | 0.94, 0.40, ±12 %, 2.5 (0.25) | 0.90, 0.55, ±18 %, 3.0 (0.25) |
+| KV tier (`fp8_kv`, opt-in), captured | as the 8-bit tier | as the 8-bit tier |
+| ... redrawn and scaled | 0.985, 0.16, ±3 %, 1.5 (0.125) | 0.97, 0.25, ±6 %, 2.5 (0.125) |
+| TTS gate: error-rate increase, speaker similarity (mean / worst sample), MOS drop | +0.05, 0.93 / 0.85, 0.3 | +0.10, 0.90 / 0.80, 0.45 |
+| LLM gate: mean KL, worst sample's KL, top-1 agreement, NLL increase (nats/token) | 0.05, 0.15, 0.85, +0.25 | 0.10, 0.30, 0.80, +0.30 |
+| VoxCPM sanity floor: mean / min step cosine; stop check | 0.95 / 0.2; ±1 patch at a margin <= 0.5 | 0.90 / 0.2; ±2 patches at a margin <= 1.0 |
+| LLM sanity floor: first-step logits cosine | 0.98 | 0.96 |
+
+Where a budget grows by less than twice, a broken variant of the calibrations
+sits close to it: at an element bound of 1.0 x RMS an output channel that a
+GEMM never writes (an off-by-one row loop, every GEMM of a layer) passes the
+captured inputs of the VoxCPM2 LocDiT and base-LM layers (element ratio 0.91 /
+0.92), at 0.75 it fails them (1.17 / 1.18); RMSNorm eps 1e-2 reaches speaker
+similarity 0.912 / 0.710 and MOS −0.42 (it still fails on its error rate,
++0.74, and on the worst sample); a decode loop that writes the right tokens one
+place late reaches +0.384 nats per token; RMSNorm eps 1e-2 reaches a min step
+cosine of 0.10 (so 0.2 stays). Unchanged in every mode: the integrity and
+anti-gaming checks (hidden work and declared concurrency, output caching and
+the redrawn-input and scaled checks, which keep running with the tier's bounds
+for redrawn inputs, memcheck, the truth digests, the paired A/B acceptance),
+the precisions allowed by default (8-bit; 4-bit and `fp8_kv` stay opt-in) and
+KernelBench suite runs, which stay exact.
+
+Calibration (#175, `docs/research-scripts/relaxed-175/`: `calibrate_tiers.py`,
+its results `results_gpu.md` / `.json` on the RTX 5070 Ti and `results_cpu.md`
+on the CPU). The reference math of every precision (fake quant; W8A8 through
+`torch._scaled_mm`, MXFP8 through `F.scaled_mm`) and broken variants replace
+every `nn.Linear` of a real capture: the VoxCPM2 LocDiT layer (M = 352, 176),
+the VoxCPM2 base-LM decode layer and a Qwen3-0.6B decoder layer at decode (M =
+1, with their KV caches); plus the `fp8_kv` decode attention of #145. Each is
+judged on the captured inputs, 10 seeds x 2 redraws per case and the x 3 /
+x 0.01 / x −1 inputs, in both tiers at once (failed draws: near-lossless ·
+relaxed):
+
+| numerics | captured, relaxed tier: min cosine / max rel L2 / max norm change / max element ratio | fails, near-lossless (captured, redrawn, scaled) | fails, relaxed |
+|---|---|---|---|
+| LocDiT layer, FP8 weights | 0.9999 / 0.015 / 0.3 % / 0.10 | 0/2, 0/40, 0/6 | 0/2, 0/40, 0/6 |
+| LocDiT layer, FP8 W8A8 | 0.9998 / 0.020 / 0.2 % / 0.14 | 0/2, 0/40, 0/6 | 0/2, 0/40, 0/6 |
+| LocDiT layer, MXFP8 | 0.9998 / 0.021 / 0.9 % / 0.14 | 0/2, 0/40, 0/6 | 0/2, 0/40, 0/6 |
+| LocDiT layer, MXFP4 weights (FP4 tiers) | 0.9976 / 0.070 / 4.9 % / 0.23 | **2/2**, 0/40, 0/6 | 0/2, 0/40, 0/6 |
+| base-LM decode layer, MXFP8 | 0.9993 / 0.039 / 3.0 % / 0.18 | **1/3, 5/60, 1/9** | 0/3, 0/60, 0/9 |
+| base-LM decode layer, MXFP4 weights (FP4 tiers) | 0.9927 / 0.120 / 2.0 % / 0.20 | 0/3, 0/60, 0/9 | 0/3, 0/60, 0/9 |
+| Qwen3 decoder layer, FP8 weights | 0.9994 / 0.034 / 0.4 % / 0.15 | 0/4, **70/80, 3/12** | 0/4, **54/80**, 0/12 |
+| Qwen3 decoder layer, FP8 W8A8 | 0.9989 / 0.047 / 0.5 % / 0.21 | 0/4, **74/80, 6/12** | 0/4, **66/80, 1/12** |
+| decode attention, `fp8_kv` (KV tiers) | 0.9996 / 0.029 / 0.9 % / 0.12 | 0/48, 0/192, 0/144 | 0/48, 0/192, 0/144 |
+
+| broken variant (on FP8 weights unless named) | LocDiT layer, captured | base-LM decode layer | Qwen3 decoder layer |
+|---|---|---|---|
+| weight scales x 1.05 | 2/2 · 2/2 | 3/3 · 3/3 | 4/4 · 4/4 |
+| weight scales x 1.2 | 2/2 · 2/2 | 3/3 · 3/3 | 4/4 · 4/4 |
+| int4 per tensor | 2/2 · 2/2 | 3/3 · 3/3 | 4/4 · 4/4 |
+| row 0 of every GEMM never written | 2/2 · 2/2 | 3/3 · 2/3 | 4/4 · 3/4 |
+| KV head 0 dropped | 2/2 · 2/2 | 3/3 · 3/3 | 4/4 · 4/4 |
+| q heads 0 and 15 swapped (a layout bug) | 0/2 · 0/2 | 0/3 · 0/3 | 4/4 · 3/4 |
+| W8A8: the first token's activation scale for all | 2/2 · 2/2 | (a no-op at M = 1) | (a no-op at M = 1) |
+| FP4: nibbles swapped / block scales x 1.2 / int4 per tensor | 2/2 · 2/2 each | 3/3 · 3/3, 3/3 · 3/3, 2/3 · 1/3 | 4/4 · 4/4 each |
+| `fp8_kv`: V scales x 1.05 / x 1.2 / the first token's scale (48 captured cases) | 48 · 48 / 48 · 48 / 48 · 44 | | |
+
+Every 8-bit class keeps a wide margin on captured inputs (relative L2 <=
+0.055 against 0.16, element ratio <= 0.27 against 1, norm <= 1.3 % against
+4 %; MXFP8 at M = 1, which near-lossless rejects there, 3.0 %), and the
+relaxed tiers reject every broken variant that the near-lossless ones reject on
+the captured inputs, in at least one case of each capture, except where both
+miss it: two swapped query heads of the first VoxCPM2 layers (their heads
+attend alike) and an unwritten output row under FP4's noise. MXFP4 weights and
+MXFP8 at decode, which near-lossless rejects, pass. The synthetic fixture of
+`tests/test_perturbed_calibration.py` (a CPU MLP with a massive-activation
+writer row) runs the reference math of every precision through the evaluator
+in both modes, and int4 per tensor, weight scales x 1.2, an unwritten output
+row and a gate / up mix-up through it too: all rejected (int4 per tensor in
+relaxed on the redrawn inputs, as the massive channel hides it on the captured
+ones).
+
+The LLM gate on Qwen3-0.6B at both thresholds (`calibrate_llm_relaxed.py`,
+the 14 natural prompts teacher forced as in `e2e`; the first-logits cosine is
+the min over them, the sanity floor 0.98 / 0.96):
+
+| variant | mean KL | worst sample KL | top-1 | NLL change | first-logits cosine | near-lossless | relaxed |
+|---|---|---|---|---|---|---|---|
+| FP8 weights, per channel | 0.0111 | 0.0429 | 0.951 | −0.068 | 0.9968 | pass | pass |
+| FP8 W8A8, every decoder `nn.Linear` | 0.0145 | 0.0368 | 0.935 | +0.020 | 0.9923 | pass | pass |
+| FP8 weights, scales x 1.05 | 0.0312 | 0.0737 | 0.930 | +0.058 | 0.9816 | pass | pass |
+| FP8 weights, scales x 1.1 | 0.0838 | 0.1413 | 0.873 | +0.098 | 0.9313 | fail (KL) | fail (floor) |
+| NVFP4 weights, everywhere | 0.1340 | 0.2575 | 0.844 | +0.070 | 0.9419 | fail | fail (KL) |
+| MXFP4 weights, everywhere | 0.2259 | 0.4582 | 0.800 | −0.083 | 0.8285 | fail | fail |
+| int4 weights, group 128 | 0.3498 | 0.7930 | 0.725 | +0.104 | 0.859 | fail | fail |
+| int4 weights, per channel | 0.8413 | 1.7420 | 0.619 | +0.317 | 0.7189 | fail | fail |
+| FP8 weights, scales x 1.2 | 0.3353 | 0.5675 | 0.750 | +0.246 | 0.5014 | fail | fail |
+| RMSNorm eps 1e-2 | 8.85 | 12.47 | 0.011 | +0.667 | 0.181 | fail | fail |
+| one KV head dropped | 0.5067 | 0.9885 | 0.698 | +0.284 | 0.7552 | fail | fail |
+| decode loop one token late | 0 | 0 | 1.000 | +0.384 | — | fail | fail (NLL) |
+
+So on a 0.6B LLM the relaxed gate leaves every 8-bit variant a wide margin
+(mean KL 0.015 against 0.10) and still rejects 4-bit weights on every layer
+(they stay opt-in and, on such a small model, need to be kept to some layers)
+and every broken variant.
+
+The TTS gate and sanity floor on VoxCPM2 (`calibrate_tts_relaxed.py`: the 8
+cloned samples paired with eager's, teacher forcing on the 60-patch main input;
+every `nn.Linear` of both LMs and the LocDiT quantised and back, 343):
+
+| variant | error-rate increase | speaker similarity (mean / worst) | MOS change | teacher forcing (mean / min step cosine) | near-lossless | relaxed |
+|---|---|---|---|---|---|---|
+| FP8 weights | 0.000 | 0.988 / 0.966 | +0.04 | 0.987 / 0.650 | pass | pass |
+| NVFP4 weights, everywhere | 0.000 | 0.978 / 0.957 | −0.09 | 0.948 / 0.571 | fail (floor 0.95) | **pass** |
+| MXFP4 weights, everywhere | 0.000 | 0.973 / 0.953 | −0.27 | 0.913 / 0.525 | fail (floor) | **pass** |
+| RMSNorm eps 1e-2 | +0.742 | 0.912 / 0.710 | −0.42 | 0.704 / 0.102 | fail | fail (error rate, worst sample, floor) |
+| int4 per tensor | +1.000 | 0.620 / 0.325 | −2.02 | 0.215 / −0.114 | fail | fail |
+
+So the relaxed mode lets FP4 weights on every layer of VoxCPM2 through end to
+end (with `--precisions ...,fp4_weights`: 4-bit stays opt-in), where
+near-lossless needed the LocDiT kept in FP8.
+
+Found while calibrating (both modes, not changed here): on the Qwen3-0.6B
+decoder layer at decode the redrawn-input check fails the reference math of
+every reduced precision on most draws (FP8 weights 70 of 80 in
+near-lossless, 54 in relaxed). It redraws the KV cache from the mean and std of
+the whole cache, and Qwen3's K cache (after its k_norm) has two channels far
+larger than the rest (layer 0: channel RMS 225 and 69, median 1.6, so the
+global std is 21): redrawn, every channel is 13 times its usual size, the
+attention logits spread widely and one FP8 rounding step moves the softmax's
+argmax (redrawing the cache per channel instead: 1 of 18 draws fail in
+relaxed, 9 in near-lossless).
+Exact-tier kernels are unaffected; FP8 kernels for whole Qwen3 attention or
+decoder layers are rejected there until the redraw keeps the cache's channel
+scales.
+
 **Allowed precisions** (`--precisions`, `kernel_agent/precisions.py`). A run lists
 the target precisions it allows; `exact` is always one of them. `--quality exact`
-allows `exact` only. `--quality near-lossless` allows `fp8_weights`, `fp8_w8a8`,
+allows `exact` only. `--quality near-lossless` and `--quality relaxed` allow `fp8_weights`, `fp8_w8a8`,
 `fp8_mx` (MXFP8, 8-bit) and `reduced` by default, but **not** the 4-bit
 `fp4_weights`: 4-bit is opt-in
 (`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights`). So is `fp8_kv`
@@ -397,7 +551,7 @@ recorded in `run.json` → `config.precisions`; a run whose `run.json` has none
 (made before the option) gets the default, so its FP4 targets stay out.
 `--precisions` on a run that exists (`improve <run_dir>`, `resume`,
 `integrate`) replaces its list in `run.json`. A reduced precision needs
-`--quality near-lossless` (else the command stops). The list is enforced
+`--quality near-lossless` or `relaxed` (else the command stops). The list is enforced
 wherever a precision is chosen or used:
 
 * **planner**: its precision policy describes only the allowed precisions (and
@@ -569,7 +723,7 @@ Decode GEMVs and skinny GEMMs stream their weights once per call, so storing
 the weights in FP8 halves their time. The precision policy follows the quality
 mode:
 
-* **Planner.** In a `--quality near-lossless` run the planner prompt allows
+* **Planner.** In a `--quality near-lossless` or `relaxed` run the planner prompt allows
   `"precision": "fp8_weights"` on a target whose time goes into streaming
   weights (`nn.Linear`, MLP or attention projections at a few rows per call),
   with a one-line `precision_why`; `"fp8_w8a8"` on a target whose GEMMs are
@@ -577,7 +731,7 @@ mode:
   numerics-changing idea. Norms, attention math and output / stop heads stay
   exact. In an exact run the prompt forbids it and the orchestrator drops a
   planned target with a reduced precision (`plan: dropping <id>: precision
-  'fp8_weights' needs --quality near-lossless`), in `plan` and in `improve`'s
+  'fp8_weights' needs --quality near-lossless or relaxed`), in `plan` and in `improve`'s
   re-plans. `capture` records the precision next to the tier in the sealed
   capture (`kernels/compare.py`: `REDUCED_PRECISIONS`).
 * **Engineer.** The prompt of such a target states the contract: quantise once
@@ -3205,13 +3359,18 @@ kernel-agent optimize <hf-url> [options]
                                                natural_text, natural_max_patches,
                                                stop_tolerance, stop_near_tie,
                                                throughput: batch_size (8), vae_batch (16), outlier_steps (1),
-                                               near-lossless: max_error_increase, max_mos_drop,
+                                               near-lossless / relaxed: max_error_increase, max_mos_drop,
                                                min_speaker_similarity(_worst), perceptual_max_patches
-  --quality exact|near-lossless        near-lossless: numerics-changing optimisations pass a
-                                       perceptual gate (see "Quality modes")
+  --quality relaxed|near-lossless|exact
+                                       relaxed (default of new runs): numerics-changing
+                                       optimisations pass module bounds and a perceptual gate
+                                       about twice near-lossless's; near-lossless: within the
+                                       noise of eager; exact: within rounding noise (see
+                                       "Quality modes"); a run keeps its recorded mode
   --precisions exact,fp8_weights,...   target precisions the run allows, in run.json (default:
-                                       exact; near-lossless: all but the 4-bit fp4_weights,
-                                       which is opt-in; see "Allowed precisions")
+                                       relaxed, near-lossless: all but the 4-bit fp4_weights
+                                       and fp8_kv, which are opt-in; exact: exact; see
+                                       "Allowed precisions")
   --backends cuda,triton,cute,tilelang,nvrtc
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
@@ -3314,7 +3473,7 @@ runs/<org>--<name>/<timestamp>/
     baseline_output.pt          output of the baseline run
     baseline_output_holdout.pt  ... of the held-out input
     baseline_output_natural.pt  ... of the natural-length run (stop condition)
-    baseline_output_perceptual.pt  perceptual samples + scores (--quality near-lossless)
+    baseline_output_perceptual.pt  perceptual samples + scores (--quality relaxed / near-lossless)
     captures/<id>.pt            module + real inputs/outputs + post-call state
     captures/<id>.parent.pt     region target: the capture of its parent class
     targets/<id>/history/       snapshot of every evaluated version (region: + rewrite.py)
@@ -3714,12 +3873,15 @@ as a `SlotModel` and call `kernel_agent.workloads.serving.serve` from `run`
 when `self.serving()` is set, marking each request with `self.mark_ready(...)`
 in `on_ready` (see "Serving" above and `tests/voxcpm_slots.py`).
 
-To opt in to the perceptual gate of `--quality near-lossless` (see "Quality
+To opt in to the perceptual gate of `--quality relaxed` / `near-lossless` (see "Quality
 modes"), implement `perceptual_samples()` (option overrides of a few short
 held-out samples, plain values), `perceptual_quality(samples)` (scores of
 `{"options", "output"}` samples; load scoring models lazily and free them) and
 `compare_perceptual(reference, candidate)` (paired, calibrated thresholds),
-and set `near_lossless_options` (the looser teacher-forcing floor).
+and set `near_lossless_options` (the looser teacher-forcing floor) and
+`relaxed_options` (the floor loosened further for relaxed runs, on top of it;
+the gate's relaxed thresholds come from `perceptual.RELAXED_GATE` through the
+same option names your `compare_perceptual` reads).
 `workloads/perceptual.py` has the TTS scorers (`score_tts`, `compare_tts`);
 an LLM would score token-match rate and the perplexity delta on held-out text.
 
