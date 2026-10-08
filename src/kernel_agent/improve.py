@@ -11,8 +11,10 @@
             research.md from the documentation (web on, not --no-dossier; issue #125)
         run one slice: a fresh agent session with --slice evaluations, seeded with
             a digest (last ledger rows, ideas, best snapshot, plan.md, NOTES.md); a
-            target with workers (--seeds-per-target, workers.py) gets one session per
-            worker, concurrently up to --parallel, that share the slice's evaluations
+            target with islands (--islands, workers.py, issue #189) gives the slice to
+            the island with the best island UCB (its own lineage and NOTES.md; the
+            best results of the other islands as inspirations every --migrate-every
+            evaluations; reseeded from the target's best once it falls --cull-gap behind)
         the native arm (--native, native/engine.py, issue #134), once every module arm
             has plateaued: first the capture of its current stage (teacher-forced
             checks), then a longer systems-native session with --native-evaluations;
@@ -137,6 +139,11 @@ class ImproveConfig:
     # (static), plus a cheap model's triage while a job waits --critic-wait s (model), off
     critic: str = "static"
     critic_wait: float = 30.0  # critic.MIN_WAIT_S
+    # islands (--islands, workers.py, issue #189): the target's evaluations between two offers
+    # of the other islands' best results to an island (0: no migration), and how far below
+    # the target's best a stagnant island is reseeded from it (0: never)
+    migrate_every: int = workers.MIGRATE_EVERY
+    cull_gap: float = workers.CULL_GAP
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -251,20 +258,26 @@ def kernel_digest(
     worker: int | None = None,
     *,
     label: str = "",
+    island: list[str] | None = None,
 ) -> str:
     """Context of a fresh kernel-engineer session (bounded: no growth with the slice count);
     ``worker``: of that worker's session (its own NOTES.md, the target's shared ledger);
-    ``label``: the session's (its part of the run's board, :func:`board_section`)."""
+    ``label``: the session's (its part of the run's board, :func:`board_section`);
+    ``island``: an island session's ``## Your island`` (``workers.island_lines``) in place of
+    ``## Best so far``."""
     lines = _header(n, evaluations, "`results.jsonl`, `NOTES.md` and `history/`")
-    lines += ["", "## Best so far"]
-    if arm.best_snapshot:
+    if island is not None:
+        lines += island
+    elif arm.best_snapshot:
         sol = "" if arm.sol is None else f", {arm.sol:.0%} of its recipe's roofline"
-        lines.append(
+        lines += [
+            "",
+            "## Best so far",
             f"* `history/{arm.best_snapshot}`: {arm.best:.3f}x module speedup{sol}. Build on "
-            f'it (`parent="history/{arm.best_snapshot}"`) unless you test a different approach.'
-        )
+            f'it (`parent="history/{arm.best_snapshot}"`) unless you test a different approach.',
+        ]
     else:
-        lines.append("* no correct candidate faster than the reference yet")
+        lines += ["", "## Best so far", "* no correct candidate faster than the reference yet"]
     lines += refusals(run, arm.id)
     rows = arm.rows[-LAST_ROWS:]
     if rows:
@@ -629,6 +642,7 @@ class Improver:
             rows=rows,
             research=self.state["research"],
             relax_native=relax,
+            islands=self._island_caps(),
         )
 
     def research_due(self, arm: Arm) -> str | None:
@@ -962,13 +976,15 @@ class Improver:
         concurrent sessions it names its sessions (``sessions``: their labels, whose ledger
         rows are its own)."""
         n = len(self.state["slices"]) + 1
-        label = f"{arm.agent}#{n}"
+        island = self._island(arm)  # with --islands: the island it goes to (workers.py)
+        agent = island.agent if island else arm.agent
+        label = f"{agent}#{n}"
         info = arm.summary()
         rec: dict[str, Any] = {
             "n": n,
             "arm": arm.id,
             "round": self.round,
-            "agent": arm.agent,
+            "agent": agent,
             "label": label,
             "status": "running",
             "started": _ts(),
@@ -978,13 +994,16 @@ class Improver:
             "why": info["why"],  # the score's components (scheduler.Arm.why, issue #122)
             **self._session_time(arm),
             **({"sessions": [label]} if self.concurrent else {}),
+            **({"island": island.k, "generation": island.generation} if island else {}),
         }
         self.state["slices"].append(rec)
         self.save()
         others = ", ".join(f"{a.id} {a.score:.3g}" for a in arms if a is not arm and not a.stop)
+        on = f" island {island.k} (island score {island.score:.3g})" if island else ""
         log(
-            f"slice {n}: {arm.id} (best {arm.best:.2f}x, expected gain {arm.expected_ms:.3g} ms, "
-            f"score {arm.score:.3g}: {info['why']}; others: {others or 'none'})"
+            f"slice {n}: {arm.id}{on} (best {arm.best:.2f}x, expected gain "
+            f"{arm.expected_ms:.3g} ms, score {arm.score:.3g}: {info['why']}; others: "
+            f"{others or 'none'})"
         )
         ledger.event(
             self.run,
@@ -994,6 +1013,7 @@ class Improver:
             score=info["score"],
             expected_ms=info["expected_ms"],
             why=info["why"],
+            **({"island": island.k} if island else {}),
         )
         return rec
 
@@ -1028,12 +1048,8 @@ class Improver:
                         evaluations=evaluations, digest=digest, label=label
                     )
                 ]
-            elif team := self._team(arm, evaluations):
-                rec["workers"] = [s.worker for s in team]
-                if "sessions" in rec:  # each worker's session is the slice's
-                    rec["sessions"] = [f"{workers.agent_name(arm.id, s.worker)}#{n}" for s in team]
-                self.save()
-                results = await self._workers(arm, team, n, rec, beside)
+            elif rec.get("island") is not None:  # one island's session (--islands, #189)
+                results = [await self._island_session(rec, arm, evaluations, beside)]
             else:
                 self._restart_advice(arm)
                 digest = kernel_digest(self.run, arm, n, evaluations, self.policy, label=label)
@@ -1141,60 +1157,174 @@ class Improver:
         log(f"native: re-profiled {snapshot}: {rec['median_ms']:.1f} ms ({rec['dir']})")
         return True
 
-    def _team(self, arm: Arm, evaluations: int) -> list[workers.Seed]:
-        """The worker sessions of a kernel slice ([]: one classic session). With
-        ``--reseed-workers`` the slices after the arm's first worker slice start from its
-        two best snapshots (``workers.reseeds``)."""
-        team = self.orch.kernel_seeds(arm.id, evaluations)
-        earlier = [s for s in self.state["slices"] if s["arm"] == arm.id and s.get("workers")]
-        if team and earlier and self.orch.cfg.reseed_workers:
-            team = workers.reseeds(self.run, arm.id, team, evaluations, self.orch.truth) or team
-        return team
+    # -------------------------------------------------------- islands (workers.py, #189)
 
-    async def _workers(
-        self, arm: Arm, team: list[workers.Seed], n: int, rec: dict[str, Any], beside: str = ""
-    ) -> list[AgentResult]:
-        """One session per worker, concurrently up to ``--parallel``, each with its share of
-        the slice's evaluations and a digest made when it starts (so a session that waited
-        for its slot sees the results of the ones before it). A session that raised is
-        logged in ``rec``; the slice fails only when every session raised."""
-        sem = asyncio.Semaphore(max(1, self.orch.cfg.parallel))
-        self._restart_advice(arm, [workers.agent_name(arm.id, s.worker) for s in team])
-        log(
-            f"slice {n}: {arm.id}: {len(team)} workers, "
-            + ", ".join(f"w{s.worker} {s.evaluations} evals ({s.origin})" for s in team)
+    def _island_caps(self) -> dict[str, int] | None:
+        """The live islands of every kernel target with several (``--islands``): the most
+        sessions its arm runs at once (None without the setting: one per arm)."""
+        if self.orch.cfg.seeds_per_target is None:
+            return None
+        counts = {t: self.orch.island_count(t) for t in self.targets()}
+        return {t: k for t, k in counts.items() if k > 1}
+
+    def islands(self, arm: Arm) -> list[workers.Island]:
+        """The islands of the kernel arm ``arm`` (``improve.json`` → ``islands``, new ones
+        saved), measured from the ledger and ranked by the island UCB (``workers.rank``);
+        [] with one island (its classic session)."""
+        if arm.kind != KERNEL or (k := self.orch.island_count(arm.id)) < 2:
+            return []
+        saved = self.state.setdefault("islands", {}).setdefault(arm.id, {})
+        spec = read_json(self.run.target(arm.id) / "spec.json", {}) or {}
+        elite = (arm.best_snapshot, arm.best) if arm.best_snapshot else None
+        available = self.orch._available_backends()
+        found = workers.new_islands(arm.id, k, spec, available, saved, elite)
+        if new := [i for i in found if str(i.k) not in saved]:
+            saved.update({str(i.k): i.state() for i in new})
+            self.save()
+        rows = [r for r in ledger.rows(self.run) if r["target"] == arm.id]
+        busy = {
+            int(s["island"])
+            for s in self.state["slices"]
+            if s["arm"] == arm.id and s.get("status") == "running" and s.get("island")
+        }
+        for island in found:
+            workers.measure(island, rows, island.k in busy)
+        return workers.rank(found, self.policy.decay, self.policy.explore)
+
+    def _island(self, arm: Arm) -> workers.Island | None:
+        """The island the next slice of ``arm`` goes to (None: its classic session): the
+        stagnant ones reseeded first (:meth:`_cull`), then the best by the island UCB without
+        a running session (``scheduler.assign`` keeps one free: the arm's ``max_sessions``)."""
+        islands = self.islands(arm)
+        if islands and self._cull(arm, islands):
+            islands = self.islands(arm)
+        return workers.choose(islands) or (islands[0] if islands else None)
+
+    def _cull(self, arm: Arm, islands: list[workers.Island]) -> bool:
+        """Reseed every island of ``arm`` that fell ``--cull-gap`` behind the target's best
+        (``workers.cull_reason``) from it, in the target's next unused direction, its
+        ``NOTES.md`` archived (``improve.json`` → ``culls``); whether one was."""
+        if not arm.best_snapshot:
+            return False
+        spec = read_json(self.run.target(arm.id) / "spec.json", {}) or {}
+        rows = ledger.rows(self.run)
+        evaluations = len(ledger.measured(r for r in rows if r["target"] == arm.id))
+        elite = (arm.best_snapshot, arm.best)
+        culled = False
+        for island in islands:
+            if (why := workers.cull_reason(island, arm.best, self.icfg.cull_gap)) is None:
+                continue
+            done = sum(c["target"] == arm.id for c in self.state.get("culls", []))
+            new = workers.reseed(
+                island,
+                spec,
+                self.orch._available_backends(),
+                len(islands) + done + 1,  # the directions so far: one per island and reseed
+                elite,
+                len(rows),
+                evaluations,
+            )
+            archived = workers.archive_notes(self.run, arm.id, island)
+            self.state["islands"][arm.id][str(island.k)] = new.state()
+            self.state.setdefault("culls", []).append(
+                {
+                    "target": arm.id,
+                    "island": island.k,
+                    "generation": new.generation,
+                    "at": _ts(),
+                    "exp": len(rows),
+                    "why": why,
+                    "best": round(island.best, 4),
+                    "target_best": round(arm.best, 4),
+                    "parent": new.parent,
+                    "approach": new.approach,
+                    **({"archived": str(archived.relative_to(self.run.root))} if archived else {}),
+                }
+            )
+            log(f"{arm.id}: {why}: reseeded from {new.parent} in a new direction")
+            ledger.event(
+                self.run,
+                "island_reseeded",
+                target=arm.id,
+                island=island.k,
+                generation=new.generation,
+                parent=new.parent,
+            )
+            culled = True
+        if culled:
+            self.save()
+        return culled
+
+    def _migrate(
+        self, rec: dict[str, Any], arm: Arm, island: workers.Island
+    ) -> list[dict[str, Any]]:
+        """The inspirations of the session of slice ``rec`` on ``island`` when a migration is
+        due (``--migrate-every``, ``workers.inspirations``): recorded in ``improve.json`` →
+        ``migrations`` and the slice's ``inspirations`` ([]: none due or none to offer)."""
+        rows = [r for r in ledger.rows(self.run) if r["target"] == arm.id]
+        evaluations = len(ledger.measured(rows))
+        if not workers.migration_due(island, evaluations, self.icfg.migrate_every):
+            return []
+        offered = workers.inspirations(island, rows)
+        if not offered:
+            return []
+        island.inspired = evaluations
+        self.state["islands"][arm.id][str(island.k)] = island.state()
+        self.state.setdefault("migrations", []).append(
+            {
+                "target": arm.id,
+                "island": island.k,
+                "slice": rec["n"],
+                "label": rec["label"],
+                "at": _ts(),
+                "evaluations": evaluations,
+                "inspirations": [
+                    {k: e[k] for k in ("snapshot", "speedup", "backend", "island")} for e in offered
+                ],
+            }
         )
+        rec["inspirations"] = [e["snapshot"] for e in offered]
+        self.save()
+        log(
+            f"slice {rec['n']}: {arm.id} island {island.k}: inspirations "
+            + ", ".join(f"{e['snapshot']} ({e['speedup']:.3f}x, {e['backend']})" for e in offered)
+        )
+        return offered
 
-        async def one(seed: workers.Seed) -> AgentResult:
-            async with sem:
-                now = next((a for a in self.arms() if a.id == arm.id), arm)
-                label = f"{workers.agent_name(arm.id, seed.worker)}#{n}"
-                digest = kernel_digest(
-                    self.run, now, n, seed.evaluations, self.policy, seed.worker, label=label
-                )
-                digest += beside
-                return await self.orch.worker_session(
-                    arm.id,
-                    seed,
-                    team,
-                    prompt=f"Continue optimising target `{arm.id}` as worker {seed.worker} "
-                    "(see the `# Worker` section). Read the `# Improve slice` section first: "
-                    "it says where the previous sessions left off.",
-                    digest=digest,
-                    label=label,
-                )
-
-        out = await asyncio.gather(*(one(s) for s in team), return_exceptions=True)
-        failed = [r for r in out if isinstance(r, BaseException)]
-        for exc in failed:
-            if not isinstance(exc, Exception):  # cancellation: the slice is interrupted
-                raise exc
-        if failed and len(failed) == len(out):
-            raise failed[0]
-        if failed:
-            log(f"slice {n}: {len(failed)} of {len(out)} worker sessions failed: {failed[0]!r}")
-            rec["error"] = repr(failed[0])[:500]
-        return [r for r in out if not isinstance(r, BaseException)]
+    async def _island_session(
+        self, rec: dict[str, Any], arm: Arm, evaluations: int, beside: str = ""
+    ) -> AgentResult:
+        """The session of slice ``rec`` on its island: the island's own directory, notes and
+        lineage, the other islands' best results when a migration is due (:meth:`_migrate`)
+        and a whole slice of evaluations (no split: the island UCB and the free slots spread
+        the target's evaluations over its islands)."""
+        islands = self.islands(arm)
+        island = next(i for i in islands if i.k == int(rec["island"]))
+        offered = self._migrate(rec, arm, island)
+        self._restart_advice(arm, [island.agent])
+        lines = workers.island_lines(island, islands, arm.best, arm.best_snapshot, offered)
+        digest = kernel_digest(
+            self.run,
+            arm,
+            rec["n"],
+            evaluations,
+            self.policy,
+            island.k,
+            label=rec["label"],
+            island=lines,
+        )
+        team = sorted(islands, key=lambda i: i.k)
+        return await self.orch.worker_session(
+            arm.id,
+            island.seed(evaluations),
+            [i.seed(evaluations) for i in team],
+            prompt=f"Continue optimising target `{arm.id}` as island {island.k} (see the "
+            "`# Island` section). Read the `# Improve slice` section first: it says where the "
+            "previous sessions left off.",
+            digest=digest + beside,
+            label=rec["label"],
+            note=workers.island_note(arm.id, island, team, evaluations),
+        )
 
     def _restart_advice(self, arm: Arm, agents: list[str] | None = None) -> None:
         """Let the evaluation advice count the arm's plateau from its last research plan,
@@ -1598,6 +1728,7 @@ def report_lines(run: RunDir) -> list[str]:
         f"* stopped: {finished.get('reason', 'not finished (interrupted or running)')}",
         *_budget_lines(finished),
         *_concurrency_lines(state),
+        *_island_lines(run, state),
         *board.report_lines(run),  # board.jsonl (#187)
         *_critic_lines(run),  # critic.jsonl (#188)
         "",
@@ -1685,6 +1816,32 @@ def _concurrency_lines(state: dict[str, Any]) -> list[str]:
         f"evaluations waited {waited / 60:.0f} min for the GPU in all; "
         f"{done['rate_limit_waits']} shared usage-limit wait(s)"
     ]
+
+
+def _island_lines(run: RunDir, state: dict[str, Any]) -> list[str]:
+    """``--islands`` (workers.py, issue #189): per target with islands, each island's best and
+    backend, the migrations offered and used and the islands reseeded ([] without islands)."""
+    saved = state.get("islands") or {}
+    if not saved:
+        return []
+    rows = ledger.rows(run)
+    out = []
+    for target, islands in saved.items():
+        mine = [r for r in rows if r["target"] == target]
+        bests = []
+        for k in sorted(islands, key=int):
+            island = workers.measure(workers.Island.of(target, int(k), islands[k]), mine)
+            bests.append(
+                f"{k}: {island.best:.3f}x `{island.backend or '?'}` gen {island.generation}"
+            )
+        offered = sum(m["target"] == target for m in state.get("migrations") or [])
+        culled = sum(c["target"] == target for c in state.get("culls") or [])
+        out.append(
+            f"* islands of `{target}` (`--islands`): {'; '.join(bests)}; {offered} migrations "
+            f"offered, {workers.adoptions(mine)} times an island built on another's result, "
+            f"{culled} reseeded"
+        )
+    return out
 
 
 def slices_chart(run: RunDir) -> Path | None:

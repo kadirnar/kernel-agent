@@ -3206,8 +3206,8 @@ model and starts a new round (`kernel_agent/improve.py`,
     takes the next slot before another engineer. Every session of a role has the same
     system prompt (the stable prefix), so a role's first session starts alone and
     writes the prompt cache, and the role's other sessions start once it has streamed
-    its first message (staggered starts: they read the cache). A target with workers (`--seeds-per-target`) runs its team in one
-    slot (islands with a slot each: #189).
+    its first message (staggered starts: they read the cache). A target with islands
+    (`--islands K`, "Islands" below) runs up to one session per island at once.
   * *GPU, integration, rounds.* Every session's evaluations take the GPU in turns
     through the GPU job queue ("Job queue" under "GPUs and the GPU lock"); their
     waits do not count against the session's time. The re-integration runs in the
@@ -3223,8 +3223,9 @@ model and starts a new round (`kernel_agent/improve.py`,
     Once a budget is spent nothing new starts and the loop waits for the running
     sessions (it drains), so the final integration has the GPU alone.
   * *Ownership and failures.* Each engineer session may write only in its own
-    directory (`targets/<id>/` without `workers/`; `transforms/` without
-    `transforms/native/`; `transforms/native/`). With `--overlap avoid` no two
+    directory (`targets/<id>/` without `workers/`, an island's
+    `targets/<id>/workers/<k>/`; `transforms/` without `transforms/native/`;
+    `transforms/native/`). With `--overlap avoid` no two
     sessions work on the same modules at once; with `warn` (default) a session's
     digest names the sessions running beside it and those on the same modules. A
     failing session never stops the others: an arm whose last 3 slices of the
@@ -3366,7 +3367,9 @@ model and starts a new round (`kernel_agent/improve.py`,
   dry run it also proposes `fp8_weights` for the plateaued MLP target, whose
   `mlp__fp8_weights` arm then reaches a higher ceiling. The CUDA graph the systems
   agent finds is incompatible with the MLP kernel, and round 2 finds a new
-  target. Time is simulated too, so `--max-hours` counts simulated hours. The
+  target. With `--islands` each island builds on its own lineage in its own
+  backend, which has its own ceiling (see "Islands"). Time is simulated too, so
+  `--max-hours` counts simulated hours. The
   images below come from `kernel-agent improve Qwen/Qwen3-0.6B --dry-run
   --rounds 2 --agents 3` (the watch screenshot under "Live dashboard" too).
 
@@ -3400,14 +3403,73 @@ captured from the unmodified model.
   target share its verified evaluation store and the GPU lock, so
   `best_for_target`, `best_result` and `best_so_far` are the best across workers
   and the integration takes it. Ledger rows, records and evaluation events carry
-  the `worker`. The target's evaluation budget stays the same and is split across
-  its workers (`--evaluations 12`, 2 workers: 6 each; an improve slice of 4: 2
-  each), because serial refinement beats parallel sampling at a fixed budget
-  (Kevin). Worker sessions run concurrently up to `--parallel`, in the `kernels`
-  phase and in a slice of `improve`; a resumed `kernels` phase skips finished
-  worker sessions. `--reseed-workers` adds round 2: after the first worker
-  sessions of a target, the next ones start from its two best snapshots (with
-  half of the budget; in `improve`, every slice after the target's first).
+  the `worker`. In the `kernels` phase the target's evaluation budget stays the
+  same and is split across its workers (`--evaluations 12`, 2 workers: 6 each),
+  because serial refinement beats parallel sampling at a fixed budget (Kevin).
+  Worker sessions run concurrently up to `--parallel`; a resumed `kernels` phase
+  skips finished worker sessions. `--reseed-workers` adds round 2: after the
+  first worker sessions of a target, the next ones start from its two best
+  snapshots (with half of the budget).
+* **Islands** (`improve --islands K`, an alias of `--seeds-per-target`; issue #189,
+  docs/MULTIAGENT.md §3.5). In `improve` a target's workers are persistent islands,
+  with no fixed split of the budget: every slice of the target is one island's
+  session (`kernel-<id>-w<k>#n`, in `workers/<k>/`) with a whole `--slice` of
+  evaluations.
+  * *Which island.* The target's score decides whether it gets a slot; the island
+    with the best island UCB (its own gain per evaluation plus an exploration
+    bonus on few evaluations, decayed by its sessions without a new island best)
+    and no running session gets it. With `--agents N` a target runs up to one
+    session per island at once (its arm's cap is its islands), so islands use
+    slots other arms leave idle. The target's move-on rules count across its
+    islands (patience in evaluations, as before).
+  * *Lineage.* An island builds on its own best (its digest's `## Your island`
+    replaces `## Best so far`) and keeps its own `NOTES.md`; island 1 continues
+    the target's best so far, the others start from the reference in their own
+    direction.
+  * *Migration* (`--migrate-every 4`; 0: off). An island whose last session found
+    no new island best gets `## Inspirations` in its next digest, at most every 4
+    evaluations of the target: the best result of the other islands when it beats
+    its own, and the best result of another cell (another backend, else another
+    idea; MAP-Elites cells of backend × idea), each faster than the reference. It
+    may build on one or carry its idea into its own direction. New bests of the
+    other islands also reach running sessions as board winners.
+  * *Culling* (`--cull-gap 0.15`; 0: never). An island more than 15 % below the
+    target's best after 8 evaluations and 2 sessions without a new island best is
+    reseeded: the target's next unused direction (planner alternative, else
+    backend), the target's best as its parent, its `NOTES.md` archived
+    (`NOTES.gen<g>.md`).
+  * *Records.* `improve.json` → `islands` (each island's direction, generation,
+    parent and last migration), `migrations` and `culls`; a slice record has its
+    `island`. The report lists each island's best and backend, the migrations
+    offered and how often an island built on another island's result.
+  * *Default 1.* `--islands 1` (and no `--islands`) is the loop as before: one
+    session per target (the dry run reproduces the earlier one exactly). In the
+    dry run the simulated targets have a ceiling per backend (the planned one's as
+    before; CUDA attention and CuTe RMSNorm higher, the other backends lower), and
+    the same run with 1, 2 and 3 islands per target at `--agents 3` gives (means of
+    seeds 0–4, `docs/research-scripts/islands-189/`; `independent`: no migration
+    and no culling):
+
+    | `--islands` | `--max-hours 8`: kernel evaluations | final speedup | agent h | log gain / agent h | migrations offered / used | `--rounds 2`: final speedup |
+    |---|---:|---:|---:|---:|---:|---:|
+    | 1 (default) | 100 | 2.516x | 13.6 | 0.068 | – | 2.525x |
+    | 2 | 117 | 2.686x | 15.2 | 0.065 | 6.6 / 2.6 | 2.695x |
+    | 2, independent | 117 | 2.696x | 15.2 | 0.065 | – | 2.689x |
+    | 3 | 127 | 2.611x | 16.6 | 0.058 | 6.0 / 3.6 | 2.623x |
+    | 3, independent | 126 | 2.633x | 16.6 | 0.059 | – | 2.641x |
+
+    Two islands beat one in every seed (median 2.68x vs 2.63x): they run in slots
+    the other arms leave idle (12 % more agent time), at a slightly lower gain per
+    agent-hour. Three do less than two (KernelArc saw no consistent gain from 2 to
+    4 agents either). Migration changes nothing measurable here: most islands that
+    built on an inspiration moved to a backend with a higher ceiling, but the
+    target's best was by then held by the move-on rules (90 % of the roofline, the
+    2x goal), and a few left a better direction too early. No island was culled,
+    with migration off too: an island is culled when its target gets its next
+    slot, and once an island has 2 sessions without a new best, the target's
+    patience (which counts every island's evaluations) has mostly retired it. So
+    the default stays 1 until a real run shows a gain per agent-hour;
+    `--agents 3 --islands 2` is the setting to try.
 * **Duplicates** (`kernel_agent/dedup.py`). Before it takes the GPU lock,
   `evaluate_candidate` hashes the candidate's source normalised by
   `ast.unparse(ast.parse(...))` (comments, blank lines and formatting do not
@@ -3963,6 +4025,7 @@ kernel-agent optimize <hf-url> [options]
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
   --seeds-per-target 2|auto            isolated workers per target, budget split across them
+                                       (alias --islands; improve: islands, see "Islands")
   --reseed-workers                     round 2 of the workers from the two best snapshots
   --no-transforms                      kernels only
   --claude-model claude-opus-5-5 --effort high --budget 10 (USD per agent)
@@ -4007,6 +4070,9 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
                                        checks; model: + a cheap model while it waits,
                                        --agents > 1); force=true overrides a reject
   --critic-wait 30                     --critic model: the least expected GPU wait
+  --islands K|auto --migrate-every 4 --cull-gap 0.15
+                                       islands per kernel target, their migration and
+                                       culling (see "Islands"; default 1: one session)
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]
                                        [--precisions P,P]  (replaces the run's list in run.json)
 kernel-agent integrate <run_dir> [--precisions P,P] [--no-reuse]
@@ -4080,7 +4146,9 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/workload_profile.md  statistics of every call of the target (+ .json)
   targets/<id>/reference_source.py
   targets/<id>/candidates/    files the agent writes
-  targets/<id>/workers/<k>/   --seeds-per-target: a worker's candidates/ + NOTES.md (+ links)
+  targets/<id>/workers/<k>/   --seeds-per-target / --islands: a worker's (island's)
+                              candidates/ + NOTES.md (+ NOTES.gen<g>.md of a culled
+                              island's earlier generations) (+ links)
   targets/<id>/plan.md        improve: the research plan of a plateaued target
   targets/<id>/research.md    the target's research dossier: findings with sources, ideas
   targets/<id>/pivot.json     near-lossless: its proposal to move to another precision; the
@@ -4104,7 +4172,8 @@ runs/<org>--<name>/<timestamp>/
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md, artifacts.jsonl:
                               kernel_agent.artifacts lookups, export_checks.jsonl)
   improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds;
-                              the running sessions and the GPU queue (sessions, gpu)
+                              the running sessions and the GPU queue (sessions, gpu); with
+                              --islands: islands, migrations, culls
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
   costs.json                  per agent: $, turns, minutes, tools, role, model, effort, usage
                               and first_usage (input, cache write, cache read, output

@@ -812,6 +812,14 @@ class Orchestrator:
             return []
         return workers.seeds(spec, k, total, self._available_backends())
 
+    def island_count(self, target_id: str) -> int:
+        """The islands of a target in ``improve`` (``--islands``, an alias of
+        ``--seeds-per-target``; workers.py, issue #189): 1 (its classic session) unless set."""
+        if self.cfg.seeds_per_target is None:
+            return 1
+        spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
+        return workers.count(self.cfg.seeds_per_target, self._share(spec))
+
     async def worker_session(
         self,
         target_id: str,
@@ -821,10 +829,12 @@ class Orchestrator:
         prompt: str,
         digest: str = "",
         label: str | None = None,
+        note: str | None = None,
     ) -> AgentResult:
         """One worker session of a target: its own directory and tools bound to it (paths,
         the ``worker`` of its ledger rows, its evaluation budget), the engineer prompt with
-        the worker's approach and backends, and a ``# Worker`` section (``team``: the round)."""
+        the worker's approach and backends, and a ``# Worker`` section (``team``: the round;
+        ``note``: an island's ``# Island`` section instead, ``workers.island_note``)."""
         profile = read_json(self.run.profile_dir / "profile.json", {})
         stats = {c["cls"]: c for c in profile.get("classes", [])}
         spec = read_json(self.run.target(target_id) / "spec.json")
@@ -833,7 +843,7 @@ class Orchestrator:
         backends = list(seed.backends) or spec["backends"]
         context = self._engineer_target(
             spec, backends, seed.evaluations, stats, approach=seed.approach
-        ) + workers.prompt_note(target_id, seed, team)
+        ) + (workers.prompt_note(target_id, seed, team) if note is None else note)
         return await self._agent(
             name,
             label,

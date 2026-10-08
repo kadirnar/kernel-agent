@@ -11,8 +11,9 @@ rate gate opens, a role's first session streams, a breaker's pause ends (and eve
 * **Slots** go to arms by the scheduler's scores with virtual pulls (``scheduler.assign``):
   a running session counts as if it had made its evaluations and found nothing, so the
   slots spread over the arms that pay. An arm gets its research session (or dossier) first
-  when one is due, as in the sequential loop; it runs one session at a time
-  (``Arm.max_sessions``) and none while its research session runs; a role runs at most its
+  when one is due, as in the sequential loop; it runs one session at a time, one per island
+  with ``--islands`` (``Arm.max_sessions``; the island UCB picks which, ``workers.py``), and
+  none while its research session runs; a role runs at most its
   ``RoleSpec.max_concurrent`` sessions (``roles.REGISTRY``; ``--role-max`` overrides). The
   native arm is not held while kernel arms improve: it takes a slot no other arm can use.
 * **GPU-free roles first on a saturated GPU**: while a new evaluation would wait more than
@@ -224,7 +225,10 @@ class Job:
 
     @property
     def agent(self) -> str:
-        return self.arm.agent if self.kind == SLICE else f"{self.role}-{self.arm.id}"
+        """Its agent name: a slice's record's (an island's, ``--islands``), else the role's."""
+        if self.kind == SLICE:
+            return str(self.rec.get("agent") or self.arm.agent)
+        return f"{self.role}-{self.arm.id}"
 
     def running(self) -> scheduler.Running:
         return scheduler.Running(self.arm.id, self.role, self.agent, self.evaluations)
@@ -440,7 +444,8 @@ class Coordinator:
             return False
         if self.icfg.overlap == "avoid" and kind == SLICE:
             mine = self._claims_of(arm)
-            return not any(overlaps(mine, job.claims) for job in self.jobs.values())
+            others = [job for job in self.jobs.values() if job.arm.id != arm.id]  # not its islands
+            return not any(overlaps(mine, job.claims) for job in others)
         return True
 
     def _gpu_free_ok(self, arm: Arm) -> bool:
@@ -660,7 +665,17 @@ class Coordinator:
             "* Each session writes only in its own directory, and the evaluations take the "
             "GPU in turns (your session's clock stops while yours waits)."
         )
-        same = [o.label for o in self.jobs.values() if overlaps(job.claims, o.claims)]
+        siblings = [
+            o.label for o in self.jobs.values() if o.arm.id == job.arm.id and o.kind == SLICE
+        ]
+        if siblings:  # the other islands of its target (--islands)
+            lines.append(
+                f"* {', '.join(f'`{s}`' for s in siblings)}: other islands of your target, each "
+                "in its own direction: the integration takes the target's fastest kernel, "
+                "whichever island made it."
+            )
+        others = [o for o in self.jobs.values() if o.arm.id != job.arm.id]
+        same = [o.label for o in others if overlaps(job.claims, o.claims)]
         if same and self.icfg.overlap == "warn":
             job.rec["overlap"] = same
             lines.append(

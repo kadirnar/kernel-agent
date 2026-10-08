@@ -555,34 +555,35 @@ def sim(monkeypatch):
     monkeypatch.setattr(charts, "available", lambda: False)
 
 
-def test_improve_slices_run_the_workers_of_a_target(tmp_path, sim):
-    config = OptimizeConfig(
-        model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path, seeds_per_target=2, parallel=2
-    )
+def test_improve_slices_go_to_the_islands_of_a_target(tmp_path, sim):
+    config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path, seeds_per_target=2)
     orch = orchestrator.Orchestrator(dryrun.create_run(config), config)
     world = dryrun.World(orch)
     improver = Improver(
-        orch, ImproveConfig(slice=4, max_slices=4), require_capture=False, live_charts=False
+        orch, ImproveConfig(slice=4, max_slices=8), require_capture=False, live_charts=False
     )
     with world.installed():
         asyncio.run(improver.improve())
     run = orch.run
     kernel_slices = [s for s in improver.state["slices"] if s["arm"] != "systems"]
-    assert kernel_slices and all(s["workers"] == [1, 2] for s in kernel_slices)
-    for s in kernel_slices:
-        assert s["evals"] <= 4  # the slice's 4 evaluations, split over two workers
-        assert s["status"] in ("done", "timed_out")
-    names = [x["name"] for x in world.sessions if x["name"].startswith("kernel-")]
+    assert kernel_slices and all(s["island"] in (1, 2) for s in kernel_slices)
+    for s in kernel_slices:  # one island's session with the whole slice (no split)
+        assert s["label"] == f"kernel-{s['arm']}-w{s['island']}#{s['n']}"
+        assert s["agent"] == f"kernel-{s['arm']}-w{s['island']}"
+        assert s["evals"] <= 4 and s["status"] in ("done", "timed_out")
     arm = kernel_slices[0]["arm"]
-    assert {f"kernel-{arm}-w1", f"kernel-{arm}-w2"} <= set(names)
+    # the untried island of the target goes next (its exploration bonus)
+    assert [s["island"] for s in kernel_slices if s["arm"] == arm][:2] == [1, 2]
     rows = [r for r in ledger.rows(run) if r["target"] == arm]
     assert {r["worker"] for r in rows} == {"1", "2"}
     assert (workers.directory(run, arm, 2) / "NOTES.md").read_text().strip()
     costs = read_json(run.root / "costs.json")
     assert f"kernel-{arm}-w1#{kernel_slices[0]['n']}" in costs
-    # the second worker's digest is its own notes, the target's shared ledger
+    assert set(improver.state["islands"][arm]) == {"1", "2"}  # their persistent state
+    # the second island's digest is its own island and notes, the target's shared ledger
     second = [x for x in world.sessions if x["name"] == f"kernel-{arm}-w2"][-1]["prompt"]
-    assert "# Worker 2 of 2" in second and "| worker |" in second
+    assert "# Island 2 of 2" in second and "| worker |" in second
+    assert "## Your island (island 2 of 2" in second and "## Best so far" not in second
 
 
 def test_unmeasured_rows_do_not_feed_the_scheduler(tmp_path):
@@ -621,11 +622,11 @@ def test_cli_flags_and_a_resumed_improve(monkeypatch, tmp_path, sim, capsys):
         cli.main(["optimize", "org/m", "--seeds-per-target", "0"])
     assert "--seeds-per-target" in capsys.readouterr().err
 
-    # `improve <run_dir> --seeds-per-target 2 --parallel 2` applies to a run made without
+    # `improve <run_dir> --islands 2` (an alias) applies to a run made without
     config = OptimizeConfig(model_ref="Qwen/Qwen3-0.6B", runs_dir=tmp_path)
     run = dryrun.create_run(config)
     argv = ["improve", str(run.root), "--dry-run", "--max-slices", "2"]
-    assert cli.main([*argv, "--seeds-per-target", "2", "--parallel", "2"]) == 0
+    assert cli.main([*argv, "--islands", "2"]) == 0
     slices = read_json(run.root / "improve.json")["slices"]
     kernel = [s for s in slices if s["arm"] != "systems"]
-    assert kernel and kernel[0]["workers"] == [1, 2]
+    assert kernel and kernel[0]["island"] == 1
