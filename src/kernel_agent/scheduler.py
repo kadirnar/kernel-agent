@@ -95,6 +95,21 @@ of the arm and the wrap-up (:func:`slice_seconds`), and the run's time budget
 keeps the final integration's expected duration (:func:`integration_estimate`).
 A slice that made no evaluation in a session the time budget cut short
 (``budget_short`` in its record) counts neither as idle nor as stale.
+
+Concurrent sessions (``improve --agents N``, :mod:`kernel_agent.coordinator`, issue #183):
+:func:`assign` gives the free slots to arms one at a time, each by the scores of
+:func:`virtual_pulls`: every running session counts as if it had made its expected
+evaluations and found nothing (its arm's UCB ``n`` grows, one more step of ``decay``), so the
+slots spread over the arms that pay instead of all going to the top one. An arm takes at
+most ``max_sessions`` sessions at once (1 without islands), a role at most its
+``max_concurrent`` (``roles.REGISTRY``, ``--role-max``), an agent name at most one, and no
+new session while a GPU-free session of it (research, a dossier) runs (paused); it needs
+time for a slice (:func:`slice_seconds`, the queue's expected wait included). There the
+native arm is not held while kernel arms improve
+(``build_arms(relax_native=True)``: :attr:`Arm.held`): it takes a slot no other arm can use.
+A slice still running counts in no arm's ``stale`` or ``idle`` (its sessions' virtual
+pulls do), and a finished one says what its own sessions' ledger rows did
+(``improve.Improver._close``).
 """
 
 from __future__ import annotations
@@ -102,12 +117,12 @@ from __future__ import annotations
 import dataclasses
 import math
 import statistics
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import gpuqueue, ledger, precisions, projection, truth
+from kernel_agent import gpuqueue, ledger, precisions, projection, roles, truth
 from kernel_agent.budget import (
     PLATEAU,
     PRIOR_HYPOTHESIS,
@@ -240,6 +255,10 @@ class Arm:
     base: float = 1.0  # kernels: its best at the start of the round (the goal counts from it)
     fresh: bool = True  # kernels: its best was found in this round (the SOL rule applies)
     note: str | None = None  # native: its staged plan is done, and what it works on now
+    max_sessions: int = 1  # sessions it may run at once (--agents N; islands, later: more)
+    # native, gate relaxed (build_arms(relax_native=True)): why it would wait; it takes a
+    # slot only when no other arm can use it
+    held: str | None = None
 
     @property
     def agent(self) -> str:
@@ -726,12 +745,15 @@ def build_arms(
     rounds: list[dict[str, Any]] | None = None,
     rows: list[dict[str, Any]] | None = None,
     research: list[dict[str, Any]] | None = None,
+    relax_native: bool = False,
 ) -> list[Arm]:
     """Every arm with its history, stop reason and score (live arms first, best first).
 
     ``research``: the research sessions (``improve.json``); one that wrote a plan
     (``plan``) restarts its arm's streak at its ``exp``. ``rounds``: the round records; the
-    move-on rules count from the current round's start (its ``exp``, issue #166)."""
+    move-on rules count from the current round's start (its ``exp``, issue #166).
+    ``relax_native``: concurrent sessions; the native arm is not stopped while kernel arms
+    improve, only marked :attr:`Arm.held` (:func:`assign`)."""
     rows = ledger.rows(run) if rows is None else rows
     profiles = _profiles(run, rounds or [])
     current = (rounds or [{}])[-1]
@@ -793,7 +815,8 @@ def build_arms(
         stage_targets = {t for t in ids if native_engine.is_stage_target(specs[t])}
         arms.append(native_arm(run, rows, policy, stage_targets, since))
     for arm in arms:
-        mine = [s for s in slices if s.get("arm") == arm.id]
+        # a slice still running says nothing yet (concurrent sessions: its virtual pulls do)
+        mine = [s for s in slices if s.get("arm") == arm.id and s.get("status") != "running"]
         earlier = since is not None and any(int(s.get("round") or 1) < round_n for s in mine)
         if since is not None:  # retired for a round only: its slices in this round count
             mine = [s for s in mine if int(s.get("round") or 1) == round_n]
@@ -812,7 +835,7 @@ def build_arms(
         arm.stop = stop_reason(arm, policy)
         if arm.stop is None and earlier and not mine:  # back in a new round only if it matters
             arm.stop = _revival(arm, policy, profiles, round_n)
-    _native_gate(run, arms, policy, rows, allowed)
+    _native_gate(run, arms, policy, rows, allowed, relax=relax_native)
     return rank(arms, policy)
 
 
@@ -876,11 +899,14 @@ def _native_gate(
     policy: Policy,
     rows: list[dict[str, Any]],
     allowed: Iterable[str] | None,
+    *,
+    relax: bool = False,
 ) -> None:
     """Hold the native arm while a kernel arm is live and has not plateaued (module kernels
-    first). Once every stage of its staged plan beat the module-level bar, note it and keep
-    the arm live (issue #164): its patience and time cap still apply, and it stops when every
-    stage of the newest stage graph runs at ``sol_stop`` of its floor."""
+    first; ``relax``: only mark it :attr:`Arm.held`, for a free slot no other arm can use).
+    Once every stage of its staged plan beat the module-level bar, note it and keep the arm
+    live (issue #164): its patience and time cap still apply, and it stops when every stage
+    of the newest stage graph runs at ``sol_stop`` of its floor."""
     arm = next((a for a in arms if a.kind == NATIVE), None)
     if arm is None or arm.stop is not None:
         return
@@ -888,8 +914,11 @@ def _native_gate(
         a.id for a in arms if a.kind == KERNEL and a.stop is None and plateau(a, policy) is None
     ]
     if live:
-        arm.stop = f"waiting: module arms still improving ({', '.join(live[:4])})"
-        return
+        why = f"waiting: module arms still improving ({', '.join(live[:4])})"
+        if not relax:
+            arm.stop = why
+            return
+        arm.held = why
     status = native_engine.status(run, rows, ceilings.columns(allowed))
     if status.complete:
         arm.note = status.note()
@@ -956,6 +985,99 @@ def rank(arms: list[Arm], policy: Policy) -> list[Arm]:
 def pick(arms: list[Arm]) -> Arm | None:
     """The live arm with the highest score (arms as returned by :func:`build_arms`)."""
     return next((a for a in arms if a.stop is None), None)
+
+
+# ------------------------------------------------------------------ concurrent sessions
+
+
+def role_caps(overrides: Mapping[str, int] | None = None) -> dict[str, int]:
+    """Sessions of each role at once: the role registry's ``max_concurrent``
+    (``roles.REGISTRY``: kernel 4, systems 1, native 1) with ``overrides`` (``--role-max``)."""
+    caps = {r.name: r.max_concurrent for r in roles.REGISTRY.values() if r.max_concurrent}
+    return {**caps, **(overrides or {})}
+
+
+@dataclass(frozen=True)
+class Running:
+    """A running session as the scheduler sees it (:func:`assign`): its arm, its role
+    (``kernel``, ``systems``, ``native``, ``research``, ``dossier``), its agent name and the
+    evaluations it is expected to make (its virtual pull)."""
+
+    arm: str
+    role: str
+    agent: str
+    evaluations: int = 0
+
+
+def virtual_pulls(arms: list[Arm], running: list[Running], policy: Policy) -> list[Arm]:
+    """Copies of ``arms`` ranked as if every running session had made its expected
+    evaluations without a new best: its arm's evaluations (the UCB ``n``, and ``N``) grow
+    by them and it is one more slice stale (``decay``). Without this every free slot would
+    go to the top arm, whose running session has no result in the ledger yet."""
+    pulled = []
+    for arm in arms:
+        mine = [r for r in running if r.arm == arm.id and r.evaluations]
+        evals = arm.evals + sum(r.evaluations for r in mine)
+        pulled.append(dataclasses.replace(arm, evals=evals, stale=arm.stale + len(mine)))
+    return rank(pulled, policy)
+
+
+def _eligible(
+    arm: Arm,
+    running: list[Running],
+    role_max: Mapping[str, int],
+    time_left: float | None,
+) -> bool:
+    """Whether ``arm`` may take a slot now (:func:`assign`)."""
+    mine = [r for r in running if r.arm == arm.id]
+    if arm.stop is not None or any(not roles.get(r.role).needs_gpu for r in mine):
+        return False  # stopped, or paused while its research (or dossier) session runs
+    if len(mine) >= arm.max_sessions or any(r.agent == arm.agent for r in running):
+        return False
+    cap = role_max.get(arm.kind)
+    if cap is not None and sum(r.role == arm.kind for r in running) >= cap:
+        return False
+    need = slice_seconds(arm) * (SHORT_SLICE if arm.short else 1.0)
+    return time_left is None or need <= time_left
+
+
+def assign(
+    arms: list[Arm],
+    slots: int,
+    running: list[Running],
+    policy: Policy,
+    *,
+    role_max: Mapping[str, int] | None = None,
+    time_left: float | None = None,
+    evaluations: Mapping[str, int] | None = None,
+    ok: Callable[[Arm], bool] | None = None,
+) -> list[Arm]:
+    """Arms for up to ``slots`` free slots, one at a time and best first, each ranked by
+    :func:`virtual_pulls` of the sessions running then (those chosen before it included).
+
+    An arm is eligible when it is live, not paused (a GPU-free session of it runs: research,
+    a dossier), below ``max_sessions`` and its role's cap (``role_max``, default
+    :func:`role_caps`), its agent name not running, with
+    ``time_left`` for a slice (:func:`slice_seconds`; None: no time limit) and ``ok`` (the
+    coordinator's own conditions). A held native arm (:attr:`Arm.held`) takes a slot only
+    when no other arm can. ``evaluations``: a session's expected evaluations by arm kind
+    (default 4)."""
+    caps = role_caps() if role_max is None else role_max
+    per = evaluations or {}
+    chosen: list[Arm] = []
+    busy = list(running)
+    for _ in range(slots):
+        ranked = [
+            a
+            for a in virtual_pulls(arms, busy, policy)
+            if _eligible(a, busy, caps, time_left) and (ok is None or ok(a))
+        ]
+        arm = next((a for a in ranked if a.held is None), ranked[0] if ranked else None)
+        if arm is None:
+            break
+        chosen.append(arm)
+        busy.append(Running(arm.id, arm.kind, arm.agent, per.get(arm.kind, 4)))
+    return chosen
 
 
 # ------------------------------------------------------------------ time

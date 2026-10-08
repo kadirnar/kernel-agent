@@ -155,7 +155,7 @@ def test_research_session_may_propose_a_pivot_in_near_lossless_runs(tmp_path):
 def test_research_evidence_lists_passing_transforms(tmp_path):
     orch, world = make(tmp_path, seed=1)
     with world.installed():
-        world._systems()  # simulated transform evaluations
+        asyncio.run(world._systems())  # simulated transform evaluations
     text = research.transforms_section(orch.run)
     assert "## End-to-end transforms" in text and "| exp | speedup | transforms |" in text
     assert research.transforms_section(make(tmp_path / "none")[0].run) == ""

@@ -29,24 +29,41 @@ Every draw is seeded by (seed, arm, evaluation index), so a dry run is
 reproducible and a restarted one continues like the original. Time is
 simulated as well (``ledger.clock``, :class:`SimBudget`), so the charts show
 hours of work and ``--max-hours`` stops the loop in simulated hours.
+
+With ``--agents N`` (N > 1, ``coordinator.py``) the simulation runs in virtual time
+(:class:`VirtualClock`, docs/MULTIAGENT.md §3.9): the event loop's clock is simulated and
+jumps to the next timer when nothing can run, the simulated sessions are concurrent
+coroutines that ``await`` their think time, and every evaluation, A/B step, capture and
+re-profile holds the GPU through the real GPU job queue (``gpuqueue.holding``) for its
+simulated seconds. Sessions then overlap as real ones would, and the run is still
+reproducible. :attr:`World.limit` simulates an account-wide usage limit (the rate gate),
+and :attr:`World.writes` records which session wrote which file (ownership).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
+import concurrent.futures
 import dataclasses
+import functools
+import math
 import random
 import re
 import statistics
+import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import ledger, pivot, program, truth, workers
+from claude_agent_sdk import AssistantMessage, TextBlock
+
+from kernel_agent import gpuqueue, interrupt, ledger, pivot, program, truth, workers
+from kernel_agent.agent import auth, runner
 from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import SessionBinding, record_candidate, record_e2e_result, snapshot
 from kernel_agent.budget import Budget
@@ -64,6 +81,7 @@ BASELINE_MS = 1532.4
 HOOK_OVERHEAD = 2086.0 / BASELINE_MS  # profiled (hooked) time / real time
 GPU_BUSY = 0.453
 KERNEL_EFFICIENCY = 0.9  # share of a module's saving that shows up end to end
+FIRST_MESSAGE_S = 12.0  # a simulated session's first streamed message (virtual time)
 
 HEADERS = {
     "triton": "import torch\nimport triton\nimport triton.language as tl\n",
@@ -239,9 +257,194 @@ class SimClock:
         return self.t
 
 
+class VirtualClock(SimClock):
+    """Simulated time of an asyncio event loop (``--dry-run --agents N``, §3.9).
+
+    While :meth:`driving` the running loop, the loop's ``time()`` is :meth:`time` and, when
+    nothing can run, the loop jumps to its next timer instead of waiting: ``asyncio.sleep``,
+    session timeouts, the rate gate and the GPU queue's waits (``gpuqueue.clock``) all take
+    simulated seconds. Work the loop hands to threads (``asyncio.to_thread``: the
+    integration, captures, re-profiles) runs while the loop is idle, one thread at a time (a
+    baton), and the clock stands still while one runs, so a simulation is deterministic. A
+    thread's simulated GPU job is a coroutine of the loop (:meth:`run_in_loop`) that the
+    thread waits for without the baton. :meth:`now` (``ledger.clock``) starts at a whole
+    second, so every run rounds the same way."""
+
+    def __init__(self, start: float) -> None:
+        super().__init__(float(math.floor(start)))
+        self.elapsed = 0.0  # simulated seconds since the start
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._thread: int | None = None  # the loop's
+        self._cond = threading.Condition()
+        self._queue: collections.deque[object] = collections.deque()  # threads waiting to run
+        self._holder: object | None = None  # the thread that runs now (None: the loop)
+        self._closed = False
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def now(self) -> float:
+        return self.t0 + self.elapsed
+
+    def time(self) -> float:
+        """The loop's clock (and the GPU queue's, the session deadlines')."""
+        return self.elapsed
+
+    def advance(self, seconds: float) -> float:
+        """From a worker thread: wait ``seconds`` of simulated time."""
+        self.run_in_loop(asyncio.sleep(seconds))
+        return self.now()
+
+    @contextmanager
+    def driving(self) -> Iterator[VirtualClock]:
+        """Drive the running event loop with this clock until the block ends (its timers
+        keep their delays)."""
+        loop = asyncio.get_running_loop()
+        selector = loop._selector  # type: ignore[attr-defined]
+        real_select, executor = selector.select, loop._default_executor  # type: ignore[attr-defined]
+        shift = self.elapsed - loop.time()
+        for handle in loop._scheduled:  # type: ignore[attr-defined]
+            handle._when += shift
+        self.loop, self._thread, self._closed = loop, threading.get_ident(), False
+        setattr(loop, "time", self.time)  # noqa: B010 - an instance attribute shadows it
+        setattr(selector, "select", functools.partial(self._select, real_select))  # noqa: B010
+        loop.set_default_executor(_BatonExecutor(self))
+        try:
+            yield self
+        finally:
+            delattr(loop, "time")
+            delattr(selector, "select")
+            loop._default_executor = executor  # type: ignore[attr-defined]
+            shift = loop.time() - self.elapsed
+            for handle in loop._scheduled:  # type: ignore[attr-defined]
+                handle._when += shift
+            with self._cond:
+                self._closed = True
+                self._cond.notify_all()
+            self.loop = None
+
+    def _select(self, real: Callable[[float | None], list[Any]], timeout: float | None) -> Any:
+        """The loop's ``select``: events first; when the loop is idle, a waiting thread runs
+        alone, else simulated time jumps to the next timer."""
+        if timeout == 0:
+            return real(0)
+        assert self.loop is not None
+        while True:
+            if events := real(0):  # the threads' results, signals
+                return events
+            with self._cond:
+                if self._queue:
+                    token = self._queue.popleft()
+                    self._holder = token
+                    self._cond.notify_all()
+                    while self._holder is token and not self._closed:
+                        self._cond.wait()
+                    continue
+            scheduled = self.loop._scheduled  # type: ignore[attr-defined]
+            if scheduled:
+                self.elapsed = max(self.elapsed, scheduled[0]._when)
+                return []
+            return real(1.0)  # nothing simulated waits: only an outside event (a signal)
+
+    def _enqueue(self, token: object) -> None:
+        with self._cond:
+            self._queue.append(token)
+
+    def _acquire(self, token: object) -> None:
+        """A thread waits for the baton (``Interrupted`` once the loop stopped driving)."""
+        with self._cond:
+            while self._holder is not token:
+                if self._closed:
+                    raise interrupt.Interrupted
+                self._cond.wait(0.5)
+
+    def _release(self) -> None:
+        with self._cond:
+            self._holder = None
+            self._cond.notify_all()
+
+    def run_in_loop[T](self, coro: Coroutine[Any, Any, T]) -> T:
+        """Run ``coro`` on the loop from a worker thread that holds the baton, and wait for
+        it there without the baton (the loop and the other threads go on meanwhile)."""
+        loop = self.loop
+        if loop is None or threading.get_ident() == self._thread:
+            coro.close()
+            raise RuntimeError("VirtualClock.run_in_loop: only from a worker thread")
+        done: concurrent.futures.Future[T] = concurrent.futures.Future()
+        token = object()
+
+        async def body() -> None:
+            try:
+                result = await coro
+            except BaseException as exc:
+                self._enqueue(token)  # before the thread wakes: the loop must wait for it
+                done.set_exception(exc)
+                if not isinstance(exc, Exception):
+                    raise
+            else:
+                self._enqueue(token)
+                done.set_result(result)
+
+        def start() -> None:
+            task = loop.create_task(body())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+        loop.call_soon_threadsafe(start)
+        self._release()
+        try:
+            while True:
+                try:
+                    return done.result(timeout=0.5)
+                except concurrent.futures.TimeoutError:
+                    if self._closed:
+                        raise interrupt.Interrupted from None
+        finally:
+            self._acquire(token)
+
+
+class _BatonExecutor(concurrent.futures.ThreadPoolExecutor):
+    """The default executor of a loop a :class:`VirtualClock` drives: every call runs in its
+    own thread once it holds the clock's baton (queued in the order of the calls)."""
+
+    def __init__(self, clock: VirtualClock) -> None:
+        super().__init__(max_workers=1)
+        self.clock = clock
+
+    def submit[T](
+        self, fn: Callable[..., T], /, *args: Any, **kwargs: Any
+    ) -> concurrent.futures.Future[T]:
+        future: concurrent.futures.Future[T] = concurrent.futures.Future()
+        token = object()
+        self.clock._enqueue(token)  # now, in the loop's thread: before the loop can idle
+
+        def body() -> None:
+            try:
+                self.clock._acquire(token)
+            except BaseException as exc:
+                future.set_exception(exc)
+                return
+            try:
+                if future.set_running_or_notify_cancel():
+                    try:
+                        result = fn(*args, **kwargs)
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    else:
+                        future.set_result(result)
+            finally:
+                self.clock._release()  # after its result is on its way to the loop
+
+        threading.Thread(target=body, name="dry-run-thread", daemon=True).start()
+        return future
+
+
+class _Limited(Exception):
+    """A simulated session reached the simulated usage limit (:attr:`World.limit`)."""
+
+
 @dataclass
 class SimBudget(Budget):
-    """A :class:`Budget` whose time is the simulated clock's."""
+    """A :class:`Budget` whose time is the simulated clock's (and in virtual time, whose
+    session deadlines are too)."""
 
     clock: SimClock | None = None
 
@@ -403,31 +606,72 @@ def create_run(cfg: OptimizeConfig, seed: int = 0) -> RunDir:
 
 
 class World:
-    """Simulated agents and worker for one run; :meth:`installed` plugs them into ``orch``."""
+    """Simulated agents and worker for one run; :meth:`installed` plugs them into ``orch``.
+    ``virtual``: concurrent sessions in virtual time (``--agents N``, :class:`VirtualClock`;
+    the caller also enters :meth:`driving` inside the event loop)."""
 
-    def __init__(self, orch: Orchestrator, hook: Callable[[str, int], None] | None = None) -> None:
+    def __init__(
+        self,
+        orch: Orchestrator,
+        hook: Callable[[str, int], None] | None = None,
+        *,
+        virtual: bool = False,
+    ) -> None:
         self.orch = orch
         self.run = orch.run
         self.seed = int((self.run.load().get("dry_run") or {}).get("seed", 0))
         last = [float(e["ts"]) for e in ledger.events(self.run) if "ts" in e]
-        self.clock = SimClock(max(last, default=time.time()) + 30)
+        start = max(last, default=time.time()) + 30
+        self.virtual = virtual
+        self.clock: SimClock = VirtualClock(start) if virtual else SimClock(start)
         self.hook = hook  # called after every simulated evaluation: (agent, evals so far)
         self.sessions: list[dict[str, Any]] = []
         profile = read_json(self.run.profile_dir / "profile.json", {}) or {}
         self.shares = class_shares(profile)
+        # virtual time: a usage limit of the account, (seconds after the start, seconds until
+        # it resets); every session that thinks inside it stops at it (the rate gate)
+        self.limit: tuple[float, float] | None = None
+        # virtual time: what each session wrote (label, file), its span and write policy
+        self.writes: list[tuple[str, Path]] = []
+        self.spans: dict[str, tuple[float, float]] = {}
+        self.policies: dict[str, tuple[list[Path], list[Path]]] = {}
 
     @contextmanager
     def installed(self) -> Iterator[World]:
         orch = self.orch
-        saved = (orch.agent_runner, orch.worker, orch.budget, orch.tc, ledger.clock)
+        saved = (orch.agent_runner, orch.worker, orch.budget, orch.tc, ledger.clock, orch.clock)
+        saved_queue = gpuqueue.clock
         orch.agent_runner, orch.worker = self.run_agent, self.worker
         orch.budget = SimBudget.of(orch.budget, self.clock)
         orch.tc = SimToolchain()  # type: ignore[assignment]
         ledger.clock = self.clock.now
+        if isinstance(self.clock, VirtualClock):  # every clock of the run is the simulated one
+            orch.clock = self.clock.now  # the usage-limit waits
+            orch.budget.monotonic = self.clock.time  # the session deadlines
+            gpuqueue.clock = self.clock.time  # the GPU queue's waits and holds
         try:
             yield self
         finally:
-            orch.agent_runner, orch.worker, orch.budget, orch.tc, ledger.clock = saved
+            orch.agent_runner, orch.worker, orch.budget, orch.tc, ledger.clock, orch.clock = saved
+            gpuqueue.clock = saved_queue
+
+    @contextmanager
+    def driving(self) -> Iterator[World]:
+        """Inside the event loop: drive it in virtual time (:class:`VirtualClock`) with a GPU
+        job queue of its own (no job of an earlier run in this process ahead of it)."""
+        assert isinstance(self.clock, VirtualClock), "World(virtual=True) drives a loop"
+        with gpuqueue._gates_lock:
+            saved = gpuqueue._gates.get("gpu")
+            gpuqueue._gates["gpu"] = gpuqueue.Gate()
+        try:
+            with self.clock.driving():
+                yield self
+        finally:
+            with gpuqueue._gates_lock:
+                if saved is None:
+                    gpuqueue._gates.pop("gpu", None)
+                else:
+                    gpuqueue._gates["gpu"] = saved
 
     def ref_ms(self, cls: str | None) -> float:
         share, _ = self.shares.get(str(cls), (0.0, 1))
@@ -441,6 +685,63 @@ class World:
 
         return allows_reduced(self.orch.cfg.quality)
 
+    # -------------------------------------------------------- time
+
+    async def _think(self, seconds: float) -> None:
+        """A session works for ``seconds`` (virtual time: other sessions run meanwhile; a
+        usage limit reached meanwhile stops it, :attr:`limit`)."""
+        if not self.virtual:
+            self.clock.advance(seconds)
+            return
+        await asyncio.sleep(seconds)
+        if self.limit is not None:
+            at, lasts = self.limit
+            if at <= self.clock.now() - self.clock.t0 < at + lasts:
+                raise _Limited
+
+    async def _read(self, seconds: float) -> None:
+        """A session reads its digest and files; in virtual time its first message streams
+        (``runner.heard``: the coordinator's staggered starts) after :data:`FIRST_MESSAGE_S`."""
+        if self.virtual:
+            await asyncio.sleep(min(FIRST_MESSAGE_S, seconds))
+            runner.heard(AssistantMessage(content=[TextBlock("reading")], model="dry-run"))
+            seconds = max(seconds - FIRST_MESSAGE_S, 0.0)
+        await self._think(seconds)
+
+    async def _evaluate(self, kind: str, seconds: float, target: str | None = None) -> float | None:
+        """The GPU job of a simulated evaluation (``eval``, ``e2e``): in virtual time it goes
+        through the GPU queue as the session's job and holds the GPU for ``seconds`` (its
+        ``eval_s``); returns its wait (``queue_s``). Without virtual time it takes no time."""
+        if not self.virtual:
+            return None
+        job = gpuqueue.Job.of(self.run, kind, target)
+        await self._held(job, seconds)
+        return job.queue_s
+
+    @staticmethod
+    async def _held(job: gpuqueue.Job, seconds: float) -> None:
+        async with gpuqueue.holding(job):
+            await asyncio.sleep(seconds)
+
+    def _hold(self, seconds: float) -> None:
+        """The GPU time of a simulated worker job (an A/B step, a capture, a re-profile; from
+        a worker thread): in virtual time the job ``Orchestrator._worker`` tagged holds the
+        GPU through the queue for ``seconds``; else the clock advances."""
+        if not isinstance(self.clock, VirtualClock):
+            self.clock.advance(seconds)
+            return
+        job = gpuqueue.current() or gpuqueue.Job.of(self.run, "capture")
+        self.clock.run_in_loop(self._held(job, seconds))
+
+    def _write(self, bound: SessionBinding | None, path: Path, text: str) -> None:
+        """A session writes ``path`` (recorded in virtual time: ownership checks)."""
+        path.write_text(text)
+        self._wrote(bound, path)
+
+    def _wrote(self, bound: SessionBinding | None, path: Path) -> None:
+        if self.virtual and bound is not None:
+            self.writes.append((bound.label, path))
+
     # -------------------------------------------------------- agents
 
     async def run_agent(
@@ -452,43 +753,64 @@ class World:
         cwd: Path,
         result: AgentResult | None = None,
         writable: list[Path] | None = None,
+        cfg: OptimizeConfig | None = None,
+        resume: str | None = None,
+        roots: list[Path] | None = None,
+        excluded: list[Path] | None = None,
         **_: Any,
     ) -> AgentResult:
         result = result or AgentResult(name=name)
+        result.is_error, result.usage_limit = False, None  # a resumed one: as runner.run_agent
         self.sessions.append({"name": name, "prompt": prompt, "system": system_append})
-        result.session_id = f"dry-{name}-{len(self.sessions)}"
+        result.session_id = resume or f"dry-{name}-{len(self.sessions)}"
         start = self.clock.now()
         rng = _rng(self.seed, "session", name, len(ledger.rows(self.run)))
-        self.clock.advance(rng.uniform(40, 90))  # reading the digest and the files
         # what the session's tools are bound to (Orchestrator._agent): its evaluation budget
         # and the label its rows carry
         bound = self.orch.bindings.get(name)
+        if self.virtual and bound is not None and roots is not None:
+            self.policies[bound.label] = (list(roots), list(excluded or []))
         evals = 0
-        if name == "planner":
-            result.structured = self._plan(Path(cwd))
-            result.cost_usd = 0.4
-        elif name == "systems":
-            evals = self._systems(bound)
-            result.cost_usd = 0.3 + 0.5 * evals * rng.uniform(0.8, 1.2)
-        elif name == "native":
-            evals = self._native(bound)
-            result.cost_usd = 0.8 + 1.2 * evals * rng.uniform(0.8, 1.2)
-        elif name.startswith("kernel-"):
-            target_id, worker = workers.parse_agent(name)
-            brief = f"{system_append}\n{prompt}"  # the digest: in the first message (#181)
-            evals = self._kernel(target_id, brief, worker=worker, bound=bound)
-            result.cost_usd = 0.25 + 0.35 * evals * rng.uniform(0.8, 1.2)
-        elif name.startswith("research-"):
-            self._research(name.removeprefix("research-"), writable or [])
-            self.clock.advance(rng.uniform(240, 480))
-            result.cost_usd = 0.6 * rng.uniform(0.8, 1.2)
-        elif name.startswith("dossier-"):  # no web in a dry run: a dossier from the spec
-            self._dossier(name.removeprefix("dossier-"), writable or [])
-            result.cost_usd = 0.15 * rng.uniform(0.8, 1.2)
+        try:
+            await self._read(rng.uniform(40, 90))  # reading the digest and the files
+            if name == "planner":
+                result.structured = await self._plan(Path(cwd))
+                result.cost_usd = 0.4
+            elif name == "systems":
+                evals = await self._systems(bound)
+                result.cost_usd = 0.3 + 0.5 * evals * rng.uniform(0.8, 1.2)
+            elif name == "native":
+                evals = await self._native(bound)
+                result.cost_usd = 0.8 + 1.2 * evals * rng.uniform(0.8, 1.2)
+            elif name.startswith("kernel-"):
+                target_id, worker = workers.parse_agent(name)
+                brief = f"{system_append}\n{prompt}"  # the digest: in the first message (#181)
+                evals = await self._kernel(target_id, brief, worker=worker, bound=bound)
+                result.cost_usd = 0.25 + 0.35 * evals * rng.uniform(0.8, 1.2)
+            elif name.startswith("research-"):
+                self._research(name.removeprefix("research-"), writable or [], bound)
+                await self._think(rng.uniform(240, 480))
+                result.cost_usd = 0.6 * rng.uniform(0.8, 1.2)
+            elif name.startswith("dossier-"):  # no web in a dry run: a dossier from the spec
+                self._dossier(name.removeprefix("dossier-"), writable or [], bound)
+                result.cost_usd = 0.15 * rng.uniform(0.8, 1.2)
+        except _Limited:  # stopped at the simulated usage limit: resumed after it resets
+            assert self.limit is not None
+            evals = self.orch.budget.evals.get(name, 0)
+            result.cost_usd = 0.25 + 0.35 * evals
+            resets = self.clock.t0 + sum(self.limit)
+            message = "You've hit your limit (simulated)"
+            result.usage_limit = auth.UsageLimit(message, resets_at=resets, kind="five_hour")
+            result.is_error = True
+        if self.virtual and cfg is not None and cfg.budget_usd_per_agent is not None:
+            result.cost_usd = min(result.cost_usd, cfg.budget_usd_per_agent)  # max_budget_usd
         result.tool_calls = {"evaluate": evals} if evals else {}
         result.turns = 4 + 5 * evals
         result.seconds = self.clock.now() - start
         result.text = f"simulated session: {evals} evaluations"
+        if self.virtual and bound is not None:
+            first = self.spans.get(bound.label, (start, start))[0]
+            self.spans[bound.label] = (first, self.clock.now())
         await asyncio.sleep(0)
         return result
 
@@ -499,17 +821,18 @@ class World:
         evals: int | None,
         rng: random.Random,
         pct_of_sol: float | None = None,
+        label: str | None = None,
     ) -> bool:
         """Whether the simulated agent stops after this evaluation (it follows the advice)."""
         budget = self.orch.budget
         ok_key = "passed" if agent in ("systems", "native") else "correct"
         feedback = budget.feedback(agent, results, evals, ok_key=ok_key, pct_of_sol=pct_of_sol)
         advice = feedback["advice"]
-        if advice == "stop" or budget.exhausted():
+        if advice == "stop" or budget.exhausted(label):
             return True
         return advice == "consider_stopping" and rng.random() < 0.5
 
-    def _kernel(
+    async def _kernel(
         self,
         target_id: str,
         system: str = "",
@@ -538,15 +861,19 @@ class World:
             idea, hypothesis = _next_idea(sim, rows, plan)
             expected = best * _rng(self.seed, "expect", target_id, k).uniform(1.05, 1.4)
             outcome = self._kernel_outcome(sim, best, rng)
-            self.clock.advance(rng.uniform(150, 330))
+            await self._think(rng.uniform(150, 330))
             src = home / "candidates" / f"{backend}_v{k + 1}.py"
             header = HEADERS.get(backend, "import torch\n")
-            src.write_text(
-                f'{header}\n"""{hypothesis}"""\n\n\ndef build(reference):\n    return reference\n'
+            self._write(
+                bound,
+                src,
+                f'{header}\n"""{hypothesis}"""\n\n\ndef build(reference):\n    return reference\n',
             )
             snap = snapshot(self.run, src, target_id)
             result = kernel_result(outcome, ref_ms, instances, sim)
             result["tolerance_tier"] = tier_of(spec.get("capture"))  # as the evaluator's
+            eval_s = round(rng.uniform(25, 70), 1)
+            queue_s = await self._evaluate("eval", eval_s, target_id)
             _, row = record_candidate(
                 self.run,
                 target_id,
@@ -555,19 +882,24 @@ class World:
                 result,
                 hypothesis=hypothesis,
                 parent=f"history/{kept[-1]['snapshot']}" if kept else None,
-                eval_s=round(rng.uniform(25, 70), 1),
+                eval_s=eval_s,
                 when=self.clock.now(),
                 idea=idea,
                 expected_speedup=round(expected, 2),
                 worker=worker,
+                queue_s=queue_s,
                 session=bound.label or None,
             )
             used += 1
             _note(home / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
+            self._wrote(bound, home / "NOTES.md")
             if self.hook:
                 self.hook(agent, used)
             results = self.run.results_file(target_id)
-            if self._advice(agent, results, bound.evaluations, rng, sol_signal(result)):
+            stop = self._advice(
+                agent, results, bound.evaluations, rng, sol_signal(result), bound.label
+            )
+            if stop:
                 return used
 
     @staticmethod
@@ -580,7 +912,7 @@ class World:
             return best + gap * rng.uniform(0.2, 0.6)
         return best * rng.uniform(0.84, 1.006)
 
-    def _systems(self, bound: SessionBinding | None = None) -> int:
+    async def _systems(self, bound: SessionBinding | None = None) -> int:
         bound = bound or SessionBinding(evaluations=self.orch.cfg.transform_evaluations)
         used = 0
         while True:
@@ -596,9 +928,9 @@ class World:
                 j = k - len(SYSTEM_IDEAS)
                 stem, hypothesis = f"tweak_{j + 1}", SYSTEM_TWEAKS[j % len(SYSTEM_TWEAKS)]
                 outcome = best * rng.uniform(0.93, 1.008)
-            self.clock.advance(rng.uniform(240, 420))
+            await self._think(rng.uniform(240, 420))
             src = self.run.transforms_dir / f"{stem}.py"
-            src.write_text(f'"""{hypothesis}"""\n\n\ndef apply(workload):\n    pass\n')
+            self._write(bound, src, f'"""{hypothesis}"""\n\n\ndef apply(workload):\n    pass\n')
             snap = snapshot(self.run, src)
             if isinstance(outcome, str):
                 result: dict[str, Any] = {
@@ -609,25 +941,29 @@ class World:
             else:
                 ms = BASELINE_MS / (outcome * rng.uniform(0.996, 1.004))
                 result = _e2e_result(ms, gated=self.gated)
+            eval_s = round(rng.uniform(60, 110), 1)
+            queue_s = await self._evaluate("e2e", eval_s)
             _, row = record_e2e_result(
                 self.run,
                 result,
                 [snap],
                 [],
                 hypothesis=hypothesis,
-                eval_s=round(rng.uniform(60, 110), 1),
+                eval_s=eval_s,
                 when=self.clock.now(),
+                queue_s=queue_s,
                 session=bound.label or None,
             )
             used += 1
             _note(self.run.transforms_dir / "NOTES.md", row, SYSTEM_TWEAKS[k % 3 :][:2])
+            self._wrote(bound, self.run.transforms_dir / "NOTES.md")
             if self.hook:
                 self.hook("systems", used)
             results = self.run.results_file()
-            if self._advice("systems", results, bound.evaluations, rng):
+            if self._advice("systems", results, bound.evaluations, rng, label=bound.label):
                 return used
 
-    def _native(self, bound: SessionBinding | None = None) -> int:
+    async def _native(self, bound: SessionBinding | None = None) -> int:
         """A simulated systems-native session: per evaluation a multi-file project of the
         current stage (once the plan is done: its focus; ``loop`` without either),
         snapshotted as its bundle like a real one, measured end to end around the
@@ -641,39 +977,48 @@ class World:
             level = native_engine.bar(rows)
             stage = native_engine.status(self.run, rows).stage
             name = stage.id if stage is not None else "loop"
-            self.clock.advance(rng.uniform(600, 1200))  # writing and compiling a project
+            await self._think(rng.uniform(600, 1200))  # writing and compiling a project
             project = native_engine.native_dir(self.run) / name
             (project / "csrc").mkdir(parents=True, exist_ok=True)
-            (project / "kernel_project.toml").write_text(
+            self._write(
+                bound,
+                project / "kernel_project.toml",
                 f'[project]\nname = "{name}"\nkind = "transform"\n\n'
-                '[build]\nsources = ["csrc/*.cu"]\n'
+                '[build]\nsources = ["csrc/*.cu"]\n',
             )
             hypothesis = f"native engine of {name}, attempt {k + 1}"
-            (project / "candidate.py").write_text(
-                f'"""{hypothesis}"""\n\n\ndef apply(workload):\n    pass\n'
+            self._write(
+                bound,
+                project / "candidate.py",
+                f'"""{hypothesis}"""\n\n\ndef apply(workload):\n    pass\n',
             )
-            (project / "csrc" / "engine.cu").write_text(f"// {hypothesis}\n")
+            self._write(bound, project / "csrc" / "engine.cu", f"// {hypothesis}\n")
             snap = snapshot(self.run, project)
             outcome = level * rng.uniform(0.96, 1.1)
             result = _e2e_result(BASELINE_MS / outcome, gated=self.gated)
+            eval_s = round(rng.uniform(200, 400), 1)
+            queue_s = await self._evaluate("e2e", eval_s)
             record_e2e_result(
                 self.run,
                 result,
                 [snap],
                 [],
                 hypothesis=hypothesis,
-                eval_s=round(rng.uniform(200, 400), 1),
+                eval_s=eval_s,
                 when=self.clock.now(),
+                queue_s=queue_s,
                 session=bound.label or None,
             )
             used += 1
             if self.hook:
                 self.hook("native", used)
             results = self.run.results_file()
-            if self._advice("native", results, bound.evaluations, rng):
+            if self._advice("native", results, bound.evaluations, rng, label=bound.label):
                 return used
 
-    def _research(self, target_id: str, writable: list[Path]) -> None:
+    def _research(
+        self, target_id: str, writable: list[Path], bound: SessionBinding | None = None
+    ) -> None:
         """A research session: ``plan.md`` from the target's ledger rows, if it may write it."""
         plan = self.run.target(target_id) / PLAN_FILE
         if plan.resolve() not in {p.resolve() for p in writable}:
@@ -681,7 +1026,7 @@ class World:
         spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
         rows = [r for r in ledger.rows(self.run) if r["target"] == target_id]
         sim = sim_target(spec)
-        plan.write_text(_plan_md(target_id, sim, rows))
+        self._write(bound, plan, _plan_md(target_id, sim, rows))
         proposal = pivot.proposal_path(self.run, target_id)
         allowed = proposal.resolve() in {p.resolve() for p in writable}
         if allowed and sim.pivot and not spec.get("precision") and not proposal.exists():
@@ -691,20 +1036,25 @@ class World:
                 f"best {best:.2f}x of a {sim.ceiling:.1f}x ceiling at bf16; FP8 halves the bytes"
             )
             write_json(proposal, {"precision": sim.pivot, "precision_why": why})
+            self._wrote(bound, proposal)
 
-    def _dossier(self, target_id: str, writable: list[Path]) -> None:
+    def _dossier(
+        self, target_id: str, writable: list[Path], bound: SessionBinding | None = None
+    ) -> None:
         """A dossier session: ``research.md`` from the target's spec, if it may write it."""
         path = self.run.target(target_id) / "research.md"
         if path.resolve() not in {p.resolve() for p in writable}:
             return
         sim = sim_target(read_json(self.run.target(target_id) / "spec.json", {}) or {})
-        path.write_text(
+        self._write(
+            bound,
+            path,
             f"# Dossier: `{target_id}`\n\n## Findings\n"
             f"* {sim.cls}: fuse the module into one kernel (simulated, no lookup)\n\n"
-            f"## Ideas\n1. `{target_id}_fused`: one launch per call\n"
+            f"## Ideas\n1. `{target_id}_fused`: one launch per call\n",
         )
 
-    def _plan(self, cwd: Path) -> dict[str, Any]:
+    async def _plan(self, cwd: Path) -> dict[str, Any]:
         profile = read_json(cwd / "profile" / "profile.json", {}) or {}
         present = {c["cls"] for c in profile.get("classes", [])}
         taken = {
@@ -714,7 +1064,7 @@ class World:
         targets = [
             _target_spec(sim) for sim in TARGETS if sim.cls in present and sim.cls not in taken
         ]
-        self.clock.advance(120)
+        await self._think(120)
         return {
             "analysis": "Re-profile: attention, MLP and norms are fast now; RoPE is next.",
             "targets": targets,
@@ -792,7 +1142,7 @@ class World:
         ms, _, _, reason = self._model(kernels, transforms)
         key = "+".join(sorted(ledger.item_label(i) for i in [*kernels, *transforms]))
         rng = _rng(self.seed, "e2e", key, len(ledger.rows(self.run)))
-        self.clock.advance(rng.uniform(65, 95))
+        self._hold(rng.uniform(65, 95))
         result = _e2e_result(ms * rng.uniform(0.997, 1.003), gated=self.gated)
         if reason:
             result.update(passed=False, reason=reason, metrics={"token_match": 0.32})
@@ -806,7 +1156,7 @@ class World:
         b_ms, _, _, reason = self._model(*b)
         key = "+".join(sorted(ledger.item_label(i) for i in [*b[0], *b[1]]))
         rng = _rng(self.seed, "e2e_ab", key, len(ledger.rows(self.run)))
-        self.clock.advance(rng.uniform(150, 210))
+        self._hold(rng.uniform(150, 210))
         times: tuple[list[float], list[float]] = ([], [])
         for _ in range(rounds):
             drift = rng.uniform(0.99, 1.01)
@@ -824,7 +1174,7 @@ class World:
         ms, speedups, families, reason = self._model(kernels, transforms)
         if reason:
             return {"status": "error", "error": f"the optimised model fails: {reason}"}
-        self.clock.advance(300)
+        self._hold(300)
         replaced = {
             (read_json(self.run.target(t) / "spec.json", {}) or {}).get("module_class")
             for t in speedups
@@ -859,7 +1209,7 @@ class World:
         if tier != EXACT_TIER:  # as worker capture: the tier and precision of the target
             info.update(tier=tier, precision=spec["precision"])
         _write_target(self.run, {**spec, "capture": info})
-        self.clock.advance(45)
+        self._hold(45)
         return info
 
 

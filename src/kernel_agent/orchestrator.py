@@ -124,6 +124,9 @@ class Orchestrator:
         # disagrees with its record (recheck.speed_warning): what ranks and projects it.
         self.speed_caps: dict[tuple[str, str], float] = {}
         self.simulated = "dry_run" in run.load()
+        # Concurrent sessions (improve --agents N, coordinator.py): every engineer session may
+        # write only in its own directory (:meth:`_owned`, docs/MULTIAGENT.md §3.6).
+        self.ownership = False
 
     # ------------------------------------------------------------ creation
 
@@ -274,11 +277,14 @@ class Orchestrator:
                 job_class = gpuqueue.EVAL
         return gpuqueue.tagged(kind, self.run, job_class=job_class)
 
-    def _session_config(self, role: str | None, config: dict[str, Any] | None) -> OptimizeConfig:
+    def _session_config(
+        self, role: str | None, config: dict[str, Any] | None, label: str | None = None
+    ) -> OptimizeConfig:
         """The config of one session of ``role``: the run's with ``config`` and the role's
-        model, effort and turns (``roles.session_config``), its USD capped (``Budget``)."""
+        model, effort and turns (``roles.session_config``), its USD capped (``Budget``; with
+        concurrent sessions, minus what the others reserved: ``label`` is the session's)."""
         cfg = dataclasses.replace(self.cfg, **(config or {}))
-        return self.budget.agent_config(roles.session_config(role, cfg))
+        return self.budget.agent_config(roles.session_config(role, cfg), label)
 
     async def _agent(
         self,
@@ -313,8 +319,8 @@ class Orchestrator:
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
         ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)
         result = AgentResult(name=name)
-        timeout = self.budget.start_agent(name)
-        cfg = self._session_config(role, config)
+        timeout = self.budget.start_agent(name, label=label or name)
+        cfg = self._session_config(role, config, label or name)
         kwargs.setdefault("mcp_tools", roles.mcp_tools(role))  # the role's tools (roles.py)
         if spec.builtin_tools is not None:
             kwargs.setdefault("tools", list(spec.builtin_tools))
@@ -372,11 +378,13 @@ class Orchestrator:
             if not await self._wait_for_limit(name, result, waits):
                 break
             waits += 1
-            timeout = self.budget.start_agent(name, worked_s=result.seconds)
-            cfg = self._session_config(role, config)
+            timeout = self.budget.start_agent(name, worked_s=result.seconds, label=label or name)
+            cfg = self._session_config(role, config, label or name)
             if result.session_id:  # continue it (else the same prompt in a new session)
                 kwargs.update(prompt=auth.RESUME_PROMPT, resume=result.session_id)
         self.agent_results.append(result)
+        if self.budget.gate is not None and result.usage_limit is None:
+            self.budget.gate.progress()  # past the limit: the next one is a first wait again
         ledger.event(
             self.run,
             "agent_done",
@@ -421,6 +429,8 @@ class Orchestrator:
         so no further agent starts and integrate + report run on what exists."""
         limit = result.usage_limit
         assert limit is not None
+        if self.budget.gate is not None:  # concurrent sessions: one wait for all of them
+            return await self._wait_on_gate(name, result)
         wait = auth.wait_seconds(limit, waits, self.clock())
         left = self.budget.agent_seconds_left()
         resume_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.clock() + wait))
@@ -439,6 +449,43 @@ class Orchestrator:
         log(f"agent {name}: {self.budget.blocked}; no further agent starts")
         self.budget.note(self.phase, "usage_limit_stop", {**item, "reason": self.budget.blocked})
         return False
+
+    async def _wait_on_gate(self, name: str, result: AgentResult) -> bool:
+        """:meth:`_wait_for_limit` with concurrent sessions (``coordinator.RateGate``): a usage
+        limit is the account's, so the first session stopped at it closes the shared gate
+        until it resets (no session starts meanwhile) and every session stopped at it waits
+        on the gate and is resumed when it opens. One wait for all of them: its back-off and
+        ``auth.MAX_LIMIT_WAITS`` count closings in a row, not each session's waits."""
+        gate, limit = self.budget.gate, result.usage_limit
+        assert gate is not None and limit is not None
+        item = {"agent": name, "session_id": result.session_id, **limit.to_dict()}
+        if (closed := gate.closed()) is None:  # the first session at this limit
+            wait = auth.wait_seconds(limit, gate.waits, self.clock())
+            left = self.budget.agent_seconds_left()
+            resume_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.clock() + wait))
+            item.update(wait_min=round(wait / 60, 1), resume_at=resume_at, shared=True)
+            why = None
+            if gate.waits >= auth.MAX_LIMIT_WAITS:
+                why = f"still limited after {gate.waits} waits"
+            elif left is not None and wait > left - MIN_AGENT_SECONDS:
+                why = f"it resets at {resume_at}, after the time budget ends"
+            if why is not None:
+                self.budget.blocked = f"usage limit: {why}"
+                log(f"agent {name}: {self.budget.blocked}; no further agent starts")
+                note = {**item, "reason": self.budget.blocked}
+                self.budget.note(self.phase, "usage_limit_stop", note)
+                return False
+            gate.close(wait, limit.message)
+            log(
+                f"agent {name}: usage limit ({limit.message[:120]}); no session starts until "
+                f"{resume_at}, and every session stopped at it resumes then"
+            )
+            self.budget.note(self.phase, "usage_limit", item)
+        else:  # a limit that resets later (another window) keeps the gate closed longer
+            gate.close(auth.wait_seconds(limit, max(gate.waits - 1, 0), self.clock()), closed)
+            log(f"agent {name}: usage limit; waiting with the other sessions ({closed})")
+        await gate.wait()
+        return self.budget.blocked is None
 
     # ------------------------------------------------------------ phases
 
@@ -783,6 +830,7 @@ class Orchestrator:
                 agent=name,
                 evaluations=seed.evaluations,
             ),
+            **self._owned(cwd),
         )
 
     async def _kernel_workers(
@@ -1913,6 +1961,7 @@ class Orchestrator:
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
             # evaluation advice says `stop` after these
             binding=SessionBinding(role="kernel", target_id=target_id, evaluations=evaluations),
+            **self._owned(target_dir, [target_dir / workers.DIR]),
         )
 
     async def systems_slice(self, *, evaluations: int, digest: str, label: str) -> AgentResult:
@@ -1939,7 +1988,16 @@ class Orchestrator:
             cwd=self.run.transforms_dir,
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
             binding=SessionBinding(role="systems", evaluations=evaluations),
+            **self._owned(self.run.transforms_dir, [native_engine.native_dir(self.run)]),
         )
+
+    def _owned(self, root: Path, excluded: list[Path] | None = None) -> dict[str, Any]:
+        """The write policy of an engineer session when sessions run concurrently
+        (:attr:`ownership`, docs/MULTIAGENT.md §3.6): its file-writing tools may touch only
+        ``root`` without ``excluded`` (``runner.write_guard``); {} with one session at a time."""
+        if not self.ownership:
+            return {}
+        return {"roots": [root], "excluded": list(excluded or [])}
 
     def native_minutes(self) -> float | None:
         """Session length of the native agent: ``--native-minutes``, else a multiple of
@@ -1983,6 +2041,7 @@ class Orchestrator:
             cwd=cwd,
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR, prompts.WORKLOADS_DIR],
             binding=SessionBinding(role="native", agent="native", evaluations=evaluations, cwd=cwd),
+            **self._owned(cwd),
         )
 
     async def research(
@@ -2040,7 +2099,7 @@ class Orchestrator:
         path = research.dossier_path(self.run, target_id)
         if not (self.cfg.allow_web and self.cfg.dossier) or path.is_file():
             return None
-        if reason := self.budget.exhausted():
+        if reason := self.budget.exhausted(label or f"dossier-{target_id}"):
             log(f"dossier: {target_id}: skipped: {reason}")
             return None
         target_dir = self.run.target(target_id)

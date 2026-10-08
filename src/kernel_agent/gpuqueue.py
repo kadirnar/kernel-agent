@@ -16,7 +16,10 @@ cannot monopolise the GPU), then the shortest job (:func:`estimate`), then the o
 Every acquisition queues on its own, so a long sequence of acquisitions (an integration,
 one A/B step each) lets waiting jobs of a better class go between its steps; a step that
 runs is never interrupted. The ``flock`` stays the outer, cross-process layer: another
-process still excludes, and the queue orders this process's jobs.
+process still excludes, and the queue orders this process's jobs. A coroutine of the event
+loop's thread waits its turn without blocking the loop (:meth:`Gate.admit_async`,
+:func:`holding`): the simulated executor of a virtual-time dry run (``dryrun.py``, whose
+clock replaces :data:`clock`) holds the GPU that way.
 
 **Exclusive and shared**: every timed job holds its GPU alone (``exclusive``, all of
 today's jobs). A job that only checks correctness may be non-exclusive (agents' dev runs,
@@ -45,7 +48,7 @@ import contextlib
 import itertools
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any
@@ -92,6 +95,10 @@ KINDS: dict[str, tuple[str, float]] = {
 #: kinds that load the whole model: their memory is the model's measured peak
 MODEL_KINDS = frozenset({"e2e", "harness", "integration", "capture", "reprofile"})
 
+#: The clock of waits, holds and aging (seconds); a virtual-time dry run (``dryrun.py``,
+#: ``--dry-run --agents N``) replaces it with its simulated one
+clock: Callable[[], float] = time.monotonic
+
 _current: ContextVar[Job | None] = ContextVar("kernel_agent_gpu_job", default=None)
 _session: ContextVar[SessionClock | None] = ContextVar("kernel_agent_session", default=None)
 _ids = itertools.count(1)
@@ -125,7 +132,7 @@ class Job:
     clock: SessionClock | None = None
     id: int = field(default_factory=lambda: next(_ids))
     seq: int = 0  # order of arrival of its current wait
-    submitted: float = 0.0  # time.monotonic() its current wait started
+    submitted: float = 0.0  # clock() its current wait started
     started: float | None = None  # ... and its current hold
     wait_s: float = 0.0
     hold_s: float = 0.0
@@ -327,6 +334,7 @@ class Gate:
         self.unplaced: list[Job] = []  # exclusive jobs admitted, not yet on a GPU
         self.served: dict[str | None, int] = {}  # session -> turn it was last admitted in
         self.gpus = 1  # GPUs of the pool at the last admission
+        self.wakers: list[Callable[[], None]] = []  # the coroutines that wait (admit_async)
         self._seq = itertools.count()
         self._turn = itertools.count()
 
@@ -335,7 +343,7 @@ class Gate:
 
     def head(self, now: float | None = None) -> Job | None:
         """The job that goes next (None: nothing waits)."""
-        now = time.monotonic() if now is None else now
+        now = clock() if now is None else now
         return min(self.waiting, key=lambda j: self._key(j, now), default=None)
 
     def _free(self, gpus: tuple[int, ...]) -> list[int]:
@@ -370,7 +378,7 @@ class Gate:
         room: tuple[int, ...] | None = None
         with self.cond:
             self.gpus = len(gpus)
-            job.submitted, job.seq = time.monotonic(), next(self._seq)
+            job.submitted, job.seq = clock(), next(self._seq)
             self.waiting.append(job)
             try:
                 while True:
@@ -385,14 +393,71 @@ class Gate:
                     interrupt.check()
             finally:
                 self.waiting.remove(job)
-                self.cond.notify_all()  # the next head checks its turn
+                self._notify()  # the next head checks its turn
             assert room is not None
-            self.served[job.session] = next(self._turn)
-            if job.exclusive:
-                self.unplaced.append(job)
-            else:
-                self.holders.setdefault(room[0], []).append(job)
-            return room
+            return self._admitted(job, room)
+
+    async def admit_async(
+        self,
+        job: Job,
+        wait: Wait,
+        gpus: tuple[int, ...] = (0,),
+        capacity: dict[int, float | None] | None = None,
+    ) -> tuple[int, ...]:
+        """:meth:`admit` for a job of the event loop's own thread: it waits as a coroutine
+        (woken by every release), so a simulated executor (``dryrun.py``: the job's body is a
+        sleep in simulated time) goes through the same queue as the threads' jobs."""
+        loop = asyncio.get_running_loop()
+        turn = asyncio.Event()
+
+        def wake() -> None:
+            with contextlib.suppress(RuntimeError):  # the loop closed meanwhile
+                loop.call_soon_threadsafe(turn.set)
+
+        with self.cond:
+            self.gpus = len(gpus)
+            job.submitted, job.seq = clock(), next(self._seq)
+            self.waiting.append(job)
+            self.wakers.append(wake)
+        try:
+            while True:
+                turn.clear()
+                with self.cond:
+                    if job.withdrawn:
+                        raise Withdrawn(f"GPU job {job.id} ({job.kind}) withdrawn while queued")
+                    room = self._room(job, gpus, capacity or {}) if self.head() is job else None
+                    if room is not None:
+                        self._unwait(job, wake)
+                        return self._admitted(job, room)
+                wait.block()
+                await turn.wait()
+                interrupt.check()
+        except BaseException:
+            with self.cond:
+                self._unwait(job, wake)
+            raise
+
+    def _unwait(self, job: Job, wake: Callable[[], None]) -> None:
+        """``job`` (a coroutine's, :meth:`admit_async`) waits no more (under ``cond``)."""
+        if job in self.waiting:
+            self.waiting.remove(job)
+        if wake in self.wakers:
+            self.wakers.remove(wake)
+        self._notify()
+
+    def _admitted(self, job: Job, room: tuple[int, ...]) -> tuple[int, ...]:
+        self.served[job.session] = next(self._turn)
+        if job.exclusive:
+            self.unplaced.append(job)
+        else:
+            self.holders.setdefault(room[0], []).append(job)
+        return room
+
+    def _notify(self) -> None:
+        """Wake every waiter (under ``cond``): threads and coroutines check their turn."""
+        self.cond.notify_all()
+        for wake in list(self.wakers):
+            wake()
 
     def placed(self, job: Job, gpu: int) -> None:
         """An admitted exclusive job took GPU ``gpu``."""
@@ -408,13 +473,13 @@ class Gate:
             for group in self.holders.values():
                 if job in group:
                     group.remove(job)
-            self.cond.notify_all()
+            self._notify()
 
     def expected_wait(self, job_class: str) -> float:
         """Seconds a new job of ``job_class`` should wait: what the jobs on the GPUs have
         left and the jobs that would go before it, spread over the pool's GPUs."""
         with self.cond:
-            now = time.monotonic()
+            now = clock()
             busy = [j for group in self.holders.values() for j in group] + self.unplaced
             left = sum(max(j.estimate_s - (now - (j.started or now)), 0.0) for j in busy)
             ahead = RANK.get(job_class, RANK[DEFAULT])
@@ -432,6 +497,30 @@ def gate(name: str = "gpu") -> Gate:
         return _gates.setdefault(name, Gate())
 
 
+@contextlib.asynccontextmanager
+async def holding(job: Job, name: str = "gpu", gpus: tuple[int, ...] = (0,)) -> AsyncIterator[int]:
+    """Hold a GPU of lock ``name``'s queue as ``job``, from a coroutine of the event loop's
+    thread (:meth:`Gate.admit_async`); yields its index. The queue's order, accounting and
+    ``gpu_job`` events are ``gpulock.gpu_lock``'s; there is no ``flock`` and no process: the
+    simulated executor of a virtual-time dry run (``dryrun.py``) holds it while it sleeps for
+    the job's simulated seconds."""
+    wait, queue = Wait(job), gate(name)
+    try:
+        room = await queue.admit_async(job, wait, gpus)
+    except BaseException as exc:
+        wait.abandoned(exc)
+        raise
+    index = room[0]
+    if job.exclusive:
+        queue.placed(job, index)
+    wait.started(index)
+    try:
+        yield index
+    finally:
+        queue.leave(job)
+        wait.ended()
+
+
 def expected_wait(job_class: str = EVAL, name: str = "gpu") -> float:
     """Seconds a job of ``job_class`` would wait for the GPU now (0: it would go at once)."""
     return gate(name).expected_wait(job_class)
@@ -447,7 +536,7 @@ class Wait:
 
     def __init__(self, job: Job) -> None:
         self.job = job
-        self.t0 = time.monotonic()
+        self.t0 = clock()
         self.blocked = False
         self.waited = 0.0
 
@@ -461,7 +550,7 @@ class Wait:
         _event(self.job, "queued", estimate_s=round(self.job.estimate_s, 1))
 
     def _end_wait(self) -> None:
-        self.waited = time.monotonic() - self.t0
+        self.waited = clock() - self.t0
         self.job.add(wait=self.waited)
         if self.blocked and self.job.clock is not None:
             self.job.clock.resume()
@@ -469,14 +558,14 @@ class Wait:
     def started(self, gpu: int) -> None:
         """It holds GPU ``gpu`` now."""
         self._end_wait()
-        self.job.started = time.monotonic()
+        self.job.started = clock()
         self.job.add(holds=1)
         mem = {"mem_gb": self.job.mem_gb} if self.job.mem_gb is not None else {}
         _event(self.job, "start", gpu=gpu, wait_s=round(self.waited, 2), **mem)
 
     def ended(self) -> None:
         """It let the GPU go."""
-        held = time.monotonic() - (self.job.started or self.t0)
+        held = clock() - (self.job.started or self.t0)
         self.job.add(hold=held)
         self.job.started = None
         _event(self.job, "done", hold_s=round(held, 2), wait_s=round(self.waited, 2))
@@ -500,7 +589,9 @@ def listen(callback: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
 
 
 def _event(job: Job, state: str, **data: Any) -> None:
-    now = time.time()
+    from kernel_agent import ledger
+
+    now = ledger.clock()  # the run's clock (a dry run's simulated one)
     record = {
         "ts": round(now, 3),
         "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
@@ -584,7 +675,7 @@ class SessionClock:
             self._waiting += 1
             if self._waiting > 1:
                 return
-            self._since = time.monotonic()
+            self._since = clock()
         self._call(self._hold)
 
     def resume(self) -> None:
@@ -593,7 +684,7 @@ class SessionClock:
             self._waiting -= 1
             if self._waiting > 0:
                 return
-            waited = time.monotonic() - self._since
+            waited = clock() - self._since
             self.waited += waited
         self._call(self._release, waited)
 

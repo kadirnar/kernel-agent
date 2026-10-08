@@ -2807,6 +2807,7 @@ librarian's model) live in one place, and `program.md`'s sections are its roles.
 
 ```bash
 kernel-agent improve <run_dir | hf-url> [--max-hours 6] [--max-usd 60] [--slice 4] [--rounds R]
+kernel-agent improve <run_dir | hf-url> --agents 3   # up to 3 agent sessions at once
 kernel-agent improve Qwen/Qwen3-0.6B --dry-run     # simulated: no GPU, no Claude
 ```
 
@@ -3042,6 +3043,77 @@ model and starts a new round (`kernel_agent/improve.py`,
   break run eagerly rather than recompile. `profile/summary.md` lists these
   regions and the module calls that replay CUDA graphs (`module_gaps` in
   `profile.json`); their kernels are in the kernel view.
+* **Concurrent sessions** (`--agents N`, issue #183, [docs/MULTIAGENT.md](docs/MULTIAGENT.md)).
+  `--agents 1` (the default) is the loop above: one session at a time. With
+  `--agents N` the one coordinator process keeps up to N sessions running at once
+  (`kernel_agent/coordinator.py`): slices of different arms, research sessions and
+  dossiers. Our runs put the sweet spot on one GPU at 3–4 sessions, and on a
+  subscription the usage windows limit N more than the GPU does
+  ([docs/MULTIAGENT-DATA.md](docs/MULTIAGENT-DATA.md)).
+  * *Slots.* A free slot goes to the arms by their scores with **virtual pulls**: a
+    running session counts as if it had made its evaluations and found nothing, so
+    the slots spread over the arms that pay instead of piling onto the top one. An
+    arm runs one session at a time and none while its research session runs; a role
+    runs at most its registry cap (`roles.py` `max_concurrent`: kernel 4, systems 1,
+    native 1; `--role-max kernel=2,...` overrides it). The
+    native arm no longer waits until every kernel arm has plateaued: it takes a slot
+    no other arm can use. While a new evaluation would wait more than 2 min for the
+    GPU, a due session of a role that needs no GPU (`needs_gpu`: research, dossier)
+    takes the next slot before another engineer. Every session of a role has the same
+    system prompt (the stable prefix), so a role's first session starts alone and
+    writes the prompt cache, and the role's other sessions start once it has streamed
+    its first message (staggered starts: they read the cache). A target with workers (`--seeds-per-target`) runs its team in one
+    slot (islands with a slot each: #189).
+  * *GPU, integration, rounds.* Every session's evaluations take the GPU in turns
+    through the GPU job queue ("Job queue" under "GPUs and the GPU lock"); their
+    waits do not count against the session's time. The re-integration runs in the
+    background every `--integrate-every` kept results while the sessions go on, and
+    a new round starts only once no session runs (the round barrier).
+  * *Budgets.* Each session reserves its role's expected cost (the median of the
+    run's `costs.json`, else the measured one per role): a session starts only while
+    what is left of `--max-usd` minus the running sessions' reservations covers it,
+    and its own cap is what is left minus the others'. A usage limit is the
+    account's: the first session stopped at it closes a shared rate gate until the
+    limit resets, no session starts meanwhile, and every session stopped at it
+    resumes when the gate opens: one wait (`rate_gate` events), not one per session.
+    Once a budget is spent nothing new starts and the loop waits for the running
+    sessions (it drains), so the final integration has the GPU alone.
+  * *Ownership and failures.* Each engineer session may write only in its own
+    directory (`targets/<id>/` without `workers/`; `transforms/` without
+    `transforms/native/`; `transforms/native/`). With `--overlap avoid` no two
+    sessions work on the same modules at once; with `warn` (default) a session's
+    digest names the sessions running beside it and those on the same modules. A
+    failing session never stops the others: an arm whose last 3 slices of the
+    round failed retires for the round (`failing`), a role whose last 3 sessions
+    failed pauses for 30 min, and 3 failed slices in a row of different arms (6 of
+    one arm) stop the loop. Not yet: the agents' own GPU runs in Bash do not go
+    through the queue, so with N > 1 a session's benchmark script can overlap
+    another session's timed evaluation (clean timing under load: #185), and the
+    per-session view in `status` / `watch` comes with #184.
+  * *Records.* A slice record names its sessions (`sessions`) and their GPU waits
+    (`queue_s`); its evaluations, keeps and `improved` come from its own sessions'
+    ledger rows, not from what the arm did meanwhile. `improve.json` → `coordinator`
+    has the most sessions at once and the rate-gate waits; `interrupted` lists every
+    activity that was running.
+  * *Dry run.* `--dry-run --agents N` runs in virtual time
+    (`dryrun.VirtualClock`): the event loop's clock is simulated, the simulated
+    sessions are concurrent and think in simulated seconds, and every evaluation,
+    A/B step, capture and re-profile holds the GPU through the real GPU job queue
+    for its simulated seconds. The same run with 1 to 4 sessions (means of seeds
+    0–4, `docs/research-scripts/agents-183/`; `1 (sequential)` is the loop without
+    `--agents`, in the same simulated time):
+
+    | `--agents` | `--rounds 2`: done after | evaluations / h | GPU busy | evaluation waits (mean / p95) | final speedup | `--max-hours 8`: evaluations / h, final speedup |
+    |---|---:|---:|---:|---:|---:|---:|
+    | 1 (sequential) | 16.8 h | 7.3 | 39% | 0 s / 0 s | 2.53x | 7.0, 2.36x |
+    | 2 | 8.5 h | 14.1 | 77% | 55 s / 169 s | 2.52x | 14.8, 2.50x |
+    | 3 | 7.1 h | 17.1 | 88% | 74 s / 192 s | 2.53x | 17.0, 2.52x |
+    | 4 | 6.6 h | 18.2 | 94% | 76 s / 199 s | 2.52x | 18.5, 2.52x |
+
+    The same work (about 117 evaluations, the same final speedup and USD) takes
+    2.4x less time with 3 sessions; the 4th adds little, because the GPU is then
+    busy 88–94% of the time, mostly with the re-integration's A/B measurements
+    (as docs/MULTIAGENT-DATA.md §8 found on our runs).
 * **Files.** `improve.json` holds the slices (arm, scores and their components,
   evaluations, outcome), the research sessions, the re-integrations, the rounds
   and why the loop stopped. `improve.png` is drawn from it, and `report.md` gets
