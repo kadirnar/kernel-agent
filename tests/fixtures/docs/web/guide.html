@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head><title>4.5. Programmatic Dependent Launch &mdash; Fake Guide</title></head>
+<body>
+<header>Site header, not content</header>
+<div role="main" class="document">
+<div itemprop="articleBody">
+<section id="programmatic-dependent-launch">
+<span id="old-anchor"></span><h1><span class="section-number">4.5. </span>Programmatic Dependent Launch<a class="headerlink" href="#programmatic-dependent-launch">¶</a></h1>
+<p>The <em>Programmatic Dependent Launch</em> mechanism allows a dependent secondary kernel
+to launch before the primary kernel it depends on has finished.</p>
+<section id="api-description">
+<h2>4.5.2. API Description<a class="headerlink" href="#api-description">¶</a></h2>
+<p>The secondary kernel waits with <code>cudaGridDependencySynchronize()</code>:</p>
+<div class="highlight"><pre>__global__ void secondary_kernel() {
+    cudaGridDependencySynchronize();
+    // dependent work
+}
+</pre></div>
+<ul>
+<li><p>Set <code>cudaLaunchAttributeProgrammaticStreamSerialization</code> on the launch.</p></li>
+<li><p>Use <code>cudaLaunchKernelEx</code>.</p></li>
+</ul>
+<table><tr><th>attribute</th><th>value</th></tr><tr><td>programmaticStreamSerializationAllowed</td><td>1</td></tr></table>
+</section>
+<section id="empty-heading">
+<h2>4.5.3. Heading only</h2>
+</section>
+</section>
+</div>
+</div>
+</body>
+</html>

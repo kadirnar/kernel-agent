@@ -53,6 +53,7 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
 
     print(describe())  # the GPU lock pool (nvidia-smi, CUDA_VISIBLE_DEVICES, KERNEL_AGENT_GPUS)
     _doctor_probes(ns, gpu=tc.gpu is not None)
+    _doctor_docs()
     if not _doctor_sanitizer(ns, gpu=tc.gpu is not None):
         return 1
     if ns.smoke:
@@ -74,6 +75,19 @@ def _doctor_probes(ns: argparse.Namespace, *, gpu: bool) -> None:
     if ns.no_probes:
         return
     print(probes.describe(probes.run(gpu)))
+
+
+def _doctor_docs() -> None:
+    """The doc library the agents search (doclib, issue #177): its shelves per library and
+    version, built first from the installed packages if needed (no network; `kernel-agent
+    docs build` fetches the web docs); informative, never a failure."""
+    from kernel_agent import doclib
+
+    try:
+        doclib.ensure()
+    except Exception as exc:
+        print(f"doc library: not built: {exc!r}")
+    print("\n".join(doclib.describe()))
 
 
 def _doctor_sanitizer(ns: argparse.Namespace, *, gpu: bool) -> bool:
@@ -794,6 +808,10 @@ def main(argv: list[str] | None = None) -> int:
     from kernel_agent import library
 
     library.add_parser(sub).set_defaults(func=library.main)
+
+    from kernel_agent import doclib
+
+    doclib.add_parser(sub).set_defaults(func=doclib.main)  # docs: the doc library (#177)
 
     from kernel_agent import suite
 
