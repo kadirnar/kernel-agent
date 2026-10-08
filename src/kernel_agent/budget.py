@@ -27,7 +27,8 @@
   (weighted ``pct_of_sol``, :mod:`kernel_agent.kernels.roofline`) also means ``stop``:
   move on to another recipe (issue #166: a bound of the recipe, not of the model).
   A ``sweep_candidate`` call is one evaluation (one :meth:`Budget.feedback`), however
-  many configs it times (:mod:`kernel_agent.kernels.sweep`).
+  many configs it times (:mod:`kernel_agent.kernels.sweep`); an ``evaluate_candidates`` or
+  ``evaluate_e2e_batch`` call is one evaluation per candidate or set it ran (#190).
 
 Time is measured from the start of this process (``optimize`` or ``resume``);
 USD is the sum of ``costs.json``, so it covers the whole run.
@@ -58,7 +59,13 @@ MIN_AGENT_USD = 0.25  # ... or with less money left
 WRAP_UP_SECONDS = 120.0  # advice is "stop" when an agent has less time than this left
 SOL_STOP_PCT = 90.0  # advice is "stop" once a kernel reaches this % of its recipe's roofline
 
-EVAL_TOOLS = ("evaluate_candidate", "sweep_candidate", "evaluate_e2e")
+EVAL_TOOLS = (
+    "evaluate_candidate",
+    "evaluate_candidates",
+    "sweep_candidate",
+    "evaluate_e2e",
+    "evaluate_e2e_batch",
+)
 #: USD of one session of a role before the run has finished one (the median API-equivalent
 #: cost per session of the runs studied for #174, docs/MULTIAGENT-DATA.md T2)
 ROLE_USD = {
@@ -216,6 +223,9 @@ class Budget:
     gate: RateGate | None = None
     # the clock of the session deadlines (a virtual-time dry run's simulated one)
     monotonic: Callable[[], float] = field(default=time.monotonic, repr=False)
+    # the evaluation tools' early termination (--early-stop, issue #190): the evaluator's
+    # early discard and sweep racing
+    early_stop: bool = True
 
     @classmethod
     def from_config(cls, run: RunDir, cfg: OptimizeConfig) -> Budget:
@@ -227,6 +237,7 @@ class Budget:
             agent_minutes=cfg.agent_minutes,
             reserve=cfg.budget_reserve,
             eval_timeout_s=cfg.eval_timeout_s,
+            early_stop=cfg.early_stop,
         )
 
     # -------------------------------------------------------- run level
@@ -417,6 +428,7 @@ class Budget:
         *,
         ok_key: str = "correct",
         pct_of_sol: float | None = None,
+        evaluations: int = 1,
     ) -> dict[str, Any]:
         """``budget`` + ``advice`` for an evaluation tool result.
 
@@ -426,8 +438,10 @@ class Budget:
         ``pct_of_sol`` is the evaluation's weighted share of its roofline
         (:func:`kernel_agent.kernels.roofline.sol_signal`); at ``SOL_STOP_PCT`` or
         more the recipe is at its bound, so the advice is ``stop`` (move on to another).
+        ``evaluations``: the evaluations one tool call made (``evaluate_candidates``,
+        ``evaluate_e2e_batch``: one per candidate or set).
         """
-        used = self.evals[agent] = self.evals.get(agent, 0) + 1
+        used = self.evals[agent] = self.evals.get(agent, 0) + max(evaluations, 1)
         if self.estimate_reserve is not None:
             with contextlib.suppress(Exception):  # advice only: never fails an evaluation
                 self.final_reserve_s = self.estimate_reserve()

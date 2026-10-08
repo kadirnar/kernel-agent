@@ -166,6 +166,8 @@ class Rounds:
     mismatch: str | None = None
     failed: str | None = None  # the state whose run raised
     error: str | None = None
+    #: the sequential stop before the last round (``abtest.sequential``; None: all ran)
+    stopped: dict[str, Any] | None = None
 
     def ab(self) -> dict[str, Any]:
         return {
@@ -176,6 +178,7 @@ class Rounds:
                 name: "identical" if ok else "skipped: the output is not bit-reproducible"
                 for name, ok in self.reproducible.items()
             },
+            **({"stopped": self.stopped} if self.stopped else {}),
         }
 
 
@@ -196,13 +199,19 @@ def alternate(
     *,
     rounds: int,
     sample: Callable[[str], Any] | None = None,
+    stop: Callable[[list[float], list[float]], dict[str, Any] | None] | None = None,
 ) -> Rounds:
     """``rounds`` rounds of one run per state, A first in even rounds and B first in odd
     ones. Stops at the first output of a reproducible state that differs from its warm-up
-    output (``mismatch``: a switch did not restore the state) or at an error (``failed``)."""
+    output (``mismatch``: a switch did not restore the state) or at an error (``failed``);
+    ``stop`` (the sequential A/B, ``abtest.sequential``) is asked after every round whether
+    the verdict is decided (``stopped``: its answer)."""
     a, b = states
     out = Rounds(reproducible=dict(reproducible))
     for i in range(rounds):
+        if stop is not None and i and (decided := stop(out.a_ms, out.b_ms)) is not None:
+            out.stopped = decided
+            return out
         for state in (a, b) if i % 2 == 0 else (b, a):
             try:
                 if session.to(state):

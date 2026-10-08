@@ -5,9 +5,10 @@ holds the same bytes as ``history/021_merge_..._cc6df165.py``), so the integrati
 cache matches a measurement by what it applied, not by file name. An item's key is the
 sha256 of everything it loads (:func:`loaded_files`), a kernel's also of the ``spec.json``
 fields and the region rewrite the worker applies it with (:func:`item_key`); a measurement's
-key adds the context it ran in (the evaluator schema, the baseline, the A/B rounds) and the
-keys of its A and B sets in order (:class:`Keys`). A file that cannot be read has no key,
-and a measurement without a key is never reused.
+key adds the context it ran in (the evaluator schema, the baseline, the A/B rounds, and for
+a sequential A/B that stopped early its stop rule) and the keys of its A and B sets in order
+(:class:`Keys`). A file that cannot be read has no key, and a measurement without a key is
+never reused.
 
 An ``integration.json`` from before content keys has none; :func:`migrate` gives its
 measurements the keys they would have had where the run proves what they ran with
@@ -96,11 +97,18 @@ def item_key(run: RunDir, kind: str, arg: str) -> str | None:
 
 class Keys:
     """Content keys of one integration's items and measurements (each item hashed once).
-    ``context``: what every measurement depends on besides its items."""
+    ``context``: what every measurement depends on besides its items; ``rule``: the stop
+    rule of a sequential A/B (``abtest.stop_rule``; None: every A/B runs all its rounds). A
+    measurement that ran all its rounds has the key of ``context`` alone, whatever the rule
+    (it serves either way); one that stopped early has the key of ``context`` and the rule
+    (``ruled``), reused only under the same rule (issue #190)."""
 
-    def __init__(self, run: RunDir, context: dict[str, Any]) -> None:
+    def __init__(
+        self, run: RunDir, context: dict[str, Any], rule: dict[str, Any] | None = None
+    ) -> None:
         self.run = run
         self.context = digest(context)
+        self.ruled = digest({**context, "ab_stop": rule}) if rule is not None else None
         self._items: dict[tuple[str, str], str | None] = {}
 
     def item(self, item: tuple[str, str]) -> str | None:
@@ -112,13 +120,17 @@ class Keys:
         """The key of an item given by its argument alone (``target=path``: a kernel)."""
         return self.item(as_item(arg))
 
-    def step(self, a: list[tuple[str, str]], b: list[tuple[str, str]]) -> str | None:
+    def step(
+        self, a: list[tuple[str, str]], b: list[tuple[str, str]], *, ruled: bool = False
+    ) -> str | None:
         """Key of an A/B measurement of set B against set A (in their order: transforms
-        apply in it); None when an item has none."""
+        apply in it); ``ruled``: of one that stopped early under the stop rule. None when an
+        item has none (or ``ruled`` without a rule)."""
+        context = self.ruled if ruled else self.context
         sets = [[self.item(i) for i in a], [self.item(i) for i in b]]
-        if any(k is None for keys in sets for k in keys):
+        if context is None or any(k is None for keys in sets for k in keys):
             return None
-        return digest([self.context, *sets])
+        return digest([context, *sets])
 
     def entry(self, h: dict[str, Any]) -> str | None:
         """The key the step of an ``integration.json`` history entry has now."""

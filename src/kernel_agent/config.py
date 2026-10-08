@@ -87,6 +87,10 @@ class OptimizeConfig:
     ab_rounds: int = 8
     ab_min_win_rate: float = 0.8
     ab_min_gain: float = 0.01
+    #: Early termination of hopeless measurements (``--early-stop``, issue #190): the
+    #: evaluator's early discard of a clear loser's timing, sweep racing and the sequential
+    #: A/B. Correctness is always checked in full; off: every measurement runs all its rounds.
+    early_stop: bool = True
     #: Integration: re-check every kernel on fresh inputs, reference and kernel timed in
     #: processes of their own (kernels/recheck.py); a kernel that fails it is refused.
     recheck: bool = True

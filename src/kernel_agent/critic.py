@@ -25,6 +25,10 @@ for free, and names the line that does it.
   ``critic-escalation`` role's model (Sonnet 5.5) while the job still waits. A confident
   reject withdraws the job if it has not taken the GPU yet (``gpuqueue.Gate.withdraw``);
   after that it only annotates the result ("the critic predicted this").
+* **Refuted ideas** (issue #190): a candidate tagged with an ``idea_id`` that
+  ``ledger.ideas`` calls ``refuted`` (3 correct tries, none a new best or within the noise of
+  the target's best) is rejected as a variant of it (by ``ledger``, check ``refuted_idea``):
+  the next open idea gets the GPU instead. Never audited and never a label of the precision.
 * **Override**: ``force=true`` evaluates whatever the static checks say, without asking the
   model (the critique rides on the result); a withdrawn candidate's result says so.
 * **Records**: ``critic.jsonl`` in the run directory (every verdict, withdrawal and outcome
@@ -66,6 +70,10 @@ from kernel_agent.workspace import RunDir, append_jsonl, update_json
 
 OFF, STATIC, MODEL = "off", "static", "model"
 MODES = (OFF, STATIC, MODEL)
+#: The source of a reject that rests on the ledger, not on the code: a variant of an idea
+#: ``ledger.ideas`` calls refuted (issue #190). Never an anti-gaming label, never audited.
+LEDGER = "ledger"
+REFUTED = "refuted_idea"  # its check
 ACCEPT, UNSURE, REJECT = "accept", "unsure", "reject"
 VERDICTS = (ACCEPT, UNSURE, REJECT)
 KERNEL, E2E = "kernel", "e2e"  # a kernel candidate (build), a transform (apply)
@@ -1351,8 +1359,9 @@ class Review:
 
 
 def _source(by: str) -> str:
-    """The source a verdict is calibrated under: the static checks or the model."""
-    return STATIC if by == STATIC else MODEL
+    """The source a verdict is calibrated under: the static checks or the model (the
+    ledger's refuted ideas are not calibrated)."""
+    return by if by in (STATIC, LEDGER) else MODEL
 
 
 def _merge(reviews: dict[int, dict[str, Any]], rec: dict[str, Any]) -> None:
@@ -1436,6 +1445,8 @@ def stats(reviews: Iterable[dict[str, Any]]) -> dict[str, Any]:
             withdrawn += 1
             saved_s += float(r.get("estimate_s") or 0.0)
             check["withdrawn"] += 1
+        elif outcome and source not in labels:  # a refuted idea forced through: no label
+            check["evaluated"] += 1
         elif outcome:
             bad = not outcome.get("correct")
             labels[source][0] += bad
@@ -1561,15 +1572,26 @@ class Critic:
         idea: str = "",
         force: bool = False,
         estimate_s: float | None = None,
+        refuted: dict[str, Any] | None = None,
     ) -> Review:
         """The static review of what one evaluation would run (``texts``: label, source and
         :data:`KERNEL` or :data:`E2E` per file), recorded at once. :meth:`blocks` says
         whether it withdraws the evaluation now; :meth:`during` may ask the model while it
-        queues."""
+        queues. ``refuted``: ``idea`` is refuted (``ledger.ideas``: its ``refuted``), so this
+        variant of it is rejected (by :data:`LEDGER`, never audited) unless forced."""
         findings = [f for label, text, k in texts for f in static_checks(text, k, label)]
         keys = "\0".join(dedup.source_key(text) for _, text, _ in texts)
         key = hashlib.sha256(keys.encode()).hexdigest()[:20]
         static = verdict_of(findings)
+        if refuted and static != REJECT:  # the ledger's verdict on the idea (issue #190)
+            tries, best = refuted.get("tries"), refuted.get("target_best")
+            line = (
+                f"idea `{idea}` is refuted: {tries} correct tries, none a new best or within "
+                f"the noise of the best ({best}x); stop variations of it and take the next open "
+                "idea (force=true when this one is a genuinely new approach)"
+            )
+            findings = [Finding(REFUTED, REJECT, None, line), *findings]
+            static = REJECT
         with self._lock:
             rid, self._next = self._next, self._next + 1
         review = Review(
@@ -1595,6 +1617,8 @@ class Critic:
         if first := next((f for f in findings if f.severity == static), None):
             review.check, review.line = first.check, first.line
             review.file, review.reason = first.file or None, first.text
+        if review.check == REFUTED:  # not an anti-gaming verdict: no audit, no calibration
+            review.by, review.audit = LEDGER, False
         self._write(review.record())
         return review
 
@@ -1763,6 +1787,14 @@ class Critic:
 
     def withdrawn_result(self, review: Review) -> dict[str, Any]:
         """The tool's result for an evaluation the critic withdrew."""
+        if review.check == REFUTED:
+            return {
+                "status": "reviewed",
+                "evaluated": False,
+                "review": review.summary(),
+                "note": f"Not evaluated: {review.reason}. No evaluation, budget or streak was "
+                "used. Evaluate it again with force=true if it is not a variant of that idea.",
+            }
         where = review.where() or "see the findings"
         return {
             "status": "reviewed",
@@ -1780,7 +1812,9 @@ class Critic:
         if review.verdict == ACCEPT:
             return {}
         out = review.summary()
-        if review.verdict == REJECT:
+        if review.check == REFUTED:
+            out["note"] = "a variant of a refuted idea, evaluated with force=true"
+        elif review.verdict == REJECT:
             if review.force:
                 why = "force=true"
             elif review.audit:

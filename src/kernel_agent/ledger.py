@@ -47,6 +47,11 @@ a label, the classification is the benchmark input's).
 ``eval_s`` is the time an evaluation took, without the time it waited for the GPU behind
 other jobs (``queue_s``, :mod:`kernel_agent.gpuqueue`; empty when not known).
 
+``early`` (issue #190, ``--early-stop``) marks a measurement cut short once its verdict was
+decided: a kernel evaluation whose timing stopped because the candidate could not be a new
+best (an early discard, :mod:`kernel_agent.kernels.early`; its correctness was checked in
+full) and an integration A/B that stopped before its last round (``abtest.sequential``).
+
 ``results.jsonl`` (``RunDir.results_file``) keeps the full records; the TSV is the readable
 summary that the charts, ``kernel-agent status`` and ``dashboard.html`` read.
 """
@@ -63,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import diversity
-from kernel_agent.budget import Standing, improves
+from kernel_agent.budget import MIN_GAIN, Standing, improves
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
 
 COLUMNS = (
@@ -86,6 +91,7 @@ COLUMNS = (
     "diverse_speedup",
     "flags",
     "review",
+    "early",
     "worker",
     "session",
     "idea",
@@ -264,6 +270,11 @@ def idea_slug(value: Any) -> str:
     return text[:40].strip("_-")
 
 
+#: An idea is ``refuted`` (:func:`ideas`) after this many correct tries, none of them a new
+#: best or within the noise of the target's best (docs/MULTIAGENT.md §3.12.5, issue #190)
+REFUTED_TRIES = 3
+
+
 def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per-idea aggregates of a target's ledger rows (or records), in order of first try.
 
@@ -273,9 +284,15 @@ def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     build or runtime errors, crashes, timeouts), with every ``statuses`` count;
     ``expected``, the last ``expected_speedup`` given; the ``last_hypothesis``; the
     ``exps``; and a ``verdict``: ``kept``, ``slow`` (measured correct and never a new
-    best) or ``buggy`` (never correct: untested, not refuted).
+    best), ``refuted`` (at least :data:`REFUTED_TRIES` correct tries, none a new best and
+    none within the noise of the target's best: ``best × (1 + max(1 %, 2 × spread))`` below
+    it; ``refuted`` holds the tries and that best) or ``buggy`` (never correct: untested,
+    not refuted).
     """
+    rows = list(rows)
+    bar = best_kept(r for r in rows if r.get("status"))  # the target's best (the keep bar)
     out: dict[str, dict[str, Any]] = {}
+    near: dict[str, bool] = {}  # a correct try within the noise of the bar
     for row in rows:
         idea = str(row.get("idea") or "")
         if not idea or row.get("status") in UNMEASURED:
@@ -307,13 +324,19 @@ def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         speedup = _num(row.get("speedup")) if row.get("correct") else None
         if speedup is not None and (agg["best"] is None or speedup > agg["best"]):
             agg["best"] = speedup
+        if speedup is not None:
+            margin = max(MIN_GAIN, 2 * (_num(row.get("spread")) or 0.0))
+            near[idea] = near.get(idea, False) or speedup * (1 + margin) >= bar
         if (expected := _num(row.get("expected_speedup"))) is not None:
             agg["expected"] = expected
         agg["last_hypothesis"] = str(row.get("hypothesis") or agg["last_hypothesis"])
         if row.get("exp") is not None:
             agg["exps"].append(row["exp"])
-    for agg in out.values():
+    for idea, agg in out.items():
         agg["verdict"] = "kept" if agg["kept"] else "slow" if agg["slow"] else "buggy"
+        if agg["verdict"] == "slow" and agg["slow"] >= REFUTED_TRIES and not near.get(idea):
+            agg["verdict"] = "refuted"
+            agg["refuted"] = {"tries": agg["slow"], "best": agg["best"], "target_best": bar}
     return list(out.values())
 
 
@@ -345,7 +368,7 @@ def _cell(value: Any) -> str:
 def _parse(key: str, cell: str) -> Any:
     if key == "exp":
         return int(cell) if cell.isdigit() else None
-    if key == "correct":
+    if key in ("correct", "early"):
         return cell == "true"
     if key in _FLOATS:
         try:
@@ -457,6 +480,7 @@ def record_kernel(
                 "worker": worker,
                 "session": session,
                 "review": review,
+                "early": True if result.get("early") else None,  # an early discard (#190)
             },
         )
     tag: dict[str, Any] = {"worker": worker} if worker else {}
@@ -512,6 +536,8 @@ def record_e2e(
                 "hypothesis": hypothesis,
                 "session": session,
                 "review": review,
+                # a paired A/B that stopped once its verdict was decided (abtest.sequential)
+                "early": True if (result.get("ab") or {}).get("stopped") else None,
             },
         )
     tag = {"session": session} if session else {}

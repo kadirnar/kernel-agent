@@ -1300,6 +1300,38 @@ tests), adds tests and is independently useful.
   * e2e batch results equal separate runs within noise (`toy_decoder`).
 * **Risk**: early stops bias measurements if the bound is wrong. Keep them conservative,
   log the bound, and make them switchable with `--early-stop off`.
+* *Implemented in #190* (`--early-stop on|off`, default on; `OptimizeConfig.early_stop`,
+  `Budget.early_stop`):
+  * Early discard (`kernels/early.py`, `kernels/evaluate.py`): the tool passes the ledger's
+    keep bar (`ledger.best_kept`, at least the reference's 1.0: what a `keep` must beat) as
+    `early_best`; every timed case gets 2 of its 3 rounds first. The median of 3 rounds lies
+    between the smallest and largest of the first 2, so the 95 % bound is a certain one:
+    `Σ n·max(ref) / Σ n·min(new)` × (1 + max(1 %, 2 × spread)) below the bar stops timing
+    (`early` with bound, bar, noise in the record and the ledger's `early` column). Such a
+    result is always a `discard`; correctness, the activity pass and the parent-side checks
+    run in full. MLP block, 4 timed cases: 3.95 → 3.35 s in the evaluator (-15 %).
+  * Sweep racing (`early.race`, `sweep._time_configs`): after round 1 only configs more than
+    50 % slower than the leader (the largest recorded case spread is 49.5 %), after round 2
+    those certainly slower beyond the noise; at most half per round, never the leader.
+  * Sequential A/B (`abtest.sequential`, `worker e2e_ab --sequential`): looks from round 3;
+    reject when B can no longer win `min_win_rate` of the rounds (exact) or the 99 % CI ends
+    below `min_gain`; accept only when the win count can no longer fail and the 99 % CI
+    starts above `min_gain`. On the 221 recorded paired A/Bs: 33 % fewer rounds, 0 verdict
+    changes (an earlier accept at round 4 changed 2 verdicts: late outlier rounds). Reuse
+    keys: a measurement that stopped early is keyed with `abtest.stop_rule`, one that ran all
+    rounds keeps the plain key and serves either way.
+  * `ledger.ideas` verdict `refuted` (3 correct tries, none within the noise of the target's
+    best) in the result, `best_result` and the digest; the critic rejects a variant
+    (`by: ledger`, check `refuted_idea`, never audited or calibrated) unless `force`. Session
+    advice: 3 build errors in a row on one idea add `advice` to the result (the time-based
+    advice and the `PostToolUse` hook are not done).
+  * Lease batching in `gpuqueue.Gate` (`Lease`: 4 jobs, 120 s).
+  * `evaluate_candidates` (`evaluate.run_evaluations`, `--also`): the evaluator is a staged
+    generator that pauses after timing, so a batch times every candidate before any profiled
+    pass (CUPTI stays subscribed and slows every later launch: a second candidate's
+    reference timed 1.34x slow otherwise). 4 candidates: 9.9 s vs 20.0 s.
+  * `evaluate_e2e_batch` (`worker e2e_batch`, `worker.e2e_batch`): sets that cannot run or be
+    undone in-process, an `oom` and a crashed batch go to separate `e2e` processes.
 
 ### PR 11: governor and asynchronous evaluations (optional)
 

@@ -19,10 +19,22 @@ to back with :data:`SEPARATE_ITERS` timed runs each (A measured again in the sam
 session): the win rate is then the share of (A run, B run) pairs that B wins,
 the gain ``1 - median(B) / median(A)``, and its interval comes from resampling
 both sets of runs.
+
+**Sequential stop** (:func:`sequential`, ``--early-stop on``, docs/MULTIAGENT.md §3.12.5,
+issue #190): from round :data:`SEQ_MIN_ROUNDS` on, the paired A/B stops before its last
+round once the verdict of all ``rounds`` is no longer in doubt: B can no longer win
+``min_win_rate`` of them (a reject whatever the rest brings), the :data:`SEQ_CONFIDENCE`
+interval of the gain ends below ``min_gain`` (a reject), or B has won enough rounds that
+the win rate holds whatever the rest brings and the interval starts above ``min_gain`` (an
+accept). Every stop is also the verdict of :func:`decide` on the rounds that ran. Only the
+timed rounds stop: B's quality checks always run in full. On the 221 paired A/Bs of our
+runs (8 rounds each) it ran 33 % fewer rounds with the same verdict on every one
+(``tests/fixtures/ab_rounds.json``).
 """
 
 from __future__ import annotations
 
+import math
 import random
 import re
 import statistics
@@ -35,6 +47,11 @@ MIN_GAIN = 0.01
 #: Timed runs per process when A and B are measured in separate processes.
 SEPARATE_ITERS = 10
 RESAMPLES = 10_000
+#: Sequential stop (:func:`sequential`): the first round after which an A/B may stop, and
+#: the (two-sided) confidence of the interval of the gain at a look before the last round
+#: (stricter than the final 95 %: several looks).
+SEQ_MIN_ROUNDS = 3
+SEQ_CONFIDENCE = 0.99
 #: ``e2e`` / ``e2e_ab`` status of a step that ran out of GPU memory: a property of what else
 #: the process held (two states of the model in one A/B process), not of the items' code.
 OOM = "oom"
@@ -123,14 +140,8 @@ def paired(
 
     ``gain`` is ``1 - sum(B) / sum(A)`` (positive: B is faster), ``ci95`` its
     percentile bootstrap interval over resampled rounds, ``wins`` the rounds B won."""
-    if len(a_ms) != len(b_ms) or not a_ms:
-        raise ValueError("paired timings need the same, non-zero number of A and B runs")
+    boot = _paired_boot(a_ms, b_ms, resamples, seed)
     n = len(a_ms)
-    rng = random.Random(seed)
-    boot = []
-    for _ in range(resamples):
-        idx = [rng.randrange(n) for _ in range(n)]
-        boot.append(1.0 - sum(b_ms[i] for i in idx) / sum(a_ms[i] for i in idx))
     wins = sum(b < a for a, b in zip(a_ms, b_ms, strict=True))
     return {
         "mode": "paired",
@@ -139,6 +150,87 @@ def paired(
         "win_rate": round(wins / n, 4),
         **_stats(a_ms, b_ms, 1.0 - sum(b_ms) / sum(a_ms), boot),
     }
+
+
+def _paired_boot(
+    a_ms: Sequence[float], b_ms: Sequence[float], resamples: int, seed: int
+) -> list[float]:
+    """The bootstrap distribution of the paired gain (rounds resampled with replacement)."""
+    if len(a_ms) != len(b_ms) or not a_ms:
+        raise ValueError("paired timings need the same, non-zero number of A and B runs")
+    n = len(a_ms)
+    rng = random.Random(seed)
+    boot = []
+    for _ in range(resamples):
+        idx = [rng.randrange(n) for _ in range(n)]
+        boot.append(1.0 - sum(b_ms[i] for i in idx) / sum(a_ms[i] for i in idx))
+    return boot
+
+
+def _interval(
+    a_ms: Sequence[float], b_ms: Sequence[float], confidence: float, resamples: int, seed: int = 0
+) -> tuple[float, float]:
+    """The percentile bootstrap interval of the paired gain at ``confidence`` (two-sided),
+    rounds resampled with replacement (vectorised: a look of the sequential A/B)."""
+    import numpy as np
+
+    a, b = np.asarray(a_ms, dtype=float), np.asarray(b_ms, dtype=float)
+    idx = np.random.default_rng(seed).integers(0, len(a), size=(resamples, len(a)))
+    boot = 1.0 - b[idx].sum(axis=1) / a[idx].sum(axis=1)
+    tail = (1.0 - confidence) / 2
+    return float(np.quantile(boot, tail)), float(np.quantile(boot, 1.0 - tail))
+
+
+def stop_rule(min_win_rate: float = MIN_WIN_RATE, min_gain: float = MIN_GAIN) -> dict[str, Any]:
+    """What a sequential A/B's stop depends on besides its rounds (part of the integration's
+    reuse keys, ``integrate/reuse.py``: a measurement that stopped early is reused only under
+    the same rule)."""
+    return {
+        "sequential": 1,  # bump when the rule changes
+        "min_rounds": SEQ_MIN_ROUNDS,
+        "confidence": SEQ_CONFIDENCE,
+        "min_win_rate": min_win_rate,
+        "min_gain": min_gain,
+    }
+
+
+def sequential(
+    a_ms: Sequence[float],
+    b_ms: Sequence[float],
+    rounds: int,
+    *,
+    min_win_rate: float = MIN_WIN_RATE,
+    min_gain: float = MIN_GAIN,
+    resamples: int = RESAMPLES,
+) -> dict[str, Any] | None:
+    """Whether a paired A/B of ``rounds`` rounds stops after the ``len(a_ms)`` it ran
+    (``{"verdict": "accept" | "reject", "why", "rounds", "of"}``; None: it goes on).
+
+    From round :data:`SEQ_MIN_ROUNDS` until the one before the last: a reject when B can no
+    longer win ``min_win_rate`` of the ``rounds`` (exact) or the :data:`SEQ_CONFIDENCE`
+    interval of the gain ends below ``min_gain``; an accept when B has won enough rounds for
+    the win rate whatever the rest brings and the interval starts above ``min_gain``. A stop
+    is always also the verdict of :func:`decide` on the rounds that ran."""
+    n = len(a_ms)
+    if n < SEQ_MIN_ROUNDS or n >= rounds:
+        return None
+    need = math.ceil(min_win_rate * rounds - 1e-9)
+    wins = sum(b < a for a, b in zip(a_ms, b_ms, strict=True))
+    out = {"rounds": n, "of": rounds}
+    if wins + (rounds - n) < need:
+        why = f"B won {wins}/{n} rounds: it can no longer win {need} of {rounds}"
+        return {"verdict": "reject", "why": why, **out}
+    lo, hi = _interval(a_ms, b_ms, SEQ_CONFIDENCE, resamples)
+    level = f"{100 * SEQ_CONFIDENCE:.0f} % CI of the gain"
+    if hi < min_gain:
+        why = f"the {level} ends at {_pct(hi)}, below {_pct(min_gain, False)}"
+        return {"verdict": "reject", "why": why, **out}
+    if wins >= need and lo > min_gain:
+        ab = paired(a_ms, b_ms, resamples=resamples)
+        if decide(ab, min_win_rate=min_win_rate, min_gain=min_gain)[0]:
+            why = f"B won {wins}/{n} rounds and the {level} starts at {_pct(lo)}"
+            return {"verdict": "accept", "why": why, **out}
+    return None
 
 
 def separate(
@@ -218,7 +310,9 @@ def describe(ab: dict[str, Any]) -> str:
     else:
         won = f"B won {_pct(float(ab['win_rate']), False)} of run pairs"
     lo, hi = ab["ci95"]
+    stopped = ab.get("stopped") or {}  # the sequential stop (:func:`sequential`)
+    early = f", stopped after {stopped['rounds']} of {stopped['of']}" if stopped else ""
     return (
-        f"{ab['mode']} A/B: {won}, gain {_pct(float(ab['gain']))} "
+        f"{ab['mode']} A/B: {won}{early}, gain {_pct(float(ab['gain']))} "
         f"(95 % CI {_pct(float(lo))} .. {_pct(float(hi))})"
     )

@@ -1468,6 +1468,17 @@ B = A with one item replaced by another version of it (see below):
   `--ab-min-win-rate 0.8` of the rounds **and** the lower bound of the
   bootstrap 95 % confidence interval of its gain `1 − ΣB / ΣA` is above
   `--ab-min-gain 0.01` (`abtest.py`).
+* **Sequential stop** (`--early-stop on`, the default; issue #190,
+  `abtest.sequential`). From round 3 the rounds stop once the verdict of all
+  `--ab-rounds` is no longer in doubt: B can no longer win `--ab-min-win-rate` of
+  them, or the 99 % interval of its gain (stricter than the final 95 %: several
+  looks) ends below `--ab-min-gain` (a reject); or B has won enough rounds that the
+  win rate holds whatever the rest brings and the interval starts above it (an
+  accept). A stop is always also the verdict of the rounds that ran, and only the
+  timed rounds stop: B's quality checks run in full. On the 221 paired A/Bs of our
+  runs (`tests/fixtures/ab_rounds.json`) it ran 33 % fewer rounds (29 % of their
+  timed run seconds) with the fixed-round verdict on every one; the record says
+  `stopped` (`verdict`, `why`, `rounds`, `of`), and the ledger row `early`.
 * A transform that changes weights in place (`param.mul_()`), declares
   `undo = False`, or whose state does not survive a switch, and an A/B whose
   process fails (two states in memory, say), are measured in two processes
@@ -1548,7 +1559,9 @@ modules it imports from its own directory, the `kernel_agent` modules it
 imports, the source files its string literals name; a kernel's `spec.json`
 fields and region rewrite), the evaluator schema (`EVALUATOR_SCHEMA`), the
 baseline it ran against (its latency, `baseline.json` and the digests and
-quality mode the worker verifies) and `--ab-rounds`. A new schema or baseline
+quality mode the worker verifies) and `--ab-rounds`; an A/B that stopped early
+(sequential stop) also by its stop rule, so it is reused only under the same rule
+(one that ran all its rounds serves either way). A new schema or baseline
 measures everything again; a changed file only the steps that hold it.
 `integration.json` → `reuse` counts the `reused` and the `measured` steps (also
 in the log, and in `improve.json` → `integrations` → `reused`).
@@ -3400,6 +3413,33 @@ model and starts a new round (`kernel_agent/improve.py`,
     when the advice says stop): `--agents 3` 137 → 139 evaluations but 80 → 96 % of the
     5-hour window, and where the window binds, fewer evaluations (125 → 118). It pays when
     evaluations wait long for the GPU and the window has room.
+  * *Early termination and batching* (`--early-stop on`, the default; issue #190,
+    docs/MULTIAGENT.md §3.12.5–3.12.6). A measurement may be cut short only with evidence,
+    never its correctness checks, and never a target or the run: the GPU time goes to the
+    next job. **Early discard** (`kernels/early.py`): `evaluate_candidate` passes the
+    target's keep bar (its best kept speedup, at least the reference's 1.0) and every case
+    first gets 2 of its 3 timing rounds; the median of the 3 then lies between the smallest
+    and the largest of those 2, so when even `Σ calls × max(reference) / Σ calls ×
+    min(candidate)` times `1 + noise` (the keep rule's) is below the bar, the candidate
+    cannot be a new best whatever the third rounds measure: its timing stops (`early` in
+    the result and the ledger, with the bound), and the activity pass, the re-verification
+    and the checks outside its process still run. Sweep racing and the sequential A/B are
+    under "Parameter sweeps" and "Integration: paired A/B". **Refuted ideas**: an idea with
+    3 correct tries, none a new best or within the noise of the target's best, is `refuted`
+    (`ledger.ideas`; the result, `best_result` and the digest say "stop variations"), and the
+    critic withdraws a further variant of it (check `refuted_idea`, never audited or
+    counted in its precision) unless `force=true`. 3 build errors in a row on one idea add
+    `advice` to the result: the compile-triage helper, or another idea. **Lease batching**
+    ("Job queue" under "GPUs and the GPU lock"). **`evaluate_candidates`** (2 to 8 variants of
+    one idea): one evaluator process loads the capture once and runs each candidate through
+    every stage, timing them all before any profiled pass (the profiler's CUPTI
+    subscription slows every later launch of its process); one ledger row and one
+    evaluation of the budget each (4 RMSNorm candidates: 9.9 s instead of 20.0 s, the same
+    speedups). **`evaluate_e2e_batch`** (2 to 8 sets, `worker e2e_batch`): one model load,
+    each set applied to the unmodified model with undo handles, measured and judged as
+    `e2e`, undone, and the unmodified model's output checked again; a set that cannot be
+    undone, runs out of memory or follows one whose undo failed is measured in an `e2e`
+    process of its own. A model load is 6–40 s of a 16–86 s `e2e` in our runs.
   * *Records.* A slice record names its sessions (`sessions`) and their GPU waits
     (`queue_s`); its evaluations, keeps and `improved` come from its own sessions'
     ledger rows, not from what the arm did meanwhile. `improve.json` → `coordinator`
@@ -3623,7 +3663,18 @@ idea_id)` tries them all while it holds one GPU of the pool
    each config (in an order rotated per round) on every timed case. One timed
    call per config runs on redrawn inputs and is checked against the reference.
    The table is sorted by weighted speedup (calls per run × time) with the
-   speedup and `pct_of_sol` of every case.
+   speedup and `pct_of_sol` of every case. **Racing** (`--early-stop on`, issue
+   #190, `kernels/early.py`): after each round but the last, the configs beyond the
+   noise of the leader drop out, at most half of those still timed per round
+   (successive halving). After the first round that means more than 50 % slower
+   (above the largest timing spread of a case in our runs, 49.5 %); after the
+   second the bound is certain: the median of the 3 rounds lies between the
+   smallest and the largest of the first 2, so a config whose fastest possible time
+   is beyond the leader's slowest by the keep rule's noise cannot win. A raced
+   config's row keeps the speedup of its rounds and says why (`raced`). On 300
+   synthetic sweeps with disturbed rounds racing kept the winner every time and
+   timed 31 % fewer config rounds; on a 36-config Triton RMSNorm sweep on the GPU,
+   where most configs are within the noise of each other, 15 % fewer.
 3. **Evaluate.** The best config is bound into the candidate's source
    (`_KA_SWEEP_CONFIG`, the defaults of `build`) and that file goes through the
    full evaluator in a fresh process, with every stage and anti-gaming guard
@@ -3821,6 +3872,11 @@ measurement holds the lock of one GPU while its subprocess runs
   the lock. Every timed job holds its GPU alone. A job marked non-exclusive
   (a `run_on_gpu` correctness check that gives its `mem_gb`) shares a GPU only
   with other non-exclusive jobs whose memory estimates fit in 90 % of it.
+  **Lease batching** (#190): once a job of a target took the GPU, the waiting jobs of
+  the same target and class go next, before the rest of their class (never before a
+  better class), up to 4 jobs and 120 estimated seconds per lease: the islands'
+  evaluations and quick checks of one target run back to back at steady clocks and
+  share the clean reference timing of their capture (`lease` in `start` events).
 * **Waiting is not the agent's time.** While a session's evaluation waits
   behind other jobs, its `--agent-minutes` timeout and the `minutes_left` of its
   evaluation advice stop running, never past the run's time for agents
@@ -4188,6 +4244,8 @@ kernel-agent optimize <hf-url> [options]
                                        workloads without reference_optimizations()
   --ab-rounds 8 --ab-min-win-rate 0.8 --ab-min-gain 0.01
                                        paired A/B of each integration step (see above)
+  --early-stop on|off                  early discard of a clear loser's timing, sweep racing,
+                                       sequential A/B stop (default on; never correctness)
   --no-recheck                         integration: no re-check of kernels on fresh inputs
   --no-library --no-librarian          cross-run kernel library / lessons agent off
   --librarian-model MODEL              (see "Kernel library and lessons")
@@ -4350,8 +4408,8 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  review  worker
-session  idea  hypothesis
+est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  review  early
+worker  session  idea  hypothesis
 ```
 
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
@@ -4362,7 +4420,10 @@ workload's diverse input set, and `flags` says `data_dependent` when that speedu
 changes with the input (see "Data-dependent speedups"). `review` is the critic's verdict on
 what the row ran (`accept:static`, `unsure:static:output_cache`,
 `reject:model:fallback audit`, ...; see "Critic" under `kernel-agent improve`): advice,
-never part of the status. `worker` is the target's worker that evaluated a kernel
+never part of the status. `early` is `true` for a measurement cut short once its verdict
+was decided (`--early-stop`): a kernel evaluation whose timing stopped because the
+candidate could not be a new best (always a `discard`, every correctness check ran) and an
+integration A/B that stopped before its last round. `worker` is the target's worker that evaluated a kernel
 candidate (empty without workers). `session` is the agent session that ran the evaluation
 (its label, the `costs.json` key such as `kernel-attn#7`; empty for the integration's
 steps), also in its `results.jsonl` record and `evaluation` event: each session's tools
@@ -4382,8 +4443,9 @@ value for that column.
   is a bug to fix, not evidence against the idea. `best_result` aggregates per
   idea: tries, best speedup, `kept`, `slow` (correct, not a new best), `bugs`
   (failed) with their statuses, the expected speedup, the last hypothesis and a
-  verdict (`kept`, `slow`, or `buggy`: never correct, so untested rather than
-  refuted). The engineer prompt and `program.md` ask for 3-5 distinct ideas
+  verdict (`kept`, `slow`, `refuted`: 3 or more correct tries, none a new best or
+  within the noise of the target's best, or `buggy`: never correct, so untested rather
+  than refuted). The engineer prompt and `program.md` ask for 3-5 distinct ideas
   with expected gain and ceiling before any code, a retry of a buggy idea before
   it is dropped, and "abandoned after N attempts: <why>" instead of "X doesn't
   work". The CUDA and CuTe DSL guides describe plan amnesia and false
