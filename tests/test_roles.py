@@ -85,9 +85,9 @@ def test_registry_and_the_options_of_each_role():
         "systems": (DEFAULT_MODEL, "high", 120),
         "native": (DEFAULT_MODEL, "high", 360),  # 3x longer sessions
         "research": (DEFAULT_MODEL, "high", 120),
-        "dossier": (SONNET_MODEL, "low", 20),
-        "librarian": (SONNET_MODEL, "low", 8),
-        "critic": (HAIKU_MODEL, None, 1),
+        "dossier": (DEFAULT_MODEL, "high", 20),  # every role on Opus 5.5 by default
+        "librarian": (DEFAULT_MODEL, "high", 8),
+        "critic": (DEFAULT_MODEL, "high", 1),
     }
     for role, wanted in expect.items():
         options = roles.options_for(role, roles.session_config(role, cfg))
@@ -103,9 +103,9 @@ def test_registry_and_the_options_of_each_role():
     )
     helpers = kernel["agents"]
     assert set(helpers) == set(roles.HELPERS)
-    assert (helpers["doc-lookup"].model, helpers["doc-lookup"].effort) == (SONNET_MODEL, "low")
+    assert (helpers["doc-lookup"].model, helpers["doc-lookup"].effort) == (INHERIT, None)
     analyst = helpers["profile-analyst"]
-    assert (analyst.model, analyst.effort) == (SONNET_MODEL, "medium")
+    assert (analyst.model, analyst.effort) == (INHERIT, None)
     assert (helpers["reviewer"].model, helpers["reviewer"].effort) == (INHERIT, None)
 
     research = roles.options_for("research", roles.session_config("research", cfg))
@@ -170,11 +170,11 @@ def test_role_flags_and_their_resume(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(cli, "cmd_optimize", optimize)
-    flags = ["--role-model", "kernel=claude-sonnet-5-5", "--role-model", "critic=inherit"]
+    flags = ["--role-model", "kernel=claude-sonnet-5-5", "--role-model", f"critic={HAIKU_MODEL}"]
     flags += ["--role-effort", "dossier=medium", "--role-effort", "librarian=none"]
     assert cli.main(["optimize", "org/m", *flags, "--librarian-model", HAIKU_MODEL]) == 0
     cfg = seen["cfg"]
-    models = {"kernel": SONNET_MODEL, "critic": INHERIT, "librarian": HAIKU_MODEL}
+    models = {"kernel": SONNET_MODEL, "critic": HAIKU_MODEL, "librarian": HAIKU_MODEL}
     assert cfg.role_models == {**ROLE_MODELS, **models}
     assert cfg.role_efforts == {**ROLE_EFFORTS, "dossier": "medium", "librarian": None}
     for bad in (
@@ -406,8 +406,8 @@ def test_costs_and_the_report_have_tokens_and_cache_hits_per_role(tmp_path):
     assert kernel["models"][DEFAULT_MODEL]["usd"] == 0.5
     assert (dossier["role"], dossier["model"], dossier["effort"]) == (
         "dossier",
-        SONNET_MODEL,
-        "low",
+        DEFAULT_MODEL,
+        "high",
     )
 
     costs["planner"] = {"usd": 1.0, "turns": 3}  # a session from before #181: no tokens
@@ -422,7 +422,7 @@ def test_costs_and_the_report_have_tokens_and_cache_hits_per_role(tmp_path):
         in text
     )
     assert (
-        f"| dossier | 1 | `{SONNET_MODEL}` | low |" in text
+        f"| dossier | 1 | `{DEFAULT_MODEL}` | high |" in text
         and "| planner | 1 | - | - | 1.00 |" in text
     )
     assert roles.usage_lines({"planner": {"usd": 1.0}}) == []  # no tokens recorded: no table

@@ -33,7 +33,7 @@ from kernel_agent import doclib, improve, ledger, roles
 from kernel_agent.agent import runner
 from kernel_agent.agent import tools as tools_mod
 from kernel_agent.agent.runner import AgentResult
-from kernel_agent.config import SONNET_MODEL, OptimizeConfig
+from kernel_agent.config import DEFAULT_MODEL, INHERIT, SONNET_MODEL, OptimizeConfig
 from kernel_agent.doclib import reading, store
 from kernel_agent.native import engine
 from kernel_agent.scheduler import KERNEL, NATIVE, Arm, Policy, build_arms
@@ -58,7 +58,7 @@ def test_engineers_get_read_only_helpers():
             assert set(helper.tools or ()) <= set(roles.HELPER_TOOLS), name
             assert not WRITERS & set(helper.tools or ()), name
     triage = roles.agent_definition("compile-triage", cfg=cfg)
-    assert (triage.model, triage.effort, triage.maxTurns) == (SONNET_MODEL, "medium", 15)
+    assert (triage.model, triage.effort, triage.maxTurns) == (INHERIT, None, 15)  # Opus 5.5
     doc_tools = tools_mod.tool_names("doc_search", "doc_read")
     assert set(triage.tools or ()) == {"Read", "Glob", "Grep", "Skill", *doc_tools}
     assert "## Cause" in triage.prompt and "## Patch" in triage.prompt
@@ -335,7 +335,7 @@ def test_a_real_session_delegates_to_read_only_helpers(tmp_path, library, monkey
     assert "When delegating pays" in json.dumps(main[0]["system"])
 
     # compile-triage: its model, exactly its tools, the candidate and the doc library
-    assert {body["model"] for body in sub} == {SONNET_MODEL}
+    assert {body["model"] for body in sub} == {DEFAULT_MODEL}  # helpers inherit Opus 5.5
     assert sorted(t["name"] for t in sub[0]["tools"]) == sorted(
         roles.agent_definition("compile-triage").tools or []
     )
@@ -353,16 +353,16 @@ def test_a_real_session_delegates_to_read_only_helpers(tmp_path, library, monkey
     assert result.tool_calls == {"Agent": 2} and result.turns == len(main)
     triaged = result.subagents["compile-triage"]
     assert triaged["calls"] == 1 and triaged["tools"] == {"Read": 1, "doc_search": 1}
-    assert triaged["models"] == [SONNET_MODEL]
+    assert triaged["models"] == [DEFAULT_MODEL]
     assert result.subagents["scribe"]["tools"] == {"Write": 3}
     assert [(w["tool"], w["results"]) for w in result.web] == [("doc_search", 2)]
 
     # the session's USD includes its helpers' (Claude Code's total_cost_usd, per model)
-    sonnet = result.model_usage[SONNET_MODEL]
-    assert sonnet["input_tokens"] == 3000 * len(sub) and sonnet["usd"] > 0
+    # every helper runs on the session's model (Opus 5.5): one entry holds main + helpers
     opus = result.model_usage[cfg.claude_model]
-    assert opus["input_tokens"] == 1000 * len(main) + 10 * len(notes)
-    assert result.cost_usd == pytest.approx(sonnet["usd"] + opus["usd"])
+    assert set(result.model_usage) == {cfg.claude_model}
+    assert opus["input_tokens"] == 1000 * len(main) + 10 * len(notes) + 3000 * len(sub)
+    assert result.cost_usd == pytest.approx(opus["usd"]) and opus["usd"] > 0
 
 
 # ------------------------------------------------------------------ profile tables in a file

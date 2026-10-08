@@ -21,7 +21,7 @@ from kernel_agent import cli, critic, gpulock, gpuqueue, improve, ledger, roles
 from kernel_agent.agent import auth
 from kernel_agent.agent import tools as tools_mod
 from kernel_agent.budget import Budget
-from kernel_agent.config import HAIKU_MODEL, SONNET_MODEL, OptimizeConfig
+from kernel_agent.config import DEFAULT_MODEL, HAIKU_MODEL, SONNET_MODEL, OptimizeConfig
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 REJECT, UNSURE, ACCEPT = critic.REJECT, critic.UNSURE, critic.ACCEPT
@@ -924,7 +924,8 @@ def test_the_model_withdraws_a_queued_job(tmp_path, monkeypatch):
         audit=0.0,
         cfg=OptimizeConfig(model_ref="m"),
     )
-    assert found.models == (HAIKU_MODEL, SONNET_MODEL) and found.efforts == (None, "low")
+    # every role runs on the session's model and effort by default (Opus 5.5, high)
+    assert found.models == (DEFAULT_MODEL, DEFAULT_MODEL) and found.efforts == ("high", "high")
     holder = Holder()  # the GPU is busy: the evaluation queues behind it
     try:
         out = evaluate("v1.py", FIXTURES["buffer_by_data_ptr"][0])
@@ -932,13 +933,13 @@ def test_the_model_withdraws_a_queued_job(tmp_path, monkeypatch):
         holder.release()
     assert out["status"] == "reviewed" and evaluator.calls == 0
     assert out["review"]["by"] == "escalation" and out["review"]["check"] == "cached_outputs"
-    assert model.asked == [(HAIKU_MODEL, None), (SONNET_MODEL, "low")]  # triage, escalation
+    assert model.asked == [(DEFAULT_MODEL, "high"), (DEFAULT_MODEL, "high")]  # triage, escalation
     assert "withdrawn" in gpu_states(run) and not ledger.rows(run)
     (rec,) = critic.load(run).values()
     assert (
         rec["withdrawn"]
         and rec["static"] == UNSURE
-        and rec["models"] == [HAIKU_MODEL, SONNET_MODEL]
+        and rec["models"] == [DEFAULT_MODEL, DEFAULT_MODEL]
     )
     costs = read_json(run.root / "costs.json")
     assert (
@@ -1090,8 +1091,9 @@ def test_cli_and_improve_config(monkeypatch, tmp_path):
 
 
 def test_the_critic_role_registry():
-    assert roles.model_for("critic-escalation", OptimizeConfig(model_ref="m")) == SONNET_MODEL
-    assert roles.effort_for("critic", OptimizeConfig(model_ref="m")) is None  # Haiku: none
+    # every role runs on the session model and effort by default (Opus 5.5, high)
+    assert roles.model_for("critic-escalation", OptimizeConfig(model_ref="m")) == DEFAULT_MODEL
+    assert roles.effort_for("critic", OptimizeConfig(model_ref="m")) == "high"
     assert "critic-escalation" not in roles.PROGRAM_ROLES and not roles.problems()
 
 

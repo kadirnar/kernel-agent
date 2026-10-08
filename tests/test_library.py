@@ -410,8 +410,8 @@ def test_librarian_distils_lessons_through_the_orchestrator(tmp_path, monkeypatc
 
     orch.agent_runner = agent
     asyncio.run(orch.librarian())
-    assert seen["name"] == "librarian" and seen["cfg"].effort == "low"
-    assert seen["cfg"].claude_model == "claude-sonnet-5-5"  # distillation: Sonnet (#181)
+    assert seen["name"] == "librarian" and seen["cfg"].effort == "high"
+    assert seen["cfg"].claude_model == "claude-opus-5-5"  # every role on Opus 5.5 by default
     assert seen["cfg"].max_turns_per_agent == 8
     assert seen["schema"]["schema"] == library.LESSONS_SCHEMA
     assert "fused rmsnorm kernel v2" in seen["system"] and "one program per row" in seen["system"]
