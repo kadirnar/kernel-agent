@@ -174,8 +174,10 @@ def test_precision_classes_tier_and_defaults():
     for name in INT8:
         assert name in compare.REDUCED_PRECISIONS and name in compare.PRECISIONS
         assert compare.tier_for("near-lossless", name) == compare.NEAR_LOSSLESS_TIER
+        assert compare.tier_for("relaxed", name) == compare.RELAXED_TIER  # #175: 8-bit tier
         assert compare.tier_for("exact", name) == compare.EXACT_TIER
         assert name in precisions.default("near-lossless") and name not in precisions.OPT_IN
+        assert name in precisions.default("relaxed")  # the default mode of new runs
         enum = prompts.PLAN_SCHEMA["properties"]["targets"]["items"]["properties"]["precision"]
         assert name in enum["enum"]
         assert precisions.parse(f"{name},exact") == ["exact", name]
@@ -233,6 +235,9 @@ def test_planner_policy_and_exact_runs():
     only = prompts.precision_policy("near-lossless", ["exact", "fp8_w8a8"])
     assert "`int8_weights`, `int8_w8a8`" in only.split("not allowed")[0]  # named as refused
     assert '`precision: "int8_w8a8"`' not in only
+    relaxed = prompts.precision_policy("relaxed", None, (8, 6))  # #175, the default mode
+    assert '`precision: "int8_w8a8"`' in relaxed and "INT8 activation scales" in relaxed
+    assert "**relaxed** run" in relaxed and '`precision: "fp8_w8a8"`' not in relaxed
 
 
 def _target(precision: str) -> dict:

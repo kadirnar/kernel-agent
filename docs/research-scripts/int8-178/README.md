@@ -28,5 +28,6 @@ Run GPU jobs under the GPU lock:
   percentile), judged by `kernels.compare` in the near-lossless tier on the captured inputs,
   on the evaluator's redrawn draws (`verify.perturb_`) and on its scaled checks (x 3, x 0.01,
   x -1), with a per-`nn.Linear` table (`results/calib_dit.out`, `calib_lm.out`,
-  `calib_alpha.out`, `calib_qwen3_mlp.out`).
+  `calib_alpha.out`, `calib_qwen3_mlp.out`); with `CALIB_TIER=relaxed` judged in #175's
+  relaxed tier (`results/calib_*_relaxed.out`).
 * `int8lib.py`: the examples as modules, CUDA-graph and streamed timing.

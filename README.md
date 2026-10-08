@@ -1072,6 +1072,12 @@ near-lossless tier.
 | Qwen3-0.6B MLP, decode (1) | FP8 W8A8 / FP8 weights | 0.052 / 0.038 | 0.99867 | 0.57 % | 0 / 24 | pass |
 | Qwen3-0.6B MLP, decode (1) | INT8 W8A8 + SmoothQuant from one decode token | 0.44 | 0.906 | 3.4 % | 12 / 12 | fail |
 
+In the **relaxed** tier (#175, the default mode of new runs; `results/calib_*_relaxed.out`)
+every correct INT8 recipe passes every check of these captures, plain per-token INT8 W8A8
+on the LocDiT layer too (norm 2.1 % captured and 4.0 % at x 0.01, within ±4 % / ±6 %), and
+every broken variant below still fails at least one capture (a static calibrated activation
+scale passes the base-LM decode layer there; it fails the LocDiT and Qwen3 ones).
+
 INT8 weights are the most accurate 8-bit weight format here. INT8 W8A8 matches FP8 W8A8 on
 activations without outlier channels (the LocDiT's q / k / v / o projections, crest 23-24:
 0.007-0.018 vs 0.008-0.020 per `nn.Linear`) and fails the tier on the LocDiT MLP (token
@@ -1084,7 +1090,8 @@ first token's scale, a zeroed output channel, a static calibrated activation sca
 activations clipped at their 99.9th percentile, and a per-tensor activation scale (passes
 the captured LocDiT inputs at 0.041, fails the x 0.01 check). The CPU calibration test
 (`tests/test_perturbed_calibration.py`) runs both classes' reference math and these
-broken variants on the synthetic massive-activation MLP.
+broken variants on the synthetic massive-activation MLP in both modes, and #175's blatant
+bugs (int4 per tensor, scales x 1.2, an unwritten row, gate / up swapped) for both classes.
 
 ### What "faster" means
 

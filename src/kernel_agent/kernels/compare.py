@@ -95,6 +95,10 @@ GLOBAL_TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
 #: Broken INT8 kernels fail: weight scales x 1.05, a neighbour channel's scale, the first
 #: token's scale, a zeroed output channel, a static (calibrated) activation scale, activations
 #: clipped at their 99.9th percentile, and a per-tensor activation scale (the x0.01 check).
+#: In the ``relaxed`` tier every correct INT8 recipe passes, plain per-token INT8 W8A8 on the
+#: LocDiT too (norm 2.1 % captured, 4.1 % at x0.01, within 4 % / 6 %), and each broken one
+#: still fails at least one capture (a static calibrated activation scale passes the VoxCPM2
+#: LM decode layer there, as it fails the LocDiT and Qwen3 ones).
 EXACT_TIER = "exact"
 NEAR_LOSSLESS_TIER = "near-lossless"
 #: ``near-lossless-fp4``: the near-lossless checks with the wider bounds of block-scaled FP4

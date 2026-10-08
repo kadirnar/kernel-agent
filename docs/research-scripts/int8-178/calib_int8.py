@@ -3,7 +3,8 @@ fp8-sm120/accuracy.py: every nn.Linear of a module replaced by a recipe's refere
 (kernels/quant.py, on the GPU: torch._int_mm), judged by the evaluator's own comparisons
 (kernels.compare) in the near-lossless tier on the captured inputs, on redrawn inputs
 (kernels.verify.perturb_: normal and mixed draws) and on the scaled inputs (x3, x0.01, x-1),
-both with the redrawn bounds. Broken variants run fewer draws.
+both with the redrawn bounds (CALIB_TIER=relaxed: the relaxed tier's). Broken variants run
+fewer draws.
 
 Usage: calib_int8.py dit|lm|alpha [normal_draws mixed_draws] | capture <capture_inputs.pt>
 [normal_draws mixed_draws [cases]] (`alpha`: SmoothQuant alpha 0.3-0.8 on the LocDiT layer;
@@ -11,6 +12,7 @@ Usage: calib_int8.py dit|lm|alpha [normal_draws mixed_draws] | capture <capture_
 
 import contextlib
 import copy
+import os
 import sys
 
 import torch
@@ -22,7 +24,7 @@ from kernel_agent.kernels.verify import SCALED, perturb_, scale_
 RUNS = "/home/kadir/kadir_projects/kernel-agent/runs/openbmb--VoxCPM2"
 DIT = f"{RUNS}/20261006-004718-retest2/targets/dit_layer__fp8_w8a8/capture_inputs.pt"
 LM = f"{RUNS}/20261005-192504/targets/lm_step_fp8/capture_inputs.pt"
-TIER = "near-lossless"
+TIER = os.environ.get("CALIB_TIER", "near-lossless")  # or relaxed (#175)
 torch.backends.cuda.matmul.allow_tf32 = False
 
 

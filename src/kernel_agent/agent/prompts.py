@@ -540,8 +540,9 @@ sm_86, where `fp8_w8a8` does not exist). On a GPU with both, decide from the mea
 and the activations: INT8 where its *INT8 W8A8* floor is at or below the *W8A8* one (on
 sm_120 s8 `mma.sync` runs at twice plain e4m3's rate) and the GEMMs' input activations have
 no outlier channels; FP8 where they do (a token's amax tens of times its RMS: int8's uniform
-step flushes the small values to zero, a biased error the tier rejects: VoxCPM2's LocDiT MLP,
-norm -2.1 %) or where the INT8 peak is the lower one (Blackwell Ultra, sm_103). Its
+step flushes the small values to zero, a biased error: VoxCPM2's LocDiT MLP, norm -2.1 %,
+beyond near-lossless's ±2 %, within relaxed's ±4 %) or where the INT8 peak is the lower one
+(Blackwell Ultra, sm_103). Its
 `precision_why` names M, the FLOP-bound number and the activations' crest.""",
     "fp8_mx": """`precision: "fp8_mx"` (MXFP8 W8A8: e4m3 weights and activations with one
 power-of-two ue8m0 scale per 32 elements along K on both operands, applied by the
@@ -571,7 +572,8 @@ checks fail them. Activation outlier channels (crest above ~20) need SmoothQuant
 (`kernel_agent.kernels.quant.smoothquant_factors`: per-input-channel factors from many
 captured tokens, alpha ~0.4, folded into the producer and the weights; a larger alpha fits
 the captured outliers and fails the redrawn-input check) or those GEMMs in FP8 / bf16 inside
-the target.""",
+the target; in a relaxed run plain per-token scales fit the tier on such inputs too (the
+perceptual gate decides), and SmoothQuant still halves their error.""",
     "reduced": """`precision: "reduced"` (also
 with `precision_why`) is for another numerics-changing idea.""",
     "fp8_kv": """`precision: "fp8_kv"` (an FP8 e4m3 KV cache, one scale per
