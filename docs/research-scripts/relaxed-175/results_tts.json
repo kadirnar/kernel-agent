@@ -1,0 +1,79 @@
+{
+ "eager": {
+  "error_rate": 0.0,
+  "mos": 3.2553,
+  "audio_s": 3.8
+ },
+ "results": [
+  {
+   "variant": "FP8 weights (343 nn.Linear)",
+   "error_increase": 0.0,
+   "speaker_similarity": 0.988,
+   "speaker_similarity_worst": 0.9656,
+   "mos_drop": -0.035,
+   "mean_step_cosine": 0.9866,
+   "min_step_cosine": 0.6496,
+   "near_lossless": true,
+   "relaxed": true,
+   "near_lossless_reason": "",
+   "relaxed_reason": "",
+   "s": 63.0
+  },
+  {
+   "variant": "NVFP4 weights (343)",
+   "error_increase": 0.0,
+   "speaker_similarity": 0.9783,
+   "speaker_similarity_worst": 0.9572,
+   "mos_drop": 0.091,
+   "mean_step_cosine": 0.9481,
+   "min_step_cosine": 0.5708,
+   "near_lossless": false,
+   "relaxed": true,
+   "near_lossless_reason": "floor",
+   "relaxed_reason": "",
+   "s": 83.7
+  },
+  {
+   "variant": "MXFP4 weights (343)",
+   "error_increase": 0.0,
+   "speaker_similarity": 0.9725,
+   "speaker_similarity_worst": 0.9526,
+   "mos_drop": 0.271,
+   "mean_step_cosine": 0.9132,
+   "min_step_cosine": 0.5248,
+   "near_lossless": false,
+   "relaxed": true,
+   "near_lossless_reason": "floor",
+   "relaxed_reason": "",
+   "s": 63.9
+  },
+  {
+   "variant": "RMSNorm eps 1e-2",
+   "error_increase": 0.7417,
+   "speaker_similarity": 0.9118,
+   "speaker_similarity_worst": 0.7095,
+   "mos_drop": 0.416,
+   "mean_step_cosine": 0.704,
+   "min_step_cosine": 0.1024,
+   "near_lossless": false,
+   "relaxed": false,
+   "near_lossless_reason": "error rate 0.742 vs eager 0.000 (+0.742, allowed +0.05); speaker similarity 0.912 < 0.93; speaker similarity of sample 6 0.710 < 0.85; MOS 2.840 vs eager 3.255 (-0.416, allowed -0.3)",
+   "relaxed_reason": "error rate 0.742 vs eager 0.000 (+0.742, allowed +0.1); speaker similarity of sample 6 0.710 < 0.8",
+   "s": 51.5
+  },
+  {
+   "variant": "int4 per tensor (343)",
+   "error_increase": 1.0,
+   "speaker_similarity": 0.6203,
+   "speaker_similarity_worst": 0.3247,
+   "mos_drop": 2.018,
+   "mean_step_cosine": 0.2146,
+   "min_step_cosine": -0.1144,
+   "near_lossless": false,
+   "relaxed": false,
+   "near_lossless_reason": "error rate 1.000 vs eager 0.000 (+1.000, allowed +0.05); speaker similarity 0.620 < 0.93; speaker similarity of sample 6 0.325 < 0.85; MOS 1.237 vs eager 3.255 (-2.018, allowed -0.3)",
+   "relaxed_reason": "error rate 1.000 vs eager 0.000 (+1.000, allowed +0.1); speaker similarity 0.620 < 0.9; speaker similarity of sample 6 0.325 < 0.8; MOS 1.237 vs eager 3.255 (-2.018, allowed -0.45)",
+   "s": 203.8
+  }
+ ]
+}
