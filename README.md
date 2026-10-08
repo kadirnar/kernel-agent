@@ -478,7 +478,11 @@ relaxed tiers reject every broken variant that the near-lossless ones reject on
 the captured inputs, in at least one case of each capture, except where both
 miss it: two swapped query heads of the first VoxCPM2 layers (their heads
 attend alike) and an unwritten output row under FP4's noise. MXFP4 weights and
-MXFP8 at decode, which near-lossless rejects, pass. The synthetic fixture of
+MXFP8 at decode, which near-lossless rejects, pass (on the CPU, whose MXFP8
+reference math runs in fp32, MXFP8 at decode still fails 1 of 60 redrawn
+draws, norm 6.3 %: it is not a decode precision, `fp8_weights` is; the CPU run
+gives the GPU run's verdict on every captured case and differs by one redrawn
+draw in three (capture, broken FP4 variant) pairs). The synthetic fixture of
 `tests/test_perturbed_calibration.py` (a CPU MLP with a massive-activation
 writer row) runs the reference math of every precision through the evaluator
 in both modes, and int4 per tensor, weight scales x 1.2, an unwritten output
