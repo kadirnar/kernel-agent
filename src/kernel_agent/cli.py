@@ -155,6 +155,42 @@ def _precisions(raw: str) -> list[str]:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+def _role_model(raw: str) -> dict[str, str | None]:
+    """``--role-model ROLE=MODEL`` (``roles.parse_settings``)."""
+    from kernel_agent import roles
+
+    try:
+        return roles.parse_settings([raw])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _role_effort(raw: str) -> dict[str, str | None]:
+    """``--role-effort ROLE=LEVEL`` (``roles.parse_settings``)."""
+    from kernel_agent import roles
+
+    try:
+        return roles.parse_settings([raw], effort=True)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _role_settings(ns: argparse.Namespace, key: str, defaults: bool = True) -> dict[str, Any]:
+    """``role_models`` / ``role_efforts`` of the config: the defaults (``config.py``; without
+    ``defaults`` none) with every ``--role-model`` / ``--role-effort`` over them, and
+    ``--librarian-model`` for the librarian."""
+    from kernel_agent.config import ROLE_EFFORTS, ROLE_MODELS
+
+    out: dict[str, Any] = {}
+    if defaults:
+        out.update(ROLE_MODELS if key == "role_models" else ROLE_EFFORTS)
+    if key == "role_models" and getattr(ns, "librarian_model", None):
+        out["librarian"] = ns.librarian_model
+    for given in getattr(ns, key, None) or []:
+        out.update(given)
+    return out
+
+
 def _config(ns: argparse.Namespace) -> OptimizeConfig:
     return OptimizeConfig(
         model_ref=ns.model,
@@ -200,7 +236,8 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         precisions=ns.precisions,
         use_library=not ns.no_library,
         librarian=not ns.no_librarian,
-        librarian_model=ns.librarian_model,
+        role_models=_role_settings(ns, "role_models"),
+        role_efforts=_role_settings(ns, "role_efforts"),
         hf_token=os.environ.get("HF_TOKEN"),
         verbose=ns.verbose,
     )
@@ -241,6 +278,9 @@ def cmd_resume(ns: argparse.Namespace) -> int:
         overrides["auth"] = ns.auth
     if ns.precisions:  # recorded in run.json (precisions.py)
         overrides["precisions"] = ns.precisions
+    for key in ("role_models", "role_efforts"):  # over the run's, per role (#181)
+        if given := _role_settings(ns, key, defaults=False):
+            overrides[key] = given
     from kernel_agent.workspace import RunDir, coordinator_lock
 
     with coordinator_lock(RunDir(Path(ns.run_dir).resolve())):  # one process per run
@@ -507,6 +547,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-transforms", action="store_true", help="skip model-level transforms")
     p.add_argument("--claude-model", default=DEFAULT_MODEL)
     p.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
+    _add_role_args(p)
     p.add_argument("--max-turns", type=int, default=120)
     p.add_argument("--budget", type=float, default=None, help="USD cap per agent")
     p.add_argument(
@@ -587,7 +628,9 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         default=0.01,
         help="integration: the 95%% CI of an item's A/B gain must start above this",
     )
-    p.add_argument("--librarian-model", help="model of the librarian (default: --claude-model)")
+    p.add_argument(
+        "--librarian-model", help="model of the librarian (= --role-model librarian=MODEL)"
+    )
     p.add_argument(
         "--no-recheck",
         action="store_true",
@@ -611,6 +654,32 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     )
     _add_precisions_arg(p)
     p.add_argument("--verbose", "-v", action="store_true")
+
+
+def _add_role_args(p: argparse.ArgumentParser) -> None:
+    from kernel_agent.config import ROLE_EFFORTS, ROLE_MODELS
+
+    models = ", ".join(f"{r}={m}" for r, m in ROLE_MODELS.items() if m != "inherit")
+    efforts = ", ".join(f"{r}={e}" for r, e in ROLE_EFFORTS.items() if e != "inherit")
+    p.add_argument(
+        "--role-model",
+        action="append",
+        type=_role_model,
+        dest="role_models",
+        metavar="ROLE=MODEL",
+        help="the model of one role (repeatable; inherit: --claude-model). Default: "
+        f"--claude-model, except {models}. Recorded in run.json; given to a run that exists "
+        "(improve, resume), it replaces that role's",
+    )
+    p.add_argument(
+        "--role-effort",
+        action="append",
+        type=_role_effort,
+        dest="role_efforts",
+        metavar="ROLE=LEVEL",
+        help="the effort of one role (repeatable; low, medium, high, xhigh, max; inherit: "
+        f"--effort; none: the model's default). Default: --effort, except {efforts}",
+    )
 
 
 def _add_precisions_arg(p: argparse.ArgumentParser) -> None:
@@ -672,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--until", choices=["plan", "capture", "kernels", "transforms", "integrate"])
     p.add_argument("--claude-model")
+    _add_role_args(p)
     p.add_argument("--program", metavar="FILE", help="replace the run's program.md with FILE")
     _add_auth_arg(p, default=None)  # None: the run's
     _add_precisions_arg(p)

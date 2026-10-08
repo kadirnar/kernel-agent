@@ -326,9 +326,10 @@ def test_dry_run_research_trigger_and_cap(tmp_path):
     # through Orchestrator._agent: program.md, events, costs
     reviews = [x for x in world.sessions if x["name"].startswith("research-")]
     assert len(reviews) == len(sessions)
-    system = reviews[0]["system"]
-    assert "pathology checklist" in system and "# Evidence" in system and "## Ideas" in system
+    system, brief = reviews[0]["system"], reviews[0]["prompt"]
+    assert "pathology checklist" in system and "# Evidence" in brief and "## Ideas" in brief
     assert "# Program" in system and "## research" in system and "## kernel" not in system
+    assert {r["system"] for r in reviews} == {system}  # one prefix for every review (#181)
     assert {s["label"] for s in sessions} <= set(read_json(run.root / "costs.json"))
     events = ledger.events(run)
     starts = [e for e in events if e["event"] == "agent_start" and e["agent"].startswith("res")]
@@ -338,8 +339,8 @@ def test_dry_run_research_trigger_and_cap(tmp_path):
     first = sessions[0]
     at = world.sessions.index(reviews[0])
     after = next(x for x in world.sessions[at:] if x["name"] == f"kernel-{first['arm']}")
-    assert "## Research plan" in after["system"] and "## Ranked directions" in after["system"]
-    top = re.search(r"^1\. `([a-z0-9_-]+)`", after["system"].split("## Research plan")[1], re.M)
+    assert "## Research plan" in after["prompt"] and "## Ranked directions" in after["prompt"]
+    top = re.search(r"^1\. `([a-z0-9_-]+)`", after["prompt"].split("## Research plan")[1], re.M)
     rows = [r for r in ledger.rows(run) if r["target"] == first["arm"]]
     assert next(r for r in rows if r["exp"] > first["exp"])["idea"] == top[1]
 
@@ -396,18 +397,21 @@ def test_orchestrator_research_session(tmp_path):
     dossier = run.target("attn") / "research.md"  # the web tools on: it may update it
     assert kw["tools"] == ["Read", "Glob", "Grep", "Write"] and kw["writable"] == [plan, dossier]
     assert kw["mcp_tools"] == ["mcp__ka__best_result"] and why in kw["prompt"]
-    system = kw["system_append"]
+    # the role's part (system prompt) and the target's (first message, #181)
+    system, brief = kw["system_append"], kw["prompt"]
     for text in ("# Diagnose: pathology checklist", "Repetition loop", "Correctness wall"):
         assert text in system
-    assert "the ceiling, not the current number" in system and str(plan) in system
+    assert "the ceiling, not the current number" in system and str(plan) in brief
     assert "## Do not try" in system and "## Retry (failed, not refuted)" in system
+    assert "attn" not in system and str(run.root) not in system
     # the evidence: why, the best result with its speed of light per case, ideas, rows
-    assert f"* {why}. 3 evaluations so far: 1 kept, 1 failed." in system
-    assert "1.500x module speedup" in system
-    assert "% of its recipe's roofline (memory bound)" in system
-    assert "| `a0[1, 1, 1024]:bfloat16` | 127 |" in system
-    assert "| `splitk` | 2 | 1.500x | 1.80x |" in system and "| `tile64` | 1 | 1.400x |" in system
-    assert "| exp | status | speedup | % SOL | idea |" in system
+    assert f"* {why}. 3 evaluations so far: 1 kept, 1 failed." in brief
+    assert "1.500x module speedup" in brief
+    assert "% of its recipe's roofline (memory bound)" in brief
+    assert "| `a0[1, 1, 1024]:bfloat16` | 127 |" in brief
+    assert "| `splitk` | 2 | 1.500x | 1.80x |" in brief and "| `tile64` | 1 | 1.400x |" in brief
+    assert "| exp | status | speedup | % SOL | idea |" in brief
+    assert brief.index("# Evidence") < brief.index("# Task\nTarget `attn` has plateaued")
     assert "# Program" in system and "untested, not refuted" in system  # `## research`
     assert read_json(run.root / "costs.json")["research-attn#3"]["usd"] == 0.5
 

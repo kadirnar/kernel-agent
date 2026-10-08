@@ -8,8 +8,10 @@ reads a section:
 * ``## planner``, ``## kernel`` (``kernel-<target>`` agents), ``## systems``,
   ``## native`` (the systems-native agent of native engines, issue #134),
   ``## harness``, ``## research`` (``research-<target>``: plateau reviews),
-  ``## refactor`` (``refactor-<target>``: rewrites of region targets) – that
-  role only; ``## kernel, systems`` names several roles.
+  ``## refactor`` (``refactor-<target>``: rewrites of region targets),
+  ``## dossier`` (``dossier-<target>``: documentation before a target's first
+  session), ``## librarian`` – that role only (:data:`ROLES`: the role registry's,
+  ``roles.py``); ``## kernel, systems`` names several roles.
 
 Other ``##`` headings are ignored with a warning; text above the first ``##``
 heading and ``<!-- comments -->`` are for humans and never reach an agent.
@@ -33,9 +35,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from kernel_agent import roles
 from kernel_agent.workspace import RunDir
 
-ROLES = ("planner", "kernel", "systems", "native", "harness", "research", "refactor")
+ROLES = roles.PROGRAM_ROLES  # the roles of the registry with a section (#181)
 SECTIONS = ("all", *ROLES)
 FILENAME = "program.md"
 TEMPLATE = Path(__file__).parent / "agent" / "program.md"
@@ -47,8 +50,9 @@ _COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 
 def role_of(agent: str) -> str | None:
-    """Role of an orchestrator agent name (``kernel-rmsnorm`` → ``kernel``), or None."""
-    role = agent.split("-", 1)[0].lower()
+    """Role of an orchestrator agent name (``kernel-rmsnorm`` → ``kernel``) with a
+    ``program.md`` section, or None."""
+    role = roles.role_of(agent)
     return role if role in ROLES else None
 
 

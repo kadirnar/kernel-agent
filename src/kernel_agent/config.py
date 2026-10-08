@@ -8,6 +8,41 @@ from typing import Any
 
 ALL_BACKENDS = ("cuda", "triton", "cute", "tilelang", "nvrtc")
 DEFAULT_MODEL = "claude-opus-5-5"
+SONNET_MODEL = "claude-sonnet-5-5"
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+#: A role's model or effort that is the session's: ``--claude-model`` / ``--effort``.
+INHERIT = "inherit"
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+#: The model of each role (#181, docs/MULTIAGENT.md §3.12.1; ``roles.py`` is the registry):
+#: the creative work and the planning on ``--claude-model``, high-volume retrieval and
+#: distillation on Sonnet, the critic's static triage on Haiku. ``--role-model ROLE=MODEL``
+#: changes one (``inherit``: back to ``--claude-model``).
+ROLE_MODELS = {
+    "planner": INHERIT,
+    "kernel": INHERIT,
+    "systems": INHERIT,
+    "native": INHERIT,
+    "research": INHERIT,
+    "refactor": INHERIT,
+    "harness": INHERIT,
+    "dossier": SONNET_MODEL,
+    "librarian": SONNET_MODEL,
+    "critic": HAIKU_MODEL,
+    "doc-lookup": SONNET_MODEL,
+    "profile-analyst": SONNET_MODEL,
+    "reviewer": INHERIT,
+}
+#: The effort of each role (``--role-effort ROLE=LEVEL``; ``inherit``: ``--effort``; None:
+#: none set, the model's default). Opus 5.5's default is medium: every Opus role inherits
+#: ``--effort`` (high).
+ROLE_EFFORTS: dict[str, str | None] = {
+    **{role: INHERIT for role in ROLE_MODELS},
+    "dossier": "low",
+    "librarian": "low",
+    "critic": None,
+    "doc-lookup": "low",
+    "profile-analyst": "medium",
+}
 #: ``--quality`` (kernels/compare.py ``QUALITIES``, without importing torch) and the mode of
 #: a new run (#175).
 QUALITIES = ("exact", "near-lossless", "relaxed")
@@ -76,6 +111,9 @@ class OptimizeConfig:
 
     claude_model: str = DEFAULT_MODEL
     effort: str | None = "high"
+    #: Model and effort per role (:data:`ROLE_MODELS`, :data:`ROLE_EFFORTS`; ``roles.py``).
+    role_models: dict[str, str] = field(default_factory=lambda: dict(ROLE_MODELS))
+    role_efforts: dict[str, str | None] = field(default_factory=lambda: dict(ROLE_EFFORTS))
     max_turns_per_agent: int = 120
     budget_usd_per_agent: float | None = None
     permission_mode: str = "bypassPermissions"
@@ -100,9 +138,7 @@ class OptimizeConfig:
 
     # Cross-run kernel library + lessons (kernel_agent/library.py).
     use_library: bool = True  # reuse prior winners and lessons, store this run's winners
-    librarian: bool = True  # distil lessons after the report (a cheap agent)
-    librarian_model: str | None = None  # None: claude_model
-    librarian_effort: str | None = "low"
+    librarian: bool = True  # distil lessons after the report (a cheap agent: role_models)
 
     hf_token: str | None = None
     verbose: bool = False
@@ -118,5 +154,13 @@ class OptimizeConfig:
         data = dict(data)
         data["runs_dir"] = Path(data.get("runs_dir", "runs"))
         data.setdefault("quality", "exact")  # made before --quality: an exact run
+        if "role_models" not in data:  # made before #181: every role on --claude-model
+            data["role_models"] = {role: INHERIT for role in ROLE_MODELS}
+            data["role_models"]["librarian"] = data.get("librarian_model") or INHERIT
+            efforts = data["role_efforts"] = {role: INHERIT for role in ROLE_EFFORTS}
+            efforts.update(dossier="low", librarian=data.get("librarian_effort", "low"))
+        # roles added since the run was made get their defaults
+        data["role_models"] = {**ROLE_MODELS, **data["role_models"]}
+        data["role_efforts"] = {**ROLE_EFFORTS, **(data.get("role_efforts") or {})}
         known = cls.__dataclass_fields__
         return cls(**{k: v for k, v in data.items() if k in known})

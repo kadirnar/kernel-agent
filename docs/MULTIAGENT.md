@@ -792,6 +792,18 @@ What breaks sharing today:
    **Measure first** (PR 1 records `cache_read_input_tokens`). If the cwd breaks it, use
    one common cwd per role (the run root) with absolute paths to the session's own
    directory, or a custom `system_prompt` string that puts our stable prefix first.
+   *Measured in PR 1 (#181), Claude Code 2.1.286 against a local fake API*: the system
+   prompt is `[billing header, "You are Claude Code…" (breakpoint), preset + append
+   (breakpoint)]`; the environment (cwd, platform, model) comes as a `system` message
+   after the first user message, so the cwd does not break the prefix. The billing
+   header changes per session (a fingerprint of the first message) and, for some
+   accounts, per request (`cc_prev_req`, turn index); Claude Code's own cross-session
+   sharing ([S46] of the literature review) implies the API keeps it out of the cache
+   key. Before PR 1 a new session read 11,791 tokens (tools + the preamble block) in
+   every kernel, systems and native session of the VoxCPM2 runs; with the target and
+   digest moved to the first message, every session of a role sends the same system
+   blocks. The first real run confirms it: `costs.json` `first_usage` of a role's later
+   sessions should read the role's system prompt on top of those 11,791 tokens.
 
 Design:
 

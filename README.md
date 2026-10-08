@@ -2334,8 +2334,9 @@ in karpathy/autoresearch (`kernel_agent/program.py`). Each `## <section>` is
 appended to the system prompt of the matching agents. `## all` goes to every
 agent. `## planner`, `## kernel` (each `kernel-<target>` agent), `## systems`,
 `## harness`, `## research` (each `research-<target>` session, see "Research
-on plateaus") and `## refactor` (each `refactor-<target>` session of a region
-target) go to that role only. A heading can name several roles
+on plateaus"), `## refactor` (each `refactor-<target>` session of a region
+target), `## dossier` (each `dossier-<target>` session) and `## librarian` go
+to that role only (the roles of `kernel_agent/roles.py`). A heading can name several roles
 (`## kernel, systems`). Unknown sections are ignored with a warning. Text
 above the first `##` heading and `<!-- comments -->` are not sent to agents.
 
@@ -2734,7 +2735,8 @@ guide in its prompt (`kernel_agent/skills.py`, `kernel_agent/roles.py`):
   role (`kernel-mlp` → `kernel-engineer`) and passes the helpers its definition lists
   (`Agent(...)` in its tools) to the SDK as agent definitions: kernel, systems and
   native sessions may delegate to all three, the planner and research sessions to
-  `doc-lookup` and `profile-analyst`. Helpers inherit the session's model, have
+  `doc-lookup` and `profile-analyst`. Helpers run on their role's model and effort (see
+  "Roles, models and the prompt cache"), have
   read-only tools (no web tools with `--no-web`), preload their skills and run under the
   session's hooks (write guard, Claude files guard, WebFetch allowlist). A session that
   ends a turn while a background helper still runs gets a second result; the runner
@@ -2756,6 +2758,50 @@ guide in its prompt (`kernel_agent/skills.py`, `kernel_agent/roles.py`):
 * **For contributors**: [AGENTS.md](AGENTS.md) (and a short `CLAUDE.md` pointing to it).
   **For Claude Code users**: `kernel-agent install-claude-code` ("Using it interactively
   from Claude Code").
+
+### Roles, models and the prompt cache
+
+Every session belongs to a role of one registry (`kernel_agent/roles.py`, #181; design:
+[docs/MULTIAGENT.md](docs/MULTIAGENT.md) §3.12–3.13): its model and effort, its turns,
+its built-in and kernel-agent tools, whether it needs the GPU, the helpers it may delegate
+to and the skills it loads first. `Orchestrator._agent` builds each session from it, so
+the per-call settings (the dossier's effort and turns, the native session's 3 × turns, the
+librarian's model) live in one place, and `program.md`'s sections are its roles.
+
+* **Model and effort per role** (`config.ROLE_MODELS` / `ROLE_EFFORTS`, recorded in
+  `run.json`): the creative and planning roles (kernel, systems, native, planner, research,
+  refactor, harness, the `reviewer` helper) run on `--claude-model` at `--effort`; the
+  dossier, the librarian and the `doc-lookup` helper on Sonnet 5.5 (`claude-sonnet-5-5`)
+  at effort `low`, `profile-analyst` on Sonnet at `medium`; the critic (#174, not run yet)
+  on Haiku 4.5. `--role-model ROLE=MODEL` and `--role-effort ROLE=LEVEL` change one
+  (repeatable; `inherit` = `--claude-model` / `--effort`, an effort of `none` sets none);
+  given to `improve` or `resume` on a run that exists, they replace those roles' settings
+  and the run keeps the others. A run made before the registry keeps every role on
+  `--claude-model`. On a subscription this keeps the high-volume, low-judgement sessions
+  out of the Opus usage window.
+* **Prompt order for the cache.** The kernel engineer, systems, native and research
+  prompts come in two parts (`prompts.stable_prefix` and the role's target block). The
+  system prompt of a session is its role's stable prefix (task, files, contracts, tools,
+  rules, the role's skills, the environment and GPU) plus the role's notes (`program.md`,
+  documentation), byte-identical for every session of the role on a run. The target block
+  (target, cases, workload, precision, backends and their skills, evaluation budget), the
+  slice digest and the `# Budget` note go into the first message, after the cached part.
+  Claude Code ends the system prompt with a cache breakpoint, so a later session of the
+  role can read it from the cache instead of writing it again (Claude Code's main
+  conversation gets a 1-hour cache on a subscription; `first_usage` in `costs.json` shows
+  what a session read). Before, every session's system prompt held its own target and digest,
+  and a new session read only the tools and Claude Code's preamble from the cache (11,791
+  tokens in every kernel, systems and native session of the VoxCPM2 runs). Through the
+  bundled Claude Code CLI against a local fake API, three kernel sessions on three targets
+  now send the same tools and the same system blocks; on the VoxCPM2 run's targets the
+  shared kernel system prompt is 22.8k characters and each target block 5.4k–7.5k plus the
+  digest. `tests/test_roles.py` checks both.
+* **Tokens and cache per session**: `costs.json` records each session's role, model and
+  effort, its tokens (`usage`: input, cache writes, cache reads, output; `first_usage`: the
+  same for its first request, which shows what it read of a cache other sessions wrote) and
+  `$` and tokens per model (helpers included). The report's **Usage per role** table gives
+  sessions, model, `$` per session, input tokens, the share read from the cache over whole
+  sessions and over first requests, and output tokens per role.
 
 ### kernel-agent improve: the continuous loop
 
@@ -3424,8 +3470,9 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
   `lessons/<module_family>.md` (`norm`, `attention`, `mlp`, `rope`, ...),
   dropping duplicates and contradicted rules. It runs through the same code as
   the other agents (budgets, `program.md` `## all`, events, `costs.json` →
-  `librarian`). It uses `--librarian-model` (default `--claude-model`) at
-  effort `low` and answers with structured output only. kernel-agent writes the
+  `librarian`). It runs on Sonnet 5.5 at effort `low` (`--role-model
+  librarian=MODEL`, or `--librarian-model MODEL`; see "Roles, models and the
+  prompt cache") and answers with structured output only. kernel-agent writes the
   files itself: only names of this run's backends and module families, at most
   20 rules each. The librarian runs again only when the ledger has new rows.
 * **Safety.** Entries are code that will run. An entry is reused only when
@@ -3606,6 +3653,9 @@ kernel-agent optimize <hf-url> [options]
   --reseed-workers                     round 2 of the workers from the two best snapshots
   --no-transforms                      kernels only
   --claude-model claude-opus-5-5 --effort high --budget 10 (USD per agent)
+  --role-model ROLE=MODEL              one role's model (repeatable; inherit: --claude-model)
+  --role-effort ROLE=LEVEL             one role's effort (repeatable; inherit: --effort; see
+                                       "Roles, models and the prompt cache")
   --max-hours 3 --max-usd 40           budget for the whole run (see "Budgets")
   --max-sessions 30                    agent sessions this invocation may start
   --auth subscription|api|auto         how agents authenticate (see "Authentication and safety")
@@ -3730,9 +3780,11 @@ runs/<org>--<name>/<timestamp>/
                               kernel_agent.artifacts lookups, export_checks.jsonl)
   improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds
   rounds/<n>/                 re-profile (baseline.json, profile/) + plan.json of round n
-  costs.json                  per agent: $, turns, minutes, tools, session_id, program_sha256,
-                              auth, api_key_source, billing (+ usage_limit_waits, web,
-                              gpu_wait_s)
+  costs.json                  per agent: $, turns, minutes, tools, role, model, effort, usage
+                              and first_usage (input, cache write, cache read, output
+                              tokens), models ($ and tokens per model), session_id,
+                              program_sha256, auth, api_key_source, billing (+
+                              usage_limit_waits, web, gpu_wait_s)
   research/sources.jsonl      every WebFetch / WebSearch: time, URL or query, outcome, sha256;
                               every doc_search / doc_read: query and ids, chunk and its source
   .coordinator.lock           flock + pid of the one kernel-agent process working on the run

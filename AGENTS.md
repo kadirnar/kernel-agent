@@ -27,7 +27,8 @@ skills (#126, #176).
 |---|---|
 | `src/kernel_agent/agent/plugin/skills/<name>/` | the agents' know-how as Agent Skills (`SKILL.md` + linked files); the plugin every session loads |
 | `src/kernel_agent/agent/agents/<name>.md` | agent definitions of the roles and helpers (frontmatter + prompt) |
-| `src/kernel_agent/agent/prompts.py` | the run-specific system prompt of each role (target, profile, budget) |
+| `src/kernel_agent/roles.py` | the role registry: model, effort, turns, tools, GPU need, helpers per role; token and cache accounting |
+| `src/kernel_agent/agent/prompts.py` | each role's prompt: a stable prefix (the system prompt every session of the role shares) and its target block (the first message) |
 | `src/kernel_agent/agent/runner.py` | one SDK session: tools, hooks, skills, subagents, isolation |
 | `src/kernel_agent/agent/tools.py` | the MCP tools (`evaluate_candidate`, `sweep_candidate`, `evaluate_e2e`, ...) |
 | `src/kernel_agent/agent/examples/` | verified example candidates of every backend (selftests run them) |

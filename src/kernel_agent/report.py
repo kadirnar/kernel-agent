@@ -14,6 +14,7 @@ from kernel_agent import (
     objective,
     precisions,
     projection,
+    roles,
     strong_baseline,
 )
 from kernel_agent.agent import auth, web
@@ -546,6 +547,7 @@ def write_report(run: RunDir) -> Path:
             lines.append(
                 f"| {name} | {c.get('usd')} | {c.get('turns')} | {c.get('minutes')} | {tools} |"
             )
+        lines += roles.usage_lines(costs)  # cost, tokens and prompt-cache hits per role (#181)
     stops = [
         f"* {phase}: {key.replace('_', ' ')} `{item.get('agent')}` {item.get('reason') or ''}"
         for phase, info in data.get("phases", {}).items()
