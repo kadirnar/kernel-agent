@@ -433,6 +433,14 @@ class World:
         share, _ = self.shares.get(str(cls), (0.0, 1))
         return share * BASELINE_MS
 
+    @property
+    def gated(self) -> bool:
+        """The run's quality mode has the perceptual gate (near-lossless, relaxed): its
+        ``e2e`` records carry ``metrics.perceptual``, as a real run's do."""
+        from kernel_agent.kernels.compare import allows_reduced
+
+        return allows_reduced(self.orch.cfg.quality)
+
     # -------------------------------------------------------- agents
 
     async def run_agent(
@@ -588,7 +596,8 @@ class World:
                     "error": f"{outcome}: simulated failure",
                 }
             else:
-                result = _e2e_result(BASELINE_MS / (outcome * rng.uniform(0.996, 1.004)))
+                ms = BASELINE_MS / (outcome * rng.uniform(0.996, 1.004))
+                result = _e2e_result(ms, gated=self.gated)
             _, row = record_e2e_result(
                 self.run,
                 result,
@@ -633,7 +642,7 @@ class World:
             (project / "csrc" / "engine.cu").write_text(f"// {hypothesis}\n")
             snap = snapshot(self.run, project)
             outcome = level * rng.uniform(0.96, 1.1)
-            result = _e2e_result(BASELINE_MS / outcome)
+            result = _e2e_result(BASELINE_MS / outcome, gated=self.gated)
             record_e2e_result(
                 self.run,
                 result,
@@ -770,7 +779,7 @@ class World:
         key = "+".join(sorted(ledger.item_label(i) for i in [*kernels, *transforms]))
         rng = _rng(self.seed, "e2e", key, len(ledger.rows(self.run)))
         self.clock.advance(rng.uniform(65, 95))
-        result = _e2e_result(ms * rng.uniform(0.997, 1.003))
+        result = _e2e_result(ms * rng.uniform(0.997, 1.003), gated=self.gated)
         if reason:
             result.update(passed=False, reason=reason, metrics={"token_match": 0.32})
         return result
@@ -789,7 +798,7 @@ class World:
             drift = rng.uniform(0.99, 1.01)
             times[0].append(round(a_ms * drift * rng.uniform(0.998, 1.002), 3))
             times[1].append(round(b_ms * drift * rng.uniform(0.998, 1.002), 3))
-        result = _e2e_result(statistics.median(times[1]))
+        result = _e2e_result(statistics.median(times[1]), gated=self.gated)
         result.update(times_ms=times[1], ab={"mode": "paired", "a_ms": times[0], "b_ms": times[1]})
         if reason:
             result.update(passed=False, reason=reason, metrics={"token_match": 0.32})
@@ -901,12 +910,15 @@ def kernel_result(
     return result
 
 
-def _e2e_result(ms: float) -> dict[str, Any]:
+def _e2e_result(ms: float, *, gated: bool = False) -> dict[str, Any]:
+    """A passing simulated ``e2e`` record; ``gated``: of a run whose quality mode has the
+    perceptual gate (near-lossless, relaxed), whose records carry ``metrics.perceptual``."""
+    gate = {"perceptual": {"passed": True, "reason": "", "simulated": True}} if gated else {}
     return {
         "status": "ok",
         "passed": True,
         "reason": None,
-        "metrics": {"token_match": 1.0, "logits_cosine": 0.9998},
+        "metrics": {"token_match": 1.0, "logits_cosine": 0.9998, **gate},
         "median_ms": round(ms, 3),
         "times_ms": [round(ms * 0.997, 3), round(ms, 3), round(ms * 1.004, 3)],
         "baseline_ms": BASELINE_MS,

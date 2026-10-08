@@ -16,6 +16,7 @@ from kernel_agent import (
     strong_baseline,
 )
 from kernel_agent.agent import auth
+from kernel_agent.config import QUALITY_NOTES
 from kernel_agent.workspace import RunDir
 
 
@@ -56,9 +57,11 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
     base = s["baseline_ms"]
     phase = ledger.phase_label(s)
     elapsed = f"  ·  {s['elapsed_min']:.0f} min" if s["elapsed_min"] is not None else ""
+    quality = str((run.load().get("config") or {}).get("quality") or "exact")
     lines = [
         f"{s['repo_id']} ({s['modality'] or '?'})  ·  phase: {phase}{elapsed}",
         f"run: {s['root']}",
+        f"quality: {quality} ({QUALITY_NOTES.get(quality, '?')})"[:width],
         *([line[:width]] if (line := objective.describe(s["baseline"])) else []),  # metric=ttfa
         "",
     ]

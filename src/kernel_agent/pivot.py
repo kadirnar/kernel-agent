@@ -11,7 +11,7 @@ same GEMMs, done as transforms, took the run from 3.3x to 4.7x), a pivot moves i
   plan; each is ``{"target", "precision", "precision_why"[, "approach"]}``, the
   ``precision_why`` backed by numbers (the bound, the ceilings table, a passing transform
   that already uses that precision).
-* **Check** (:func:`check`): ``--quality near-lossless`` only, a reduced precision
+* **Check** (:func:`check`): ``--quality near-lossless`` or ``relaxed`` only, a reduced precision
   (:data:`kernel_agent.kernels.compare.REDUCED_PRECISIONS`) that the run allows
   (``--precisions``, :mod:`kernel_agent.precisions`: no 4-bit by default) other than the
   target's own, a ``precision_why`` with a number in it, a module target (not a region
@@ -93,12 +93,12 @@ def check(
     precisions the run allows (``precisions.py``; None: the default of ``quality``, no
     4-bit)."""
     from kernel_agent import precisions
-    from kernel_agent.kernels.compare import NEAR_LOSSLESS_TIER, REDUCED_PRECISIONS
+    from kernel_agent.kernels.compare import REDUCED_PRECISIONS, allows_reduced
 
     if not spec.get("id"):
         return "no such target"
-    if quality != NEAR_LOSSLESS_TIER:
-        return f"a precision pivot needs --quality near-lossless (this run: {quality})"
+    if not allows_reduced(quality):
+        return f"a precision pivot needs --quality near-lossless or relaxed (this run: {quality})"
     precision = str(proposal.get("precision") or "")
     if precision not in REDUCED_PRECISIONS:
         return f"precision {precision!r} is not one of {', '.join(REDUCED_PRECISIONS)}"

@@ -401,6 +401,11 @@ class VoxCPMWorkload(Workload):
         "min_mean_step_cosine": 0.95,
         "stop_tolerance": 1,
     }
+    #: ``--quality relaxed`` (#175): twice the mean-step budget (1 - 0.95 -> 1 - 0.90) and
+    #: ±2 patches at a near-tie up to a margin of 1.0. NVFP4 weights everywhere (0.948) and
+    #: MXFP4 (0.913) pass it; broken RMSNorm, a dropped KV head and int4 weights (<= 0.70)
+    #: still fail. The min step cosine stays 0.2 (broken RMSNorm reaches 0.10).
+    relaxed_options = {"min_mean_step_cosine": 0.90, "stop_tolerance": 2, "stop_near_tie": 1.0}
 
     def perceptual_samples(self) -> list[dict[str, Any]]:
         """``PERCEPTUAL_TEXTS`` x ``PERCEPTUAL_SEEDS``, natural length (the stop head

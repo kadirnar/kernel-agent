@@ -19,8 +19,13 @@ helpers in `kernel_agent.kernels.kv_quant`: "FP8 KV cache" below).
 
 Only for a target whose spec says `"precision": "fp8_weights"` (or `"fp8_w8a8"`,
 `"fp8_mx"`, `"fp8_kv"`, below), which the planner
-may set in a `--quality near-lossless` run (an exact run refuses such targets).
-The target is then captured in the **near-lossless tolerance tier**
+may set in a `--quality near-lossless` or `--quality relaxed` run (an exact run
+refuses such targets; relaxed, the default of new runs, has the same tiers with
+about twice the error budgets: **relaxed**, cosine >= 0.99, relative L2 error <=
+0.16, norm within ±4 %, every element within 0.75 x RMS + 0.125 x |reference|;
+**relaxed-fp4** and **relaxed-kv** likewise; your prompt states the bounds of the
+tier your target was captured in). In near-lossless the target is captured in
+the **near-lossless tolerance tier**
 (`kernels/compare.py`): instead of per-element (atol, rtol), every output tensor
 needs cosine >= 0.996, relative L2 error <= 0.08, its norm within ±2 % of the
 reference (rounding noise is unbiased, a wrong scale is not) and every element

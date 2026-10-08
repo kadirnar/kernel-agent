@@ -142,7 +142,7 @@ draft == argmax, plus the model's next token), and measure them honestly:
   (the LLM workload before #170) makes a greedy model repeat it, and prompt lookup then looks
   40-67x faster than on real text (Qwen3-0.6B: 65x on the repeated paragraph, 11-14x on
   READMEs, code and a licence).
-* With `--quality near-lossless` an LLM is judged teacher forced (KL and top-1 agreement on
+* With `--quality near-lossless` or `relaxed` an LLM is judged teacher forced (KL and top-1 agreement on
   eager's continuations, the likelihood of its own): the gate calls `model(input_ids)` on a
   prompt plus 64 tokens, so keep plain forward calls of the model working when a transform
   replaces the decode loop.

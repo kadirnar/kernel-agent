@@ -1,11 +1,15 @@
-"""``--quality near-lossless``: the perceptual gate for numerics-changing optimisations.
+"""``--quality near-lossless`` / ``relaxed``: the perceptual gate for numerics-changing
+optimisations.
 
-``exact`` (the default) accepts changes whose numerics stay within rounding noise of the
-baseline: module tolerances (:mod:`kernel_agent.kernels.compare`) and, end to end, the
-workload's own comparison or teacher forcing (:mod:`kernel_agent.workloads.quality`).
-Once a model runs near the memory-bandwidth floor of its bf16 weights, the next big gains
-(FP8 weights, ...) change numerics by design. ``near-lossless`` accepts them when the
-*perceptual* quality stays within the noise of eager:
+``exact`` accepts changes whose numerics stay within rounding noise of the baseline: module
+tolerances (:mod:`kernel_agent.kernels.compare`) and, end to end, the workload's own
+comparison or teacher forcing (:mod:`kernel_agent.workloads.quality`). Once a model runs
+near the memory-bandwidth floor of its bf16 weights, the next big gains (FP8 weights, ...)
+change numerics by design. ``near-lossless`` accepts them when the *perceptual* quality
+stays within the noise of eager; ``relaxed`` (the default of new runs, #175) with about
+twice the error budgets (:data:`RELAXED_GATE`, :meth:`Workload.relaxed_options`, the
+``relaxed`` tiers of :mod:`kernel_agent.kernels.compare`): small measured drops pass,
+broken kernels still fail.
 
 * **Perceptual gate.** The workload declares held-out samples
   (:meth:`~kernel_agent.workloads.base.Workload.perceptual_samples`; VoxCPM: four
@@ -32,13 +36,16 @@ Once a model runs near the memory-bandwidth floor of its bf16 weights, the next 
 * **Sanity floor.** Teacher forcing, the held-out input and the stop check stay, with the
   workload's looser :attr:`~kernel_agent.workloads.base.Workload.near_lossless_options`
   (thresholds that FP8-weight variants pass and broken kernels still fail; the stop check
-  accepts ±1 step at a near-tie). Options the user set (``-o``) win.
+  accepts ±1 step at a near-tie); in ``relaxed`` mode with
+  :attr:`~kernel_agent.workloads.base.Workload.relaxed_options` on top (:func:`floor_options`).
+  Options the user set (``-o``) win.
 * **Module tolerance tier.** Targets whose spec allows reduced precision
-  (``"precision": "reduced"``) are captured with the ``near-lossless`` tier of
+  (``"precision": "reduced"``) are captured with the ``near-lossless`` (``relaxed``) tier of
   :mod:`kernel_agent.kernels.compare` (whole-tensor cosine and relative L2 error).
 
 Without a perceptual baseline (the workload declares no samples, or ``analyze`` ran in
-``exact`` mode or its perceptual run failed) a near-lossless run keeps the exact checks.
+``exact`` mode or its perceptual run failed) a near-lossless or relaxed run keeps the exact
+checks.
 The scoring models load lazily, in the worker process and only when the gate runs, one at
 a time, and are freed afterwards; in the paired A/B of the integration after A's state is
 freed (``check(before_scoring=...)``). Out of GPU memory in the gate is no verdict: the
@@ -63,7 +70,10 @@ from kernel_agent.workloads.base import Comparison, Workload
 
 EXACT = "exact"
 NEAR_LOSSLESS = "near-lossless"
-MODES = (EXACT, NEAR_LOSSLESS)
+RELAXED = "relaxed"
+MODES = (EXACT, NEAR_LOSSLESS, RELAXED)
+#: The modes with a perceptual gate (and reduced-precision targets).
+GATED = (NEAR_LOSSLESS, RELAXED)
 
 #: Scoring models of the TTS gate (Hugging Face Hub; downloaded once when not cached).
 ASR_MODEL = "openai/whisper-large-v3"
@@ -114,6 +124,25 @@ LLM_MIN_TOP1 = 0.85
 #: likely (under the candidate) than eager's own (under eager), on average.
 LLM_MAX_NLL_INCREASE = 0.25
 
+#: ``--quality relaxed`` (#175): the gate's thresholds as option overrides (the option names
+#: of :meth:`Workload.compare_perceptual`; ``-o`` wins), about twice the near-lossless error
+#: budgets where the broken variants of the calibrations above keep a clear margin
+#: (README, "Quality modes"). TTS: the error rate may rise by 0.10 (broken: >= +0.74); the
+#: speaker similarity (mean 0.93 -> 0.90, worst sample 0.85 -> 0.80) and the MOS drop (0.3 ->
+#: 0.45) move by less than twice, as RMSNorm eps 1e-2 reaches 0.912 / 0.710 / -0.42 there.
+#: LLM: mean KL 0.10 (broken: >= 0.34), worst sample 0.30 (>= 0.57), top-1 0.80 (<= 0.76),
+#: NLL increase 0.30 nats per token (a decode loop shifted by one token: +0.38).
+RELAXED_GATE: dict[str, float] = {
+    "max_error_increase": 0.10,
+    "min_speaker_similarity": 0.90,
+    "min_speaker_similarity_worst": 0.80,
+    "max_mos_drop": 0.45,
+    "max_kl": 0.10,
+    "max_kl_worst": 0.30,
+    "min_top1": 0.80,
+    "max_nll_increase": 0.30,
+}
+
 
 def mode_of(value: Any) -> str:
     """A validated quality mode (``None`` / empty: ``exact``)."""
@@ -123,11 +152,21 @@ def mode_of(value: Any) -> str:
     return mode
 
 
-def floor_options(workload: Workload) -> dict[str, Any]:
-    """The workload's near-lossless option overrides, without the ones the user set."""
-    return {
-        k: v for k, v in workload.near_lossless_options.items() if k not in workload.spec.options
-    }
+def gated(mode: Any) -> bool:
+    """Whether quality mode ``mode`` judges numerics changes with the perceptual gate
+    (:data:`GATED`: ``near-lossless``, ``relaxed``)."""
+    return mode_of(mode) in GATED
+
+
+def floor_options(workload: Workload, mode: str = NEAR_LOSSLESS) -> dict[str, Any]:
+    """The workload's option overrides in quality mode ``mode``, without the ones the user
+    set: ``near_lossless_options`` (the sanity floor); in ``relaxed`` mode also the gate's
+    :data:`RELAXED_GATE` and the workload's ``relaxed_options`` on top."""
+    found = dict(workload.near_lossless_options)
+    if mode_of(mode) == RELAXED:
+        found.update(RELAXED_GATE)
+        found.update(workload.relaxed_options)
+    return {k: v for k, v in found.items() if k not in workload.spec.options}
 
 
 # ------------------------------------------------------------------ text
@@ -570,18 +609,20 @@ def record_baseline(workload: Workload) -> tuple[dict[str, Any] | None, dict[str
 
 
 def save_baseline(workload: Workload, path: Path, *, quality: str) -> dict[str, Any]:
-    """:func:`record_baseline` in ``near-lossless`` mode, saved to ``path`` (none: no file).
-    Failures are recorded, not raised: ``e2e`` then keeps the exact checks."""
+    """:func:`record_baseline` in ``near-lossless`` and ``relaxed`` mode, saved to ``path``
+    (none: no file), the mode recorded (``quality``). Failures are recorded, not raised:
+    ``e2e`` then keeps the exact checks."""
     path.unlink(missing_ok=True)  # never leave a stale perceptual baseline behind
-    if mode_of(quality) != NEAR_LOSSLESS:
-        return {"status": "none", "reason": f"--quality {mode_of(quality)}"}
+    mode = mode_of(quality)
+    if mode not in GATED:
+        return {"status": "none", "reason": f"--quality {mode}"}
     try:
         data, info = record_baseline(workload)
     except Exception:
-        return {"status": "error", "error": traceback.format_exc()[-2000:]}
+        return {"status": "error", "quality": mode, "error": traceback.format_exc()[-2000:]}
     if data is not None:
         torch.save(data, path)
-    return info
+    return {**info, "quality": mode}
 
 
 # ------------------------------------------------------------------ e2e
@@ -592,14 +633,17 @@ def check(
     reference: dict[str, Any],
     *,
     before_scoring: Callable[[], None] | None = None,
+    quality: str = NEAR_LOSSLESS,
 ) -> dict[str, Any]:
     """``metrics.perceptual`` of an ``e2e`` run: the stored baseline samples
     (``reference``) generated by the candidate, scored and compared paired with the
-    baseline's scores: ``{"passed", "reason", ...}``. Both ran through :meth:`Workload.run`
-    under the run's metric (``metric=ttfa``: the streaming path), so the gate judges the
-    audio of the code path the objective times; a baseline recorded under another metric
-    fails (re-run ``analyze``). ``before_scoring`` runs between the model's last run (the
-    samples generated) and the scoring models: the paired A/B frees A's state there."""
+    baseline's scores: ``{"passed", "reason", ...}``, with the thresholds of quality mode
+    ``quality`` (:func:`floor_options`: ``relaxed`` loosens them). Both ran through
+    :meth:`Workload.run` under the run's metric (``metric=ttfa``: the streaming path), so
+    the gate judges the audio of the code path the objective times; a baseline recorded
+    under another metric fails (re-run ``analyze``). ``before_scoring`` runs between the
+    model's last run (the samples generated) and the scoring models: the paired A/B frees
+    A's state there."""
     samples = reference["samples"]
     recorded = str(reference.get("metric") or workload.metric)
     if recorded != workload.metric:
@@ -616,7 +660,8 @@ def check(
         if before_scoring is not None:
             before_scoring()
         scores, score_s = score(workload, generated)
-        cmp = workload.compare_perceptual([s["scores"] for s in samples], scores)
+        with workload.with_options(floor_options(workload, quality)):  # the mode's thresholds
+            cmp = workload.compare_perceptual([s["scores"] for s in samples], scores)
     except Exception as exc:
         return {
             "passed": False,
@@ -627,6 +672,7 @@ def check(
         "passed": cmp.passed,
         "reason": cmp.reason,
         **cmp.metrics,
+        "quality": mode_of(quality),
         "metric": workload.metric,
         "generate_s": round(gen_s, 1),
         "score_s": round(score_s, 1),
@@ -637,22 +683,23 @@ def check(
 @contextlib.contextmanager
 def judging(workload: Workload, quality: str, reference: Any) -> Iterator[bool]:
     """Around the exact checks of an ``e2e`` verdict: yields whether the perceptual gate
-    decides (``near-lossless`` with a perceptual baseline), with the workload's
-    near-lossless options (the sanity floor) applied while it does."""
-    gate = mode_of(quality) == NEAR_LOSSLESS and reference is not None
-    with workload.with_options(floor_options(workload) if gate else None):
+    decides (``near-lossless`` or ``relaxed`` with a perceptual baseline), with the
+    workload's options of the mode (the sanity floor, :func:`floor_options`) applied while
+    it does."""
+    gate = gated(quality) and reference is not None
+    with workload.with_options(floor_options(workload, quality) if gate else None):
         yield gate
 
 
 def skipped(quality: str, baseline: dict[str, Any]) -> dict[str, Any] | None:
     """``metrics.perceptual`` when the gate cannot run (``None`` in ``exact`` mode)."""
-    if mode_of(quality) != NEAR_LOSSLESS:
+    if not gated(quality):
         return None
     info = baseline.get("perceptual") or {}
     why = {
         "none": info.get("reason") or "no perceptual samples",
         "error": "its baseline run failed",
-    }.get(str(info.get("status")), "analyze ran without --quality near-lossless")
+    }.get(str(info.get("status")), f"analyze ran without --quality {mode_of(quality)}")
     return {
         "passed": True,
         "reason": "",
@@ -669,8 +716,8 @@ def messages(baseline: dict[str, Any]) -> list[str]:
     status = info.get("status")
     if status == "error":
         return [
-            "WARNING: the perceptual baseline run failed; near-lossless e2e evaluations keep "
-            f"the exact checks ({str(info.get('error', ''))[-300:]})"
+            "WARNING: the perceptual baseline run failed; e2e evaluations keep the exact "
+            f"checks ({str(info.get('error', ''))[-300:]})"
         ]
     if status != "ok":
         return []
@@ -686,9 +733,15 @@ def summary_lines(baseline: dict[str, Any]) -> list[str]:
     info = baseline.get("perceptual") or {}
     if info.get("status") != "ok":
         return []
+    mode = str(info.get("quality") or NEAR_LOSSLESS)  # recorded since #175
+    within = (
+        "stays within about twice the noise of eager (small measured drops pass)"
+        if mode == RELAXED
+        else "stays within the noise of eager"
+    )
     return [
-        "* **quality mode: near-lossless.** Numerics-changing optimisations (FP8 weights, "
-        "...) are allowed when the perceptual quality stays within the noise of eager: "
+        f"* **quality mode: {mode}.** Numerics-changing optimisations (FP8 weights, "
+        f"...) are allowed when the perceptual quality {within}: "
         f"every candidate also generates {info.get('samples')} held-out samples (free "
         "running, untimed), scored and compared paired with eager's (TTS: transcript error "
         "rate, speaker similarity, MOS; LLM: teacher forced on eager's continuation, KL and "

@@ -425,10 +425,11 @@ def rounds_context(
     precisions: tuple[str, ...] | None = None,
 ) -> str:
     """Planner context for round ``n``: what earlier rounds did and which targets exist (and,
-    in a near-lossless run, how to move one of them to another of the ``precisions`` it
+    in a near-lossless or relaxed run, how to move one of them to another of the ``precisions`` it
     allows, ``pivot.py``; None: the quality mode's default, no 4-bit); ``owners``: the
     modules the accepted items change (``integration.json``)."""
     from kernel_agent import precisions as allowed_precisions
+    from kernel_agent.kernels.compare import allows_reduced
 
     base = (read_json(run.baseline_json, {}) or {}).get("median_ms")
     lines = [
@@ -465,7 +466,7 @@ def rounds_context(
         "New transform ideas are passed on to the systems agent.",
     ]
     allowed = allowed_precisions.default(quality) if precisions is None else precisions
-    if quality == "near-lossless" and (reduced := allowed_precisions.reduced(allowed)):
+    if allows_reduced(quality) and (reduced := allowed_precisions.reduced(allowed)):
         lines += [
             "",
             "## Precision pivots",

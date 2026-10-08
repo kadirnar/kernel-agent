@@ -2,7 +2,10 @@
 every reduced precision passes both of the evaluator's checks (captured inputs, and inputs
 redrawn from each tensor's own mean and std by ``kernels.verify``) on a synthetic capture
 with a massive-activation writer row (VoxCPM2's LocDiT o_proj / down_proj row 497), the
-bounds of the captured inputs would reject it on the redrawn ones, and broken scales fail."""
+bounds of the captured inputs would reject it on the redrawn ones, and broken scales fail.
+Both quality modes with reduced precision: ``near-lossless`` and ``relaxed`` (#175, about
+twice the error budgets), where blatant bugs (int4 per tensor, scales x 1.2, a skipped
+output row, gate / up swapped) still fail."""
 
 import pytest
 import torch
@@ -23,14 +26,29 @@ PRECISION, BUG = {precision!r}, {bug!r}
 RULE = "floor" if BUG == "floor scale rule" else "ceil"
 
 
+def int4_per_tensor(w):
+    scale = w.float().abs().amax() / 7
+    return (torch.round(w.float() / scale).clamp(-8, 7) * scale).to(w.dtype)
+
+
 def quantize_activations(x):  # fp8_mx: the scale-rule guard's hook
     return quant.quantize_mxfp8(x, RULE)
+
+
+PRECISION_OF = {{}}
+ACTIVATION_BUGS = ("first token's scale", "cached activation scales", "static activation scale")
 
 
 class Linear(torch.nn.Module):
     def __init__(self, linear):
         super().__init__()
-        w = linear.weight.detach()
+        w = linear.weight.detach().clone()
+        if BUG == "row 0 skipped":  # an off-by-one row loop: output channel 0 never written
+            w[0] = 0
+        if BUG == "int4 per tensor":
+            self.w = int4_per_tensor(w)
+            PRECISION_OF[id(self)] = "int4"
+            return
         if PRECISION == "fp8_mx":
             self.q, self.s = quant.quantize_mxfp8(w)
             if BUG == "neighbour scale":
@@ -40,11 +58,15 @@ class Linear(torch.nn.Module):
             codes, scales, ts = quant.quantize_fp4(w)
             if BUG == "nibbles":
                 codes = (codes >> 4) | ((codes & 0xF) << 4)
+            elif BUG == "scale x1.2":
+                ts = ts * 1.2
             self.w = quant.dequantize_fp4(codes, scales, ts, w.dtype)
             return
         self.q, self.s = quant.quantize_fp8(w)
         if BUG == "scale x1.05":
             self.s = self.s * 1.05
+        elif BUG == "scale x1.2":
+            self.s = self.s * 1.2
         elif BUG == "neighbour scale":
             self.s = self.s.roll(1)
         self.w = quant.dequantize_fp8(self.q, self.s, w.dtype)
@@ -52,11 +74,13 @@ class Linear(torch.nn.Module):
         self.static = None
 
     def forward(self, x):
+        if PRECISION_OF.get(id(self)) == "int4":
+            return torch.nn.functional.linear(x, self.w)
         if PRECISION == "fp8_mx":
             return quant.mxfp8_linear(x, self.q, self.s, rule=RULE)
         if PRECISION != "fp8_w8a8":
             return torch.nn.functional.linear(x, self.w)
-        if BUG is None:
+        if BUG not in ACTIVATION_BUGS:
             return quant.fp8_w8a8_linear(x, self.q, self.s)
         xq, xs = quant.quantize_fp8_activations(x)
         if BUG == "first token's scale":
@@ -82,6 +106,8 @@ class Mlp(torch.nn.Module):
                                          Linear(ref.down_proj))
 
     def forward(self, x):
+        if BUG == "gate-up swapped":  # a packed gate|up weight read in the wrong order
+            return self.down(torch.nn.functional.silu(self.up(x)) * self.gate(x))
         return self.down(torch.nn.functional.silu(self.gate(x)) * self.up(x))
 
 
@@ -131,10 +157,13 @@ def writer():
     return _writer_mlp()
 
 
-def _capture(tmp_path, writer, precision):
+QUALITIES = ("near-lossless", "relaxed")
+
+
+def _capture(tmp_path, writer, precision, quality="near-lossless"):
     mlp, inputs = writer
-    path = tmp_path / f"{precision}.pt"
-    tier = compare.tier_for("near-lossless", precision)
+    path = tmp_path / f"{precision}.{quality}.pt"
+    tier = compare.tier_for(quality, precision)
     calls = [((x,), {}, count) for x, count in zip(inputs, (540, 0), strict=True)]
     capture_calls(mlp, calls, path, tier=tier, precision=precision)
     return path, tier
@@ -178,9 +207,34 @@ def test_every_reduced_precision_is_calibrated_on_both_input_classes():
     assert compare.CHANNEL_MIN_ROWS >= 2
 
 
+def test_the_relaxed_tiers_mirror_the_near_lossless_ones_with_looser_bounds():
+    """#175: one relaxed tier per near-lossless tier (per precision), never tighter, and the
+    8-bit tier's whole-tensor error budgets twice near-lossless's on captured inputs."""
+    pairs = {
+        compare.NEAR_LOSSLESS_TIER: compare.RELAXED_TIER,
+        compare.NEAR_LOSSLESS_FP4_TIER: compare.RELAXED_FP4_TIER,
+        compare.NEAR_LOSSLESS_KV_TIER: compare.RELAXED_KV_TIER,
+    }
+    for precision in compare.REDUCED_PRECISIONS:
+        near, relaxed = (
+            compare.tier_for(QUALITIES[0], precision),
+            compare.tier_for(QUALITIES[1], precision),
+        )
+        assert pairs[near] == relaxed
+    for bounds in (compare.NEAR_LOSSLESS_BOUNDS, compare.PERTURBED_BOUNDS):
+        for near, relaxed in pairs.items():
+            (c0, l0, n0, (a0, r0)), (c1, l1, n1, (a1, r1)) = bounds[near], bounds[relaxed]
+            assert c1 <= c0 and l1 >= l0 and n1 >= n0 and a1 >= a0 and r1 == r0, (near, relaxed)
+    (c0, l0, n0, _), (c1, l1, n1, _) = (
+        compare.NEAR_LOSSLESS_BOUNDS[t] for t in (compare.NEAR_LOSSLESS_TIER, compare.RELAXED_TIER)
+    )
+    assert 1 - c1 >= 2 * (1 - c0) and l1 == 2 * l0 and n1 == 2 * n0
+
+
+@pytest.mark.parametrize("quality", QUALITIES)
 @pytest.mark.parametrize("precision", REFERENCE_MATH)
-def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, precision):
-    capture, tier = _capture(tmp_path, writer, precision)
+def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, precision, quality):
+    capture, tier = _capture(tmp_path, writer, precision, quality)
     path, build = _candidate(tmp_path, precision)
     result = evaluate(capture, path, device="cpu")  # captured, then redrawn (verify.py)
     assert result["status"] == "ok" and result["correct"], result
@@ -188,6 +242,8 @@ def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, pre
 
     redrawn = _redrawn(writer, build, tier, perturbed=True)
     assert all(r["ok"] for r in redrawn), [r.get("error") for r in redrawn if not r["ok"]]
+    if quality != "near-lossless":
+        return
     # what #109 fixed: the bounds of captured inputs reject the same draws (output channel 0
     # keeps 6x the rounding error of the others, its values are no longer massive)
     old = _redrawn(writer, build, tier, perturbed=False)
@@ -208,13 +264,41 @@ def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, pre
         ("fp4_weights", "nibbles", "incorrect"),
     ],
 )
-def test_broken_scales_still_fail(tmp_path, writer, precision, bug, status):
-    capture, tier = _capture(tmp_path, writer, precision)
+@pytest.mark.parametrize("quality", QUALITIES)
+def test_broken_scales_still_fail(tmp_path, writer, precision, bug, status, quality):
+    capture, tier = _capture(tmp_path, writer, precision, quality)
     path, build = _candidate(tmp_path, precision, bug)
     result = evaluate(capture, path, device="cpu")
     assert result["status"] == status, result
     if status == "incorrect":  # and on every redrawn input too
         assert not any(r["ok"] for r in _redrawn(writer, build, tier, perturbed=True))
+
+
+@pytest.mark.parametrize(
+    ("bug", "status"),
+    [
+        # on the captured inputs the massive output channel 0 dominates the tensor's norm and
+        # hides most of int4's error (near-lossless: element ratio 1.06; relaxed: 0.74, FP4
+        # tiers less); the redrawn inputs (no massive channel) show it
+        ("int4 per tensor", {"near-lossless": "incorrect", "relaxed": "incorrect_perturbed"}),
+        ("scale x1.2", "incorrect"),
+        ("row 0 skipped", "incorrect"),  # an output channel never written
+        ("gate-up swapped", "incorrect"),  # a packed gate|up weight read in the wrong order
+    ],
+)
+@pytest.mark.parametrize("precision", ("fp8_weights", "fp8_w8a8", "fp4_weights"))
+@pytest.mark.parametrize("quality", QUALITIES)
+def test_blatant_bugs_fail_the_relaxed_tiers_as_the_near_lossless_ones(
+    tmp_path, writer, precision, bug, status, quality
+):
+    """#175: the relaxed bounds reject blatant bugs at the stage the near-lossless ones do
+    (the evaluator's captured inputs, or its redrawn ones)."""
+    capture, tier = _capture(tmp_path, writer, precision, quality)
+    path, _ = _candidate(tmp_path, precision, bug)
+    result = evaluate(capture, path, device="cpu")
+    if isinstance(status, dict):
+        status = "incorrect_perturbed" if precision == "fp4_weights" else status[quality]
+    assert result["status"] == status and result["tolerance_tier"] == tier, result
 
 
 def test_a_saturating_mxfp8_scale_rule_is_rejected_with_its_reason(tmp_path, writer):
@@ -327,11 +411,13 @@ def test_recheck_and_the_timed_output_check_use_the_redrawn_bounds(monkeypatch):
     assert bench.check_timed_output(lambda x: ref, kept)["failures"]
 
 
-def test_engineer_prompt_states_the_redrawn_bounds():
+@pytest.mark.parametrize("quality", QUALITIES)
+def test_engineer_prompt_states_the_redrawn_bounds(quality):
     for precision in REFERENCE_MATH:
-        tier = compare.tier_for("near-lossless", precision)
+        tier = compare.tier_for(quality, precision)
         cosine, rel_l2, norm, (a, r) = compare.PERTURBED_BOUNDS[tier]
-        text = prompts._tier_bounds(precision)
+        text = prompts._tier_bounds(precision, tier)
+        assert f"the {tier} tolerance tier" in text
         assert "perturbed-input check" in text and f"cosine >= {cosine:g}" in text
         assert f"{a:g} x RMS (the larger of the tensor's and its channel's)" in text
         assert f"±{norm * 100:g} %" in text and f"{rel_l2:g}" in text and f"{r:g}" in text

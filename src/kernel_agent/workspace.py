@@ -13,7 +13,7 @@ runs/<org>--<name>/<timestamp>/
                         baseline_output_holdout.pt (held-out input),
                         baseline_output_natural.pt (natural-length run, stop condition),
                         baseline_output_diverse.pt (the diverse input set),
-                        baseline_output_perceptual.pt (--quality near-lossless),
+                        baseline_output_perceptual.pt (--quality near-lossless / relaxed),
                         captures/<id>.pt, targets/<id>/{results.jsonl,history/},
                         transforms/{results.jsonl,history/}
   targets/<id>/         spec.json, capture_inputs.pt (no outputs), reference_source.py,
