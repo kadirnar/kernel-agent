@@ -758,6 +758,8 @@ item is measurable: `costs.json` gets per-session token usage, and the ledger ge
 
 #### 3.12.1 Model mix per role
 
+> **Decision (2026-10-08, user):** every role runs on Opus 5.5 at `--effort` — the goal is the fastest optimisation, not a cheaper one. The mix below is kept as the design record; `--role-model ROLE=MODEL` still allows it per run.
+
 Today every session uses `cfg.claude_model` (default `claude-opus-5-5`, `config.py`) at
 `effort="high"`, except the dossier (`DOSSIER_CONFIG`: effort low, 20 turns) and the
 librarian (`librarian_model`, default `None` = same model, effort low). Proposal, as

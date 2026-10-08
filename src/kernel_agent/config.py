@@ -8,6 +8,7 @@ from typing import Any
 
 ALL_BACKENDS = ("cuda", "triton", "cute", "tilelang", "nvrtc")
 DEFAULT_MODEL = "claude-opus-5-5"
+#: Other model ids for `--role-model ROLE=MODEL` (every role runs on DEFAULT_MODEL by default).
 SONNET_MODEL = "claude-sonnet-5-5"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 #: A role's model or effort that is the session's: ``--claude-model`` / ``--effort``.
@@ -25,28 +26,18 @@ ROLE_MODELS = {
     "research": INHERIT,
     "refactor": INHERIT,
     "harness": INHERIT,
-    "dossier": SONNET_MODEL,
-    "librarian": SONNET_MODEL,
-    "critic": HAIKU_MODEL,
-    "critic-escalation": SONNET_MODEL,  # an unsure triage, once (critic.py, #188)
-    "doc-lookup": SONNET_MODEL,
-    "profile-analyst": SONNET_MODEL,
-    "compile-triage": SONNET_MODEL,
+    "dossier": INHERIT,
+    "librarian": INHERIT,
+    "critic": INHERIT,
+    "critic-escalation": INHERIT,
+    "doc-lookup": INHERIT,
+    "profile-analyst": INHERIT,
+    "compile-triage": INHERIT,
     "reviewer": INHERIT,
 }
 #: The effort of each role (``--role-effort ROLE=LEVEL``; ``inherit``: ``--effort``; None:
-#: none set, the model's default). Opus 5.5's default is medium: every Opus role inherits
-#: ``--effort`` (high).
-ROLE_EFFORTS: dict[str, str | None] = {
-    **{role: INHERIT for role in ROLE_MODELS},
-    "dossier": "low",
-    "librarian": "low",
-    "critic": None,
-    "critic-escalation": "low",
-    "doc-lookup": "low",
-    "profile-analyst": "medium",
-    "compile-triage": "medium",
-}
+#: none set, the model's default). Every role inherits ``--effort`` (high) by default.
+ROLE_EFFORTS: dict[str, str | None] = {role: INHERIT for role in ROLE_MODELS}
 #: ``--quality`` (kernels/compare.py ``QUALITIES``, without importing torch) and the mode of
 #: a new run (#175).
 QUALITIES = ("exact", "near-lossless", "relaxed")

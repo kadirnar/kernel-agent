@@ -2902,12 +2902,10 @@ the per-call settings (the dossier's effort and turns, the native session's 3 ×
 librarian's model) live in one place, and `program.md`'s sections are its roles.
 
 * **Model and effort per role** (`config.ROLE_MODELS` / `ROLE_EFFORTS`, recorded in
-  `run.json`): the creative and planning roles (kernel, systems, native, planner, research,
-  refactor, harness, the `reviewer` helper) run on `--claude-model` at `--effort`; the
-  dossier, the librarian and the `doc-lookup` helper on Sonnet 5.5 (`claude-sonnet-5-5`)
-  at effort `low`, `profile-analyst` and `compile-triage` on Sonnet at `medium`; the
-  critic's triage on Haiku 4.5 and its escalation (`critic-escalation`) on Sonnet at `low`
-  (`improve --critic model`). `--role-model ROLE=MODEL` and `--role-effort ROLE=LEVEL` change one
+  `run.json`): every role — planner, kernel, systems, native, research, refactor, harness,
+  dossier, librarian, critic and the helpers (`doc-lookup`, `profile-analyst`,
+  `compile-triage`, `reviewer`) — runs on `--claude-model` (Opus 5.5) at `--effort` (high):
+  the goal is the fastest optimisation, not a cheaper one (`improve --critic model`). `--role-model ROLE=MODEL` and `--role-effort ROLE=LEVEL` change one
   (repeatable; `inherit` = `--claude-model` / `--effort`, an effort of `none` sets none);
   given to `improve` or `resume` on a run that exists, they replace those roles' settings
   and the run keeps the others. A run made before the registry keeps every role on
@@ -3322,9 +3320,9 @@ model and starts a new round (`kernel_agent/improve.py`,
     With `--critic model` and `--agents` above 1, a candidate the static checks are unsure
     about (a cache keyed by `data_ptr` that is not returned, a call counter in a condition,
     a write to a path they cannot place) gets one tool-less turn of the `critic` role's
-    model (Haiku 4.5) while its job waits for the GPU (when the wait is expected to last
+    model (the session's, Opus 5.5) while its job waits for the GPU (when the wait is expected to last
     `--critic-wait` seconds, default 30), and an unsure answer one more of the
-    `critic-escalation` role's (Sonnet 5.5, effort `low`). A reject with confidence 0.8 or
+    `critic-escalation` role's (also Opus 5.5). A reject with confidence 0.8 or
     more withdraws the job if it has not taken the GPU yet, and otherwise only annotates the
     result. One reject in ten (a draw on the normalised source) is evaluated anyway: with
     the forced ones and those whose verdict came late, they label the critic's precision
@@ -3915,7 +3913,7 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
   `lessons/<module_family>.md` (`norm`, `attention`, `mlp`, `rope`, ...),
   dropping duplicates and contradicted rules. It runs through the same code as
   the other agents (budgets, `program.md` `## all`, events, `costs.json` →
-  `librarian`). It runs on Sonnet 5.5 at effort `low` (`--role-model
+  `librarian`). It runs on Opus 5.5 like every role (`--role-model
   librarian=MODEL`, or `--librarian-model MODEL`; see "Roles, models and the
   prompt cache") and answers with structured output only. kernel-agent writes the
   files itself: only names of this run's backends and module families, at most

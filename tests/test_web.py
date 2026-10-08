@@ -267,7 +267,7 @@ def test_dossier_session(tmp_path, monkeypatch):
     assert asyncio.run(orch.dossier("t1", label="dossier-t1")) is not None
     ((name, cfg, kw),) = seen
     assert name == "dossier-t1" and kw["cwd"] == orch.run.target("t1")
-    assert (cfg.effort, cfg.max_turns_per_agent) == ("low", 20)  # cheap
+    assert (cfg.effort, cfg.max_turns_per_agent) == ("high", 20)  # Opus 5.5 at the run effort
     assert kw["tools"] == ["Read", "Glob", "Grep", "Write"] and kw["writable"] == [path]
     assert kw["mcp_tools"] == [] and str(path) in kw["prompt"]
     system = kw["system_append"]
