@@ -39,6 +39,7 @@ from kernel_agent import (
     research,
     roles,
     scheduler,
+    sessions,
     strong_baseline,
     telemetry,
     toolchain,
@@ -129,6 +130,11 @@ class Orchestrator:
         # Concurrent sessions (improve --agents N, coordinator.py): every engineer session may
         # write only in its own directory (:meth:`_owned`, docs/MULTIAGENT.md §3.6).
         self.ownership = False
+        # What every agent session is doing and the GPU's queue (sessions.py, issue #184):
+        # sessions.jsonl, session_state events, improve.json sessions / gpu, costs.json time
+        self.observer = sessions.Observer(
+            run, reserved=lambda label: self.budget.reservations.get(label)
+        )
 
     # ------------------------------------------------------------ creation
 
@@ -348,11 +354,15 @@ class Orchestrator:
             cap=self.budget.agent_seconds_left,
             extend=functools.partial(self.budget.extend_deadline, name),
         )
+        # its states and time split (sessions.py): tool spans, GPU jobs, turns
+        tracker = self.observer.open(
+            label or name, agent=name, role=role or "", arm=binding.target_id
+        )
         while True:
             timer = asyncio.timeout(timeout)
             self.bindings[name] = binding
             try:
-                async with timer, clock.running(timer):
+                async with tracker.running(result), timer, clock.running(timer):
                     result = await (self.agent_runner or run_agent)(
                         name,
                         role=role,
@@ -387,6 +397,7 @@ class Orchestrator:
             cfg = self._session_config(role, config, label or name)
             if result.session_id:  # continue it (else the same prompt in a new session)
                 kwargs.update(prompt=auth.RESUME_PROMPT, resume=result.session_id)
+        timing = tracker.close(result)
         self.agent_results.append(result)
         if self.budget.gate is not None and result.usage_limit is None:
             self.budget.gate.progress()  # past the limit: the next one is a first wait again
@@ -419,6 +430,7 @@ class Orchestrator:
             "billing": auth.billing(result.api_key_source, self.env),
             **({"timed_out": True} if result.timed_out else {}),
             **({"gpu_wait_s": round(clock.waited, 1)} if clock.waited else {}),
+            "time": timing,  # seconds per part of its time split (sessions.PARTS)
             **({"usage_limit_waits": waits} if waits else {}),
             **({"usage_limit": result.usage_limit.to_dict()} if result.usage_limit else {}),
             **({"web": web.summary(result.web)} if result.web else {}),

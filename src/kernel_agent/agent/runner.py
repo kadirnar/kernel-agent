@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookEvent
 
-from kernel_agent import roles
+from kernel_agent import roles, sessions
 from kernel_agent.agent import auth, web
 from kernel_agent.config import OptimizeConfig
 
@@ -258,6 +258,9 @@ async def run_agent(
     hooks = write_guard(writable or [], cwd, roots=roots, excluded=excluded) if guarded else {}
     hooks.setdefault("PreToolUse", []).append(claude_files_guard(cwd))
     options.hooks = hooks
+    tracker = sessions.current()  # the session's states (sessions.py, #184): its tool spans
+    if tracker is not None:
+        tracker.hooks(hooks)
     if resume:
         options.resume = resume
 
@@ -284,6 +287,8 @@ async def run_agent(
                     watch.see(message)
                     lookups.see(message)
                     heard(message)  # the coordinator's listener (rate limits, first message)
+                    if tracker is not None:  # its turns; tool results close denied calls
+                        tracker.see(message)
                     if isinstance(message, AssistantMessage):
                         result.session_id = result.session_id or message.session_id
                         if message.parent_tool_use_id is None:

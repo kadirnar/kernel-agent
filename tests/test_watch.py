@@ -337,3 +337,15 @@ def test_server(partial):
 def test_cli_watch_needs_a_run_dir(tmp_path):
     with pytest.raises(SystemExit, match="not a run directory"):
         main(["watch", str(tmp_path)])
+
+
+def test_page_draws_progress_as_lines():
+    """The live page shows the improvement as lines (the best so far, a thin line through every
+    result, failures as ticks), never as scattered points; legends show line samples."""
+    page = watch.PAGE.read_text()
+    script = page.split('<script nonce="__NONCE__">', 1)[1]
+    for gone in ("diamond(", '"cost-dot"', "dot(xs(", 'key("keep"', 'key("dkeep"', 'key("fail"'):
+        assert gone not in script, gone
+    for line in ('class: "each-line"', 'key("each"', 'key("failtick"', "failTick("):
+        assert line in script, line
+    assert "svg .each-line" in page and "svg .fail-tick" in page

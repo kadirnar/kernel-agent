@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import textwrap
+import time
 from typing import Any
 
 from kernel_agent import (
@@ -13,11 +14,12 @@ from kernel_agent import (
     ledger,
     objective,
     projection,
+    sessions,
     strong_baseline,
 )
 from kernel_agent.agent import auth
 from kernel_agent.config import QUALITY_NOTES
-from kernel_agent.workspace import RunDir
+from kernel_agent.workspace import RunDir, read_json
 
 
 def _ms(value: float | None, nd: int = 1) -> str:
@@ -49,6 +51,45 @@ def _table(headers: list[str], rows: list[list[str]], right: set[int], width: in
         return "  ".join(out).rstrip()
 
     return [line(headers), *(line(r) for r in rows)]
+
+
+def _agents(run: RunDir, width: int, running: bool) -> list[str]:
+    """The Agents table: the agent sessions open now (role, arm, state and for how long,
+    evaluations, the USD reserved for them), and the time split of every session so far
+    (``sessions.py``; [] before the first session)."""
+    live, ended = sessions.agents(run)
+    if not live and not ended:
+        return []
+    lines = []
+    now = time.time()
+    if live:
+        config = (read_json(run.root / "improve.json", {}) or {}).get("config") or {}
+        n = config.get("agents") if isinstance(config, dict) else None
+        lines.append(
+            f"agents: {len(live)} running"
+            + (f" (--agents {n})" if isinstance(n, int) and n > 1 else "")
+            + ("" if running else " (the run is not running: left open)")
+        )
+        rows = [
+            [
+                a.label,
+                a.role,
+                a.arm or "—",
+                sessions.duration(max(now - a.since, 0.0)),
+                str(a.evaluations),
+                f"≤{a.reserved:.2f}" if a.reserved else "—",
+                sessions.describe(a.state, a.detail),
+            ]
+            for a in live
+        ]
+        headers = ["session", "role", "arm", "for", "evals", "$", "state"]
+        lines += _table(headers, rows, {3, 4, 5}, width)
+    every = [*ended, *live]
+    split = sessions.total_split(every, max(now, *(a.since for a in every)))
+    if text := sessions.split_text(split):
+        hours = sum(split.values()) / 3600
+        lines.append(f"agent time ({len(every)} sessions, {hours:.1f} h): {text}"[:width])
+    return lines
 
 
 def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
@@ -172,8 +213,10 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
         lines.append("no evaluations yet")
     if per_backend := backends.status_lines(run, s["rows"]):  # by source, priors left out
         lines += ["", *(line[:width] for line in per_backend)]
+    if agents := _agents(run, width, bool(s["phase_running"])):  # sessions.jsonl (#184)
+        lines += ["", *agents]
     if gpu := gpuqueue.status_lines(run, width):  # the GPU job queue (gpu_queue.jsonl)
-        lines += ["", *gpu]
+        lines += ["", *gpu, *sessions.gpu_lines(run, width)]
 
     recent = s["rows"][-last:]
     if recent:

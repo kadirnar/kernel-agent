@@ -215,6 +215,44 @@ def test_charts_report_dashboard(run):
     assert "prefers-color-scheme: dark" in page and "<table>" in page
 
 
+def test_progress_is_drawn_as_lines_without_point_markers(run, monkeypatch):
+    """The progress charts (and the integration waterfall) show the improvement as lines: the
+    best so far prominent, every result a thin line, failures as ticks; no scattered points,
+    and the legends show line samples (the failure tick's is a short vertical line)."""
+    pytest.importorskip("matplotlib")
+    from matplotlib.collections import LineCollection, PathCollection
+
+    drawn = {}
+    render = charts._render
+
+    def keep(path, size, draw):
+        def capture(fig, ax):
+            draw(fig, ax)
+            drawn[path.name if path.parent == run.root else f"{path.parent.name}/{path.name}"] = ax
+
+        return render(path, size, capture)
+
+    monkeypatch.setattr(charts, "_render", keep)
+    assert charts.target_progress(run, "attn") and charts.run_progress(run)
+    assert charts.integration(run)
+    assert set(drawn) == {"attn/progress.png", "progress.png", "integration.png"}
+    for name, ax in drawn.items():
+        assert not [c for c in ax.collections if isinstance(c, PathCollection)], name
+        assert all(line.get_marker() in ("None", "", None) for line in ax.get_lines()), name
+        handles = ax.get_legend().legend_handles
+        assert all(
+            h.get_marker() in ("None", "", None, "|") for h in handles if hasattr(h, "get_marker")
+        )
+    target, progress = drawn["attn/progress.png"], drawn["progress.png"]
+    labels = [t.get_text() for t in target.get_legend().get_texts()]
+    assert labels[:3] == ["running best", "each evaluation", "failed"]
+    assert any(isinstance(c, LineCollection) for c in target.collections)  # the failure ticks
+    best = max(target.get_lines(), key=lambda line: line.get_linewidth())
+    assert best.get_linewidth() == charts.BEST_LW and best.get_color() == charts.KEEP_COLOR
+    labels = [t.get_text() for t in progress.get_legend().get_texts()]
+    assert labels[:3] == ["projected (kernels)", "measured, best so far", "each measured run"]
+
+
 def test_refresh_never_raises(run, tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("chart bug")

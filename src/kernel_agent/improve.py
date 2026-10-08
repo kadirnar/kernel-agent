@@ -560,6 +560,12 @@ class Improver:
     def save(self) -> None:
         write_json(self.run.root / STATE, self.state)
 
+    def _live(self, snapshot: dict[str, Any]) -> None:
+        """``sessions`` (the agent sessions running now, their states and time split) and
+        ``gpu`` (the GPU job queue) of ``improve.json`` (``sessions.Observer.attach``)."""
+        self.state.update(snapshot)
+        self.save()
+
     @property
     def round(self) -> int:
         return int(self.state["rounds"][-1]["n"])
@@ -806,6 +812,7 @@ class Improver:
         ledger.event(self.run, "phase_start", phase="improve")
         if board.enabled(self.icfg.board, self.icfg.agents):  # the blackboard (board.py, #187)
             board.open_board(self.run)
+        self.orch.observer.attach(self._live)  # improve.json: sessions and GPU, live (#184)
         try:
             reason = await self._loop()
             log(f"stopping: {reason}")
@@ -817,6 +824,7 @@ class Improver:
             raise
         finally:
             board.close(self.run)
+            self.orch.observer.detach()
         ledger.event(self.run, "phase_done", phase="improve")
         return reason
 
@@ -1624,8 +1632,9 @@ def _concurrency_lines(state: dict[str, Any]) -> list[str]:
 
 
 def slices_chart(run: RunDir) -> Path | None:
-    """``improve.png``: one lane per arm, a bar per slice, re-integrations and rounds."""
-    from kernel_agent import charts
+    """``improve.png``: one lane per arm, a bar per slice (sub-lanes for its sessions that
+    ran at once), re-integrations, rounds and the GPU's busy strip."""
+    from kernel_agent import charts, sessions
 
     state = read_json(run.root / STATE, None)
     if not isinstance(state, dict) or not state.get("slices") or not charts.available():
@@ -1633,12 +1642,46 @@ def slices_chart(run: RunDir) -> Path | None:
     start = ledger.start_time(run)
     if start is None:
         return None
+    spans = sessions.spans(run)  # every session's start and end (sessions.jsonl, #184)
+    holds = [(h.start, h.end, h.session) for h in sessions.gpu_holds(sessions.read_gpu(run))]
     return charts._render(
-        run.root / "improve.png", (10.0, 4.6), lambda fig, ax: _draw_slices(ax, state, start)
+        run.root / "improve.png",
+        (10.0, 4.6),
+        lambda fig, ax: _draw_slices(ax, state, start, spans, holds),
     )
 
 
-def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
+def _bars(
+    slices: list[dict[str, Any]], spans: dict[str, tuple[float, float | None]]
+) -> list[tuple[dict[str, Any], float, float, int, int]]:
+    """(slice, start, end, sub-lane, sub-lanes of its arm) per bar: one per slice, one per
+    session of a slice whose sessions are known (``sessions.jsonl``) and more than one (its
+    workers). Bars of an arm that overlap (concurrent sessions) go to different sub-lanes."""
+    bars: list[tuple[dict[str, Any], float, float]] = []
+    for s in slices:
+        known = [spans[label] for label in s.get("sessions") or [] if label in spans]
+        if len(known) > 1:
+            end = s.get("ended") or s["started"]
+            bars += [(s, a, b if b is not None else end) for a, b in known]
+        else:
+            bars.append((s, s["started"], s.get("ended") or s["started"]))
+    free: dict[str, list[float]] = {}  # arm -> the end of each of its sub-lanes so far
+    placed = []
+    for s, a, b in sorted(bars, key=lambda bar: bar[1]):
+        ends = free.setdefault(s["arm"], [])
+        k = next((i for i, e in enumerate(ends) if e <= a + 1e-6), len(ends))
+        ends[k : k + 1] = [b]
+        placed.append((s, a, b, k))
+    return [(s, a, b, k, len(free[s["arm"]])) for s, a, b, k in placed]
+
+
+def _draw_slices(
+    ax: Any,
+    state: dict[str, Any],
+    start: float,
+    spans: dict[str, tuple[float, float | None]] | None = None,
+    holds: list[tuple[float, float | None, str | None]] | None = None,
+) -> None:
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
@@ -1647,6 +1690,7 @@ def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
     slices = state["slices"]
     arms = list(dict.fromkeys(s["arm"] for s in slices))
     lane = {a: i for i, a in enumerate(arms)}
+    holds = holds or []
 
     def minutes(ts: float | None) -> float:
         return max((ts or start) - start, 0.0) / 60
@@ -1656,30 +1700,34 @@ def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
         + [minutes(i.get("at")) for i in state.get("integrations", [])],
         default=1.0,
     )
+    rows = [*arms, "GPU"] if holds else arms  # the GPU's busy strip below the arms
     ax.set_xlim(0, max(end, 1.0) * 1.03)
-    ax.set_ylim(len(arms) + 0.05, -0.6)  # room below the last lane for the integration labels
-    ax.set_yticks(range(len(arms)), arms)
+    # room below the last lane for the integration labels
+    ax.set_ylim(len(rows) + (0.45 if holds else 0.05), -0.6)
+    ax.set_yticks(range(len(rows)), rows)
     ax.grid(axis="y", visible=False)
-    for s in slices:
-        a, b = minutes(s["started"]), minutes(s.get("ended") or s["started"])
+    for s, t0, t1, k, n in _bars(slices, spans or {}):
+        a, b = minutes(t0), minutes(t1)
         failed = s.get("status") in ("interrupted", "timed_out", "error", "failed")
         color = charts.KEEP_COLOR if s.get("improved") else charts.DISCARD_COLOR
+        y = lane[s["arm"]] + (k - (n - 1) / 2) * 0.62 / n  # sub-lane k of n
         ax.barh(
-            lane[s["arm"]],
+            y,
             max(b - a, 0.3),
             left=a,
-            height=0.56,
+            height=0.56 / n,
             color=color,
             edgecolor=charts.FAIL_COLOR if failed else charts.SURFACE,
             linewidth=1.4 if failed else 0.8,
             hatch="///" if failed else None,
             zorder=3,
         )
-        if s.get("improved") and charts._fits(ax, f"{s['best_after']:.2f}x", 7.5, a, b, 2):
+        label = f"{s['best_after']:.2f}x" if s.get("improved") else ""
+        if label and n == 1 and charts._fits(ax, label, 7.5, a, b, 2):
             ax.text(
                 (a + b) / 2,
-                lane[s["arm"]],
-                f"{s['best_after']:.2f}x",
+                y,
+                label,
                 ha="center",
                 va="center",
                 fontsize=7.5,
@@ -1725,17 +1773,32 @@ def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
             fontsize=8,
             color=charts.PROJECTED_COLOR,
         )
+    busy = 0.0
+    for a0, b0, session in holds:  # who held the GPU: the agents' jobs, background work
+        a, b = minutes(a0), minutes(b0 if b0 is not None else a0)
+        busy += b - a
+        ax.barh(
+            len(arms),
+            max(b - a, 0.05),
+            left=a,
+            height=0.4,
+            color=charts.TARGET_COLORS[2] if session else charts.MUTED,
+            linewidth=0,
+            zorder=3,
+        )
     ax.set_xlabel("wall-clock time since the run started (min)")
     integrations = state.get("integrations", [])
     best = max([1.0, *(float(i["speedup"]) for i in integrations)])
     finished = (state.get("finished") or {}).get("reason", "running").split(" (")[0]
+    first = min((minutes(a) for a, _, _ in holds), default=0.0)
+    gpu = f" · GPU busy {busy / (end - first):.0%}" if holds and end > first else ""
     charts._header(
         ax,
         f"improve: {len(slices)} slices, measured end to end 1.00 → {best:.2f}x",
         charts._short(
             f"{sum(s.get('evals') or 0 for s in slices)} evaluations, "
             f"{len(integrations)} re-integrations, {len(state.get('rounds', []))} round(s) · "
-            f"stopped: {finished}",
+            f"stopped: {finished}{gpu}",
             120,
         ),
     )
@@ -1756,7 +1819,16 @@ def _draw_slices(ax: Any, state: dict[str, Any], start: float) -> None:
                 if sessions
                 else []
             ),
+            *(
+                [
+                    Patch(color=charts.TARGET_COLORS[2], label="GPU: agents' jobs"),
+                    Patch(color=charts.MUTED, label="GPU: integration, captures"),
+                ]
+                if holds
+                else []
+            ),
         ],
+        ncol=4 if holds else None,
     )
 
 
