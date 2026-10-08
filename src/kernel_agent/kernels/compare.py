@@ -25,6 +25,16 @@ inputs (``perturbed``) these tiers use their own bounds (:data:`PERTURBED_BOUNDS
 the element bound scaled per channel. On inputs scaled by a factor (``input_scale``: the
 evaluator's ×3 / ×0.01 / ×−1 checks, :mod:`kernel_agent.kernels.verify`) the absolute
 tolerance grows with a factor above 1 and the signal threshold shrinks with one below 1.
+
+Caches are compared relative to the update. An argument a call updates in place is compared
+on the elements the reference or the candidate changed (:func:`compare_side_effects`). A
+cache the call grows (:func:`grown_dim`: an argument, or an output whose leading part along
+one dimension equals an input tensor, e.g. a KV cache ``torch.cat``-ed with the new token's
+K / V) is compared in two parts (:func:`compare_grown`): the appended rows on their own
+(the tier's checks with their own RMS), and the part of the input's shape, which must stay
+bit for bit where the reference kept it. Compared whole, one wrong new row of a 4096-token
+cache was 0.02 % of the elements, inside :data:`MAX_MISMATCH`, and at ×0.01 the scaled old
+rows set the element bound of a new row that is not scaled (#202).
 """
 
 from __future__ import annotations
@@ -331,6 +341,16 @@ CHANNEL_MIN_ROWS = 16
 #: draws in both modes, from 37 / 14), except FP4 weights with an unwritten output row on the
 #: LocDiT layer, which only the global redraw caught (23 of 40 near-lossless draws):
 #: realistic draws keep it within FP4's noise, as the captured inputs do.
+#:
+#: Re-measured with grown caches compared in parts (#202, :func:`compare_grown`;
+#: docs/research-scripts/grown-cache-202), the bounds unchanged: on the Qwen3 layer the
+#: x 0.01 checks (kept V rows scaled, the new row not) no longer fail the reference math
+#: (near-lossless / relaxed, of 12: FP8 weights 3 / 0 -> 0 / 0, NVFP4 and MXFP4 4 / 4 ->
+#: 0 / 0, FP8 W8A8 6 / 1 -> 2 / 0, MXFP8 5 / 2 -> 1 / 0, INT8 W8A8 4 / 1 -> 0 / 0); the new
+#: rows' own norm, cosine and relative L2 checks add redrawn failures of the noisiest
+#: numerics (of 80: FP8 weights 4 / 0 -> 5 / 0, MXFP8 65 / 1 -> 70 / 1, MXFP4 6 / 0 ->
+#: 8 / 1, the key row's norm). Every broken variant is still rejected in both modes; the
+#: VoxCPM2 captures (in-place caches) are unchanged.
 PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.03, (0.75, 0.125)),
     NEAR_LOSSLESS_FP4_TIER: (0.94, 0.40, 0.12, (2.5, 0.25)),
@@ -421,14 +441,29 @@ def _non_finite_error(a: torch.Tensor, b: torch.Tensor) -> str | None:
     return "; ".join(problems) or None
 
 
-def _channel_rms(ref: torch.Tensor, rms: float) -> torch.Tensor | float:
-    """``max(rms, RMS of the element's channel)`` per element of ``ref`` (a channel: one
-    position of the last dimension, its RMS over all the other dimensions, non-finite
-    values as 0); ``rms`` for tensors with fewer than :data:`CHANNEL_MIN_ROWS` rows."""
+def _channels(ref: torch.Tensor) -> torch.Tensor | None:
+    """The RMS of each channel of ``ref`` (one position of the last dimension, over all the
+    other dimensions, non-finite values as 0; shape ``[1, ..., 1, C]``), None for fewer than
+    :data:`CHANNEL_MIN_ROWS` rows."""
     if ref.dim() < 2 or ref.numel() < CHANNEL_MIN_ROWS * ref.shape[-1]:
-        return rms
+        return None
     values = torch.where(torch.isfinite(ref), ref, torch.zeros_like(ref))
-    channel = values.pow(2).mean(dim=tuple(range(ref.dim() - 1)), keepdim=True).sqrt()
+    return values.pow(2).mean(dim=tuple(range(ref.dim() - 1)), keepdim=True).sqrt()
+
+
+def _channel_rms(
+    ref: torch.Tensor, rms: float, floor: torch.Tensor | None = None
+) -> torch.Tensor | float:
+    """``max(rms, RMS of the element's channel)`` per element of ``ref`` (:func:`_channels`);
+    ``rms`` for tensors with fewer than :data:`CHANNEL_MIN_ROWS` rows. ``floor``: a
+    per-channel RMS (broadcastable to ``ref``) the element's is at least: the RMS of the
+    channels of a grown cache for its appended rows (:func:`compare_grown`)."""
+    channel = _channels(ref)
+    if floor is not None:
+        floor = floor.to(ref.device, torch.float32)
+        channel = floor if channel is None else torch.maximum(channel, floor)
+    if channel is None:
+        return rms
     return channel.clamp_min(rms).expand_as(ref)
 
 
@@ -441,9 +476,12 @@ def compare_tensors(
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
+    channel_rms: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """One tensor against its reference (module docstring); ``tier``: the tolerance tier
-    (default :data:`TIER`); ``perturbed``: on redrawn inputs (:data:`PERTURBED_BOUNDS`);
+    (default :data:`TIER`); ``perturbed``: on redrawn inputs (:data:`PERTURBED_BOUNDS`;
+    ``channel_rms``: a per-channel RMS, broadcastable to ``ref``, that the element bound's
+    channel RMS is at least: a grown cache's for its appended rows, :func:`compare_grown`);
     ``input_scale``: the factor ``f`` the inputs were scaled by (the evaluator's ×3, ×0.01
     and ×−1 checks, :data:`kernel_agent.kernels.verify.SCALED`). A module's outputs, and
     their rounding errors, grow with ``|f| > 1``, so the absolute tolerance is
@@ -518,7 +556,7 @@ def compare_tensors(
         rms = ref_norm / math.sqrt(a.numel())
         scale: torch.Tensor | float = rms
         if perturbed:  # the larger of the tensor's and the element's channel's RMS
-            scale = _channel_rms(full, rms)
+            scale = _channel_rms(full, rms, channel_rms)
             if masked and isinstance(scale, torch.Tensor):
                 scale = scale[finite]
         element = float((diff / (e_atol * scale + e_rtol * a.abs())).max())
@@ -564,24 +602,161 @@ def compare_tensors(
     return result
 
 
+def grown_dim(before: Any, after: Any) -> int | None:
+    """The dimension along which ``after`` is ``before`` grown by a call (a cache extended by
+    concatenation): floating-point tensors of one dtype and rank, strided, ``before`` not
+    empty, the same size in every dimension but this one, where ``after`` is larger. None
+    otherwise (the same shape too: an in-place update, :func:`compare_side_effects`)."""
+    if not (isinstance(before, torch.Tensor) and isinstance(after, torch.Tensor)):
+        return None
+    if (
+        not before.is_floating_point()
+        or before.dtype != after.dtype
+        or before.dim() != after.dim()
+        or before.layout != torch.strided
+        or after.layout != torch.strided
+        or before.numel() == 0
+    ):
+        return None
+    dims = [d for d in range(before.dim()) if before.shape[d] != after.shape[d]]
+    if len(dims) != 1 or after.shape[dims[0]] < before.shape[dims[0]]:
+        return None
+    return dims[0]
+
+
+def _same(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Elementwise: ``a`` and ``b`` hold the same value (NaN the same as NaN)."""
+    return (a == b) | (torch.isnan(a) & torch.isnan(b))
+
+
+def compare_grown(
+    name: str,
+    before: torch.Tensor,
+    ref: torch.Tensor,
+    new: torch.Tensor,
+    dim: int,
+    *,
+    tier: str | None = None,
+    perturbed: bool = False,
+    input_scale: float = 1.0,
+) -> dict[str, Any]:
+    """``new`` against ``ref``, both ``before`` grown by the call along ``dim``
+    (:func:`grown_dim`; a KV cache ``torch.cat``-ed with the new token's K / V), relative to
+    the update as in-place caches are (:func:`compare_side_effects`):
+
+    * the appended rows (past ``before``'s size along ``dim``) on their own, with the tier's
+      checks (:func:`compare_tensors`: their own RMS, mismatch fraction, norm, cosine and
+      relative L2 error; on redrawn inputs an element's channel RMS is at least its
+      channel's in the whole grown reference: a decode step appends one token, too few rows
+      for a channel RMS of its own, and Qwen3-0.6B's ``k_norm`` makes key channel 50 ~10x
+      the row's RMS);
+    * the kept part (``before``'s shape): where the reference left it as ``before`` (a
+      concatenation copies it), the candidate must too, bit for bit; where the reference
+      changed it, the elements either side changed are compared.
+
+    Compared whole, the kept rows diluted the new ones: one wrong row of a 4096-token
+    cache was 0.02 % of the elements (within :data:`MAX_MISMATCH`), and at ×0.01 the
+    scaled old rows set the element bound (their RMS) of a new row computed from
+    normalised activations, which is not scaled (#202). A candidate whose tensor does not
+    match ``ref``'s type, shape, dtype, layout or device is compared whole (the error)."""
+    kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
+    if (
+        type_error(new) is not None
+        or new.shape != ref.shape
+        or new.dtype != ref.dtype
+        or new.layout != ref.layout
+        or new.device.type != ref.device.type
+    ):
+        return compare_tensors(name, ref, new, **kw)
+    kept, total = before.shape[dim], ref.shape[dim]
+    ref, before = ref.detach().to(new.device), before.detach().to(new.device)
+    new = new.detach()
+    appended = total - kept
+    channels = _channels(ref.float()) if perturbed else None
+    if channels is not None and dim == ref.dim() - 1:  # grown along the channels themselves
+        channels = channels.narrow(dim, kept, appended)
+    result = compare_tensors(
+        name,
+        ref.narrow(dim, kept, appended),
+        new.narrow(dim, kept, appended),
+        channel_rms=channels,
+        **kw,
+    )
+    result["grown"] = {"dim": dim, "kept": kept, "appended": appended}
+    rows = f"{appended} appended row{'s' if appended != 1 else ''} along dim {dim}"
+    problems = [f"the {rows} (after {kept} kept): {result['error']}"] if "error" in result else []
+    ref_old, new_old = ref.narrow(dim, 0, kept), new.narrow(dim, 0, kept)
+    unchanged = _same(ref_old, before)
+    if bool(unchanged.all()):  # the reference only appended: the kept part stays bit for bit
+        moved = int((~_same(new_old, before)).sum())
+        result["kept_changed"] = moved
+        if moved:
+            problems.append(
+                f"{moved} of the {before.numel()} elements of the {kept} kept rows along dim "
+                f"{dim} changed; the reference keeps them as they were (it only appends)"
+            )
+    else:  # the reference changed the kept part too: compare the elements either side changed
+        changed = ~unchanged | ~_same(new_old, before)
+        count = int(changed.sum())
+        old = compare_tensors(name, ref_old[changed], new_old[changed], **kw)
+        result["changed_elements"] = count
+        if not old["ok"]:
+            problems.append(f"the {count} changed elements of the {kept} kept rows: {old['error']}")
+    result.pop("error", None)
+    if problems:
+        result["error"] = "; ".join(problems)
+    result["ok"] = not problems
+    return result
+
+
+def compare_output(
+    name: str,
+    ref: torch.Tensor,
+    new: Any,
+    inputs: Any = (),
+    *,
+    tier: str | None = None,
+    perturbed: bool = False,
+    input_scale: float = 1.0,
+) -> dict[str, Any]:
+    """One output tensor against its reference: :func:`compare_grown` when the reference is
+    one of the call's input tensors ``inputs`` (pre-call) grown along one dimension (its
+    leading part there equal to that input, NaN as NaN: a returned ``torch.cat`` of a cache
+    and the new rows), else :func:`compare_tensors`."""
+    kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
+    for before in inputs:
+        dim = grown_dim(before, ref)
+        if dim is None:
+            continue
+        lead = ref.detach().narrow(dim, 0, before.shape[dim])
+        if bool(_same(lead, before.detach().to(lead.device)).all()):
+            return compare_grown(name, before, ref, new, dim, **kw)
+    return compare_tensors(name, ref, new, **kw)
+
+
 def compare_structures(
     ref: Any,
     new: Any,
     prefix: str = "out",
     *,
+    inputs: Any = None,
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
 ) -> list[dict[str, Any]]:
+    """The candidate's output ``new`` against the reference's ``ref``, tensor by tensor
+    (:func:`compare_output`); ``inputs``: the call's inputs before the call (e.g.
+    ``(args, kwargs)``), for outputs that grow one of them (:func:`compare_grown`)."""
     ref_flat = flatten(ref, prefix)
     new_flat = flatten(new, prefix)
+    sources = list(flatten(inputs, "in").values())
     kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
     results = []
     for name, tensor in ref_flat.items():
         if name not in new_flat:
             results.append({"name": name, "ok": False, "error": "missing in candidate output"})
             continue
-        results.append(compare_tensors(name, tensor, new_flat[name], **kw))
+        results.append(compare_output(name, tensor, new_flat[name], sources, **kw))
     return results
 
 
@@ -601,8 +776,10 @@ def compare_side_effects(
     the reference *or* the candidate changed are compared, so the mismatch
     allowance (:data:`MAX_MISMATCH`) is relative to the update.  Otherwise
     writing one position of an 8192-long KV cache (0.01 % of its elements), or
-    forgetting to, would vanish inside the allowance.  Other tensors (e.g. caches
-    that grow by concatenation) are compared whole."""
+    forgetting to, would vanish inside the allowance.  Caches that the call grows
+    along one dimension (concatenation, :func:`grown_dim`) likewise: the appended
+    rows on their own, the kept part unchanged where the reference kept it
+    (:func:`compare_grown`).  Other tensors are compared whole."""
     return compare_side_effects_flat(
         flatten(pre, prefix),
         flatten(ref_post, prefix),
@@ -631,6 +808,9 @@ def compare_side_effects_flat(
             results.append({"name": name, "ok": False, "error": "missing in candidate arguments"})
             continue
         before = pre_flat.get(name)
+        if before is not None and (dim := grown_dim(before, ref)) is not None:
+            results.append(compare_grown(name, before, ref, new, dim, **kw))
+            continue
         if (
             before is None
             or type_error(new) is not None

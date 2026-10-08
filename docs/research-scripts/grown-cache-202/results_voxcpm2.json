@@ -1,0 +1,2706 @@
+{
+ "device": "cuda",
+ "seeds": 10,
+ "bounds": {
+  "near-lossless": {
+   "captured": [
+    0.996,
+    0.08,
+    0.02,
+    [
+     0.5,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.996,
+    0.08,
+    0.03,
+    [
+     0.75,
+     0.125
+    ]
+   ]
+  },
+  "near-lossless-fp4": {
+   "captured": [
+    0.96,
+    0.28,
+    0.04,
+    [
+     1.25,
+     0.25
+    ]
+   ],
+   "redrawn": [
+    0.94,
+    0.4,
+    0.12,
+    [
+     2.5,
+     0.25
+    ]
+   ]
+  },
+  "near-lossless-kv": {
+   "captured": [
+    0.996,
+    0.08,
+    0.02,
+    [
+     0.5,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.985,
+    0.16,
+    0.03,
+    [
+     1.5,
+     0.125
+    ]
+   ]
+  },
+  "relaxed": {
+   "captured": [
+    0.99,
+    0.16,
+    0.04,
+    [
+     0.75,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.99,
+    0.16,
+    0.06,
+    [
+     1.5,
+     0.125
+    ]
+   ]
+  },
+  "relaxed-fp4": {
+   "captured": [
+    0.94,
+    0.36,
+    0.06,
+    [
+     1.75,
+     0.25
+    ]
+   ],
+   "redrawn": [
+    0.9,
+    0.55,
+    0.18,
+    [
+     3.0,
+     0.25
+    ]
+   ]
+  },
+  "relaxed-kv": {
+   "captured": [
+    0.99,
+    0.16,
+    0.04,
+    [
+     0.75,
+     0.125
+    ]
+   ],
+   "redrawn": [
+    0.97,
+    0.25,
+    0.06,
+    [
+     2.5,
+     0.125
+    ]
+   ]
+  }
+ },
+ "results": [
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "FP8 weights",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99989,
+     "max_rel_l2": 0.0151,
+     "max_norm_change": 0.0034,
+     "max_element_ratio": {
+      "near-lossless": 0.139,
+      "relaxed": 0.099
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.9997,
+     "max_rel_l2": 0.0246,
+     "max_norm_change": 0.0098,
+     "max_element_ratio": {
+      "near-lossless": 0.172,
+      "relaxed": 0.091
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99988,
+     "max_rel_l2": 0.0152,
+     "max_norm_change": 0.0063,
+     "max_element_ratio": {
+      "near-lossless": 0.117,
+      "relaxed": 0.059
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "FP8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99979,
+     "max_rel_l2": 0.0204,
+     "max_norm_change": 0.0024,
+     "max_element_ratio": {
+      "near-lossless": 0.194,
+      "relaxed": 0.138
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99944,
+     "max_rel_l2": 0.0336,
+     "max_norm_change": 0.0105,
+     "max_element_ratio": {
+      "near-lossless": 0.231,
+      "relaxed": 0.117
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99972,
+     "max_rel_l2": 0.0251,
+     "max_norm_change": 0.0083,
+     "max_element_ratio": {
+      "near-lossless": 0.18,
+      "relaxed": 0.11
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "MXFP8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99979,
+     "max_rel_l2": 0.0207,
+     "max_norm_change": 0.0092,
+     "max_element_ratio": {
+      "near-lossless": 0.174,
+      "relaxed": 0.145
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99939,
+     "max_rel_l2": 0.0349,
+     "max_norm_change": 0.0106,
+     "max_element_ratio": {
+      "near-lossless": 0.27,
+      "relaxed": 0.136
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99976,
+     "max_rel_l2": 0.0223,
+     "max_norm_change": 0.0071,
+     "max_element_ratio": {
+      "near-lossless": 0.162,
+      "relaxed": 0.086
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "NVFP4 weights",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99844,
+     "max_rel_l2": 0.0558,
+     "max_norm_change": 0.0097,
+     "max_element_ratio": {
+      "near-lossless": 0.189,
+      "relaxed": 0.136
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99467,
+     "max_rel_l2": 0.1032,
+     "max_norm_change": 0.0059,
+     "max_element_ratio": {
+      "near-lossless": 0.211,
+      "relaxed": 0.177
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99839,
+     "max_rel_l2": 0.0568,
+     "max_norm_change": 0.0077,
+     "max_element_ratio": {
+      "near-lossless": 0.123,
+      "relaxed": 0.104
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "MXFP4 weights",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99761,
+     "max_rel_l2": 0.07,
+     "max_norm_change": 0.0487,
+     "max_element_ratio": {
+      "near-lossless": 0.268,
+      "relaxed": 0.228
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x0.9516 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99067,
+     "max_rel_l2": 0.1367,
+     "max_norm_change": 0.0623,
+     "max_element_ratio": {
+      "near-lossless": 0.283,
+      "relaxed": 0.239
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99721,
+     "max_rel_l2": 0.0807,
+     "max_norm_change": 0.0447,
+     "max_element_ratio": {
+      "near-lossless": 0.148,
+      "relaxed": 0.124
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99989,
+     "max_rel_l2": 0.1587,
+     "max_norm_change": 0.1584,
+     "max_element_ratio": {
+      "near-lossless": 1.325,
+      "relaxed": 1.298
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.33x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x1.1584 (allowed \u00b12%): a systematic error, not rounding noise; relative L2 error 0.1587 > 0.08",
+      "relaxed": "output[0]: an element is 1.3x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1.1584 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99676,
+     "max_rel_l2": 0.0906,
+     "max_norm_change": 0.0504,
+     "max_element_ratio": {
+      "near-lossless": 0.896,
+      "relaxed": 0.553
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.0303 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 4
+     },
+     "min_cosine": 0.99423,
+     "max_rel_l2": 0.1498,
+     "max_norm_change": 0.1483,
+     "max_element_ratio": {
+      "near-lossless": 1.157,
+      "relaxed": 0.635
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1483 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1498 > 0.08",
+      "relaxed": "output[0]: norm x1.1483 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp8: scales x1.2",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99952,
+     "max_rel_l2": 0.7336,
+     "max_norm_change": 0.7325,
+     "max_element_ratio": {
+      "near-lossless": 6.05,
+      "relaxed": 5.926
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 6.01x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x1.7304 (allowed \u00b12%): a systematic error, not rounding noise; relative L2 error 0.7314 > 0.08",
+      "relaxed": "output[0]: an element is 5.88x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1.7304 (allowed \u00b14%): a systematic error, not rounding noise; relative L2 error 0.7314 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": 0.94257,
+     "max_rel_l2": 0.3711,
+     "max_norm_change": 0.2001,
+     "max_element_ratio": {
+      "near-lossless": 3.898,
+      "relaxed": 2.405
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.52x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); cosine 0.984965 < 0.996; relative L2 error 0.1737 > 0.08",
+      "relaxed": "output[0]: cosine 0.984965 < 0.99; relative L2 error 0.1737 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 6
+     },
+     "min_cosine": 0.91787,
+     "max_rel_l2": 0.6806,
+     "max_norm_change": 0.677,
+     "max_element_ratio": {
+      "near-lossless": 5.375,
+      "relaxed": 2.949
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.03x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.6755 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.6791 > 0.08",
+      "relaxed": "output[0]: an element is 1.24x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.6755 (allowed \u00b16%): a systematic error, not rounding noise; relative L2 error 0.6791 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp8: int4 per tensor",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99017,
+     "max_rel_l2": 0.1419,
+     "max_norm_change": 0.0193,
+     "max_element_ratio": {
+      "near-lossless": 3.714,
+      "relaxed": 2.962
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 3.71x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|)",
+      "relaxed": "output[0]: an element is 2.96x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|)"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": 0.9558,
+     "max_rel_l2": 0.31,
+     "max_norm_change": 0.1621,
+     "max_element_ratio": {
+      "near-lossless": 3.345,
+      "relaxed": 2.13
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.61x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.8608 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.989623 < 0.996; relative L2 error 0.193 > 0.08",
+      "relaxed": "output[0]: an element is 1.59x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.8608 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.989623 < 0.99; relative L2 error 0.193 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 6
+     },
+     "min_cosine": 0.94365,
+     "max_rel_l2": 0.5823,
+     "max_norm_change": 0.4227,
+     "max_element_ratio": {
+      "near-lossless": 2.422,
+      "relaxed": 1.475
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.42x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[0]: an element is 1.48x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp8: row 0 of every GEMM skipped",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99942,
+     "max_rel_l2": 0.034,
+     "max_norm_change": 0.0047,
+     "max_element_ratio": {
+      "near-lossless": 1.615,
+      "relaxed": 1.167
+     },
+     "example": {
+      "near-lossless": "output[1][0]: an element is 1.62x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|)",
+      "relaxed": "output[1][0]: an element is 1.17x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|)"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": 0.99791,
+     "max_rel_l2": 0.0647,
+     "max_norm_change": 0.0099,
+     "max_element_ratio": {
+      "near-lossless": 2.761,
+      "relaxed": 1.682
+     },
+     "example": {
+      "near-lossless": "output[1][0]: an element is 2.3x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "output[1][0]: an element is 1.34x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99815,
+     "max_rel_l2": 0.0607,
+     "max_norm_change": 0.0062,
+     "max_element_ratio": {
+      "near-lossless": 1.654,
+      "relaxed": 0.939
+     },
+     "example": {
+      "near-lossless": "output[1][0]: an element is 1.65x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp8: KV head 0 dropped",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.78113,
+     "max_rel_l2": 0.6244,
+     "max_norm_change": 0.2192,
+     "max_element_ratio": {
+      "near-lossless": 6.641,
+      "relaxed": 6.121
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x0.9758 (allowed \u00b12%): a systematic error, not rounding noise",
+      "relaxed": "output[1][1]: an element is 6.12x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0.7808 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.781128 < 0.99; relative L2 error 0.6244 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": 0.72513,
+     "max_rel_l2": 1.1,
+     "max_norm_change": 0.9537,
+     "max_element_ratio": {
+      "near-lossless": 3.178,
+      "relaxed": 1.983
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.91x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.5848 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.926951 < 0.996; relative L2 error 0.7573 > 0.08",
+      "relaxed": "output[0]: an element is 1.08x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.5848 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.926951 < 0.99; relative L2 error 0.7573 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 6
+     },
+     "min_cosine": 0.53175,
+     "max_rel_l2": 1.073,
+     "max_norm_change": 0.2507,
+     "max_element_ratio": {
+      "near-lossless": 5.064,
+      "relaxed": 3.08
+     },
+     "example": {
+      "near-lossless": "output[1][1]: an element is 3.44x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.7805 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.781335 < 0.996; relative L2 error 0.6241 > 0.08",
+      "relaxed": "output[1][1]: an element is 2.19x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.7805 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.781335 < 0.99; relative L2 error 0.6241 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp8: q heads 0/last swapped (layout)",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99989,
+     "max_rel_l2": 0.0151,
+     "max_norm_change": 0.0012,
+     "max_element_ratio": {
+      "near-lossless": 0.325,
+      "relaxed": 0.228
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.9997,
+     "max_rel_l2": 0.0246,
+     "max_norm_change": 0.0066,
+     "max_element_ratio": {
+      "near-lossless": 0.176,
+      "relaxed": 0.105
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.98621,
+     "max_rel_l2": 0.1656,
+     "max_norm_change": 0.0089,
+     "max_element_ratio": {
+      "near-lossless": 1.341,
+      "relaxed": 0.739
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.34x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); cosine 0.986206 < 0.996; relative L2 error 0.1656 > 0.08",
+      "relaxed": "output[0]: cosine 0.986206 < 0.99; relative L2 error 0.1656 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG w8a8: first token's activation scale",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.98118,
+     "max_rel_l2": 0.7827,
+     "max_norm_change": 0.7773,
+     "max_element_ratio": {
+      "near-lossless": 6.086,
+      "relaxed": 5.961
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 6.08x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x0.2230 (allowed \u00b12%): a systematic error, not rounding noise; cosine 0.981309 < 0.996; relative L2 error 0.7823 > 0.08",
+      "relaxed": "output[0]: an element is 5.95x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0.2230 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.981309 < 0.99; relative L2 error 0.7823 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 36,
+      "relaxed": 27
+     },
+     "min_cosine": 0.91268,
+     "max_rel_l2": 0.5709,
+     "max_norm_change": 0.486,
+     "max_element_ratio": {
+      "near-lossless": 1.934,
+      "relaxed": 1.18
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.0438 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.995037 < 0.996; relative L2 error 0.1108 > 0.08",
+      "relaxed": "output[1][0]: cosine 0.983518 < 0.99; relative L2 error 0.1824 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 4
+     },
+     "min_cosine": 0.9558,
+     "max_rel_l2": 0.6946,
+     "max_norm_change": 0.6735,
+     "max_element_ratio": {
+      "near-lossless": 2.059,
+      "relaxed": 1.254
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.06x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.3266 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.955829 < 0.996; relative L2 error 0.6945 > 0.08",
+      "relaxed": "output[0]: an element is 1.25x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.3266 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.955829 < 0.99; relative L2 error 0.6945 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp4: nibbles swapped",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.01395,
+     "max_rel_l2": 1.188,
+     "max_norm_change": 0.948,
+     "max_element_ratio": {
+      "near-lossless": 3.698,
+      "relaxed": 3.623
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 3.7x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x0.0520 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.595289 < 0.96; relative L2 error 0.9699 > 0.28",
+      "relaxed": "output[0]: an element is 3.62x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|); norm x0.0520 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.595289 < 0.94; relative L2 error 0.9699 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": -0.03047,
+     "max_rel_l2": 1.768,
+     "max_norm_change": 0.7132,
+     "max_element_ratio": {
+      "near-lossless": 3.03,
+      "relaxed": 2.594
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x0.3151 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.575210 < 0.94; relative L2 error 0.8584 > 0.4",
+      "relaxed": "output[0]: norm x0.3151 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.575210 < 0.9; relative L2 error 0.8584 > 0.55"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 6
+     },
+     "min_cosine": -0.07252,
+     "max_rel_l2": 1.188,
+     "max_norm_change": 0.8508,
+     "max_element_ratio": {
+      "near-lossless": 2.544,
+      "relaxed": 2.164
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x0.1493 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.661469 < 0.94; relative L2 error 0.9082 > 0.4",
+      "relaxed": "output[0]: norm x0.1493 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.661469 < 0.9; relative L2 error 0.9082 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp4: scales x1.2",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99844,
+     "max_rel_l2": 0.7115,
+     "max_norm_change": 0.7103,
+     "max_element_ratio": {
+      "near-lossless": 2.908,
+      "relaxed": 2.849
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.89x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x1.7076 (allowed \u00b14%): a systematic error, not rounding noise; relative L2 error 0.7086 > 0.28",
+      "relaxed": "output[0]: an element is 2.83x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|); norm x1.7076 (allowed \u00b16%): a systematic error, not rounding noise; relative L2 error 0.7086 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": 0.94433,
+     "max_rel_l2": 0.3627,
+     "max_norm_change": 0.1998,
+     "max_element_ratio": {
+      "near-lossless": 1.346,
+      "relaxed": 1.173
+     },
+     "example": {
+      "near-lossless": "output[1][0]: norm x1.1979 (allowed \u00b112%): a systematic error, not rounding noise",
+      "relaxed": "output[1][0]: norm x1.1979 (allowed \u00b118%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 6
+     },
+     "min_cosine": 0.9216,
+     "max_rel_l2": 0.6635,
+     "max_norm_change": 0.6599,
+     "max_element_ratio": {
+      "near-lossless": 1.7,
+      "relaxed": 1.444
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.6599 (allowed \u00b112%): a systematic error, not rounding noise; relative L2 error 0.6635 > 0.4",
+      "relaxed": "output[0]: norm x1.6599 (allowed \u00b118%): a systematic error, not rounding noise; relative L2 error 0.6635 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp4: int4 per tensor",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99017,
+     "max_rel_l2": 0.1419,
+     "max_norm_change": 0.0193,
+     "max_element_ratio": {
+      "near-lossless": 1.648,
+      "relaxed": 1.345
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.65x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|)",
+      "relaxed": "output[0]: an element is 1.34x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|)"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 1
+     },
+     "min_cosine": 0.9558,
+     "max_rel_l2": 0.31,
+     "max_norm_change": 0.1621,
+     "max_element_ratio": {
+      "near-lossless": 1.212,
+      "relaxed": 1.065
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x0.8608 (allowed \u00b112%): a systematic error, not rounding noise",
+      "relaxed": "output[0]: an element is 1.06x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.94365,
+     "max_rel_l2": 0.5823,
+     "max_norm_change": 0.4227,
+     "max_element_ratio": {
+      "near-lossless": 0.848,
+      "relaxed": 0.738
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.4227 (allowed \u00b112%): a systematic error, not rounding noise; relative L2 error 0.5823 > 0.4",
+      "relaxed": "output[0]: norm x1.4227 (allowed \u00b118%): a systematic error, not rounding noise; relative L2 error 0.5823 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp4: row 0 of every GEMM skipped",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99825,
+     "max_rel_l2": 0.0591,
+     "max_norm_change": 0.009,
+     "max_element_ratio": {
+      "near-lossless": 0.681,
+      "relaxed": 0.515
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99302,
+     "max_rel_l2": 0.118,
+     "max_norm_change": 0.0054,
+     "max_element_ratio": {
+      "near-lossless": 0.96,
+      "relaxed": 0.835
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99666,
+     "max_rel_l2": 0.0818,
+     "max_norm_change": 0.0075,
+     "max_element_ratio": {
+      "near-lossless": 0.551,
+      "relaxed": 0.472
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp4: KV head 0 dropped",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.78032,
+     "max_rel_l2": 0.6254,
+     "max_norm_change": 0.2197,
+     "max_element_ratio": {
+      "near-lossless": 3.185,
+      "relaxed": 2.945
+     },
+     "example": {
+      "near-lossless": "output[1][1]: an element is 3.19x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x0.7803 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.780324 < 0.96; relative L2 error 0.6254 > 0.28",
+      "relaxed": "output[1][1]: an element is 2.95x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|); norm x0.7803 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.780324 < 0.94; relative L2 error 0.6254 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": 0.72401,
+     "max_rel_l2": 1.092,
+     "max_norm_change": 0.9425,
+     "max_element_ratio": {
+      "near-lossless": 1.133,
+      "relaxed": 0.991
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.5736 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.925836 < 0.94; relative L2 error 0.7499 > 0.4",
+      "relaxed": "output[0]: norm x1.5736 (allowed \u00b118%): a systematic error, not rounding noise; relative L2 error 0.7499 > 0.55"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 6
+     },
+     "min_cosine": 0.52151,
+     "max_rel_l2": 1.094,
+     "max_norm_change": 0.2532,
+     "max_element_ratio": {
+      "near-lossless": 1.781,
+      "relaxed": 1.548
+     },
+     "example": {
+      "near-lossless": "output[1][1]: an element is 1.25x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x0.7800 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.780530 < 0.94; relative L2 error 0.6251 > 0.4",
+      "relaxed": "output[1][1]: an element is 1.1x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x0.7800 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.780530 < 0.9; relative L2 error 0.6251 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG fp4: q heads 0/last swapped (layout)",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99844,
+     "max_rel_l2": 0.0558,
+     "max_norm_change": 0.0145,
+     "max_element_ratio": {
+      "near-lossless": 0.189,
+      "relaxed": 0.136
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99467,
+     "max_rel_l2": 0.1032,
+     "max_norm_change": 0.0128,
+     "max_element_ratio": {
+      "near-lossless": 0.211,
+      "relaxed": 0.177
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.98487,
+     "max_rel_l2": 0.1733,
+     "max_norm_change": 0.0141,
+     "max_element_ratio": {
+      "near-lossless": 0.411,
+      "relaxed": 0.349
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG w8a8: cached activation scales",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99979,
+     "max_rel_l2": 0.0204,
+     "max_norm_change": 0.0024,
+     "max_element_ratio": {
+      "near-lossless": 0.194,
+      "relaxed": 0.138
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 40
+     },
+     "min_cosine": 0.68069,
+     "max_rel_l2": 0.7595,
+     "max_norm_change": 0.5464,
+     "max_element_ratio": {
+      "near-lossless": 3.32,
+      "relaxed": 2.198
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 2.48x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.5078 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.717422 < 0.996; relative L2 error 0.7275 > 0.08",
+      "relaxed": "output[0]: an element is 1.54x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.5078 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.717422 < 0.99; relative L2 error 0.7275 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99861,
+     "max_rel_l2": 0.0583,
+     "max_norm_change": 0.0235,
+     "max_element_ratio": {
+      "near-lossless": 1.1,
+      "relaxed": 0.558
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.1x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "INT8 weights",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99999,
+     "max_rel_l2": 0.0054,
+     "max_norm_change": 0.0012,
+     "max_element_ratio": {
+      "near-lossless": 0.082,
+      "relaxed": 0.059
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99993,
+     "max_rel_l2": 0.0119,
+     "max_norm_change": 0.0012,
+     "max_element_ratio": {
+      "near-lossless": 0.104,
+      "relaxed": 0.057
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99998,
+     "max_rel_l2": 0.0065,
+     "max_norm_change": 0.0025,
+     "max_element_ratio": {
+      "near-lossless": 0.073,
+      "relaxed": 0.041
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "INT8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 1,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99984,
+     "max_rel_l2": 0.0229,
+     "max_norm_change": 0.021,
+     "max_element_ratio": {
+      "near-lossless": 0.3,
+      "relaxed": 0.229
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x0.9790 (allowed \u00b12%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99822,
+     "max_rel_l2": 0.0598,
+     "max_norm_change": 0.0146,
+     "max_element_ratio": {
+      "near-lossless": 0.629,
+      "relaxed": 0.325
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99926,
+     "max_rel_l2": 0.0567,
+     "max_norm_change": 0.0408,
+     "max_element_ratio": {
+      "near-lossless": 0.443,
+      "relaxed": 0.269
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.0399 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG int8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99996,
+     "max_rel_l2": 0.1573,
+     "max_norm_change": 0.157,
+     "max_element_ratio": {
+      "near-lossless": 1.268,
+      "relaxed": 1.242
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.27x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x1.1563 (allowed \u00b12%): a systematic error, not rounding noise; relative L2 error 0.1566 > 0.08",
+      "relaxed": "output[0]: an element is 1.24x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1.1563 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99651,
+     "max_rel_l2": 0.0903,
+     "max_norm_change": 0.0503,
+     "max_element_ratio": {
+      "near-lossless": 0.919,
+      "relaxed": 0.565
+     },
+     "example": {
+      "near-lossless": "output[1][0]: norm x1.0501 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 6
+     },
+     "min_cosine": 0.99402,
+     "max_rel_l2": 0.1463,
+     "max_norm_change": 0.1452,
+     "max_element_ratio": {
+      "near-lossless": 1.194,
+      "relaxed": 0.655
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1452 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1463 > 0.08",
+      "relaxed": "output[0]: norm x1.1452 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261006-004718/dit_layer",
+   "variant": "BUG int8 w8a8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 2,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99984,
+     "max_rel_l2": 0.133,
+     "max_norm_change": 0.1325,
+     "max_element_ratio": {
+      "near-lossless": 1.095,
+      "relaxed": 1.072
+     },
+     "example": {
+      "near-lossless": "output[0]: an element is 1.09x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x1.1325 (allowed \u00b12%): a systematic error, not rounding noise; relative L2 error 0.133 > 0.08",
+      "relaxed": "output[0]: an element is 1.07x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1.1325 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 40,
+     "fails": {
+      "near-lossless": 40,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99635,
+     "max_rel_l2": 0.0895,
+     "max_norm_change": 0.0528,
+     "max_element_ratio": {
+      "near-lossless": 0.861,
+      "relaxed": 0.529
+     },
+     "example": {
+      "near-lossless": "output[1][0]: norm x1.0518 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 6,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 5
+     },
+     "min_cosine": 0.99373,
+     "max_rel_l2": 0.1404,
+     "max_norm_change": 0.1283,
+     "max_element_ratio": {
+      "near-lossless": 1.184,
+      "relaxed": 0.651
+     },
+     "example": {
+      "near-lossless": "output[0]: norm x1.1283 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1296 > 0.08",
+      "relaxed": "output[0]: norm x1.1283 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "FP8 weights",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99976,
+     "max_rel_l2": 0.0217,
+     "max_norm_change": 0.0015,
+     "max_element_ratio": {
+      "near-lossless": 0.15,
+      "relaxed": 0.111
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99921,
+     "max_rel_l2": 0.0398,
+     "max_norm_change": 0.0053,
+     "max_element_ratio": {
+      "near-lossless": 0.252,
+      "relaxed": 0.128
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99968,
+     "max_rel_l2": 0.0254,
+     "max_norm_change": 0.0041,
+     "max_element_ratio": {
+      "near-lossless": 0.134,
+      "relaxed": 0.073
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "FP8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99952,
+     "max_rel_l2": 0.0311,
+     "max_norm_change": 0.0129,
+     "max_element_ratio": {
+      "near-lossless": 0.265,
+      "relaxed": 0.197
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99874,
+     "max_rel_l2": 0.0505,
+     "max_norm_change": 0.0172,
+     "max_element_ratio": {
+      "near-lossless": 0.271,
+      "relaxed": 0.151
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99936,
+     "max_rel_l2": 0.0361,
+     "max_norm_change": 0.0129,
+     "max_element_ratio": {
+      "near-lossless": 0.225,
+      "relaxed": 0.116
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "MXFP8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 1,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99927,
+     "max_rel_l2": 0.0393,
+     "max_norm_change": 0.0304,
+     "max_element_ratio": {
+      "near-lossless": 0.242,
+      "relaxed": 0.181
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0304 (allowed \u00b12%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 11,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99803,
+     "max_rel_l2": 0.0663,
+     "max_norm_change": 0.0453,
+     "max_element_ratio": {
+      "near-lossless": 0.35,
+      "relaxed": 0.195
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0304 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 1,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99921,
+     "max_rel_l2": 0.0491,
+     "max_norm_change": 0.0304,
+     "max_element_ratio": {
+      "near-lossless": 0.262,
+      "relaxed": 0.139
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0304 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "NVFP4 weights",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99911,
+     "max_rel_l2": 0.0422,
+     "max_norm_change": 0.0049,
+     "max_element_ratio": {
+      "near-lossless": 0.146,
+      "relaxed": 0.108
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99752,
+     "max_rel_l2": 0.0704,
+     "max_norm_change": 0.0058,
+     "max_element_ratio": {
+      "near-lossless": 0.108,
+      "relaxed": 0.092
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.98032,
+     "max_rel_l2": 0.1997,
+     "max_norm_change": 0.0153,
+     "max_element_ratio": {
+      "near-lossless": 0.274,
+      "relaxed": 0.231
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "MXFP4 weights",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99273,
+     "max_rel_l2": 0.1205,
+     "max_norm_change": 0.0203,
+     "max_element_ratio": {
+      "near-lossless": 0.251,
+      "relaxed": 0.199
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.98405,
+     "max_rel_l2": 0.178,
+     "max_norm_change": 0.0164,
+     "max_element_ratio": {
+      "near-lossless": 0.296,
+      "relaxed": 0.249
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.95706,
+     "max_rel_l2": 0.2914,
+     "max_norm_change": 0.0286,
+     "max_element_ratio": {
+      "near-lossless": 0.451,
+      "relaxed": 0.378
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99941,
+     "max_rel_l2": 0.0616,
+     "max_norm_change": 0.0506,
+     "max_element_ratio": {
+      "near-lossless": 0.521,
+      "relaxed": 0.495
+     },
+     "example": {
+      "near-lossless": "output: norm x1.0506 (allowed \u00b12%): a systematic error, not rounding noise",
+      "relaxed": "output: norm x1.0506 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 60,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99784,
+     "max_rel_l2": 0.0808,
+     "max_norm_change": 0.0542,
+     "max_element_ratio": {
+      "near-lossless": 0.958,
+      "relaxed": 0.709
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0459 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 6
+     },
+     "min_cosine": 0.98816,
+     "max_rel_l2": 0.1692,
+     "max_norm_change": 0.1497,
+     "max_element_ratio": {
+      "near-lossless": 3.758,
+      "relaxed": 2.6
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0488 (allowed \u00b13%): a systematic error, not rounding noise",
+      "relaxed": "output: norm x1.1441 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp8: scales x1.2",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99043,
+     "max_rel_l2": 0.2984,
+     "max_norm_change": 0.2551,
+     "max_element_ratio": {
+      "near-lossless": 2.551,
+      "relaxed": 2.427
+     },
+     "example": {
+      "near-lossless": "output: an element is 2.55x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x1.2551 (allowed \u00b12%): a systematic error, not rounding noise; cosine 0.990433 < 0.996; relative L2 error 0.2984 > 0.08",
+      "relaxed": "output: an element is 2.43x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x1.2551 (allowed \u00b14%): a systematic error, not rounding noise; relative L2 error 0.2984 > 0.16"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 60,
+      "relaxed": 60
+     },
+     "min_cosine": 0.96672,
+     "max_rel_l2": 0.3767,
+     "max_norm_change": 0.2432,
+     "max_element_ratio": {
+      "near-lossless": 4.47,
+      "relaxed": 3.307
+     },
+     "example": {
+      "near-lossless": "output: an element is 4.14x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.1256 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.975460 < 0.996; relative L2 error 0.2665 > 0.08",
+      "relaxed": "output: an element is 3.21x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.1256 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.975460 < 0.99; relative L2 error 0.2665 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 9
+     },
+     "min_cosine": 0.85135,
+     "max_rel_l2": 0.782,
+     "max_norm_change": 0.6614,
+     "max_element_ratio": {
+      "near-lossless": 18.234,
+      "relaxed": 11.995
+     },
+     "example": {
+      "near-lossless": "output: an element is 1.21x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.0917 (allowed \u00b13%): a systematic error, not rounding noise; relative L2 error 0.1291 > 0.08",
+      "relaxed": "output: an element is 1.04x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x1.0917 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp8: int4 per tensor",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.98101,
+     "max_rel_l2": 0.1967,
+     "max_norm_change": 0.0557,
+     "max_element_ratio": {
+      "near-lossless": 2.064,
+      "relaxed": 1.385
+     },
+     "example": {
+      "near-lossless": "output: an element is 1.69x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|); norm x0.9443 (allowed \u00b12%): a systematic error, not rounding noise; cosine 0.988530 < 0.996; relative L2 error 0.1574 > 0.08",
+      "relaxed": "output: an element is 1.24x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|); norm x0.9443 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.988530 < 0.99"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 60,
+      "relaxed": 60
+     },
+     "min_cosine": 0.92751,
+     "max_rel_l2": 0.3837,
+     "max_norm_change": 0.0951,
+     "max_element_ratio": {
+      "near-lossless": 1.812,
+      "relaxed": 0.978
+     },
+     "example": {
+      "near-lossless": "output: an element is 1.52x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); cosine 0.988395 < 0.996; relative L2 error 0.1519 > 0.08",
+      "relaxed": "output: cosine 0.988395 < 0.99"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 7
+     },
+     "min_cosine": 0.84436,
+     "max_rel_l2": 0.5546,
+     "max_norm_change": 0.1619,
+     "max_element_ratio": {
+      "near-lossless": 2.818,
+      "relaxed": 1.6
+     },
+     "example": {
+      "near-lossless": "args[3][0]: cosine 0.981027 < 0.996; relative L2 error 0.1967 > 0.08",
+      "relaxed": "args[3][0]: cosine 0.981027 < 0.99; relative L2 error 0.1967 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp8: row 0 of every GEMM skipped",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 2
+     },
+     "min_cosine": 0.9977,
+     "max_rel_l2": 0.0678,
+     "max_norm_change": 0.0036,
+     "max_element_ratio": {
+      "near-lossless": 1.637,
+      "relaxed": 1.175
+     },
+     "example": {
+      "near-lossless": "args[3][0]: an element is 1.15x its near-lossless tolerance away (0.5 x RMS + 0.125 x |reference|)",
+      "relaxed": "args[3][0]: an element is 1.03x its relaxed tolerance away (0.75 x RMS + 0.125 x |reference|)"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 36,
+      "relaxed": 5
+     },
+     "min_cosine": 0.98816,
+     "max_rel_l2": 0.1534,
+     "max_norm_change": 0.0112,
+     "max_element_ratio": {
+      "near-lossless": 2.252,
+      "relaxed": 1.304
+     },
+     "example": {
+      "near-lossless": "args[3][0]: an element is 1.04x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)",
+      "relaxed": "args[3][0]: an element is 1.05x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99769,
+     "max_rel_l2": 0.0679,
+     "max_norm_change": 0.0039,
+     "max_element_ratio": {
+      "near-lossless": 1.175,
+      "relaxed": 0.636
+     },
+     "example": {
+      "near-lossless": "args[3][0]: an element is 1.04x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|)"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp8: KV head 0 dropped",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99976,
+     "max_rel_l2": 0.0217,
+     "max_norm_change": 0.0015,
+     "max_element_ratio": {
+      "near-lossless": 0.15,
+      "relaxed": 0.111
+     },
+     "example": {
+      "near-lossless": "args[3][1]: 1.1719% of elements outside tolerance (max 0.10%)",
+      "relaxed": "args[3][1]: 1.1719% of elements outside tolerance (max 0.10%)"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 57,
+      "relaxed": 51
+     },
+     "min_cosine": 0.99921,
+     "max_rel_l2": 0.0398,
+     "max_norm_change": 0.0053,
+     "max_element_ratio": {
+      "near-lossless": 0.252,
+      "relaxed": 0.128
+     },
+     "example": {
+      "near-lossless": "args[3][1]: 1.1719% of elements outside tolerance (max 0.10%)",
+      "relaxed": "args[3][1]: 0.3906% of elements outside tolerance (max 0.10%)"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 7
+     },
+     "min_cosine": 0.74458,
+     "max_rel_l2": 0.6675,
+     "max_norm_change": 0.2554,
+     "max_element_ratio": {
+      "near-lossless": 4.772,
+      "relaxed": 3.4
+     },
+     "example": {
+      "near-lossless": "args[3][1]: 0.3906% of elements outside tolerance (max 0.10%)",
+      "relaxed": "args[3][1]: an element is 2.62x its relaxed tolerance away on redrawn inputs (1.5 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.8104 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.811807 < 0.99; relative L2 error 0.5839 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp8: q heads 0/last swapped (layout)",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99976,
+     "max_rel_l2": 0.0217,
+     "max_norm_change": 0.0015,
+     "max_element_ratio": {
+      "near-lossless": 0.15,
+      "relaxed": 0.111
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99921,
+     "max_rel_l2": 0.0398,
+     "max_norm_change": 0.0053,
+     "max_element_ratio": {
+      "near-lossless": 0.252,
+      "relaxed": 0.128
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99968,
+     "max_rel_l2": 0.0254,
+     "max_norm_change": 0.0041,
+     "max_element_ratio": {
+      "near-lossless": 0.344,
+      "relaxed": 0.175
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG w8a8: first token's activation scale",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99952,
+     "max_rel_l2": 0.0311,
+     "max_norm_change": 0.0129,
+     "max_element_ratio": {
+      "near-lossless": 0.265,
+      "relaxed": 0.197
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99874,
+     "max_rel_l2": 0.0505,
+     "max_norm_change": 0.0172,
+     "max_element_ratio": {
+      "near-lossless": 0.271,
+      "relaxed": 0.151
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99936,
+     "max_rel_l2": 0.0361,
+     "max_norm_change": 0.0129,
+     "max_element_ratio": {
+      "near-lossless": 0.225,
+      "relaxed": 0.116
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp4: nibbles swapped",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": -0.00792,
+     "max_rel_l2": 1.007,
+     "max_norm_change": 0.9089,
+     "max_element_ratio": {
+      "near-lossless": 1.853,
+      "relaxed": 1.765
+     },
+     "example": {
+      "near-lossless": "output: an element is 1.85x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x0.6882 (allowed \u00b14%): a systematic error, not rounding noise; cosine 0.925792 < 0.96; relative L2 error 0.4465 > 0.28",
+      "relaxed": "output: an element is 1.77x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|); norm x0.6882 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.925792 < 0.94; relative L2 error 0.4465 > 0.36"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 60,
+      "relaxed": 60
+     },
+     "min_cosine": -0.29674,
+     "max_rel_l2": 1.079,
+     "max_norm_change": 0.9033,
+     "max_element_ratio": {
+      "near-lossless": 2.473,
+      "relaxed": 2.251
+     },
+     "example": {
+      "near-lossless": "output: an element is 2.41x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); cosine 0.925398 < 0.94",
+      "relaxed": "output: an element is 2.23x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 9
+     },
+     "min_cosine": -0.00843,
+     "max_rel_l2": 3.662,
+     "max_norm_change": 2.6174,
+     "max_element_ratio": {
+      "near-lossless": 8.645,
+      "relaxed": 7.675
+     },
+     "example": {
+      "near-lossless": "output: norm x0.8739 (allowed \u00b112%): a systematic error, not rounding noise",
+      "relaxed": "args[3][0]: norm x0.1921 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.284203 < 0.9; relative L2 error 0.9632 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp4: scales x1.2",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99065,
+     "max_rel_l2": 0.2928,
+     "max_norm_change": 0.2498,
+     "max_element_ratio": {
+      "near-lossless": 1.218,
+      "relaxed": 1.161
+     },
+     "example": {
+      "near-lossless": "output: an element is 1.22x its near-lossless-fp4 tolerance away (1.25 x RMS + 0.25 x |reference|); norm x1.2498 (allowed \u00b14%): a systematic error, not rounding noise; relative L2 error 0.2928 > 0.28",
+      "relaxed": "output: an element is 1.16x its relaxed-fp4 tolerance away (1.75 x RMS + 0.25 x |reference|); norm x1.2498 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 60,
+      "relaxed": 60
+     },
+     "min_cosine": 0.96784,
+     "max_rel_l2": 0.3647,
+     "max_norm_change": 0.2319,
+     "max_element_ratio": {
+      "near-lossless": 1.688,
+      "relaxed": 1.552
+     },
+     "example": {
+      "near-lossless": "output: an element is 1.68x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x1.1213 (allowed \u00b112%): a systematic error, not rounding noise",
+      "relaxed": "output: an element is 1.55x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|)"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 9
+     },
+     "min_cosine": 0.85114,
+     "max_rel_l2": 0.7812,
+     "max_norm_change": 0.6526,
+     "max_element_ratio": {
+      "near-lossless": 6.589,
+      "relaxed": 5.997
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.2009 (allowed \u00b112%): a systematic error, not rounding noise",
+      "relaxed": "args[3][0]: norm x1.2009 (allowed \u00b118%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp4: int4 per tensor",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 1
+     },
+     "min_cosine": 0.98101,
+     "max_rel_l2": 0.1967,
+     "max_norm_change": 0.0557,
+     "max_element_ratio": {
+      "near-lossless": 0.829,
+      "relaxed": 0.595
+     },
+     "example": {
+      "near-lossless": "output: norm x0.9443 (allowed \u00b14%): a systematic error, not rounding noise",
+      "relaxed": "args[3][1]: 0.7812% of elements outside tolerance (max 0.10%)"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 0
+     },
+     "min_cosine": 0.92751,
+     "max_rel_l2": 0.3837,
+     "max_norm_change": 0.0951,
+     "max_element_ratio": {
+      "near-lossless": 0.578,
+      "relaxed": 0.489
+     },
+     "example": {
+      "near-lossless": "args[3][0]: cosine 0.935082 < 0.94"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 4,
+      "relaxed": 3
+     },
+     "min_cosine": 0.84436,
+     "max_rel_l2": 0.5546,
+     "max_norm_change": 0.1619,
+     "max_element_ratio": {
+      "near-lossless": 0.926,
+      "relaxed": 0.8
+     },
+     "example": {
+      "near-lossless": "output: norm x0.8381 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.939913 < 0.94",
+      "relaxed": "args[3][1]: cosine 0.868986 < 0.9"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp4: row 0 of every GEMM skipped",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99735,
+     "max_rel_l2": 0.0728,
+     "max_norm_change": 0.0054,
+     "max_element_ratio": {
+      "near-lossless": 0.687,
+      "relaxed": 0.517
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.98706,
+     "max_rel_l2": 0.1604,
+     "max_norm_change": 0.0104,
+     "max_element_ratio": {
+      "near-lossless": 0.756,
+      "relaxed": 0.65
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.98008,
+     "max_rel_l2": 0.2009,
+     "max_norm_change": 0.0153,
+     "max_element_ratio": {
+      "near-lossless": 0.377,
+      "relaxed": 0.32
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp4: KV head 0 dropped",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99911,
+     "max_rel_l2": 0.0422,
+     "max_norm_change": 0.0049,
+     "max_element_ratio": {
+      "near-lossless": 0.146,
+      "relaxed": 0.108
+     },
+     "example": {
+      "near-lossless": "args[3][1]: 1.1719% of elements outside tolerance (max 0.10%)",
+      "relaxed": "args[3][1]: 1.1719% of elements outside tolerance (max 0.10%)"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 26,
+      "relaxed": 21
+     },
+     "min_cosine": 0.99752,
+     "max_rel_l2": 0.0704,
+     "max_norm_change": 0.0058,
+     "max_element_ratio": {
+      "near-lossless": 0.108,
+      "relaxed": 0.092
+     },
+     "example": {
+      "near-lossless": "args[3][1]: 0.7812% of elements outside tolerance (max 0.10%)",
+      "relaxed": "args[3][1]: 0.3906% of elements outside tolerance (max 0.10%)"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 6,
+      "relaxed": 5
+     },
+     "min_cosine": 0.72786,
+     "max_rel_l2": 0.6859,
+     "max_norm_change": 0.2549,
+     "max_element_ratio": {
+      "near-lossless": 1.88,
+      "relaxed": 1.7
+     },
+     "example": {
+      "near-lossless": "args[3][1]: an element is 1.48x its near-lossless-fp4 tolerance away on redrawn inputs (2.5 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x0.8074 (allowed \u00b112%): a systematic error, not rounding noise; cosine 0.799527 < 0.94; relative L2 error 0.6007 > 0.4",
+      "relaxed": "args[3][1]: an element is 1.31x its relaxed-fp4 tolerance away on redrawn inputs (3 x RMS (the larger of the tensor's and its channel's) + 0.25 x |reference|); norm x0.8074 (allowed \u00b118%): a systematic error, not rounding noise; cosine 0.799527 < 0.9; relative L2 error 0.6007 > 0.55"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG fp4: q heads 0/last swapped (layout)",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99911,
+     "max_rel_l2": 0.0422,
+     "max_norm_change": 0.0049,
+     "max_element_ratio": {
+      "near-lossless": 0.146,
+      "relaxed": 0.108
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99752,
+     "max_rel_l2": 0.0704,
+     "max_norm_change": 0.0058,
+     "max_element_ratio": {
+      "near-lossless": 0.108,
+      "relaxed": 0.092
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.98032,
+     "max_rel_l2": 0.1997,
+     "max_norm_change": 0.0153,
+     "max_element_ratio": {
+      "near-lossless": 0.274,
+      "relaxed": 0.231
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG w8a8: cached activation scales",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 1
+     },
+     "min_cosine": 0.99921,
+     "max_rel_l2": 0.0688,
+     "max_norm_change": 0.057,
+     "max_element_ratio": {
+      "near-lossless": 0.28,
+      "relaxed": 0.21
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x0.9775 (allowed \u00b12%): a systematic error, not rounding noise",
+      "relaxed": "args[3][0]: norm x0.9430 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 37,
+      "relaxed": 33
+     },
+     "min_cosine": 0.84618,
+     "max_rel_l2": 0.6976,
+     "max_norm_change": 0.6476,
+     "max_element_ratio": {
+      "near-lossless": 2.4,
+      "relaxed": 1.391
+     },
+     "example": {
+      "near-lossless": "args[3][0]: an element is 1.07x its near-lossless tolerance away on redrawn inputs (0.75 x RMS (the larger of the tensor's and its channel's) + 0.125 x |reference|); norm x0.6809 (allowed \u00b13%): a systematic error, not rounding noise; cosine 0.983059 < 0.996; relative L2 error 0.3534 > 0.08",
+      "relaxed": "args[3][0]: norm x0.6809 (allowed \u00b16%): a systematic error, not rounding noise; cosine 0.983059 < 0.99; relative L2 error 0.3534 > 0.16"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99833,
+     "max_rel_l2": 0.0688,
+     "max_norm_change": 0.057,
+     "max_element_ratio": {
+      "near-lossless": 1.706,
+      "relaxed": 0.896
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x0.9442 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "INT8 weights",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99999,
+     "max_rel_l2": 0.0055,
+     "max_norm_change": 0.0006,
+     "max_element_ratio": {
+      "near-lossless": 0.034,
+      "relaxed": 0.023
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99996,
+     "max_rel_l2": 0.0094,
+     "max_norm_change": 0.0012,
+     "max_element_ratio": {
+      "near-lossless": 0.05,
+      "relaxed": 0.029
+     },
+     "example": {}
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99947,
+     "max_rel_l2": 0.0328,
+     "max_norm_change": 0.0032,
+     "max_element_ratio": {
+      "near-lossless": 0.109,
+      "relaxed": 0.072
+     },
+     "example": {}
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "INT8 W8A8",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 0,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99992,
+     "max_rel_l2": 0.0123,
+     "max_norm_change": 0.0023,
+     "max_element_ratio": {
+      "near-lossless": 0.075,
+      "relaxed": 0.052
+     },
+     "example": {}
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 2,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99918,
+     "max_rel_l2": 0.0405,
+     "max_norm_change": 0.0131,
+     "max_element_ratio": {
+      "near-lossless": 0.205,
+      "relaxed": 0.108
+     },
+     "example": {
+      "near-lossless": "args[3][1]: 0.3906% of elements outside tolerance (max 0.10%)"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.9798,
+     "max_rel_l2": 0.2022,
+     "max_norm_change": 0.0245,
+     "max_element_ratio": {
+      "near-lossless": 0.798,
+      "relaxed": 0.406
+     },
+     "example": {
+      "near-lossless": "args[3][1]: cosine 0.983531 < 0.996; relative L2 error 0.1832 > 0.08",
+      "relaxed": "args[3][1]: cosine 0.983531 < 0.99; relative L2 error 0.1832 > 0.16"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG int8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.99942,
+     "max_rel_l2": 0.0616,
+     "max_norm_change": 0.0507,
+     "max_element_ratio": {
+      "near-lossless": 0.521,
+      "relaxed": 0.495
+     },
+     "example": {
+      "near-lossless": "output: norm x1.0507 (allowed \u00b12%): a systematic error, not rounding noise",
+      "relaxed": "output: norm x1.0507 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 60,
+      "relaxed": 0
+     },
+     "min_cosine": 0.99793,
+     "max_rel_l2": 0.0797,
+     "max_norm_change": 0.051,
+     "max_element_ratio": {
+      "near-lossless": 0.949,
+      "relaxed": 0.679
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0510 (allowed \u00b13%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 6
+     },
+     "min_cosine": 0.98816,
+     "max_rel_l2": 0.1694,
+     "max_norm_change": 0.1499,
+     "max_element_ratio": {
+      "near-lossless": 3.758,
+      "relaxed": 2.6
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0496 (allowed \u00b13%): a systematic error, not rounding noise",
+      "relaxed": "output: norm x1.1444 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  },
+  {
+   "capture": "20261005-192504/lm_step_fp8",
+   "variant": "BUG int8 w8a8: scales x1.05",
+   "classes": {
+    "captured": {
+     "draws": 3,
+     "fails": {
+      "near-lossless": 3,
+      "relaxed": 3
+     },
+     "min_cosine": 0.9992,
+     "max_rel_l2": 0.0728,
+     "max_norm_change": 0.0601,
+     "max_element_ratio": {
+      "near-lossless": 0.625,
+      "relaxed": 0.595
+     },
+     "example": {
+      "near-lossless": "output: norm x1.0601 (allowed \u00b12%): a systematic error, not rounding noise",
+      "relaxed": "output: norm x1.0601 (allowed \u00b14%): a systematic error, not rounding noise"
+     }
+    },
+    "redrawn": {
+     "draws": 60,
+     "fails": {
+      "near-lossless": 60,
+      "relaxed": 2
+     },
+     "min_cosine": 0.99731,
+     "max_rel_l2": 0.0861,
+     "max_norm_change": 0.0632,
+     "max_element_ratio": {
+      "near-lossless": 0.993,
+      "relaxed": 0.709
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0535 (allowed \u00b13%): a systematic error, not rounding noise",
+      "relaxed": "args[3][0]: norm x1.0632 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    },
+    "scaled": {
+     "draws": 9,
+     "fails": {
+      "near-lossless": 9,
+      "relaxed": 6
+     },
+     "min_cosine": 0.97983,
+     "max_rel_l2": 0.2154,
+     "max_norm_change": 0.1506,
+     "max_element_ratio": {
+      "near-lossless": 3.758,
+      "relaxed": 2.6
+     },
+     "example": {
+      "near-lossless": "args[3][0]: norm x1.0508 (allowed \u00b13%): a systematic error, not rounding noise",
+      "relaxed": "output: norm x1.1448 (allowed \u00b16%): a systematic error, not rounding noise"
+     }
+    }
+   }
+  }
+ ]
+}

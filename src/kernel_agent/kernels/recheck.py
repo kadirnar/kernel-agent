@@ -364,7 +364,7 @@ def compare_entries(
     """Failed checks per entry (``(case, seed)`` of ``entries``): the candidate's saved
     outputs and post-call state against the reference's (:mod:`kernels.compare`, in the
     capture's tolerance ``tier``, with its bounds for redrawn inputs)."""
-    from kernel_agent.kernels.compare import compare_side_effects_flat, compare_tensors
+    from kernel_agent.kernels.compare import compare_output, compare_side_effects_flat
 
     if not isinstance(saved, list) or len(saved) != len(expected):
         bad = {"name": "outputs", "ok": False, "error": "saved outputs do not match the inputs"}
@@ -374,11 +374,15 @@ def compare_entries(
         new = new if isinstance(new, dict) else {}
         checks = []
         new_out = new.get("output") or {}
+        pres = exp.get("pre") or {}
+        inputs = [*(pres.get("args") or {}).values(), *(pres.get("kwargs") or {}).values()]
         for name, ref in (exp.get("output") or {}).items():
             if name not in new_out:
                 checks.append({"name": name, "ok": False, "error": "missing in candidate output"})
             else:
-                checks.append(compare_tensors(name, ref, new_out[name], tier=tier, perturbed=True))
+                checks.append(
+                    compare_output(name, ref, new_out[name], inputs, tier=tier, perturbed=True)
+                )
         for key in ("args", "kwargs"):
             pre = (exp.get("pre") or {}).get(key) or {}
             checks += compare_side_effects_flat(

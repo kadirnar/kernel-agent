@@ -206,7 +206,7 @@ def _judge(
     found = {}
     for quality, tier in tiers.items():
         kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
-        checks = compare.compare_structures(expected, out, "output", **kw)
+        checks = compare.compare_structures(expected, out, "output", inputs=pre, **kw)
         checks += compare.compare_side_effects(pre[0], ref_post[0], new_post[0], "args", **kw)
         checks += compare.compare_side_effects(pre[1], ref_post[1], new_post[1], "kwargs", **kw)
         found[quality] = checks

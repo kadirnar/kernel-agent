@@ -640,7 +640,8 @@ def _evaluate(
             # import + build + first call: where load_inline / JIT backends compile
             result["compile_s"] = round(time.perf_counter() - t_build, 1)
             print(f"{COMPILE_MARKER}{result['compile_s']}", file=sys.stderr, flush=True)
-        checks = compare_structures(case["output"], out, "output")
+        inputs = (case["args"], case["kwargs"])  # a cache the call grows: per part
+        checks = compare_structures(case["output"], out, "output", inputs=inputs)
         checks += compare_side_effects(case["args"], case["post_args"], args, "args")
         checks += compare_side_effects(case["kwargs"], case["post_kwargs"], kwargs, "kwargs")
         checks += replay.check(case, *holders)  # what the call changed in the module's state

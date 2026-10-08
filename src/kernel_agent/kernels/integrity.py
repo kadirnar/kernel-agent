@@ -620,8 +620,8 @@ def compare_saved_outputs(capture: dict[str, Any], saved: Any) -> list[dict[str,
     "outputs": flat_outputs(...)}``) against the capture: the same checks as the
     evaluator's correctness stage, run outside the candidate's process."""
     from kernel_agent.kernels.compare import (
+        compare_output,
         compare_side_effects_flat,
-        compare_tensors,
         flatten,
         tier_of,
     )
@@ -643,11 +643,12 @@ def compare_saved_outputs(capture: dict[str, Any], saved: Any) -> list[dict[str,
         case = cases[i]
         checks = []
         new_out = new.get("output", {})
+        inputs = list(flatten((case["args"], case["kwargs"])).values())  # grown caches
         for name, ref in flatten(case["output"], "output").items():
             if name not in new_out:
                 checks.append({"name": name, "ok": False, "error": "missing in saved outputs"})
             else:
-                checks.append(compare_tensors(name, ref, new_out[name], tier=tier))
+                checks.append(compare_output(name, ref, new_out[name], inputs, tier=tier))
         for key in ("args", "kwargs"):
             checks += compare_side_effects_flat(
                 flatten(case[key], key),

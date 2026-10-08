@@ -87,7 +87,14 @@ same time.
   shares memory with an input exactly when the reference's does (a live
   reference call is checked). Side effects are compared on the elements the
   reference or the candidate changed, so writing one position of an 8192-long
-  cache (or forgetting to) is not lost in the 0.1 %. If `build()` hands back
+  cache (or forgetting to) is not lost in the 0.1 %. A cache the call grows
+  (#202: a KV cache `torch.cat`-ed with the new token's K / V, as an argument
+  such as a `transformers` `DynamicCache` layer, or returned: an output whose
+  leading part along one dimension equals an input tensor) is compared in two
+  parts: the appended rows on their own, with the tier's checks and their own
+  RMS, and the kept rows, which must stay bit for bit where the reference kept
+  them (`compare.grown_dim`, `compare_grown`); compared whole, one wrong new row
+  of a 4096-token cache was 0.02 % of the elements. If `build()` hands back
   the reference module unchanged, the candidate is rejected.
 * **More than one KV length and one setting**: decode steps share their
   primary input while the KV cache grows, so `capture` runs the workload once
@@ -573,7 +580,8 @@ are unchanged: on the Qwen3 layer x 0.01 leaves the grown V cache's 512 old rows
 tiny next to the new one (computed from normalised activations, so not scaled),
 and the element bound's RMS over the whole cache is far below the new row's, so
 FP8 weights fail 3 of 12 scaled checks in near-lossless (0 in relaxed, element
-ratio 0.97) and FP4 4 of 12 in both modes. Every broken variant is still
+ratio 0.97) and FP4 4 of 12 in both modes (fixed by #202, "Grown caches" below).
+Every broken variant is still
 rejected on every capture where it was before (activation scales cached from the
 first call: on all 40 LocDiT draws in both modes, from 37 and 14), except FP4
 weights with an unwritten output row on the LocDiT layer, which only the global
@@ -588,6 +596,53 @@ redraw failed FP8 weights on 27 of 60 near-lossless draws, the new one on none;
 broken scales, an unwritten row, a skipped KV head, swapped heads and cached
 activation scales are rejected in both modes) and the real layer 0 on the GPU
 (11 of 20 relaxed draws before, none now).
+
+**Grown caches** (#202, `docs/research-scripts/grown-cache-202/`: `calibrate_grown.py`
+runs the calibration above with grown caches compared whole and in parts on the same
+seeds, `results.md`; `exploit.py`, `exploit.md`). A cache a call grows by
+concatenation (Qwen3's `DynamicCache` layers; a returned `torch.cat` of a cache and the
+new rows) was compared whole, so its kept rows diluted the new ones. One new row of a
+4096-token cache of Qwen3's shape is 0.02 % of the elements: written x 1.2 (a wrong
+dequantisation scale), x 0.9 or 5x its exact tolerance off, it passed every tier, the
+exact one included (each value within 10x its tolerance, the whole-tensor error
+diluted), and a skipped write (zeros) passed the FP4 tiers' redrawn bounds. Now the
+appended rows are compared on their own (the tier's checks with their own RMS, norm,
+cosine and relative L2 error; on redrawn inputs an element's channel RMS is at least
+its channel's in the whole cache, as one token has too few rows for a channel RMS and
+Qwen3's `k_norm` makes key channel 50 about ten times the row's RMS) and the kept rows
+must stay bit for bit where the reference kept them (`compare.grown_dim`,
+`compare_grown`). Every such wrong row is rejected in every tier, except where a tier's
+own budget allows that error (x 0.9 on the FP4 tiers' redrawn bounds, a bias of 5x the
+exact tolerance on the FP4 tiers and relaxed-kv's redrawn ones). On the
+Qwen3 decoder layer at decode (failed draws, near-lossless · relaxed, before → after):
+
+| numerics | x 3 / x 0.01 / x −1 inputs (12) | max element ratio there | redrawn inputs (80) |
+|---|---|---|---|
+| FP8 weights | 3 · 0 → **0 · 0** | 1.71 / 0.97 → 0.24 / 0.13 | 4 · 0 → 5 · 0 |
+| FP8 W8A8 | 6 · 1 → **2 · 0** | 2.31 / 1.21 → 0.40 / 0.29 | 65 · 0 → 65 · 0 |
+| MXFP8 | 5 · 2 → **1 · 0** | 2.86 / 1.48 → 0.39 / 0.26 | 65 · 1 → 70 · 1 |
+| NVFP4 weights (FP4 tiers) | 4 · 4 → **0 · 0** | 1.86 / 1.57 → 0.27 / 0.25 | 0 · 0 → 0 · 0 |
+| MXFP4 weights (FP4 tiers) | 4 · 4 → **0 · 0** | 2.29 / 1.95 → 0.31 / 0.26 | 6 · 0 → 8 · 1 |
+| INT8 weights | 0 · 0 → 0 · 0 | 0.73 / 0.36 → 0.10 / 0.05 | 0 · 0 → 0 · 0 |
+| INT8 W8A8 | 4 · 1 → **0 · 0** | 1.82 / 1.05 → 0.31 / 0.17 | 4 · 0 → 4 · 0 |
+
+The captured inputs pass as before (0 of 4). The new rows' own norm, cosine and
+relative L2 checks, which the kept rows used to dilute, add a few redrawn failures of
+the noisiest numerics: MXFP8 at decode (not a decode precision; e.g. the key row's
+cosine 0.9958), MXFP4 once in relaxed, on the key row's norm (19 % against 18 %:
+`k_norm`'s channel 50 carries most of a key row's energy, so 4-bit noise there moves the
+norm; in-place cache slots have been checked this way all along). Every broken
+variant of the calibration is still rejected in both modes on every capture (results.md);
+some fail fewer draws, where only the dilution had failed them, as it failed honest
+kernels (an unwritten output row of FP8 weights: 3 → 2 of 4 captured cases in relaxed,
+the cache's old rows giving the new row a tighter bound than its own RMS; FP4 with a
+dropped KV head: 4 → 0 of 12 scaled relaxed, still 3 of 4 captured and 20 of 80 redrawn).
+The VoxCPM2 LocDiT and base-LM layers (in-place caches) give the same results in both
+modes. `tests/test_grown_cache.py` checks a synthetic decode step on the CPU, with the
+cache as a growing argument and as a returned tensor: wrong new rows are rejected by the
+evaluator, in the exact tier (a new key row x 1.2 passed every check before) and on
+every redrawn and scaled draw in both reduced modes, and honest FP8 weights pass
+near-lossless's x 0.01 check, which failed them before.
 
 **Allowed precisions** (`--precisions`, `kernel_agent/precisions.py`). A run lists
 the target precisions it allows; `exact` is always one of them. `--quality exact`

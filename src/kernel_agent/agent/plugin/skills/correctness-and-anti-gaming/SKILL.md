@@ -30,7 +30,11 @@ guards", "Independent re-check of winners", "Out-of-bounds accesses: memcheck").
   none by more than 10×), whole-tensor relative L2 and cosine for tensors above 1024
   elements, NaN / inf at the same positions, plain `torch.Tensor` outputs, aliasing of
   outputs and inputs exactly as the reference's. Handing back the reference unchanged is
-  rejected.
+  rejected. Caches are compared relative to the update: an in-place update on the elements
+  either side changed, a cache the call grows (`torch.cat` of a KV cache and the new
+  token's K / V, as an argument or returned) in two parts: the appended rows on their own
+  (the tier's checks, their own RMS), the kept rows bit for bit where the reference kept
+  them. A wrong new row is never diluted by a long cache.
 * **Several KV lengths and settings**: the first, middle and last decode step of every
   decode signature are separate cases, and `variants()` add correctness-only cases (other
   lengths and settings): a kernel that only handles the captured length fails them.
