@@ -1285,6 +1285,8 @@ tune them with `sweep_candidate`.
   `profile=true` adds per-kernel GPU time tables for candidate and reference and the
   candidate's registers / spills; `profile="ncu"` also Nsight Compute metrics per
   kernel (memory / compute / under-utilised, occupancy, warp stalls) when available.
+  The tables go to `profiles/<snapshot>.json`; the result has a summary (`profile`:
+  top kernels, spills, bounds) and the file's path.
   `mode="quick"` only checks correctness on the smallest and the largest case
   (no timing, no speedup, not counted against your budget): use it to debug a
   candidate before you spend a full evaluation on it. A candidate whose code

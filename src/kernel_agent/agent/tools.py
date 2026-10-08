@@ -26,7 +26,7 @@ from kernel_agent.native import engine as native_engine
 from kernel_agent.native import project as native_project
 from kernel_agent.truth import TamperError, Truth, sha256_file
 from kernel_agent.worker import call_worker
-from kernel_agent.workspace import RunDir, append_jsonl, read_json
+from kernel_agent.workspace import RunDir, append_jsonl, read_json, write_json
 
 SERVER_NAME = "ka"
 QUICK_NOTE = (
@@ -260,6 +260,75 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
     if cases:
         keep["cases"] = cases
     return keep
+
+
+#: An evaluation's profile tables (``profile=true`` / ``"ncu"``): they go to the session's
+#: ``profiles/<snapshot>.json`` and the result keeps a summary (:func:`profile_file`, #186).
+PROFILE_KEYS = ("kernels_candidate", "kernels_reference", "compiler_stats", "profile_error", "ncu")
+PROFILES_DIR = "profiles"
+PROFILE_TOP = 3  # kernels per side, spill warnings and ncu kernels in the summary
+
+
+def _share_rows(rows: Any) -> dict[str, Any]:
+    """A per-kernel GPU time table (``kernels_candidate``) in short: the kernels it lists,
+    their GPU time and the top ones with their share."""
+    rows = [r for r in rows or [] if isinstance(r, dict)]
+    total = sum(float(r.get("us") or 0.0) for r in rows)
+    top = [
+        f"{str(r.get('kernel'))[:70]}: {r.get('us')} us, {r.get('calls')} calls"
+        + (f" ({float(r.get('us') or 0.0) / total:.0%})" if total else "")
+        for r in rows[:PROFILE_TOP]
+    ]
+    return {"kernels": len(rows), "gpu_us": round(total, 1), "top": top}
+
+
+def profile_summary(tables: dict[str, Any]) -> dict[str, Any]:
+    """The few lines of an evaluation's profile tables (:data:`PROFILE_KEYS`) that stay in
+    its result: the top kernels of candidate and reference with their share of GPU time,
+    the compiler's spill warnings, each top ncu kernel's bound."""
+    out: dict[str, Any] = {}
+    for side in ("candidate", "reference"):
+        if f"kernels_{side}" in tables:
+            out[side] = _share_rows(tables[f"kernels_{side}"])
+    stats = tables.get("compiler_stats") or {}
+    if isinstance(stats, dict) and stats.get("warnings"):
+        out["warnings"] = stats["warnings"][:PROFILE_TOP]
+    if error := tables.get("profile_error"):
+        out["error"] = str(error)[:300]
+    ncu = tables.get("ncu")
+    if isinstance(ncu, dict) and ncu.get("status") == "ok":
+        out["ncu"] = [
+            f"{str(k.get('kernel'))[:70]}: {k.get('bound')} ({str(k.get('why') or '')[:160]})"
+            for k in (ncu.get("kernels") or [])[:PROFILE_TOP]
+            if isinstance(k, dict)
+        ]
+    elif isinstance(ncu, dict):
+        out["ncu"] = {"status": ncu.get("status"), "reason": ncu.get("reason")}
+    return out
+
+
+def profile_file(directory: Path, snap: Path, out: dict[str, Any], result: dict[str, Any]) -> None:
+    """Move an evaluation's profile tables (:data:`PROFILE_KEYS`, from ``out`` and the full
+    ``result``) into ``<directory>/profiles/<snapshot>.json`` (``directory``: the session's
+    working directory) and leave in ``out`` its ``profile``: :func:`profile_summary` and the
+    file's path. Up to 24 KB of tables then stay out of the engineer's context; it reads
+    the file when it needs more, or hands it to the ``profile-analyst`` helper (#186)."""
+    tables = {k: out.pop(k, None) or result.get(k) for k in PROFILE_KEYS}
+    tables = {k: v for k, v in tables.items() if v}
+    if not tables:
+        return
+    path = directory / PROFILES_DIR / f"{Path(snap.name).stem}.json"
+    try:
+        write_json(path, {"snapshot": snap.name, **tables})
+    except OSError as exc:  # the tables then stay inline
+        out |= tables
+        out["profile_note"] = f"profile tables not written to {path}: {exc}"
+        return
+    out["profile"] = profile_summary(tables) | {
+        "file": str(path),
+        "note": "the full tables (per-kernel GPU time of candidate and reference, compiler "
+        "stats, ncu metrics) are in the file: Read it, or give the path to profile-analyst",
+    }
 
 
 def record_candidate(
@@ -622,7 +691,9 @@ def build_server(
                     "description": "true: per-kernel GPU time tables and compiler stats "
                     '(registers, spills); "ncu": also Nsight Compute metrics per candidate '
                     "kernel (SM / memory throughput, occupancy, cache hit rates, warp stalls, "
-                    "memory / compute / under-utilised), when ncu can profile on this machine",
+                    "memory / compute / under-utilised), when ncu can profile on this machine. "
+                    "The tables go to profiles/<snapshot>.json in your working directory; the "
+                    "result has a summary and the file's path (`profile`)",
                     "default": False,
                 },
                 "compile_check": {
@@ -766,6 +837,8 @@ def build_server(
                 snap,
                 capture_sha256=capture_sha256,
             )
+        if args.get("profile") and not quick:  # the tables to a file, a summary here (#186)
+            profile_file(cwd or target_dir, snap, out, result)
         if quick:
             out["mode"], out["not_a_benchmark"] = dedup.QUICK, QUICK_NOTE
             out |= _best_so_far(target_id) | _uncounted(budget, name, evals_budget)

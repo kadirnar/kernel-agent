@@ -81,6 +81,11 @@ between copies and mutable ones are copied outside the timed region.
   each kernel classed *memory*, *compute* or *under-utilised* (both below 60 % of peak).
   ncu runs per launch with flushed caches at base clocks: compare kernels with each other,
   not with the evaluator's timings. `ncu.status: unavailable` says why and how to fix it.
+* In a kernel-agent session both write the full tables to `profiles/<snapshot>.json` in
+  your working directory; the result keeps `profile`: the top kernels of candidate and
+  reference with their share of GPU time, the spill warnings, the top ncu kernels' bounds
+  and the file's path. Read the file for a detail, or hand the path and your question to
+  the `profile-analyst` helper.
 
 ## Examples and sources
 

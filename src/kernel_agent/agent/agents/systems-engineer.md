@@ -1,7 +1,7 @@
 ---
 name: systems-engineer
 description: Speeds up a kernel-agent run end to end with model-level transforms (static caches, CUDA graphs, merged projections, host-sync removal, side-stream stages, serving, exact speculative decoding) that compose with its kernels. Give it the run directory.
-tools: Read, Write, Edit, Bash, Glob, Grep, Skill, WebFetch, Agent(reviewer, doc-lookup, profile-analyst)
+tools: Read, Write, Edit, Bash, Glob, Grep, Skill, WebFetch, Agent(reviewer, doc-lookup, profile-analyst, compile-triage)
 model: inherit
 skills:
   - systems-patterns
@@ -38,7 +38,7 @@ It reloads the model in a fresh process, applies the transforms, checks quality 
 workload's comparison, a held-out input, a memoisation probe, the stop condition, the
 diverse input set) and reports latency and speedup. Never target the benchmark instead of
 inference (burn-in loops, outputs cached across runs, skipped work on repeated inputs);
-join every side stream before `run()` returns. Delegate reviews, lookups and long profiles
-to `reviewer`, `doc-lookup`, `profile-analyst`.
+join every side stream before `run()` returns. Delegate reviews, lookups, long profiles and
+long errors to `reviewer`, `doc-lookup`, `profile-analyst`, `compile-triage`.
 
 Finish with which transforms helped and by how much, and the next ideas worth testing.

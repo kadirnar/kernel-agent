@@ -282,6 +282,7 @@ def kernel_digest(
         "target's time goes to the other arms for this round, so prefer a fundamentally "
         "different idea over small variations.",
     ]
+    lines += docs_section(run, read_json(run.target(arm.id) / "spec.json", {}) or {})
     lines += board_section(run, arm, label)
     return "\n".join(lines + _footer("NOTES.md"))
 
@@ -291,6 +292,31 @@ def _per(run: RunDir) -> str:
     of generated audio`` (throughput), ``to first audio`` (ttfa)."""
     metric = objective.of(read_json(run.baseline_json, {}) or {})
     return "per model run" if metric.name == objective.LATENCY else metric.per
+
+
+def docs_section(
+    run: RunDir, spec: dict[str, Any], *, native: bool = False, pattern: str | None = None
+) -> list[str]:
+    """``## Docs to read first`` of a digest (``doclib/reading.py``, #186; [] before the doc
+    library is built): the library's best sections for a target's ``spec`` (its precision,
+    backends, module class, approach and why) on the run's GPU, found without a model;
+    ``native``: in the native engine's libraries, ``pattern``: its stage's."""
+    from kernel_agent.doclib import reading
+
+    gpu = (read_json(run.toolchain_json, {}) or {}).get("gpu") or {}
+    found = reading.queries(
+        module_class=spec.get("module_class"),
+        text=f"{spec.get('approach') or ''} {spec.get('why') or ''}",
+        precision=spec.get("precision"),
+        arch=gpu.get("arch"),
+        pattern=pattern,
+    )
+    libs = reading.NATIVE_LIBRARIES if native else reading.libraries(spec.get("backends") or [])
+    try:
+        return reading.section(reading.first_reads(found, libs))
+    except Exception as exc:  # documentation is a bonus: never fail a slice for it
+        log(f"docs to read first: {exc!r}")
+        return []
 
 
 def board_section(run: RunDir, arm: Arm, label: str) -> list[str]:
@@ -413,6 +439,13 @@ def native_digest(
         f"* {arm.streak} native runs in a row without a new best; after "
         f"{policy.native_patience} the native arm's time goes to the other arms for this round.",
     ]
+    if (current := status.stage) is not None:  # the docs of the stage it works on
+        spec = {"module_class": current.module_class, "precision": current.precision}
+        spec |= {"approach": current.idea, "why": current.why}
+        lines += docs_section(run, spec, native=True, pattern=current.pattern)
+    elif module:  # no stage graph: the docs of the modules it fuses
+        spec = {"module_class": " ".join(a.module_class or "" for a in module)}
+        lines += docs_section(run, spec, native=True)
     lines += board_section(run, arm, label)
     return "\n".join(lines + _footer("NOTES.md"))
 

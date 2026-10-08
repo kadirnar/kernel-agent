@@ -851,6 +851,16 @@ Rules:
   `ResultMessage`s.
 * Hooks (`write_guard`, `claude_files_guard`, web `Lookups`) are session-level and also
   apply to subagent tool calls. Verify this in a test.
+* *Measured in PR 6 (#186), Claude Code 2.1.286 against a local fake API*
+  (`tests/test_subagents.py`): a helper's requests carry its own model (Sonnet for
+  `compile-triage`) and exactly its definition's tools, MCP tools included; the session's
+  `PreToolUse` hooks deny a (test-only) helper's Write to `CLAUDE.md` and outside the
+  session's files; `ResultMessage.total_cost_usd` equals the sum of `model_usage`'s
+  `costUSD` over the main and the helper models, so the session total includes its
+  helpers and nothing needs to be added. Per helper the stream gives no exact tokens: the
+  helper's last request (its final text) is not streamed, the `Agent` tool result's
+  `usage` is that last request's only and `task_notification`'s `total_tokens` is a
+  context size; `model_usage` per model is exact.
 
 #### 3.12.4 Critic before the GPU evaluation
 

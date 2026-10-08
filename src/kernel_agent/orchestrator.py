@@ -416,6 +416,8 @@ class Orchestrator:
             "turns": result.turns,
             "minutes": round(result.seconds / 60, 1),
             "tools": result.tool_calls,
+            # its helpers (#186): delegations, tool calls, seconds, models; their USD is in "usd"
+            **({"subagents": result.subagents} if result.subagents else {}),
             # the role, its model and effort, its tokens (#181: report "Usage per role")
             **({"role": role} if role else {}),
             "model": result.model or cfg.claude_model,
