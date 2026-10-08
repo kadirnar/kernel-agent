@@ -3307,7 +3307,7 @@ captured from the unmodified model.
   aggregates ignore. A full evaluation of a quick-checked source still runs; a
   quick check of an evaluated source returns the full result as a duplicate.
 * **Views.** `status` shows `<target>/w<k>` in the latest rows and the number of
-  workers per target; a target's `progress.png` has one marker shape per
+  workers per target; a target's `progress.png` has one line style per
   worker; `kernel-agent watch` shows the worker in the ledger, the events and
   the tooltips, and quick checks and duplicates as neutral rows.
 
