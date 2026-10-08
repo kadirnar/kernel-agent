@@ -368,6 +368,7 @@ def cmd_improve(ns: argparse.Namespace) -> int:
         agents=ns.agents,
         **({"role_max": ns.role_max} if ns.role_max else {}),
         overlap=ns.overlap,
+        board=ns.board,
         policy=Policy(
             patience=ns.patience,
             sol_stop=ns.sol_stop or None,
@@ -869,6 +870,15 @@ def main(argv: list[str] | None = None) -> int:
         default="warn",
         help="--agents N: sessions working on the same modules at once: warn (default: their "
         "digests name each other), avoid (one at a time) or allow",
+    )
+    p.add_argument(
+        "--board",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="the blackboard (board.jsonl): the sessions post their conclusions (post_note: "
+        "wins, traps, insights, claims, questions) and read the others' in their digests and "
+        "on their evaluation results; kernel-agent posts every new best, integration and "
+        "round. auto (default): with --agents above 1",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="simulated agents and GPU (no Claude, no GPU)"

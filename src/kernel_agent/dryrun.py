@@ -38,6 +38,11 @@ re-profile holds the GPU through the real GPU job queue (``gpuqueue.holding``) f
 simulated seconds. Sessions then overlap as real ones would, and the run is still
 reproducible. :attr:`World.limit` simulates an account-wide usage limit (the rate gate),
 and :attr:`World.writes` records which session wrote which file (ownership).
+
+With a board (``board.py``: ``--agents N``, ``--board on``) the simulated engineers post
+now and then through the ``post_note`` checks (why a kept result wins, a trap after an idea
+failed twice, an insight when a result pays well), and every simulated session reads what
+its evaluation results carry (:attr:`World.seen`), as a real session's results do.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ import argparse
 import asyncio
 import collections
 import concurrent.futures
+import contextlib
 import dataclasses
 import functools
 import math
@@ -62,7 +68,7 @@ from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import AssistantMessage, TextBlock
 
-from kernel_agent import gpuqueue, interrupt, ledger, pivot, program, truth, workers
+from kernel_agent import board, gpuqueue, interrupt, ledger, pivot, program, truth, workers
 from kernel_agent.agent import auth, runner
 from kernel_agent.agent.runner import AgentResult
 from kernel_agent.agent.tools import SessionBinding, record_candidate, record_e2e_result, snapshot
@@ -635,6 +641,8 @@ class World:
         self.writes: list[tuple[str, Path]] = []
         self.spans: dict[str, tuple[float, float]] = {}
         self.policies: dict[str, tuple[list[Path], list[Path]]] = {}
+        # with a board (board.py): the entries each session's evaluation results carried
+        self.seen: dict[str, list[int]] = {}
 
     @contextmanager
     def installed(self) -> Iterator[World]:
@@ -768,6 +776,7 @@ class World:
         # what the session's tools are bound to (Orchestrator._agent): its evaluation budget
         # and the label its rows carry
         bound = self.orch.bindings.get(name)
+        self.sessions[-1] |= {"label": bound.label if bound else name, "at": start}
         if self.virtual and bound is not None and roots is not None:
             self.policies[bound.label] = (list(roots), list(excluded or []))
         evals = 0
@@ -893,6 +902,8 @@ class World:
             used += 1
             _note(home / "NOTES.md", row, sim.hypotheses[(k + 1) % len(sim.hypotheses) :])
             self._wrote(bound, home / "NOTES.md")
+            self._post(bound, target_id, sim, row, rows, backend)
+            self._news(bound)
             if self.hook:
                 self.hook(agent, used)
             results = self.run.results_file(target_id)
@@ -957,6 +968,7 @@ class World:
             used += 1
             _note(self.run.transforms_dir / "NOTES.md", row, SYSTEM_TWEAKS[k % 3 :][:2])
             self._wrote(bound, self.run.transforms_dir / "NOTES.md")
+            self._news(bound)
             if self.hook:
                 self.hook("systems", used)
             results = self.run.results_file()
@@ -1010,11 +1022,69 @@ class World:
                 session=bound.label or None,
             )
             used += 1
+            self._news(bound)
             if self.hook:
                 self.hook("native", used)
             results = self.run.results_file()
             if self._advice("native", results, bound.evaluations, rng, label=bound.label):
                 return used
+
+    # -------------------------------------------------------- the board (board.py)
+
+    def _post(
+        self,
+        bound: SessionBinding | None,
+        target_id: str,
+        sim: SimTarget,
+        row: dict[str, Any],
+        rows: list[dict[str, Any]],
+        backend: str,
+    ) -> None:
+        """A simulated engineer's note after an evaluation, through the ``post_note`` checks
+        (its own draws, so the run's outcomes do not depend on the board): why a kept result
+        wins (half of them), an insight that holds for every target when one pays well, a
+        trap once an idea failed twice in a row. Refused notes (the session's notes spent,
+        a duplicate) are dropped, as an agent would."""
+        found = board.active(self.run)
+        if found is None or bound is None or not bound.label:
+            return
+        draw = _rng(self.seed, "board", target_id, row["exp"]).random()
+        idea, args = str(row.get("idea") or ""), None
+        if row["status"] == ledger.KEEP and draw < 0.5:
+            args = {
+                "kind": board.WINNER,
+                "target": target_id,
+                "text": f"`{idea}` wins at {row['speedup']:.2f}x: {row['hypothesis']}",
+                "refs": [f"exp:{row['exp']}"],
+            }
+        elif row["status"] == ledger.KEEP and draw < 0.7 and (row["speedup"] or 0) > 1.4:
+            args = {
+                "kind": board.INSIGHT,
+                "text": f"{backend} pays on {sim.cls} ({row['speedup']:.2f}x): {row['hypothesis']}",
+                "refs": [f"exp:{row['exp']}"],
+            }
+        elif row["status"] in ledger.FAILURES:
+            same = [r for r in rows if idea and r.get("idea") == idea]
+            if same and same[-1]["status"] in ledger.FAILURES:
+                args = {
+                    "kind": board.TRAP,
+                    "target": target_id,
+                    "text": f"`{idea}` failed twice in a row ({same[-1]['status']}, "
+                    f"{row['status']}): {row['hypothesis']}",
+                    "refs": [f"exp:{same[-1]['exp']}", f"exp:{row['exp']}"],
+                }
+        if args is not None:
+            with contextlib.suppress(board.Refused):
+                found.note(self.run, board.Reader.of_session(self.run, bound), args)
+
+    def _news(self, bound: SessionBinding | None) -> None:
+        """What a simulated session's evaluation result carries from the board (the entries
+        new for it since its cursor, as the tools' piggyback), recorded in :attr:`seen`."""
+        found = board.active(self.run)
+        if found is None or bound is None or not bound.label:
+            return
+        if new := found.news(board.Reader.of_session(self.run, bound)):
+            self.seen.setdefault(bound.label, []).extend(int(e["id"]) for e in new)
 
     def _research(
         self, target_id: str, writable: list[Path], bound: SessionBinding | None = None

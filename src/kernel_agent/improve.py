@@ -59,7 +59,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_agent import interrupt, ledger, objective, pivot, projection, research, workers
+from kernel_agent import board, interrupt, ledger, objective, pivot, projection, research, workers
 from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
@@ -131,6 +131,8 @@ class ImproveConfig:
     overlap: str = "warn"
     # a role's first session starts alone until it streams (its prompt cache), then the rest
     stagger: bool = True
+    # the blackboard (--board, board.py, issue #187): auto = with --agents N > 1, on, off
+    board: str = "auto"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -237,10 +239,18 @@ def refusals(run: RunDir, target_id: str) -> list[str]:
 
 
 def kernel_digest(
-    run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy, worker: int | None = None
+    run: RunDir,
+    arm: Arm,
+    n: int,
+    evaluations: int,
+    policy: Policy,
+    worker: int | None = None,
+    *,
+    label: str = "",
 ) -> str:
     """Context of a fresh kernel-engineer session (bounded: no growth with the slice count);
-    ``worker``: of that worker's session (its own NOTES.md, the target's shared ledger)."""
+    ``worker``: of that worker's session (its own NOTES.md, the target's shared ledger);
+    ``label``: the session's (its part of the run's board, :func:`board_section`)."""
     lines = _header(n, evaluations, "`results.jsonl`, `NOTES.md` and `history/`")
     lines += ["", "## Best so far"]
     if arm.best_snapshot:
@@ -272,6 +282,7 @@ def kernel_digest(
         "target's time goes to the other arms for this round, so prefer a fundamentally "
         "different idea over small variations.",
     ]
+    lines += board_section(run, arm, label)
     return "\n".join(lines + _footer("NOTES.md"))
 
 
@@ -282,7 +293,19 @@ def _per(run: RunDir) -> str:
     return "per model run" if metric.name == objective.LATENCY else metric.per
 
 
-def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy) -> str:
+def board_section(run: RunDir, arm: Arm, label: str) -> list[str]:
+    """``## Board`` of the digest of the session ``label`` of ``arm`` ([] without a board or
+    a label; ``board.py``, issue #187): the newest entries for it (its subscription). It
+    sets the session's cursor: what is posted after rides on its evaluation results."""
+    found = board.active(run)
+    if found is None or not label:
+        return []
+    return found.section(board.Reader.of(run, label, arm.kind, arm.id))
+
+
+def systems_digest(
+    run: RunDir, arm: Arm, n: int, evaluations: int, policy: Policy, *, label: str = ""
+) -> str:
     lines = _header(n, evaluations, "`results.jsonl`, `NOTES.md` and `history/`")
     base = (read_json(run.baseline_json, {}) or {}).get("median_ms")
     lines += ["", "## Best end-to-end configuration so far (transforms, plus kernels if listed)"]
@@ -321,6 +344,7 @@ def systems_digest(run: RunDir, arm: Arm, n: int, evaluations: int, policy: Poli
         f"* {arm.streak} evaluations in a row without a new best; after {policy.patience} the "
         "systems agent's time goes to the other arms for this round.",
     ]
+    lines += board_section(run, arm, label)
     return "\n".join(lines + _footer("NOTES.md"))
 
 
@@ -332,9 +356,12 @@ def native_digest(
     policy: Policy,
     status: native_engine.Status,
     arms: list[Arm],
+    *,
+    label: str = "",
 ) -> str:
     """Context of a fresh systems-native session: the module-level bar, the staged plan
-    with each stage's state, why the module arms stopped, the last native evaluations."""
+    with each stage's state, why the module arms stopped, the last native evaluations; the
+    board's newest entries for the session ``label`` (the live winners, :func:`board_section`)."""
     lines = _header(
         n, evaluations, "the transforms' `results.jsonl`, your `NOTES.md` and the ledger"
     )
@@ -386,6 +413,7 @@ def native_digest(
         f"* {arm.streak} native runs in a row without a new best; after "
         f"{policy.native_patience} the native arm's time goes to the other arms for this round.",
     ]
+    lines += board_section(run, arm, label)
     return "\n".join(lines + _footer("NOTES.md"))
 
 
@@ -776,6 +804,8 @@ class Improver:
         self.state.pop("coordinator", None)  # of an earlier invocation with --agents N
         self.save()
         ledger.event(self.run, "phase_start", phase="improve")
+        if board.enabled(self.icfg.board, self.icfg.agents):  # the blackboard (board.py, #187)
+            board.open_board(self.run)
         try:
             reason = await self._loop()
             log(f"stopping: {reason}")
@@ -785,6 +815,8 @@ class Improver:
                 self._interrupted()
             ledger.event(self.run, "phase_failed", phase="improve", error=repr(exc)[:300])
             raise
+        finally:
+            board.close(self.run)
         ledger.event(self.run, "phase_done", phase="improve")
         return reason
 
@@ -922,7 +954,9 @@ class Improver:
                 if note := stand.note():
                     rec["note"] = note
                     log(f"slice {n}: native: {note}")
-                digest = native_digest(self.run, arm, n, evaluations, self.policy, stand, arms)
+                digest = native_digest(
+                    self.run, arm, n, evaluations, self.policy, stand, arms, label=label
+                )
                 digest += beside
                 results = [
                     await self.orch.native_slice(
@@ -930,7 +964,8 @@ class Improver:
                     )
                 ]
             elif arm.kind == SYSTEMS:
-                digest = systems_digest(self.run, arm, n, evaluations, self.policy) + beside
+                digest = systems_digest(self.run, arm, n, evaluations, self.policy, label=label)
+                digest += beside
                 results = [
                     await self.orch.systems_slice(
                         evaluations=evaluations, digest=digest, label=label
@@ -944,7 +979,8 @@ class Improver:
                 results = await self._workers(arm, team, n, rec, beside)
             else:
                 self._restart_advice(arm)
-                digest = kernel_digest(self.run, arm, n, evaluations, self.policy) + beside
+                digest = kernel_digest(self.run, arm, n, evaluations, self.policy, label=label)
+                digest += beside
                 results = [
                     await self.orch.kernel_slice(
                         arm.id, evaluations=evaluations, digest=digest, label=label
@@ -1075,8 +1111,9 @@ class Improver:
         async def one(seed: workers.Seed) -> AgentResult:
             async with sem:
                 now = next((a for a in self.arms() if a.id == arm.id), arm)
+                label = f"{workers.agent_name(arm.id, seed.worker)}#{n}"
                 digest = kernel_digest(
-                    self.run, now, n, seed.evaluations, self.policy, worker=seed.worker
+                    self.run, now, n, seed.evaluations, self.policy, seed.worker, label=label
                 )
                 digest += beside
                 return await self.orch.worker_session(
@@ -1087,7 +1124,7 @@ class Improver:
                     "(see the `# Worker` section). Read the `# Improve slice` section first: "
                     "it says where the previous sessions left off.",
                     digest=digest,
-                    label=f"{workers.agent_name(arm.id, seed.worker)}#{n}",
+                    label=label,
                 )
 
         out = await asyncio.gather(*(one(s) for s in team), return_exceptions=True)
@@ -1363,6 +1400,7 @@ class Improver:
         done.append(rec)
         self.save()
         ledger.event(self.run, "integrated", speedup=speedup, median_ms=final.get("median_ms"))
+        board.integration(self.run, rec)  # every session's baseline moved (#187)
         self._charts()
         return rec
 
@@ -1461,6 +1499,7 @@ class Improver:
             f"round {n}: {info['median_ms']:.1f} ms; new targets: {captured or 'none'}; "
             f"live arms: {', '.join(live) or 'none'}"
         )
+        board.round_started(self.run, n, float(info["median_ms"]), captured, live)  # (#187)
         if not live:
             self.no_round = f"round {n} has no new target and no arm that still matters"
         return bool(live)
@@ -1502,6 +1541,7 @@ def report_lines(run: RunDir) -> list[str]:
         f"* stopped: {finished.get('reason', 'not finished (interrupted or running)')}",
         *_budget_lines(finished),
         *_concurrency_lines(state),
+        *board.report_lines(run),  # board.jsonl (#187)
         "",
         "| arm | precision | slices | evaluations | slices with a new best | best |",
         "|---|---|---|---|---|---|",

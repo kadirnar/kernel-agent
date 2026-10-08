@@ -3145,6 +3145,27 @@ model and starts a new round (`kernel_agent/improve.py`,
     through the queue, so with N > 1 a session's benchmark script can overlap
     another session's timed evaluation (clean timing under load: #185), and the
     per-session view in `status` / `watch` comes with #184.
+  * *Board* (`--board auto`: with `--agents` above 1; `on`, `off`; issue #187,
+    `kernel_agent/board.py`). The sessions share conclusions in `board.jsonl`, never
+    progress (KernelArc's wins and traps: two agents that shared them beat one by
+    1.6–2.0x, [docs/MULTIAGENT-LITERATURE.md](docs/MULTIAGENT-LITERATURE.md)). With the
+    `post_note` tool a kernel, systems, native or research session posts why a kept
+    result of its wins (`winner`, only with that result's `exp:N` or snapshot), a dead
+    end and what proves it (`trap`), a fact that holds beyond its kernel (`insight`), a
+    module it is about to change (`claim`) or a question for another arm (`question`,
+    `to: "arm:<id>"`): at most 6 notes a session, 1500 characters each, the same note
+    once. kernel-agent posts every new best of every arm itself (`winner`, with the
+    snapshot to build on or to run end to end), each re-integration and round, and the
+    modules of each running slice (`claim` / `release`; a claim an agent posts joins its
+    session's claims, which `--overlap` weighs). A session reads what is for it (its
+    target and module class, notes for every target or for its precision, what is
+    addressed to it; the systems and native agents every winner): the newest entries in
+    its digest, the first lines of the new ones on every evaluation result (`board`),
+    the full text with `read_board`. The native and systems agents' building blocks are
+    so live, not frozen at session start. A research session's evidence has its
+    target's board history, the librarian's prompt the run's insights and traps, and the
+    report counts the entries and how many posted winners another session built on. The
+    board is advice: nothing on it is scored, and the ledger stays the truth.
   * *Records.* A slice record names its sessions (`sessions`) and their GPU waits
     (`queue_s`); its evaluations, keeps and `improved` come from its own sessions'
     ledger rows, not from what the arm did meanwhile. `improve.json` → `coordinator`
@@ -3816,6 +3837,7 @@ kernel-agent improve <run_dir | hf-url> [--max-hours H] [--max-usd U] [--slice 4
                                        the move-on rules retire a target for one round
   --integration-reserve auto|MINUTES   time kept for the final integration (auto: its
                                        estimate, at most a third of --max-hours; 0: none)
+  --board auto|on|off                  the sessions' blackboard (auto: with --agents > 1)
 kernel-agent resume <run_dir> [--redo kernels] [--program FILE] [--auth subscription]
                                        [--precisions P,P]  (replaces the run's list in run.json)
 kernel-agent integrate <run_dir> [--precisions P,P] [--no-reuse]
@@ -3902,6 +3924,9 @@ runs/<org>--<name>/<timestamp>/
   results.tsv                 experiment ledger: one row per evaluation
   events.jsonl                phase changes, agent start/stop, evaluations
   gpu_queue.jsonl             GPU job queue: queued / start / done / withdrawn per job
+  board.jsonl                 improve --agents N / --board on: the sessions' notes (insight,
+                              trap, winner, claim, question) and kernel-agent's posts
+                              (winner, integration, round, claim, release)
   progress.png  amdahl.png  integration.png  dashboard.html
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md, artifacts.jsonl:
                               kernel_agent.artifacts lookups, export_checks.jsonl)

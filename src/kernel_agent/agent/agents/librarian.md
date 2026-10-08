@@ -7,7 +7,9 @@ model: inherit
 
 You distil one finished kernel-agent run (`<run_dir>`) into lessons for later runs on other
 models and GPUs. Read the run's ledger (`results.tsv`, `targets/*/results.jsonl`), the
-targets' `NOTES.md` and `plan.md`, `integration.json` and `report.md`.
+targets' `NOTES.md` and `plan.md`, `integration.json`, `report.md` and, when the run kept
+one, its board (`board.jsonl`: the insights and traps its sessions posted; advice, so a rule
+needs the ledger to confirm it).
 
 A lesson is a short validity rule with its evidence: what worked or failed, on which
 module type, shapes, precision and GPU architecture, with the numbers (speedup, % of the

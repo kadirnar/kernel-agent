@@ -24,6 +24,7 @@ from typing import Any
 
 from kernel_agent import (
     abtest,
+    board,
     diversity,
     gpuqueue,
     hub,
@@ -53,6 +54,7 @@ from kernel_agent.agent.tools import (
     current_records,
     ranked_for_target,
     record_candidate,
+    tool_names,
 )
 from kernel_agent.budget import MIN_AGENT_SECONDS, MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
@@ -313,7 +315,7 @@ class Orchestrator:
         role = roles.role_of(name) if role is None else role
         spec = roles.get(role)
         binding = kwargs.pop("binding", None) or SessionBinding()
-        binding = dataclasses.replace(binding, label=label or name)
+        binding = dataclasses.replace(binding, label=label or name, role=binding.role or role or "")
         server = build_server(self.run, self.budget, self.truth, binding)
         tag: dict[str, Any] = {"label": label} if label else {}
         prog = program.for_agent(self.run, name, log)  # re-read: humans may edit it mid-run
@@ -328,6 +330,9 @@ class Orchestrator:
         if cfg.allow_web:  # when to look things up, where, citations (issue #125)
             kwargs["system_append"] += prompts.web_note(name, web.domains(cfg.web_domains))
         kwargs["system_append"] += prompts.docs_note(name)  # doc_search / doc_read (#177)
+        if board.active(self.run) is not None and role in board.ROLES:  # the blackboard (#187)
+            kwargs["mcp_tools"] = [*kwargs["mcp_tools"], *tool_names(*board.TOOLS)]
+            kwargs["system_append"] += prompts.board_note(name)
         budget = self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
         # the session's own part, after everything its role's sessions share
         kwargs["prompt"] = prompts.first_message((context, budget), kwargs["prompt"])
@@ -2086,6 +2091,7 @@ class Orchestrator:
             cwd=target_dir,
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
             writable=[plan] + ([proposal] if proposal else []) + ([dossier] if dossier else []),
+            binding=SessionBinding(role="research", target_id=target_id),  # its board (#187)
         )
 
     async def dossier(self, target_id: str, *, label: str | None = None) -> AgentResult | None:
