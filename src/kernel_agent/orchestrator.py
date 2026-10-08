@@ -22,6 +22,7 @@ from typing import Any
 
 from kernel_agent import (
     abtest,
+    diversity,
     hub,
     interrupt,
     ledger,
@@ -1032,6 +1033,8 @@ class Orchestrator:
         }
         if seed is not None:
             result["composite"] = seed
+        if dependent := _data_dependent(history, accepted):  # diversity.py: labelled, kept
+            result["data_dependent"] = dependent
         result["reuse"] = counts  # A/B steps taken from the previous integration / measured
         if irreversible:
             result["irreversible"] = sorted(irreversible)
@@ -1062,6 +1065,7 @@ class Orchestrator:
                 f"integrate: final {final['median_ms']:.1f} ms vs {base_ms:.1f} ms "
                 f"= {final['speedup']}x"
                 + (f" ({vs_compiled:.2f}x vs compiled)" if vs_compiled else "")
+                + (f"; {spread}" if (spread := diversity.headline(final)) else "")
                 + (
                     f"; projected {projected:.1f} ms"
                     if projected is not None
@@ -1512,8 +1516,11 @@ class Orchestrator:
             log(f"integrate: no in-process A/B ({why[:300]}); separate processes")
         iters = abtest.SEPARATE_ITERS
         flags = ["--expandable-segments"] if oom else []
-        ra = self._integration_call(
-            "e2e", a, [*_cli(a, iters=iters), *flags], " (A of an A/B in separate processes)"
+        ra = self._integration_call(  # A's diverse set: measured when it was B
+            "e2e",
+            a,
+            [*_cli(a, iters=iters), *flags, "--no-diverse"],
+            " (A of an A/B in separate processes)",
         )
         rb = self._integration_call("e2e", b, [*_cli(b, iters=iters), *flags], note)
         rb["ab"] = {
@@ -1772,7 +1779,7 @@ class Orchestrator:
         known = previous.get("reference") or {}
         if known.get("items") == items:  # re-integration of the same kernels
             return dict(known)
-        cli = ["--warmup", "2", "--iters", "5"]
+        cli = ["--warmup", "2", "--iters", "5", "--no-diverse"]
         for arg in kernels:
             cli += ["--kernel", arg]
         cli += ["--transform", str(strong_baseline.REFERENCE_TRANSFORM)]
@@ -2392,6 +2399,23 @@ def _short(r: dict[str, Any]) -> dict[str, Any]:
         k: r.get(k)
         for k in ("status", "passed", "reason", "median_ms", "speedup", "metrics", "patches")
     }
+
+
+def _data_dependent(
+    history: list[dict[str, Any]], accepted: list[tuple[str, str]]
+) -> list[dict[str, Any]]:
+    """The items whose A/B alone against the unmodified model measured a speedup that changes
+    with the input (:mod:`kernel_agent.diversity`), with their diverse-set speedups and
+    whether they were accepted: labelled in ``integration.json``, never dropped for it."""
+    kept = {a for _, a in accepted}
+    out = []
+    for h in history:
+        if len(h.get("items") or []) != 1 or (h.get("ab") or {}).get("a_items"):
+            continue
+        if diversity.is_data_dependent(h) and (info := diversity.compact(h)) is not None:
+            item = h["items"][0]
+            out.append({"item": item, "accepted": item in kept, **info})
+    return out
 
 
 def _scope(target: dict[str, Any]) -> str | None:

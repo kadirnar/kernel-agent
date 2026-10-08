@@ -1,0 +1,472 @@
+{
+ "baseline": {
+  "ms": 1159.43
+ },
+ "tiled": {
+  "ms": 1163.14
+ },
+ "results": [
+  {
+   "transform": "eager prompt lookup (K=10, report_stats)",
+   "benchmark_speedup": 0.97,
+   "benchmark_decode_stats": {
+    "steps": 64,
+    "tokens": 64,
+    "verifies": 9,
+    "drafted": 83,
+    "accepted": 0,
+    "acceptance_rate": 0.0,
+    "tokens_per_verify": 1.0,
+    "tokens_per_step": 1.0
+   },
+   "tiled_v1_prompt_speedup": 6.43,
+   "tiled_decode_stats": {
+    "steps": 9,
+    "tokens": 64,
+    "verifies": 6,
+    "drafted": 59,
+    "accepted": 55,
+    "acceptance_rate": 0.9322,
+    "tokens_per_verify": 10.167,
+    "tokens_per_step": 7.111
+   },
+   "diverse": {
+    "median_speedup": 1.2138,
+    "min_speedup": 0.9934,
+    "max_speedup": 2.0383,
+    "min_input": "french",
+    "max_input": "poem",
+    "spread": 0.8609,
+    "data_dependent": true,
+    "why": "speedup 0.99x (french) to 2.04x (poem) over 12 inputs: spread 86% > 10% (timing noise 0.7%); decode steps per token change with the input (0.469 .. 1)"
+   },
+   "diverse_quality_near_lossless": {
+    "passed": true,
+    "reason": ""
+   },
+   "diverse_quality_exact": {
+    "passed": true,
+    "reason": ""
+   },
+   "gate": {
+    "passed": true,
+    "reason": "",
+    "kl": 0.0,
+    "kl_worst": 0.0,
+    "top1": 1.0,
+    "nll_increase": 0.003,
+    "nll_increase_worst": 0.1998
+   },
+   "rows": [
+    {
+     "label": "news",
+     "baseline_ms": 1162.88,
+     "ms": 1022.643,
+     "speedup": 1.1371,
+     "decode_stats": {
+      "steps": 55.0,
+      "tokens": 64.0,
+      "verifies": 10.0,
+      "drafted": 85.0,
+      "accepted": 9.0,
+      "acceptance_rate": 0.1059,
+      "tokens_per_verify": 1.9,
+      "tokens_per_step": 1.164
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "dialogue",
+     "baseline_ms": 1166.772,
+     "ms": 981.729,
+     "speedup": 1.1885,
+     "decode_stats": {
+      "steps": 52.0,
+      "tokens": 64.0,
+      "verifies": 12.0,
+      "drafted": 101.0,
+      "accepted": 12.0,
+      "acceptance_rate": 0.1188,
+      "tokens_per_verify": 2.0,
+      "tokens_per_step": 1.231
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "code",
+     "baseline_ms": 1169.0,
+     "ms": 576.65,
+     "speedup": 2.0272,
+     "decode_stats": {
+      "steps": 30.0,
+      "tokens": 64.0,
+      "verifies": 13.0,
+      "drafted": 123.0,
+      "accepted": 34.0,
+      "acceptance_rate": 0.2764,
+      "tokens_per_verify": 3.615,
+      "tokens_per_step": 2.133
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "recipe",
+     "baseline_ms": 1168.526,
+     "ms": 1062.196,
+     "speedup": 1.1001,
+     "decode_stats": {
+      "steps": 57.0,
+      "tokens": 64.0,
+      "verifies": 11.0,
+      "drafted": 93.0,
+      "accepted": 7.0,
+      "acceptance_rate": 0.0753,
+      "tokens_per_verify": 1.636,
+      "tokens_per_step": 1.123
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "poem",
+     "baseline_ms": 1166.266,
+     "ms": 572.166,
+     "speedup": 2.0383,
+     "decode_stats": {
+      "steps": 30.0,
+      "tokens": 64.0,
+      "verifies": 9.0,
+      "drafted": 73.0,
+      "accepted": 34.0,
+      "acceptance_rate": 0.4658,
+      "tokens_per_verify": 4.778,
+      "tokens_per_step": 2.133
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "question",
+     "baseline_ms": 1165.398,
+     "ms": 990.403,
+     "speedup": 1.1767,
+     "decode_stats": {
+      "steps": 53.0,
+      "tokens": 64.0,
+      "verifies": 11.0,
+      "drafted": 104.0,
+      "accepted": 11.0,
+      "acceptance_rate": 0.1058,
+      "tokens_per_verify": 2.0,
+      "tokens_per_step": 1.208
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "math",
+     "baseline_ms": 1166.943,
+     "ms": 941.746,
+     "speedup": 1.2391,
+     "decode_stats": {
+      "steps": 50.0,
+      "tokens": 64.0,
+      "verifies": 14.0,
+      "drafted": 138.0,
+      "accepted": 14.0,
+      "acceptance_rate": 0.1014,
+      "tokens_per_verify": 2.0,
+      "tokens_per_step": 1.28
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "table",
+     "baseline_ms": 1166.786,
+     "ms": 648.302,
+     "speedup": 1.7998,
+     "decode_stats": {
+      "steps": 32.0,
+      "tokens": 64.0,
+      "verifies": 23.0,
+      "drafted": 208.0,
+      "accepted": 32.0,
+      "acceptance_rate": 0.1538,
+      "tokens_per_verify": 2.391,
+      "tokens_per_step": 2.0
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "german",
+     "baseline_ms": 1165.58,
+     "ms": 1130.912,
+     "speedup": 1.0307,
+     "decode_stats": {
+      "steps": 61.0,
+      "tokens": 64.0,
+      "verifies": 10.0,
+      "drafted": 85.0,
+      "accepted": 3.0,
+      "acceptance_rate": 0.0353,
+      "tokens_per_verify": 1.3,
+      "tokens_per_step": 1.049
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "french",
+     "baseline_ms": 1162.738,
+     "ms": 1170.468,
+     "speedup": 0.9934,
+     "decode_stats": {
+      "steps": 64.0,
+      "tokens": 64.0,
+      "verifies": 4.0,
+      "drafted": 33.0,
+      "accepted": 0.0,
+      "acceptance_rate": 0.0,
+      "tokens_per_verify": 1.0,
+      "tokens_per_step": 1.0
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "spanish",
+     "baseline_ms": 1164.027,
+     "ms": 925.598,
+     "speedup": 1.2576,
+     "decode_stats": {
+      "steps": 50.0,
+      "tokens": 64.0,
+      "verifies": 7.0,
+      "drafted": 57.0,
+      "accepted": 14.0,
+      "acceptance_rate": 0.2456,
+      "tokens_per_verify": 3.0,
+      "tokens_per_step": 1.28
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "chinese",
+     "baseline_ms": 1163.956,
+     "ms": 700.667,
+     "speedup": 1.6612,
+     "decode_stats": {
+      "steps": 38.0,
+      "tokens": 64.0,
+      "verifies": 4.0,
+      "drafted": 38.0,
+      "accepted": 26.0,
+      "acceptance_rate": 0.6842,
+      "tokens_per_verify": 7.5,
+      "tokens_per_step": 1.684
+     },
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    }
+   ]
+  },
+  {
+   "transform": "run 033: FP8 megakernel + prompt lookup",
+   "benchmark_speedup": 12.18,
+   "benchmark_decode_stats": null,
+   "tiled_v1_prompt_speedup": 65.64,
+   "tiled_decode_stats": null,
+   "diverse": {
+    "median_speedup": 14.7136,
+    "min_speedup": 10.1229,
+    "max_speedup": 21.6235,
+    "min_input": "recipe",
+    "max_input": "poem",
+    "spread": 0.7816,
+    "data_dependent": true,
+    "why": "speedup 10.12x (recipe) to 21.62x (poem) over 12 inputs: spread 78% > 10% (timing noise 1.2%)"
+   },
+   "diverse_quality_near_lossless": {
+    "passed": true,
+    "reason": ""
+   },
+   "diverse_quality_exact": {
+    "passed": true,
+    "reason": ""
+   },
+   "gate": {
+    "passed": true,
+    "reason": "",
+    "kl": 0.0,
+    "kl_worst": 0.0,
+    "top1": 1.0,
+    "nll_increase": -0.0329,
+    "nll_increase_worst": 0.1683
+   },
+   "rows": [
+    {
+     "label": "news",
+     "baseline_ms": 1162.88,
+     "ms": 75.961,
+     "speedup": 15.3089,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "dialogue",
+     "baseline_ms": 1166.772,
+     "ms": 96.938,
+     "speedup": 12.0363,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "code",
+     "baseline_ms": 1169.0,
+     "ms": 68.975,
+     "speedup": 16.9482,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "recipe",
+     "baseline_ms": 1168.526,
+     "ms": 115.434,
+     "speedup": 10.1229,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "poem",
+     "baseline_ms": 1166.266,
+     "ms": 53.935,
+     "speedup": 21.6235,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "question",
+     "baseline_ms": 1165.398,
+     "ms": 75.083,
+     "speedup": 15.5215,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "math",
+     "baseline_ms": 1166.943,
+     "ms": 108.001,
+     "speedup": 10.8049,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "table",
+     "baseline_ms": 1166.786,
+     "ms": 106.601,
+     "speedup": 10.9454,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "german",
+     "baseline_ms": 1165.58,
+     "ms": 81.057,
+     "speedup": 14.3798,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "french",
+     "baseline_ms": 1162.738,
+     "ms": 86.044,
+     "speedup": 13.5133,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "spanish",
+     "baseline_ms": 1164.027,
+     "ms": 76.185,
+     "speedup": 15.279,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    },
+    {
+     "label": "chinese",
+     "baseline_ms": 1163.956,
+     "ms": 77.352,
+     "speedup": 15.0475,
+     "decode_stats": null,
+     "quality": {
+      "passed": true,
+      "reason": ""
+     }
+    }
+   ]
+  }
+ ]
+}

@@ -7,6 +7,7 @@ lives outside the agents' working directories, in ``<run>/.truth/``::
     .truth/baseline_output.pt         reference output of the baseline run
     .truth/baseline_output_holdout.pt ... of the held-out input (workloads/holdout.py)
     .truth/baseline_output_natural.pt ... of the natural-length run (workloads/stopping.py)
+    .truth/baseline_output_diverse.pt ... of the diverse input set (workloads/diverse.py)
     .truth/baseline_output_perceptual.pt samples + scores of the perceptual gate
                                       (--quality near-lossless, workloads/perceptual.py)
     .truth/captures/<id>.pt           module + inputs + reference outputs + post-call state
@@ -222,6 +223,7 @@ class Truth:
             run.baseline_output(),
             run.baseline_output_holdout(),
             run.baseline_output_natural(),
+            run.baseline_output_diverse(),
             run.baseline_output_perceptual(),
         )
 

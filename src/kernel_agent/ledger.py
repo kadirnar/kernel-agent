@@ -35,6 +35,11 @@ Kernel rows carry the ``idea`` the agent tagged the candidate with (``idea_id`` 
 buggy attempt is not mistaken for a refuted idea, and the ``worker`` that produced them
 when the target has parallel workers (:mod:`kernel_agent.workers`; empty otherwise).
 
+``e2e`` rows carry the median speedup over the workload's diverse input set
+(``diverse_speedup``, :mod:`kernel_agent.workloads.diverse`) and ``flags``:
+``data_dependent`` when that speedup changes with the input (:mod:`kernel_agent.diversity`;
+a label, the classification is the benchmark input's).
+
 ``results.jsonl`` (``RunDir.results_file``) keeps the full records; the TSV is the readable
 summary that the charts, ``kernel-agent status`` and ``dashboard.html`` read.
 """
@@ -50,6 +55,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from kernel_agent import diversity
 from kernel_agent.budget import Standing, improves
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
 
@@ -69,6 +75,8 @@ COLUMNS = (
     "spread",
     "pct_of_sol",
     "eval_s",
+    "diverse_speedup",
+    "flags",
     "worker",
     "idea",
     "hypothesis",
@@ -97,7 +105,16 @@ UNMEASURED = (QUICK_OK, QUICK_FAIL, DUPLICATE, REEVALUATED)
 E2E = "e2e"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-_FLOATS = {"speedup", "ref_ms", "new_ms", "est_saved_ms", "spread", "pct_of_sol", "eval_s"}
+_FLOATS = {
+    "speedup",
+    "ref_ms",
+    "new_ms",
+    "est_saved_ms",
+    "spread",
+    "pct_of_sol",
+    "eval_s",
+    "diverse_speedup",
+}
 # Statuses of the evaluator / e2e worker that are not ledger statuses.
 _STATUS_MAP = {"patch_error": "build_error", "harness_error": "crash", "error": "crash"}
 _BACKENDS = (
@@ -459,6 +476,8 @@ def record_e2e(
                 else None,
                 "spread": e2e_spread(result),
                 "eval_s": eval_s,
+                "diverse_speedup": diversity.median_speedup(result),
+                "flags": diversity.flags(result),
                 "hypothesis": hypothesis,
             },
         )

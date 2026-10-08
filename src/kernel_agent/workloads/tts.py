@@ -25,6 +25,12 @@ HOLDOUT_TEXT = (
     "from an earlier run, whatever words it happens to contain."
 )
 SHORT_TEXT = "Short sentences matter too."
+#: Diverse input set (``diverse_inputs``): sentences of other kinds, the same seed.
+DIVERSE_TEXTS = {
+    "question": "Could you tell me how late the museum stays open on public holidays?",
+    "numbers": "Your booking code is four seven two nine; the train leaves from platform 11.",
+    "instruction": "Turn left at the bakery, cross the bridge and take the second street.",
+}
 
 
 class TTSWorkload(Workload):
@@ -52,6 +58,9 @@ class TTSWorkload(Workload):
 
     def variants(self) -> list[dict[str, Any]]:
         return [{"text": SHORT_TEXT}]
+
+    def diverse_inputs(self) -> dict[str, dict[str, Any]]:
+        return {label: {"text": text} for label, text in DIVERSE_TEXTS.items()}
 
     def make_inputs(self) -> str:
         return str(self.options["text"])

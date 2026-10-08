@@ -6,7 +6,7 @@ import shutil
 import textwrap
 from typing import Any
 
-from kernel_agent import backends, ledger, objective, projection, strong_baseline
+from kernel_agent import backends, diversity, ledger, objective, projection, strong_baseline
 from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
@@ -72,8 +72,16 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
     final = s["final"] or {}
     if base and final.get("passed") and final.get("median_ms"):
         parts.append(f"measured {_ms(final['median_ms'])} ({vs(final['median_ms'])}, integrated)")
+        if spread := diversity.headline(final):  # the diverse set's speedups (#170)
+            parts.append(spread)
     elif best and base and best["new_ms"]:
         parts.append(f"measured {_ms(best['new_ms'])} ({vs(best['new_ms'])}, {best['snapshot']})")
+        if best.get("diverse_speedup"):
+            dependent = diversity.DATA_DEPENDENT in str(best.get("flags"))
+            parts.append(
+                f"diverse-set median {_x(best['diverse_speedup'])}"
+                + (", data-dependent" if dependent else "")
+            )
     else:
         parts.append("measured —")
     notional = auth.usd_note(s["costs"])
@@ -165,7 +173,12 @@ def render(run: RunDir, width: int | None = None, last: int = 10) -> str:
                     str(r["time"])[11:] or str(r["time"]),
                     r["target"] + (f"/w{r['worker']}" if r.get("worker") else ""),
                     r["backend"],
-                    r["status"],
+                    r["status"]
+                    + (
+                        " (data-dependent)"
+                        if diversity.DATA_DEPENDENT in str(r.get("flags"))
+                        else ""
+                    ),
                     _x(r["speedup"]),
                     ledger.labelled(r) or r["snapshot"] or "",
                 ]

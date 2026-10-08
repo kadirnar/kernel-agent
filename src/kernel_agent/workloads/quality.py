@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from kernel_agent.kernels.compare import flatten
-from kernel_agent.workloads import holdout, perceptual, stopping
+from kernel_agent.workloads import diverse, holdout, perceptual, stopping
 from kernel_agent.workloads.base import Comparison, Workload
 
 #: Free-running sanity check: RMS energy of every float output within ±25 %.
@@ -272,6 +272,7 @@ def probe_messages(baseline: dict[str, Any]) -> list[str]:
         messages
         + holdout.messages(baseline)
         + stopping.messages(baseline)
+        + diverse.messages(baseline)
         + perceptual.messages(baseline)
     )
 
@@ -335,5 +336,6 @@ def summary_section(baseline: dict[str, Any]) -> str:
         what = own.get("check") or "the workload's own run"
         lines.append(f"* workload self-check ({what}): {state}.")
     lines += holdout.summary_lines(baseline) + stopping.summary_lines(baseline)
+    lines += diverse.summary_lines(baseline)
     lines += perceptual.summary_lines(baseline)
     return "\n".join(lines) + "\n"

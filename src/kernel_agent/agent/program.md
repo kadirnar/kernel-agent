@@ -150,6 +150,10 @@ version is saved as `logs/program-<sha12>.md`.
   removed, work not repeated) over a gain of a few percent seen in a single
   evaluation, because each `evaluate_e2e` reloads the model and timings vary
   between calls.
+* Data-dependent techniques (exact speculative decoding, early exit) are
+  welcome; judge them by the diverse-set median in `metrics.diverse` as much as
+  by the benchmark speedup, and report their counters with
+  `workload.report_stats(...)`.
 
 ## native
 

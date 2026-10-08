@@ -5,6 +5,7 @@ orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
     python -m kernel_agent.worker capture --run-dir R --target ID [--parent]
     python -m kernel_agent.worker e2e     --run-dir R [--kernel ID=PATH ...] [--transform PATH ...]
                                           [--baseline-ms MS] [--verify REL=SHA256 ...]
+                                          [--no-diverse]
     python -m kernel_agent.worker e2e_ab  --run-dir R [A: --kernel ... --transform ...]
                                           [B: --b-kernel ... --b-transform ...] [--rounds K]
     python -m kernel_agent.worker export_check --run-dir R --package DIR [--verify ...]
@@ -71,7 +72,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     from kernel_agent.kernels.roofline import current_peaks
     from kernel_agent.profiling import ceilings
     from kernel_agent.profiling.profiler import profile_workload, summarize
-    from kernel_agent.workloads import holdout, perceptual, quality, stopping
+    from kernel_agent.workloads import diverse, holdout, perceptual, quality, stopping
     from kernel_agent.workloads.base import measure
 
     if (ns.kernel or ns.transform) and not ns.out_dir:
@@ -125,6 +126,9 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         # ... and the stop condition on a natural-length run (workloads/stopping.py)
         target = truth.replace(out.baseline_output_natural())
         baseline["natural_length"] = stopping.save_baseline(workload, target)
+        # ... and the diverse input set: outputs and times (workloads/diverse.py)
+        target = truth.replace(out.baseline_output_diverse())
+        baseline["diverse"] = diverse.save_baseline(workload, target)
         # ... and, with --quality near-lossless, the perceptual samples (workloads/perceptual.py)
         target = truth.replace(out.baseline_output_perceptual())
         mode = _quality(ns, run)
@@ -369,7 +373,7 @@ def cmd_export_check(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     if ns.package is None:
         raise ValueError("export_check needs --package")
     try:  # everything from the run directory first: it is hidden while the package runs
-        reference_bytes, baseline_bytes, _, _, perceptual_bytes = _truth_files(run, ns)
+        reference_bytes, baseline_bytes, *_, perceptual_bytes = _truth_files(run, ns)
     except truth.TamperError as exc:
         return {"status": "tampered", "passed": False, "error": str(exc)}
     mode = _quality(ns, run)
@@ -406,14 +410,16 @@ def cmd_export_check(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
 def _truth_files(run: RunDir, ns: argparse.Namespace) -> tuple[bytes, ...]:
     """The baseline output, baseline.json, the held-out baseline output, the
-    natural-length baseline and the perceptual baseline, checked against the digests the
-    orchestrator holds (``--verify``) before anything runs; read once."""
+    natural-length baseline, the diverse set's outputs and the perceptual baseline, checked
+    against the digests the orchestrator holds (``--verify``) before anything runs; read
+    once."""
     expected = dict(item.partition("=")[::2] for item in ns.verify or [])
     return (
         _truth_bytes(run, run.baseline_output(), expected),
         _truth_bytes(run, run.baseline_json, expected, required=False),
         _truth_bytes(run, run.baseline_output_holdout(), expected, required=False),
         _truth_bytes(run, run.baseline_output_natural(), expected, required=False),
+        _truth_bytes(run, run.baseline_output_diverse(), expected, required=False),
         _truth_bytes(run, run.baseline_output_perceptual(), expected, required=False),
     )
 
@@ -512,13 +518,13 @@ def _checks(
     truth_files: tuple[bytes, ...],
 ) -> tuple[float, dict[str, Any]]:
     """:func:`_judge` without the perceptual gate: teacher forcing (or the workload's own
-    comparison), the held-out input and the stop condition."""
+    comparison), the held-out input, the stop condition and the diverse input set."""
     import torch
 
-    from kernel_agent.workloads import holdout, stopping
+    from kernel_agent.workloads import diverse, holdout, stopping
     from kernel_agent.workloads.quality import assess, is_chaotic
 
-    reference_bytes, baseline_bytes, holdout_bytes, natural_bytes = truth_files
+    reference_bytes, baseline_bytes, holdout_bytes, natural_bytes, diverse_bytes = truth_files
     reference = torch.load(io.BytesIO(reference_bytes), weights_only=False)
     baseline = json.loads(baseline_bytes or b"{}")
     # the orchestrator's baseline latency (--baseline-ms), not what baseline.json says now
@@ -550,6 +556,18 @@ def _checks(
     if natural is not None:
         metrics["natural_length"] = natural
         reasons.append(natural["reason"] and f"natural length: {natural['reason']}")
+    # Diverse input set (judged + timed): only for a candidate that passed the main checks
+    if getattr(ns, "no_diverse", False):
+        varied = {"passed": True, "reason": "", "skipped": "not asked (--no-diverse)"}
+    elif not (verdict["passed"] and held["passed"]):
+        varied = {"passed": True, "reason": "", "skipped": "the main checks failed"}
+    else:
+        outputs = None
+        if diverse_bytes:
+            outputs = torch.load(io.BytesIO(diverse_bytes), weights_only=False)
+        varied = diverse.check(workload, outputs, baseline, chaotic=chaotic)
+    metrics["diverse"] = varied
+    reasons.append(varied["reason"] and f"diverse input {varied['reason']}")
     concurrency = _concurrency_check(ns, workload, inputs)  # last: its profiler slows launches
     metrics["concurrency"] = concurrency
     reasons.append(concurrency["reason"])
@@ -558,6 +576,7 @@ def _checks(
         "passed": verdict["passed"]
         and held["passed"]
         and (natural or {}).get("passed", True)
+        and varied["passed"]
         and concurrency["passed"],
         "reason": "; ".join(r for r in reasons if r),
         "metrics": metrics,
@@ -596,6 +615,7 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     from kernel_agent import abtest, telemetry
     from kernel_agent.integrate import ab, undo
+    from kernel_agent.workloads.base import decode_stats
 
     try:
         truth_files = _truth_files(run, ns)
@@ -688,6 +708,8 @@ def cmd_e2e_ab(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         "peak_mem_gb": round(peak, 3),
         "patches": b.report.__dict__,
     }
+    if (stats := decode_stats(rounds.b_stats)) is not None:  # Workload.report_stats of B
+        result["metric_detail"] = {"decode_stats": stats}
     result["ab"] = {
         **abtest.paired(rounds.a_ms, rounds.b_ms),
         **rounds.ab(),
@@ -803,6 +825,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--verify", action="append", help="e2e: REL=SHA256, refuse a run file without it"
     )
+    parser.add_argument("--no-diverse", action="store_true", help="e2e: skip the diverse input set")
     parser.add_argument("--quality", help="exact | near-lossless (default: run.json's)")
     parser.add_argument(
         "--precisions", help="P,P,...: the precisions the run allows (default: run.json's)"

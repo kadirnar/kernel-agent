@@ -8,6 +8,7 @@ from typing import Any
 from kernel_agent import (
     abtest,
     backends,
+    diversity,
     ledger,
     library,
     objective,
@@ -282,6 +283,7 @@ def write_report(run: RunDir) -> Path:
         held = found.pop("holdout", None)  # workloads/holdout.py: one phrase, not every metric
         natural = found.pop("natural_length", None)  # workloads/stopping.py: one phrase too
         perceived = found.pop("perceptual", None)  # workloads/perceptual.py: near-lossless
+        varied = found.pop("diverse", None)  # workloads/diverse.py: its own section below
         metrics = ", ".join(f"{k}={v}" for k, v in _flat_metrics(found).items())
         if isinstance(perceived, dict):
             from kernel_agent.workloads import perceptual
@@ -295,9 +297,12 @@ def write_report(run: RunDir) -> Path:
             from kernel_agent.workloads import stopping
 
             metrics += f"; {stopping.summary_text(natural)}"
-        lines.append(
-            row("optimised", final.get("median_ms"), metrics, f"**{final.get('speedup')}x**")
-        )
+        if isinstance(varied, dict):
+            metrics += f"; {diversity.summary_text(varied)}"
+        eager_x = f"**{final.get('speedup')}x**"
+        if spread := diversity.headline(final):  # the diverse set's next to the benchmark's
+            eager_x += f" ({spread})"
+        lines.append(row("optimised", final.get("median_ms"), metrics, eager_x))
     else:
         lines.append("| optimised | — | — | — | no optimisation passed end-to-end validation |")
     if reference:
@@ -306,6 +311,14 @@ def write_report(run: RunDir) -> Path:
     lines.append("")
     if (line := strong_baseline.describe(baseline)) is not None:
         lines += [f"* {line}. *vs compiled* = against what users get without custom kernels.", ""]
+    if varied_lines := diversity.report_lines(final, "Diverse inputs (integrated result)"):
+        lines += [*varied_lines[1:], ""]  # per-input speedups and decode counters
+    alone = integration.get("data_dependent") or []  # items whose A/B alone measured it
+    for item in alone:
+        name = ledger.item_label(str(item.get("item")))
+        kept = "accepted" if item.get("accepted") else "not accepted"
+        lines.append(f"* data-dependent alone ({kept}): `{name}` ({item.get('why')})")
+    lines += [""] if alone else []
     lines += _chart(run, run.root / "progress.png", "end-to-end progress")
     lines += _chart(run, run.root / "amdahl.png", "time split before and after the best kernels")
     lines += [
@@ -403,16 +416,25 @@ def write_report(run: RunDir) -> Path:
             "",
             "## Model-level transforms",
             "",
-            "| transforms | passed | ms | speedup | note |",
-            "|---|---|---|---|---|",
+            "| transforms | passed | ms | speedup | diverse inputs | note |",
+            "|---|---|---|---|---|---|",
         ]
         for rec in transforms:
             note = rec.get("reason") or rec.get("status") or ""
             if (oom := abtest.step_out_of_memory(rec)) is not None:  # no quality verdict (#137)
                 note = f"not measurable: {oom}"
+            varied = diversity.of(rec) or {}
+            spread = (
+                f"{varied['median_speedup']:.2f}x ({varied['min_speedup']:.2f}"
+                f"..{varied['max_speedup']:.2f})"
+                + (" **data-dependent**" if varied.get(diversity.DATA_DEPENDENT) else "")
+                if varied
+                else "—"
+            )
             lines.append(
                 f"| {', '.join(rec.get('transforms', []))} | {rec.get('passed')} | "
-                f"{_fmt(rec.get('median_ms'), 1)} | {_fmt(rec.get('speedup'))} | {note[:80]} |"
+                f"{_fmt(rec.get('median_ms'), 1)} | {_fmt(rec.get('speedup'))} | {spread} | "
+                f"{note[:80]} |"
             )
     if integration:
         lines += ["", "## Integration", ""]
