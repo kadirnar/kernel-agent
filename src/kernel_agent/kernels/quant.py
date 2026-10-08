@@ -3,7 +3,7 @@
 A target whose spec says ``"precision": "fp8_weights"`` (planned in a ``--quality
 near-lossless`` run, evaluated in the near-lossless tolerance tier of
 :mod:`kernel_agent.kernels.compare`) may store its weights in FP8. The contract
-(``agent/knowledge/low_precision.md``): quantise once in ``build()``, one scale per
+(skill ``fp8-weights``): quantise once in ``build()``, one scale per
 output channel, activations stay bf16, accumulate in fp32, report the numerical error.
 
 * :func:`quantize_fp8`: symmetric FP8 (e4m3 by default) with one fp32 scale per row of an

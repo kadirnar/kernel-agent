@@ -10,8 +10,8 @@ agent, which rewrites it as native CUDA C++ / CuTe (a multi-file project) that k
 weights streaming, fuses across module boundaries and runs the part in one persistent kernel
 or a few launches.
 
-This document is the design; `src/kernel_agent/native/` implements it,
-`src/kernel_agent/agent/knowledge/native.md` is the agents' contract and
+This document is the design; `src/kernel_agent/native/` implements it, the `native-engines`
+skill (`src/kernel_agent/agent/plugin/skills/native-engines/`) is the agents' contract and
 `src/kernel_agent/agent/examples/native_project/` the project template. Everything here is
 model-agnostic: targets come from the profile's structure, never from model names. VoxCPM2
 appears only as the worked example in §10.
@@ -228,7 +228,7 @@ A `native` session (role `native` in `program.md`):
 * **Budget**: `--native-minutes` per session (default 3 × `--agent-minutes`), 3 × the turns,
   `--native-evaluations` per slice (default 6); `native_patience` 8 runs without a new best
   and `native_hours` 6 h of slices before the arm stops.
-* **Context**: the contract (`knowledge/native.md`), the template project, the workload
+* **Context**: the contract (the `native-engines` skill), the template project, the workload
   files, the digest (the bar, the staged plan with each stage's state and teacher-forced
   target, the module arms and why they stopped, the last native evaluations, its
   `NOTES.md`), and **building blocks**: this run's best kernel per target and the kernel

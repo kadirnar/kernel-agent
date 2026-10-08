@@ -49,7 +49,7 @@ FETCH, SEARCH = "WebFetch", "WebSearch"
 DOC_SEARCH, DOC_READ = "doc_search", "doc_read"  # the doc library's MCP tools (#177)
 DOC_TOOLS = [f"mcp__ka__{DOC_SEARCH}", f"mcp__ka__{DOC_READ}"]  # every session has them
 #: Hosts ``WebFetch`` may reach by default, each with its subdomains: documentation,
-#: reference code and papers (``knowledge/sources.md`` uses only these).
+#: reference code and papers (the ``documentation-sources`` skill uses only these).
 DOMAINS = (
     "docs.nvidia.com",
     "developer.nvidia.com",

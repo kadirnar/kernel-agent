@@ -164,6 +164,8 @@ def test_the_systems_agent_gets_the_patterns():
 
     card = {"repo_id": "o/m", "modality": "tts"}
     text = prompts.systems_prompt(card, {"median_ms": 2.0}, "", [], "py", "tc", 4)
-    assert "# Systems patterns: host syncs, side streams, serving" in text
-    assert "workload.async_flags()" in text and "SideStage" in text
+    assert "`kernel-agent:systems-patterns`" in text  # the skill to load (#176)
+    patterns = prompts.knowledge("systems-patterns")
+    assert "# Systems patterns: host syncs, side streams, serving" in patterns
+    assert "workload.async_flags()" in patterns and "SideStage" in patterns
     assert "Host synchronisation" in prompts.knowledge("playbook.md")

@@ -13,7 +13,10 @@ Roles
   reference code and papers for it and writes ``research.md`` (issue #125).
 
 Every session with the web tools also gets :func:`web_note`: when to look things up,
-where (``knowledge/sources.md``), how to cite, and that pages are untrusted data.
+where (the ``documentation-sources`` skill), how to cite, and that pages are untrusted data.
+
+kernel-agent's know-how is in skills (``kernel_agent/skills.py``, issue #176): the prompts
+name the skills a role loads first (:func:`skills_note`) instead of inlining whole guides.
 """
 
 from __future__ import annotations
@@ -26,23 +29,20 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import objective
+from kernel_agent import objective, skills
 from kernel_agent.strong_baseline import headroom_note
 
 AGENT_DIR = Path(__file__).parent
-KNOWLEDGE_DIR = AGENT_DIR / "knowledge"
+#: The skills tree (``agent/plugin/skills``), which replaced ``agent/knowledge/`` (#176):
+#: sessions load it as a plugin and may Read it (``add_dirs``).
+KNOWLEDGE_DIR = skills.SKILLS_DIR
 EXAMPLES_DIR = AGENT_DIR / "examples"
 WORKLOADS_DIR = AGENT_DIR.parent / "workloads"
-SOURCES = KNOWLEDGE_DIR / "sources.md"
+SOURCES = KNOWLEDGE_DIR / "documentation-sources" / "sources.md"
 DOSSIER_FILE = "research.md"
 
-BACKEND_GUIDES = {
-    "triton": "triton.md",
-    "cuda": "cuda.md",
-    "nvrtc": "cuda.md",
-    "cute": "cute_dsl.md",
-    "tilelang": "tilelang.md",
-}
+BACKEND_GUIDES = skills.BACKEND_SKILLS  # the skill of each backend (#176)
+PRECISION_SKILLS = skills.PRECISION_SKILLS
 
 BACKEND_NAMES = {
     "triton": "Triton (`triton.jit`)",
@@ -54,7 +54,99 @@ BACKEND_NAMES = {
 
 
 def knowledge(name: str) -> str:
-    return (KNOWLEDGE_DIR / name).read_text()
+    """The text of a skill (``triton-kernels``) or of a former ``agent/knowledge/<name>``
+    file (``low_precision.md``: the skills it moved to, joined)."""
+    if name in skills.LEGACY:
+        return skills.legacy_text(name)
+    return skills.get(name).text()
+
+
+def skills_note(load: list[tuple[str, str]], others: str = "") -> str:
+    """The ``# Skills`` section of a prompt: the skills (name, why) a role loads before it
+    starts, with the Skill tool (#176), and ``others`` worth loading when the task needs
+    them."""
+    names: dict[str, str] = {}
+    for name, why in load:  # in order, the first reason of a repeated name
+        names.setdefault(name, why)
+    listed = "\n".join(f"* `{skills.qualified(name)}`: {why}" for name, why in names.items())
+    more = f"\nWhen the task needs them: {others}." if others else ""
+    return f"""
+# Skills
+kernel-agent's know-how is in skills: the Skill tool loads one by name (`kernel-agent:<name>`),
+and the files its `SKILL.md` links are in `{skills.SKILLS_DIR}/<name>/` (Read them when it
+points to them). Load these before you start:
+{listed}{more}
+Every other skill is listed with the Skill tool: load one whenever the task touches its topic.
+"""
+
+
+#: Why a role loads a skill first (``(role, skill)``, else ``skill``): the ``# Skills`` lines.
+_WHY: dict[str | tuple[str, str], str] = {
+    "optimisation-playbook": "the methodology: diagnose the regime, the engineering loop, "
+    "host overhead per backend",
+    ("planner", "optimisation-playbook"): "the regimes and what wins in each; read its "
+    "`model-families.md` for this model's family and `model-transforms.md` before you "
+    "propose transforms",
+    ("systems", "optimisation-playbook"): "the regimes; its `model-transforms.md` lists the "
+    "algorithm-level changes",
+    "profiling-and-roofline": "how to read the profile above: kernel view, timeline, phase "
+    "split, host synchronisation, the *Ceilings* table and its floors",
+    "precision-tiers": "the precision classes, tiers, formats and scales",
+    ("planner", "precision-tiers"): "the precision classes and their tiers; each precision "
+    "has a skill of its own (`fp8-weights`, `fp8-w8a8`, `mxfp8`, `fp8-kv-cache`, "
+    "`fp4-weights`)",
+    "systems-patterns": "host synchronisation (async flag reads, constants built once, "
+    "pinned copies, static shapes), a post stage on a side stream, serving, loading run files",
+    "speculative-decoding": "exact data-dependent speedups and how the diverse input set "
+    "times them",
+}
+
+
+def _role_skills(
+    role: str,
+    others: str,
+    *,
+    backends: Iterable[str] = (),
+    precision: str | None = None,
+    quality: str = "exact",
+) -> str:
+    """The ``# Skills`` section of a role's prompt: :func:`skills.for_role` with a reason
+    each (a backend's guide, the precision's guide, else :data:`_WHY`)."""
+    of_backend: dict[str, list[str]] = {}
+    for backend in backends:
+        if backend in BACKEND_GUIDES:
+            of_backend.setdefault(BACKEND_GUIDES[backend], []).append(f"`{backend}`")
+    own = PRECISION_SKILLS.get(precision) if precision is not None else None
+    load = []
+    for qualified in skills.for_role(role, backends=backends, precision=precision, quality=quality):
+        name = qualified.split(":", 1)[1]
+        if name in of_backend:
+            why = f"the guide of the {' and '.join(of_backend[name])} backend (before its code)"
+        elif name == own and name != "precision-tiers":
+            why = f"the `{precision}` guide: contract details, measured numbers, pitfalls"
+        else:
+            why = _WHY.get((role, name)) or _WHY[name]
+        load.append((name, why))
+    return skills_note(load, others)
+
+
+def _target_skills(target: dict[str, Any], precision: str | None) -> str:
+    """The skills a target's engineer loads first, for the research and dossier prompts
+    (``kernel-agent:<name>``, comma-separated)."""
+    names = skills.for_role("kernel", backends=target.get("backends", []), precision=precision)
+    return ", ".join(f"`{n}`" for n in names)
+
+
+def _engineer_skills(backends: list[str], precision: str | None) -> str:
+    """The skills of a kernel engineer: the methodology, a skill per backend, the precision's."""
+    return _role_skills(
+        "kernel",
+        "`profiling-and-roofline` (reading `profile=true` and Nsight Compute results), "
+        "`correctness-and-anti-gaming` (what the evaluator rejects), `gpu-architectures`, "
+        "`cuda-graphs-streams-pdl`, `documentation-sources`",
+        backends=backends,
+        precision=precision,
+    )
 
 
 def _env_block(python: str, toolchain_summary: str) -> str:
@@ -72,8 +164,8 @@ def _env_block(python: str, toolchain_summary: str) -> str:
 
 
 def _gpu_block(toolchain_summary: str) -> str:
-    """This GPU's facts and its architecture's section of ``knowledge/gpus.md`` (issue #165;
-    "" when the summary names no GPU)."""
+    """This GPU's facts and its architecture's section of the ``gpu-architectures`` skill
+    (issue #165; "" when the summary names no GPU)."""
     from kernel_agent.gpu_arch import prompt_section
 
     section = prompt_section(toolchain_summary)
@@ -515,10 +607,7 @@ model. Specialist agents will then write custom kernels for each target you pick
 ```
 {headroom_note(baseline)}
 {profile_summary}
-
-# Optimisation playbook
-{knowledge("playbook.md")}
-
+{_planner_skills(quality)}
 # Your job
 1. Inspect the source of the hottest module classes (use Read/Grep on the files
    referenced by `{Path("profile/profile.json")}` → `classes[].source_file`).
@@ -590,6 +679,18 @@ model. Specialist agents will then write custom kernels for each target you pick
 Return the plan as structured output.
 
 {_env_block(python, toolchain)}"""
+
+
+def _planner_skills(quality: str) -> str:
+    """The planner's skills: the playbook (its model-family and transform files), reading
+    the profile, and in a run that allows reduced precision the precision classes."""
+    return _role_skills(
+        "planner",
+        "the backend skills (`triton-kernels`, `cuda-kernels`, `cute-dsl`, "
+        "`tilelang-kernels`) to judge an approach, `gpu-architectures`, `systems-patterns`, "
+        "`speculative-decoding`, `native-engines`",
+        quality=quality,
+    )
 
 
 def _backend_class_block(
@@ -771,8 +872,8 @@ def _precision_block(
 * activations stay bf16 (never quantise them), accumulate in fp32, apply the
   scale (and bias) once per output in the epilogue, round to bf16 once;
 * verified examples: `cuda_fp8_gemv.py` (decode GEMV, M <= 4),
-  `cuda_fp8_skinny_gemm.py` (bf16 tensor cores, M <= 32); guide: "Low-precision
-  weights" below;
+  `cuda_fp8_skinny_gemm.py` (bf16 tensor cores, M <= 32); guide: skill
+  `kernel-agent:fp8-weights`;
 * report the numerical error in `NOTES.md`: `fp8_error(weight, q, scale)` of the
   weights and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     elif precision == "fp4_weights":
@@ -785,8 +886,8 @@ def _precision_block(
 * activations stay bf16 (never quantise them: that is W4A4), accumulate in fp32:
   scale each block's partial sum by its block scale (or dequantise in registers),
   the tensor scale and bias once per output in the epilogue, round to bf16 once;
-* verified example: `cuda_fp4_gemv.py` (decode GEMV, M <= 4); guide:
-  "Low-precision weights" below;
+* verified example: `cuda_fp4_gemv.py` (decode GEMV, M <= 4); guide: skill
+  `kernel-agent:fp4-weights`;
 * report the numerical error in `NOTES.md`: `fp4_error(weight, codes, scales,
   tensor_scale)` of the weights and the evaluator's per-case `min_cosine` /
   `max_rel_l2`. FP4 moves outputs ~4x more than FP8: the perceptual gate decides."""
@@ -803,7 +904,7 @@ def _precision_block(
   softmax / attention math and residual adds stay in bf16 / fp32 as in eager;
 * verified example: `triton_fp8_w8a8_gemm.py` (Triton e4m3 GEMM with per-shape
   tiles, M = 352); fallback and reference: `fp8_w8a8_linear` (`torch._scaled_mm`);
-  guide: "FP8 W8A8" in "Low-precision weights" below; FP8 toolkit examples:
+  guide: skill `kernel-agent:fp8-w8a8`; FP8 toolkit examples:
   `cuda_cublaslt_fp8.py` (cuBLASLt FP8 GEMMs with cached plans: ~6 us of host time
   per GEMM instead of ~19 for `_scaled_mm`), `triton_fp8_producers.py` (RMSNorm /
   `silu(gate) * up` writing e4m3 + scales in their epilogue);
@@ -832,8 +933,8 @@ def _precision_block(
 * GEMMs with N <= ~1024 at a few hundred rows: tensor-wise FP8 with batched split-K
   (the `fp8_w8a8` numerics, same tier) beats cuBLASLt's single MXFP8 algorithm there;
 * verified-style example: `triton_mxfp8_gemm.py` (ceil-rule quantiser writing swizzled
-  scales + `F.scaled_mm`); reference: `mxfp8_linear`; guide: "MXFP8 W8A8" in
-  "Low-precision weights" below;
+  scales + `F.scaled_mm`); reference: `mxfp8_linear`; guide: skill
+  `kernel-agent:mxfp8`;
 * report the numerical error in `NOTES.md`: `mxfp8_error(weight, q, scales, x)` on
   captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     elif precision == "fp8_kv":
@@ -900,12 +1001,7 @@ def engineer_prompt(
     class_stats: dict[str, Any] | None,
     precisions: Iterable[str] | None = None,
 ) -> str:
-    guides = []
-    for b in dict.fromkeys(BACKEND_GUIDES[b] for b in backends if b in BACKEND_GUIDES):
-        guides.append(knowledge(b))
     precision = reduced_precision(target, capture_info)
-    if precision is not None:
-        guides.append(knowledge("low_precision.md"))
     tier = capture_info.get("tier")  # the capture's tolerance tier (near-lossless, relaxed)
     backend_list = "\n".join(
         f"  {i + 1}. `{b}` — {BACKEND_NAMES.get(b, b)}" for i, b in enumerate(backends)
@@ -1033,16 +1129,19 @@ the kernel does all the work the reference does.
 The orchestrator always keeps the best correct snapshot.
 
 {COMMON_RULES}
-
-# Methodology
-{knowledge("playbook.md")}
-
-# Backend guides
-{"\n\n".join(guides)}
-
+{_engineer_skills(backends, precision)}
 {_env_block(python, toolchain)}
 
 Finish with a short summary: best candidate, speedup per case, what limited it."""
+
+
+def _systems_skills() -> str:
+    """The systems agent's skills."""
+    return _role_skills(
+        "systems",
+        "`cuda-graphs-streams-pdl` (graphs, side streams, PDL), the precision skills "
+        "(`precision-tiers` first), `correctness-and-anti-gaming`, `profiling-and-roofline`",
+    )
 
 
 def systems_prompt(
@@ -1127,8 +1226,7 @@ every attribute, module, `.data` binding and torch flag it changed. Change
 weights by rebinding (`param.data = new`), not in place (`param.mul_()`), or
 the transform falls back to slower separate-process measurements; a transform
 that cannot be undone that way sets `undo = False` or defines `undo(workload)`.
-
-{knowledge("systems.md")}
+{_systems_skills()}
 # Tools
 * `evaluate_e2e(transforms=["transforms/<id>.py"], kernels=[], hypothesis="...")` loads
   the full model in a fresh process, applies the transforms, runs the workload,
@@ -1169,10 +1267,13 @@ Baseline: {baseline.get("median_ms", 0):.1f} ms {objective.of(baseline).per} \
 {profile_summary}
 
 # Read first
-`{KNOWLEDGE_DIR / "native.md"}`: the native-engine contract (scopes, the staged plan, the
-interface to the PyTorch model, correctness, integration, timing) and the project layout.
-The template project `{EXAMPLES_DIR / "native_project"}` builds and passes the evaluator:
-copy it to start a project.
+The skill `{skills.qualified("native-engines")}` (Skill tool; files in
+`{skills.get("native-engines").dir}`): the native-engine contract (scopes, the staged plan,
+the interface to the PyTorch model, correctness, integration) and in its `projects.md` the
+project layout and timing. For the kernels: `kernel-agent:cuda-kernels`,
+`kernel-agent:cute-dsl`, `kernel-agent:cuda-graphs-streams-pdl` (PDL, cooperative grids,
+streams). The template project `{EXAMPLES_DIR / "native_project"}` builds and passes the
+evaluator: copy it to start a project.
 
 # Building blocks (verified kernels: reuse their device code, do not start from zero)
 {blocks_text}
@@ -1240,10 +1341,10 @@ def research_prompt(
         for c in capture_info.get("cases", [])
     )
     precision = ""
-    if reduced := reduced_precision(target, capture_info):  # knowledge/low_precision.md
+    if reduced := reduced_precision(target, capture_info):  # the precision skills
         precision = (
-            f"* precision: `{reduced}` ({capture_info.get('tier')} tolerance tier; "
-            "low_precision.md): "
+            f"* precision: `{reduced}` ({capture_info.get('tier')} tolerance tier; skill "
+            f"`{skills.qualified(PRECISION_SKILLS.get(reduced, 'precision-tiers'))}`): "
             f"{target.get('precision_why', '')}\n"
         )
     return f"""You are a senior GPU performance researcher, brought in with a clean context.
@@ -1272,8 +1373,9 @@ evaluation: per-case times, errors, `sol_ms`, `pct_of_sol`, `bound`), `history/`
 `candidates/`, the previous `plan.md` if there is one, and `research.md` (the
 target's research dossier: findings from the documentation, with sources) if there is one.
 `best_result(target_id="{target["id"]}")` returns the per-idea aggregates.
-Backend guides and the methodology: `{KNOWLEDGE_DIR}`; verified examples:
-`{EXAMPLES_DIR}`.
+The engineer's skills (load one with the Skill tool when the diagnosis needs what it told
+the engineer): {_target_skills(target, reduced)}; `kernel-agent:profiling-and-roofline`
+explains the numbers of the records. Verified examples: `{EXAMPLES_DIR}`.
 
 # Diagnose: pathology checklist
 Go through every item, say whether it applies and cite `exp` numbers:
@@ -1585,8 +1687,9 @@ def web_note(agent: str, hosts: list[str]) -> str:
     return f"""
 
 # Documentation (WebFetch / WebSearch)
-{when}* Where: `{SOURCES}` lists what to read per topic, one line per source. Local
-  reference code comes first (Grep / Read it, no fetch):
+{when}* Where: `{SOURCES}` (the skill `kernel-agent:documentation-sources`) lists what to
+  read per topic, one line per source. Local reference code comes first (Grep / Read it,
+  no fetch):
 {local}
 * WebFetch reaches only these hosts and their subdomains: {", ".join(hosts)}. Prefer
   official documentation and reference code (library examples, production kernels) over
@@ -1643,7 +1746,8 @@ def dossier_prompt(
     precision = ""
     if reduced := reduced_precision(target, capture_info):
         why = target.get("precision_why", "")
-        precision = f"* precision: `{reduced}` (low_precision.md): {why}\n"
+        guide = skills.qualified(PRECISION_SKILLS.get(reduced, "precision-tiers"))
+        precision = f"* precision: `{reduced}` (skill `{guide}`): {why}\n"
     earlier = ""
     if target.get("pivot_of"):
         earlier = (
@@ -1665,23 +1769,23 @@ kernel code. This is a cheap step before the real work, not a survey.
 {_workload_block(capture_info)}
 # Read first
 `reference_source.py` (the module's code) and `spec.json` in your working directory. The
-engineer already gets the methodology and the backend guides in `{KNOWLEDGE_DIR}` and the
-verified examples in `{EXAMPLES_DIR}` in its prompt: skim the guides of this target's
-backends (and `low_precision.md` for a reduced precision) so that you know what they say,
-and do not copy them into the dossier. The dossier is for what they do not say.
+engineer loads kernel-agent's skills ({_target_skills(target, reduced)}) and gets
+the verified examples in `{EXAMPLES_DIR}`: skim those skills (the Skill tool) so that you
+know what they say, and do not copy them into the dossier. The dossier is for what they do
+not say.
 {earlier}
 # Look up
 1. From the module, its shapes, the bound in *why it matters* and the precision, pick the
    2-4 questions whose answers would most change what the engineer does and that the
-   guides leave open: the fastest known design for this op at this bound (a reference
+   skills leave open: the fastest known design for this op at this bound (a reference
    implementation), the exact API, instruction or library path it needs on this GPU, the
    accuracy or layout facts of the format.
 2. Answer each from the doc library first (`doc_search` / `doc_read`: the installed
    versions' APIs, the PTX ISA, the CUDA guide, cuBLASLt, CUTLASS), then for what it lacks
-   with a lookup in the sources of `sources.md`: local reference code (Grep / Read) or one
+   with a lookup in the sources of `{SOURCES}`: local reference code (Grep / Read) or one
    WebFetch with a precise question; WebSearch only when no listed source covers it. At
    least one answer comes from the documentation (the doc library or a WebFetch of
-   official documentation or reference code): the knowledge files are not a lookup.
+   official documentation or reference code): the skills are not a lookup.
 3. Record only what you read, with its source. Never guess a URL or a number.
 
 # Write `{dossier}`

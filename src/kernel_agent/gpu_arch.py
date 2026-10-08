@@ -4,7 +4,7 @@ kernel-agent runs on any NVIDIA GPU torch supports. What differs per architectur
 decided here from the detected compute capability (:class:`kernel_agent.toolchain.GPUInfo`)
 and the peaks measured on the GPU (:mod:`kernel_agent.kernels.roofline`,
 :mod:`kernel_agent.kernels.mma_peaks`), never from the GPU the toolkit was developed on (an
-RTX 5070 Ti, sm_120: its measurements stay in the knowledge files as labelled evidence).
+RTX 5070 Ti, sm_120: its measurements stay in the skills as labelled evidence).
 
 * :func:`family`: the architecture family of a capability (:data:`FAMILIES`): its tensor-core
   instructions, the one a compute-bound kernel needs for the full rate, async copies,
@@ -19,7 +19,7 @@ RTX 5070 Ti, sm_120: its measurements stay in the knowledge files as labelled ev
 * :func:`summary_lines` (in :meth:`Toolchain.summary <kernel_agent.toolchain.Toolchain.summary>`,
   so in ``doctor`` and every prompt's toolchain block): the family, what runs at full rate,
   the precisions this GPU cannot run and the bf16 ridge from the measured peaks;
-  :func:`prompt_section`: those facts and this family's section of ``knowledge/gpus.md``.
+  :func:`prompt_section`: those facts and this family's section of ``gpu-architectures/gpus.md``.
 * :func:`from_summary`: the GPU, its capability and its measured instruction rates read
   back from a toolchain summary (the prompts receive the summary text).
 """
@@ -33,14 +33,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-KNOWLEDGE = Path(__file__).parent / "agent" / "knowledge" / "gpus.md"
+#: Every family's section (the ``gpu-architectures`` skill, issue #176).
+KNOWLEDGE = Path(__file__).parent / "agent" / "plugin" / "skills" / "gpu-architectures" / "gpus.md"
 
 
 @dataclass(frozen=True)
 class Family:
     """One architecture family (a row of :data:`FAMILIES`)."""
 
-    key: str  # knowledge/gpus.md section, backends.ARCH_POLICY key
+    key: str  # gpu-architectures/gpus.md section, backends.ARCH_POLICY key
     name: str
     archs: str  # its compute capabilities
     gpus: str  # examples
@@ -469,7 +470,7 @@ def summary_lines(gpu: Any, peaks: Mapping[str, Any] | None) -> list[str]:
 
 
 def knowledge_section(key: str | None, text: str | None = None) -> str:
-    """The section of ``knowledge/gpus.md`` whose heading carries ``[key]`` ("" without)."""
+    """The section of ``gpu-architectures/gpus.md`` whose heading carries ``[key]`` ("" without)."""
     if not key:
         return ""
     if text is None:
@@ -488,7 +489,7 @@ def knowledge_section(key: str | None, text: str | None = None) -> str:
 def prompt_section(toolchain_summary: str | None) -> str:
     """The ``# This GPU`` section of an agent prompt: what the toolchain summary's GPU is,
     that numbers measured on another GPU are evidence from it, and this family's section
-    of ``knowledge/gpus.md`` ("" when the summary names no GPU)."""
+    of ``gpu-architectures/gpus.md`` ("" when the summary names no GPU)."""
     facts = from_summary(toolchain_summary)
     fam = facts.family
     if fam is None:
@@ -497,9 +498,10 @@ def prompt_section(toolchain_summary: str | None) -> str:
         f"# This GPU: {facts.label}",
         "Decide with this GPU's facts: the toolchain block (SMs, shared memory per block, L2, "
         "measured peaks and instruction rates, the precisions it cannot run) and the section "
-        "below. Numbers the guides give for another GPU (most were measured on an RTX 5070 "
+        "below. Numbers the skills give for another GPU (most were measured on an RTX 5070 "
         "Ti, sm_120) are evidence from that GPU: measure here before relying on them. Every "
-        f"family, with its sources: `{KNOWLEDGE}`.",
+        "family, with its sources: the skill `kernel-agent:gpu-architectures` "
+        f"(`{KNOWLEDGE}`).",
     ]
     if section := knowledge_section(fam.key):
         lines += ["", section]

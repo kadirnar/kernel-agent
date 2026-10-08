@@ -1,3 +1,8 @@
+---
+name: native-engines
+description: Contract for native engines — scopes (stage, group, loop) and patterns, the staged plan and its bar, the interface to the PyTorch model, correctness, integration, the project layout, build and timing. Use when rewriting part of the inference path as a native CUDA / CuTe engine.
+---
+
 # Native engines: contract for the systems-native agent
 
 Module kernels stop paying where the remaining time sits *between* modules: an iterative
@@ -6,6 +11,8 @@ made of many short launches and grid syncs, glue kernels between stages, host ro
 inside a loop. A native engine rewrites such a part of the inference path as native CUDA
 C++ / CuTe code, keeps the weights streaming, fuses across module boundaries and runs the
 part in one persistent kernel or a few launches.
+
+Project layout, building and timing: [projects.md](projects.md).
 
 ## Scopes (what you may replace)
 
@@ -92,43 +99,14 @@ export copies what an accepted item loads through `artifacts` (or names in a str
 literal) into `optimized/`, and its self-test applies the package in a fresh process that
 cannot read the run directory.
 
-## Projects
-
-```
-<stage id>/
-  kernel_project.toml     [project] name, entry, kind; [build] backend, sources, flags
-  candidate.py            build(reference) (kind = "kernel") / apply(workload) ("transform")
-  include/*.cuh           device helpers shared by the .cu files
-  csrc/*.cu csrc/binding.cpp
-```
-
-* `project.load(__file__)` (`from kernel_agent.native import project`) compiles the
-  project once per content digest and toolchain (`~/.cache/kernel-agent/native/`) and
-  returns it; its attributes are the functions `binding.cpp` binds.
-* kernel-agent's toolkit headers are on every build's include path:
-  `#include "ka_launch.cuh"` for PDL and cooperative launches (`ka_launch`,
-  `ka_pdl_wait`, `ka_pdl_launch_dependents`, `ka_coresident_blocks`; see `cuda.md`).
-* `python -m kernel_agent.native.project check <dir>` validates the manifest and files;
-  `... build <dir>` compiles on the CPU (no GPU, no evaluation used): fix compiler errors
-  there. The tools also compile a project before its evaluation, outside the GPU lock.
-* `backend = "command"` runs your own build (`command = ["bash", "{src}/build.sh"]`,
-  CMake, make) and loads `outputs` (`load = "torch_ops"` for `TORCH_LIBRARY` libraries,
-  `"python"` for extension modules, `"none"` for ctypes).
-* Text files only (sources, headers, scripts), at most 200 files / 4 MB; `build/` and
-  hidden directories are not part of the project.
-* Evaluations snapshot the project's **bundle**: one `.py` file holding every file and the
-  project's sha256, which the evaluator, the sweep (`build(reference, **config)` keyword
-  arguments), memcheck, the integration and the export use like any candidate file.
-
-## Timing
-
-Stage targets are timed per captured case against the reference stage (CUDA events, full
-clocks, interleaved rounds), end-to-end runs as the median of the workload's runs after a
-warm-up (compile and capture time excluded). Inside CUDA graphs host overhead does not
-count; a persistent engine is still judged by the whole stage's GPU time.
-
 ## Rules
 
 * No work on hidden streams or threads (the evaluator checks it): join every side stream.
 * No caching of outputs across calls, no skipped work, no reading of unused cache slots.
 * Fallbacks only for shapes you do not support, never for the captured dominant case.
+
+## Examples and sources
+
+* Examples: `examples/native_project`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Sources: the `documentation-sources` skill's `sources.md`, sections "CUDA C++ and PTX"; "CUTLASS / CuTe".
+* Related skills: `cuda-kernels`, `cute-dsl`, `cuda-graphs-streams-pdl`, `systems-patterns`; design document `docs/NATIVE.md` in the repository.

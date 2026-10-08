@@ -4,7 +4,7 @@ and §4.3).
 ``kernel[grid](*args, **meta)`` runs Triton's JIT launcher on every call: it binds the
 arguments to the signature, computes the specialisation key, looks the compiled kernel up
 and checks the globals it captured, then launches. That is tens of microseconds of host
-time per launch (``knowledge/playbook.md``: ~43 us per Triton launch vs ~19 us for one
+time per launch (skill ``optimisation-playbook``: ~43 us per Triton launch vs ~19 us for one
 ``load_inline`` entry), so when the module evaluator times eager calls a candidate with
 several Triton launches per call is host bound: a fused decoder layer of cuBLAS GEMMs +
 5 Triton glue kernels measured 2.21x with ~216 us of host time vs ~167 us of GPU time per

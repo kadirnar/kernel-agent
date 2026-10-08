@@ -225,7 +225,7 @@ def test_fp4_policy_planner_orchestrator_and_engineer_prompt():
         "fp4_error",
         "one e4m3 scale per 16",
         "cuda_fp4_gemv.py",
-        "# Low-precision weights",
+        "`kernel-agent:fp4-weights`",  # the skill to load (#176)
     ):
         assert needle in text, needle
     fp8 = prompts.engineer_prompt(

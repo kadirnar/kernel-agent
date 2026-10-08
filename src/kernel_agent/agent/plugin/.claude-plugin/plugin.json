@@ -1,0 +1,7 @@
+{
+  "name": "kernel-agent",
+  "description": "kernel-agent's know-how as Agent Skills: optimisation methodology, profiling and roofline reading, backends (Triton, CUDA C++, CuTe DSL, TileLang), streams / PDL, precision classes (FP8, MXFP8, FP4, FP8 KV), GPU architectures, systems patterns, native engines, documentation sources and the evaluator's correctness rules.",
+  "version": "0.1.0",
+  "author": {"name": "kadirnar"},
+  "license": "Apache-2.0"
+}

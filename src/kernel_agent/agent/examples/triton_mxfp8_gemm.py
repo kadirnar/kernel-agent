@@ -2,7 +2,7 @@
 the block-scaled tensor cores (sm_100 / sm_120), for compute-bound GEMMs with wide outputs.
 
 Reduced precision: only for a target whose spec says ``"precision": "fp8_mx"`` (a
-``--quality near-lossless`` run, knowledge/low_precision.md "MXFP8 W8A8"); the exact tier
+``--quality near-lossless`` run, skill mxfp8); the exact tier
 rejects it. Written for issue #144 from the measurements of docs/FP8.md (RTX 5070 Ti,
 torch 2.14, cuBLASLt 13.1) and NOT run on a GPU when written: verify with
 ``kernel-agent doctor --smoke`` (selftest ``MX_EXAMPLES``) or ``pytest -m gpu

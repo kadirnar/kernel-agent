@@ -743,8 +743,8 @@ mode:
   bf16 activations, fp32 accumulation, scale and bias in the epilogue, and
   report the numerical error (`kernel_agent.kernels.quant.fp8_error` for the
   weights; the evaluator adds `max_rel_l2` per case in the near-lossless tier).
-  It gets `knowledge/low_precision.md` (formats, scales, dequantisation in
-  registers, outliers, what sm_120 supports, when FP4 is worth it) and two
+  It gets the skills `precision-tiers` and `fp8-weights` (formats, scales,
+  dequantisation in registers, outliers, what sm_120 supports) and two
   verified examples: `examples/cuda_fp8_gemv.py` (decode GEMV, M <= 4) and
   `examples/cuda_fp8_skinny_gemm.py` (M <= 32, bf16 `mma.sync` fed with
   e4m3 codes upcast in registers). Both pass the evaluator in the
@@ -858,7 +858,7 @@ LocDiT GEMMs (M = 352) took the run from 11.36 to 8.73 ms per audio second
 * **Planner.** In a near-lossless run the policy sends compute-bound GEMMs
   (~64+ rows per call on large weights) to `fp8_w8a8`, with a `precision_why`
   that names the FLOP-bound number; few rows per call stay `fp8_weights`.
-* **Contract** (engineer prompt, `knowledge/low_precision.md` → "FP8 W8A8"):
+* **Contract** (engineer prompt, skill `fp8-w8a8`):
   weights quantised once in `build()` (e4m3, one scale per output channel),
   activations per token on every call (`amax / 448`, dynamic; never a static
   or per-tensor scale), e4m3 x e4m3 with fp32 accumulation, both scales and the
@@ -927,7 +927,7 @@ in near-lossless runs, like `fp8_w8a8`), in the same near-lossless tier:
   with batched split-K (one MXFP8 algorithm, no split-K): such GEMMs run tensor-wise
   inside an `fp8_mx` target, or the target is `fp8_w8a8`. FP8 activation scales stay
   dynamic; a static (calibrated) one only when the redrawn-input check passes.
-* **Contract** (`knowledge/low_precision.md` → "MXFP8 W8A8"): weights once in
+* **Contract** (engineer prompt, skill `mxfp8`): weights once in
   `build()` (`quant.quantize_mxfp8`, scales swizzled once into cuBLASLt's 128 x 4
   layout, `quant.swizzle_mx_scales`), activations per block of 32 on every call
   with the scale `2^ceil(log2(amax / 448))`, the GEMM through `F.scaled_mm`
@@ -1597,7 +1597,7 @@ needs count too):
   `e2e_ab`, `analyze`) record each lookup in `logs/artifacts.jsonl` with the
   calling file's sha256, so a name computed at run time is copied too. The
   systems and native agents are told to load run files this way
-  (`knowledge/systems.md`, `knowledge/native.md`).
+  (skills `systems-patterns`, `native-engines`).
 
 Then the integration **self-tests** the package: a copy of `optimized/` in a new
 temporary directory is imported (its `apply.py`) and applied to the workload in a
@@ -1788,7 +1788,7 @@ pageable host-to-device copy, a tensor built on the host for the device, or a
 data-dependent output size. `profile/summary.md` gets a *Host synchronisation
 (transform opportunities)* table with the fix for each kind (async flag read,
 build the constant once, pinned non-blocking copy, static shapes), so the
-planner and the systems agent see them (`agent/knowledge/systems.md` describes
+planner and the systems agent see them (the `systems-patterns` skill describes
 the patterns). A CUDA-graph replay makes no Python calls, so what it captured
 is not listed; a `torch.compile`d region may trace or graph-break around the
 mode. If the scanned run fails under the mode, the summary says so and keeps
@@ -2393,10 +2393,11 @@ round's work.
 Every agent session has `WebFetch` and `WebSearch` unless `--no-web`. In four
 VoxCPM2 runs (~110 sessions) no agent used them: no prompt said when to look
 something up or where, so the engineers found API facts by trial and error
-(issue #125). Now (`kernel_agent/agent/web.py`, `prompts.web_note`,
-`knowledge/sources.md`):
+(issue #125). Now (`kernel_agent/agent/web.py`, `prompts.web_note`, the
+`documentation-sources` skill):
 
-* **Sources.** `src/kernel_agent/agent/knowledge/sources.md` lists 56 checked
+* **Sources.** `src/kernel_agent/agent/plugin/skills/documentation-sources/sources.md`
+  lists 56 checked
   URLs, one line each with what it answers: CUDA Programming Guide pages, PTX
   ISA, cuBLASLt samples (FP8, MXFP8, NVFP4), CUTLASS sm_120 examples and CuTe
   DSL kernels, the Triton reference and tutorials (block-scaled matmul),
@@ -2535,6 +2536,77 @@ issue #177), with or without `--no-web`:
   the installed shelves if needed) and what is missing; `kernel-agent docs
   search "tl.dot_scaled" --library triton` and `docs read <id>` are the agents'
   tools on the command line.
+
+### Skills and agent definitions
+
+The agents' know-how and roles are packaged the way Claude Code and the Claude Agent
+SDK expect (#176), so a session loads what its task needs instead of carrying every
+guide in its prompt (`kernel_agent/skills.py`, `kernel_agent/roles.py`):
+
+* **Skills** (`src/kernel_agent/agent/plugin/skills/<name>/`: a `SKILL.md` with
+  `name` and `description` frontmatter, and the files it links). They replaced
+  `agent/knowledge/*.md` section by section: methodology and numbers
+  (`optimisation-playbook`, `profiling-and-roofline`, `correctness-and-anti-gaming`),
+  backends (`triton-kernels`, `cuda-kernels`, `cute-dsl`, `tilelang-kernels`,
+  `cuda-graphs-streams-pdl`), precisions (`precision-tiers`, `fp8-weights`, `fp8-w8a8`,
+  `mxfp8`, `fp8-kv-cache`, `fp4-weights`), systems (`systems-patterns`,
+  `speculative-decoding`, `native-engines`) and reference (`gpu-architectures`,
+  `documentation-sources`). A session's context holds each skill's name and one-line
+  description; the Skill tool loads a `SKILL.md` (with its directory) when the task
+  needs it, and the long material sits in the files it links (sm_120 measurements, FP8
+  GEMM paths and scaling recipes, the GPU families, the list of sources). Each skill
+  names its examples and sources. 189 of the 202 paragraphs of the former files moved
+  verbatim; the other 13 changed only where they pointed to another file ("see
+  `cuda.md`" became the skill's name). `prompts.knowledge(<former file>)` still returns
+  that file's text from the skills it moved to.
+* **Prompts name skills.** The engineer prompt lists the playbook, the skill of each of
+  its backends and of its precision under `# Skills` instead of inlining them; the
+  planner gets the playbook (its `model-families.md`, `model-transforms.md`),
+  `profiling-and-roofline` and, when reduced precision is allowed, `precision-tiers`; the
+  systems agent `systems-patterns`, `speculative-decoding` and the playbook; the native,
+  research and dossier prompts name the skills of their target. The system prompt of a
+  kernel session on the VoxCPM2 LocDiT layer (triton + cuda) went from 13.0k to 5.8k
+  tokens (exact) and from 24.3k to 6.7k (`fp8_w8a8`); its whole first request from 32.1k
+  to 25.1k and from 43.4k to 26.1k, 29.9k and 34.0k with every skill it names loaded.
+  Planner and systems requests shrink by 5 %, native grows by 2 %; research and dossier
+  sessions, which had no Skill tool, grow by the skill listing (and research by its
+  helpers): +3.7k and +2.1k tokens, while the guides they skim on demand shrank from
+  62.5k characters (`triton.md`, `cuda.md`, `low_precision.md`) to 26.5k (the four skills
+  of a triton + cuda `fp8_w8a8` target). Measured with `system_append` and the request
+  Claude Code sends to a local fake API; tokens ≈ characters / 4.
+* **Agent definitions** (`src/kernel_agent/agent/agents/<name>.md`, Claude Code subagent
+  files): the roles `planner`, `kernel-engineer`, `systems-engineer`, `native-engineer`,
+  `researcher`, `dossier-researcher`, `refactor-engineer`, `harness-author`, `librarian`,
+  and three helpers: `doc-lookup` (one documentation question, answered from the doc library
+  (`doc_search` / `doc_read`), local reference code and the web with cited
+  sources), `profile-analyst` (profiles and result histories too long for the caller's
+  context) and `reviewer` (a critic: a candidate against the evaluator's rules and its
+  reference, before an evaluation is spent). `runner.run_agent` looks up a session's
+  role (`kernel-mlp` → `kernel-engineer`) and passes the helpers its definition lists
+  (`Agent(...)` in its tools) to the SDK as agent definitions: kernel, systems and
+  native sessions may delegate to all three, the planner and research sessions to
+  `doc-lookup` and `profile-analyst`. Helpers inherit the session's model, have
+  read-only tools (no web tools with `--no-web`), preload their skills and run under the
+  session's hooks (write guard, Claude files guard, WebFetch allowlist). A session that
+  ends a turn while a background helper still runs gets a second result; the runner
+  keeps the first one's structured output. `roles.agent_definition(name)` is any role's SDK
+  definition, for a coordinator to start roles uniformly (#174). A pipeline session's own
+  system prompt still comes from `prompts.py`; a definition's body is the role's prompt
+  when it runs as a subagent.
+* **Isolation (#126).** Sessions keep `setting_sources=[]`, load kernel-agent's plugin by
+  explicit path (`plugins=`) and enable exactly its skills (`skills=`; plus Claude Code's
+  own `workflow-authoring`, the reference of its Workflow tool, which Claude Code would
+  otherwise inline into that tool's description, +17k characters per request): no user,
+  project or other bundled skill, no `CLAUDE.md` or `AGENTS.md`. `tests/test_skills.py`
+  runs the bundled Claude Code CLI against a local fake Messages API with a user skill,
+  user and repository `CLAUDE.md`, an `AGENTS.md` and a project skill around the run:
+  none of them reaches the request, the listing has every kernel-agent skill and helper,
+  and a Skill call returns the `SKILL.md`. The same file validates the tree (frontmatter
+  as plain YAML, every link, every example name, every file linked from its `SKILL.md`,
+  every former section heading present).
+* **For contributors**: [AGENTS.md](AGENTS.md) (and a short `CLAUDE.md` pointing to it).
+  **For Claude Code users**: `kernel-agent install-claude-code` ("Using it interactively
+  from Claude Code").
 
 ### kernel-agent improve: the continuous loop
 
@@ -3045,7 +3117,8 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   their evidence, labelled as measured on the RTX 5070 Ti. The ceilings table's *FP8
   MMA* column appears only where two FP8 `mma.sync` forms exist (sm_12x); the
   `mma.sync` e4m3 rates are not measured on sm_90 / sm_100, where they are emulated.
-* **Knowledge per GPU.** `knowledge/gpus.md` has one section per family (what is fast,
+* **Knowledge per GPU.** The `gpu-architectures` skill's `gpus.md` has one section per
+  family (what is fast,
   what to avoid, shared memory, FP8 accumulation, sources: CUDA Programming Guide, PTX
   ISA target notes, tuning guides, cuBLAS scale modes, Triton's lowering, CUTLASS,
   papers); every prompt gets its GPU's section under "# This GPU", with the note that
@@ -3256,10 +3329,11 @@ kernel-agent library import-memory ~/.claude/projects/<project>/memory \
 | `triton` | Triton | ~43 µs |
 
 There are verified example kernels for every backend in
-`src/kernel_agent/agent/examples/`, and backend guides plus an optimisation
-playbook in `src/kernel_agent/agent/knowledge/`. Both are fed to the agents.
+`src/kernel_agent/agent/examples/`, and a skill per backend plus an optimisation
+playbook in `src/kernel_agent/agent/plugin/skills/` ("Skills and agent
+definitions"); the prompts name the ones a session loads first.
 The FP8 weight-only examples (`cuda_fp8_gemv.py`, `cuda_fp8_skinny_gemm.py`)
-and `low_precision.md` go to the engineer of an `fp8_weights` target (see
+and the `fp8-weights` skill go to the engineer of an `fp8_weights` target (see
 "Low-precision weights"); `doctor --smoke` also runs them (sm_80+), in the
 near-lossless tier and against the exact tier, which must reject them. The FP4
 example (`cuda_fp4_gemv.py`) goes to an `fp4_weights` target; the smoke test
@@ -3270,7 +3344,7 @@ the exact tier. The MXFP8 example (`triton_mxfp8_gemm.py`) goes to an `fp8_mx`
 target; on sm_100+ the smoke test runs it like the W8A8 one, and its OCP floor
 scale-rule variant must fail the scale-rule guard.
 
-Triton toolkit (#148, `knowledge/triton.md`), for any model:
+Triton toolkit (#148, the `triton-kernels` skill), for any model:
 
 * **Cheap launches** for eager-timed targets: `kernels/triton_launch.py`
   (`CachedLaunch(kernel)[grid](...)`, used like `kernel[grid](...)`) keeps the
@@ -3323,7 +3397,7 @@ file CuTe DSL exports, keyed by source digest + arch + DSL version + options +
 the caller's specialisation key, so a later evaluation (a fresh process) loads
 it in ~0.04 s instead of compiling again (0.2-2 s per kernel; `meta.json` records
 the compile time; `KERNEL_AGENT_CUTE_CACHE` moves it, `off` disables it). Two
-FP8 examples go with `knowledge/cute_dsl.md`: `cute_fp8_blockscaled_gemm.py`
+FP8 examples go with the `cute-dsl` skill: `cute_fp8_blockscaled_gemm.py`
 (W8A8 `nn.Linear` on `MmaMXF8Op` with unit ue8m0 scales, persistent and
 warp-specialised: a TMA producer warp and two MMA warpgroups, the per-token ×
 per-channel scales, bias, residual and an optional e4m3 output fused into the
@@ -3891,10 +3965,16 @@ an LLM would score token-match rate and the perplexity delta on held-out text.
 
 ## Using it interactively from Claude Code
 
-`kernel-agent install-claude-code <project>` copies a `/optimize-model`
-slash command and a `kernel-engineer` subagent into `<project>/.claude/`. You
-can then drive the same tools (`kernel-agent analyze/eval/...`) from an
-interactive Claude Code session instead of the autonomous pipeline.
+`kernel-agent install-claude-code <project>` copies into `<project>/.claude/` the
+`/optimize-model` slash command, the agent definitions of every role and helper
+(`agents/`: `planner`, `kernel-engineer`, `systems-engineer`, `native-engineer`,
+`researcher`, `dossier-researcher`, `refactor-engineer`, `harness-author`,
+`librarian`, `reviewer`, `doc-lookup`, `profile-analyst`) and the skills
+(`skills/<name>/`, "Skills and agent definitions"). You can then drive the same
+tools (`kernel-agent analyze/eval/...`) from an interactive Claude Code session
+instead of the autonomous pipeline: `/optimize-model` hands the analysis to the
+`planner`, each target to a `kernel-engineer` and a candidate to the `reviewer`, and
+the subagents preload their skills.
 
 ## Authentication and safety
 
@@ -3959,7 +4039,9 @@ kernel-agent's prompts, `program.md` and the run directory, so it behaves the
 same on every machine (`kernel_agent/agent/runner.py`):
 
 * `setting_sources=[]`: no user or project `settings.json`, hooks, skills,
-  `~/.claude/CLAUDE.md` or project `CLAUDE.md` are loaded.
+  `~/.claude/CLAUDE.md`, project `CLAUDE.md` or `AGENTS.md` are loaded.
+* `plugins=` kernel-agent's own plugin by explicit path and `skills=` exactly its
+  skills (#176): no other plugin's, user's, project's or (but one) bundled skill.
 * `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`: no Claude Code auto memory. Without it
   every session loads the repository's
   `~/.claude/projects/<project>/memory/MEMORY.md` into its system prompt (the
@@ -3987,3 +4069,5 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pyt
 ```
 
 GPU tests are marked `gpu` and skipped when no CUDA device is present.
+[AGENTS.md](AGENTS.md) is the guide for developing kernel-agent with coding agents
+(principles, layout, the GPU lock, tests, pull requests).

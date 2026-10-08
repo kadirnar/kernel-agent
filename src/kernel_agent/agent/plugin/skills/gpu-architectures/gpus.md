@@ -111,7 +111,7 @@ sm_120 sections hold them.
 
 The family is not described here yet: trust the toolchain block (measured peaks and
 `mma.sync` rates), run `kernel-agent doctor` (its probes say whether `tl.dot_scaled`,
-TMA and PDL work) and look the architecture up (`sources.md`: the CUDA Programming
+TMA and PDL work) and look the architecture up (the `documentation-sources` skill's `sources.md`: the CUDA Programming
 Guide's compute capabilities and the PTX ISA's target notes) before choosing an
 instruction.
 

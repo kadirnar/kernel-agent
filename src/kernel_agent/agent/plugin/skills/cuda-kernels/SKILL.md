@@ -1,6 +1,13 @@
+---
+name: cuda-kernels
+description: CUDA C++ candidates through load_inline (nvcc) or NVRTC — builds, launches, dtype pitfalls, vectorisation, the tensor-core path per architecture, FP8 GEMMs via cuBLASLt from C++, long debug loops, torch.compile registration. Use when a target's backend is cuda or nvrtc.
+---
+
 # CUDA C++ backends
 
 Two verified ways to run hand-written CUDA C++:
+
+Streams, PDL, cooperative grids and SM partitions: the `cuda-graphs-streams-pdl` skill. Per-architecture facts: `gpu-architectures`. FP8 / FP4 formats and contracts: the precision skills (`precision-tiers` first).
 
 ## A. `cuda` — `torch.utils.cpp_extension.load_inline` (nvcc)
 
@@ -82,48 +89,7 @@ Register it with `torch.library.custom_op` + `register_fake`
 (`examples/triton_rmsnorm_custom_op.py` shows the wrapper; only the launcher
 body changes) and check it with `evaluate_candidate(..., compile_check=true)`.
 
-## Streams, PDL and SM partitions (`kernel_agent.concurrency`)
+## Examples and sources
 
-Overlap is legal when it is joined and declared (the evaluator rejects the rest):
-launch from the calling thread, join every stream before the call returns, name
-side streams with `kernel_agent.concurrency` (`cc`).
-
-* **Fork/join** (Python, around your launchers):
-  `with cc.fork("aux"): y = branch(x)` (the stream waits for the caller's on entry,
-  the caller's waits for it on exit), or `h = cc.launch("aux", fn, *args)` …
-  `h.result()` (joins exactly that work; `cc.join_all()` joins the rest). Inside
-  `torch.cuda.graph(...)` the same fork/join becomes graph edges (multi-stream
-  capture): two independent branches in one graph ran 1.09-1.16x faster than
-  serial (docs/PARALLEL.md §4.4). Your C++ launchers keep using
-  `at::cuda::getCurrentCUDAStream()`: inside `cc.fork` that is the side stream.
-* **PDL** (programmatic dependent launch, sm_90+): the next kernel on the stream
-  launches while the current one drains. Header `ka_launch.cuh`:
-  `load_inline(..., extra_include_paths=[str(cc.include_dir())])` and
-  `#include "ka_launch.cuh"`; launch with
-  `KaLaunch opt; opt.pdl = true; C10_CUDA_CHECK(ka_launch(kernel, grid, block, smem, stream, opt, args...));`
-  (`cudaLaunchKernelEx` with programmatic stream serialization; dropped below
-  sm_90). Device idiom: issue the loads that do not depend on the previous kernel
-  (weights, constants), then `ka_pdl_launch_dependents(); ka_pdl_wait();`, then read
-  what the previous kernel wrote; write nothing before the wait. Hash the header
-  into the extension `name` with your source.
-  - Pays for graph-captured chains of short memory-bound kernels whose prologue is
-    a weight load: 28 dependent GEMVs of 2 MB, one CUDA graph 101.2 us -> graph +
-    PDL 77.7 us = the DRAM floor (76.7 us); a graph kernel boundary costs ~0.9 us.
-    Eager launches gain little (host-bound): capture the chain in a graph.
-  - Hurt or noise where the wait came before the independent loads, and on
-    GEMM -> GEMM edges in our runs; cuBLAS / cuBLASLt kernels between yours do not
-    take part.
-  - Example: `examples/cuda_pdl_gemv_chain.py` (the chain captured in `build()`,
-    `pdl` a `build()` keyword for `sweep_candidate`).
-* **Cooperative / persistent grids**: `opt.cooperative = true` (grid-wide sync)
-  needs every block resident: size the grid by
-  `ka_coresident_blocks(kernel, threads, smem, stream)`, which counts the SMs of the
-  stream's green-context partition (`ka_sm_count(stream)`; in Python
-  `cc.sm_count()`). `cudaDevAttrMultiProcessorCount` reports the whole device even
-  inside a partition, and a cooperative grid sized from it is rejected there. A
-  hand-rolled grid barrier cost ~2.2-2.4 us per layer on sm_120, more than a PDL
-  graph boundary (~0.9 us): prefer one kernel per phase + PDL in a graph for
-  memory-bound chains.
-* **Partitions** (`cc.partition(sms=k)`: green contexts, two disjoint SM sets from
-  one driver split, None where unsupported): they buy isolation, not throughput
-  (two jobs on two plain streams finished first in every pair measured).
+* Examples: `examples/cuda_rmsnorm.py`, `examples/nvrtc_rmsnorm.py`, `examples/cuda_cublaslt_fp8.py`, `cuda_fp8_gemv.py`, `cuda_fp8_skinny_gemm.py`, `cuda_fp4_gemv.py`, `examples/cuda_pdl_gemv_chain.py`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Sources: the `documentation-sources` skill's `sources.md`, sections "Local reference code"; "CUDA C++ and PTX"; "cuBLASLt (FP8 / FP4 GEMMs, epilogues, heuristics)"; "CUTLASS / CuTe".

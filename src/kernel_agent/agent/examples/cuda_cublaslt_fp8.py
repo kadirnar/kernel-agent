@@ -3,7 +3,7 @@ descriptors, layouts and the algorithm cached per shape, for ``nn.Linear`` (and 
 Linears on one input behind a single call).
 
 Reduced precision: ``"precision": "fp8_w8a8"`` (a ``--quality near-lossless`` run,
-knowledge/low_precision.md) in the default tensor-wise mode, ``"fp8_mx"`` in the MXFP8 mode
+skill fp8-w8a8) in the default tensor-wise mode, ``"fp8_mx"`` in the MXFP8 mode
 (``build(mxfp8=1)``); the exact tier rejects both.
 
 Why: ``torch._scaled_mm`` costs 18-20 us of host time per eager call and ``at::_scaled_mm``

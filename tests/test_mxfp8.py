@@ -274,7 +274,7 @@ def test_planner_policy_and_engineer_contract():
         "triton_mxfp8_gemm.py",
         "mxfp8_error(weight, q, scales, x)",
         "near-lossless tolerance tier",
-        "## MXFP8 W8A8",
+        "`kernel-agent:mxfp8`",  # the skill to load (#176)
     ):
         assert needle in text, needle
 
@@ -357,9 +357,10 @@ def test_example_passes_the_tier_and_its_floor_rule_fails_the_guard(tmp_path, mo
 
 
 def test_knowledge_and_readme():
-    text = prompts.knowledge("low_precision.md")
+    text = prompts.knowledge("mxfp8")
+    assert prompts.knowledge("mxfp8") in prompts.knowledge("low_precision.md")
     for needle in (
-        "## MXFP8 W8A8 (`precision: fp8_mx`)",
+        "# MXFP8 W8A8 (`precision: fp8_mx`)",
         "2^ceil(log2(amax / 448))",
         "quantize_activations",
         "split-K",

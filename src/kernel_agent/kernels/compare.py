@@ -117,7 +117,7 @@ REDUCED_QUALITIES = (NEAR_LOSSLESS_TIER, RELAXED_TIER)
 DEFAULT_QUALITY = RELAXED_TIER
 #: ``"precision"`` of a target spec that ``--quality near-lossless`` captures in the
 #: near-lossless tier: ``fp8_weights`` (FP8 weight-only storage, per-channel scales, bf16
-#: activations; agent/knowledge/low_precision.md), ``fp8_w8a8`` (FP8 tensor-core math:
+#: activations; skill fp8-weights), ``fp8_w8a8`` (FP8 tensor-core math:
 #: e4m3 weights per output channel and activations per token, fp32 accumulation; for
 #: compute-bound GEMMs), ``fp8_mx`` (MXFP8 W8A8: e4m3 + ue8m0 per 32 along K on both
 #: operands, block-scaled tensor cores; compute-bound GEMMs with wide N) or ``reduced``

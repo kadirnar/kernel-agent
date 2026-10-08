@@ -187,14 +187,15 @@ def test_engineer_prompt_explains_the_fp8_contract():
         "max_rel_l2",
         "cuda_fp8_gemv.py",
         "cuda_fp8_skinny_gemm.py",
-        "# Low-precision weights",
+        "`kernel-agent:fp8-weights`",  # the skill to load (#176)
+        "`kernel-agent:precision-tiers`",
     ):
         assert needle in text, needle
     # an exact capture (an exact run, or no precision in the spec): no contract, no guide
     for spec, capture in ((target, {"cases": cases}), ({**target, "precision": None}, near)):
         text = prompts.engineer_prompt(spec, capture, *args)
         assert prompts.reduced_precision(spec, capture) is None
-        assert "# Precision" not in text and "# Low-precision weights" not in text
+        assert "# Precision" not in text and "kernel-agent:precision-tiers" not in text
     generic = prompts.engineer_prompt({**target, "precision": "reduced"}, near, *args)
     assert "# Precision: `reduced`" in generic and "FP8 weight-only:" not in generic
 

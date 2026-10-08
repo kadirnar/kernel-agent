@@ -2,7 +2,7 @@
 compute-bound GEMMs (hundreds of rows per call).
 
 Reduced precision: only for a target whose spec says ``"precision": "fp8_w8a8"`` (a
-``--quality near-lossless`` run, knowledge/low_precision.md); the exact tier rejects it.
+``--quality near-lossless`` run, skill fp8-w8a8); the exact tier rejects it.
 The recipe is the one the systems agent of the VoxCPM2 throughput run found
 (``runs/openbmb--VoxCPM2/20261006-004718``, transforms ``fp8_locdit_mlp`` and
 ``triton_fp8_locdit_gemm``, ledger exp 40-47: the LocDiT GEMMs at M = 352, end to end
@@ -53,7 +53,7 @@ us (cuBLAS bf16 68.2, ``torch._scaled_mm`` alone 41.3), q|k|v 15.1 (25.5 / 15.5)
 M = 352 (0.95x on gate|up); at M = 704 it measures 1.79x. ``tl.dot`` on e4m3 tops out
 at ~195 TFLOP/s on sm_120 (``tl.dot_scaled`` 214-227 at 4096^3), cuBLASLt's FP8 kernel for
 scalar scales at 338 (gate|up in 28.9 us, the scales then applied by the consumer;
-``cuda_cublaslt_fp8.py`` calls it directly): knowledge/low_precision.md, "The FP8 peak on
+``cuda_cublaslt_fp8.py`` calls it directly): skill fp8-w8a8 (gemm-paths.md), "The FP8 peak on
 sm_120". These figures were measured on the ``tl.dot`` version and on the research kernels;
 the ``tl.dot_scaled`` switch and its :data:`CONFIGS` are not re-measured on this file yet:
 re-sweep them on a new GPU.

@@ -2,7 +2,7 @@
 for ``nn.Linear``, on bf16 tensor cores (``mma.sync`` m16n8k16).
 
 Reduced precision: only for a target whose spec says ``"precision": "fp8_weights"`` (a
-``--quality near-lossless`` run, knowledge/low_precision.md); the exact tier rejects it.
+``--quality near-lossless`` run, skill fp8-weights); the exact tier rejects it.
 
 * ``build()`` quantises the weight once (``kernel_agent.kernels.quant.quantize_fp8``: e4m3,
   one fp32 scale per output channel); no bf16 copy is kept.

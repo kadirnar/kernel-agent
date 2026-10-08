@@ -2,7 +2,7 @@
 for decode steps over long contexts.
 
 Reduced precision: ``"precision": "fp8_kv"`` (opt-in: ``--precisions ...,fp8_kv`` in a
-``--quality near-lossless`` run; knowledge/low_precision.md, "FP8 KV cache"). Reference math
+``--quality near-lossless`` run; skill fp8-kv-cache). Reference math
 and helpers: ``kernel_agent.kernels.kv_quant`` (``quantize_fp8_kv``, ``fp8_kv_attention``,
 ``Fp8KVCache``, ``kv_cache_share``).
 

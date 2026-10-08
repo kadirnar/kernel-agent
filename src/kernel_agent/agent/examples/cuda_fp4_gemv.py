@@ -1,7 +1,7 @@
 """Example candidate (CUDA C++ via load_inline): NVFP4 weight-only GEMV for ``nn.Linear``.
 
 Reduced precision: only for a target whose spec says ``"precision": "fp4_weights"`` (a
-``--quality near-lossless`` run, knowledge/low_precision.md). The evaluator checks it in
+``--quality near-lossless`` run, skill fp4-weights). The evaluator checks it in
 the near-lossless-fp4 tier; the exact and the FP8 near-lossless tier reject it (FP4 moves
 every output by ~10 %).
 

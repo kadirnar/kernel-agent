@@ -187,7 +187,7 @@ _FP8_LABEL = "Compute-bound FP8 GEMM (W8A8, M ≳ 128 rows)"
 #: :data:`POLICY` rows that differ by architecture family (``gpu_arch.Family.key``): they
 #: replace the row of the same id on that family. :data:`POLICY`'s rows were measured on an
 #: RTX 5070 Ti (GeForce Blackwell); these follow the families' documented instructions
-#: (``knowledge/gpus.md`` and its sources), and the GeForce Blackwell FP8 row the GPU's own
+#: (``gpu-architectures/gpus.md`` and its sources), and the GeForce Blackwell FP8 row the GPU's own
 #: measured rates (:func:`_geforce_fp8`).
 ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
     "ada": {

@@ -7,5 +7,6 @@
   the whole generation loop) derived from the profile's stage graph, the staged plan, and
   when the improve loop opens the native arm (module arms plateaued; opt-in).
 
-Design: ``docs/NATIVE.md``; agent-facing contract: ``agent/knowledge/native.md``.
+Design: ``docs/NATIVE.md``; agent-facing contract: the ``native-engines`` skill
+(``agent/plugin/skills/native-engines/``).
 """

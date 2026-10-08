@@ -15,7 +15,7 @@ CARD = {
 
 
 def test_knowledge_and_examples_exist():
-    for guide in set(prompts.BACKEND_GUIDES.values()) | {"playbook.md"}:
+    for guide in set(prompts.BACKEND_GUIDES.values()) | {"playbook.md"}:  # skills (#176)
         assert len(prompts.knowledge(guide)) > 500
     for backend in prompts.BACKEND_GUIDES:
         assert (prompts.EXAMPLES_DIR / f"{backend}_rmsnorm.py").exists()
@@ -32,7 +32,12 @@ def test_prompts_render():
         8,
         {"instances": 2, "calls": 6, "inclusive_ms": 1.0},
     )
-    assert "LlamaRMSNorm" in text and "load_inline" in text and "Triton backend" in text
+    assert "LlamaRMSNorm" in text and "`kernel-agent:cuda-kernels`" in text
+    assert (
+        "`kernel-agent:triton-kernels`" in text and "`kernel-agent:optimisation-playbook`" in text
+    )
+    assert "load_inline" in prompts.knowledge("cuda-kernels")
+    assert "Triton backend" in prompts.knowledge("triton-kernels")
     plan = prompts.planner_prompt(CARD, {"median_ms": 1.0}, "# Profile", ["triton"], 3, "py", "tc")
     assert "up to 3" in plan
     assert "harness.py" in prompts.harness_prompt(CARD, "boom", "py", "tc")
