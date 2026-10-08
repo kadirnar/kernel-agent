@@ -14,6 +14,9 @@ is appended to the system prompt of the matching agents:
   and writes its `plan.md` (no code)
 * `## refactor`: moves the ops of a region target out of its parent module's
   code into a new submodule (`rewrite.py`), without changing the math
+* `## dossier`: looks up the documentation for a target before its first
+  session and writes its `research.md`
+* `## librarian`: distils a finished run into lessons for later runs
 
 A heading can name several roles (`## kernel, systems`). Other `##` headings
 are ignored with a warning. Text above the first `##` heading (this
@@ -196,3 +199,18 @@ version is saved as `logs/program-<sha12>.md`.
 * Cut the region where the planned fusion needs it, no wider: the inputs it
   reads and the outputs the rest of the parent uses, nothing the kernel
   cannot fuse.
+
+## dossier
+
+* Answer the few questions that change what the engineer writes first (the
+  fastest known design at this bound, the exact API or instruction on this
+  GPU), with their sources. Skip what the engineer's skills already say.
+* Record what you read, never what you expect a page to say: a finding
+  without a source is not a finding.
+
+## librarian
+
+* Keep a lesson only when it transfers to another model: name the module
+  type, shapes, precision and GPU it holds for, with the numbers behind it.
+* A failed idea is a lesson only when it measured correct and slower; bugs
+  are not evidence against an idea.

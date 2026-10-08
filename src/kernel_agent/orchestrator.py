@@ -36,6 +36,7 @@ from kernel_agent import (
     projection,
     region,
     research,
+    roles,
     scheduler,
     strong_baseline,
     telemetry,
@@ -44,7 +45,7 @@ from kernel_agent import (
     workers,
 )
 from kernel_agent.agent import auth, prompts, web
-from kernel_agent.agent.runner import READ_TOOLS, AgentResult, agent_env, run_agent
+from kernel_agent.agent.runner import AgentResult, agent_env, run_agent
 from kernel_agent.agent.tools import (
     SessionBinding,
     best_for_target,
@@ -52,7 +53,6 @@ from kernel_agent.agent.tools import (
     current_records,
     ranked_for_target,
     record_candidate,
-    tool_names,
 )
 from kernel_agent.budget import MIN_AGENT_SECONDS, MIN_AGENT_USD, SOL_STOP_PCT, Budget
 from kernel_agent.config import OptimizeConfig
@@ -73,9 +73,6 @@ from kernel_agent.workloads.quality import probe_messages
 from kernel_agent.workspace import RunDir, coordinator_lock, read_json, write_json
 
 PHASES = ["analyze", "plan", "capture", "kernels", "transforms", "integrate", "report"]
-#: The dossier session (``Orchestrator.dossier``): cheap, so it delays a target's first
-#: engineer session by a few minutes at most.
-DOSSIER_CONFIG = {"effort": "low", "max_turns_per_agent": 20}
 #: The GPU job kind (``gpuqueue.py``) of the worker commands the coordinator runs
 WORKER_JOBS = {
     "capture": "capture",
@@ -198,6 +195,10 @@ class Orchestrator:
             chosen = data["config"]["precisions"] = list(precisions.allowed(quality, wanted, cap))
             run.update(lambda d: d["config"].__setitem__("precisions", chosen))
             log(f"precisions: {precisions.describe(data['config']['precisions'])} (run.json)")
+        for key in ("role_models", "role_efforts"):  # --role-model / --role-effort: per role
+            if key in overrides:
+                own = getattr(OptimizeConfig.from_dict(data["config"]), key)
+                overrides[key] = {**own, **overrides[key]}
         cfg = OptimizeConfig.from_dict({**data["config"], **overrides})
         if "dry_run" not in data:  # simulated runs have no agents
             log(auth.preflight(cfg.auth))
@@ -273,21 +274,38 @@ class Orchestrator:
                 job_class = gpuqueue.EVAL
         return gpuqueue.tagged(kind, self.run, job_class=job_class)
 
+    def _session_config(self, role: str | None, config: dict[str, Any] | None) -> OptimizeConfig:
+        """The config of one session of ``role``: the run's with ``config`` and the role's
+        model, effort and turns (``roles.session_config``), its USD capped (``Budget``)."""
+        cfg = dataclasses.replace(self.cfg, **(config or {}))
+        return self.budget.agent_config(roles.session_config(role, cfg))
+
     async def _agent(
         self,
         name: str,
         label: str | None = None,
         config: dict[str, Any] | None = None,
+        *,
+        role: str | None = None,
+        context: str = "",
         **kwargs: Any,
     ) -> AgentResult:
         """Run an agent session; ``label`` keys its ``costs.json`` entry (default: ``name``),
-        ``config`` overrides fields of the run's config for this session (e.g. the model),
+        ``role`` (default: the one of ``name``) decides its model, effort, turns and tools
+        (``roles.py``; ``config`` overrides fields of the run's config before that),
         ``binding`` (in ``kwargs``, a :class:`~kernel_agent.agent.tools.SessionBinding`) is
         what the session's own tools are bound to (its target, worker, evaluation budget;
         labelled ``label``): every session gets its own MCP server (``build_server``).
+
+        The prompt in cache order (#181, docs/MULTIAGENT.md §3.12.2): the system prompt is
+        ``system_append`` (a split role's ``prompts.stable_prefix``) and the role's notes
+        (program, documentation), the same for every session of the role; the first message
+        is ``context`` (the target block and the digest), the budget note, then ``prompt``.
         A session stopped at a usage limit is resumed once the limit resets
         (:meth:`_wait_for_limit`). A run that is stopping (Ctrl-C) starts none."""
         interrupt.check()
+        role = roles.role_of(name) if role is None else role
+        spec = roles.get(role)
         binding = kwargs.pop("binding", None) or SessionBinding()
         binding = dataclasses.replace(binding, label=label or name)
         server = build_server(self.run, self.budget, self.truth, binding)
@@ -296,12 +314,17 @@ class Orchestrator:
         ledger.event(self.run, "agent_start", agent=name, program_sha256=prog.sha256, **tag)
         result = AgentResult(name=name)
         timeout = self.budget.start_agent(name)
-        cfg = self.budget.agent_config(dataclasses.replace(self.cfg, **(config or {})))
-        kwargs["system_append"] += self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
+        cfg = self._session_config(role, config)
+        kwargs.setdefault("mcp_tools", roles.mcp_tools(role))  # the role's tools (roles.py)
+        if spec.builtin_tools is not None:
+            kwargs.setdefault("tools", list(spec.builtin_tools))
         kwargs["system_append"] += prog.prompt_note(name)
         if cfg.allow_web:  # when to look things up, where, citations (issue #125)
             kwargs["system_append"] += prompts.web_note(name, web.domains(cfg.web_domains))
         kwargs["system_append"] += prompts.docs_note(name)  # doc_search / doc_read (#177)
+        budget = self.budget.prompt_note(name, cfg, kwargs["mcp_tools"])
+        # the session's own part, after everything its role's sessions share
+        kwargs["prompt"] = prompts.first_message((context, budget), kwargs["prompt"])
         if self.agent_runner is None:  # real sessions: build the doc library meanwhile, once
             from kernel_agent import doclib
 
@@ -321,6 +344,7 @@ class Orchestrator:
                 async with timer, clock.running(timer):
                     result = await (self.agent_runner or run_agent)(
                         name,
+                        role=role,
                         cfg=cfg,
                         mcp_server=server,
                         env=self.env,
@@ -349,7 +373,7 @@ class Orchestrator:
                 break
             waits += 1
             timeout = self.budget.start_agent(name, worked_s=result.seconds)
-            cfg = self.budget.agent_config(dataclasses.replace(self.cfg, **(config or {})))
+            cfg = self._session_config(role, config)
             if result.session_id:  # continue it (else the same prompt in a new session)
                 kwargs.update(prompt=auth.RESUME_PROMPT, resume=result.session_id)
         self.agent_results.append(result)
@@ -368,6 +392,13 @@ class Orchestrator:
             "turns": result.turns,
             "minutes": round(result.seconds / 60, 1),
             "tools": result.tool_calls,
+            # the role, its model and effort, its tokens (#181: report "Usage per role")
+            **({"role": role} if role else {}),
+            "model": result.model or cfg.claude_model,
+            "effort": cfg.effort,
+            **({"usage": result.usage} if result.usage else {}),
+            **({"first_usage": result.first_usage} if result.first_usage else {}),
+            **({"models": result.model_usage} if result.model_usage else {}),
             "session_id": result.session_id,
             "program_sha256": prog.sha256,
             "auth": cfg.auth,
@@ -444,7 +475,6 @@ class Orchestrator:
             prompt="Write and validate harness.py for this model.",
             system_append=prompts.harness_prompt(card, error, self.python, self.tc.summary()),
             cwd=self.run.root,
-            mcp_tools=tool_names("check_harness"),
             add_dirs=[prompts.WORKLOADS_DIR],
         )
         if not self.run.harness.exists():
@@ -458,7 +488,7 @@ class Orchestrator:
         summary = (self.run.profile_dir / "summary.md").read_text()
         backends = self._available_backends()
         log(
-            f"plan: asking the planner ({self.cfg.claude_model}) for up to "
+            f"plan: asking the planner ({roles.model_for('planner', self.cfg)}) for up to "
             f"{self.cfg.max_targets} targets"
         )
         result = await self._agent(
@@ -477,7 +507,6 @@ class Orchestrator:
                 backend_record=self._backend_record(),
             ),
             cwd=self.run.root,
-            mcp_tools=[],
             output_format={"type": "json_schema", "schema": self._plan_schema()},
         )
         plan = result.structured
@@ -588,8 +617,6 @@ class Orchestrator:
                 ),
                 system_append=prompts.refactor_prompt(spec, spec.get("parent_capture", {})),
                 cwd=target_dir,
-                mcp_tools=tool_names("verify_rewrite"),
-                tools=[*READ_TOOLS, "Write", "Edit"],
                 writable=[rewrite],
             )
             result = await asyncio.to_thread(install)
@@ -638,16 +665,7 @@ class Orchestrator:
                 if not team:  # one engineer session in the target directory
                     target_dir = self.run.target(target_id)
                     spec = read_json(target_dir / "spec.json")
-                    system = prompts.engineer_prompt(
-                        spec,
-                        spec.get("capture", {}),
-                        spec["backends"],
-                        self.python,
-                        self.tc.summary(),
-                        self.cfg.evaluations_per_target,
-                        stats.get(spec["module_class"]),
-                        precisions=self.allowed_precisions(),
-                    ) + self._library_note(target_id, spec)
+                    evals = self.cfg.evaluations_per_target
                     (target_dir / "NOTES.md").touch()
                     await self._agent(
                         f"kernel-{target_id}",
@@ -656,11 +674,9 @@ class Orchestrator:
                             "reference_source.py and spec.json, then write and evaluate "
                             "candidates."
                         ),
-                        system_append=system,
+                        system_append=self._stable("kernel"),
+                        context=self._engineer_target(spec, spec["backends"], evals, stats),
                         cwd=target_dir,
-                        mcp_tools=tool_names(
-                            "evaluate_candidate", "sweep_candidate", "best_result"
-                        ),
                         add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
                         binding=SessionBinding(
                             role="kernel",
@@ -697,19 +713,16 @@ class Orchestrator:
         await self._agent(
             "systems",
             prompt="Design, write and evaluate model-level transforms.",
-            system_append=prompts.systems_prompt(
+            system_append=self._stable("systems"),
+            context=prompts.systems_target(
                 data["card"],
                 baseline,
                 summary,
                 plan.get("transforms", []),
-                self.python,
-                self.tc.summary(),
                 self.cfg.transform_evaluations,
                 kernels=self._kernel_winners(),
-            )
-            + prompts.precision_note(self.cfg.quality, self.allowed_precisions()),
+            ),
             cwd=self.run.transforms_dir,
-            mcp_tools=tool_names("evaluate_e2e", "run_info"),
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
             binding=SessionBinding(role="systems", evaluations=self.cfg.transform_evaluations),
         )
@@ -751,27 +764,17 @@ class Orchestrator:
         spec = read_json(self.run.target(target_id) / "spec.json")
         cwd = workers.prepare(self.run, target_id, seed.worker)
         name = workers.agent_name(target_id, seed.worker)
-        system = (
-            prompts.engineer_prompt(
-                {**spec, "approach": seed.approach},
-                spec.get("capture", {}),
-                list(seed.backends) or spec["backends"],
-                self.python,
-                self.tc.summary(),
-                seed.evaluations,
-                stats.get(spec["module_class"]),
-                precisions=self.allowed_precisions(),
-            )
-            + self._library_note(target_id, spec)
-            + workers.prompt_note(target_id, seed, team)
-        )
+        backends = list(seed.backends) or spec["backends"]
+        context = self._engineer_target(
+            spec, backends, seed.evaluations, stats, approach=seed.approach
+        ) + workers.prompt_note(target_id, seed, team)
         return await self._agent(
             name,
             label,
             prompt=prompt,
-            system_append=system + digest,
+            system_append=self._stable("kernel"),
+            context=context + digest,
             cwd=cwd,
-            mcp_tools=tool_names("evaluate_candidate", "sweep_candidate", "best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
             binding=SessionBinding(
                 role="kernel",
@@ -1896,16 +1899,7 @@ class Orchestrator:
         target_dir = self.run.target(target_id)
         spec = read_json(target_dir / "spec.json")
         (target_dir / "NOTES.md").touch()
-        system = prompts.engineer_prompt(
-            spec,
-            spec.get("capture", {}),
-            spec["backends"],
-            self.python,
-            self.tc.summary(),
-            evaluations,
-            stats.get(spec["module_class"]),
-            precisions=self.allowed_precisions(),
-        ) + self._library_note(target_id, spec)
+        target = self._engineer_target(spec, spec["backends"], evaluations, stats)
         return await self._agent(
             f"kernel-{target_id}",
             label,
@@ -1913,9 +1907,9 @@ class Orchestrator:
                 f"Continue optimising target `{target_id}`. Read the `# Improve slice` section "
                 "first: it says where the previous sessions left off."
             ),
-            system_append=system + digest,
+            system_append=self._stable("kernel"),
+            context=target + digest,
             cwd=target_dir,
-            mcp_tools=tool_names("evaluate_candidate", "sweep_candidate", "best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
             # evaluation advice says `stop` after these
             binding=SessionBinding(role="kernel", target_id=target_id, evaluations=evaluations),
@@ -1925,16 +1919,14 @@ class Orchestrator:
         """A fresh systems-engineer session seeded with ``digest``."""
         plan = read_json(self.run.plan_json, {})
         self.run.transforms_dir.mkdir(parents=True, exist_ok=True)
-        system = prompts.systems_prompt(
+        context = prompts.systems_target(
             self.run.load()["card"],
             read_json(self.run.baseline_json, {}),
             (self.run.profile_dir / "summary.md").read_text(),
             plan.get("transforms", []),
-            self.python,
-            self.tc.summary(),
             evaluations,
             kernels=self._kernel_winners(),
-        ) + prompts.precision_note(self.cfg.quality, self.allowed_precisions())
+        )
         return await self._agent(
             "systems",
             label,
@@ -1942,23 +1934,21 @@ class Orchestrator:
                 "Continue designing and evaluating model-level transforms. Read the "
                 "`# Improve slice` section first: it says where the previous sessions left off."
             ),
-            system_append=system + digest,
+            system_append=self._stable("systems"),
+            context=context + digest,
             cwd=self.run.transforms_dir,
-            mcp_tools=tool_names("evaluate_e2e", "run_info"),
             add_dirs=[prompts.WORKLOADS_DIR, prompts.KNOWLEDGE_DIR],
             binding=SessionBinding(role="systems", evaluations=evaluations),
         )
 
-    #: A native session gets this many times the turns of the others (and, without
-    #: ``--native-minutes``, this many times ``--agent-minutes``).
-    NATIVE_FACTOR = 3
-
     def native_minutes(self) -> float | None:
         """Session length of the native agent: ``--native-minutes``, else a multiple of
-        ``--agent-minutes`` (None: no per-session limit)."""
+        ``--agent-minutes`` (its ``session_factor``, ``roles.py``; None: no per-session
+        limit). Its turns are the same multiple of ``--max-turns``."""
         if self.cfg.native_minutes:
             return float(self.cfg.native_minutes)
-        return self.cfg.agent_minutes * self.NATIVE_FACTOR if self.cfg.agent_minutes else None
+        factor = roles.get("native").session_factor
+        return self.cfg.agent_minutes * factor if self.cfg.agent_minutes else None
 
     async def native_slice(self, *, evaluations: int, digest: str, label: str) -> AgentResult:
         """A fresh systems-native session (``native/engine.py``, issue #134) seeded with
@@ -1973,29 +1963,24 @@ class Orchestrator:
             self.budget.minutes_by_agent["native"] = minutes
         why = native_engine.enabled(self.cfg.native, native_engine.plan_entry(self.run))
         blocks = native_engine.building_blocks(self._kernel_winners(), self._library_arch())
-        system = prompts.native_prompt(
+        context = prompts.native_target(
             self.run.load()["card"],
             read_json(self.run.baseline_json, {}),
             (self.run.profile_dir / "summary.md").read_text(),
-            self.python,
-            self.tc.summary(),
             evaluations,
             why=f"{why or 'opened by the scheduler'}; every module arm has plateaued",
             blocks=blocks,
-        ) + prompts.precision_note(self.cfg.quality, self.allowed_precisions())
+        )
         return await self._agent(
             "native",
             label,
-            config={"max_turns_per_agent": self.cfg.max_turns_per_agent * self.NATIVE_FACTOR},
             prompt=(
                 "Continue the native engine of this model. Read the `# Improve slice` section "
                 "first: it says which stage is current and where the previous sessions left off."
             ),
-            system_append=system + digest,
+            system_append=self._stable("native"),
+            context=context + digest,
             cwd=cwd,
-            mcp_tools=tool_names(
-                "evaluate_candidate", "sweep_candidate", "best_result", "evaluate_e2e", "run_info"
-            ),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR, prompts.WORKLOADS_DIR],
             binding=SessionBinding(role="native", agent="native", evaluations=evaluations, cwd=cwd),
         )
@@ -2021,12 +2006,11 @@ class Orchestrator:
         if near:
             evidence += research.transforms_section(self.run)
         dossier = research.dossier_path(self.run, target_id) if self.cfg.allow_web else None
-        system = prompts.research_prompt(
+        context = prompts.research_target(
             spec,
             spec.get("capture", {}),
             evidence,
             plan,
-            self.tc.summary(),
             pivot=proposal,
             dossier=dossier,
             precisions=allowed,
@@ -2038,11 +2022,10 @@ class Orchestrator:
                 f"Target `{target_id}` has plateaued ({reason}). Diagnose why from the ledger "
                 f"and the files, then write the plan to {plan}."
             ),
-            system_append=system,
+            system_append=self._stable("research"),
+            context=context,
             cwd=target_dir,
-            mcp_tools=tool_names("best_result"),
             add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
-            tools=[*READ_TOOLS, "Write"],
             writable=[plan] + ([proposal] if proposal else []) + ([dossier] if dossier else []),
         )
 
@@ -2064,10 +2047,9 @@ class Orchestrator:
         spec = read_json(target_dir / "spec.json")
         log(f"dossier: {target_id}: documentation and reference code before its first session")
         try:
-            return await self._agent(
+            return await self._agent(  # cheap: its model, effort and turns are the registry's
                 f"dossier-{target_id}",
                 label,
-                config=DOSSIER_CONFIG,
                 prompt=(
                     f"Look up what the sources say about making target `{target_id}` fast and "
                     f"write the dossier to {path}."
@@ -2076,9 +2058,7 @@ class Orchestrator:
                     spec, spec.get("capture", {}), path, self.tc.summary()
                 ),
                 cwd=target_dir,
-                mcp_tools=[],
                 add_dirs=[prompts.EXAMPLES_DIR, prompts.KNOWLEDGE_DIR],
-                tools=[*READ_TOOLS, "Write"],
                 writable=[path],
             )
         except auth.AuthError:  # the wrong billing stops the run, as in any session
@@ -2179,7 +2159,6 @@ class Orchestrator:
             )
             + context,
             cwd=round_dir,
-            mcp_tools=[],
             output_format={"type": "json_schema", "schema": self._plan_schema()},
         )
         plan = result.structured
@@ -2260,6 +2239,36 @@ class Orchestrator:
             return ""
         return library.prompt_note(self.run, target_id, spec)
 
+    def _stable(self, role: str) -> str:
+        """The system prompt of every session of a split ``role`` on this run (#181): its
+        ``prompts.stable_prefix``; the run's precision policy for the systems and native
+        engineers (the same for each of their sessions)."""
+        text = prompts.stable_prefix(role, self.python, self.tc.summary())
+        if role in ("systems", "native"):
+            text += prompts.precision_note(self.cfg.quality, self.allowed_precisions())
+        return text
+
+    def _engineer_target(
+        self,
+        spec: dict[str, Any],
+        backends: list[str],
+        evaluations: int,
+        stats: dict[str, dict[str, Any]],
+        approach: str | None = None,
+    ) -> str:
+        """The target block of a kernel engineer session (``prompts.engineer_target``; a
+        worker's ``approach``) and the library's priors and lessons for the target."""
+        target = prompts.engineer_target(
+            {**spec, "approach": approach} if approach is not None else spec,
+            spec.get("capture", {}),
+            backends,
+            self.tc.summary(),
+            evaluations,
+            stats.get(spec["module_class"]),
+            precisions=self.allowed_precisions(),
+        )
+        return target + self._library_note(spec["id"], spec)
+
     def _backend_record(self) -> str:
         """Planner-prompt section: which backend won which target class on this GPU in
         earlier runs (kernel_agent/backends.py; "" without a library or a record)."""
@@ -2313,15 +2322,9 @@ class Orchestrator:
         try:
             result = await self._agent(
                 "librarian",
-                config={
-                    "claude_model": self.cfg.librarian_model or self.cfg.claude_model,
-                    "effort": self.cfg.librarian_effort,
-                    "max_turns_per_agent": 8,
-                },
                 prompt="Distil this run into the library's lessons files.",
                 system_append=library.librarian_prompt(self.run, names, arch=arch),
                 cwd=self.run.root,
-                mcp_tools=[],
                 output_format={"type": "json_schema", "schema": library.LESSONS_SCHEMA},
             )
         except Exception as exc:  # lessons are a bonus: never fail a finished run

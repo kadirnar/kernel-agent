@@ -367,11 +367,11 @@ def test_dry_run_end_to_end(tmp_path, monkeypatch):
 
     # fresh sessions seeded with a digest, through Orchestrator._agent (program.md, costs)
     kernel_sessions = [s for s in world.sessions if s["name"].startswith("kernel-")]
-    assert all("# Improve slice" in s["system"] for s in kernel_sessions)
+    assert all("# Improve slice" in s["prompt"] for s in kernel_sessions)
     assert all("# Program" in s["system"] for s in world.sessions)
     later = [s for s in world.sessions if s["name"] == "kernel-attn"][1]
-    assert "## Best so far" in later["system"] and "history/" in later["system"]
-    assert "(none recorded yet)" not in later["system"] and "- exp " in later["system"]
+    assert "## Best so far" in later["prompt"] and "history/" in later["prompt"]
+    assert "(none recorded yet)" not in later["prompt"] and "- exp " in later["prompt"]
     planner = next(s for s in world.sessions if s["name"] == "planner")
     assert "# Round 2" in planner["system"] and "`attn` (`Qwen3Attention`)" in planner["system"]
     costs = read_json(run.root / "costs.json")

@@ -17,6 +17,11 @@ where (the ``documentation-sources`` skill), how to cite, and that pages are unt
 
 kernel-agent's know-how is in skills (``kernel_agent/skills.py``, issue #176): the prompts
 name the skills a role loads first (:func:`skills_note`) instead of inlining whole guides.
+
+The prompts of the kernel engineer, systems, native and research roles come in two parts for
+the prompt cache (#181, :data:`SPLIT_ROLES`): :func:`stable_prefix`, byte-identical for every
+session of the role on a run (the system prompt), and the role's target block (the first
+message, with the session's digest and budget after it).
 """
 
 from __future__ import annotations
@@ -102,16 +107,16 @@ _WHY: dict[str | tuple[str, str], str] = {
 }
 
 
-def _role_skills(
+def _skill_reasons(
     role: str,
-    others: str,
     *,
     backends: Iterable[str] = (),
     precision: str | None = None,
     quality: str = "exact",
-) -> str:
-    """The ``# Skills`` section of a role's prompt: :func:`skills.for_role` with a reason
-    each (a backend's guide, the precision's guide, else :data:`_WHY`)."""
+) -> list[tuple[str, str]]:
+    """:func:`skills.for_role` with a reason each (a backend's guide, the precision's guide,
+    else :data:`_WHY`)."""
+    backends = list(backends)
     of_backend: dict[str, list[str]] = {}
     for backend in backends:
         if backend in BACKEND_GUIDES:
@@ -127,6 +132,19 @@ def _role_skills(
         else:
             why = _WHY.get((role, name)) or _WHY[name]
         load.append((name, why))
+    return load
+
+
+def _role_skills(
+    role: str,
+    others: str,
+    *,
+    backends: Iterable[str] = (),
+    precision: str | None = None,
+    quality: str = "exact",
+) -> str:
+    """The ``# Skills`` section of a role's prompt (:func:`_skill_reasons`)."""
+    load = _skill_reasons(role, backends=backends, precision=precision, quality=quality)
     return skills_note(load, others)
 
 
@@ -137,16 +155,28 @@ def _target_skills(target: dict[str, Any], precision: str | None) -> str:
     return ", ".join(f"`{n}`" for n in names)
 
 
-def _engineer_skills(backends: list[str], precision: str | None) -> str:
-    """The skills of a kernel engineer: the methodology, a skill per backend, the precision's."""
+def _engineer_skills() -> str:
+    """The skills of every kernel engineer: the methodology (its target's backends and
+    precision add theirs, :func:`_target_skill_lines`)."""
     return _role_skills(
         "kernel",
         "`profiling-and-roofline` (reading `profile=true` and Nsight Compute results), "
         "`correctness-and-anti-gaming` (what the evaluator rejects), `gpu-architectures`, "
         "`cuda-graphs-streams-pdl`, `documentation-sources`",
-        backends=backends,
-        precision=precision,
     )
+
+
+def _target_skill_lines(backends: list[str], precision: str | None) -> str:
+    """The skills a kernel engineer loads first for its target: one per backend and the
+    precision's (those of :func:`skills.for_role` beyond the role's own)."""
+    own = set(skills.for_role("kernel"))
+    load = _skill_reasons("kernel", backends=backends, precision=precision)
+    lines = [
+        f"* `{skills.qualified(n)}`: {why}" for n, why in load if skills.qualified(n) not in own
+    ]
+    if not lines:
+        return ""
+    return "\n# Skills of this target\nLoad these too before you start:\n" + "\n".join(lines) + "\n"
 
 
 def _env_block(python: str, toolchain_summary: str) -> str:
@@ -1050,7 +1080,7 @@ allows, and report the numerical error (the evaluator's per-case `min_cosine` /
 This target may change numerics{why}.
 The evaluator checks it in {_tier_bounds(precision, tier)} (the exact tier would reject
 low-precision weights). End to end, the run's perceptual gate decides. This replaces the "no
-fp8/int8" rule below for this target only.
+fp8/int8" rule of `# Rules` for this target only.
 {contract}
 {no_four_note}{gpu_line}"""
 
@@ -1080,6 +1110,48 @@ def _tier_bounds(precision: str, tier: str | None = None) -> str:
     )
 
 
+#: The roles whose prompt is split for the prompt cache (#181): :func:`stable_prefix`, the
+#: system prompt of every session of the role, then the role's target block
+#: (:func:`engineer_target`, :func:`systems_target`, :func:`native_target`,
+#: :func:`research_target`) in the session's first message.
+SPLIT_ROLES = ("kernel", "systems", "native", "research")
+
+
+def stable_prefix(role: str, python: str, toolchain: str) -> str:
+    """The part of a role's prompt that is byte-identical for every session of the role on a
+    run (#181, docs/MULTIAGENT.md §3.12.2): its task, the files, contracts and tools, the
+    rules, the skills of the role and the environment; nothing of a target, a session or
+    the time (no target id, budget, timestamp). A session's system prompt is this (and its
+    role's notes: program, documentation), so the prompt cache serves it to every session
+    of the role after the first; what differs per session goes into its first message."""
+    if role == "kernel":
+        return _engineer_stable(python, toolchain)
+    if role == "systems":
+        return _systems_stable(python, toolchain)
+    if role == "native":
+        return _native_stable(python, toolchain)
+    if role == "research":
+        return _research_stable(toolchain)
+    raise KeyError(f"no split prompt for role {role!r} ({', '.join(SPLIT_ROLES)})")
+
+
+#: The opening of a session's first message when it has a part of its own (#181): after the
+#: system prompt its role's sessions share, what this session works on.
+BRIEF_HEADING = (
+    "# This session\nIts target, where the work stands and its budget; the task comes last.\n"
+)
+
+
+def first_message(parts: Iterable[str], task: str) -> str:
+    """A session's first message (#181): what is its own (the target block, the digest, the
+    budget note; ``parts``, the empty ones left out) after :data:`BRIEF_HEADING`, then the
+    task. ``task`` alone when there is nothing of its own."""
+    own = [part.strip("\n") for part in parts if part.strip()]
+    if not own:
+        return task
+    return "\n\n".join([BRIEF_HEADING.rstrip("\n"), *own, f"# Task\n{task}"])
+
+
 def engineer_prompt(
     target: dict[str, Any],
     capture_info: dict[str, Any],
@@ -1090,6 +1162,25 @@ def engineer_prompt(
     class_stats: dict[str, Any] | None,
     precisions: Iterable[str] | None = None,
 ) -> str:
+    """A kernel engineer's whole prompt: :func:`stable_prefix` then :func:`engineer_target`
+    (a session gets the first as its system prompt, the second in its first message)."""
+    stable = stable_prefix("kernel", python, toolchain)
+    return stable + engineer_target(
+        target, capture_info, backends, toolchain, evaluations, class_stats, precisions
+    )
+
+
+def engineer_target(
+    target: dict[str, Any],
+    capture_info: dict[str, Any],
+    backends: list[str],
+    toolchain: str,
+    evaluations: int,
+    class_stats: dict[str, Any] | None,
+    precisions: Iterable[str] | None = None,
+) -> str:
+    """The target block of a kernel engineer's prompt (#181): the target, its cases, workload,
+    entrypoints and precision, its backends and their skills, its evaluation budget."""
     precision = reduced_precision(target, capture_info)
     tier = capture_info.get("tier")  # the capture's tolerance tier (near-lossless, relaxed)
     backend_list = "\n".join(
@@ -1107,17 +1198,33 @@ def engineer_prompt(
             f"* profile: {class_stats.get('instances')} instances, {class_stats.get('calls')} "
             f"calls per run, inclusive {class_stats.get('inclusive_ms')} ms (hooked)"
         )
-    return f"""You are an expert GPU kernel engineer. Make the module below faster with
-custom kernels while keeping its results identical within numerical tolerance.
-
-# Target `{target["id"]}`
+    return f"""# Target `{target["id"]}`
 * module class: `{target["module_class"]}` (instance captured: `{capture_info.get("qualname")}`)
 {stats}
 {_scope_lines(target)}* why it matters: {target.get("why", "")}
 * suggested approach: {target.get("approach", "")}
 * captured cases (real shapes from the model run):
 {cases}
-{_workload_block(capture_info)}{_state_block(capture_info)}
+* tools: `target_id="{target["id"]}"`; budget: about {evaluations} evaluations, spend them on
+  distinct hypotheses.
+{_workload_block(capture_info)}{_state_block(capture_info)}{entrypoints}\
+{_precision_block(precision, target, precisions, toolchain, tier)}
+# Backends (in priority order)
+{backend_list}
+Start with the first. When it is correct and fast, try the next one only if
+you expect it to beat the current best (different algorithm, lower launch
+overhead). Verified examples of every backend are in `{EXAMPLES_DIR}` — copy
+their structure; an example's `ARCHS` names the GPUs it runs on.
+{_backend_class_block(target, capture_info, backends, toolchain)}\
+{_target_skill_lines(backends, precision)}"""
+
+
+def _engineer_stable(python: str, toolchain: str) -> str:
+    """The stable prefix of every kernel engineer's prompt (:func:`stable_prefix`)."""
+    return f"""You are an expert GPU kernel engineer. Make the module of your target (`# Target`
+in the first message) faster with custom kernels while keeping its results identical within
+numerical tolerance.
+
 Files in your working directory:
 * `capture_inputs.pt` — the module (with weights) + the captured inputs, for local
   debugging (`torch.load(path, weights_only=False)`). The reference outputs stay with
@@ -1127,7 +1234,7 @@ Files in your working directory:
 * `workload_profile.md` — statistics of every call of the module during the run.
 * `spec.json` — target metadata.
 * `candidates/` — put your candidates here, one file per idea, e.g.
-  `candidates/{backends[0]}_v1.py`.
+  `candidates/<backend>_v1.py`.
 * `NOTES.md` — keep a short log: hypothesis → result for every evaluation.
 * `plan.md` (when present) — a research review of this target: diagnosis, ranked
   next directions and a do-not-try list. Read it first and start from it.
@@ -1149,27 +1256,21 @@ write "abandoned after N attempts: <why>".
 ```python
 def build(reference: torch.nn.Module) -> torch.nn.Module:
     # Return a drop-in replacement: same signature for every captured
-    # entrypoint (forward, and e.g. forward_step if listed above; including
-    # kwargs such as attention_mask / position_embeddings / past_key_values /
-    # cache_position), same outputs, same in-place side effects. Reuse the
-    # reference's parameters (you may pre-pack fused weights once here).
-    # Return `reference` for instances you do not support.
+    # entrypoint (forward, and e.g. forward_step when the target lists it;
+    # including kwargs such as attention_mask / position_embeddings /
+    # past_key_values / cache_position), same outputs, same in-place side
+    # effects. Reuse the reference's parameters (you may pre-pack fused
+    # weights once here). Return `reference` for instances you do not support.
 ```
 `build` is called on every instance of the class in the model, so handle the
 instances' configuration generically (read sizes from the module). Expose tuning
 parameters (block sizes, `num_warps`, `num_stages`, vector widths) as keyword
 arguments with defaults, `def build(reference, BLOCK=1024, num_warps=4)`, and
 tune them with `sweep_candidate`.
-{entrypoints}{_precision_block(precision, target, precisions, toolchain, tier)}
-# Backends (in priority order)
-{backend_list}
-Start with the first. When it is correct and fast, try the next one only if
-you expect it to beat the current best (different algorithm, lower launch
-overhead). Verified examples of every backend are in `{EXAMPLES_DIR}` — copy
-their structure; an example's `ARCHS` names the GPUs it runs on.
-{_backend_class_block(target, capture_info, backends, toolchain)}
+
 # Tools
-* `evaluate_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py",
+`<target>`: your target's id (`# Target`).
+* `evaluate_candidate(target_id="<target>", candidate="candidates/<file>.py",
   hypothesis="...", idea_id="<slug>", expected_speedup=1.4,
   parent="history/<snapshot>.py", profile=false)`:
   compiles, checks correctness on all cases, benchmarks against the reference
@@ -1189,7 +1290,7 @@ their structure; an example's `ARCHS` names the GPUs it runs on.
   candidate before you spend a full evaluation on it. A candidate whose code
   was evaluated before (comments and formatting aside) is not run again: the
   result says `duplicate` and returns the earlier one.
-* `sweep_candidate(target_id="{target["id"]}", candidate="candidates/<file>.py",
+* `sweep_candidate(target_id="<target>", candidate="candidates/<file>.py",
   configs=[{{"BLOCK": 512, "num_warps": 4}}, {{"BLOCK": 1024, "num_warps": 8}}],
   hypothesis="...", idea_id="<slug>")`: tunes the keyword arguments of
   `build(reference, **config)` in one GPU session. Every config (at most
@@ -1201,10 +1302,9 @@ their structure; an example's `ARCHS` names the GPUs it runs on.
   speedup (`speedup_per_case`, `pct_of_sol`). A sweep counts as ONE evaluation:
   tune block sizes, `num_warps`, `num_stages` and vector widths with one sweep per
   idea, never with one evaluation per value.
-* `best_result(target_id="{target["id"]}")`: best correct result so far, and per
+* `best_result(target_id="<target>")`: best correct result so far, and per
   idea: tries, best speedup, bugs (failed attempts) vs slow (correct, not faster).
-You have a budget of about {evaluations} evaluations: spend them on distinct
-hypotheses. Every timed result reports the roofline of each case for the current
+Every timed result reports the roofline of each case for the current
 recipe: `sol_ms` = max(FLOPs / peak FLOP/s, `min_bytes` / peak bandwidth) with peaks
 measured on this GPU, `pct_of_sol` = 100 × sol_ms / new_ms, and `bound`
 (`memory`, `compute`, or `launch` when even a perfect kernel is dominated by one
@@ -1218,10 +1318,11 @@ the kernel does all the work the reference does.
 The orchestrator always keeps the best correct snapshot.
 
 {COMMON_RULES}
-{_engineer_skills(backends, precision)}
+{_engineer_skills()}
 {_env_block(python, toolchain)}
 
-Finish with a short summary: best candidate, speedup per case, what limited it."""
+Finish with a short summary: best candidate, speedup per case, what limited it.
+"""
 
 
 def _systems_skills() -> str:
@@ -1243,6 +1344,33 @@ def systems_prompt(
     evaluations: int,
     kernels: list[tuple[str, str, float]] | None = None,
 ) -> str:
+    """A systems engineer's whole prompt: :func:`stable_prefix` then :func:`systems_target`."""
+    stable = stable_prefix("systems", python, toolchain)
+    return stable + systems_target(
+        card, baseline, profile_summary, transforms, evaluations, kernels=kernels
+    )
+
+
+def _model_block(card: dict[str, Any], baseline: dict[str, Any], profile_summary: str) -> str:
+    """``# Model``: the model, its baseline and its profile summary."""
+    return f"""# Model
+`{card["repo_id"]}` ({card["modality"]}). Baseline: {baseline.get("median_ms", 0):.1f} ms \
+{objective.of(baseline).per} ({baseline.get("workload")}).
+{headroom_note(baseline)}
+{profile_summary}
+"""
+
+
+def systems_target(
+    card: dict[str, Any],
+    baseline: dict[str, Any],
+    profile_summary: str,
+    transforms: list[dict[str, Any]],
+    evaluations: int,
+    kernels: list[tuple[str, str, float]] | None = None,
+) -> str:
+    """The run block of a systems engineer's prompt (#181): the model, its baseline and
+    profile, the planner's ideas, the kernels written so far, the evaluation budget."""
     winners = (
         "\n".join(
             f"* `{tid}={path}` (module speedup {speedup:.2f}x)"
@@ -1251,27 +1379,30 @@ def systems_prompt(
         or "* (none)"
     )
     ideas = "\n".join(f"* `{t['id']}`: {t['idea']} — {t['why']}" for t in transforms) or "* (none)"
-    return f"""You are a systems/inference engineer. Speed up the end-to-end run of
-`{card["repo_id"]}` ({card["modality"]}) with model-level algorithm changes.
-Kernel engineers are separately replacing individual modules; you work on
-everything around them: decoding loop, caches, graph capture, layouts,
-redundant work, host synchronisation.
-
-Baseline: {baseline.get("median_ms", 0):.1f} ms {objective.of(baseline).per} \
-({baseline.get("workload")}).
-{headroom_note(baseline)}
-{profile_summary}
-
+    return f"""{_model_block(card, baseline, profile_summary)}
 # Planner's ideas
 {ideas}
 
 # Kernels already written for this model
 {winners}
+
+Budget: about {evaluations} evaluations (each reloads the model).
+"""
+
+
+def _systems_stable(python: str, toolchain: str) -> str:
+    """The stable prefix of every systems engineer's prompt (:func:`stable_prefix`)."""
+    return f"""You are a systems/inference engineer. Speed up the end-to-end run of the model
+(`# Model` in the first message) with model-level algorithm changes. Kernel engineers are
+separately replacing individual modules; you work on everything around them: decoding loop,
+caches, graph capture, layouts, redundant work, host synchronisation.
+
 The final integration measures every kernel and transform alone and then
 combines them greedily, so the best results are transforms that also work
-*on top of* these kernels: keep calling the (possibly replaced) sub-modules
-instead of re-implementing their math, and check compatibility with
-`evaluate_e2e(transforms=[...], kernels=[<entries above>])`.
+*on top of* the kernels already written (`# Kernels already written for this model`):
+keep calling the (possibly replaced) sub-modules instead of re-implementing their
+math, and check compatibility with `evaluate_e2e(transforms=[...], kernels=[<those
+entries>])`.
 
 # Transform contract
 Write files `transforms/<id>.py` in the current directory:
@@ -1321,13 +1452,13 @@ that cannot be undone that way sets `undo = False` or defines `undo(workload)`.
   the full model in a fresh process, applies the transforms, runs the workload,
   compares against the baseline output and reports latency + speedup. Give a
   one-sentence `hypothesis`; it is recorded in the run's ledger.
-Budget: about {evaluations} evaluations (each reloads the model).
 
 {COMMON_RULES}
 
 {_env_block(python, toolchain)}
 
-Finish with a summary of which transforms helped and by how much."""
+Finish with a summary of which transforms helped and by how much.
+"""
 
 
 def native_prompt(
@@ -1343,17 +1474,43 @@ def native_prompt(
 ) -> str:
     """The systems-native agent (``native`` sessions, issue #134): rewrites a stage, a group
     of stages or the whole generation loop as native code (multi-file CUDA / C++ projects,
-    ``native/project.py``) once the module kernels have plateaued."""
-    blocks_text = "\n".join(blocks) or "* (none yet)"
-    return f"""You are a systems-native inference engineer. The module-by-module kernels of
-`{card["repo_id"]}` ({card["modality"]}) have plateaued ({why}). Rewrite part of its inference
-path natively: one stage, the stages of one loop iteration, or the whole generation loop, as
-a CUDA C++ / CuTe engine that keeps weights streaming, fuses across module boundaries and
-runs in one persistent kernel or a few launches instead of many.
+    ``native/project.py``) once the module kernels have plateaued. Its whole prompt:
+    :func:`stable_prefix` then :func:`native_target`."""
+    stable = stable_prefix("native", python, toolchain)
+    return stable + native_target(
+        card, baseline, profile_summary, evaluations, why=why, blocks=blocks
+    )
 
-Baseline: {baseline.get("median_ms", 0):.1f} ms {objective.of(baseline).per} \
-({baseline.get("workload")}).
-{profile_summary}
+
+def native_target(
+    card: dict[str, Any],
+    baseline: dict[str, Any],
+    profile_summary: str,
+    evaluations: int,
+    *,
+    why: str,
+    blocks: list[str],
+) -> str:
+    """The run block of a native engineer's prompt (#181): the model, why the native arm
+    opened, its baseline and profile, the building blocks, the evaluation budget."""
+    blocks_text = "\n".join(blocks) or "* (none yet)"
+    return f"""{_model_block(card, baseline, profile_summary)}
+Its module-by-module kernels have plateaued ({why}).
+
+# Building blocks (verified kernels: reuse their device code, do not start from zero)
+{blocks_text}
+
+Budget: about {evaluations} evaluations.
+"""
+
+
+def _native_stable(python: str, toolchain: str) -> str:
+    """The stable prefix of every native engineer's prompt (:func:`stable_prefix`)."""
+    return f"""You are a systems-native inference engineer. The module-by-module kernels of the
+model (`# Model` in the first message) have plateaued. Rewrite part of its inference path
+natively: one stage, the stages of one loop iteration, or the whole generation loop, as a
+CUDA C++ / CuTe engine that keeps weights streaming, fuses across module boundaries and
+runs in one persistent kernel or a few launches instead of many.
 
 # Read first
 The skill `{skills.qualified("native-engines")}` (Skill tool; files in
@@ -1362,10 +1519,8 @@ the interface to the PyTorch model, correctness, integration) and in its `projec
 project layout and timing. For the kernels: `kernel-agent:cuda-kernels`,
 `kernel-agent:cute-dsl`, `kernel-agent:cuda-graphs-streams-pdl` (PDL, cooperative grids,
 streams). The template project `{EXAMPLES_DIR / "native_project"}` builds and passes the
-evaluator: copy it to start a project.
-
-# Building blocks (verified kernels: reuse their device code, do not start from zero)
-{blocks_text}
+evaluator: copy it to start a project. Reuse the device code of the building blocks
+(`# Building blocks` in the first message) rather than starting from zero.
 
 # Projects
 A project is a directory `<stage id>/` in your working directory (name it after the stage
@@ -1399,15 +1554,16 @@ stage with the most time left above its floor in a re-profile of your best run).
 the stage alone first (its target), then end to end on top of the accepted
 kernels (`kernels=[...]` from the list above).
 
-Budget: about {evaluations} evaluations; a native session is longer than a kernel session,
-so plan the engine, write it in several files, compile it with the CLI, then evaluate.
+A native session is longer than a kernel session, so plan the engine, write it in several
+files, compile it with the CLI, then evaluate.
 
 {COMMON_RULES}
 
 {_env_block(python, toolchain)}
 
 Finish with a summary: the stage, what the engine fuses, the measured stage and end-to-end
-speedups and what limits it now."""
+speedups and what limits it now.
+"""
 
 
 def research_prompt(
@@ -1424,7 +1580,31 @@ def research_prompt(
     """The research agent of a plateaued target: read-only, writes ``plan`` (``plan.md``)
     and, with ``pivot`` (near-lossless / relaxed runs), may propose a precision pivot there, to
     one of the reduced ``precisions`` the run allows (None: near-lossless's default, no 4-bit); with
-    ``dossier`` (the web tools on) it may also update the target's ``research.md``."""
+    ``dossier`` (the web tools on) it may also update the target's ``research.md``. Its whole
+    prompt: :func:`stable_prefix` then :func:`research_target`."""
+    return stable_prefix("research", "", toolchain) + research_target(
+        target,
+        capture_info,
+        evidence,
+        plan,
+        pivot=pivot,
+        dossier=dossier,
+        precisions=precisions,
+    )
+
+
+def research_target(
+    target: dict[str, Any],
+    capture_info: dict[str, Any],
+    evidence: str,
+    plan: Path,
+    *,
+    pivot: Path | None = None,
+    dossier: Path | None = None,
+    precisions: Iterable[str] | None = None,
+) -> str:
+    """The target block of a research prompt (#181): the target, the engineer's skills, the
+    evidence, the precision pivot it may propose and the files it may write."""
     cases = "\n".join(
         f"  * `{c['signature']}` — {c['count']} calls per run per instance"
         for c in capture_info.get("cases", [])
@@ -1436,22 +1616,33 @@ def research_prompt(
             f"`{skills.qualified(PRECISION_SKILLS.get(reduced, 'precision-tiers'))}`): "
             f"{target.get('precision_why', '')}\n"
         )
-    return f"""You are a senior GPU performance researcher, brought in with a clean context.
-The kernel engineer of the target below has plateaued. You do not know its reasoning:
-form your conclusions from the files and the ledger only. You do not write kernel
-code. You find out why progress stopped and write a plan for the next engineer
-session, which starts fresh with your plan, the ledger digest and `NOTES.md`.
-
-# Target `{target["id"]}`
+    return f"""# Target `{target["id"]}`
 * module class: `{target["module_class"]}` (instance captured: `{capture_info.get("qualname")}`)
 {_scope_lines(target)}* why it matters: {target.get("why", "")}
 * planner's approach: {target.get("approach", "")}
 * backends: {", ".join(target.get("backends", []))}
 {precision}* captured cases:
 {cases}
+* the engineer's skills (load one with the Skill tool when the diagnosis needs what it told
+  the engineer): {_target_skills(target, reduced)}
 {_workload_block(capture_info)}
 # Evidence
 {evidence}
+{_pivot_block(target, pivot, precisions)}
+# Write `{plan}`
+This file{" (and `pivot.json` above)" if pivot else ""} only{_besides(dossier)}: the \
+session cannot write anything else. In the layout of `# The plan`, with `<target id>` =
+`{target["id"]}`.
+"""
+
+
+def _research_stable(toolchain: str) -> str:
+    """The stable prefix of every research prompt (:func:`stable_prefix`)."""
+    return f"""You are a senior GPU performance researcher, brought in with a clean context.
+The kernel engineer of your target (`# Target` in the first message) has plateaued.
+You do not know its reasoning: form your conclusions from the files and the ledger only.
+You do not write kernel code. You find out why progress stopped and write a plan for the
+next engineer session, which starts fresh with your plan, the ledger digest and `NOTES.md`.
 
 # Read
 In your working directory: `NOTES.md` (the engineer's log and ideas),
@@ -1461,10 +1652,9 @@ evaluation: per-case times, errors, `sol_ms`, `pct_of_sol`, `bound`), `history/`
 (the evaluated snapshots: read the best one and those the ledger rows cite),
 `candidates/`, the previous `plan.md` if there is one, and `research.md` (the
 target's research dossier: findings from the documentation, with sources) if there is one.
-`best_result(target_id="{target["id"]}")` returns the per-idea aggregates.
-The engineer's skills (load one with the Skill tool when the diagnosis needs what it told
-the engineer): {_target_skills(target, reduced)}; `kernel-agent:profiling-and-roofline`
-explains the numbers of the records. Verified examples: `{EXAMPLES_DIR}`.
+`best_result(target_id=<your target's id>)` returns the per-idea aggregates.
+`kernel-agent:profiling-and-roofline` explains the numbers of the records. Verified
+examples: `{EXAMPLES_DIR}`.
 
 # Diagnose: pathology checklist
 Go through every item, say whether it applies and cite `exp` numbers:
@@ -1496,12 +1686,11 @@ bandwidth, compute or launch floor, from `sol_ms` and the profile) times the
 share of calls they cover. Recommend a pivot when the current design's ceiling
 is below another's, even if that one has no good number yet. An idea whose
 attempts all failed is untested, not refuted.
-{_pivot_block(target, pivot, precisions)}
-# Write `{plan}`
-This file{" (and `pivot.json` above)" if pivot else ""} only{_besides(dossier)}: the \
-session cannot write anything else. Layout:
+
+# The plan
+Write it to the file the first message names (`# Write`), in this layout:
 ```markdown
-# Plan: `{target["id"]}` after exp <N>
+# Plan: `<target id>` after exp <N>
 
 ## Diagnosis
 2-4 sentences with exp numbers; the checklist items that apply.
@@ -1532,7 +1721,8 @@ direction.
 ```
 {toolchain}
 ```
-{_gpu_block(toolchain)}"""
+{_gpu_block(toolchain)}
+"""
 
 
 def _besides(dossier: Path | None) -> str:

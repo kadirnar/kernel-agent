@@ -263,6 +263,7 @@ def make_orchestrator(tmp_path, monkeypatch, calls, *, sleep=0.0, costs=None, **
     async def fake_run_agent(name, *, cfg, system_append, cwd, result=None, **kwargs):
         result = result or AgentResult(name=name)
         calls.append({"name": name, "usd_cap": cfg.budget_usd_per_agent, "system": system_append})
+        calls[-1]["prompt"] = kwargs["prompt"]  # the budget note: in the first message (#181)
         result.session_id, result.turns = f"sess-{name}", 1
         try:
             await asyncio.sleep(sleep)
@@ -301,7 +302,7 @@ def test_agent_timeout_is_enforced(tmp_path, monkeypatch):
     assert time.monotonic() - t0 < 10  # 2 agents x 0.6 s, not 2 x 60 s
     assert [c["name"] for c in calls] == ["kernel-t1", "kernel-t2"]
     assert all(c.get("cancelled") for c in calls)
-    assert "about 1 min for this session" in calls[0]["system"]
+    assert "about 1 min for this session" in calls[0]["prompt"]
     costs = read_json(orch.run.root / "costs.json")
     assert costs["kernel-t1"]["timed_out"] and costs["kernel-t1"]["session_id"] == "sess-kernel-t1"
     assert costs["kernel-t1"]["turns"] == 1
@@ -324,7 +325,7 @@ def test_usd_budget_stops_new_agents_but_integrate_and_report_run(tmp_path, monk
 
     assert [c["name"] for c in calls] == ["kernel-t1"]  # t2 + systems skipped: $3.5 spent
     assert calls[0]["usd_cap"] == 2.0  # the agent itself is capped at what was left
-    assert "at most $2.00" in calls[0]["system"]
+    assert "at most $2.00" in calls[0]["prompt"] and "# Budget" not in calls[0]["system"]
     phases = orch.run.load()["phases"]
     assert [s["agent"] for s in phases["kernels"]["budget_skipped"]] == ["kernel-t2"]
     assert "USD budget spent" in phases["kernels"]["budget_skipped"][0]["reason"]

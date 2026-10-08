@@ -441,11 +441,14 @@ def make_orchestrator(tmp_path, monkeypatch, **cfg):
     active = [0, 0]  # now, most at once
     rng = iter(range(10_000))
 
-    async def fake_run_agent(name, *, cfg, system_append, cwd, mcp_server, result=None, **_):
+    async def fake_run_agent(
+        name, *, cfg, system_append, prompt, cwd, mcp_server, result=None, **_
+    ):
         target_id, worker = workers.parse_agent(name)
-        found = re.search(r"budget in this session: (\d+) evaluations", system_append)
+        text = f"{system_append}\n{prompt}"  # the role's part, then the session's (#181)
+        found = re.search(r"budget in this session: (\d+) evaluations", text)
         n = int(found[1]) if found else config.evaluations_per_target
-        sessions.append({"name": name, "cwd": cwd, "system": system_append, "evals": n})
+        sessions.append({"name": name, "cwd": cwd, "system": text, "evals": n})
         active[0] += 1
         active[1] = max(active)
         tools = {t.name: t for t in mcp_server}
@@ -578,7 +581,7 @@ def test_improve_slices_run_the_workers_of_a_target(tmp_path, sim):
     costs = read_json(run.root / "costs.json")
     assert f"kernel-{arm}-w1#{kernel_slices[0]['n']}" in costs
     # the second worker's digest is its own notes, the target's shared ledger
-    second = [x for x in world.sessions if x["name"] == f"kernel-{arm}-w2"][-1]["system"]
+    second = [x for x in world.sessions if x["name"] == f"kernel-{arm}-w2"][-1]["prompt"]
     assert "# Worker 2 of 2" in second and "| worker |" in second
 
 

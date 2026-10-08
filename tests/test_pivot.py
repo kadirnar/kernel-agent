@@ -141,7 +141,7 @@ def test_research_session_may_propose_a_pivot_in_near_lossless_runs(tmp_path):
         (kw,) = calls
         proposal = pivot.proposal_path(orch.run, "mlp")
         dossier = research.dossier_path(orch.run, "mlp")  # the web tools on (issue #125)
-        system = kw["system_append"]
+        system = kw["system_append"] + kw["prompt"]  # the role's part and the target's
         if quality == "exact":
             assert kw["writable"] == [research.plan_path(orch.run, "mlp"), dossier]
             assert "# Precision pivot" not in system and "pivot.json" not in system

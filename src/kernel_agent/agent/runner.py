@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -26,13 +27,13 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookEvent
 
-from kernel_agent import roles, skills
+from kernel_agent import roles
 from kernel_agent.agent import auth, web
 from kernel_agent.config import OptimizeConfig
 
-BASE_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite"]
-READ_TOOLS = ["Read", "Glob", "Grep"]
-WEB_TOOLS = ["WebFetch", "WebSearch"]
+BASE_TOOLS = list(roles.BASE_TOOLS)
+READ_TOOLS = list(roles.READ_TOOLS)
+WEB_TOOLS = list(roles.WEB_TOOLS)
 WRITE_TOOLS = "Write|Edit|MultiEdit|NotebookEdit"
 #: Set in every session (#126): no Claude Code auto memory, which would read and write the
 #: user's own ``~/.claude/projects/<repo>/memory/`` (lessons belong in library.py), and no
@@ -56,6 +57,14 @@ class AgentResult:
     api_key_source: str | None = None  # the init message's; "none" = no API key in use
     usage_limit: auth.UsageLimit | None = None  # the session stopped at a usage limit
     web: list[dict[str, Any]] = field(default_factory=list)  # WebFetch / WebSearch / doc_*
+    # Tokens (#181, roles.USAGE_KEYS): the session's main thread (ResultMessage.usage) and
+    # its first request (the first AssistantMessage's: what it read of a cache other sessions
+    # wrote), the model it ran on, and per model the tokens and USD of everything it ran
+    # (helpers, Claude Code's own calls; ResultMessage.model_usage)
+    model: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+    first_usage: dict[str, int] = field(default_factory=dict)
+    model_usage: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _log(msg: str) -> None:
@@ -160,23 +169,27 @@ async def run_agent(
     tools: list[str] | None = None,
     writable: list[Path] | None = None,
     resume: str | None = None,
+    role: str | None = None,
 ) -> AgentResult:
     """Run one agent session to completion.
 
     ``result`` is filled in place while messages arrive, so a caller that
     cancels the session (e.g. a timeout) still has its session id, turns and
     tool calls so far. Cancelling terminates the Claude Code subprocess.
-    ``tools`` replaces :data:`BASE_TOOLS` as the built-in tools the session has at
-    all; with ``writable`` the file-writing tools may touch only those files.
+    ``role`` (default: the one of ``name``, ``roles.role_of``) decides the session's tools
+    and helpers (``roles.options_for``; ``cfg``: the session's config, whose model, effort
+    and turns it runs on); ``tools`` replaces the role's built-in tools (None:
+    :data:`BASE_TOOLS` for most roles) as the ones the session has at all; with
+    ``writable`` the file-writing tools may touch only those files.
 
     A session that stops at a usage limit returns with ``usage_limit`` set instead of
-    raising (auth.py); ``resume`` (its session id) continues it, and the USD, turns and
-    seconds of ``result`` then add up over both runs. :class:`~kernel_agent.agent.auth.
+    raising (auth.py); ``resume`` (its session id) continues it, and the USD, tokens, turns
+    and seconds of ``result`` then add up over both runs. :class:`~kernel_agent.agent.auth.
     AuthError` stops a session whose API key source ``cfg.auth`` does not allow.
     """
-    builtin = list(BASE_TOOLS if tools is None else tools)
-    builtin += (WEB_TOOLS if cfg.allow_web else []) + list(extra_tools or [])
-    helpers = roles.subagents(name, web=cfg.allow_web)  # the role's delegates (#176)
+    role = roles.role_of(name) if role is None else role
+    fields = roles.options_for(role, cfg, tools=tools, mcp=mcp_tools, extra_tools=extra_tools or ())
+    helpers = fields["agents"] or {}  # the role's delegates (#176)
     options = ClaudeAgentOptions(
         system_prompt={
             "type": "preset",
@@ -185,23 +198,13 @@ async def run_agent(
         },
         cwd=str(cwd),
         add_dirs=[str(d) for d in (add_dirs or [])],
-        allowed_tools=builtin + mcp_tools + web.DOC_TOOLS,  # doc library: every session
         mcp_servers={"ka": mcp_server},
         permission_mode=cfg.permission_mode,  # type: ignore[arg-type]
-        model=cfg.claude_model,
-        max_turns=cfg.max_turns_per_agent,
         max_budget_usd=cfg.budget_usd_per_agent,
-        setting_sources=[],  # no user/project settings, hooks or CLAUDE.md files (#126)
-        plugins=[skills.plugin()],  # kernel-agent's skills, by explicit path (#176)
-        skills=skills.session_skills(),  # those (+ Workflow's): no other bundled or user skill
-        agents=helpers or None,
         env={**env, **SESSION_ENV},
         output_format=output_format,
+        **fields,  # model, effort, turns, tools, helpers, skills, no settings (roles.py)
     )
-    if cfg.effort:
-        options.effort = cfg.effort  # type: ignore[assignment]
-    if tools is not None:  # a restricted session: no other built-in tool exists at all
-        options.tools = [*builtin, "Skill", *(["Agent"] if helpers else [])]
     hooks = write_guard(writable, cwd) if writable is not None else {}
     hooks.setdefault("PreToolUse", []).append(claude_files_guard(cwd))
     options.hooks = hooks
@@ -214,6 +217,7 @@ async def run_agent(
         hooks["PreToolUse"].append(lookups.guard())
     result.is_error, result.usage_limit = False, None
     usd, turns_before, seconds = result.cost_usd, result.turns, result.seconds  # resumed: > 0
+    usage, by_model = dict(result.usage), dict(result.model_usage)  # resumed: a first run's
     watch = auth.LimitWatch()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"agent-{name}.jsonl"
@@ -234,6 +238,9 @@ async def run_agent(
                         if message.parent_tool_use_id is None:
                             turns.add(message.message_id or f"#{len(turns)}")
                             result.turns = turns_before + len(turns)
+                            result.model = result.model or message.model
+                            if not result.first_usage:  # the session's first request
+                                result.first_usage = roles.usage_of(message.usage)
                         for block in message.content:
                             if isinstance(block, ToolUseBlock):
                                 short = block.name.removeprefix("mcp__ka__")
@@ -254,6 +261,9 @@ async def run_agent(
                         if message.structured_output is not None:
                             result.structured = message.structured_output
                         result.cost_usd = usd + (message.total_cost_usd or 0.0)
+                        # so do the tokens (#181): the session so far, on top of a first run's
+                        result.usage = roles.add_usage(usage, roles.usage_of(message.usage))
+                        result.model_usage = _model_usage(by_model, message.model_usage)
                         result.turns = max(result.turns, turns_before + message.num_turns)
                         result.is_error = message.is_error
                         result.session_id = message.session_id
@@ -279,6 +289,30 @@ async def run_agent(
             f"{' (error)' if result.is_error else ''}"
         )
     return result
+
+
+#: ``ResultMessage.model_usage`` (camelCase, per model) → the names of ``roles.USAGE_KEYS``
+_MODEL_USAGE = {
+    "inputTokens": "input_tokens",
+    "cacheCreationInputTokens": "cache_creation_input_tokens",
+    "cacheReadInputTokens": "cache_read_input_tokens",
+    "outputTokens": "output_tokens",
+}
+
+
+def _model_usage(
+    before: dict[str, dict[str, Any]], raw: Mapping[str, Any] | None
+) -> dict[str, dict[str, Any]]:
+    """``before`` (a first run's, when resumed) plus a result's tokens and USD per model."""
+    out = {model: dict(counts) for model, counts in before.items()}
+    for model, counts in (raw or {}).items():
+        if not isinstance(counts, Mapping):
+            continue
+        row = out.setdefault(str(model), {})
+        for key, name in _MODEL_USAGE.items():
+            row[name] = row.get(name, 0) + int(counts.get(key) or 0)
+        row["usd"] = round(row.get("usd", 0.0) + float(counts.get("costUSD") or 0.0), 6)
+    return out
 
 
 def _write(log: IO[str], message: Message) -> None:

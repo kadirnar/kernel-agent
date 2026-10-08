@@ -354,7 +354,7 @@ def test_research_and_replan_offer_only_allowed_pivots(tmp_path):
         asyncio.run(orch.research("mlp", reason="plateau", label="research-mlp#3"))
         proposal = pivot.proposal_path(orch.run, "mlp")
         assert (proposal in seen[0]["writable"]) is offered
-        assert ("# Precision pivot" in seen[0]["system_append"]) is offered
+        assert ("# Precision pivot" in seen[0]["prompt"]) is offered  # the target's part
 
     improver = Improver(make(tmp_path / "ctx")[0], ImproveConfig(), require_capture=False)
     arms = improver.arms()

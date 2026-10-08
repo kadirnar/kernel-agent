@@ -1619,6 +1619,19 @@ def _interrupt_note(run: RunDir) -> Iterator[None]:
         raise
 
 
+def _role_overrides(cfg: OptimizeConfig) -> dict[str, Any]:
+    """The per-role models and efforts a resumed run takes over its own: those that differ
+    from the defaults (``--role-model`` / ``--role-effort``; ``roles.changed``)."""
+    from kernel_agent import roles
+    from kernel_agent.config import ROLE_EFFORTS, ROLE_MODELS
+
+    out: dict[str, Any] = {}
+    for key, defaults in (("role_models", ROLE_MODELS), ("role_efforts", ROLE_EFFORTS)):
+        if given := roles.changed(getattr(cfg, key), defaults):
+            out[key] = given
+    return out
+
+
 async def improve(
     ref: str,
     cfg: OptimizeConfig,
@@ -1669,6 +1682,7 @@ async def improve(
             **({"precisions": cfg.precisions} if cfg.precisions else {}),  # into run.json
             **({"native": cfg.native} if cfg.native != "plan" else {}),  # else the run's
             **({"native_minutes": cfg.native_minutes} if cfg.native_minutes else {}),
+            **_role_overrides(cfg),  # --role-model / --role-effort over the run's (#181)
         }
         orch = Orchestrator.resume(path, overrides)
     elif dry_run:

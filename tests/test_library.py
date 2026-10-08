@@ -230,8 +230,8 @@ def test_kernels_phase_seeds_and_prompts(tmp_path, monkeypatch, lib):
     capture(orch, "rmsnorm")
     systems = {}
 
-    async def agent(name, *, system_append, result=None, **_):
-        systems[name] = system_append
+    async def agent(name, *, system_append, prompt, result=None, **_):
+        systems[name] = prompt  # the target's part of the prompt: its first message (#181)
         return result or AgentResult(name=name)
 
     orch.agent_runner = agent
@@ -411,7 +411,7 @@ def test_librarian_distils_lessons_through_the_orchestrator(tmp_path, monkeypatc
     orch.agent_runner = agent
     asyncio.run(orch.librarian())
     assert seen["name"] == "librarian" and seen["cfg"].effort == "low"
-    assert seen["cfg"].claude_model == orch.cfg.claude_model
+    assert seen["cfg"].claude_model == "claude-sonnet-5-5"  # distillation: Sonnet (#181)
     assert seen["cfg"].max_turns_per_agent == 8
     assert seen["schema"]["schema"] == library.LESSONS_SCHEMA
     assert "fused rmsnorm kernel v2" in seen["system"] and "one program per row" in seen["system"]
@@ -431,9 +431,10 @@ def test_librarian_distils_lessons_through_the_orchestrator(tmp_path, monkeypatc
     orch.cfg.librarian = False  # --no-librarian
     asyncio.run(orch.librarian())
     assert seen == {}
-    orch.cfg.librarian, orch.cfg.librarian_model = True, "claude-haiku-4-5"
+    orch.cfg.librarian, orch.cfg.role_models["librarian"] = True, "claude-haiku-4-5"
     asyncio.run(orch.librarian())
     assert seen["cfg"].claude_model == "claude-haiku-4-5"
+    assert read_json(orch.run.root / "costs.json")["librarian"]["model"] == "claude-haiku-4-5"
 
 
 def test_report_runs_the_librarian_once(tmp_path, monkeypatch):

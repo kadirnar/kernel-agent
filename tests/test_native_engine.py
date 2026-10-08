@@ -457,8 +457,8 @@ def test_dry_run_reaches_the_native_arm_after_the_module_arms(tmp_path):
     kernels = {a.id for a in improver.arms() if a.kind == KERNEL}
     assert kernels <= set(arms[:first])  # every module arm had its slices first
     sessions = [s for s in world.sessions if s["name"] == "native"]
-    assert sessions and all("# Improve slice" in s["system"] for s in sessions)
-    assert "## Where the native engine stands" in sessions[0]["system"]
+    assert sessions and all("# Improve slice" in s["prompt"] for s in sessions)
+    assert "## Where the native engine stands" in sessions[0]["prompt"]
     assert "kernel-agent:native-engines" in sessions[0]["system"]
     rows = [r for r in ledger.rows(orch.run) if engine.is_native(r)]
     assert rows and all(r["snapshot"].split("_")[1] == "loop" for r in rows)
@@ -511,7 +511,7 @@ def test_dry_run_keeps_improving_after_the_plan_until_patience(tmp_path):
     notes = [s for s in state["slices"] if s.get("note")]
     assert notes and all(s["arm"] == NATIVE for s in notes)
     assert "now body (stage)" in notes[-1]["note"]
-    sessions = [s["system"] for s in world.sessions if s["name"] == "native"]
+    sessions = [s["prompt"] for s in world.sessions if s["name"] == "native"]
     later = [text for text in sessions if "## After the staged plan" in text]
     assert later and "[**focus**] **body**" in later[-1]
     assert "rounds/1/native/" in later[-1]

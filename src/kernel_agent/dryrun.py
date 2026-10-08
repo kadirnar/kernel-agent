@@ -475,7 +475,8 @@ class World:
             result.cost_usd = 0.8 + 1.2 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("kernel-"):
             target_id, worker = workers.parse_agent(name)
-            evals = self._kernel(target_id, system_append, worker=worker, bound=bound)
+            brief = f"{system_append}\n{prompt}"  # the digest: in the first message (#181)
+            evals = self._kernel(target_id, brief, worker=worker, bound=bound)
             result.cost_usd = 0.25 + 0.35 * evals * rng.uniform(0.8, 1.2)
         elif name.startswith("research-"):
             self._research(name.removeprefix("research-"), writable or [])
