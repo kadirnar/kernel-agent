@@ -94,8 +94,13 @@ same time.
   parts: the appended rows on their own, with the tier's checks and their own
   RMS, and the kept rows, which must stay bit for bit where the reference kept
   them (`compare.grown_dim`, `compare_grown`); compared whole, one wrong new row
-  of a 4096-token cache was 0.02 % of the elements. If `build()` hands back
-  the reference module unchanged, the candidate is rejected.
+  of a 4096-token cache was 0.02 % of the elements. A cache the call returns as
+  an updated copy of its input's shape (#206: a static or paged KV cache written
+  by a functional `index_copy` / `scatter`, the input left as it was: an output
+  equal to an input except for a box of written rows) likewise: the written box
+  on its own, the rest bit for bit (`compare.written_box`, `compare_written`).
+  If `build()` hands back the reference module unchanged, the candidate is
+  rejected.
 * **More than one KV length and one setting**: decode steps share their
   primary input while the KV cache grows, so `capture` runs the workload once
   to count them and keeps the **first, middle and last** decode step of every
@@ -642,6 +647,56 @@ modes. `tests/test_grown_cache.py` checks a synthetic decode step on the CPU, wi
 cache as a growing argument and as a returned tensor: wrong new rows are rejected by the
 evaluator, in the exact tier (a new key row x 1.2 passed every check before) and on
 every redrawn and scaled draw in both reduced modes, and honest FP8 weights pass
+near-lossless's x 0.01 check, which failed them before.
+
+**Written caches** (#206, `docs/research-scripts/same-shape-cache-206/`: `exploit.py`,
+`exploit.md`; `calibrate_written.py` runs the calibration above with such caches compared
+whole and in parts, `results.md`; `scan.md`). A cache a call returns as an updated copy of
+its input's shape (a static or paged KV cache written by a functional `index_copy` /
+`scatter`, the input left as it was) was still compared whole: one written row of a
+4096-slot cache of Qwen3's shape (`[1, 8, 4096, 128]`, or paged `[256, 16, 8, 128]`) is
+0.02 % of the elements, and written x 1.2, x 0.9 or 5x its exact tolerance off it passed
+all 14 (tier, bounds) verdicts, the exact tier's included. `compare.written_box` now takes
+an output for such a cache when it equals an input of its shape (NaN as NaN) except for a
+box of written rows: the indices along each dimension where an element differs span a
+whole dimension of more than one element (rows are vectors), cover at most half of the
+tensor, and the elements that differ fill at least 3/4 of that box (a residual add whose
+rounding leaves some elements as they were scatters them). `compare_written` then compares
+the box on its own (the tier's checks with its own RMS; on redrawn inputs an element's
+channel RMS is at least its channel's in the whole cache, as for grown caches) and requires
+the rest bit for bit. In both layouts the wrong rows are now rejected as grown caches' are:
+x 1.2 in 14 of 14 verdicts, x 0.9 in 12, 5x the exact tolerance in 9 (within the FP4
+tiers' budgets and relaxed-kv's redrawn one), a skipped write, the previous token's row,
+rotated KV heads, a write one slot late or also over the next slot in 14. On 15 captures of
+VoxCPM2 and Qwen3-0.6B (`scan.md`) no output is taken for a written cache (their caches are
+arguments; their residual outputs leave at most 0.88 % of the elements as the input had
+them), and the calibration above gives byte for byte #202's results (the Qwen3 decoder
+layer, the VoxCPM2 LocDiT and base-LM layers). The Qwen3 decoder layer with a returned
+static cache (`static_layer.py`: the captured layer, weights and inputs, its cache in the
+first half of a static one, the token written at the next slot; outputs bit-identical to
+the `DynamicCache` call's) shows #202's effect (failed draws, near-lossless · relaxed,
+before → after):
+
+| numerics | x 3 / x 0.01 / x −1 inputs (12) | max element ratio there | redrawn inputs (80) |
+|---|---|---|---|
+| FP8 weights | 4 · 3 → **0 · 0** | 2.31 / 1.30 → 0.24 / 0.13 | 8 · 0 → 9 · 0 |
+| FP8 W8A8 | 6 · 4 → **2 · 0** | 3.14 / 1.68 → 0.40 / 0.29 | 63 · 3 → 63 · 4 |
+| MXFP8 | 5 · 4 → **1 · 0** | 3.95 / 2.06 → 0.39 / 0.26 | 68 · 4 → 68 · 6 |
+| NVFP4 weights (FP4 tiers) | 4 · 4 → **0 · 0** | 2.55 / 2.16 → 0.27 / 0.25 | 0 · 0 → 0 · 0 |
+| MXFP4 weights (FP4 tiers) | 4 · 4 → **0 · 0** | 3.17 / 2.64 → 0.31 / 0.26 | 5 · 1 → 6 · 1 |
+| INT8 weights | 1 · 0 → **0 · 0** | 1.02 / 0.51 → 0.10 / 0.05 | 0 · 0 → 0 · 0 |
+| INT8 W8A8 | 4 · 3 → **0 · 0** | 2.50 / 1.39 → 0.31 / 0.17 | 4 · 0 → 4 · 0 |
+
+The captured inputs pass (0 of 4). At x 0.01 the static cache's old rows are scaled and the
+new V row is not, so compared whole the cache's RMS bounded the new row's noise (the
+relaxed tier failed too: a static cache's unused slots are zeros). The written rows' own
+norm checks add a few redrawn failures of the noisiest numerics, as for grown caches (FP8
+W8A8 at decode: the key row's norm x 1.079 against relaxed's 6 %). Every broken variant is
+still rejected in both modes. `tests/test_written_cache.py` checks the detection (rows,
+paged slots, a residual add that keeps most elements of a short output is not a write) and a
+synthetic decode step returning a static cache on the CPU: wrong written rows are rejected
+by the evaluator in the exact tier (a written key row x 1.2 passed every check before) and
+on every redrawn and scaled draw in both reduced modes, and honest FP8 weights pass
 near-lossless's x 0.01 check, which failed them before.
 
 **Allowed precisions** (`--precisions`, `kernel_agent/precisions.py`). A run lists
