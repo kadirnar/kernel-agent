@@ -1307,6 +1307,19 @@ tests), adds tests and is independently useful.
 * Optional `submit_evaluation` / `evaluation_result` tools, so one agent can write its
   next candidate while the previous one is queued. This needs new advice semantics.
 * Optional shared correctness leases with memory admission and quick-check batching.
+* As built (#191, `governor.py`): the objective is the run's wall-clock speed, never cost
+  (USD bounds k only with `--max-usd`). `k_gpu` is the knee `⌈1 + Z/S⌉` plus one, with Z
+  from `sessions.Observer.work` and S from every GPU hold (the re-integration's A/B steps
+  too). Each window's k is AIMD on `u + n(k)·s·H` (its reset or the run's end, whichever
+  is first), with the rise per session-second measured from the events' `unifiedWindows`
+  and `n(k)` from the measured occupancy of the allowed slots: up by one after a quiet
+  15 min while `p(k + 1)` ≤ 95 %, held between 95 and 100 %, and only once the window would
+  run out down to what fits under 95 % (at least halved far over it or on a rejection).
+  The model windows bind only their model's sessions; a host-memory term
+  (`host_memory`) bounds k too. The async tools are behind `--async-evals`; the advice
+  comes with `evaluation_result`, one evaluation in flight per session, the session's
+  clock stops only while it collects (`gpuqueue.Job.attach`). The shared leases are not
+  done. Dry-run evidence: `docs/research-scripts/agents-191/`.
 
 ---
 

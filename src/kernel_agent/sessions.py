@@ -65,7 +65,7 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from kernel_agent import gpuqueue, interrupt, ledger
+from kernel_agent import gpuqueue, interrupt, ledger, roles
 from kernel_agent.roles import MCP_PREFIX
 from kernel_agent.workspace import RunDir, append_jsonl, read_json
 
@@ -92,6 +92,7 @@ PART = {
     IDLE: "idle",
 }
 PARTS = ("model", "gpu", "queued", "eval", "tools", "idle")  # the order the views show
+WORK = ("model", "eval", "tools")  # a session's work off the GPU (governor.py: Z)
 TITLES = {
     "model": "model",
     "gpu": "GPU held",
@@ -109,10 +110,17 @@ GPU_TOOLS = frozenset(
         "check_harness",
         "verify_rewrite",
         "run_on_gpu",
+        "submit_evaluation",
+        "evaluation_result",
     }
 )
 #: ... and those whose call is an evaluation (a ledger row; not with ``mode="quick"``)
-EVAL_TOOLS = frozenset({"evaluate_candidate", "sweep_candidate", "evaluate_e2e"})
+EVAL_TOOLS = frozenset(
+    {"evaluate_candidate", "sweep_candidate", "evaluate_e2e", "submit_evaluation"}
+)
+#: the tool that waits for a submitted evaluation (--async-evals): while it runs, the GPU
+#: states of the session's detached jobs are its own (before, the session works meanwhile)
+COLLECT_TOOL = "evaluation_result"
 HELPER_TOOLS = frozenset({"Agent", "Task"})  # a subagent's work: model time
 FILE = "sessions.jsonl"  # in the run directory
 EVENT_S = 600.0  # a session's session_state events in events.jsonl: at most one per this long
@@ -212,6 +220,7 @@ class Tracker:
         self._turn = STARTING  # the state outside its tools and GPU jobs
         self._tools: dict[str, tuple[str, str, bool]] = {}  # id -> (state, name, an evaluation)
         self._jobs: dict[Any, tuple[str, str]] = {}  # GPU job id -> (QUEUED / ON_GPU, detail)
+        self._detached: set[Any] = set()  # of those, its submitted evaluations' (--async-evals)
         self._lock = threading.Lock()
         self._ids = itertools.count(1)
 
@@ -289,16 +298,22 @@ class Tracker:
                 self._jobs[job] = (ON_GPU, str(event.get("kind") or ""))
             elif self._jobs.pop(job, None) is None:
                 return
+            if event.get("detached"):  # a submitted evaluation: its own only when collected
+                self._detached.add(job)
+            if state not in ("queued", "start"):
+                self._detached.discard(job)
         ts = event.get("ts")
         self._update(now=float(ts) if isinstance(ts, int | float) else None)
 
     # -------------------------------------------------------- state
 
     def _resolve(self) -> tuple[str, str]:
-        """The most specific of what it does (under the lock)."""
+        """The most specific of what it does (under the lock). A submitted evaluation's GPU
+        job (``detached``) is what the session does only while it waits for its result."""
+        collecting = any(name == COLLECT_TOOL for _, name, _ in self._tools.values())
         for want in (ON_GPU, QUEUED):
-            for state, detail in self._jobs.values():
-                if state == want:
+            for job, (state, detail) in self._jobs.items():
+                if state == want and (collecting or job not in self._detached):
                     return state, detail
         for want in (EVALUATING, TOOL, HELPER):
             for state, name, _ in self._tools.values():
@@ -430,6 +445,7 @@ class Observer:
         self._saved = -math.inf  # the loop's time of the last save
         self._dirty = False
         self._recovered = False
+        self._worked = 0.0  # the work off the GPU of the ended sessions of GPU roles (WORK)
 
     def now(self) -> float:
         return ledger.clock()  # the run's clock (a dry run's simulated one)
@@ -511,6 +527,8 @@ class Observer:
         with self._lock:
             if self.trackers.get(tracker.label) is tracker:
                 del self.trackers[tracker.label]
+            if roles.get(tracker.role).needs_gpu:
+                self._worked += sum(float(record["split"].get(part) or 0.0) for part in WORK)
         fields = {k: v for k, v in record.items() if k not in ("ts", "label", "state")}
         ledger.event(
             self.run, "session_state", when=record["ts"], label=tracker.label, state=ENDED, **fields
@@ -521,6 +539,19 @@ class Observer:
     def _write(self, record: dict[str, Any]) -> None:
         with contextlib.suppress(OSError):  # a record: it never fails the session
             append_jsonl(self.run.root / FILE, record)
+
+    def work(self) -> float:
+        """Seconds the sessions of the roles that need the GPU (``RoleSpec.needs_gpu``) have
+        worked off the GPU so far (:data:`WORK`: model, evaluations' own steps, own runs), the
+        ended ones and the open ones (``governor.py``: Z, the work per evaluation)."""
+        now = self.now()
+        with self._lock:
+            trackers, worked = list(self.trackers.values()), self._worked
+        for tracker in trackers:
+            if roles.get(tracker.role).needs_gpu:
+                split = tracker.snapshot(now)["split"]
+                worked += sum(float(split.get(part) or 0.0) for part in WORK)
+        return worked
 
     # -------------------------------------------------------- the improve loop
 
@@ -1198,10 +1229,10 @@ def report_lines(run: RunDir) -> list[str]:
         "| role | sessions | hours | " + " | ".join(heads) + " | evaluations | per session-hour |",
         "|---|---:|---:|" + "---:|" * len(PARTS) + "---:|---:|",
     ]
-    roles = sorted(
+    ordered = sorted(
         {s.role for s in sessions}, key=lambda r: -sum(x.seconds() for x in sessions if x.role == r)
     )
-    for role in [*roles, None]:
+    for role in [*ordered, None]:
         mine = [s for s in sessions if role is None or s.role == role]
         split = total_split(mine)
         total = sum(split.values())

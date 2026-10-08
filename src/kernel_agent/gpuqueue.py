@@ -105,6 +105,7 @@ _current: ContextVar[Job | None] = ContextVar("kernel_agent_gpu_job", default=No
 _session: ContextVar[SessionClock | None] = ContextVar("kernel_agent_session", default=None)
 _ids = itertools.count(1)
 _account = threading.Lock()
+_attach = threading.Lock()  # a job's waiting and its session clock (Job.attach)
 _listeners: list[Callable[[dict[str, Any]], None]] = []
 
 
@@ -141,6 +142,10 @@ class Job:
     holds: int = 0
     withdrawn: bool = False
     front: bool = False  # its next wait: first of its class (a dirty measurement's re-run)
+    # an evaluation its session submitted and does not wait for (submit_evaluation, #191):
+    # its waits stop the session's clock only once the session waits for it (attach)
+    detached: bool = False
+    waiting: bool = False  # it waits for the GPU now (under _attach)
 
     @classmethod
     def of(
@@ -152,11 +157,14 @@ class Job:
         job_class: str | None = None,
         exclusive: bool = True,
         mem_gb: float | None = None,
+        detached: bool = False,
     ) -> Job:
         """A job of ``kind`` of this context: its session (the agent session whose tool
-        call this is) and the job it is tagged inside of, if any (:func:`tagged`)."""
+        call this is) and the job it is tagged inside of, if any (:func:`tagged`). A
+        ``detached`` job is its session's, but its waits are not (:meth:`attach`)."""
         outer, clock = current(), _session.get()
         clock = clock or (outer.clock if outer else None)
+        detached = detached or (outer is not None and outer.detached)
         return cls(
             kind=kind,
             job_class=job_class or KINDS.get(kind, KINDS[DEFAULT])[0],
@@ -167,7 +175,8 @@ class Job:
             mem_gb=mem_gb if mem_gb is not None else memory_gb(run, kind),
             exclusive=exclusive,
             parent=outer,
-            clock=clock,
+            clock=None if detached else clock,
+            detached=detached,
         )
 
     def requeue(self) -> None:
@@ -178,6 +187,32 @@ class Job:
     def withdraw(self) -> None:
         """Its caller is gone: if it still waits, it leaves the queue (:class:`Withdrawn`)."""
         self.withdrawn = True
+
+    def attach(self, clock: SessionClock | None) -> None:
+        """Its session waits for it from now on (``evaluation_result``): its waits for the GPU
+        stop ``clock`` (the one it waits now too)."""
+        if clock is None:
+            return
+        with _attach:
+            if self.clock is not None:
+                return
+            self.clock = clock
+            if self.waiting:
+                clock.pause()
+
+    def _blocked(self) -> None:
+        """It starts waiting for the GPU (``Wait.block``)."""
+        with _attach:
+            self.waiting = True
+            if self.clock is not None:
+                self.clock.pause()
+
+    def _unblocked(self) -> None:
+        """It stops waiting (``Wait``)."""
+        with _attach:
+            if self.waiting and self.clock is not None:
+                self.clock.resume()
+            self.waiting = False
 
     def add(self, *, wait: float = 0.0, hold: float = 0.0, holds: int = 0) -> None:
         """Account a wait / hold to this job and the jobs it is tagged inside of."""
@@ -567,15 +602,14 @@ class Wait:
         if self.blocked:
             return
         self.blocked = True
-        if self.job.clock is not None:
-            self.job.clock.pause()
+        self.job._blocked()
         _event(self.job, "queued", estimate_s=round(self.job.estimate_s, 1))
 
     def _end_wait(self) -> None:
         self.waited = clock() - self.t0
         self.job.add(wait=self.waited)
-        if self.blocked and self.job.clock is not None:
-            self.job.clock.resume()
+        if self.blocked:
+            self.job._unblocked()
 
     def started(self, gpu: int) -> None:
         """It holds GPU ``gpu`` now."""
@@ -625,6 +659,7 @@ def _event(job: Job, state: str, **data: Any) -> None:
         **({"session": job.session} if job.session else {}),
         **({"target": job.target} if job.target else {}),
         **({"shared": True} if not job.exclusive else {}),
+        **({"detached": True} if job.detached else {}),
         **data,
     }
     if job.run is not None:

@@ -2107,6 +2107,32 @@ new best (`winner`), each integration and round, and the modules each running se
 on (`claim` / `release`).{_BOARD_ROLE[role]}"""
 
 
+def async_note() -> str:
+    """``# Evaluations in flight`` section of a session with ``submit_evaluation`` /
+    ``evaluation_result`` (``improve --async-evals``, issue #191): what they do and the advice
+    semantics. The same for every session that has them (the stable prefix)."""
+    return """
+
+# Evaluations in flight (submit_evaluation / evaluation_result)
+The GPU is shared, so a full evaluation may wait for it. `submit_evaluation` takes the same
+arguments as `evaluate_candidate` and returns as soon as your candidate is snapshotted and
+reviewed, with a `ticket`: the evaluation then waits for the GPU, runs and is recorded while
+you write your next candidate. Then:
+* `evaluation_result` (the ticket) waits for it and returns exactly what `evaluate_candidate`
+  would have: the measurement, its ledger row, idea feedback, best so far and the advice. The
+  advice counts that evaluation; follow it before you submit the next one (`stop`: do not
+  evaluate the candidate you wrote meanwhile, write it into your open ideas).
+* One evaluation in flight per session: collect it before you submit another or run a full
+  `evaluate_candidate`; a `mode="quick"` check of your next candidate may run meanwhile. A
+  result known at once (the same source as before, a critic's reject, an input error) comes
+  back from `submit_evaluation` itself, with no ticket.
+* An evaluation counts as used when you submit it (`evaluations_left`). Your clock runs while
+  you work and stops only while `evaluation_result` waits for the GPU. One still in flight when
+  your session ends is still measured and recorded as yours.
+Use it when the next candidate does not depend on the result; when it does, evaluate_candidate
+is the same thing without the ticket."""
+
+
 def dossier_prompt(
     target: dict[str, Any], capture_info: dict[str, Any], dossier: Path, toolchain: str
 ) -> str:

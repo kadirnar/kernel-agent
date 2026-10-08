@@ -11,7 +11,8 @@ import shutil
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,71 @@ QUICK_NOTE = (
 )
 # (run, target, source key) of evaluations in flight: the same source waits for the first one
 _inflight: dict[tuple[str, str, str], asyncio.Event] = {}
+ASYNC_TOOLS = ("submit_evaluation", "evaluation_result")  # --async-evals (issue #191)
+ASYNC_NEXT = (
+    "Write your next candidate now; then call evaluation_result with this ticket and follow "
+    "its advice before you submit the next (stop: do not evaluate the one you wrote, write it "
+    "into your open ideas)."
+)
+
+
+@dataclass(eq=False)
+class Ticket:
+    """An evaluation a session submitted (``submit_evaluation``, ``--async-evals``): the task
+    that runs ``evaluate_candidate`` for it, its GPU job (detached: its waits are not the
+    session's until it collects it) and ``ready``, set once its candidate is snapshotted and
+    reviewed (the agent may edit the file from then on)."""
+
+    id: str
+    candidate: str
+    task: asyncio.Task[dict[str, Any]] | None = None
+    job: gpuqueue.Job | None = None
+    snapshot: str | None = None
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class Tickets:
+    """The evaluations one session submitted and has not collected (at most one)."""
+
+    def __init__(self) -> None:
+        self.open: dict[str, Ticket] = {}
+        self._n = 0
+
+    def new(self, candidate: str) -> Ticket:
+        self._n += 1
+        ticket = Ticket(f"e{self._n}", candidate)
+        self.open[ticket.id] = ticket
+        return ticket
+
+    def pending(self) -> Ticket | None:
+        return next(iter(self.open.values()), None)
+
+    def get(self, ticket: Any) -> Ticket | None:
+        """The ticket ``ticket`` names (empty: the one in flight)."""
+        return self.open.get(str(ticket).strip()) if ticket else self.pending()
+
+    def drop(self, ticket: Ticket) -> None:
+        self.open.pop(ticket.id, None)
+
+
+# (run, session label) -> its submitted evaluations; the ticket evaluate_candidate runs for
+_tickets: dict[tuple[str, str], Tickets] = {}
+_ticket: ContextVar[Ticket | None] = ContextVar("kernel_agent_ticket", default=None)
+
+
+def tickets_of(run: RunDir, label: str) -> Tickets:
+    """The submitted evaluations of session ``label`` (one object over its resumed runs)."""
+    return _tickets.setdefault((str(run.root), label), Tickets())
+
+
+async def settle(run: RunDir, label: str) -> int:
+    """Session ``label`` ended: wait for the evaluations it submitted and never collected, so
+    they are measured and recorded as its own (``Orchestrator._agent``); returns how many."""
+    found = _tickets.pop((str(run.root), label), None)
+    tasks = [t.task for t in (found.open.values() if found else []) if t.task is not None]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return len(tasks)
 
 
 @dataclass(frozen=True)
@@ -597,16 +663,21 @@ def build_server(
     keeper: Truth | None = None,
     binding: SessionBinding | None = None,
     env: dict[str, str] | None = None,
+    *,
+    async_evals: bool = False,
 ) -> Any:
     """Tools bound to one run directory (its budget: eval timeout + advice; its truth) and
     to one agent session (:class:`SessionBinding`: its label, worker directory, the name its
     budget advice is kept under, its evaluation budget and working directory). Build one
     server per session (``Orchestrator._agent``); ``env``: the session's environment
-    (``runner.agent_env``), the one ``run_on_gpu`` runs its scripts in."""
+    (``runner.agent_env``), the one ``run_on_gpu`` runs its scripts in; ``async_evals``
+    (``improve --async-evals``, issue #191): also ``submit_evaluation`` /
+    ``evaluation_result``."""
     budget = budget or Budget(run)
     keeper = keeper or truth.of(run)
     bound = binding or SessionBinding()
     cwd, session = bound.cwd, bound.label or None
+    tickets = tickets_of(run, bound.label)  # its submitted evaluations (--async-evals)
     # the run's blackboard (board.py, #187): the subscription of a session of a role with the
     # board; what is on it now is in its digest, what is posted later rides on its results
     posts = board.active(run)
@@ -803,6 +874,16 @@ def build_server(
         if mode not in (dedup.FULL, dedup.QUICK):
             return _text({"status": "error", "error": f'mode is "full" or "quick", not {mode!r}'})
         quick = mode == dedup.QUICK
+        ticket = _ticket.get()  # submitted (submit_evaluation): this runs as its task
+        if ticket is None and not quick and (flying := tickets.pending()) is not None:
+            return _text(
+                {
+                    "status": "error",
+                    "error": f"evaluation {flying.id} ({flying.candidate}) is in flight: collect "
+                    "it with evaluation_result first (one full evaluation at a time; a "
+                    'mode="quick" check may run meanwhile)',
+                }
+            )
         idea = ledger.idea_slug(args.get("idea_id"))
         expected = _expected(args.get("expected_speedup"))
         name, evals_budget = bound.kernel_agent(target_id), bound.evaluations
@@ -838,7 +919,8 @@ def build_server(
             snap = snapshot(run, src, target_id)
             snap_sha256 = sha256_file(snap)
             start = time.perf_counter()
-            job = gpuqueue.Job.of(run, "quick" if quick else "eval", target_id)
+            kind = "quick" if quick else "eval"
+            job = gpuqueue.Job.of(run, kind, target_id, detached=ticket is not None)
             if not quick:  # the critic (critic.py, #188): static checks now, a model's while
                 # the job queues (critic.during)
                 review = await _review(
@@ -855,6 +937,9 @@ def build_server(
             if critic.blocks(review):  # a static reject: withdrawn before it is queued
                 uncounted = _uncounted(budget, name, evals_budget)
                 return _withdrawn(review, uncounted | _best_so_far(target_id))
+            if ticket is not None:  # submitted: the agent goes on (submit_evaluation returns)
+                ticket.job, ticket.snapshot = job, f"history/{snap.name}"
+                ticket.ready.set()
             # a project compiles outside the GPU lock first: a compiler error is its result
             result = await asyncio.to_thread(_prebuilt, snap)
             if result is None:
@@ -942,6 +1027,101 @@ def build_server(
             pct_of_sol=sol_signal(result),
         )
         return _text(out | _news())
+
+    schema = dict(evaluate_candidate.input_schema)  # type: ignore[arg-type]
+    schema["properties"] = {k: v for k, v in schema["properties"].items() if k != "mode"}
+
+    @tool(
+        "submit_evaluation",
+        "evaluate_candidate (full) without waiting: returns once the candidate is snapshotted "
+        "and reviewed, with a ticket; the evaluation then waits for the GPU, runs and is "
+        "recorded while you write your next candidate. Collect it with evaluation_result, whose "
+        "result has the advice; one evaluation in flight per session. A result known at once "
+        "(the same source as before, a critic's reject, an error) comes back here, no ticket.",
+        schema,
+    )
+    async def submit_evaluation(args: dict[str, Any]) -> dict[str, Any]:
+        if str(args.get("mode") or dedup.FULL).strip().lower() == dedup.QUICK:
+            return _text(
+                {
+                    "status": "error",
+                    "error": 'a quick check is not submitted: evaluate_candidate(mode="quick") '
+                    "runs it now, also while an evaluation is in flight",
+                }
+            )
+        if (flying := tickets.pending()) is not None:
+            return _text(
+                {
+                    "status": "error",
+                    "error": f"evaluation {flying.id} ({flying.candidate}) is in flight: collect "
+                    "it with evaluation_result first (one evaluation in flight per session)",
+                }
+            )
+        ticket = tickets.new(str(args.get("candidate") or ""))
+
+        async def evaluation() -> dict[str, Any]:
+            return await evaluate_candidate.handler({**args, "mode": dedup.FULL})
+
+        token = _ticket.set(ticket)  # the task's context: evaluate_candidate runs for it
+        try:
+            task = asyncio.create_task(evaluation())
+        finally:
+            _ticket.reset(token)
+        ticket.task = task
+        ready = asyncio.ensure_future(ticket.ready.wait())
+        try:
+            await asyncio.wait({task, ready}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            ready.cancel()
+        if not ticket.ready.is_set():  # its result now (a duplicate, an error, a reject)
+            tickets.drop(ticket)
+            return await task
+        name = bound.kernel_agent(str(args.get("target_id")))
+        left = None
+        if bound.evaluations is not None:  # this one counts as used
+            left = max(bound.evaluations - budget.evals.get(name, 0) - 1, 0)
+        out = {
+            "ticket": ticket.id,
+            "state": "submitted",
+            "snapshot": ticket.snapshot,
+            "expected_wait_s": round(gpuqueue.expected_wait(gpuqueue.EVAL)),
+            "evaluations_left": left,
+            "next": ASYNC_NEXT,
+        }
+        return _text(out | _news())
+
+    @tool(
+        "evaluation_result",
+        "The result of an evaluation you submitted (submit_evaluation): waits until it is "
+        "measured and recorded, and returns what evaluate_candidate would have, its advice "
+        "included. Your clock stops while it waits for the GPU, as in evaluate_candidate.",
+        {
+            "type": "object",
+            "properties": {
+                "ticket": {
+                    "type": "string",
+                    "description": "the ticket submit_evaluation returned (default: the one in "
+                    "flight)",
+                }
+            },
+        },
+    )
+    async def evaluation_result(args: dict[str, Any]) -> dict[str, Any]:
+        ticket = tickets.get(args.get("ticket"))
+        if ticket is None or ticket.task is None:
+            what = f"no evaluation {args['ticket']}" if args.get("ticket") else "none"
+            return _text({"status": "error", "error": f"{what} in flight (submit_evaluation)"})
+        if ticket.job is not None:  # its waits for the GPU are the session's from now on
+            ticket.job.attach(gpuqueue.session())
+        try:  # shielded: a session that stops waiting leaves it running (settle)
+            out = await asyncio.shield(ticket.task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # the evaluation itself failed: an error result, no ticket
+            tickets.drop(ticket)
+            return _text({"status": "error", "error": f"evaluation {ticket.id}: {exc!r}"[:500]})
+        tickets.drop(ticket)
+        return out
 
     @tool(
         "sweep_candidate",
@@ -1375,6 +1555,8 @@ def build_server(
     ]
     if reader is not None:  # a session of a role with the board (board.ROLES)
         tools += [post_note, read_board]
+    if async_evals:  # --async-evals (issue #191)
+        tools += [submit_evaluation, evaluation_result]
     return create_sdk_mcp_server(SERVER_NAME, version="0.1.0", tools=tools)
 
 
