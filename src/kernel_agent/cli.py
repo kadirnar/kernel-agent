@@ -175,6 +175,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         ab_min_win_rate=ns.ab_min_win_rate,
         ab_min_gain=ns.ab_min_gain,
         recheck=not ns.no_recheck,
+        export_check=not ns.no_export_check,
         quality=ns.quality,
         precisions=ns.precisions,
         use_library=not ns.no_library,
@@ -556,6 +557,11 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         "--no-recheck",
         action="store_true",
         help="integration: do not re-check kernels on fresh inputs in separate processes",
+    )
+    p.add_argument(
+        "--no-export-check",
+        action="store_true",
+        help="integration: do not self-test optimized/ in a fresh process outside the run",
     )
     p.add_argument(
         "--quality",

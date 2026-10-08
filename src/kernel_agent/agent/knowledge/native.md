@@ -83,6 +83,15 @@ native stage owns the modules it replaces: module kernels inside it are its alte
 (a CUDA graph around it) still composes. Make a stage engine a drop-in for the stage's
 module so the rest of the accepted set keeps applying.
 
+A transform that builds on an evaluated engine (speculative decoding around a decode-step
+engine, say) loads that engine's bundle by its snapshot name:
+`artifacts.load("NNN_<project>_<sha8>.py")` (`from kernel_agent import artifacts`; it looks
+next to the calling file, in its `history/`, `../history/` and `..`). Never load a run file
+by an absolute path, relative to the run directory or from the project directory: the
+export copies what an accepted item loads through `artifacts` (or names in a string
+literal) into `optimized/`, and its self-test applies the package in a fresh process that
+cannot read the run directory.
+
 ## Projects
 
 ```
