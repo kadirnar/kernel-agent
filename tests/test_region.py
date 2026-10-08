@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 import toy_decoder
+from fake_clock import Clock
 from test_truth import force_write, sealed_run, tamper_events
 from toy_decoder import (
     FUSED_CANDIDATE,
@@ -44,6 +45,7 @@ from kernel_agent.agent.tools import record_candidate, snapshot
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.kernels.evaluate import evaluate
 from kernel_agent.profiling.capture import capture_calls, load_capture
+from kernel_agent.workloads import base
 from kernel_agent.workloads.base import WorkloadSpec
 from kernel_agent.workspace import append_jsonl, read_json, write_json
 
@@ -202,7 +204,7 @@ def _call_worker(capsys):
         out = capsys.readouterr().out
         line = [x for x in out.splitlines() if x.startswith(worker.MARKER)][-1]
         result = json.loads(line[len(worker.MARKER) :])
-        if command == "e2e_ab" and result.get("ab"):  # CPU timings are noise: B is 2x faster
+        if command == "e2e_ab" and result.get("ab"):  # every run takes 1 ms: B is 2x faster
             result["ab"]["b_ms"] = [t / 2 for t in result["ab"]["b_ms"]]
         return result
 
@@ -215,21 +217,13 @@ def _orchestrator(tmp_path, capsys, rewrite: str | None):
     spec = WorkloadSpec(
         repo_id="toy/decoder", modality="llm", device="cpu", dtype="float32", harness=str(TOY)
     )
-    # This tests the pipeline wiring; whether the fused kernel wins a paired A/B on a
-    # CPU toy is timing noise under load, so any quality-passing item is accepted.
-    cfg = OptimizeConfig(
-        model_ref="toy/decoder",
-        runs_dir=tmp_path,
-        use_library=False,
-        ab_min_win_rate=0.0,
-        ab_min_gain=-1.0,
-    )
+    cfg = OptimizeConfig(model_ref="toy/decoder", runs_dir=tmp_path, use_library=False)
     run = sealed_run(tmp_path, workload=spec.to_dict(), config=cfg.to_dict())
     orch = orchestrator.Orchestrator(run, cfg)
     orch.worker = _call_worker(capsys)
     baseline = orch._worker("analyze", "--no-profile", "--iters", "1")
     assert baseline["deterministic"], baseline
-    # CPU timings are noise: a long recorded baseline lets integration keep what passes
+    # a long recorded baseline: the integration's own A/B decides what it keeps
     orch.truth.seal_baseline(1e6)
     sessions = []
 
@@ -258,9 +252,13 @@ def _target():
     return target
 
 
-def test_region_target_end_to_end(tmp_path, capsys, cpu):
+def test_region_target_end_to_end(tmp_path, capsys, cpu, monkeypatch):
     """Parent capture → refactor (fake agent) → verified rewrite → region capture →
     a fused candidate → integration (rewrite + kernel) → optimized/apply.py."""
+    # The worker's timed runs take 1 ms of simulated time each (the integration's paired
+    # A/B under its default rule, the memoisation probe): real CPU timings of the toy on a
+    # busy machine decided whether the fused kernel was kept.
+    monkeypatch.setattr(base, "time", Clock(tick=1e-3))
     orch, sessions = _orchestrator(tmp_path, capsys, GOOD_REWRITE)
     run, keeper = orch.run, orch.truth
     assert asyncio.run(orch.capture_targets([_target()])) == [TID]

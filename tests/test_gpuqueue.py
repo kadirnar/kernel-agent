@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import pytest
+from fake_clock import Clock
 
 from kernel_agent import gpulock, gpuqueue, ledger, scheduler
 from kernel_agent.agent import tools as tools_mod
@@ -20,6 +21,7 @@ from kernel_agent.budget import Budget
 from kernel_agent.workspace import RunDir, read_jsonl
 
 POOL_ENV = (gpulock.ENV, gpulock.GPUS_ENV, gpulock.INDEX_ENV, "CUDA_VISIBLE_DEVICES")
+TIMEOUT = 60  # seconds a thread waits for the test's next step (never reached when it works)
 
 
 @pytest.fixture(autouse=True)
@@ -47,7 +49,7 @@ def job(kind="eval", job_class=None, estimate=10.0, session=None, **kw):
     )
 
 
-def until(predicate, timeout=10.0):
+def until(predicate, timeout=TIMEOUT):
     deadline = time.monotonic() + timeout
     while not predicate():
         assert time.monotonic() < deadline, "timed out"
@@ -76,14 +78,35 @@ class Holder:
         self.go.set()
         self.thread.join(5)
 
+    def release_when_queued(self, seconds, clock=None):
+        """Let the GPU go ``seconds`` after a job queued behind it (not after a timer that
+        ran while a busy machine was still getting the job there); on ``clock`` (a
+        simulated one) at once, ``seconds`` later in its time."""
+
+        def wait_and_release():
+            try:
+                queued(1)
+            finally:  # (a job that never queued fails the test, it does not hang it)
+                if clock is None:
+                    time.sleep(seconds)
+                else:
+                    clock.sleep(seconds)
+                self.release()
+
+        threading.Thread(target=wait_and_release, daemon=True).start()
+
 
 def submit(job_, order, label=None, hold=0.0):
-    """A thread that takes the GPU as ``job_`` and appends ``label`` to ``order``."""
+    """A thread that takes the GPU as ``job_``, appends ``label`` to ``order`` and holds the
+    GPU ``hold`` seconds (an Event: until it is set)."""
 
     def work():
         with gpuqueue.using(job_), gpulock.gpu_lock():
             order.append(label or job_.kind)
-            time.sleep(hold)
+            if isinstance(hold, threading.Event):
+                hold.wait(TIMEOUT)
+            else:
+                time.sleep(hold)
 
     thread = threading.Thread(target=work, daemon=True)
     thread.start()
@@ -133,11 +156,15 @@ def test_round_robin_across_sessions():
 
 
 def test_aging_moves_a_waiting_job_up(monkeypatch):
+    # The queue's clock is simulated: the later jobs do not age while the test (on a busy
+    # machine, slowly) queues them, only the first one does, by exactly 5 steps.
+    clock = Clock()
+    monkeypatch.setattr(gpuqueue, "clock", clock.monotonic)
     monkeypatch.setattr(gpuqueue, "AGE_S", 0.1)
     holder, order = Holder(), []
     old = submit(job("integration"), order, "background")
     queued(1)
-    time.sleep(0.55)  # 5 steps: background -> interactive at best
+    clock.sleep(0.55)  # 5 steps: background -> interactive at best
     new = [submit(job(k), order, k) for k in ("eval", "sweep")]
     queued(3)
     holder.release()
@@ -155,7 +182,7 @@ def test_integration_steps_yield_to_waiting_evaluations():
     """A long sequence of acquisitions (an integration: one A/B step each) lets a job of a
     better class go between its steps; a step that runs is not interrupted."""
     order: list[str] = []
-    step = threading.Event()
+    step, waiting = threading.Event(), threading.Event()
 
     def integration():
         with gpuqueue.using(job("integration")):
@@ -163,13 +190,15 @@ def test_integration_steps_yield_to_waiting_evaluations():
                 with gpulock.gpu_lock():
                     order.append(f"step{i}")
                     step.set()
-                    time.sleep(0.3 if i == 0 else 0.0)
+                    if i == 0:  # the first step runs until the evaluation waits for it
+                        waiting.wait(TIMEOUT)
 
     background = threading.Thread(target=integration, daemon=True)
     background.start()
     assert step.wait(5)
     evaluation = submit(job("eval"), order, "eval")
     queued(1)
+    waiting.set()
     background.join(10)
     evaluation.join(10)
     assert order == ["step0", "eval", "step1", "step2"]
@@ -280,7 +309,10 @@ def test_non_exclusive_jobs_share_within_memory(monkeypatch, lock_dir):
             with guard:
                 inside.append(label)
                 peak.append(len(inside))
-            time.sleep(hold)
+            if isinstance(hold, threading.Barrier):
+                hold.wait(TIMEOUT)  # all of them on the GPU at once (broken: they were not)
+            else:
+                time.sleep(hold)  # a chance for another to join it (it must not)
             with guard:
                 inside.remove(label)
 
@@ -300,19 +332,21 @@ def test_non_exclusive_jobs_share_within_memory(monkeypatch, lock_dir):
         return max(peak)
 
     small = [job("dev", exclusive=False, mem_gb=1.0) for _ in range(3)]
-    assert together(small) == 3  # 3 GB of 16: all at once
+    assert together(small, threading.Barrier(3)) == 3  # 3 GB of 16: all at once
     big = [job("dev", exclusive=False, mem_gb=8.0) for _ in range(2)]
     assert together(big) == 1  # 16 GB > 90 % of 16
     unknown = [job("dev", exclusive=False) for _ in range(2)]
     assert together(unknown) == 1  # no memory estimate: alone
     # an exclusive job waits for the shared ones, and the queue does not pass it
     order: list[str] = []
-    first = submit(small[0], order, "shared", hold=0.3)
+    release = threading.Event()
+    first = submit(small[0], order, "shared", hold=release)
     until(lambda: bool(order))
     later = [submit(job("eval"), order, "eval")]
     queued(1)
     later.append(submit(small[1], order, "shared again"))  # it would fit, but waits its turn
     queued(2)
+    release.set()
     for t in (first, *later):
         t.join(10)
     assert order == ["shared", "eval", "shared again"]
@@ -450,6 +484,7 @@ def test_expected_wait_and_slice_seconds(monkeypatch):
     gate = gpuqueue.gate()
     assert gpuqueue.expected_wait(gpuqueue.EVAL) == 0.0
     now = time.monotonic()
+    monkeypatch.setattr(gpuqueue, "clock", lambda: now)  # the test's own time does not count
     on_gpu = job("e2e", estimate=100.0, started=now - 40.0)
     gate.holders[0] = [on_gpu]
     gate.waiting = [
@@ -481,14 +516,17 @@ def _budget_session(run, agent_minutes):
     return budget, timeout, clock
 
 
-def test_queue_wait_extends_the_session_timeout_and_deadline(tmp_path):
+def test_queue_wait_extends_the_session_timeout_and_deadline(tmp_path, monkeypatch):
     """A session whose evaluation waits 1.5 s behind another job keeps its 0.6 s of work:
-    its timeout and Budget.deadlines are pushed back by the wait."""
+    its timeout and Budget.deadlines are pushed back by the wait (1.5 s of the queue's
+    clock, simulated: exactly that much)."""
+    queue_clock = Clock()
+    monkeypatch.setattr(gpuqueue, "clock", queue_clock.monotonic)
     run = RunDir.create(tmp_path, "org/m")
     budget, timeout, clock = _budget_session(run, agent_minutes=0.01)
     deadline = budget.deadlines["kernel-t"]
     holder = Holder()
-    threading.Timer(1.5, holder.release).start()
+    holder.release_when_queued(1.5, queue_clock)
 
     async def session():
         async with asyncio.timeout(timeout) as timer:
@@ -501,9 +539,9 @@ def test_queue_wait_extends_the_session_timeout_and_deadline(tmp_path):
                 return j, when, timer.when()
 
     j, before, after = asyncio.run(session())
-    assert j.wait_s >= 1.4 and clock.waited == pytest.approx(j.wait_s, abs=0.1)
-    assert after - before == pytest.approx(clock.waited, abs=0.1)
-    assert budget.deadlines["kernel-t"] - deadline == pytest.approx(clock.waited, abs=0.1)
+    assert j.wait_s == clock.waited == 1.5
+    assert after - before == pytest.approx(1.5)
+    assert budget.deadlines["kernel-t"] - deadline == pytest.approx(1.5)
     holder.thread.join(5)
 
 
@@ -554,27 +592,27 @@ def test_orchestrator_session_does_not_time_out_while_queued(tmp_path, monkeypat
     from kernel_agent.agent.runner import AgentResult
 
     calls: list[dict] = []
-    orch, _ = make_orchestrator(tmp_path, monkeypatch, calls, agent_minutes=0.01)
+    orch, _ = make_orchestrator(tmp_path, monkeypatch, calls, agent_minutes=0.02)
     labels = []
 
     async def fake_run_agent(name, *, result=None, **kwargs):
         result = result or AgentResult(name=name)
         j = gpuqueue.Job.of(orch.run, "eval", "t1")
         labels.append(j.session)
-        await gpuqueue.run(j, _hold_gpu)  # waits 1.5 s: longer than the 0.6 s session
+        await gpuqueue.run(j, _hold_gpu)  # waits 2 s: longer than the 1.2 s session
         await asyncio.sleep(0.3)
         return result
 
     monkeypatch.setattr(orchestrator, "run_agent", fake_run_agent)
     holder = Holder()
-    threading.Timer(1.5, holder.release).start()
+    holder.release_when_queued(2.0)
     result = asyncio.run(
         orch._agent("kernel-t1", label="kernel-t1#1", prompt="p", system_append="", mcp_tools=[])
     )
     holder.thread.join(5)
     assert not result.timed_out and labels == ["kernel-t1#1"]
     costs = json.loads((orch.run.root / "costs.json").read_text())
-    assert costs["kernel-t1#1"]["gpu_wait_s"] >= 1.0 and "timed_out" not in costs["kernel-t1#1"]
+    assert costs["kernel-t1#1"]["gpu_wait_s"] >= 2.0 and "timed_out" not in costs["kernel-t1#1"]
 
 
 def test_integration_jobs_class(tmp_path, monkeypatch):
@@ -615,12 +653,12 @@ def test_evaluate_candidate_records_queue_s(tmp_path, monkeypatch):
     monkeypatch.setattr(tools_mod, "create_sdk_mcp_server", lambda n, version, tools: tools)
     server = {t.name: t for t in tools_mod.build_server(run, Budget(run))}
     holder = Holder()
-    threading.Timer(1.0, holder.release).start()
+    holder.release_when_queued(2.0)
     args = {"target_id": "t", "candidate": "candidates/v1.py", "hypothesis": "h"}
     asyncio.run(server["evaluate_candidate"].handler(args))
     holder.thread.join(5)
     row = ledger.rows(run)[-1]
-    assert row["queue_s"] >= 0.8 and row["eval_s"] < 0.8  # the hold, without the wait
+    assert row["queue_s"] >= 2.0 and row["eval_s"] < 1.5  # the hold (0.2 s), without the wait
     record = read_jsonl(run.results_file("t"))[-1]
     assert record["queue_s"] == row["queue_s"]
     log = read_jsonl(run.root / gpuqueue.FILE)

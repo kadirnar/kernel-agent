@@ -68,6 +68,32 @@ All four must pass before a PR. Add CPU tests for new behaviour (a fake SDK stre
 Claude Code CLI or a local fake Messages API where a session is involved; never a real
 model call), GPU tests marked `@pytest.mark.gpu`.
 
+### Flaky tests
+
+Several agents often run the suite at once (load average 20+): a CPU test whose verdict
+depends on wall-clock time or thread scheduling then fails now and then, passes on a rerun
+and hides real regressions (#211). Keep CPU tests deterministic:
+
+* Times a verdict compares (A/B rounds, the memoisation probe, debounce intervals, queue
+  aging) come from a simulated clock, `tests/fake_clock.py`'s `Clock` in place of the
+  measuring module's clock (`workloads.base.time`, `gpuqueue.clock`, `dashboard.time`),
+  not from real runs and sleeps.
+* Threads and processes meet on a `threading.Barrier`, `Event` or `Semaphore` (or a file
+  a child writes), never on a `sleep` after which they "are there by now". A timeout on
+  such a wait (60 s) is reached only when the code under test is broken.
+* Random draws are seeded and exclude what the check compares against (a fresh input
+  that happens to be the held-out one).
+* A real-time bound that remains (an agent timeout, a grace period) leaves a wide margin
+  between what passes and what the bug would take.
+
+Check a new or changed test that uses threads, processes or time 50 times on a loaded
+machine (`--load 8`: 8 busy processes for the session; `--repeat 50`: each test 50 times;
+both in `tests/conftest.py`); it must not fail once:
+
+```bash
+uv run pytest -q --repeat 50 --load 8 tests/test_x.py::test_y
+```
+
 ## Pull requests
 
 * One issue per branch, `issue-<N>-<slug>`, rebased on `origin/main`.

@@ -147,7 +147,8 @@ def test_first_ctrl_c_stops_the_run_and_its_processes(tmp_path, mode):
 def test_second_signal_exits_at_once(tmp_path):
     """Children that ignore SIGTERM keep the first stop waiting for its grace period; a
     second Ctrl-C kills them and exits at once."""
-    proc = driver(tmp_path, "integration", *NEW, KA_TEST_TRAP_SIGTERM="1")
+    # a long grace period: "at once" is far from it, however busy the machine is
+    proc = driver(tmp_path, "integration", *NEW, KA_TEST_TRAP_SIGTERM="1", KA_TEST_GRACE="60")
     child, grandchild = started(proc, tmp_path / "pids")
     try:
         proc.send_signal(signal.SIGINT)
@@ -155,8 +156,8 @@ def test_second_signal_exits_at_once(tmp_path):
         assert proc.poll() is None and not gone(child, timeout=0)  # SIGTERM is ignored
         start = time.monotonic()
         proc.send_signal(signal.SIGINT)
-        assert proc.wait(timeout=10) == interrupt.EXIT_CODE
-        assert time.monotonic() - start < 5.0
+        assert proc.wait(timeout=40) == interrupt.EXIT_CODE
+        assert time.monotonic() - start < 30.0
         assert gone(child) and gone(grandchild)
     finally:
         cleanup(child, grandchild)
@@ -307,19 +308,29 @@ def test_a_child_dies_with_the_process_that_started_it(tmp_path):
     parent_code = (
         "import os, subprocess, sys, time\n"
         "from kernel_agent import gpulock\n"
-        "code = 'import kernel_agent, time; time.sleep(600)'\n"
-        "child = subprocess.Popen([sys.executable, '-c', code], env=gpulock.child_env())\n"
-        "plain = subprocess.Popen([sys.executable, '-c', code])\n"
+        "code = 'import kernel_agent, pathlib, sys, time; "
+        "pathlib.Path(sys.argv[1]).touch(); time.sleep(600)'\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', code, sys.argv[1]], env=gpulock.child_env()\n"
+        ")\n"
+        "plain = subprocess.Popen([sys.executable, '-c', code, sys.argv[2]])\n"
         "print(child.pid, plain.pid, flush=True)\n"
         "time.sleep(600)\n"
     )
     env_ = env(tmp_path, **{interrupt.PARENT_ENV: "1"})  # inherited, naming another parent
+    imported = [tmp_path / "child.imported", tmp_path / "plain.imported"]
     parent = subprocess.Popen(
-        [sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True, env=env_
+        [sys.executable, "-c", parent_code, *map(str, imported)],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env_,
     )
     child, plain = map(int, parent.stdout.readline().split())
     try:
-        time.sleep(1.0)  # both have imported kernel_agent
+        deadline = time.monotonic() + 60
+        while not all(p.exists() for p in imported):  # both have imported kernel_agent
+            assert time.monotonic() < deadline, "the children never imported kernel_agent"
+            time.sleep(0.05)
         assert not gone(child, timeout=0) and not gone(plain, timeout=0)
         parent.kill()
         parent.wait()

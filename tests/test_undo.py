@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import pytest
 import torch
 import torch._inductor.config as inductor_config
 import toy_decoder
+from fake_clock import Clock
 from torch import nn
 from toy_decoder import FUSED_CANDIDATE, GOOD_REWRITE, ToyDecoderWorkload
 
@@ -22,6 +24,7 @@ from kernel_agent.integrate.patcher import (
     apply_transforms,
 )
 from kernel_agent.region import Rewrite
+from kernel_agent.workloads import base
 from kernel_agent.workloads.base import WorkloadSpec
 from kernel_agent.workloads.holdout import outputs_equal
 from kernel_agent.workspace import write_json
@@ -311,7 +314,10 @@ def cpu(monkeypatch):
     monkeypatch.setattr(toolchain, "setup", lambda *a, **k: None)
 
 
-def test_worker_e2e_ab_on_the_toy_decoder(tmp_path, capsys, cpu):
+def test_worker_e2e_ab_on_the_toy_decoder(tmp_path, capsys, cpu, monkeypatch):
+    # Every timed run takes 1 ms of simulated time: on a busy machine, real CPU timings of
+    # the toy made the memoisation probe flag fresh runs that were merely preempted.
+    monkeypatch.setattr(base, "time", Clock(tick=1e-3))
     harness = _file(tmp_path, "biased.py", BIASED)
     root = _run_dir(tmp_path, harness)
     baseline = _worker(capsys, "analyze", "--run-dir", root, "--no-profile", "--iters", 1)
@@ -327,8 +333,9 @@ def test_worker_e2e_ab_on_the_toy_decoder(tmp_path, capsys, cpu):
     assert rec["mode"] == "paired" and rec["rounds"] == 4 and rec["shared_kernels"]
     assert rec["order"] == "A B B A A B B A" and len(rec["a_ms"]) == len(rec["b_ms"]) == 4
     assert rec["undo_check"] == {"A": "identical", "B": "identical"}
-    assert r["times_ms"] == rec["b_ms"] and r["patches"]["replaced"] == {"norm": 5}
-    assert r["metrics"]["holdout"]["passed"]
+    assert r["times_ms"] == rec["b_ms"] == [1.0] * 4 and r["patches"]["replaced"] == {"norm": 5}
+    held = r["metrics"]["holdout"]
+    assert held["passed"] and held["memoisation"]["fresh_over_repeat"] == 1.0, held
     judged = abtest.judge(rec)
     assert set(judged) >= {"accepted", "why", "ci95", "win_rate"}
 
@@ -350,6 +357,23 @@ def test_worker_e2e_ab_on_the_toy_decoder(tmp_path, capsys, cpu):
     r = _worker(capsys, "e2e_ab", "--run-dir", root, "--transform", declared)
     assert r["status"] == "irreversible" and "declares undo = False" in r["reason"]
     assert r["status"] in abtest.FALLBACK
+
+
+def test_toy_fresh_inputs_are_never_the_held_out_input(toy):
+    """The memoisation probe's fresh inputs (a random variant >= 2, and the next one to
+    confirm a slow run) differ from the held-out and the main input: with one in 32 the
+    probe saw "identical outputs" and failed an honest candidate (#211)."""
+
+    def ids(variant: int) -> torch.Tensor:
+        with toy.with_options(toy.holdout_options(variant) or {}):
+            return toy.make_inputs()
+
+    seen = [toy.make_inputs(), ids(1)]
+    rng = random.Random(211)
+    for variant in [2, 32, 33, *(2 + rng.randrange(2**30) for _ in range(300))]:
+        fresh, confirm = ids(variant), ids(variant + 1)
+        assert not torch.equal(fresh, confirm), variant
+        assert not any(torch.equal(x, s) for x in (fresh, confirm) for s in seen), variant
 
 
 # ------------------------------------------------------------------ VoxCPM2 on the GPU

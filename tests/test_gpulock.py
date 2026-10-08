@@ -13,6 +13,7 @@ import pytest
 from kernel_agent import gpulock, interrupt
 
 NVIDIA_SMI = gpulock._nvidia_smi  # before the fixture fakes it
+TIMEOUT = 60  # seconds a thread waits for another before the test fails (never on time)
 POOL_ENV = (
     gpulock.ENV,
     gpulock.GPUS_ENV,
@@ -265,13 +266,14 @@ def test_threads_spread_over_the_pool_never_two_on_one_gpu(monkeypatch):
     inside = {0: 0, 1: 0}
     peak = {0: 0, 1: 0}
     guard = threading.Lock()
+    pair = threading.Barrier(2)  # two at once, whatever the scheduler does: both GPUs
 
     def work():
         with gpulock.gpu_lock() as gpu:
             with guard:
                 inside[gpu] += 1
                 peak[gpu] = max(peak[gpu], inside[gpu])
-            time.sleep(0.05)
+            pair.wait(TIMEOUT)
             with guard:
                 inside[gpu] -= 1
 
@@ -386,6 +388,9 @@ def test_parallel_evaluations_run_one_per_gpu(monkeypatch, tmp_path):
     busy = {"0": 0, "1": 0}
     peak = {"0": 0, "1": 0, "all": 0}
     guard = threading.Lock()
+    # Each evaluation waits until another one runs too: two at once by construction, not
+    # because a sleep happened to overlap them (it did not always on a busy machine).
+    pair = threading.Barrier(2)
 
     def run(cmd, *, env, **kwargs):
         gpu = env["CUDA_VISIBLE_DEVICES"]
@@ -393,7 +398,7 @@ def test_parallel_evaluations_run_one_per_gpu(monkeypatch, tmp_path):
             busy[gpu] += 1
             peak[gpu] = max(peak[gpu], busy[gpu])
             peak["all"] = max(peak["all"], sum(busy.values()))
-        time.sleep(0.2)
+        pair.wait(TIMEOUT)  # broken (an error) if they ran one at a time
         with guard:
             busy[gpu] -= 1
         tag = kwargs["input"].strip() + "@@"  # run_evaluation's result-line nonce

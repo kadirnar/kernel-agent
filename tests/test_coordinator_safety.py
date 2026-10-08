@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 import pytest
+from fake_clock import Clock
 
 import kernel_agent
 from kernel_agent import budget as budget_mod
@@ -161,22 +162,22 @@ def sim(tmp_path, monkeypatch):
 
 
 class Ticker:
-    """A task that counts while the event loop is free; ``seen`` records, for every fake
-    GPU worker call, whether it counted on while that call slept."""
+    """A task that ticks while the event loop is free; ``seen`` records, for every fake
+    GPU worker call, whether the loop ticked while that call waited for it (a call that
+    blocks the loop waits in vain, until ``timeout``)."""
 
     def __init__(self) -> None:
-        self.ticks = 0
+        self.ticked = threading.Event()
         self.seen: list[bool] = []
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             await asyncio.sleep(0.005)
-            self.ticks += 1
+            self.ticked.set()
 
-    def sleep(self, seconds: float = 0.15) -> None:  # in the worker's thread
-        before = self.ticks
-        time.sleep(seconds)
-        self.seen.append(self.ticks > before)
+    def sleep(self, timeout: float = 30.0) -> None:  # in the worker's thread
+        self.ticked.clear()
+        self.seen.append(self.ticked.wait(timeout))
 
     def around(self, coro):
         async def main():
@@ -387,28 +388,35 @@ def test_snapshots_taken_at_once_get_distinct_numbers(tmp_path):
 # ------------------------------------------------------------------ dashboard
 
 
-def test_refresher_coalesces_and_debounces_requests(tmp_path):
+def test_refresher_coalesces_and_debounces_requests(tmp_path, monkeypatch):
     run = RunDir.create(tmp_path, "org/m")
+    # The interval passes in simulated seconds, when the test says so: on a busy machine a
+    # real one passed before the test had made all the requests it coalesces.
+    clock = Clock()
+    monkeypatch.setattr(dashboard, "time", clock)
     calls: list[tuple[float, list[str] | None]] = []
+    rendered = threading.Semaphore(0)
 
     def render(r: RunDir, targets: list[str] | None) -> None:
         assert r is run
-        calls.append((time.monotonic(), targets))
-        time.sleep(0.05)
+        calls.append((clock.monotonic(), targets))
+        rendered.release()
 
     refresher = dashboard.Refresher(run, interval=0.3, render=render)
-    refresher.request("a")  # the first one is served at once
-    time.sleep(0.02)
+    refresher.request("a")  # the first one is served at once (no simulated time passes)
+    assert rendered.acquire(timeout=60)
     for target in ("b", "c", "b"):  # within the interval: one rewrite later, coalesced
         refresher.request(target)
-    assert refresher.flush(timeout=5)
+    assert refresher.flush(timeout=60) and rendered.acquire(timeout=0)
     assert [t for _, t in calls] == [["a"], ["b", "c"]]
     refresher.request("d")
     refresher.request(None)  # every target
-    time.sleep(0.6)
+    assert not rendered.acquire(timeout=0.4)  # not before the interval has passed
+    clock.sleep(0.3)
+    assert rendered.acquire(timeout=60)
     assert [t for _, t in calls] == [["a"], ["b", "c"], None]
-    assert calls[2][0] - calls[1][0] >= 0.3 - 0.01  # at most once per interval
-    refresher.close(timeout=5)
+    assert calls[2][0] - calls[1][0] == pytest.approx(0.3)  # at most once per interval
+    refresher.close(timeout=60)
     refresher.request("e")  # closed: dropped
     time.sleep(0.05)
     assert len(calls) == 3

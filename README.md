@@ -4757,5 +4757,8 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pyt
 ```
 
 GPU tests are marked `gpu` and skipped when no CUDA device is present.
+`uv run pytest --repeat 50 --load 8 <tests>` runs each test 50 times next to 8 busy
+processes: a test that uses threads, processes or time must pass every time (AGENTS.md,
+"Flaky tests").
 [AGENTS.md](AGENTS.md) is the guide for developing kernel-agent with coding agents
 (principles, layout, the GPU lock, tests, pull requests).
