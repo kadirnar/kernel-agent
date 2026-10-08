@@ -32,7 +32,7 @@ skills (#126, #176).
 | `src/kernel_agent/agent/runner.py` | one SDK session: tools, hooks, skills, subagents, isolation |
 | `src/kernel_agent/agent/tools.py` | the MCP tools (`evaluate_candidate`, `sweep_candidate`, `evaluate_e2e`, ...) |
 | `src/kernel_agent/agent/examples/` | verified example candidates of every backend (selftests run them) |
-| `src/kernel_agent/orchestrator.py`, `improve.py` | the pipeline and the continuous loop |
+| `src/kernel_agent/orchestrator.py`, `improve.py`, `coordinator.py` | the pipeline, the continuous loop and its concurrent sessions (`--agents N`) |
 | `src/kernel_agent/kernels/` | the evaluator: correctness, timing, roofline, integrity, memcheck |
 | `docs/` | design and research documents with their measurements |
 
