@@ -41,6 +41,14 @@ statistics", "Host synchronisation in the profile"). What to do about each regim
   instruction a W8A8 kernel needs (*SF*: the block-scaled one; *any*), *KV GB* the KV-cache
   bytes of decode rows. The end-to-end line puts every class at its floor. Approximate:
   attention scores, element-wise math and caches held as attributes are not counted.
+* **Fusion candidates (measured)** (`profile/fusions.md`, `fusions.json`): chains of
+  memory-bound ops (element-wise, norms, reductions, casts) found from the tensor storages
+  of every op of one run, with the GEMM / convolution / attention that could take them as
+  an epilogue or prologue (*fuse*), across module boundaries (*crosses*), never across a
+  host sync; layers deduplicated (*calls*). *saves* = intermediates written and read back
+  that exceed the L2 / DRAM bandwidth (an L2-resident one saves 0 bytes) + launches saved
+  × the launch floor (eager) or ~0.9 us per CUDA-graph boundary. A row is a region target:
+  `parent_class` = its parent class, `region` = its ops, `fusion` = its id.
 * **Workload profile** of a target (`workload_profile.md`): every call of the target's
   instances during the capture run (signatures and shares, masks, strides, flags, integer
   ranges, KV-cache valid lengths): what may be specialised behind a run-time check.
@@ -92,6 +100,8 @@ between copies and mutable ones are copied outside the timed region.
 * Code: `kernel_agent.kernels.roofline`, `kernel_agent.kernels.ncu`,
   `kernel_agent.profiling.ceilings` (`python -m kernel_agent.profiling.ceilings
   profile.json --baseline-ms <ms>` prints the table of any profile),
-  `kernel_agent.profiling.timeline`, `kernel_agent.profiling.host_sync`.
+  `kernel_agent.profiling.timeline`, `kernel_agent.profiling.host_sync`,
+  `kernel_agent.profiling.fusion` (`python -m kernel_agent.profiling.fusion profile.json
+  --window-ms <ms>` ranks the chains of a profile again).
 * Sources: the `documentation-sources` skill's `sources.md`, sections "CUDA C++ and PTX"
   (best practices, tuning guides).

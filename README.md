@@ -2212,6 +2212,62 @@ loads in the evaluator and in the agent's own scripts without the rewrite on
 the import path; a candidate can subclass the region class with
 `from ka_region_<id> import Region_<id>` or `type(reference)`.
 
+### Fusion candidates (measured)
+
+Which regions are worth it is measured, not left to the planner's reading of the
+source (`kernel_agent/profiling/fusion.py`, issue #231). `analyze` runs the
+unmodified model once more in the hooked work pass (module calls, no timing)
+under a `TorchDispatchMode` that records every aten op: its name, the storages
+it reads and writes (views resolved to their storage) with their bytes, and the
+module call around it (qualname, class, entrypoint, phase). A composite op is
+recorded as the kernels it decomposes into; GEMMs, convolutions and attention
+stay one op each (*anchors*). Producer → consumer edges come from the storages.
+The memory-bound ops (element-wise, norms, reductions, casts, copies) are
+grouped into maximal sets that can be one kernel: an op joins the group of an op
+it reads from unless a path from that group reaches it through an op outside
+the group, within 64 ops of its producer, and never across a host sync
+(`.item()`, `nonzero`, a device-to-host copy). Each chain is measured as one
+kernel of its own (*chain*), inside the anchors it reads from (*epilogue*; several
+only when they read a common input, one merged GEMM such as gate and up) and
+inside the anchors that read it (*prologue*, e.g. a norm in front of q / k / v):
+the ops in order with their module, the launches now and saved, the
+intermediates written and read back, the module boundaries crossed and the
+lowest common ancestor call (its class is a region's `parent_class`, the ops its
+`region`). The same chain in every layer is one row (`calls`, `instances`).
+
+The estimate per run is `Σ round trips of intermediates larger than L2 / DRAM
+bandwidth + calls × launches saved × per-launch cost`: an intermediate no larger
+than the GPU's L2 stays there between its write and its read and saves no bytes
+(what made `fused_gate_up_silu` buy nothing on the 48 MB L2 of the RTX 5070 Ti);
+the per-launch cost is the measured launch floor of an eager run, at most the
+run's own time per recorded op, or ~0.9 µs per kernel boundary when the kernel
+view shows the run mostly CUDA-graph launched (docs/PARALLEL.md §4.6). The
+candidates go to `profile/fusions.md` + `fusions.json`, the top 10 to
+`summary.md` (*Fusion candidates (measured)*); a re-profile of an optimised model
+shows the run's own table. The planner takes a region from a row (`parent_class`,
+`region`, and `fusion` = its id); the improve scheduler expects that row's saving
+for the region arm (see "Scheduler"), and the native stage graph takes chains
+that span stages as evidence for a group. `python -m kernel_agent.profiling.fusion
+profile.json --window-ms <ms>` ranks a profile's chains again.
+
+Measured on the RTX 5070 Ti (eager, bf16; a loaded host, so the windows are long and
+a launch is priced at the run's time per op). Every intermediate was at most 4 MB, in
+the 48 MB L2: the savings are launches, the byte column is 0. Overlapping rows (they
+share a projection) do not add up.
+
+| model, run | chain (phase) | calls | fuse | parent class | launches | saves ms |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B, 512-token prompt + 64 tokens: 103,822 ops, 70 host syncs, 26 chains, 15 s pass, 2,058 ms window | `k_proj` → `k_norm` → RoPE → KV `cat` (decode) | 1,701 | epilogue | `Qwen3Attention` | 15 → 1 | 472 |
+| | `q_proj` → `q_norm` → RoPE (decode) | 1,701 | epilogue | `Qwen3Attention` | 14 → 1 | 438 |
+| | residual add → `input_layernorm` → q / k / v (decode) | 1,701 | prologue | `Qwen3Model` | 12 → 1 | 371 |
+| | residual add → `post_attention_layernorm` → gate / up (decode) | 1,764 | prologue | `Qwen3DecoderLayer` | 11 → 1 | 350 |
+| | gate, up → SiLU · mul (decode) | 1,764 | epilogue | `Qwen3MLP` | 4 → 1 | 105 |
+| VoxCPM2, one request of 60 patches: 468,673 ops, 64 host syncs, 99 chains, 47 s pass, 5,795 ms window | LocDiT residual add → `input_layernorm` → q / k / v | 5,940 | prologue | `MiniCPMModel` | 12 → 1 | 808 |
+| | LocDiT residual add → `post_attention_layernorm` → gate / up | 6,480 | prologue | `MiniCPMDecoderLayer` | 11 → 1 | 801 |
+| | LocDiT `q_proj` → RoPE | 5,940 | epilogue | `MiniCPMAttention` | 9 → 1 | 588 |
+| | LocDiT gate, up → SiLU · mul | 6,480 | epilogue | `MiniCPMMLP` | 4 → 1 | 240 |
+| | base LM residual add → `input_layernorm` → q / k / v (decode) | 1,620 | prologue | `MiniCPMModel` | 12 → 1 | 220 |
+
 ### Speed of light
 
 Every timed `evaluate_candidate` result says how close each case is to the
@@ -3031,6 +3087,12 @@ model and starts a new round (`kernel_agent/improve.py`,
     math and weights (`reduced`). A precision pivot's arm takes the floor of its
     new precision.
 
+  A region target takes its expected gain from the fusion table instead (see
+  "Fusion candidates (measured)"): the row of its `fusion` id, else the largest
+  region row of its `parent_class`, converted to the metric's ms; `expected` is
+  that predicted saving minus what its best kernel saved so far, and never less
+  than 1 − 1/1.1 (≈ 9 %) of the prediction (`remaining_ms` as below).
+
   Without a table, a row that holds it or a floor (an older run, a region
   target, unknown work, a peak not measured), Amdahl as before:
   * `remaining_ms`: the target's share of the profiled time × the baseline ms
@@ -3631,8 +3693,9 @@ planner's plan has a `native` entry) gives the improve loop a **native arm**: on
 every module arm has stopped or plateaued, a systems-native agent rewrites one
 stage, the stages of one loop iteration or the whole generation loop as a
 multi-file CUDA project, in the order of a staged plan derived from the ceilings
-table (topmost stages by time above their floor, then the loop body, then the
-loop; any model family). A stage is captured as a kernel target `native_<id>` and
+table (topmost stages by time above their floor, then the loop body, then a group
+per set of stages that measured fusion chains span, with the chains as its
+evidence (see "Fusion candidates (measured)"), then the loop; any model family). A stage is captured as a kernel target `native_<id>` and
 checked teacher forced on its recorded inputs, then end to end; each stage must
 beat the best module-level result end to end before the next starts. Once every
 stage has, the arm keeps going: the loop re-profiles the model as its best run has
@@ -4379,6 +4442,7 @@ runs/<org>--<name>/<timestamp>/
   program.md                  agent instructions; edit it mid-run to steer the agents
   profile/summary.md          profile handed to the planner
   profile/ceilings.md         floors per class at bf16 / FP8 / FP4 (+ ceilings.json; in summary.md)
+  profile/fusions.md          measured fusion candidates across modules (+ fusions.json; top 10 in summary.md)
   plan.json                   targets + transforms
   .truth/                     what the evaluator trusts (read-only, sha256 in run.json):
     baseline_output.pt          output of the baseline run

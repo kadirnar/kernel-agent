@@ -34,6 +34,10 @@ least :data:`MIN_SHARE` of the run, each with its pattern (:func:`pattern`):
 ``calls`` says how often it runs (1: one-shot; many: a decode / per-iteration step). The
 stages called equally often (≥ 2 per run) form the loop body (``group`` scope, with two or
 more of them); with :data:`LOOP_SHARE` or more of the run, the whole loop is a target too.
+Fusion chains that span stages (``profile/fusions.json``, issue #231: the ops of one
+fusible chain in the modules of two or more stages) are evidence for a group: the loop
+body's when its stages hold the chain, else a ``group`` of the stages it spans
+(``fuse_<a>_<b>``), each with the chains and their predicted saving (``evidence``).
 Order (the staged plan): stages by the time above their floor (``now − floor`` at the best
 precision the run allows), then the group, then the loop. The planner can replace this with
 its own ``native`` plan entry (``plan.json``: ``why`` and ``stages``).
@@ -116,6 +120,7 @@ class Stage:
     why: str = ""
     precision: str | None = None  # the plan's precision for its capture
     expected_speedup: float | None = None
+    evidence: str = ""  # a group: the fusion chains across its stages' boundaries (#231)
 
     @property
     def target_id(self) -> str | None:
@@ -150,6 +155,8 @@ class Stage:
             )
         if self.inner:
             parts.append(self.inner)
+        if self.evidence:
+            parts.append(self.evidence)
         text = "; ".join(parts)
         return text + (f". Plan: {self.idea}" if self.idea else "")
 
@@ -169,6 +176,7 @@ class Stage:
                 "phase",
                 "idea",
                 "precision",
+                "evidence",
             )
             if getattr(self, k) not in (None, "", 0.0)
         }
@@ -223,12 +231,15 @@ def stage_graph(
     *,
     columns: Sequence[str] | None = None,
     min_share: float = MIN_SHARE,
+    fusions: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[Stage]:
     """The native engine targets of a ceilings table, in staged-plan order: the stages
     (topmost non-leaf rows with ``min_share`` of the run) by their time above the floor,
-    then the loop body (stages called equally often, ≥ 2 of them) and the whole loop
-    (when that body covers :data:`LOOP_SHARE` of the run). ``columns``: the precisions
-    whose floors count (default: the table's ``columns``)."""
+    then the loop body (stages called equally often, ≥ 2 of them), the groups of stages
+    that fusion chains span (``fusions``: a fusion table's candidates,
+    :func:`fusion_groups`) and the whole loop (when that body covers :data:`LOOP_SHARE` of
+    the run). ``columns``: the precisions whose floors count (default: the table's
+    ``columns``)."""
     if not table:
         return []
     rows = [r for r in table.get("rows") or [] if r.get("group") and r.get("now_ms")]
@@ -274,7 +285,80 @@ def stage_graph(
             )
         )
     stages.sort(key=lambda s: (-s.headroom_ms, -s.now_ms, s.id))
-    return stages + loop_targets(stages)
+    loops = loop_targets(stages)
+    body = next((s for s in loops if s.scope == "group"), None)
+    body, spans = fusion_groups(stages, fusions or [], body)
+    groups = [body] if body is not None else []
+    return stages + groups + spans + [s for s in loops if s.scope != "group"]
+
+
+def fusion_groups(
+    stages: Sequence[Stage], fusions: Sequence[Mapping[str, Any]], body: Stage | None = None
+) -> tuple[Stage | None, list[Stage]]:
+    """The loop ``body`` with the fusion chains inside its stages as evidence (issue #231),
+    and a ``group`` (``fuse_<a>_<b>``) per other set of stages that chains span (their ops in
+    the modules of two or more stages: ``modules``, folded qualnames), by predicted saving."""
+    spans: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
+    for chain in fusions:
+        modules = [str(m) for m in chain.get("modules") or [] if m]
+        spanned = {
+            s.id
+            for s in stages
+            if s.scope == "stage" and any(m == s.group or inside(m, s.group) for m in modules)
+        }
+        if len(spanned) >= 2:
+            spans.setdefault(tuple(sorted(spanned)), []).append(chain)
+    members = set(body.members) if body is not None else set()
+    if body is not None:
+        mine = [c for ids, chains in spans.items() if set(ids) <= members for c in chains]
+        if mine:
+            body = dataclasses.replace(body, evidence=_evidence(mine))
+    rest = [(ids, chains) for ids, chains in spans.items() if not set(ids) <= members]
+    rest.sort(key=lambda kv: (-sum(float(c.get("saving_ms") or 0.0) for c in kv[1]), kv[0]))
+    by_id = {s.id: s for s in stages}
+    groups = []
+    for ids, chains in rest:
+        parts = [by_id[i] for i in ids]
+        floors = [s.floor_ms for s in parts]
+        floor = sum(f for f in floors if f is not None) if None not in floors else None
+        groups.append(
+            Stage(
+                id=project.safe_name("fuse_" + "_".join(ids))[:32],
+                scope="group",
+                members=ids,
+                calls=min(s.calls for s in parts),
+                now_ms=sum(s.now_ms for s in parts),
+                share=sum(s.share for s in parts),
+                floor_ms=floor,
+                floor_label=parts[0].floor_label if floor is not None else "",
+                evidence=_evidence(chains),
+            )
+        )
+    return body, groups
+
+
+def _evidence(chains: Sequence[Mapping[str, Any]], shown: int = 3) -> str:
+    """``2 fusion chains across its stages' boundaries predict 0.5 ms (…): `f1a2b3c` 0.42 ms
+    (`add` → `mul`), …``."""
+    ranked = sorted(chains, key=lambda c: (-float(c.get("saving_ms") or 0.0), str(c.get("id"))))
+    total = sum(float(c.get("saving_ms") or 0.0) for c in ranked)
+    items = []
+    for c in ranked[:shown]:
+        ops = " → ".join(f"`{o.get('op')}`" for o in (c.get("ops") or [])[:6])
+        items.append(f"`{c.get('id')}` {float(c.get('saving_ms') or 0.0):,.3g} ms ({ops})")
+    more = f" and {len(ranked) - shown} more" if len(ranked) > shown else ""
+    return (
+        f"{len(ranked)} fusion chains across its stages' boundaries predict {total:,.3g} ms "
+        "(`profile/fusions.md`): " + ", ".join(items) + more
+    )
+
+
+def fusion_candidates(run: RunDir) -> list[dict[str, Any]]:
+    """The candidates of the run's fusion table (``profile/fusions.json``: the analyze
+    profile of the unmodified model; [] without one)."""
+    table = read_json(run.profile_dir / "fusions.json", None)
+    found = table.get("candidates") if isinstance(table, dict) else None
+    return [c for c in found or [] if isinstance(c, dict)]
 
 
 def loop_targets(stages: Sequence[Stage]) -> list[Stage]:
@@ -408,7 +492,7 @@ def planned(entry: Mapping[str, Any], derived: Sequence[Stage]) -> list[Stage]:
 
 def stages(run: RunDir, columns: Sequence[str] | None = None) -> list[Stage]:
     """The staged plan of a run: the plan's ``native`` stages, else the derived graph."""
-    derived = stage_graph(newest_table(run), columns=columns)
+    derived = stage_graph(newest_table(run), columns=columns, fusions=fusion_candidates(run))
     entry = plan_entry(run)
     return (planned(entry, derived) if entry else []) or derived
 
@@ -680,7 +764,8 @@ def status(
     every stage is done, the stage graph of the newest ceilings table (a re-profile of the
     native arm's best run, :func:`reprofile_dir`) says what to work on next (:func:`focus`)."""
     path = newest_table_path(run)
-    graph = stage_graph(read_json(path, None) if path else None, columns=columns)
+    table = read_json(path, None) if path else None
+    graph = stage_graph(table, columns=columns, fusions=fusion_candidates(run))
     entry = plan_entry(run)
     plan = (planned(entry, graph) if entry else []) or graph
     finished = done(plan, rows)

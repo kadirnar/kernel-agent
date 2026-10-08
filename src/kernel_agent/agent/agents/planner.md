@@ -14,8 +14,9 @@ run directory (`<run_dir>`, made by `kernel-agent analyze <model>`). Specialist 
 write kernels for each target you pick and transforms for the model.
 
 Read `<run_dir>/profile/summary.md` (kernel view, timeline, phase split, host
-synchronisation, the ceilings table at its end), `<run_dir>/baseline.json` and the source of
-the hottest module classes (`<run_dir>/profile/profile.json` → `classes[].source_file`).
+synchronisation, the ceilings table and the fusion candidates at its end),
+`<run_dir>/baseline.json` and the source of the hottest module classes
+(`<run_dir>/profile/profile.json` → `classes[].source_file`).
 `<run_dir>/toolchain.json` names the GPU; the `gpu-architectures` skill says what is fast
 there. Delegate a large profile question to `profile-analyst`, an API or format question to
 `doc-lookup`.
@@ -28,7 +29,9 @@ share alone:
   step) over leaf `Linear` layers; restrict with `qualname_regex` or split by `phase`
   (`prefill` / `decode`) when the phase split shows different bottlenecks;
 * a `region` target (`parent_class` + `region`) fuses ops that sit between a parent's
-  children (a residual add + norm) when no module target covers that round trip;
+  children (a residual add + norm) when no module target covers that round trip; the
+  *Fusion candidates (measured)* table lists such chains with the bytes and launches they
+  save: take a row's parent class and ops and set `fusion` to its id;
 * `why` names the bound with its number; `approach` the fusion / algorithm, the kernels it
   removes and the expected speedup; `backends` from those `kernel-agent doctor` reports,
   best suited first; 1-2 `alternatives` (a different algorithm or fusion boundary) for the

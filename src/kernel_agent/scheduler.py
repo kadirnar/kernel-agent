@@ -26,6 +26,14 @@ ms per profiled window × the round's baseline ÷ that window are the metric's
 * ``headroom``: ``1 − floor / remaining_ms``, the floor of those rows at the target's
   precision (``ceilings.TARGET_PRECISIONS``; a precision pivot's arm: its new one).
 
+A region target (and a target that names a ``fusion``) without a ceiling takes its expected
+gain from the newest fusion table (issue #231, ``profiling/fusion.py``: the candidate of its
+``fusion`` id, else the largest region candidate of its ``parent_class``; :class:`FusionGain`):
+``remaining_ms`` as below, ``headroom`` = (its predicted saving − what its best kernel saved
+so far) ÷ ``remaining_ms``, so ``expected`` is what the fusion still predicts, and never
+below ``1 − 1 / MIN_FURTHER`` of the prediction (a kernel that already saved it all may
+still find more).
+
 Without a table, a row or a floor (a region target, unknown work, a peak not measured),
 and for the systems agent (Amdahl):
 
@@ -224,6 +232,23 @@ class Ceiling:
         return text + f", {self.precision} floor {self.floor:,.4g} ms"
 
 
+@dataclass(frozen=True)
+class FusionGain:
+    """A region arm's candidate in the newest fusion table (issue #231): its predicted
+    saving in the metric's ms (the table's ms per profiled window × the round's baseline ÷
+    that window) and how it was matched."""
+
+    id: str
+    saving_ms: float
+    how: str
+    region: str = ""
+
+    def describe(self) -> str:
+        """``fusion f1a2b3c (…): predicts 1.2 ms``."""
+        what = f": {self.region[:120]}" if self.region else ""
+        return f"{self.how}{what}, predicts {self.saving_ms:,.3g} ms"
+
+
 @dataclass
 class Arm:
     id: str
@@ -261,6 +286,7 @@ class Arm:
     # native, gate relaxed (build_arms(relax_native=True)): why it would wait; it takes a
     # slot only when no other arm can use it
     held: str | None = None
+    fusion: FusionGain | None = None  # region arms: their fusion candidate (issue #231)
 
     @property
     def agent(self) -> str:
@@ -276,6 +302,11 @@ class Arm:
     def headroom(self) -> float:
         if self.ceiling is not None:
             return self.ceiling.headroom
+        if self.fusion is not None and self.remaining_ms > 0:  # what it still predicts
+            saving = self.fusion.saving_ms
+            left = max(saving - max(self.ref_ms - self.remaining_ms, 0.0), 0.0)
+            # never nothing: as MIN_FURTHER, a share of the prediction is always left
+            return min(max(left, (1.0 - 1.0 / MIN_FURTHER) * saving) / self.remaining_ms, 1.0)
         if self.sol is not None:
             return min(max(1.0 - self.sol, 0.0), 1.0)
         further = max(self.estimate / max(self.best, 1e-9), MIN_FURTHER)
@@ -287,6 +318,12 @@ class Arm:
         gain = self.remaining_ms * self.headroom
         if self.ceiling is not None:
             text = self.ceiling.describe()
+        elif self.fusion is not None:
+            text = (
+                f"{self.fusion.describe()}, {max(self.ref_ms - self.remaining_ms, 0.0):.3g} "
+                f"of it saved: {self.ref_ms:.3g} ms at 1.0x ÷ its best {self.best:.2f}x = "
+                f"{self.remaining_ms:.3g} ms, headroom {self.headroom:.0%}"
+            )
         else:
             if self.kind == SYSTEMS:
                 text = f"end to end {self.remaining_ms:.3g} ms at its best {self.best:.2f}x"
@@ -361,8 +398,9 @@ def sol_fraction(record: dict[str, Any] | None) -> float | None:
 
 
 def _profiles(run: RunDir, rounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Profiles newest first: ``{shares, baseline_ms, applied, profile, ceilings}`` per round
-    (round 1 = the run's; ``ceilings``: the table next to the profile, None without one)."""
+    """Profiles newest first: ``{shares, baseline_ms, applied, profile, ceilings, fusions}``
+    per round (round 1 = the run's; ``ceilings`` / ``fusions``: the tables next to the
+    profile, None without one)."""
     out = []
     for rnd in reversed(rounds):
         path = run.root / str(rnd.get("profile") or "")
@@ -375,6 +413,7 @@ def _profiles(run: RunDir, rounds: list[dict[str, Any]]) -> list[dict[str, Any]]
                     "applied": rnd.get("applied") or {},
                     "profile": profile,
                     "ceilings": read_json(path.parent / "ceilings.json", None),
+                    "fusions": read_json(path.parent / "fusions.json", None),
                 }
             )
     base = read_json(run.baseline_json, {}) or {}
@@ -387,6 +426,7 @@ def _profiles(run: RunDir, rounds: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "applied": {},
                 "profile": profile,
                 "ceilings": read_json(run.profile_dir / "ceilings.json", None),
+                "fusions": read_json(run.profile_dir / "fusions.json", None),
             }
         )
     return out
@@ -510,6 +550,25 @@ def arm_ceiling(
         rows="; ".join(p[2] for p in held),
         upper=upper,
     )
+
+
+def fusion_gain(spec: dict[str, Any], profiles: list[dict[str, Any]]) -> FusionGain | None:
+    """A region target's candidate (or a target's named ``fusion``) in the newest fusion table
+    (``fusion.match``), its saving in the metric's ms; None: no table has one."""
+    from kernel_agent.profiling import fusion
+
+    if spec.get("kind") != "region" and not spec.get("fusion"):
+        return None
+    for prof in profiles:  # newest first: the analyze profile mines them (#231)
+        table = prof.get("fusions") or {}
+        window = float(table.get("window_ms") or 0.0)
+        found = fusion.match(table, spec) if window > 0 else None
+        if found is not None:
+            hit, how = found
+            factor = float(prof["baseline_ms"]) / window
+            saving = float(hit.get("saving_ms") or 0.0) * factor
+            return FusionGain(str(hit["id"]), saving, how, str(hit.get("region") or ""))
+    return None
 
 
 def _split(
@@ -803,6 +862,8 @@ def build_arms(
                 ceiling, kernel_ms=_per_run(run, target_id, spec, record, "new_ms")
             )
         arm.ceiling = ceiling
+        if ceiling is None and not refused:  # a region's expected gain: its fusion (#231)
+            arm.fusion = fusion_gain(spec, profiles)
         arms.append(arm)
     if policy.systems:
         busy = gpu_busy(run)
