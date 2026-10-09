@@ -38,6 +38,10 @@ from kernel_agent.libscout.registry import Adapter, Site
 
 _HALF = ("bfloat16", "float16")
 _FLOAT = ("bfloat16", "float16", "float32")
+#: The wheels torch loads cuBLAS(Lt) and cuDNN from (the CUDA 12 and CUDA 13 names): their
+#: versions key a remembered scout with torch's (``Adapter.runtime``)
+_CUBLAS = ("nvidia-cublas-cu12", "nvidia-cublas")
+_CUDNN = ("nvidia-cudnn-cu12", "nvidia-cudnn-cu13")
 
 
 def _cap(gpu: Mapping[str, Any]) -> tuple[int, ...] | None:
@@ -346,6 +350,11 @@ def ops(reference=None, FUSE=0):
     return {}  # a pattern of several ops: nothing to swap one for one
 
 
+def patterns(reference=None, FUSE=0):
+    # what rewrite() puts in a written-out RMSNorm's place (the probe's op bar)
+    return {"rms_norm": _rms_norm_fused if FUSE else _rms_norm_split}
+
+
 def rewrite(graph, reference=None, FUSE=0):
     return fold_rms_norm(graph, _rms_norm_fused if FUSE else _rms_norm_split)
 """
@@ -399,6 +408,11 @@ def _rms_norm_lib(x, weight, eps, dtype, mid=None):
 
 def ops(reference=None):
     return {{}}  # folded from patterns and F.rms_norm by rewrite()
+
+
+def patterns(reference=None, **config):
+    """What rewrite() puts in a written-out RMSNorm's place (the probe's op bar)."""
+    return {{"rms_norm": _rms_norm_lib}}
 
 
 def rewrite(graph, reference=None, **config):
@@ -908,6 +922,7 @@ ADAPTERS: tuple[Adapter, ...] = (
         licence="BSD-3-Clause",
         families=("sdpa",),
         dtypes=_FLOAT,
+        runtime=_CUDNN,
     ),
     TorchRmsNorm(
         name="torch-rms-norm",
@@ -931,6 +946,7 @@ ADAPTERS: tuple[Adapter, ...] = (
         dtype_archs={"bfloat16": ("sm_80+", "bf16 tensor cores")},
         compiles=True,
         helpers=("fold_linear",),
+        runtime=_CUBLAS,
     ),
     TorchScaledMm(
         name="torch-scaled-mm",
@@ -943,6 +959,7 @@ ADAPTERS: tuple[Adapter, ...] = (
         archs_why="FP8 (e4m3) tensor cores",
         precisions=("fp8_w8a8",),
         helpers=("fold_linear",),
+        runtime=_CUBLAS,
     ),
     FlashAttn(
         name="flash-attn",
@@ -1014,6 +1031,7 @@ ADAPTERS: tuple[Adapter, ...] = (
         archs_why="QuACK lists H100, B200 / B300 and RTX 50",
         verified=False,
         helpers=("fold_rms_norm",),
+        runtime=("nvidia-cutlass-dsl",),
     ),
     QuackSoftmax(
         name="quack-softmax",
@@ -1026,6 +1044,7 @@ ADAPTERS: tuple[Adapter, ...] = (
         archs_why="QuACK lists H100, B200 / B300 and RTX 50",
         dtypes=_FLOAT,
         verified=False,
+        runtime=("nvidia-cutlass-dsl",),
     ),
     LigerRmsNorm(
         name="liger-rmsnorm",
@@ -1038,6 +1057,7 @@ ADAPTERS: tuple[Adapter, ...] = (
         archs_why="Liger-Kernel's Triton kernels: Ampere and newer",
         verified=False,
         helpers=("fold_rms_norm",),
+        runtime=("triton",),
     ),
     LigerSwiGLU(
         name="liger-swiglu",
@@ -1051,6 +1071,7 @@ ADAPTERS: tuple[Adapter, ...] = (
         dtypes=_FLOAT,
         verified=False,
         helpers=("fold_silu_mul",),
+        runtime=("triton",),
     ),
     Adapter(
         name="liger-rope",

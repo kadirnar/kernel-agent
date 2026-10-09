@@ -1691,6 +1691,7 @@ class Improver:
             ledger.event(self.run, "round_failed", round=n, error=str(info.get("error"))[:300])
             self.no_round = f"the re-profile for round {n} failed"
             return False
+        libscout.write_ceilings(self.run)  # the re-planner's ceilings.md: the library bar (#227)
         applied = {}
         for item in accepted:
             if item["kind"] == "kernel":

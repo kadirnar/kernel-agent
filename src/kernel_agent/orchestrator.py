@@ -2472,7 +2472,9 @@ class Orchestrator:
             library.remember_seed(self.run, target_id, tried)
 
     async def scout_libraries(self, target_ids: list[str]) -> None:
-        """The library scout (``libscout/``, issue #227) on the targets not scouted yet:
+        """The library scout (``libscout/``, issue #227) on the targets not scouted yet, or
+        scouted under another key (``libscout.stale``: a library of the target's op families
+        installed, upgraded or removed since, another GPU, a scout from before the key):
         library kernels swept and fully evaluated with no agent, one GPU lease per target.
         Their rows are the bar the engineers start from (a floor, never a stop); a failure
         is logged and recorded, never fatal. Off with ``--no-library-scout``, in a simulated
@@ -2483,11 +2485,18 @@ class Orchestrator:
         if not self.cfg.library_scout or (self.scouter is None and not real):
             return
         done = False
+        nvcc = getattr(self.tc, "nvcc_version", None)
+        versions = libscout.installed()  # one metadata pass for every target (no import)
         for target_id in target_ids:
-            if libscout.scouted(self.run, target_id) is not None or self._refused(target_id):
+            if self._refused(target_id) or not self.run.capture_file(target_id).exists():
                 continue
-            if not self.run.capture_file(target_id).exists():
-                continue
+            before = libscout.scouted(self.run, target_id)
+            why = None
+            if before is not None:
+                why = libscout.stale(before, self.tc.gpu, nvcc=nvcc, versions=versions)
+                if why is None:
+                    continue  # the same libraries on the same GPU: its bar holds
+                log(f"libscout: {target_id}: scouting again: {why}")
             try:
                 with self._gpu_job("scout"):  # background work in the GPU queue
                     found = await asyncio.to_thread(
@@ -2504,6 +2513,11 @@ class Orchestrator:
                 found = {"error": repr(exc)[:300]}
             entry = {"seconds": found.get("seconds"), "error": found.get("error")}
             entry["adapters"] = [r.get("adapter") for r in found.get("adapters") or []]
+            families = found.get("families")  # its key: None (failed before detecting) = all
+            names = list(families) if isinstance(families, dict) else None
+            entry["key"] = libscout.key(names, self.tc.gpu, nvcc=nvcc, versions=versions)
+            if before is not None:
+                entry.update(scouts=int(before.get("scouts") or 1) + 1, rescouted=why)
             libscout.remember(self.run, target_id, entry)
             ledger.event(self.run, "library_scout", target=target_id, **entry)
             done = True

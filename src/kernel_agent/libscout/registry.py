@@ -17,7 +17,11 @@ library's kernels:
   from sm_80;
 * **candidate template** (:meth:`Adapter.code`: the op functions and the graph rewrite of a
   scout candidate, rendered by :mod:`kernel_agent.libscout.template`) and the configs the
-  scout sweeps (:meth:`Adapter.configs`).
+  scout sweeps (:meth:`Adapter.configs`);
+* the **distributions** its kernels come from (:attr:`Adapter.distributions`: its package and
+  :attr:`Adapter.runtime`, the cuBLAS / cuDNN wheels torch loads, Triton under Liger): their
+  installed versions (:func:`versions`, read from the metadata without importing anything)
+  key a run's remembered scout, so a changed install scouts the target again.
 
 :func:`applicable` decides, from the detected families, the GPU, the target's precision and
 the probes, which adapters run on a target and why each other one does not. Nothing here
@@ -110,9 +114,18 @@ class Adapter:
     helpers: tuple[str, ...] = ("swap_calls",)
     #: no template yet: listed and probed, never run (the reason)
     no_template: str | None = None
+    #: distributions whose kernels its candidates run besides :attr:`package`'s own (the
+    #: cuBLAS wheel under cuBLASLt, cuDNN under SDPA's cuDNN backend, Triton under Liger):
+    #: an upgrade of one changes what the scout measures as much as the package's own
+    runtime: tuple[str, ...] = ()
 
     #: subclasses: the candidate's op code (see :meth:`code`)
     CODE: ClassVar[str] = ""
+
+    @property
+    def distributions(self) -> tuple[str, ...]:
+        """Its :attr:`package` and :attr:`runtime`: what its measurements depend on."""
+        return (self.package, *self.runtime)
 
     # ---------------------------------------------------------------- probes
 
@@ -194,9 +207,11 @@ class Adapter:
 
     def code(self) -> str:
         """The op code of a candidate: imports, the replacement functions, ``ops(**config)``
-        (original callable → replacement: what op bars time) and ``rewrite(graph, **config)``
-        (what the candidate's Dynamo backend runs on each FX graph; returns the nodes it
-        changed)."""
+        (original callable → replacement: what op bars time), for an adapter that folds a
+        written-out pattern ``patterns(**config)`` (family → the function its rewrite puts in
+        the pattern's place: what the pattern's op bars time) and ``rewrite(graph,
+        **config)`` (what the candidate's Dynamo backend runs on each FX graph; returns the
+        nodes it changed)."""
         return self.CODE
 
 
@@ -206,6 +221,37 @@ def package_version(package: str) -> str | None:
         return importlib.metadata.version(package)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+#: :func:`versions` of a package that imports but has no distribution metadata (a source
+#: tree on ``PYTHONPATH``)
+NO_METADATA = "importable, no version metadata"
+
+
+def versions(adapters: Iterable[Adapter]) -> dict[str, str]:
+    """``{distribution: installed version}`` of every distribution the ``adapters`` use
+    (:attr:`Adapter.distributions`), sorted, from the metadata alone: nothing is imported
+    (the coordinator's view, cheap enough for every improve pass; :meth:`Adapter.probe`
+    imports in the GPU worker). Not installed: left out (an absent entry and a missing
+    library compare equal, so a distribution new to the registry changes nothing until it
+    is installed); an adapter's package that imports without metadata: :data:`NO_METADATA`."""
+    found: dict[str, str] = {}
+    seen: set[str] = set()
+    for adapter in adapters:
+        for dist in adapter.distributions:
+            if dist in seen:
+                continue
+            seen.add(dist)
+            version = package_version(dist)
+            if version is None and dist == adapter.package:
+                try:
+                    spec = importlib.util.find_spec(adapter.module.split(".")[0])
+                except (ImportError, ValueError):
+                    spec = None
+                version = NO_METADATA if spec is not None else None
+            if version is not None:
+                found[dist] = version
+    return dict(sorted(found.items()))
 
 
 def _parts(version: str) -> tuple[int, ...]:

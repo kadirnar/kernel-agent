@@ -14,7 +14,8 @@ engineer starts, deterministically and with no Claude session:
   (TorchDynamo, no Inductor) with the library's ops pointed in;
 * :mod:`.probe`: the GPU step (detection, decisions, candidates, op bars);
 * :mod:`.scout`: the step in a run (sweeps, ledger rows ``library:<package>@<version>``,
-  the library bar of the digest, the planner and ``ceilings.md``, export requirements,
+  the remembered scout keyed by the installed library versions and the GPU, the library
+  bar of the digest, the planner, ``ceilings.md`` and ``report.md``, export requirements,
   ``doctor``).
 """
 
