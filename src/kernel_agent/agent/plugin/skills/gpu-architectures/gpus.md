@@ -116,6 +116,11 @@ block's measured peaks and instruction rates are the numbers to use.
   **Blackwell Ultra (sm_103: B300, GB300) keeps INT8 at about 1/30 of its FP8 rate**, the
   PTX ISA exposes no `kind::i8` there (only warp-level IMMA) and CUTLASS generates no INT8
   kernels for it: prefer FP8 W8A8 on sm_103 unless INT8 is measured faster.
+* W4A4 (`fp4_w4a4`, opt-in): `tcgen05.mma kind::mxf4nvf4` (NVFP4 at twice FP8);
+  cuBLASLt NVFP4 through `F.scaled_mm` (`BlockWise1x16`, two-level with a tensor-wise
+  scale) and MXFP4 (`BlockWise1x32`, torch 2.14: B200 / B300 only). The bundled CuTe W4A4
+  GEMM is sm_12x (`mma.sync`): start from `cute_sm100_gemm_tcgen05.py` here with the FP4
+  operand and scale-factor types (skill `fp4-w4a4`).
 
 ## [blackwell_geforce] Blackwell GeForce / RTX PRO / DGX Spark (sm_120 / sm_121)
 
@@ -134,6 +139,10 @@ sm_120 sections hold them.
 * INT8 `mma.sync` (`IMMA.16832.S8.S8`, int32 accumulation) runs at the full rate: 410
   TOPS on an RTX 5070 Ti, as fast as the block-scaled FP8 instruction and twice plain e4m3
   with fp32 accumulation, so a plain Triton `tl.dot` on int8 reaches it (`int8_w8a8`).
+* FP4 `mma.sync` (`kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64`, CuTe DSL
+  `MmaMXF4NVF4Op`) for W4A4 (`fp4_w4a4`, opt-in): the bundled CuTe GEMM reaches 650
+  TFLOP/s on an RTX 5070 Ti, cuBLASLt NVFP4 (`F.scaled_mm`) 661, FP8 332. torch 2.14's
+  `F.scaled_mm` has NVFP4 here but no MXFP4.
 * TMA works without multicast (CUTLASS fixes the cluster shape to 1x1x1); PDL works.
   Shared memory 99 KB per block: Hopper / B200 tile configs do not fit (Triton raises
   `OutOfResources`). cuBLASLt has tensor-wise FP8 and MXFP8 here, but no row-wise or

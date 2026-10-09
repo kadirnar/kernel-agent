@@ -338,9 +338,9 @@ PLAN_SCHEMA: dict[str, Any] = {
                     "approach": {"type": "string"},
                     "backends": {"type": "array", "items": {"type": "string"}},
                     # fp8_weights / reduced / fp4_weights / fp8_w8a8 / fp8_mx / fp8_kv /
-                    # int8_weights / int8_w8a8 (kernels.compare.PRECISIONS): --quality
-                    # near-lossless / relaxed captures the target with its tolerance tier;
-                    # an exact run refuses it.
+                    # int8_weights / int8_w8a8 / fp4_w4a4 (kernels.compare.PRECISIONS):
+                    # --quality near-lossless / relaxed captures the target with its
+                    # tolerance tier; an exact run refuses it.
                     # Default exact.
                     "precision": {
                         "type": "string",
@@ -354,6 +354,7 @@ PLAN_SCHEMA: dict[str, Any] = {
                             "fp8_kv",
                             "int8_weights",
                             "int8_w8a8",
+                            "fp4_w4a4",
                         ],
                     },
                     "precision_why": {"type": "string"},
@@ -468,8 +469,8 @@ def precision_policy(
     return """
 # Precision (`--quality exact`)
 This run keeps full precision: do not set `precision` (a target with
-`fp8_weights`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8` or `reduced`
-is refused); every kernel must match eager within rounding noise.
+`fp8_weights`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8`, `fp4_w4a4`
+or `reduced` is refused); every kernel must match eager within rounding noise.
 """
 
 
@@ -520,11 +521,16 @@ def _near_lossless_policy(
             + ("it" if len(gpu) == 1 else "one of them")
             + " is refused; its *Ceilings* column is not shown."
         )
-    if any(p in refused for p in four_bit):
+    if four_bit and all(p not in allowed for p in four_bit):
         lines.append(
             "No 4-bit weights or activations (FP4, NVFP4, MXFP4, int4) anywhere, also not in a "
             "`reduced` target or an approach; the *Ceilings* table's *FP4 w* / *W4A4* floors "
             "(where shown) are out of reach."
+        )
+    elif "fp4_w4a4" in four_bit and "fp4_w4a4" not in allowed:  # FP4 weights only (#233)
+        lines.append(
+            "No 4-bit activations (W4A4, `fp4_w4a4`) anywhere, also not in a `reduced` target "
+            "or an approach: FP4 weights keep bf16 activations."
         )
     lines.append(_POLICY["intro"])
     if quality == "relaxed":
@@ -536,6 +542,7 @@ def _near_lossless_policy(
         "fp8_w8a8",
         "int8_w8a8",
         "fp8_mx",
+        "fp4_w4a4",
         "reduced",
         "fp8_kv",
     ):
@@ -623,6 +630,18 @@ tiles leave SMs idle (1.7x slower than tensor-wise FP8 with batched split-K ther
 inside an `fp8_mx` target such GEMMs run tensor-wise W8A8 with split-K (same tier), or
 plan the target `fp8_w8a8`. Not at a few rows per call (memory bound: `fp8_weights`).
 Its `precision_why` names M, the N of its GEMMs and the bound.""",
+    "fp4_w4a4": """`precision: "fp4_w4a4"` (W4A4: NVFP4 weights and activations, e2m1 with an
+e4m3 scale per 16 and an fp32 scale per tensor / per token, the activations quantised on
+every call, on the block-scaled FP4 tensor cores of sm_100 / sm_120 at about twice FP8's
+rate; its own looser tier, near-lossless-fp4a) only for compute-bound GEMMs whose *W4A4*
+floor in the *Ceilings* table is well below their *W8A8* / *MXFP8* one (many rows per
+weight read, past this GPU's FP8 ridge). It moves a GEMM's output about 1.4x as far as FP4
+weights and can shrink it by up to ~1 % per GEMM (measured on VoxCPM2's LocDiT layer at
+M = 352: relative L2 0.08, norm -3.4 %): give it the largest compute-bound targets first,
+keep their most sensitive `nn.Linear` layers in FP8 inside the target (the engineer's
+sensitivity probe ranks them), and let the perceptual gate decide. Not at a few rows per call
+(memory bound: `fp4_weights` / `fp8_weights` there). Its `precision_why` names M and the
+*W4A4* and *W8A8* floors.""",
     "fp8_scales": """FP8 activation scales stay dynamic (computed from every call's data: per
 token, per 32 / 128 block); a static (offline-calibrated) activation scale is allowed
 only when the target passes the evaluator's redrawn-input check with it (a scale
@@ -676,15 +695,16 @@ def precision_note(quality: str, precisions: Iterable[str]) -> str:
         if quality == "relaxed"
         else ""
     )
+    four = ""
+    if len(no_four) == len(allowed_precisions.FOUR_BIT):
+        four = " No 4-bit weights or activations (FP4, NVFP4, MXFP4, int4) in any transform."
+    elif "fp4_w4a4" in no_four:  # FP4 weights allowed, W4A4 not (#233)
+        four = " No 4-bit activations (W4A4) in any transform."
     return (
         f"\n\n# Precision\nThis run allows the precisions {', '.join(f'`{p}`' for p in allowed)} "
         "(`--precisions`); the perceptual gate judges every numerics change."
         + relaxed
-        + (
-            " No 4-bit weights or activations (FP4, NVFP4, MXFP4, int4) in any transform."
-            if no_four
-            else ""
-        )
+        + four
         + "\n"
     )
 
@@ -976,13 +996,17 @@ def _precision_block(
     gpu_line = f"\nOn this GPU: {gpu_note}\n" if gpu_note else ""
     allowed = allowed_precisions.default("near-lossless") if precisions is None else precisions
     four_bit = allowed_precisions.FOUR_BIT
-    no_four = precision not in four_bit and any(p not in tuple(allowed) for p in four_bit)
-    no_four_note = (
-        "\nNo 4-bit weights or activations (FP4, NVFP4, MXFP4, int4): this run does not allow "
-        "them (`--precisions`); skip the FP4 parts of the guide.\n"
-        if no_four
-        else ""
-    )
+    missing = [p for p in four_bit if p not in tuple(allowed)]
+    no_four_note = ""
+    if precision not in four_bit and len(missing) == len(four_bit):
+        no_four_note = (
+            "\nNo 4-bit weights or activations (FP4, NVFP4, MXFP4, int4): this run does not "
+            "allow them (`--precisions`); skip the FP4 parts of the guide.\n"
+        )
+    elif precision != "fp4_w4a4" and "fp4_w4a4" in missing:  # 4-bit weights only (#233)
+        no_four_note = (
+            "\nNo 4-bit activations (W4A4): this run does not allow them (`--precisions`).\n"
+        )
     why = f" (planner: {target['precision_why']})" if target.get("precision_why") else ""
     if precision == "fp8_weights":
         contract = """FP8 weight-only:
@@ -1057,6 +1081,36 @@ def _precision_block(
   `kernel-agent:mxfp8`;
 * report the numerical error in `NOTES.md`: `mxfp8_error(weight, q, scales, x)` on
   captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
+    elif precision == "fp4_w4a4":
+        contract = """W4A4 (block-scaled FP4 tensor-core math, NVFP4; opt-in):
+* quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
+  quantize_fp4, quantize_fp4_activations, swizzle_fp4_scales, fp4_w4a4_linear,
+  fp4_w4a4_error, fp4_w4a4_sensitivity`): e2m1 codes, two per byte (even k in the low
+  nibble), one e4m3 scale per 16 consecutive K elements and one fp32 scale per tensor;
+  keep no bf16 copy of a quantised weight;
+* quantise the activations on every call, per token (dynamic; `quantize_fp4_activations`:
+  `outer = amax(|row|) * NVFP4_OUTER_STEP`, block scale `e4m3(min(bmax / (outer * 6), 448))`,
+  codes `e2m1(x / (scale * outer))` to nearest even with IEEE divisions, saturated at ±6),
+  in the GEMM's prologue or fused into the op that produces them (RMSNorm, `silu(gate) *
+  up`); never a static (calibrated) scale;
+* e2m1 x e2m1 products with both block scales applied by the tensor core (`F.scaled_mm`
+  with `ScalingType.BlockWise1x16` and `swizzle_fp4_scales` scales; CuTe DSL
+  `MmaMXF4NVF4Op` on sm_120a; `tcgen05.mma kind::mxf4nvf4` on sm_100), fp32 accumulation,
+  then `acc * outer[m] * tensor_scale (+ bias[n])` once per output, one rounding to bf16
+  (that is `fp4_w4a4_linear`); norms, softmax / attention math and residual adds as in eager;
+* sensitive layers: `fp4_w4a4_sensitivity(module, run)` ranks the target's `nn.Linear` by
+  their W4A4 output error on captured inputs (with FP8 W8A8's for comparison); when the
+  evaluator or the perceptual gate rejects W4A4 everywhere, keep the top ones in FP8 W8A8
+  inside the target. MXFP4 (`fmt="mxfp4"`) and a Hadamard rotation (`rotate=16`) measured no
+  better than plain NVFP4 on VoxCPM2 (MXFP4 fails near-lossless-fp4a on its LocDiT layer):
+  measure before using them;
+* examples: `cute_nvfp4_w4a4_gemm.py` (CuTe DSL GEMM on `MmaMXF4NVF4Op`, sm_12x) and
+  `triton_nvfp4_w4a4_gemm.py` (Triton quantiser + `F.scaled_mm` NVFP4, sm_100+); reference
+  and fallback: `fp4_w4a4_linear`; guide: skill `kernel-agent:fp4-w4a4`;
+* report the numerical error in `NOTES.md`: `fp4_w4a4_error(weight, codes, scales,
+  tensor_scale, x)` on captured activations and the evaluator's per-case `min_cosine` /
+  `max_rel_l2`. W4A4 moves outputs further than any 8-bit class: the perceptual gate
+  decides."""
     elif precision == "int8_weights":
         contract = """INT8 weight-only:
 * quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
@@ -1818,6 +1872,11 @@ def _pivot_block(
             "compute bound where INT8's measured peak is at least FP8's or there are no FP8 "
             "tensor cores (INT8 W8A8, `int8_w8a8`; activations without outlier channels or "
             "with SmoothQuant)"
+        )
+    if "fp4_w4a4" in choices:
+        bounds.append(
+            "compute bound at the FP8 peak on block-scaled FP4 tensor cores (W4A4: about twice "
+            "FP8's FLOP rate, `fp4_w4a4`; its looser tier and the perceptual gate decide)"
         )
     streams = [f"`{p}`" for p in ("fp8_weights", "int8_weights", "fp4_weights") if p in choices]
     if streams:

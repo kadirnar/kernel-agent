@@ -183,6 +183,7 @@ def test_fp4_precision_maps_to_its_tier():
         FP4,
         compare.NEAR_LOSSLESS_KV_TIER,  # fp8_kv: near-lossless's bounds on captured inputs
         *(compare.RELAXED_TIER, compare.RELAXED_FP4_TIER, compare.RELAXED_KV_TIER),  # #175
+        *(compare.NEAR_LOSSLESS_FP4A_TIER, compare.RELAXED_FP4A_TIER),  # W4A4, #233
     }
     assert compare.tier_for("relaxed", "fp4_weights") == compare.RELAXED_FP4_TIER
     fp8_bounds, fp4_bounds = (compare.NEAR_LOSSLESS_BOUNDS[t] for t in ("near-lossless", FP4))

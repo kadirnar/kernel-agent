@@ -49,7 +49,7 @@ down_proj GEMV 2.06 x RMS in its massive-activation channel).
 **The contract** (as FP8, with the block scales):
 
 * quantise once in `build()` with `quantize_fp4`, keep no bf16 copy;
-* activations stay bf16 (FP4 activations are W4A4, not this class);
+* activations stay bf16 (FP4 activations are W4A4: `fp4_w4a4`, skill `fp4-w4a4`);
 * fp32 accumulation: a partial sum per 16-weight block times its block scale
   (or the weights dequantised with their scale), the tensor scale and bias once
   per output, one rounding to bf16;
@@ -73,7 +73,7 @@ the two block scales (`__nv_fp8x2_storage_t`, converted with
 dequantised with its block scale is exact in bf16: an FP4 skinny GEMM can feed
 `cuda_fp8_skinny_gemm.py`'s bf16 `mma.sync` with `e2m1 * scale` and apply the
 tensor scale in the epilogue. The block-scaled FP4 MMA (`kind::mxf4nvf4`,
-`sm_120a`) needs FP4 activations (W4A4).
+`sm_120a`) needs FP4 activations (W4A4: precision `fp4_w4a4`, skill `fp4-w4a4`).
 
 **Measured** (RTX 5070 Ti, streamed as above; GB/s of codes + scales):
 

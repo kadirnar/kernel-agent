@@ -2,10 +2,12 @@
 weight-only, W8A8 and MXFP8 examples and the INT8 weight-only and W8A8 ones in the
 near-lossless tier, and their rejection by the exact tier, MXFP8 with the OCP floor scale rule
 by the scale-rule guard; the FP4 one in the
-near-lossless-fp4 tier, and its rejection by the FP8 tier; the PDL GEMV chain on sm_90+; the
+near-lossless-fp4 tier and the W4A4 ones in near-lossless-fp4a, and their rejection by the FP8
+tier; the PDL GEMV chain on sm_90+; the
 Triton toolkit examples, cached launches and short-sequence attention:
-:func:`smoke_triton_tools`; on sm_120 the CuTe DSL block-scaled W8A8 GEMM and the fused FP8
-decoder block; on sm_90 / sm_100 the CuTe DSL ``wgmma`` / ``tcgen05`` W8A8 GEMM templates).
+:func:`smoke_triton_tools`; on sm_120 the CuTe DSL block-scaled W8A8 and W4A4 GEMMs and the
+fused FP8 decoder block; on sm_90 / sm_100 the CuTe DSL ``wgmma`` / ``tcgen05`` W8A8 GEMM
+templates).
 
 Every example declares the GPUs it runs on (its ``ARCHS``, ``kernel_agent/gpu_arch.py``):
 :func:`smoke_backends` runs those this GPU supports and lists the others with the reason
@@ -218,6 +220,17 @@ CUTE_ARCH_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]
 #: 22-row call (0 calls per run: correctness only) takes the dequantised fallback.
 FP4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     "cuda_fp4_gemv.py": (2048, 12288, [((1,), 28), ((4,), 1), ((2, 11), 0)]),
+}
+#: The W4A4 examples (``precision: fp4_w4a4``, #233; opt-in) in their near-lossless-fp4a
+#: tier, as :data:`W8A8_EXAMPLES`: the merged gate|up GEMM at 704 rows (compute bound) and,
+#: correctness only, 300 rows (zero-padded scale rows past the 128-row blocks).
+W4A4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "triton_nvfp4_w4a4_gemm.py": (1024, 8192, [((64, 11), 540), ((300,), 0)]),
+}
+#: The CuTe DSL W4A4 GEMM on sm_120's block-scaled FP4 MMA (``MmaMXF4NVF4Op``), as
+#: :data:`CUTE_W8A8_EXAMPLES` (300 rows: TMA's zero-filled tail; 17: the per-token tail).
+CUTE_W4A4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "cute_nvfp4_w4a4_gemm.py": (1024, 8192, [((4, 176), 100), ((300,), 0), ((17,), 0)]),
 }
 
 
@@ -468,15 +481,27 @@ def smoke_fp8(
     return ok
 
 
-def smoke_fp4(tmp: Path, verbose: bool = False) -> bool:
-    """Every FP4 example passes the evaluator in the near-lossless-fp4 tier, and the FP8
-    near-lossless tier (a quick check) rejects it: FP4 needs its own tier."""
+def smoke_fp4(
+    tmp: Path,
+    verbose: bool = False,
+    *,
+    precision: str = "fp4_weights",
+    examples: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] | None = None,
+) -> bool:
+    """Every FP4 example of ``precision`` (:data:`FP4_EXAMPLES`; ``fp4_w4a4``:
+    :data:`W4A4_EXAMPLES`, or ``examples``) passes the evaluator in its own tier
+    (near-lossless-fp4, near-lossless-fp4a), and the 8-bit near-lossless tier (a quick check)
+    rejects it: FP4 needs its own tier."""
+    from kernel_agent.kernels.compare import tier_for
     from kernel_agent.kernels.evaluate import run_evaluation
 
     ok = True
-    for name, (k, n, calls) in FP4_EXAMPLES.items():
+    tier = tier_for("near-lossless", precision)
+    if examples is None:
+        examples = W4A4_EXAMPLES if precision == "fp4_w4a4" else FP4_EXAMPLES
+    for name, (k, n, calls) in examples.items():
         fp4 = make_linear_capture(
-            tmp / f"{name}.fp4.pt", k, n, calls, tier="near-lossless-fp4", precision="fp4_weights"
+            tmp / f"{name}.fp4.pt", k, n, calls, tier=tier, precision=precision
         )
         fp8 = make_linear_capture(
             tmp / f"{name}.fp8.pt", k, n, calls, tier="near-lossless", precision="fp8_weights"
@@ -490,7 +515,7 @@ def smoke_fp4(tmp: Path, verbose: bool = False) -> bool:
                 cases = result.get("cases") or [{}]
                 detail = (
                     f"speedup {result.get('speedup')}x, rel L2 {cases[0].get('max_rel_l2')} "
-                    f"(near-lossless-fp4), the FP8 tier rejects it"
+                    f"({tier}), the FP8 tier rejects it"
                 )
             elif not result.get("correct"):
                 detail = f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
@@ -757,6 +782,8 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_block_scale(tuple(tc.gpu.capability) if tc.gpu else (0, 0), verbose)
         if runs(MX_EXAMPLES, "triton") and mxfp8_supported(tc):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
+        if runs(W4A4_EXAMPLES, "triton") and hasattr(torch, "float4_e2m1fn_x2"):  # #233
+            ok &= smoke_fp4(Path(tmp), verbose, precision="fp4_w4a4")
         for precision, found in (
             ("int8_w8a8", INT8_W8A8_EXAMPLES),
             ("int8_weights", INT8_WEIGHT_EXAMPLES),
@@ -769,6 +796,8 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_triton_tools(Path(tmp), verbose, attention=attention)
         if runs(CUTE_W8A8_EXAMPLES, "cute"):
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8", examples=CUTE_W8A8_EXAMPLES)
+        if runs(CUTE_W4A4_EXAMPLES, "cute"):  # #233
+            ok &= smoke_fp4(Path(tmp), verbose, precision="fp4_w4a4", examples=CUTE_W4A4_EXAMPLES)
         if runs(CUTE_BLOCK_EXAMPLES, "cute"):
             ok &= smoke_fp8(
                 Path(tmp), verbose, examples=CUTE_BLOCK_EXAMPLES, capture=make_mlp_capture

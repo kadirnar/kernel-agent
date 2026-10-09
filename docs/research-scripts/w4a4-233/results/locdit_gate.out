@@ -1,0 +1,34 @@
+## the sensitivity probe (M = 352)
+  mlp.gate_proj      W4A4 rel L2 0.0882 norm -1.14 %  FP8 0.0190  FLOP share 0.242  crest 29
+  mlp.up_proj        W4A4 rel L2 0.0863 norm -0.99 %  FP8 0.0180  FLOP share 0.242  crest 29
+  self_attn.v_proj   W4A4 rel L2 0.0792 norm +0.05 %  FP8 0.0204  FLOP share 0.015  crest 24
+  self_attn.k_proj   W4A4 rel L2 0.0480 norm -0.54 %  FP8 0.0119  FLOP share 0.015  crest 24
+  self_attn.q_proj   W4A4 rel L2 0.0288 norm -0.37 %  FP8 0.0076  FLOP share 0.121  crest 24
+  self_attn.o_proj   W4A4 rel L2 0.0180 norm -0.47 %  FP8 0.0062  FLOP share 0.121  crest 23
+  mlp.down_proj      W4A4 rel L2 0.0120 norm -0.65 %  FP8 0.0069  FLOP share 0.242  crest 49
+
+## near-lossless-fp4a: all W4A4
+  status ok correct True speedup 0.703x (eager, vs the bf16 layer) checks ['aliasing', 'captured', 'perturbed', 'scaled', 'timed_output']
+  case 0: min cosine 0.9968636 max rel L2 0.0792 ref 0.54774 ms new 0.77878 ms
+  case 1: min cosine 0.9968438 max rel L2 0.0795 ref None ms new None ms
+
+## near-lossless-fp4a: W4A4, gate / up in FP8
+  status ok correct True speedup 0.851x (eager, vs the bf16 layer) checks ['aliasing', 'captured', 'perturbed', 'scaled', 'timed_output']
+  case 0: min cosine 0.9968636 max rel L2 0.0792 ref 0.6687 ms new 0.78624 ms
+  case 1: min cosine 0.9968438 max rel L2 0.0795 ref None ms new None ms
+
+## relaxed-fp4a: all W4A4
+  status ok correct True speedup 0.88x (eager, vs the bf16 layer) checks ['aliasing', 'captured', 'perturbed', 'scaled', 'timed_output']
+  case 0: min cosine 0.9968636 max rel L2 0.0792 ref 0.53427 ms new 0.6069 ms
+  case 1: min cosine 0.9968438 max rel L2 0.0795 ref None ms new None ms
+
+## relaxed-fp4a: W4A4, gate / up in FP8
+  status ok correct True speedup 0.875x (eager, vs the bf16 layer) checks ['aliasing', 'captured', 'perturbed', 'scaled', 'timed_output']
+  case 0: min cosine 0.9968636 max rel L2 0.0792 ref 0.54384 ms new 0.62187 ms
+  case 1: min cosine 0.9968438 max rel L2 0.0795 ref None ms new None ms
+
+## GPU time per layer call, CUDA graph (M = 352)
+  bf16 layer (reference)          301.3 us
+  all W4A4                        201.5 us  (1.50x)
+  W4A4, gate / up in FP8          210.5 us  (1.43x)
+  all FP8 W8A8                    267.4 us  (1.13x)

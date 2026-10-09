@@ -31,12 +31,14 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
     (``int8_weights``) has the ``fp8_weights`` floor (one byte per weight, math as profiled);
   - ``fp4_weights``: NVFP4 weights, 4.5 bits each (e2m1 + one e4m3 scale per 16), math
     as profiled;
-  - ``w4a4``: NVFP4 weights, all FLOPs at the NVFP4 tensor-core peak.
+  - ``w4a4``: NVFP4 weights, all FLOPs at the NVFP4 tensor-core peak (target precision
+    ``fp4_w4a4``, #233).
 
   A precision whose peak was not measured is unknown: no ratio to bf16 is assumed.
   ``ceilings.json`` has every floor; the markdown shows the ``columns`` of the precisions
   the run allows (``--precisions``, :mod:`kernel_agent.precisions`: exact; near-lossless
-  FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with 4-bit allowed), and only they rank a row.
+  FP8 w, W8A8 and MXFP8; FP4 w with ``fp4_weights`` and W4A4 with ``fp4_w4a4``, each only
+  when ``--precisions`` names it), and only they rank a row.
   A column whose tensor cores the peaks' GPU lacks (W8A8 before sm_89, MXFP8 and W4A4
   before sm_100, INT8 W8A8 before sm_75: :data:`kernel_agent.gpu_arch.COLUMN_NEEDS`) is never
   shown (``gpu_hidden``).
@@ -130,10 +132,8 @@ TARGET_COLUMNS = {
     "fp4_weights": "fp4_weights",
     "int8_weights": "fp8_weights",  # one byte per weight, bf16 math: the same floor
     "int8_w8a8": "int8_w8a8",
+    "fp4_w4a4": "w4a4",  # #233: W4A4 is opt-in, its column with it
 }
-#: The 4-bit columns, and the target precision that allows them (W4A4: no target precision
-#: reaches it; shown when 4-bit weights are allowed).
-_FOUR_BIT_COLUMNS = {"fp4_weights": "fp4_weights", "w4a4": "fp4_weights"}
 
 
 def target_columns(allowed: Iterable[str]) -> list[str]:
@@ -145,13 +145,11 @@ def target_columns(allowed: Iterable[str]) -> list[str]:
 
 def columns(allowed: Iterable[str] | None) -> list[str]:
     """The table's columns for a run that allows the target precisions ``allowed`` (None:
-    every column): those of :func:`target_columns`, and W4A4 with the 4-bit weights."""
+    every column): those of :func:`target_columns` (FP4 w only with ``fp4_weights``, W4A4
+    only with ``fp4_w4a4``)."""
     if allowed is None:
         return list(PRECISIONS)
-    allowed = tuple(allowed)
-    found = set(target_columns(allowed))
-    found |= {c for c, p in _FOUR_BIT_COLUMNS.items() if p in allowed}
-    return [name for name in PRECISIONS if name in found]
+    return target_columns(allowed)
 
 
 # ------------------------------------------------------------------ rows
@@ -422,6 +420,7 @@ TARGET_PRECISIONS = {
     "fp4_weights": PRECISIONS["fp4_weights"],
     "int8_weights": Precision("INT8 w", 1.0, None),  # the fp8_weights floor, its own label
     "int8_w8a8": PRECISIONS["int8_w8a8"],
+    "fp4_w4a4": PRECISIONS["w4a4"],
     "reduced": Precision("bf16", 2.0, "bfloat16"),
 }
 _SIBLINGS = re.compile(r"(.*)\.\{([^{}]*)\}")

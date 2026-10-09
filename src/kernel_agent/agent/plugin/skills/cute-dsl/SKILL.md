@@ -32,6 +32,11 @@ Examples (copy their structure; `kernel-agent doctor --smoke` runs them):
   per-channel scales, bias, residual, optional e4m3 output), per-token quantiser kernel.
   **Compiled for sm_120a on the CPU, not yet run on a GPU**: evaluate a copy with
   `mode="quick"` first and report what fails.
+* `examples/cute_nvfp4_w4a4_gemm.py`: W4A4 `nn.Linear` (`fp4_w4a4`, opt-in) on
+  `MmaMXF4NVF4Op` (e2m1 x e2m1, ue4m3 scales per 16): the FP8 GEMM's structure with the FP4
+  operand / scale types, the per-token scale and bias in the epilogue, a per-token NVFP4
+  quantiser bit for bit `quant.quantize_fp4_activations`. Run on an RTX 5070 Ti: 650 TFLOP/s
+  at 4096³ (cuBLASLt NVFP4 661, FP8 332; skill `fp4-w4a4`).
 * `examples/cute_fp8_decoder_block.py`: fused small-M block (M ≤ 16) with FP8 weights:
   RMSNorm → gate|up → silu·up in one launch, down + residual in a second. Same status.
 
@@ -142,6 +147,6 @@ failure modes follow:
 
 ## Examples and sources
 
-* Examples: `examples/cute_rmsnorm.py`, `examples/cute_fp8_blockscaled_gemm.py`, `examples/cute_fp8_decoder_block.py`, `examples/cute_sm90_gemm_ws.py`, `examples/cute_sm100_gemm_tcgen05.py`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Examples: `examples/cute_rmsnorm.py`, `examples/cute_fp8_blockscaled_gemm.py`, `examples/cute_nvfp4_w4a4_gemm.py`, `examples/cute_fp8_decoder_block.py`, `examples/cute_sm90_gemm_ws.py`, `examples/cute_sm100_gemm_tcgen05.py`. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
 * Sources: the `documentation-sources` skill's `sources.md`, sections "CUTLASS / CuTe"; "Local reference code".
 * Code: `kernel_agent.cute_dsl.compile_cached`.

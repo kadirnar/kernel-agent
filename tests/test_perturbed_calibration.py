@@ -8,7 +8,8 @@ statistics) the bounds of redrawn inputs scale the element bound per channel
 Both quality modes with reduced precision: ``near-lossless`` and ``relaxed`` (#175, about
 twice the error budgets), where blatant bugs (int4 per tensor, scales x 1.2, a skipped
 output row, gate / up swapped) still fail. INT8 (#178: ``int8_weights``, ``int8_w8a8``)
-shares the 8-bit tiers and is calibrated here the same way."""
+shares the 8-bit tiers and is calibrated here the same way, W4A4 (#233: ``fp4_w4a4``) its
+own near-lossless-fp4a / relaxed-fp4a tiers."""
 
 import pytest
 import torch
@@ -71,13 +72,14 @@ class Linear(torch.nn.Module):
             self.cache = {{}}
             self.static = None
             return
-        if PRECISION == "fp4_weights":
+        if PRECISION in ("fp4_weights", "fp4_w4a4"):
             codes, scales, ts = quant.quantize_fp4(w)
             if BUG == "nibbles":
                 codes = (codes >> 4) | ((codes & 0xF) << 4)
             elif BUG == "scale x1.2":
                 ts = ts * 1.2
             self.w = quant.dequantize_fp4(codes, scales, ts, w.dtype)
+            self.codes, self.scales, self.ts = codes, scales, ts  # fp4_w4a4 (#233)
             return
         self.q, self.s = quant.quantize_fp8(w)
         if BUG == "scale x1.05":
@@ -99,6 +101,8 @@ class Linear(torch.nn.Module):
             return quant.int8_weights_linear(x, self.q, self.s)
         if PRECISION == "int8_w8a8":
             return self.int8(x)
+        if PRECISION == "fp4_w4a4":
+            return quant.fp4_w4a4_linear(x, self.codes, self.scales, self.ts)
         if PRECISION != "fp8_w8a8":
             return torch.nn.functional.linear(x, self.w)
         if BUG not in ACTIVATION_BUGS:
@@ -153,11 +157,20 @@ def build(reference):
     return Mlp(reference)
 """
 INT8 = ("int8_weights", "int8_w8a8")
+FOUR_BIT = ("fp4_weights", "fp4_w4a4")
 #: Broken variants caught on the captured inputs but not on every redrawn draw: INT8 clamps
 #: where e4m3 would round coarser, and the redrawn tokens' amax are within ~20 % of the
 #: first one's (the captured tokens' are not).
 CAPTURED_ONLY = {("int8_w8a8", "first token's scale")}
-REFERENCE_MATH = ("fp8_weights", "fp8_w8a8", "fp4_weights", "fp8_mx", "int8_weights", "int8_w8a8")
+REFERENCE_MATH = (
+    "fp8_weights",
+    "fp8_w8a8",
+    "fp4_weights",
+    "fp8_mx",
+    "int8_weights",
+    "int8_w8a8",
+    "fp4_w4a4",
+)
 
 
 class Mlp(nn.Module):
@@ -257,6 +270,7 @@ def test_the_relaxed_tiers_mirror_the_near_lossless_ones_with_looser_bounds():
         compare.NEAR_LOSSLESS_TIER: compare.RELAXED_TIER,
         compare.NEAR_LOSSLESS_FP4_TIER: compare.RELAXED_FP4_TIER,
         compare.NEAR_LOSSLESS_KV_TIER: compare.RELAXED_KV_TIER,
+        compare.NEAR_LOSSLESS_FP4A_TIER: compare.RELAXED_FP4A_TIER,  # #233
     }
     for precision in compare.REDUCED_PRECISIONS:
         near, relaxed = (
@@ -306,6 +320,7 @@ def test_reference_math_passes_captured_and_redrawn_inputs(tmp_path, writer, pre
         ("fp8_weights", "neighbour scale", "incorrect"),
         ("fp8_mx", "neighbour scale", "incorrect"),
         ("fp4_weights", "nibbles", "incorrect"),
+        ("fp4_w4a4", "nibbles", "incorrect"),
         ("int8_w8a8", "scale x1.05", "incorrect"),
         ("int8_w8a8", "neighbour scale", "incorrect"),
         ("int8_w8a8", "first token's scale", "incorrect"),
@@ -338,7 +353,7 @@ def test_broken_scales_still_fail(tmp_path, writer, precision, bug, status, qual
         ("gate-up swapped", "incorrect"),  # a packed gate|up weight read in the wrong order
     ],
 )
-@pytest.mark.parametrize("precision", ("fp8_weights", "fp8_w8a8", "fp4_weights", *INT8))
+@pytest.mark.parametrize("precision", ("fp8_weights", "fp8_w8a8", "fp4_weights", "fp4_w4a4", *INT8))
 @pytest.mark.parametrize("quality", QUALITIES)
 def test_blatant_bugs_fail_the_relaxed_tiers_as_the_near_lossless_ones(
     tmp_path, writer, precision, bug, status, quality
@@ -349,7 +364,7 @@ def test_blatant_bugs_fail_the_relaxed_tiers_as_the_near_lossless_ones(
     path, _ = _candidate(tmp_path, precision, bug)
     result = evaluate(capture, path, device="cpu")
     if isinstance(status, dict):
-        status = "incorrect_perturbed" if precision == "fp4_weights" else status[quality]
+        status = "incorrect_perturbed" if precision in FOUR_BIT else status[quality]
     assert result["status"] == status and result["tolerance_tier"] == tier, result
 
 

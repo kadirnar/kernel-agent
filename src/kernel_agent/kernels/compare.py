@@ -17,10 +17,11 @@ A floating-point tensor matches its reference when
 Integer and boolean tensors must match exactly. In the ``near-lossless`` tier
 (:data:`TIERS`: ``--quality near-lossless`` and a target whose spec allows reduced
 precision) whole-tensor bounds replace the per-element tolerances; FP4 weights
-(``fp4_weights``) get the wider bounds of the ``near-lossless-fp4`` tier. ``--quality
+(``fp4_weights``) get the wider bounds of the ``near-lossless-fp4`` tier, W4A4
+(``fp4_w4a4``) those of ``near-lossless-fp4a``. ``--quality
 relaxed`` (the default of new runs, :data:`DEFAULT_QUALITY`) has the same structure with
-about twice the error budgets: the ``relaxed``, ``relaxed-fp4`` and ``relaxed-kv`` tiers
-(:data:`QUALITY_TIERS`). On redrawn
+about twice the error budgets: the ``relaxed``, ``relaxed-fp4``, ``relaxed-fp4a`` and
+``relaxed-kv`` tiers (:data:`QUALITY_TIERS`). On redrawn
 inputs (``perturbed``) these tiers use their own bounds (:data:`PERTURBED_BOUNDS`), with
 the element bound scaled per channel. On inputs scaled by a factor (``input_scale``: the
 evaluator's ×3 / ×0.01 / ×−1 checks, :mod:`kernel_agent.kernels.verify`) the absolute
@@ -128,6 +129,11 @@ NEAR_LOSSLESS_KV_TIER = "near-lossless-kv"
 RELAXED_TIER = "relaxed"
 RELAXED_FP4_TIER = "relaxed-fp4"
 RELAXED_KV_TIER = "relaxed-kv"
+#: ``near-lossless-fp4a`` / ``relaxed-fp4a`` (#233): W4A4 (``fp4_w4a4``: block-scaled FP4
+#: weights and activations), whose two quantised operands move a GEMM's output about 1.4x as
+#: far as FP4 weights alone (:data:`NEAR_LOSSLESS_BOUNDS`).
+NEAR_LOSSLESS_FP4A_TIER = "near-lossless-fp4a"
+RELAXED_FP4A_TIER = "relaxed-fp4a"
 TIERS = (
     EXACT_TIER,
     NEAR_LOSSLESS_TIER,
@@ -136,6 +142,8 @@ TIERS = (
     RELAXED_TIER,
     RELAXED_FP4_TIER,
     RELAXED_KV_TIER,
+    NEAR_LOSSLESS_FP4A_TIER,
+    RELAXED_FP4A_TIER,
 )
 #: The quality modes (``--quality``): ``exact`` (numerics within rounding noise of eager),
 #: ``near-lossless`` and ``relaxed`` (numerics-changing optimisations judged end to end by
@@ -161,7 +169,10 @@ DEFAULT_QUALITY = RELAXED_TIER
 #: ``int8_weights`` (INT8 weight-only: int8 codes per output channel, bf16 activations) and
 #: ``int8_w8a8`` (INT8 tensor-core math, IMMA: int8 weights per output channel and activations
 #: per token, int32 accumulation; the 8-bit compute class of GPUs without FP8 tensor cores),
-#: #178: the near-lossless tier. Anything else (``exact``, none) is the exact tier.
+#: #178: the near-lossless tier. ``fp4_w4a4`` (W4A4, #233: NVFP4 / MXFP4 weights and
+#: activations on the block-scaled FP4 tensor cores, fp32 accumulation; opt-in like every
+#: 4-bit precision): the near-lossless-fp4a tier. Anything else (``exact``, none) is the
+#: exact tier.
 REDUCED_PRECISIONS = (
     "fp8_weights",
     "reduced",
@@ -171,11 +182,20 @@ REDUCED_PRECISIONS = (
     "fp8_kv",
     "int8_weights",
     "int8_w8a8",
+    "fp4_w4a4",
 )
 #: The tier of a reduced precision other than the near-lossless tier.
-PRECISION_TIERS = {"fp4_weights": NEAR_LOSSLESS_FP4_TIER, "fp8_kv": NEAR_LOSSLESS_KV_TIER}
+PRECISION_TIERS = {
+    "fp4_weights": NEAR_LOSSLESS_FP4_TIER,
+    "fp8_kv": NEAR_LOSSLESS_KV_TIER,
+    "fp4_w4a4": NEAR_LOSSLESS_FP4A_TIER,
+}
 #: ... and other than the relaxed tier.
-RELAXED_PRECISION_TIERS = {"fp4_weights": RELAXED_FP4_TIER, "fp8_kv": RELAXED_KV_TIER}
+RELAXED_PRECISION_TIERS = {
+    "fp4_weights": RELAXED_FP4_TIER,
+    "fp8_kv": RELAXED_KV_TIER,
+    "fp4_w4a4": RELAXED_FP4A_TIER,
+}
 #: Per quality mode that allows reduced precision: (the tier of its reduced precisions, the
 #: precisions with a tier of their own).
 QUALITY_TIERS: dict[str, tuple[str, dict[str, str]]] = {
@@ -224,6 +244,34 @@ RELAXED_FP4_MIN_COSINE = 0.94
 RELAXED_FP4_MAX_REL_L2 = 0.36
 RELAXED_FP4_MAX_NORM_CHANGE = 0.06
 RELAXED_FP4_ELEMENT = (1.75, 0.25)
+#: The ``near-lossless-fp4a`` / ``relaxed-fp4a`` tiers' bounds (W4A4, #233), calibrated with
+#: the reference math (``quant.fp4_w4a4_linear``: NVFP4 weights and per-token NVFP4
+#: activations, ``F.scaled_mm`` on the GPU) on real captures (docs/research-scripts/w4a4-233):
+#: the VoxCPM2 LocDiT layer (M = 352 / 176, compute bound: what W4A4 is for) reaches cosine
+#: >= 0.9968, relative L2 <= 0.080, norm within 3.4 %, element ``a`` (at r = 0.25) <= 0.40;
+#: the 12-layer VoxCPM2 LocEnc at M = 80 0.9929 / 0.119 / 0.2 % / 0.75; the VoxCPM2 base-LM
+#: and Qwen3-0.6B decode layers (M = 1) >= 0.9839 / <= 0.179 / 2.3 % / 0.75. Quantised
+#: activations shrink a GEMM's output by up to ~1 % (e2m1's grid, not the scale rounding:
+#: unrounded block scales give the same; LocDiT gate_proj -0.9 %, down_proj -1.1 %, q_proj
+#: 0.0 %), so the LocDiT MLP (gate / up, then down) loses 3.4 % of the hidden state's norm
+#: (gate / up in FP8: 0.9 %). Hence the FP4 weight tier's cosine and relative L2 with norm
+#: ±5 % and ``a`` 1.5. MXFP4 W4A4 fails it on the LocDiT layer (norm 6.5 %), as MXFP4 weights fail
+#: near-lossless-fp4 there, and passes ``relaxed-fp4a`` (about 1.3-1.6x the budgets). Broken
+#: kernels fail on the single-layer captures: weight tensor scale x 1.05 (norm 5.7-13.6 %)
+#: and x 1.2, swapped nibbles, activation block scales shifted by one block, the first token's
+#: outer scale for every token, activation codes truncated instead of rounded, activation
+#: scales cached from the first call (redrawn inputs), int4 per tensor, a dropped KV head; an
+#: unwritten output row and swapped q heads pass the LocDiT layer within W4A4's noise (as with
+#: FP4 weights), and the LocEnc's final RMSNorm hides scale bugs (x 1.2 and truncated codes
+#: pass it): the perceptual gate judges those end to end.
+NEAR_LOSSLESS_FP4A_MIN_COSINE = 0.96
+NEAR_LOSSLESS_FP4A_MAX_REL_L2 = 0.28
+NEAR_LOSSLESS_FP4A_MAX_NORM_CHANGE = 0.05
+NEAR_LOSSLESS_FP4A_ELEMENT = (1.5, 0.25)
+RELAXED_FP4A_MIN_COSINE = 0.94
+RELAXED_FP4A_MAX_REL_L2 = 0.36
+RELAXED_FP4A_MAX_NORM_CHANGE = 0.08
+RELAXED_FP4A_ELEMENT = (2.0, 0.25)
 #: (min cosine, max relative L2 error, max norm change, element bound) of each tier that
 #: replaces the per-element checks with whole-tensor bounds.
 NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
@@ -262,6 +310,18 @@ NEAR_LOSSLESS_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]]
         RELAXED_MAX_REL_L2,
         RELAXED_MAX_NORM_CHANGE,
         RELAXED_ELEMENT,
+    ),
+    NEAR_LOSSLESS_FP4A_TIER: (
+        NEAR_LOSSLESS_FP4A_MIN_COSINE,
+        NEAR_LOSSLESS_FP4A_MAX_REL_L2,
+        NEAR_LOSSLESS_FP4A_MAX_NORM_CHANGE,
+        NEAR_LOSSLESS_FP4A_ELEMENT,
+    ),
+    RELAXED_FP4A_TIER: (
+        RELAXED_FP4A_MIN_COSINE,
+        RELAXED_FP4A_MAX_REL_L2,
+        RELAXED_FP4A_MAX_NORM_CHANGE,
+        RELAXED_FP4A_ELEMENT,
     ),
 }
 #: Redrawn inputs (``perturbed``: the evaluator's perturbed-input check,
@@ -364,6 +424,16 @@ CHANNEL_MIN_ROWS = 16
 #: 1 / 0 -> 0 / 0, INT8 W8A8 4 / 3 -> 0 / 0); redrawn (of 80) FP8 weights 8 / 0 -> 9 / 0, FP8
 #: W8A8 63 / 3 -> 63 / 4, MXFP8 68 / 4 -> 68 / 6, MXFP4 5 / 1 -> 6 / 1 (the key row's norm).
 #: Every broken variant is still rejected in both modes.
+#:
+#: * ``near-lossless-fp4a`` / ``relaxed-fp4a`` (W4A4, #233; per-channel redraws, 10 seeds of
+#:   both kinds): NVFP4 W4A4 on the LocDiT layer reaches cosine >= 0.9885, relative L2 <=
+#:   0.151, norm within 3.2 %, ``a`` <= 0.84 (redrawn and x 3 / x 0.01 / x -1), the LocEnc
+#:   stack 0.9868 / 0.162 / 0.4 %, the base-LM decode layer 0.9684 / 0.256 / 2.8 % (x 0.01);
+#:   none fails. The Qwen3-0.6B decode layer's one-token output reaches 0.893 / 0.479 / 15.4 %
+#:   and fails 4 of 80 near-lossless draws on the cosine (none relaxed): W4A4 at M = 1 is
+#:   memory bound anyway (``fp4_weights``' job). MXFP4 W4A4 there: 32 / 6 of 80. The redrawn
+#:   norm bounds stay below 20 % (relaxed-fp4a at relaxed-fp4's 18 %): a KV-cache row written
+#:   x 1.2 must fail every tier (``tests/test_grown_cache.py``).
 PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     NEAR_LOSSLESS_TIER: (0.996, 0.08, 0.03, (0.75, 0.125)),
     NEAR_LOSSLESS_FP4_TIER: (0.94, 0.40, 0.12, (2.5, 0.25)),
@@ -371,6 +441,8 @@ PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     RELAXED_TIER: (0.99, 0.16, 0.06, (1.5, 0.125)),
     RELAXED_FP4_TIER: (0.90, 0.55, 0.18, (3.0, 0.25)),
     RELAXED_KV_TIER: (0.97, 0.25, 0.06, (2.5, 0.125)),
+    NEAR_LOSSLESS_FP4A_TIER: (0.90, 0.50, 0.15, (3.0, 0.25)),
+    RELAXED_FP4A_TIER: (0.85, 0.65, 0.18, (3.5, 0.25)),
 }
 #: An output of an input's shape is that input with rows written into it (:func:`written_box`,
 #: #206) when the elements the reference changed fill at least WRITTEN_MIN_DENSITY of their box
@@ -400,8 +472,9 @@ def tier_of(capture: dict[str, Any] | None) -> str:
 def tier_for(quality: str | None, precision: str | None) -> str:
     """The tier of a target: ``near-lossless`` when the run's quality mode is
     ``near-lossless`` and the target's spec allows reduced precision
-    (:data:`REDUCED_PRECISIONS`; ``fp4_weights``: ``near-lossless-fp4``); ``relaxed`` (and
-    ``relaxed-fp4`` / ``relaxed-kv``) likewise in a ``relaxed`` run."""
+    (:data:`REDUCED_PRECISIONS`; ``fp4_weights``: ``near-lossless-fp4``, ``fp4_w4a4``:
+    ``near-lossless-fp4a``); ``relaxed`` (and ``relaxed-fp4`` / ``relaxed-fp4a`` /
+    ``relaxed-kv``) likewise in a ``relaxed`` run."""
     if quality not in QUALITY_TIERS or precision not in REDUCED_PRECISIONS:
         return EXACT_TIER
     main, own = QUALITY_TIERS[str(quality)]

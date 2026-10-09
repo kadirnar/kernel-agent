@@ -46,6 +46,7 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://github.com/NVIDIA/cutlass/tree/main/examples/87_blackwell_geforce_gemm_blockwise — sm_120 FP8 x FP8 -> bf16 GEMMs with blockwise / groupwise scales.
 * https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/blackwell_functionality.md — "Blackwell SM120 GEMMs": mma.sync kinds and types, TN layout only, no TMA multicast (cluster 1x1x1).
 * https://github.com/NVIDIA/cutlass/blob/main/examples/91_fp4_gemv/91_fp4_gemv.cu — FP4 GEMV.
+* https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_warp.html — CuTe DSL warp MMA ops: `MmaMXF8Op`, `MmaMXF8F6F4Op`, `MmaMXF4NVF4Op` (sm_120a block-scaled `mma.sync`).
 * https://github.com/NVIDIA/cutlass/blob/main/examples/94_ada_fp8_blockwise/ada_fp8_blockwise.cu — sm_89-class (mma.sync) FP8 blockwise GEMM.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/blackwell_geforce/kernel — CuTe DSL sm_120 kernels: `dense_gemm`, `blockscaled_gemm`.
 * https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/cute/ampere — CuTe DSL mma.sync kernels (`dense_gemm`, `attention`, `elementwise`) and a tutorial.
@@ -123,6 +124,8 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://docs.nvidia.com/deeplearning/transformer-engine-releases/release-2.18/user-guide/features/low_precision_training/ — Transformer Engine FP8 recipes: delayed vs current scaling, 1x128 / 128x128 block scaling, MXFP8, and which GPUs run each.
 * https://arxiv.org/abs/2405.04532 — QServe: W4A8KV4 and its GEMM design (code: https://github.com/mit-han-lab/omniserve).
 * https://github.com/pytorch/ao/tree/main/torchao/prototype/mx_formats — MX / NVFP4 reference quantisation in PyTorch.
+* https://arxiv.org/abs/2509.23202 — QuTLASS: W4A4 MXFP4 / NVFP4 GEMMs with online Hadamard rotations, CUTLASS builds for sm_100 and sm_120 (the authors' layer-wise and end-to-end speed-ups).
+* https://github.com/mit-han-lab/nunchaku — SVDQuant's W4A4 inference engine (INT4, and NVFP4 on Blackwell): a low-rank branch absorbs the outliers 4-bit activations cannot hold.
 
 ## Attention and sampling algorithms (papers)
 * https://arxiv.org/abs/2307.08691 — FlashAttention-2: work partitioning.

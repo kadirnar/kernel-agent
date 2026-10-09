@@ -81,6 +81,7 @@ PRECISION_SKILLS = {
     "fp4_weights": "fp4-weights",
     "int8_weights": "int8-weights",
     "int8_w8a8": "int8-w8a8",
+    "fp4_w4a4": "fp4-w4a4",
     "reduced": "precision-tiers",
 }
 #: The skills a role loads first, before those of its target's backends and precision.

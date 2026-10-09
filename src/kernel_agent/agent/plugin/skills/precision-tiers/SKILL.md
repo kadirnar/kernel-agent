@@ -1,6 +1,6 @@
 ---
 name: precision-tiers
-description: Precision classes (fp8_weights, fp8_w8a8, fp8_mx, fp8_kv, fp4_weights, int8_weights, int8_w8a8, reduced) and when a run allows them, the near-lossless and relaxed tolerance tiers and redrawn-input checks, FP8 / FP4 / INT8 formats, scale granularity and outliers. Use when planning a precision or before any low-precision kernel.
+description: Precision classes (fp8_weights, fp8_w8a8, fp8_mx, fp8_kv, fp4_weights, fp4_w4a4, int8_weights, int8_w8a8, reduced) and when a run allows them, the near-lossless and relaxed tolerance tiers and redrawn-input checks, FP8 / FP4 / INT8 formats, scale granularity and outliers. Use when planning a precision or before any low-precision kernel.
 ---
 
 # Low-precision weights (FP8, FP4, INT8): precision classes and tolerance tiers
@@ -34,7 +34,8 @@ One skill per precision class (load the one of your target's `precision`):
 | `fp8_w8a8` | `fp8-w8a8` | compute-bound GEMMs: e4m3 weights and per-token activations on the FP8 tensor cores |
 | `fp8_mx` | `mxfp8` | compute-bound GEMMs with wide outputs on block-scaled tensor cores (sm_100 / sm_120) |
 | `fp8_kv` | `fp8-kv-cache` | decode attention over long KV caches (opt-in) |
-| `fp4_weights` | `fp4-weights` | memory-bound decode GEMVs where FP8 weights are not enough (NVFP4) |
+| `fp4_weights` | `fp4-weights` | memory-bound decode GEMVs where FP8 weights are not enough (NVFP4; opt-in) |
+| `fp4_w4a4` | `fp4-w4a4` | compute-bound GEMMs past FP8 on block-scaled FP4 tensor cores: NVFP4 weights and per-token activations (sm_100+; opt-in) |
 | `int8_weights` | `int8-weights` | memory-bound decode GEMVs and skinny GEMMs: int8 weights, bf16 activations (no e4m3 conversion: GPUs before sm_89) |
 | `int8_w8a8` | `int8-w8a8` | compute-bound GEMMs on the IMMA tensor cores: int8 weights and per-token activations (the 8-bit compute class of Turing / Ampere) |
 
@@ -58,7 +59,12 @@ exact tier applies and FP8 weights fail it (~2.6 % relative L2 per GEMM, ~20 %
 of the elements outside the bf16 tolerance). `"precision": "fp4_weights"`
 (block-scaled FP4 weights) has its own tier, **near-lossless-fp4**: cosine >=
 0.96, relative L2 error <= 0.28, norm within ±4 %, every element within 1.25 x
-RMS + 0.25 x |reference| (skill `fp4-weights`); FP4 fails the FP8 tier.
+RMS + 0.25 x |reference| (skill `fp4-weights`); FP4 fails the FP8 tier. W4A4
+(`"precision": "fp4_w4a4"`: FP4 weights and activations, opt-in) has
+**near-lossless-fp4a**: cosine >= 0.96, relative L2 error <= 0.28, norm within ±5 %,
+every element within 1.5 x RMS + 0.25 x |reference|, and **relaxed-fp4a** (skill
+`fp4-w4a4`). No quality mode allows a 4-bit class by default: `--precisions` must name
+it.
 After timing the evaluator checks again on inputs redrawn from each channel's own
 mean and std (the perturbed-input check; a single token from the tensor's, rotary
 cos / sin tables kept). A single token has no outlier channels then, so a
