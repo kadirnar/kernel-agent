@@ -12,15 +12,32 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import operator
 import os
 import sys
 import types
 from pathlib import Path
 from typing import Any
 
+import libscout_toy
 import pytest
 import torch
-from libscout_toy import Block, Core, Feed, Head, Mixer, Plain, Promoted, Residual, Scale
+from libscout_toy import (
+    Block,
+    Boxed,
+    Branchy,
+    Core,
+    Counted,
+    Feed,
+    Fused,
+    Head,
+    Mixer,
+    Plain,
+    Promoted,
+    Residual,
+    Rotary,
+    Scale,
+)
 from test_ceilings import PEAKS
 from test_ceilings import _profile as ceilings_profile
 from test_recheck import kernel, make, simulated  # noqa: F401 (fixture)
@@ -187,7 +204,7 @@ def test_missing_and_broken_libraries_are_skipped_with_reasons(monkeypatch):
     assert not decisions["flash-attn"].run
     assert decisions["flashinfer-norm"].reason == probes["flashinfer-norm"].reason
     assert decisions["torch-scaled-mm"].reason == "serves fp8_w8a8 targets; this one is exact"
-    assert decisions["liger-rope"].reason.startswith("no template yet")
+    assert decisions["liger-rope"].reason == probes["liger-rope"].reason  # not installed
     assert decisions["torch-sdpa"].run and decisions["torch-rms-norm"].run
     assert decisions["cublaslt"].reason == (
         "no call site it takes: linear in float32 (takes bfloat16, float16)"
@@ -453,8 +470,9 @@ def test_op_bars_spare_the_sweep_its_losers():
 
 
 class InPlace(Scale):
-    """The written-out RMSNorm with ``+=`` (``add_``): no pattern to replay for an op bar
-    (a replayed in-place call would change its recorded input)."""
+    """The written-out RMSNorm with ``+=`` (``add_``): an RMSNorm to detect and fold, but no
+    pattern to replay for an op bar (a replayed in-place call would change its recorded
+    input)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -485,7 +503,7 @@ def test_written_out_rms_norms_get_op_bars_against_the_fused_kernel(tmp_path):
     assert calls[spans[1].entry].name == "to" and calls[spans[1].calls[0] - 1].name == "add"
     in_place = InPlace(8)
     traced = detect.trace(in_place, (torch.randn(3, 8),), module=in_place)
-    assert "rms_norm" not in detect.families(traced) and detect.rms_spans(traced) == []
+    assert "rms_norm" in detect.families(traced) and detect.rms_spans(traced) == []
     assert detect._in_place("TensorBase.add_") and detect._in_place("Tensor.__imul__")
     assert not detect._in_place("Tensor.__add__") and not detect._in_place("TensorBase.pow")
 
@@ -1327,6 +1345,451 @@ def test_doctor_lists_libraries_and_where_their_adapters_run(monkeypatch):
     assert "    torch-scaled-mm [linear]: skipped: needs sm_89+" in text
 
 
+# ------------------------------------------------------------------ follow-ups 3, 5, 6, 8
+
+
+def test_a_written_out_rms_norm_with_an_in_place_add_is_detected_and_folded(tmp_path):
+    """``variance += eps`` reaches the trace as ``add_`` and Dynamo's graph as
+    ``operator.iadd``: the same RMSNorm, detected and folded."""
+    torch.manual_seed(0)
+    norm = InPlace(8).eval()
+    with torch.no_grad():
+        norm.weight.add_(torch.randn(8))
+    x = torch.randn(3, 8)
+    assert found_in(norm, x)["rms_norm"]["sites"] == [
+        {
+            "form": "manual",
+            "hidden": 8,
+            "eps": 1e-6,
+            "weight": "weight",
+            "dtype": "float32",
+            "rows": 3,
+        }
+    ]
+    (graph,) = _graphs(norm, x)
+    assert any(n.target is operator.iadd for n in graph.graph.nodes)
+    assert fx_rewrites.fold_rms_norm(graph.graph, lambda *a: a[0]) == 1
+    module = _load(_render("torch-rms-norm", [{"FUSE": 0}]), tmp_path / "n.py")
+    with torch.inference_mode():
+        candidate = module.build(norm, FUSE=0)
+        torch.testing.assert_close(candidate(x), norm(x), rtol=1e-5, atol=1e-5)
+    assert candidate.rewritten == 1
+
+
+def test_norms_in_torchscript_functions_are_run_as_python_and_inlined(tmp_path, monkeypatch):
+    """A ``@torch.jit.script`` RMSNorm runs in C++, where the trace sees nothing: the trace
+    runs its Python (its original, or its TorchScript code as Python when it has none, as a
+    function of a TorchScript archive), and a candidate lets Dynamo trace into it."""
+    torch.manual_seed(0)
+    fused = Fused(16).eval()
+    with torch.no_grad():
+        fused.weight.add_(torch.randn(16))
+    x = torch.randn(3, 16)
+    with torch.inference_mode():
+        want = fused(x)
+    assert detect.trace(fused, (x,)) == []  # no module given: TorchScript, nothing seen
+    inlined: list[str] = []
+    calls = detect.trace(fused, (x,), module=fused, inlined=inlined)
+    assert inlined == ["norm_scripted"]
+    assert fx_rewrites.torchscript_functions(Block()) == []  # in its file, never called
+    assert detect.describe(detect.families(calls)) == "rms_norm x1 (manual)"
+    assert isinstance(libscout_toy.norm_scripted, torch.jit.ScriptFunction)  # put back
+    assert fx_rewrites.torchscript_python(libscout_toy.norm_scripted) is libscout_toy._norm
+
+    # a TorchScript function without its Python original: its code, run as Python
+    monkeypatch.delattr(libscout_toy.norm_scripted, "_torchdynamo_inline")
+    python = fx_rewrites.torchscript_python(libscout_toy.norm_scripted)
+    assert python is not None and python is not libscout_toy._norm
+    with torch.inference_mode():
+        torch.testing.assert_close(python(x, fused.weight, 1e-6), want)
+    assert "rms_norm" in detect.families(detect.trace(fused, (x,), module=fused))
+    case = {"args": (x,), "kwargs": {}}
+    torch._dynamo.reset()
+    plain = tmp_path / "plain.py"  # Dynamo breaks its graph there: nothing to rewrite
+    plain.write_text(_render("torch-rms-norm"))
+    assert probe._dry_run(plain, fused, None, case, {})[1] == probe.UNCHANGED
+    torch._dynamo.reset()
+    inlining = tmp_path / "inlining.py"
+    inlining.write_text(
+        template.render(
+            adapters.BY_NAME["torch-rms-norm"],
+            target="t",
+            version="2",
+            configs=[{}],
+            torchscript=True,
+        )
+    )
+    output: list[Any] = []
+    module, why = probe._dry_run(inlining, fused, None, case, {}, output)
+    assert why is None and module is not None
+    torch.testing.assert_close(output[0], want, rtol=1e-5, atol=1e-5)
+    assert critic.static_checks(inlining.read_text()) == []
+
+
+def cos_sin(batch: int = 2, seq: int = 5, dim: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate-half tables: their two halves repeat the frequencies, as models build them."""
+    torch.manual_seed(2)
+    freqs = torch.randn(batch, seq, dim // 2)
+    table = torch.cat((freqs, freqs), dim=-1)
+    return table.cos(), table.sin()
+
+
+def _fake_liger(monkeypatch) -> None:
+    functional = _module(
+        "liger_kernel.transformers.functional",
+        liger_rms_norm=print,
+        liger_swiglu=print,
+        liger_rope=lambda q, k, cos, sin: (q, k),
+    )
+    transformers = _module("liger_kernel.transformers", functional=functional)
+    liger = _module("liger_kernel", transformers=transformers)
+    liger._submodules = {  # type: ignore[attr-defined]
+        "transformers": transformers,
+        "transformers.functional": functional,
+    }
+    _fake_libraries(monkeypatch, {"liger_kernel": liger})
+
+
+def test_rope_of_q_and_k_is_detected_as_a_pair_and_folded_into_one_call(tmp_path, monkeypatch):
+    """Rotate-half RoPE of q and k with one cos and sin: two paired sites, one call of
+    Liger's kernel; q alone is not Liger's; a q read again afterwards is copied first."""
+    torch.manual_seed(0)
+    rotary = Rotary().eval()
+    x = torch.randn(2, 5, 32)
+    cos, sin = cos_sin()
+    found = found_in(rotary, x, cos, sin)
+    assert found["rotary"]["sites"] == [
+        {"shape": [2, 4, 5, 8], "head_dim": 8, "dtype": "float32", "paired": True},
+        {"shape": [2, 2, 5, 8], "head_dim": 8, "dtype": "float32", "paired": True},
+    ]
+    alone = found_in(Mixer(), torch.randn(2, 5, 32), *rope())
+    assert [s["paired"] for s in alone["rotary"]["sites"]] == [False]
+    _fake_liger(monkeypatch)
+    probes = registry.availability([adapters.BY_NAME["liger-rope"]])
+
+    def decide(found: dict[str, Any]) -> registry.Decision:
+        (decision,) = registry.applicable(
+            [adapters.BY_NAME["liger-rope"]],
+            found,
+            capability=(8, 6),
+            precision="exact",
+            available=probes,
+        )
+        return decision
+
+    assert decide(found).run and decide(found).sites == 2
+    assert decide(alone).reason == (
+        "no call site it takes: rotary embedding of one tensor (Liger's RoPE rotates q and k "
+        "with one cos and sin together)"
+    )
+
+    def pair(q: Any, k: Any, cos: Any, sin: Any, q_free: bool, k_free: bool) -> Any:
+        return q, k
+
+    for module, free in ((rotary, (True, True)), (Rotary(keep=True), (False, True))):
+        (graph,) = _graphs(module, x, cos, sin)
+        assert fx_rewrites.fold_rope(graph.graph, pair) == 1
+        (node,) = [n for n in graph.graph.nodes if n.target is pair]
+        assert node.args[4:] == free  # q read again: the library must not write into it
+        assert not any(n.target is torch.cat for n in graph.graph.nodes)
+    (graph,) = _graphs(Mixer(), torch.randn(2, 5, 32), *rope())
+    assert fx_rewrites.fold_rope(graph.graph, pair) == 0  # q alone
+
+    module = _load(_render("liger-rope"), tmp_path / "rope.py")
+    with torch.inference_mode():
+        candidate = module.build(rotary)  # on the CPU: the reference's math
+        torch.testing.assert_close(candidate(x, cos, sin), rotary(x, cos, sin))
+    assert candidate.rewritten == 1
+    q = torch.randn(2, 4, 5, 8)
+    assert module._table(cos.unsqueeze(1), q).shape == (2, 5, 8)  # as Liger takes it
+    assert module._table(cos[0], q).shape == (1, 5, 8)
+    assert module._table(torch.randn(4, 5, 8), q) is None  # one table per head
+
+
+def test_gemlite_runs_at_low_bit_weight_precisions_on_the_gpus_of_each_format():
+    gemlite = adapters.BY_NAME["gemlite"]
+    probes = {"gemlite": registry.Availability("gemlite", "gemlite", "0.6.0")}
+    linear = {"linear": {"sites": [{"m": 1, "n": 4096, "k": 1024, "dtype": "bfloat16"}]}}
+
+    def decide(arch: str, precision: str, found: dict[str, Any] = linear) -> registry.Decision:
+        (decision,) = registry.applicable(
+            [gemlite],
+            found,
+            capability=GPUS[arch].capability,
+            precision=precision,
+            available=probes,
+        )
+        return decision
+
+    assert decide("sm_86", "exact").reason == (
+        "serves fp8_weights, int8_weights, fp4_weights targets; this one is exact"
+    )
+    assert decide("sm_86", "fp8_w8a8").reason.startswith("serves fp8_weights")
+    assert decide("sm_86", "int8_weights").configs == [{"FORMAT": "int8"}]
+    assert decide("sm_86", "fp8_weights").reason == (
+        "fp8 weights need sm_89+ (Triton converts e4m3 from sm_89; sm_86: a compile error); "
+        "this GPU is sm_86"
+    )
+    assert decide("sm_120", "fp8_weights").configs == [{"FORMAT": "fp8"}]
+    assert decide("sm_86", "fp4_weights").configs == [{"FORMAT": "mxfp4"}]
+    assert decide("sm_120", "fp4_weights").configs == [{"FORMAT": "mxfp4"}, {"FORMAT": "nvfp4"}]
+    assert decide("sm_75", "int8_weights").reason.startswith("needs sm_80+")
+    odd = {"linear": {"sites": [{"m": 1, "n": 4096, "k": 1000, "dtype": "bfloat16"}]}}
+    assert decide("sm_86", "int8_weights", odd).reason == (
+        "no call site it takes: linear N=4096 K=1000 (needs multiples of 32)"
+    )
+    # its libraries key only the scouts of targets at its precisions
+    a10 = GPUS["sm_86"]
+    versions = {"torch": "2.10.0", "nvidia-cublas-cu12": "12.8", "gemlite": "0.6.0"}
+    versions["triton"] = "3.6.0"
+    exact = libscout.key(["linear"], a10, versions=versions)
+    assert set(exact["libraries"]) == {"torch", "nvidia-cublas-cu12"} and "precision" not in exact
+    low = libscout.key(["linear"], a10, versions=versions, precision="int8_weights")
+    assert low["libraries"]["gemlite"] == "0.6.0" and low["precision"] == "int8_weights"
+    assert libscout.stale({"key": low}, a10, versions={**versions, "triton": "3.7.0"}) == (
+        "triton 3.6.0 → 3.7.0"
+    )
+    assert libscout.stale({"key": exact}, a10, versions={**versions, "triton": "3.7.0"}) is None
+
+
+def test_low_bit_weights_are_quantised_once_per_reference(tmp_path, monkeypatch):
+    """Dynamo calls ``rewrite`` again on every recompile, inside a CUDA graph capture too
+    (an evaluator's copy of an input made in inference mode fails a guard there), where
+    quantising cannot run: the weights of one reference are quantised once."""
+    helper = _module(
+        "gemlite.helper", **{n: object for n in ("A16W4_MXFP", "A16W4_NVFP", "A16W8_FP8")}
+    )
+    helper.A16W8_INT8 = object  # type: ignore[attr-defined]
+    gemlite = _module("gemlite", helper=helper)
+    monkeypatch.setitem(sys.modules, "gemlite", gemlite)
+    monkeypatch.setitem(sys.modules, "gemlite.helper", helper)
+    lin = torch.nn.Linear(64, 64)
+    for name, configs in (("gemlite", ("int8", "mxfp4")), ("torch-scaled-mm", (True, False))):
+        module = _load(_render(name), tmp_path / f"{name}.py")
+        tables = getattr(module, "_layers" if name == "gemlite" else "_weights")
+        first = [tables(lin, c) for c in configs]
+        again = [tables(lin, c) for c in configs]  # the same tables, not new ones
+        assert all(a is b for a, b in zip(first, again, strict=True))
+        assert tables(torch.nn.Linear(64, 64), configs[0]) is not first[0]  # another reference
+
+
+def test_the_guard_free_variant_calls_one_traced_graph_per_signature(tmp_path, monkeypatch):
+    """``GUARDS=0``: each call signature's graph traced once and called directly; the
+    guarded callable (Dynamo's guards) never runs, and the results are the reference's."""
+    torch.manual_seed(0)
+    block = Block().eval()
+    path = tmp_path / "g.py"
+    module = _load(_render("torch-rms-norm", template.guard_free([{"FUSE": 0}])), path)
+    source = path.read_text()
+    assert "def build(reference, FUSE=0, GUARDS=1):" in source
+    assert "LibraryScout(reference, {'FUSE': FUSE}, guards=bool(GUARDS))" in source
+    assert "FUSE=0, GUARDS=1; FUSE=0, GUARDS=0" in source  # the configs swept
+    traced: list[Any] = []
+    export = module.export_graph
+    monkeypatch.setattr(
+        module, "export_graph", lambda *a: traced.append(a[1][0].shape) or export(*a)
+    )
+    candidate = module.build(block, FUSE=0, GUARDS=0)
+    guarded: list[int] = []
+    compiled = candidate._compiled["forward"]
+    candidate._compiled["forward"] = lambda *a, **k: guarded.append(1) or compiled(*a, **k)
+    small, large = (torch.randn(2, 5, 32), *rope()), (torch.randn(3, 5, 32), *rope())
+    with torch.inference_mode():
+        for args in (small, large, small, large, small):
+            torch.testing.assert_close(candidate(*args), block(*args), rtol=1e-5, atol=1e-5)
+    assert traced == [torch.Size([2, 5, 32]), torch.Size([3, 5, 32])]  # once per signature
+    assert guarded == [] and candidate.guarded == {}
+    assert len(candidate.graphs) == 2 and candidate.rewritten == 4  # two norms, two graphs
+    with torch.inference_mode():  # the key holds the grad and inference modes too
+        key = fx_rewrites.call_key("forward", small, {})
+    assert key is not None and key in candidate.graphs
+    assert fx_rewrites.call_key("forward", small, {}) not in candidate.graphs
+    assert fx_rewrites.call_key("forward", (small[0], libscout_toy.Box(small[1])), {}) is None
+    with torch.inference_mode():  # GUARDS=1: Dynamo's compiled callable on every call
+        guarded_candidate = module.build(block, FUSE=0)
+        torch.testing.assert_close(guarded_candidate(*small), block(*small), rtol=1e-5, atol=1e-5)
+    assert not guarded_candidate.graphs and guarded_candidate.rewritten == 2
+
+
+def test_the_guard_free_variant_runs_guarded_where_it_must(tmp_path):
+    """An object argument (a cache) or a graph break: the guarded graphs, and why; the
+    probe then sweeps no guard-free variant, and says why."""
+    torch.manual_seed(0)
+    module = _load(_render("torch-rms-norm", template.guard_free([{"FUSE": 0}])), tmp_path / "g.py")
+    x, box = torch.randn(3, 16), libscout_toy.Box(torch.full((16,), 2.0))
+    boxed, branchy = Boxed(16).eval(), Branchy(16).eval()
+    with torch.inference_mode():
+        candidate = module.build(boxed, FUSE=0, GUARDS=0)
+        torch.testing.assert_close(candidate(x, box), boxed(x, box), rtol=1e-5, atol=1e-5)
+        assert candidate.guarded == {None: template.NOT_PLAIN} and not candidate.graphs
+        candidate = module.build(branchy, FUSE=0, GUARDS=0)
+        for sign in (1.0, -1.0, 1.0):
+            y = sign * x.abs()
+            torch.testing.assert_close(candidate(y), branchy(y), rtol=1e-5, atol=1e-5)
+    (why,) = set(candidate.guarded.values())
+    assert why.startswith("Dynamo does not trace the call as one graph (")
+    assert candidate.rewritten > 0 and not candidate.graphs  # the guarded graphs fold it
+
+    def verdict(reference: torch.nn.Module, *args: Any) -> str | None:
+        with torch.inference_mode():
+            expected = reference(*args)
+        case = {"args": args, "kwargs": {}}
+        return probe.guard_free(module, reference, case, {"FUSE": 0}, expected)
+
+    assert verdict(Block().eval(), torch.randn(2, 5, 32), *rope()) is None
+    assert verdict(boxed, x, box) == (f"its guard-free variant runs guarded: {template.NOT_PLAIN}")
+    assert str(verdict(branchy, x)).startswith(
+        "its guard-free variant runs guarded: Dynamo does not trace the call as one graph"
+    )
+
+
+def test_the_probe_sweeps_each_config_with_and_without_guards_where_it_may(tmp_path, monkeypatch):
+    """On CPU captures (no op bars): every config twice, with and without Dynamo's guards;
+    only the guarded ones for a graph-timed target or a module with state."""
+    from kernel_agent.profiling.capture import capture_calls
+
+    _fake_libraries(monkeypatch, {})
+    torch.manual_seed(0)
+    capture_calls(Block().eval(), [((torch.randn(2, 5, 32), *rope()), {}, 10)], tmp_path / "b.pt")
+    counted = tmp_path / "c.pt"
+    capture_calls(Counted(16).eval(), [((torch.randn(3, 16),), {}, 4)], counted)
+
+    def norm(capture: Path, out: str, context: str | None = None) -> dict[str, Any]:
+        info = probe.probe(capture, out_dir=tmp_path / out, target="t", context=context)
+        (row,) = [d for d in info["decisions"] if d["adapter"] == "torch-rms-norm"]
+        assert row["run"], row
+        return {**row, "source": Path(info["candidates"]["torch-rms-norm"]).read_text()}
+
+    both = norm(tmp_path / "b.pt", "eager")
+    assert both["guard_free"] is True
+    assert both["configs"] == [
+        {"FUSE": 0, "GUARDS": 1},
+        {"FUSE": 0, "GUARDS": 0},
+        {"FUSE": 1, "GUARDS": 1},
+        {"FUSE": 1, "GUARDS": 0},
+    ]
+    assert "def build(reference, FUSE=0, GUARDS=1):" in both["source"]
+    graph = norm(tmp_path / "b.pt", "graph", context="graph")
+    assert graph["guard_free"] == probe.GRAPH_TIMED
+    assert graph["configs"] == [{"FUSE": 0}, {"FUSE": 1}]
+    stateful = norm(counted, "state")
+    assert stateful["guard_free"] == probe.STATEFUL and stateful["configs"] == [
+        {"FUSE": 0},
+        {"FUSE": 1},
+    ]
+
+
+def test_the_scout_times_its_candidates_in_the_targets_context(tmp_path, monkeypatch):
+    """A graph-launched target's scout candidates are timed in a CUDA graph, as an agent's:
+    the probe hears the context (no guard-free variant there), every sweep gets it."""
+    from kernel_agent.kernels import context as timing_context
+
+    monkeypatch.setenv(gpulock.ENV, "1")
+    run, keeper = _scouted_run(tmp_path)
+    seen: dict[str, Any] = {"sweeps": []}
+
+    def prober(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        seen["probe"] = kwargs.get("context")
+        info = _prober(*args, **kwargs)
+        info["decisions"][0]["guard_free"] = probe.GRAPH_TIMED
+        return info
+
+    def sweeper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        seen["sweeps"].append({k: kwargs.get(k) for k in ("context", "l2_flush")})
+        return _sweeper(*args, **kwargs)
+
+    graph = timing_context.TimingContext("graph", "cold", "graph: 98% of the stage's events")
+    monkeypatch.setattr(timing_context, "for_target", lambda run_, target_id: graph)
+    found = libscout.scout_target(
+        run, "mix", keeper=keeper, prober=prober, sweeper=sweeper, say=lambda m: None
+    )
+    assert seen == {"probe": "graph", "sweeps": [{"context": "graph", "l2_flush": True}] * 2}
+    assert found["timing_context"] == {
+        "context": "graph",
+        "l2": "cold",
+        "why": "graph: 98% of the stage's events",
+    }
+    assert found["precision"] == "exact"
+    lines = libscout.bar_lines(run, "mix")
+    assert lines[3].startswith("* Measured (module level, graph): torch-sdpa")
+    assert lines[4] == f"* Swept with Dynamo's guards only: torch-sdpa ({probe.GRAPH_TIMED})"
+
+
+class FakeLt:
+    """The cuBLASLt extension's functions (``lt_linear``, ``lt_plans``) on the CPU: torch's
+    linear, and a plan per shape (the timed pick: the heuristic's 4th of 8, 4.5 us)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.plans: dict[tuple[int, ...], list[float]] = {}
+
+    def lt_linear(self, x: Any, w: Any, bias: Any, residual: Any, gelu: int, algo: int) -> Any:
+        self.calls.append((tuple(x.shape), tuple(w.shape), algo))
+        epilogue = 2 * (bias is not None) + int(gelu)
+        key = (x.shape[0], w.shape[0], w.shape[1], epilogue, int(residual is not None), algo)
+        self.plans.setdefault(key, [3.0, 8.0, 4.5] if algo < 0 else [float(algo), 8.0, -1.0])
+        out = torch.nn.functional.linear(x, w, bias)
+        if gelu:
+            out = torch.nn.functional.gelu(out, approximate="tanh")
+        return out if residual is None else out + residual
+
+    def lt_plans(self) -> list[list[float]]:
+        return [[*map(float, k), *v] for k, v in self.plans.items()]
+
+
+def test_cublaslt_gets_op_bars_from_its_extension_built_in_the_probe(tmp_path, monkeypatch):
+    """The extension is built by the candidate's prepare (the probe's dry run: once), its
+    per-shape choice timed against F.linear on the recorded GEMMs, with the algorithm in the
+    bar; a config that folds an epilogue the bar leaves out is not pruned for speed."""
+    configs = [dict(c) for c in adapters.CublasLt.CONFIGS]
+    path = tmp_path / "libscout_cublaslt.py"
+    path.write_text(_render("cublaslt", configs))
+    module = probe._import(path)
+    fake, built = FakeLt(), []
+
+    def builder(**kwargs: Any) -> FakeLt:
+        built.append(kwargs)
+        return fake
+
+    monkeypatch.setattr(module, "load_inline", builder)
+    with monkeypatch.context() as gpu:
+        gpu.setattr(torch.cuda, "is_available", lambda: True)
+        module.prepare(None)
+        module.prepare(None)
+    (build,) = built  # built once
+    assert build["functions"] == ["lt_linear", "lt_plans"]
+    assert build["extra_ldflags"] == ["-lcublasLt"]
+    assert build["name"].startswith("ka_libscout_cublaslt_")
+    monkeypatch.setattr(module, "_lt_takes", lambda *a: True)  # CPU tensors, the fake
+    torch.manual_seed(0)
+    lin = Residual().eval()
+    invocations: list[Any] = []
+    detect.trace(lin, (torch.randn(4, 16),), module=lin, invocations=invocations)
+
+    def timer(fns: Any) -> dict[str, list[float] | None]:  # the GEMM 0.83x torch's
+        return {"eager": [10.0, 12.0], "graph": [5.0, 6.0]}
+
+    bars = probe.op_bars(lin, invocations, {"cublaslt": (module, configs)}, timer=timer)
+    assert [(b["config"], b["calls"], b["ok"]) for b in bars] == [(c, 2, True) for c in configs]
+    assert bars[0]["signature"] == "linear([4, 16] [16, 16] [16] float32)"
+    assert [b.get("folds") for b in bars] == [
+        "a residual add or a tanh GELU into the epilogue",
+        None,
+        None,
+    ]
+    assert {k: bars[0][k] for k in ("algorithm", "algorithms", "algorithm_us")} == {
+        "algorithm": 3,
+        "algorithms": 8,
+        "algorithm_us": 4.5,
+    }
+    assert bars[2]["algorithm"] == 0 and "algorithm_us" not in bars[2]
+    assert fake.calls and {c[2] for c in fake.calls} == {-1, 0}
+    keep, pruned = probe.prune(configs, bars)
+    assert keep == configs[:1]  # its epilogue folds a kernel the GEMM's bar does not count
+    assert [p["config"] for p in pruned] == configs[1:]
+    assert all(p["why"] == "op bar at most 0.83x" for p in pruned)
+
+
 # ------------------------------------------------------------------ on the GPU
 
 
@@ -1358,15 +1821,12 @@ def test_probe_measures_sdpa_backends_and_the_scout_evaluates_them(tmp_path, mon
     info = probe.run_probe(capture, out_dir=tmp_path / "out", target="core", timeout=600)
     assert "error" not in info, info.get("error")
     assert info["described"] == "sdpa x1"
-    # (FlashInfer's and flash-attn's bars too, where they are installed)
-    every = {b["config"]["BACKEND"]: b for b in info["op_bars"] if b["adapter"] == "torch-sdpa"}
-    assert set(every) >= {"efficient", "math"}
-    # a backend without a kernel for this call on this GPU fails its op bar (mem-efficient
-    # on an A10, sm_86: "No available kernel"); every other one is correct
+    sdpa = [b for b in info["op_bars"] if b["adapter"] == "torch-sdpa"]  # flash-attn: its own
+    every = {b["config"]["BACKEND"]: b for b in sdpa}
+    assert set(every) >= {"efficient", "math"} and every["math"]["ok"]
+    # a backend without a kernel for the call (mem-efficient on an A10, sm_86) fails its bar
+    assert all(b["ok"] or "No available kernel" in str(b.get("error")) for b in every.values())
     bars = {name: b for name, b in every.items() if b["ok"]}
-    assert "math" in bars and all(
-        "No available kernel" in str(b.get("error")) for b in every.values() if not b["ok"]
-    )
     assert all(b["ref_us"] > 0 and b["us"] > 0 for b in bars.values())
     (decision,) = [d for d in info["decisions"] if d["adapter"] == "torch-sdpa"]
     fastest = min(bars.values(), key=lambda b: b["us"])["config"]
@@ -1471,3 +1931,91 @@ def test_liger_swiglu_on_the_gpu(tmp_path):
         want, got = feed(x), candidate(x)
     assert candidate.rewritten == 1
     torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.gpu
+def test_the_guard_free_variant_runs_the_library_on_the_gpu(tmp_path):
+    """The SDPA core pinned to cuDNN: ``GUARDS=0`` computes what ``GUARDS=1`` does from one
+    traced graph, and is timed in a CUDA graph with the evaluator's copy of an input (made in
+    inference mode) without tracing again."""
+    from kernel_agent.kernels import bench
+
+    torch.manual_seed(0)
+    core = Core().cuda().eval()
+    q = torch.randn(16, 16, 11, 64, device="cuda", dtype=torch.bfloat16)
+    k, v = (torch.randn(16, 2, 11, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    configs = template.guard_free([{"BACKEND": "cudnn"}])
+    module = _load(_render("torch-sdpa", configs), tmp_path / "sdpa.py")
+    with torch.inference_mode():
+        free = module.build(core, BACKEND="cudnn", GUARDS=0)
+        guarded = module.build(core, BACKEND="cudnn", GUARDS=1)
+        torch.testing.assert_close(free(q, k, v), guarded(q, k, v))
+    assert len(free.graphs) == 1 and free.guarded == {} and free.rewritten == 1
+    timing = bench.time_call(free, (q, k, v), {}, context="graph", target_ms=5.0, keep=True)
+    assert timing["median_ms"] > 0 and len(free.graphs) == 1 and free.guarded == {}
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(importlib.util.find_spec("liger_kernel") is None, reason="no liger-kernel")
+def test_liger_rope_rotates_q_and_k_in_one_kernel_on_the_gpu(tmp_path, monkeypatch):
+    torch.manual_seed(0)
+    for keep in (False, True):  # q read again afterwards: Liger writes into a copy of it
+        rotary = Rotary(hidden=256, heads=4, kv_heads=2, keep=keep).cuda().bfloat16().eval()
+        x = torch.randn(2, 11, 256, device="cuda", dtype=torch.bfloat16)
+        cos, sin = (t.cuda().bfloat16() for t in cos_sin(2, 11, 64))
+        module = _load(_render("liger-rope"), tmp_path / f"rope_{keep}.py")
+        calls: list[int] = []
+
+        def counted(*a: Any, calls: list[int] = calls, liger: Any = module.liger_rope) -> Any:
+            calls.append(1)
+            return liger(*a)
+
+        monkeypatch.setattr(module, "liger_rope", counted)
+        with torch.inference_mode():
+            want = rotary(x, cos, sin)
+            candidate = module.build(rotary)
+            got = candidate(x, cos, sin)
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+        assert candidate.rewritten == 1 and calls == [1]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(importlib.util.find_spec("gemlite") is None, reason="no gemlite")
+def test_gemlite_int8_weights_on_the_gpu(tmp_path):
+    torch.manual_seed(0)
+    lin = torch.nn.Sequential(torch.nn.Linear(1024, 2048, bias=False)).cuda().bfloat16().eval()
+    with torch.no_grad():
+        lin[0].weight.normal_(0, 0.02)
+    x = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
+    module = _load(_render("gemlite", [{"FORMAT": "int8"}]), tmp_path / "gemlite.py")
+    with torch.inference_mode():
+        want = lin(x).float()
+        candidate = module.build(lin, FORMAT="int8")
+        got = candidate(x).float()
+    assert candidate.rewritten == 1
+    assert ((got - want).norm() / want.norm()).item() < 0.02  # per-channel INT8 weights
+
+
+@pytest.mark.gpu
+def test_probe_times_cublaslts_choice_per_gemm_shape(tmp_path, monkeypatch):
+    """cuBLASLt's extension built in the probe; its op bars on a skinny bf16 GEMM say which
+    of the heuristic's algorithms it runs."""
+    from kernel_agent.profiling.capture import capture_calls
+
+    monkeypatch.setenv(gpulock.ENV, "1")  # conftest holds this process's GPU lock
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join([str(TESTS), os.environ.get("PYTHONPATH", "")])
+    )
+    torch.manual_seed(0)
+    lin = torch.nn.Linear(1024, 2048, bias=False).cuda().bfloat16().eval()
+    rows = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
+    capture_calls(lin, [((rows,), {}, 10)], tmp_path / "lin.pt")
+    info = probe.run_probe(
+        tmp_path / "lin.pt", out_dir=tmp_path / "out", target="lin", backends={"cuda": True}
+    )
+    assert "error" not in info, info.get("error")
+    bars = [b for b in info["op_bars"] if b["adapter"] == "cublaslt"]
+    assert len(bars) == 3 and all(b["ok"] and b["us"] > 0 for b in bars), bars
+    assert all(0 <= b["algorithm"] < b["algorithms"] for b in bars)
+    timed = [b for b in bars if b["config"]["ALGO"] == -1]
+    assert all(b["algorithm_us"] > 0 for b in timed)

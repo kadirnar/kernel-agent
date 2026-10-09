@@ -2532,7 +2532,9 @@ class Orchestrator:
             entry["adapters"] = [r.get("adapter") for r in found.get("adapters") or []]
             families = found.get("families")  # its key: None (failed before detecting) = all
             names = list(families) if isinstance(families, dict) else None
-            entry["key"] = libscout.key(names, self.tc.gpu, nvcc=nvcc, versions=versions)
+            entry["key"] = libscout.key(
+                names, self.tc.gpu, nvcc=nvcc, versions=versions, precision=found.get("precision")
+            )
             if before is not None:
                 entry.update(scouts=int(before.get("scouts") or 1) + 1, rescouted=why)
             libscout.remember(self.run, target_id, entry)

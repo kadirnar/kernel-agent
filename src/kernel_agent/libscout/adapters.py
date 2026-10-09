@@ -24,9 +24,12 @@ Liger-Kernel 0.8.4):
   each wrapper planned once per call shape); ``flashinfer-norm`` (RMSNorm). FlashInfer
   sampling is listed and skipped: a random draw cannot be compared with the reference's
   (``kernels/distribution.py``: the comparison it needs);
-* ``liger-rmsnorm``, ``liger-swiglu`` (Liger-Kernel, Triton); Liger RoPE is listed without a
-  template yet;
-* ``gemlite`` (low-bit weight GEMV): listed without a template yet.
+* ``liger-rmsnorm``, ``liger-swiglu``, ``liger-rope`` (Liger-Kernel, Triton; RoPE: the
+  rotate-half pattern of q and k with one cos and sin folded into one call,
+  ``fx_rewrites.fold_rope``);
+* ``gemlite`` (low-bit weight-only GEMV / GEMM, Triton; gemlite 0.6.0.post2): only on
+  targets planned at ``int8_weights``, ``fp8_weights`` or (opt-in) ``fp4_weights``, each
+  format on the GPUs its kernels compile for (:attr:`Gemlite.FORMATS`).
 
 Written from each library's documentation (``verified`` False: their templates are checked
 statically until a GPU run with the library installed; their GPUs were not at hand):
@@ -39,7 +42,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 from kernel_agent import gpu_arch
 from kernel_agent.libscout.registry import Adapter, Site
@@ -646,6 +649,88 @@ def rewrite(graph, reference=None, **config):
 '''
 
 
+class LigerRope(Adapter):
+    """Rotate-half RoPE of q and k as Liger's fused RoPE kernel: one launch for both
+    tensors instead of about ten elementwise kernels (``fx_rewrites.fold_rope``)."""
+
+    def check(self, module: Any) -> str | None:
+        import importlib
+
+        functional = importlib.import_module("liger_kernel.transformers.functional")
+        return None if hasattr(functional, "liger_rope") else "no liger_rope"
+
+    def sites_ok(self, family: str, site: Mapping[str, Any]) -> str | None:
+        if not site.get("paired"):
+            return (
+                "rotary embedding of one tensor (Liger's RoPE rotates q and k with one cos "
+                "and sin together)"
+            )
+        if len(site.get("shape") or []) != 4:
+            return f"rotary embedding of a {len(site.get('shape') or [])}-D tensor (takes 4-D)"
+        if int(site.get("head_dim") or 0) % 2:
+            return f"odd head size {site.get('head_dim')}"
+        return super().sites_ok(family, site)
+
+    CODE = r'''
+from liger_kernel.transformers.functional import liger_rope
+
+
+def _rotate(x, cos, sin):
+    """The reference's rotate-half RoPE of x."""
+    half = x.shape[-1] // 2
+    return x * cos + torch.cat((-x[..., half:], x[..., :half]), dim=-1) * sin
+
+
+def _table(t, q):
+    """cos / sin as Liger takes them: [1 or batch, seq, head_dim] (None: a layout it does
+    not take, such as one per head)."""
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+    elif t.dim() == 4 and t.shape[1] == 1:
+        t = t.squeeze(1)
+    elif t.dim() != 3 or t.shape[0] != 1:
+        return None
+    if t.shape[0] not in (1, q.shape[0]) or tuple(t.shape[1:]) != tuple(q.shape[2:]):
+        return None
+    return t
+
+
+def _rope(q, k, cos, sin, q_free=False, k_free=False):
+    """Liger's RoPE of q [batch, heads, seq, d] and k [batch, kv_heads, seq, d] in one
+    kernel; the reference's math where it does not take them. Liger writes its results into
+    q's and k's storage: one something else still reads (``q_free`` / ``k_free`` False, from
+    the graph) is copied first. It reads the first half of cos and sin only (rotate-half
+    tables repeat their frequencies; the evaluator rejects a model whose do not)."""
+    c, s = _table(cos, q), _table(sin, q)
+    takes = (
+        q.is_cuda
+        and q.dim() == 4
+        and k.dim() == 4
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and q.dtype == k.dtype == cos.dtype == sin.dtype
+        and q.shape[0] == k.shape[0]
+        and q.shape[2:] == k.shape[2:]
+        and q.shape[-1] % 2 == 0
+        and c is not None
+        and s is not None
+        and c.shape == s.shape
+    )
+    if not takes:
+        return _rotate(q, cos, sin), _rotate(k, cos, sin)
+    q = q if q_free else q.clone()
+    k = k if k_free else k.clone()
+    return liger_rope(q, k, c, s)
+
+
+def ops(reference=None):
+    return {}  # x * cos + rotate_half(x) * sin of q and k: a pattern, folded by rewrite()
+
+
+def rewrite(graph, reference=None, **config):
+    return fold_rope(graph, _rope)
+'''
+
+
 # ------------------------------------------------------------------ GEMMs
 
 
@@ -882,11 +967,28 @@ torch::Tensor lt_linear(torch::Tensor x, torch::Tensor w, c10::optional<torch::T
   TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "cublasLtMatmul returned ", (int)status);
   return y;
 }
+
+// The plans made so far, one row each: M, N, K, epilogue (2 bias + 1 GELU), residual, the
+// algo argument, the algorithm run (the heuristic's index), how many it offered, and the
+// pick's time in us when they were timed (-1: not timed).
+std::vector<std::vector<double>> lt_plans() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  std::vector<std::vector<double>> rows;
+  for (const auto& kv : g_plans) {
+    const Key& k = kv.first;
+    const Plan& p = kv.second;
+    rows.push_back({(double)std::get<1>(k), (double)std::get<2>(k), (double)std::get<3>(k),
+                    (double)std::get<5>(k), (double)std::get<6>(k), (double)std::get<8>(k),
+                    (double)p.pick, (double)p.algos.size(), (double)p.us});
+  }
+  return rows;
+}
 """
 
 CPP_SRC = (
     "torch::Tensor lt_linear(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> "
-    "bias, c10::optional<torch::Tensor> residual, int64_t gelu, int64_t algo);"
+    "bias, c10::optional<torch::Tensor> residual, int64_t gelu, int64_t algo);\n"
+    "std::vector<std::vector<double>> lt_plans();"
 )
 _EXT = []
 
@@ -900,7 +1002,7 @@ def _ext():
                 name=f"ka_libscout_cublaslt_{tag}",
                 cpp_sources=CPP_SRC,
                 cuda_sources=CUDA_SRC,
-                functions=["lt_linear"],
+                functions=["lt_linear", "lt_plans"],
                 extra_cuda_cflags=["-O3"],
                 extra_ldflags=["-lcublasLt"],
             )
@@ -947,7 +1049,26 @@ def ops(reference=None, ALGO=-1, FUSE=1):
         out = _ext().lt_linear(rows, weight, bias, res, 1 if act == "gelu" else 0, int(ALGO))
         return out.view(*x.shape[:-1], weight.shape[0])
 
+    if FUSE:  # what an op bar of the GEMM alone leaves out (the probe does not prune on it)
+        linear_cublaslt.folds = "a residual add or a tanh GELU into the epilogue"
     return {torch._C._nn.linear: linear_cublaslt}
+
+
+def bar_details(func, args, kwargs, ALGO=-1, FUSE=1):
+    """The algorithm cuBLASLt runs for an op bar's linear call (the probe's): the
+    heuristic's i-th of n, and with ALGO=-1 (all n timed per shape) the pick's time."""
+    if not _EXT or len(args) < 2:
+        return {}
+    x, weight = args[0], args[1]
+    bias = args[2] if len(args) > 2 else (kwargs or {}).get("bias")
+    want = (x.numel() // x.shape[-1], weight.shape[0], weight.shape[1], 2 * (bias is not None))
+    for m, n, k, epilogue, res, algo, pick, count, us in _EXT[0].lt_plans():
+        if (m, n, k, epilogue, res, algo) == (*want, 0, int(ALGO)):
+            found = {"algorithm": int(pick), "algorithms": int(count)}
+            if us >= 0:
+                found["algorithm_us"] = round(us, 2)
+            return found
+    return {}
 
 
 def rewrite(graph, reference=None, **config):
@@ -967,6 +1088,8 @@ class TorchScaledMm(Adapter):
         return [{"SCALING": "rowwise"}, {"SCALING": "tensorwise"}]
 
     CODE = r'''
+import weakref
+
 _E4M3 = torch.float8_e4m3fn
 _E4M3_MAX = 448.0
 
@@ -979,12 +1102,20 @@ def _quantize(t, rowwise):
     return (t32 / scale).clamp(-_E4M3_MAX, _E4M3_MAX).to(_E4M3), scale
 
 
+_QUANTISED = weakref.WeakKeyDictionary()  # reference -> {rowwise: its table}
+
+
 def _weights(reference, rowwise):
     """Every 2-D bf16 / fp16 weight of the reference quantised once (per output channel or
-    per tensor), keyed by the parameter (what the graph passes in)."""
-    table = {}
+    per tensor), keyed by the parameter (what the graph passes in). Once per reference:
+    Dynamo recompiles (another input's guards fail) call ``rewrite`` again, inside a CUDA
+    graph capture too, where quantising cannot run."""
     if reference is None:
-        return table
+        return {}
+    done = _QUANTISED.setdefault(reference, {})
+    if rowwise in done:
+        return done[rowwise]
+    table = done[rowwise] = {}
     for p in reference.parameters():
         if p.dim() == 2 and p.dtype in (torch.bfloat16, torch.float16) and p.is_cuda:
             if p.shape[0] % 16 == 0 and p.shape[1] % 16 == 0:
@@ -1033,6 +1164,112 @@ def ops(reference=None, SCALING="rowwise"):
 def rewrite(graph, reference=None, **config):
     (linear,) = ops(reference, **config).values()
     return fold_linear(graph, linear)
+'''
+
+
+class Gemlite(Adapter):
+    """Weight-only low-bit linears through gemlite's Triton GEMV / GEMM kernels (bf16 /
+    fp16 activations; the weights quantised once at build): INT8 or FP8 per output channel
+    at ``int8_weights`` / ``fp8_weights`` targets, MXFP4 or NVFP4 at ``fp4_weights`` ones
+    (opt-in: ``--precisions ...,fp4_weights``). Only on targets planned at one of these
+    precisions, which the run allows."""
+
+    #: target precision -> its formats: (FORMAT, the GPUs gemlite runs it on, why)
+    FORMATS: ClassVar[dict[str, tuple[tuple[str, str, str], ...]]] = {
+        "int8_weights": (("int8", "sm_80+", "INT8 weights dequantised in registers"),),
+        "fp8_weights": (
+            ("fp8", "sm_89+", "Triton converts e4m3 from sm_89; sm_86: a compile error"),
+        ),
+        "fp4_weights": (
+            ("mxfp4", "sm_80+", "MXFP4 weights (e8m0 scales) dequantised in registers"),
+            ("nvfp4", "sm_89+", "NVFP4's e4m3 scales: from sm_89; sm_86: an error"),
+        ),
+    }
+
+    def configs(self, found: Mapping[str, Site], gpu: Mapping[str, Any]) -> list[dict[str, Any]]:
+        cap = _cap(gpu)
+        return [
+            {"FORMAT": name}
+            for name, spec, _ in self.FORMATS.get(str(gpu.get("precision")), ())
+            if gpu_arch.supports(spec, cap)
+        ]
+
+    def no_config(self, found: Mapping[str, Site], gpu: Mapping[str, Any]) -> str:
+        cap = _cap(gpu)
+        here = gpu_arch.arch_of(cap) if cap else "none"
+        why = [
+            f"{name} weights need {spec} ({reason}); this GPU is {here}"
+            for name, spec, reason in self.FORMATS.get(str(gpu.get("precision")), ())
+        ]
+        return "; ".join(why) or super().no_config(found, gpu)
+
+    def sites_ok(self, family: str, site: Mapping[str, Any]) -> str | None:
+        return super().sites_ok(family, site) or _gemm_site(site, 32)
+
+    CODE = r'''
+import types
+import weakref
+
+from gemlite.helper import A16W4_MXFP, A16W4_NVFP, A16W8_FP8, A16W8_INT8
+
+_FORMATS = {"int8": A16W8_INT8, "fp8": A16W8_FP8, "mxfp4": A16W4_MXFP, "nvfp4": A16W4_NVFP}
+_GROUP = {"int8": 1, "fp8": 1, "mxfp4": 32, "nvfp4": 16}  # gemlite's scale groups along K
+
+
+_QUANTISED = weakref.WeakKeyDictionary()  # reference -> {FORMAT: its layers}
+
+
+def _layers(reference, FORMAT):
+    """Every 2-D bf16 / fp16 CUDA weight of the reference quantised once into a gemlite
+    layer, keyed by the parameter (what the graph passes in); gemlite needs K a multiple
+    of 32 and of its group, N of 32. Once per reference: Dynamo recompiles call
+    ``rewrite`` again, inside a CUDA graph capture too, where packing cannot run."""
+    if reference is None:
+        return {}
+    done = _QUANTISED.setdefault(reference, {})
+    if FORMAT in done:
+        return done[FORMAT]
+    table = done[FORMAT] = {}
+    make = _FORMATS[FORMAT]
+    for p in reference.parameters():
+        if p.dim() != 2 or p.dtype not in (torch.bfloat16, torch.float16) or not p.is_cuda:
+            continue
+        n, k = p.shape
+        if k % 32 or k % _GROUP[FORMAT] or n % 32:
+            continue
+        stand_in = types.SimpleNamespace(weight=p.detach(), bias=None)  # gemlite's Linear
+        quantiser = make(device=str(p.device), dtype=p.dtype)
+        table[p] = quantiser.from_linear(stand_in, del_orig=False)
+    return table
+
+
+def ops(reference=None, FORMAT="int8"):
+    """F.linear -> gemlite's low-bit weight GEMV / GEMM (the reference's bias, activation
+    and residual stay its own ops)."""
+    table = _layers(reference, FORMAT)
+
+    def linear_gemlite(x, weight, bias=None, residual=None, act=None):
+        layer = table.get(weight)
+        takes = (
+            layer is not None
+            and x.is_cuda
+            and x.dtype == weight.dtype
+            and x.shape[-1] == weight.shape[1]
+            and x.numel() > 0
+        )
+        out = layer(x) if takes else torch.nn.functional.linear(x, weight)
+        if bias is not None:
+            out = out + bias
+        if act == "gelu":
+            out = torch.nn.functional.gelu(out, approximate="tanh")
+        return out if residual is None else out + residual
+
+    return {torch._C._nn.linear: linear_gemlite}
+
+
+def rewrite(graph, reference=None, **config):
+    (linear,) = ops(reference, **config).values()
+    return fold_linear(graph, linear, residual=False, gelu=False)
 '''
 
 
@@ -1196,26 +1433,33 @@ ADAPTERS: tuple[Adapter, ...] = (
         helpers=("fold_silu_mul",),
         runtime=("triton",),
     ),
-    Adapter(
+    LigerRope(
         name="liger-rope",
-        title="rotary embedding as Liger-Kernel's RoPE (Triton)",
+        title="rotary embedding of q and k as Liger-Kernel's RoPE (Triton)",
         package="liger-kernel",
         module="liger_kernel",
         licence="BSD-2-Clause",
         families=("rotary",),
-        verified=False,
-        no_template="no template yet (the rotate-half rewrite of q and k together: follow-up)",
+        archs="sm_80+",
+        archs_why="Liger-Kernel's Triton kernels: Ampere and newer",
+        dtypes=_FLOAT,
+        verified=True,  # tests: the gpu tests (an A10, liger-kernel 0.8.4)
+        helpers=("fold_rope",),
+        runtime=("triton",),
     ),
-    Adapter(
+    Gemlite(
         name="gemlite",
         title="low-bit weight GEMV / GEMM (gemlite)",
         package="gemlite",
         module="gemlite",
         licence="Apache-2.0",
         families=("linear",),
+        archs="sm_80+",
+        archs_why="gemlite's Triton kernels: Ampere and newer (per format: Gemlite.FORMATS)",
         precisions=("fp8_weights", "int8_weights", "fp4_weights"),
-        verified=False,
-        no_template="no template yet (gemlite's packed weight formats: follow-up)",
+        verified=True,  # tests: the gpu tests (an A10, gemlite 0.6.0.post2)
+        helpers=("fold_linear",),
+        runtime=("triton",),
     ),
 )
 
