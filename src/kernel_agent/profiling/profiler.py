@@ -391,6 +391,10 @@ class ModuleTimer:
         self.skipped: collections.Counter[str] = collections.Counter()
         #: Calls :meth:`class_stats` could not time (no end, or start/end that do not pair).
         self.untimed = 0
+        #: A profiler range factory (index of a call -> context manager): each call then runs
+        #: in a range, so the fusion miner's kernel map knows the call around a launch (#231).
+        self.call_range: Callable[[int], Any] | None = None
+        self._ranges: dict[int, Any] = {}  # open ranges by call index
 
     def __enter__(self) -> ModuleTimer:
         # Modules that run inside a compiled module are not hooked (#86): their hooks would
@@ -426,9 +430,18 @@ class ModuleTimer:
         return self
 
     def __exit__(self, *exc: object) -> None:
+        self._close_ranges(list(self._ranges))  # calls that never returned
         if self._ctx is not None:
             self._ctx.close()
             self._ctx = None
+
+    def _close_ranges(self, indices: list[int]) -> None:
+        """Close the ranges of these calls (:attr:`call_range`), the innermost first."""
+        for index in reversed(indices):
+            rf = self._ranges.pop(index, None)
+            if rf is not None:
+                with contextlib.suppress(Exception):
+                    rf.__exit__(None, None, None)
 
     def _now(self) -> Any:
         if not self.cuda:
@@ -487,6 +500,11 @@ class ModuleTimer:
         if parent >= 0:
             self.calls[parent].children.append(index)
         self._stack.append((index, id(module), method))
+        if self.call_range is not None:
+            with contextlib.suppress(Exception):  # a range never breaks the pass
+                rf = self.call_range(index)
+                rf.__enter__()
+                self._ranges[index] = rf
 
     def _post(
         self,
@@ -507,6 +525,8 @@ class ModuleTimer:
             return
         # Calls opened above it never saw their post-hook: they stay untimed.
         index = self._stack[depth][0]
+        if self._ranges:
+            self._close_ranges([i for i, _, _ in self._stack[depth:]])
         del self._stack[depth:]
         self.calls[index].end = self._now()
         with contextlib.suppress(Exception):
@@ -1143,9 +1163,9 @@ def profile_workload(
     """Module view + kernel view (:func:`guarded_kernel_profile`; ``reference_ms``: the
     end-to-end time of the profiled window, measured without the profiler). Assumes the
     workload is warmed up. ``work``: the unmodified model's (:func:`work_reference`), for
-    the calls of an optimised model whose insides the hooks do not see. ``fusions``: the
-    model is the unmodified one; one more hooked run records its fusion chains
-    (:func:`.fusion.scan`, ``fusions``)."""
+    the calls of an optimised model whose insides the hooks do not see. ``fusions``: one
+    more hooked run records the fusion chains of the model as it is (:func:`.fusion.scan`,
+    ``fusions``; an improve round's optimised model: what is left, #231)."""
     roots = workload.roots()
     methods = discover_entrypoints(roots, workload_entrypoints(workload))
     synchronize()

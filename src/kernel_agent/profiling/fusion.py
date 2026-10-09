@@ -4,9 +4,10 @@ A module target fuses what one ``nn.Module`` does; the steps that paid most in o
 glue *between* modules (a residual add and the next norm, a gate · up product, the update of
 a solver step), and some fusions bought nothing because their intermediates stayed in L2.
 This module measures those chains instead of leaving them to the planner's reading of the
-source. ``analyze`` runs the unmodified model once more in the hooked work pass
-(:func:`~kernel_agent.profiling.profiler.work_reference`: module calls without timing) under
-a ``TorchDispatchMode`` (:class:`Recorder`) that records every aten op:
+source. ``analyze`` runs the model once more in the hooked work pass
+(:func:`~kernel_agent.profiling.profiler.work_reference`: module calls without timing; the
+unmodified model, and in an improve round's re-profile the optimised one) under a
+``TorchDispatchMode`` (:class:`Recorder`) that records every aten op:
 
 * its name, the storages it reads and writes (views resolved to their storage) and their
   bytes, and the innermost module call around it (qualname, class, entrypoint, phase); a
@@ -31,7 +32,7 @@ before it launches what follows). Each chain is measured in three *placements*:
   in front of the q / k / v projections).
 
 Per placement: the ops in order with their module (layer indices folded), the launches now
-and saved (``launches − 1``: the placement becomes one kernel), the intermediates written
+and saved (the placement becomes one kernel; the kernel map below), the intermediates written
 and read back (a tensor one op of the placement writes and another reads: its write, unless
 an op outside also reads it, and those reads), the module boundaries it crosses (distinct
 module calls − 1) and the lowest common ancestor call: its class is a region target's
@@ -59,10 +60,11 @@ are not taken to refresh it, the L2 is one pool of its full size, and work the r
 does not see (another process, a graph replay) is not traffic.
 
 The per-launch cost is the measured launch floor when the run launches eagerly, at most the
-run's own time per recorded op (window ÷ ops: the floor times a module call, whose Python a
-bare op does not pay), and the measured CUDA-graph launch floor (``launch_floor_graph_us``;
-:data:`GRAPH_BOUNDARY_US` for peaks without one) per kernel boundary when the kernel view
-shows most GPU work launched by CUDA graphs.
+run's own time per GPU launch (window ÷ launches; per recorded op without a kernel map: the
+floor times a module call, whose Python a bare op does not pay), and the measured CUDA-graph
+launch floor (``launch_floor_graph_us``; :data:`GRAPH_BOUNDARY_US` for peaks without one) per
+kernel boundary when the kernel view shows most GPU work launched by CUDA graphs and no
+kernel map says that the mined ops launch eagerly.
 
 Overlap-aware ranking (:func:`build`): rows can share an op, an anchor in one's prologue
 and another's epilogue (a norm before q / k / v and the q norm after q), and one GEMM
@@ -75,19 +77,64 @@ placement is taken in elsewhere takes its next one: ``blocked``). The rows taken
 none taken is an alternative of the rows it overlaps (``overlaps``), ranked after them.
 Greedy and deterministic, not the best combination in general.
 
-``analyze`` writes ``profile/fusions.json`` + ``fusions.md`` and the top :data:`TOP` counted
-rows with their alternatives into ``summary.md`` (*Fusion candidates (measured)*); the
-improve scheduler takes a region arm's expected gain from its candidate (``fusion`` id in
-the plan, else the largest of its parent class, counted rows first: :func:`match`), and the
-native stage graph takes chains that span stages as evidence for a group, adding up only
-the savings of chains that share no op (:func:`additive`, ``native/engine.py``). Candidates
-are evidence: the planner decides. Tables from before the traffic and the overlaps were
-recorded (``fusions.json`` version 1) stay readable: every row counts.
+Kernel map (:func:`kernel_map`; on a GPU): the pass runs under the profiler (Kineto: the
+GPU's work, the launch calls and, on the host, only user-scope ranges, not every aten op:
+:func:`_kernel_profiler`) and the recorder runs each op it dispatches in a range
+(:data:`OP_RANGE` + its dispatch number), each module call in another (:data:`CALL_RANGE` +
+its index). A GPU event (kernel, copy, memset) belongs to the innermost op range around the
+host call that launched it (its correlation id), so every recorded op carries its exact
+``launches`` (0 for an op on host tensors; several for an op that launches several kernels)
+and the GPU time of its kernels (``kernel_ns``, measured in this pass: each kernel runs alone
+while the recorder works).
+A placement's launches are then the sum over its ops, and it becomes one kernel, or as
+many as its largest anchor launches (a split-K reduction stays); its ``kernel_ns`` is what
+its kernels take now. :func:`build` prices an eager launch at most at the run's time per
+GPU launch (window ÷ launches, not ÷ recorded ops) and caps a placement's byte saving at
+the measured time of its kernels (fusing cannot save more GPU time than they take). On the
+CPU, or when the profiler fails, each recorded op counts one launch (``kernel_map`` absent,
+the table says so). GPU work launched between two recorded ops outside every op range (a
+graph replay, a Triton kernel: the recorder saw neither what it read nor what it wrote)
+separates them like a host sync: no chain crosses it (``launch_cuts``).
 
-Approximate: each recorded op counts one launch; bytes are the logical bytes of each tensor
-(at most its storage's); an op of a CUDA-graph replay or a compiled region dispatches nothing
-here (the miner runs on the unmodified model); state a module keeps outside its arguments is
-a storage like any other.
+Not mined (:meth:`Miner.unmined`): a CUDA-graph replay launches its kernels without
+dispatching an op, and so do Triton kernels, extensions and other kernels launched outside
+the dispatcher; compiled code does not run under a dispatch mode at all (Dynamo runs the
+module's Python eagerly instead), so its ops are recorded but are not what the run does.
+The ops inside a ``torch.compile``'d module call are kept as barriers (never in a chain),
+and the kernel map attributes the GPU work launched outside every op range to the innermost
+module call around its launch: ``unmined`` lists each such region (``graphed``,
+``compiled``, ``custom`` kernels) with its GPU events and time; :func:`build` gives each its
+share of the run (of the pass's GPU time; a compiled region by the profile's module view,
+its eager kernels being no measure of the compiled code), and without a kernel map the
+regions of the profile's ``module_gaps`` and its graph-launched timeline stages.
+
+``analyze`` writes ``profile/fusions.json`` + ``fusions.md`` and the top :data:`TOP` counted
+rows with their alternatives into ``summary.md`` (*Fusion candidates (measured)*), and so
+does every improve round's re-profile of the optimised model (``rounds/<n>/profile/``): its
+table lists what is left. The improve scheduler takes a region arm's expected gain from its
+candidate in the newest table (``fusion`` id in the plan, else the largest of its parent
+class, counted rows first: :func:`match`), and the native stage graph takes chains that
+span stages as evidence for a group, adding up only the savings of chains that share no op
+(:func:`additive`, ``native/engine.py``). Candidates are evidence: the planner decides.
+Tables from before the traffic and the overlaps were recorded (``fusions.json`` version 1)
+stay readable: every row counts; tables from before the kernel map (version 2) count one
+launch per op.
+
+Recorder cost (:class:`Recorder`): the dispatch mode itself costs ~25 us per op in Python
+(a pass-through mode, measured on the CPU of the A10 host); the bookkeeping, 55 → 43 us per
+op on Qwen3-0.6B (measured on an NVIDIA A10, torch 2.10), is kept small:
+per-overload facts looked up once (:class:`_Func`), each tensor's storage looked up once per
+op, no Dynamo wrapper around ``__torch_dispatch__`` (torch ≥ 2.11 adds one; Dynamo skips
+every frame while this mode is active anyway), and the cyclic GC collecting young objects
+less often during the pass (the recorded ops are long-lived; cyclic garbage is still
+collected). The recorded ops are the same as before (``tests/test_fusion.py`` compares
+them with the straightforward recorder).
+
+Approximate: bytes are the logical bytes of each tensor (at most its storage's); state a
+module keeps outside its arguments is a storage like any other; a kernel launched on
+another thread at the time of an op range counts for that op; the profiler may lose a
+GPU event now and then (1 in 40,000 on a toy, measured on an NVIDIA A10): that op counts
+one launch less.
 
     python -m kernel_agent.profiling.fusion profile.json --window-ms MS [--peaks peaks.json]
 """
@@ -95,12 +142,14 @@ a storage like any other.
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
+import gc
 import hashlib
 import itertools
 import json
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -109,9 +158,12 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from kernel_agent.kernels.roofline import GRAPH_LAUNCH_FLOOR_US
+from kernel_agent.profiling import timeline
 from kernel_agent.projection import fold
 
-VERSION = 2  # 2: the L2 traffic of each intermediate, overlaps and counted rows
+# 2: the L2 traffic of each intermediate, overlaps and counted rows; 3: the kernel map (exact
+# launches and kernel times per op), regions not mined
+VERSION = 3
 #: Ops between a producer and its consumer beyond which they are not linked: a value a loop
 #: carries to its next step (a position counter) is not a fusion.
 MAX_GAP = 64
@@ -124,6 +176,17 @@ TOP = 10
 SHOWN = 40
 #: Placements, in the order a tie prefers them.
 PLACEMENTS = ("chain", "epilogue", "prologue")
+#: Profiler ranges of the kernel map (:func:`kernel_map`): around each op the recorder
+#: dispatches (+ its dispatch number) and each module call of the pass (+ its index). Not
+#: ``ka::``: the timeline (:mod:`.timeline`) takes those for stages.
+OP_RANGE = "ka.op/"
+CALL_RANGE = "ka.call/"
+#: Regions not mined (:meth:`Miner.unmined`), by how their GPU work escaped the recorder.
+UNMINED = ("graphed", "compiled", "custom", "unattributed")
+#: The cyclic GC's young-generation threshold during the pass: the recorded ops are long
+#: lived, and collecting every 700 allocations cost ~10 % of the pass (measured on a toy
+#: decoder on the CPU of the A10 host); cyclic garbage still goes every 50,000.
+GC_YOUNG = 50_000
 
 MEM, ANCHOR, BARRIER = "mem", "anchor", "barrier"
 _GEMM = frozenset(
@@ -250,6 +313,11 @@ class _Func:
     composite: bool  # it decomposes into other aten ops
     written: tuple[int, ...]  # positional arguments it writes (in place)
     written_kw: tuple[str, ...]  # keyword-only ones (``out=``)
+    alloc: bool = False  # _ALLOC
+    sync: bool = False  # _SYNC
+    transfer: bool = False  # _TRANSFER
+    overwrite: bool = False  # _OVERWRITE
+    partial: bool = False  # _PARTIAL
 
 
 _FUNCS: dict[Any, _Func] = {}
@@ -277,21 +345,32 @@ def _func(func: Any) -> _Func:
             aten and anchor is None and composite,
             tuple(i for i in written if not args[i].kwarg_only),
             tuple(args[i].name for i in written if args[i].kwarg_only),
+            name in _ALLOC,
+            name in _SYNC,
+            name in _TRANSFER,
+            name in _OVERWRITE,
+            name in _PARTIAL,
         )
     return found
+
+
+# a tuple, not ``tuple | list``: that union is built anew at each isinstance call
+_SEQ = (tuple, list)
+_TENSOR = torch.Tensor
 
 
 def _tensors(values: Any) -> list[torch.Tensor]:
     """The tensors in ``values`` (a tensor, or a sequence of tensors and of lists of them, as
     aten arguments and outputs are)."""
-    if isinstance(values, torch.Tensor):
+    if isinstance(values, _TENSOR):
         return [values]
     out = []
-    for v in values if isinstance(values, tuple | list) else ():
-        if isinstance(v, torch.Tensor):
-            out.append(v)
-        elif isinstance(v, tuple | list):
-            out += [x for x in v if isinstance(x, torch.Tensor)]
+    if isinstance(values, _SEQ):
+        for v in values:
+            if isinstance(v, _TENSOR):
+                out.append(v)
+            elif isinstance(v, _SEQ):
+                out += [x for x in v if isinstance(x, _TENSOR)]
     return out
 
 
@@ -306,11 +385,52 @@ def _storage(t: torch.Tensor) -> tuple[Key | None, int]:
     if not ptr:
         return None, 0
     size = t.element_size()
-    n = int(t.numel())
+    n = t.numel()
     if not t.is_contiguous():
         span = 1 + sum((s - 1) * abs(st) for s, st in zip(t.shape, t.stride(), strict=True))
-        n = min(n, int(span))
+        n = min(n, span)
     return (t.get_device(), ptr - int(t.storage_offset()) * size), n * size
+
+
+def _record_function_enter(name: str) -> Any:
+    rf = torch.autograd.profiler.record_function(name)
+    rf.__enter__()
+    return rf
+
+
+def _record_function_exit(handle: Any) -> None:
+    handle.__exit__(None, None, None)
+
+
+#: Open and close a profiler range in the user scope (``record_function``'s), through the
+#: direct bindings where torch has them (no op to dispatch, no object per range): the pass's
+#: profiler records only that scope (:func:`_kernel_profiler`).
+_range_enter: Callable[[str], Any] = getattr(
+    torch.autograd, "_record_function_with_args_enter", _record_function_enter
+)
+_range_exit: Callable[[Any], None] = getattr(
+    torch.autograd, "_record_function_with_args_exit", _record_function_exit
+)
+
+
+class _Range:
+    """A profiler range named ``name`` (:func:`_range_enter`), a context manager."""
+
+    __slots__ = ("handle", "name")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.handle: Any = None
+
+    def __enter__(self) -> None:
+        self.handle = _range_enter(self.name)
+
+    def __exit__(self, *exc: object) -> None:
+        _range_exit(self.handle)
+
+
+def _call_range(index: int) -> Any:
+    return _Range(f"{CALL_RANGE}{index}")
 
 
 def _shape(shape: Sequence[int], dtype: Any) -> str:
@@ -337,20 +457,41 @@ class _Op:
     loads: tuple[tuple[Key, int], ...] = ()
     writes: dict[Key, int] = field(default_factory=dict)  # storage -> bytes written
     consumers: list[tuple[int, Key, int]] = field(default_factory=list)  # op, storage, bytes
+    # the kernel map (Miner._apply): GPU events it launched (-1: no map) and their GPU time
+    launches: int = -1
+    kernel_ns: int = 0
+    hidden: bool = False  # inside a compiled module call: not what the run does (Miner._hide)
 
 
 class Recorder(TorchDispatchMode):
-    """Records every aten op of a run (:class:`_Op`) while active; never changes one. ``call``
-    returns the innermost open module call (an index into the timer's calls, -1: none)."""
+    """Records every aten op of a run (:class:`_Op`) while active; never changes one.
+    ``stack``: the open module calls, innermost last, each with its index into the timer's
+    calls first (``ModuleTimer._stack``). ``ranges``: each op it dispatches runs inside a
+    profiler range named :data:`OP_RANGE` + its dispatch number, for :func:`kernel_map`;
+    ``seq`` maps dispatch numbers to ops.
 
-    def __init__(self, call: Callable[[], int]) -> None:
+    Kept cheap (the module docstring): it records the same ops as a straightforward
+    recorder, which ``tests/test_fusion.py`` checks."""
+
+    @classmethod
+    def _should_skip_dynamo(cls) -> bool:
+        # torch >= 2.11 wraps __torch_dispatch__ in torch._disable_dynamo (a few us per op);
+        # Dynamo already skips every frame while a mode like this one is active
+        return False
+
+    def __init__(
+        self, stack: list[tuple[int, int, str]] | None = None, *, ranges: bool = False
+    ) -> None:
         super().__init__()
-        self.call = call
+        self.stack = stack if stack is not None else []
+        self.ranges = ranges
         self.ops: list[_Op] = []
         self.writer: dict[Key, int] = {}
         self.epoch = 0
         self.views = 0
         self.failed = 0  # ops the bookkeeping could not record (the run went on)
+        self.dispatched = 0  # ops run in a range (their dispatch numbers)
+        self.seq: dict[int, int] = {}  # dispatch number -> index of the op recorded
 
     def __torch_dispatch__(
         self,
@@ -360,7 +501,7 @@ class Recorder(TorchDispatchMode):
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
         kwargs = kwargs or {}
-        info = _func(func)
+        info = _FUNCS.get(func) or _func(func)
         if info.composite:
             # record the kernels it runs (re-entering the mode for them). An error
             # propagates: running the op again could repeat an in-place update.
@@ -368,78 +509,113 @@ class Recorder(TorchDispatchMode):
                 out = func.decompose(*args, **kwargs)
             if out is not NotImplemented:
                 return out
-        out = func(*args, **kwargs)
+        seq = -1
+        if not self.ranges:
+            out = func(*args, **kwargs)
+        else:  # the kernels it launches are launched in its range (kernel_map)
+            seq = self.dispatched
+            self.dispatched = seq + 1
+            handle = _range_enter(f"{OP_RANGE}{seq}")
+            try:
+                out = func(*args, **kwargs)
+            finally:
+                _range_exit(handle)
         try:
-            self._record(info, args, kwargs, out)
+            self._record(info, args, kwargs, out, seq)
         except Exception:  # the bookkeeping never breaks the run
             self.failed += 1
         return out
 
-    def _record(self, info: _Func, args: tuple[Any, ...], kwargs: dict[str, Any], out: Any) -> None:
-        name = info.name
-        written = _tensors([args[i] for i in info.written if i < len(args)])
-        written += _tensors([kwargs[k] for k in info.written_kw if k in kwargs])
-        ins = _tensors(args) + (_tensors(list(kwargs.values())) if kwargs else [])
+    def _record(
+        self, info: _Func, args: tuple[Any, ...], kwargs: dict[str, Any], out: Any, seq: int = -1
+    ) -> None:
+        if info.written or info.written_kw:
+            written = _tensors([args[i] for i in info.written if i < len(args)])
+            written += _tensors([kwargs[k] for k in info.written_kw if k in kwargs])
+        else:
+            written = []
+        ins = _tensors(args)
+        if kwargs:
+            ins += _tensors(list(kwargs.values()))
         outs = _tensors(out)
-        in_st = [_storage(t) for t in ins]
         out_st = [_storage(t) for t in outs]
-        if name in _ALLOC:
+        writer = self.writer
+        if info.alloc:
             for key, _ in out_st:
-                self.writer.pop(key or (0, 0), None)
+                writer.pop(key or (0, 0), None)
             return
-        in_keys = {key for key, _ in in_st}
-        if not written and outs and all(key in in_keys for key, _ in out_st):
-            self.views += 1  # a view (or an op that returned its input): no kernel
-            return
-        if not outs and not written and name not in _SYNC:
+        in_st = [_storage(t) for t in ins]
+        if not written and outs:
+            in_keys = {key for key, _ in in_st}
+            if all(key in in_keys for key, _ in out_st):
+                self.views += 1  # a view (or an op that returned its input): no kernel
+                return
+        if not outs and not written and not info.sync:
             return  # sizes, metadata
         cross = to_host = False
-        if name in _TRANSFER:
+        if info.transfer:
             devices = {t.get_device() for t in (*ins, *outs) if t.dim() or not t.is_cpu}
             cross = len(devices) > 1
             to_host = cross and any(t.is_cpu for t in outs)
-        sync = name in _SYNC or to_host
+        sync = info.sync or to_host
         # a host synchronisation, a transfer, a custom op: never fused
         barrier = sync or cross or not info.aten
         kind = BARRIER if barrier else ANCHOR if info.anchor else MEM
-        first = outs[0] if outs else (written[0] if written else None)
-        index = len(self.ops)
-        op = _Op(
-            name,
-            kind,
-            self.call(),
-            self.epoch,
-            tuple(first.shape) if first is not None else (),
-            first.dtype if first is not None else None,
-            info.anchor or "",
-        )
-        overwrites = name in _OVERWRITE  # its written argument is not read
+        overwrites = info.overwrite and written  # its written argument is not read
         loads: dict[Key, int] = {}
+        reads: list[tuple[int, Key, int]] = []
         for t, (key, nbytes) in zip(ins, in_st, strict=True):
             if key is None or (overwrites and any(t is w for w in written)):
                 continue
-            loads[key] = max(loads.get(key, 0), nbytes)
-            producer = self.writer.get(key)
+            known = loads.get(key)
+            if known is None or nbytes > known:
+                loads[key] = nbytes
+            producer = writer.get(key)
             if producer is not None:
-                op.reads.append((producer, key, nbytes))
-        op.loads = tuple(loads.items())
-        mutated = {id(t) for t in written}
+                reads.append((producer, key, nbytes))
+        writes: dict[Key, int] = {}
+        targets = list(zip(outs, out_st, strict=True))
+        if written:  # an in-place op: its storages were looked up as inputs
+            looked = {id(t): st for t, st in zip(ins, in_st, strict=True)}
+            targets += [(t, looked.get(id(t)) or _storage(t)) for t in written]
         carried = None
-        if name in _PARTIAL:  # it writes the rows its other arguments carry, not the buffer
+        mutated: set[int] = set()
+        if info.partial:  # it writes the rows its other arguments carry, not the buffer
+            mutated = {id(t) for t in written}
             carried = sum(n for t, (_, n) in zip(ins, in_st, strict=True) if id(t) not in mutated)
-        targets = [*zip(outs, out_st, strict=True), *((t, _storage(t)) for t in written)]
         for t, (key, nbytes) in targets:
             if key is None:
                 continue
             if carried is not None and id(t) in mutated:
                 nbytes = min(nbytes, carried)
-            op.writes[key] = max(op.writes.get(key, 0), nbytes)
+            known = writes.get(key)
+            if known is None or nbytes > known:
+                writes[key] = nbytes
+        first = outs[0] if outs else (written[0] if written else None)
+        stack = self.stack
+        ops = self.ops
+        index = len(ops)
+        op = _Op(
+            info.name,
+            kind,
+            stack[-1][0] if stack else -1,
+            self.epoch,
+            first.shape if first is not None else (),  # a torch.Size: a tuple
+            first.dtype if first is not None else None,
+            info.anchor or "",
+            reads,
+            tuple(loads.items()),
+            writes,
+            [],
+        )
         # committed only once the op is complete: a failure above leaves no half an op
-        for producer, key, nbytes in op.reads:
-            self.ops[producer].consumers.append((index, key, nbytes))
-        for key in op.writes:
-            self.writer[key] = index
-        self.ops.append(op)
+        for producer, key, nbytes in reads:
+            ops[producer].consumers.append((index, key, nbytes))
+        for key in writes:
+            writer[key] = index
+        ops.append(op)
+        if seq >= 0:
+            self.seq[seq] = index
         if sync:
             self.epoch += 1
 
@@ -468,6 +644,17 @@ class _Groups:
         return {self.find(g) for g in groups}
 
 
+#: A placement's numbers that add up over a row's occurrences (:meth:`Miner.chains`).
+_SUMMED = (
+    "intermediate_bytes",
+    "round_trip_bytes",
+    "dram_bytes",
+    "tensors",
+    "launches_run",
+    "launches_saved_run",
+    "kernel_ns",
+)
+
 #: Why an intermediate's round trip counts (:func:`l2_round_trip`), from none to all of it.
 L2_WHY = ("in", "traffic", "size", "unknown")
 
@@ -492,46 +679,375 @@ def l2_round_trip(written: int, trip: int, traffic: int, l2: int | None) -> tupl
     return -(-trip * (written - resident) // written), "size" if written > l2 else "traffic"
 
 
+#: Kind of this module's ranges in :func:`profiled_events`.
+RANGE = "range"
+
+
+@dataclass
+class KernelMap:
+    """The GPU events of a profiled pass by the op range that launched them
+    (:func:`kernel_map`)."""
+
+    #: dispatch number -> (GPU events launched inside its op range, their GPU ns)
+    ops: dict[int, tuple[int, int]]
+    #: (kind (:data:`UNMINED`), innermost module call around the launch, -1: none) -> the same
+    unmined: dict[tuple[str, int], tuple[int, int]]
+    events: int = 0  # every GPU event of the pass
+    ns: int = 0
+    #: GPU events in the range of a dispatch that recorded no op (Miner.map_kernels)
+    unrecorded: tuple[int, int] = (0, 0)
+    #: Dispatch numbers before which GPU work was launched outside every op range (a graph
+    #: replay, a Triton kernel), sorted: the recorder saw neither what it read nor what it
+    #: wrote, so no chain crosses one (Miner.map_kernels)
+    cuts: list[int] = field(default_factory=list)
+
+
+def _innermost(ranges: list[tuple[int, int, int]]) -> Callable[[int], int | None]:
+    """The key of the innermost range around a time (None: none), for properly nested
+    ``(start, end, key)`` ranges."""
+    segs = timeline.flatten(ranges)
+    starts = [s for s, _, _ in segs]
+
+    def at(t: int) -> int | None:
+        j = bisect.bisect_right(starts, t) - 1
+        return segs[j][2] if j >= 0 and segs[j][0] <= t < segs[j][1] else None
+
+    return at
+
+
+def kernel_map(events: Iterable[timeline.Event]) -> KernelMap:
+    """Each GPU event (kernel, copy, memset; ``timeline.GPU_KINDS``) of a profiled pass to
+    the op whose range (:data:`OP_RANGE` + its dispatch number) is the innermost around the
+    host call that launched it (the launch call with its correlation id), and one launched
+    outside every op range to how (``graphed``: by a CUDA-graph launch, ``custom``: by any
+    other launch outside the dispatcher: Triton, an extension; ``unattributed``: no launch
+    call in the trace) and the innermost module call (:data:`CALL_RANGE` + its index) around
+    the launch. Ranges are matched by time on any thread: the profiler numbers the threads
+    of its ranges and of its launch calls differently, and the recorder runs on one."""
+    op_ranges: list[tuple[int, int, int]] = []
+    call_ranges: list[tuple[int, int, int]] = []
+    gpu: list[timeline.Event] = []
+    api: dict[int, timeline.Event] = {}
+    for e in events:
+        if e.kind == RANGE:
+            for prefix, found in ((OP_RANGE, op_ranges), (CALL_RANGE, call_ranges)):
+                if e.name.startswith(prefix):
+                    with contextlib.suppress(ValueError):
+                        found.append((e.start, e.end, int(e.name[len(prefix) :])))
+        elif e.kind in timeline.GPU_KINDS:
+            gpu.append(e)
+        elif e.kind in timeline.API_KINDS and e.correlation >= 0:
+            api[e.correlation] = e
+    op_at, call_at = _innermost(op_ranges), _innermost(call_ranges)
+    op_ranges.sort()
+    starts = [s for s, _, _ in op_ranges]
+    per_op: dict[int, list[int]] = {}
+    outside: dict[tuple[str, int], list[int]] = {}
+    cuts: set[int] = set()
+    total = 0
+    for g in gpu:
+        ns = max(g.end - g.start, 0)
+        total += ns
+        launch = api.get(g.correlation)
+        seq = op_at(launch.start) if launch is not None else None
+        if seq is not None:
+            entry = per_op.setdefault(seq, [0, 0])
+        elif launch is None:
+            entry = outside.setdefault(("unattributed", -1), [0, 0])
+        else:
+            kind = "graphed" if "Graph" in launch.name else "custom"
+            call = call_at(launch.start)
+            entry = outside.setdefault((kind, call if call is not None else -1), [0, 0])
+            k = bisect.bisect_left(starts, launch.start)  # the first op range after it
+            if k < len(op_ranges):  # (after the last one it separates nothing)
+                cuts.add(op_ranges[k][2])
+        entry[0] += 1
+        entry[1] += ns
+    return KernelMap(
+        {k: (v[0], v[1]) for k, v in per_op.items()},
+        {k: (v[0], v[1]) for k, v in outside.items()},
+        len(gpu),
+        total,
+        cuts=sorted(cuts),
+    )
+
+
+def profiled_events(prof: Any) -> list[timeline.Event]:
+    """The events :func:`kernel_map` reads from a finished profiler (``torch.profiler``'s or
+    the autograd one of :func:`_kernel_profiler`): GPU work and launch calls
+    (``timeline.activity_type``) and this module's ranges on the host (kind :data:`RANGE`;
+    a user range's GPU-side span is not one), from its Kineto results (no chrome trace)."""
+    results = getattr(prof, "kineto_results", None)
+    if results is None:  # torch.profiler.profile: the autograd profiler inside
+        results = prof.profiler.kineto_results
+    from torch._C._autograd import DeviceType
+
+    keep = timeline.GPU_KINDS | timeline.API_KINDS
+    ranges = (OP_RANGE, CALL_RANGE)
+    host = DeviceType.CPU
+    event = timeline.Event
+    out: list[timeline.Event] = []
+    append = out.append
+    # half a million events for Qwen3-0.6B: the cheap tests first (activity_type reads
+    # three or four fields on a torch without _KinetoEvent.activity_type)
+    for e in results.events():
+        name = e.name()
+        on_host = e.device_type() == host
+        if name.startswith(ranges):
+            if on_host:  # not Kineto's GPU span of the range
+                append(event(RANGE, name, e.start_ns(), e.end_ns()))
+            continue
+        if on_host and not name.startswith(_LAUNCH_CALLS):
+            continue  # an aten op, cudaGetDevice, cudaStreamIsCapturing, ...
+        kind = timeline.activity_type(e)
+        if kind in keep:
+            append(event(kind, name, e.start_ns(), e.end_ns(), e.correlation_id()))
+    return out
+
+
+#: Host calls that put work on the GPU (CUDA runtime and driver): the launches of
+#: :func:`kernel_map` (a GPU event whose launch is none of these is ``unattributed``).
+_LAUNCH_CALLS = (
+    "cudaLaunch",
+    "cudaGraphLaunch",
+    "cudaMemcpy",
+    "cudaMemset",
+    "cuLaunch",
+    "cuGraphLaunch",
+    "cuMemcpy",
+    "cuMemset",
+)
+
+
+def _kernel_profiler() -> Any:
+    """The profiler of a pass with a kernel map: the host's user-scope ranges (this
+    module's; every aten op too made the Qwen3-0.6B pass 25.7 s instead of 19.1 s, measured
+    on an NVIDIA A10), the launch calls and the GPU's work; no shapes, stacks or memory, and
+    no external correlation (the map pairs launches and kernels by CUPTI's own correlation
+    id; Kineto's GPU spans of the ranges were a quarter of the events). Falls back to
+    torch's defaults where its profiler differs."""
+    from torch._C._profiler import RecordScope, _ExperimentalConfig
+    from torch.autograd import _enable_profiler
+    from torch.autograd.profiler import profile
+
+    class UserScope(profile):
+        def _start_trace(self) -> None:  # torch's, with the scopes
+            self.entered = True
+            config = self.config(create_trace_id=False)
+            try:
+                scopes = {RecordScope.USER_SCOPE}  # the binding takes them; its stub does not
+                _enable_profiler(config, self.kineto_activities, scopes)  # type: ignore[call-arg]
+            except TypeError:  # a torch without scopes: every op too
+                _enable_profiler(config, self.kineto_activities)
+            self.profiling_start_time_ns = time.perf_counter_ns()
+
+    try:
+        experimental = _ExperimentalConfig(disable_external_correlation=True)
+    except TypeError:
+        experimental = None
+    return UserScope(
+        use_device="cuda" if torch.cuda.is_available() else None,
+        use_kineto=True,
+        experimental_config=experimental,
+    )
+
+
+@contextlib.contextmanager
+def _young_gc_less_often() -> Iterator[None]:
+    """The cyclic GC's young generation collected every :data:`GC_YOUNG` allocations (not
+    700) while active, unless it is disabled; restored after."""
+    old = gc.get_threshold()
+    if old[0]:
+        gc.set_threshold(max(old[0], GC_YOUNG), max(old[1], 50), old[2])
+    try:
+        yield
+    finally:
+        gc.set_threshold(*old)
+
+
+def _error(exc: BaseException) -> str:
+    return " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
+
+
 class Miner:
     """Records a run's ops in the hooked work pass (:meth:`recording`) and finds its fusion
     chains (:meth:`chains`, :meth:`result`). ``l2_bytes``: the GPU's L2 (None: unknown,
-    every intermediate counts as DRAM traffic) and where that number is from."""
+    every intermediate counts as DRAM traffic) and where that number is from. ``kernels``:
+    map the ops to their kernels (:meth:`recording`; default: with CUDA)."""
 
     def __init__(
-        self, l2_bytes: int | None = None, l2_source: str = "", *, max_gap: int = MAX_GAP
+        self,
+        l2_bytes: int | None = None,
+        l2_source: str = "",
+        *,
+        max_gap: int = MAX_GAP,
+        kernels: bool | None = None,
     ) -> None:
         self.l2_bytes = l2_bytes
         self.l2_source = l2_source
         self.max_gap = max_gap
+        self.want_kernels = kernels
         self.recorder: Recorder | None = None
         self.calls: list[Any] = []  # the timer's calls (qualname, cls, method, phase, parent)
+        self.compiled: set[str] = set()  # qualnames of the torch.compile'd modules (the timer's)
+        self.kernels: KernelMap | None = None  # the kernel map (map_kernels)
+        self.kernel_note = ""  # why there is none, when one was asked for
+        self.map_seconds = 0.0
         self._ancestry: dict[int, tuple[int, ...]] = {}
         self._folded: dict[int, str] = {}
         self._windows: dict[tuple[int, int], tuple[int, dict[Key, int]]] = {}
+        self._inside: dict[int, str] = {}  # call -> the compiled call around it
+        self._hid = False
+        self._epochs: list[int] | None = None  # the ops' epochs before the launch cuts
 
     @contextlib.contextmanager
-    def recording(self, timer: Any) -> Iterator[Recorder]:
+    def recording(self, timer: Any, *, kernels: bool | None = None) -> Iterator[Recorder]:
         """Record every op while active, each with the innermost open call of ``timer`` (a
-        ``ModuleTimer`` that is active around this)."""
-        stack = timer._stack
-
-        def innermost() -> int:
-            return int(stack[-1][0]) if stack else -1
-
-        self.recorder = Recorder(innermost)
+        ``ModuleTimer`` that is active around this). ``kernels`` (default: the miner's, else
+        with CUDA): run the pass under the profiler (:func:`_kernel_profiler`) with the op and
+        module-call ranges and map the ops to their kernels at the end (:meth:`map_kernels`),
+        also when the run fails."""
+        if kernels is None:
+            kernels = self.want_kernels
+        mapped = torch.cuda.is_available() if kernels is None else kernels
+        self.recorder = Recorder(timer._stack, ranges=mapped)
         self.calls = timer.calls
-        with self.recorder:
-            yield self.recorder
+        self.compiled = set(getattr(timer, "compiled", ()))
+        self.kernel_note = "" if mapped else "no CUDA: a pass on the CPU"
+        prof = None
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(_young_gc_less_often())
+                if mapped:
+                    try:
+                        prof = stack.enter_context(_kernel_profiler())
+                    except Exception as exc:  # another profiler is active, say: no map
+                        self.kernel_note = f"the profiler did not start: {_error(exc)}"
+                        self.recorder.ranges = False
+                    else:
+                        timer.call_range = _call_range
+                        stack.callback(setattr, timer, "call_range", None)
+                with self.recorder:
+                    yield self.recorder
+        finally:
+            if prof is not None:
+                start = time.perf_counter()
+                try:
+                    with _young_gc_less_often():  # hundreds of thousands of events
+                        self.map_kernels(profiled_events(prof))
+                except Exception as exc:  # the map never breaks the pass
+                    self.kernels, self.kernel_note = None, f"the kernel map failed: {_error(exc)}"
+                self.map_seconds = time.perf_counter() - start
+            self._hide()
 
     @property
     def ops(self) -> list[_Op]:
         return self.recorder.ops if self.recorder is not None else []
+
+    def map_kernels(self, events: Iterable[timeline.Event]) -> KernelMap | None:
+        """Each recorded op's ``launches`` and ``kernel_ns`` from the events of its pass
+        (:func:`kernel_map`; the recorder ran with ranges): 0 for an op whose range launched
+        nothing. A pass without GPU events (a workload on the CPU) maps nothing: every op
+        then counts one launch. GPU work launched between two recorded ops outside the
+        dispatcher (a graph replay, a Triton kernel) separates them as a host sync does
+        (``epoch``): the recorder did not see what it read and wrote, so a chain across it
+        could skip a dependency (a residual add, a Triton norm, the next add)."""
+        km = kernel_map(events)
+        rec = self.recorder
+        if not km.events or rec is None:
+            self.kernels = None
+            self.kernel_note = "no GPU work in the pass (a workload on the CPU)"
+            return None
+        ops = rec.ops
+        if self._epochs is None:  # the host syncs' epochs, before any cut
+            self._epochs = [op.epoch for op in ops]
+        for seq, i in rec.seq.items():
+            ops[i].epoch = self._epochs[i] + bisect.bisect_right(km.cuts, seq)
+        for op in ops:
+            op.launches, op.kernel_ns = 0, 0
+        lost = [0, 0]
+        for seq, (events_n, ns) in km.ops.items():
+            index = rec.seq.get(seq)
+            if index is None:  # a view, an allocation, an op the bookkeeping failed on
+                lost[0] += events_n
+                lost[1] += ns
+                continue
+            ops[index].launches, ops[index].kernel_ns = events_n, ns
+        km.unrecorded = (lost[0], lost[1])
+        self.kernels = km
+        self.kernel_note = ""
+        return km
+
+    # -------------------------------------------------------------- compiled regions
+
+    def _compiled_around(self, call: int) -> str:
+        """The qualname of the compiled module call around ``call`` ("" for none)."""
+        found = self._inside.get(call)
+        if found is None:
+            found = next(
+                (
+                    self.calls[a].qualname
+                    for a in self._ancestors(call)
+                    if self.calls[a].qualname in self.compiled
+                ),
+                "",
+            )
+            self._inside[call] = found
+        return found
+
+    def _hide(self) -> None:
+        """The ops inside a compiled module call become barriers (``hidden``): under the
+        dispatch mode its Python ran eagerly, not the compiled code the run executes."""
+        if self._hid or not self.compiled:
+            return
+        self._hid = True
+        for op in self.ops:
+            if op.call >= 0 and self._compiled_around(op.call):
+                op.hidden = True
+                op.kind = BARRIER
+
+    def unmined(self) -> list[dict[str, Any]]:
+        """The regions of the pass whose ops were not mined (the module docstring), per kind
+        (:data:`UNMINED`) and instance group: their GPU events and ms (with a kernel map)
+        and, for a compiled region, the ops recorded inside it. Largest first."""
+        self._hide()
+        rows: dict[tuple[str, str], list[int]] = {}
+        instances: dict[tuple[str, str], set[str]] = {}
+
+        def add(kind: str, qualname: str, events: int, ns: int, ops: int) -> None:
+            key = (kind, fold(qualname))
+            row = rows.setdefault(key, [0, 0, 0])
+            row[0] += events
+            row[1] += ns
+            row[2] += ops
+            instances.setdefault(key, set()).add(qualname)
+
+        for op in self.ops:
+            if op.hidden:
+                where = self._compiled_around(op.call)
+                add("compiled", where, max(op.launches, 0), op.kernel_ns, 1)
+        if self.kernels is not None:
+            for (kind, call), (events, ns) in self.kernels.unmined.items():
+                add(kind, self.calls[call].qualname if call >= 0 else "", events, ns, 0)
+        out = [
+            {
+                "kind": kind,
+                "where": where,
+                "instances": len(instances[(kind, where)] - {""}),
+                "gpu_events": n,
+                "gpu_ms": round(ns / 1e6, 4),
+                **({"ops": ops} if ops else {}),
+            }
+            for (kind, where), (n, ns, ops) in rows.items()
+        ]
+        return sorted(out, key=lambda r: (-r["gpu_ms"], -r.get("ops", 0), r["kind"], r["where"]))
 
     # -------------------------------------------------------------- grouping
 
     def groups(self) -> list[list[int]]:
         """The memory-bound ops in maximal fusible groups (the module docstring), each in
         execution order, groups by their first op."""
+        self._hide()
         ops, gap = self.ops, self.max_gap
         g = _Groups()
         dep: list[set[int]] = []
@@ -618,9 +1134,15 @@ class Miner:
 
     def _describe(self, i: int) -> dict[str, Any]:
         op = self.ops[i]
-        out = {"op": op.name, "module": self._module(op.call), "shape": _shape(op.shape, op.dtype)}
+        out: dict[str, Any] = {
+            "op": op.name,
+            "module": self._module(op.call),
+            "shape": _shape(op.shape, op.dtype),
+        }
         if op.kind == ANCHOR:
             out["anchor"] = op.anchor
+        if self.kernels is not None and op.launches != 1:  # none (host tensors) or several
+            out["launches"] = op.launches
         return out
 
     def _traffic(self, first: int, last: int, key: Key) -> int:
@@ -643,14 +1165,28 @@ class Miner:
         """Launches, intermediates and module boundaries of fusing ``members`` (the module
         docstring), for one occurrence; ``intermediates``: each one's bytes, round trip, the
         traffic between its write and its last read inside, and its DRAM bytes and why
-        (:func:`l2_round_trip`), ``op`` its producer's position in ``members``."""
+        (:func:`l2_round_trip`), ``op`` its producer's position in ``members``. With a kernel
+        map the launches are its ops' GPU launches (after the fusion: one kernel, or as many
+        as its largest anchor launches), ``kernel_ns`` their GPU time, and the outputs of an
+        op that launched no GPU work (host tensors) move no GPU bytes; without, one launch per
+        op."""
         inside = set(members)
         l2 = self.l2_bytes
+        ops = self.ops
+        mapped = self.kernels is not None
+        if mapped:  # exact: its ops' GPU launches, after: one kernel or its largest anchor's
+            launches = sum(ops[i].launches for i in members)
+            anchors = [ops[i].launches for i in members if ops[i].kind == ANCHOR]
+            after = max([1, *anchors]) if launches else 0
+        else:  # one launch per recorded op
+            launches, after = len(members), 1
         totals = {"intermediate": 0, "round_trip": 0, "dram": 0, "largest": 0, "tensors": 0}
         found: list[dict[str, Any]] = []
         for pos, p in enumerate(members):
-            op = self.ops[p]
+            op = ops[p]
             for out, (key, written) in enumerate(op.writes.items()):
+                if mapped and not op.launches:
+                    continue  # it launched no GPU work (host tensors): no GPU bytes to save
                 readers = [(c, b) for c, k, b in op.consumers if k == key]
                 mine = [(c, b) for c, b in readers if c in inside]
                 if not mine:
@@ -677,10 +1213,15 @@ class Miner:
                 )
         lca = self._lca(members)
         call = self.calls[lca] if lca >= 0 else None
+        saved = max(launches - after, 0)
         return {
-            "launches": len(members),
-            "launches_saved": len(members) - 1,
-            "boundaries": len({self.ops[i].call for i in members}) - 1,
+            "launches": launches,
+            "launches_saved": saved,
+            # per run (chains() sums the occurrences; an op's launches may differ by call)
+            "launches_run": launches,
+            "launches_saved_run": saved,
+            **({"kernel_ns": sum(ops[i].kernel_ns for i in members)} if mapped else {}),
+            "boundaries": len({ops[i].call for i in members}) - 1,
             "parent_class": call.cls if call is not None else None,
             "group": fold(call.qualname) if call is not None else "",
             "intermediate_bytes": totals["intermediate"],
@@ -777,8 +1318,9 @@ class Miner:
             else:
                 for name, m in measured.items():
                     total = row["placements"][name]
-                    for k in ("intermediate_bytes", "round_trip_bytes", "dram_bytes", "tensors"):
-                        total[k] += m[k]
+                    for k in _SUMMED:
+                        if k in m:
+                            total[k] += m[k]
                     total["largest_bytes"] = max(total["largest_bytes"], m["largest_bytes"])
                     _merge_intermediates(total["intermediates"], m["intermediates"])
             row["calls"] += 1
@@ -812,7 +1354,9 @@ class Miner:
         return rows
 
     def result(self, *, seconds: float = 0.0, error: str | None = None) -> dict[str, Any]:
-        """``profile.json`` → ``fusions``: the chains and how they were found."""
+        """``profile.json`` → ``fusions``: the chains, how they were found, the kernel map
+        (``kernel_map``: GPU events and launches of the pass; ``kernel_map_note`` when there
+        is none) and the regions not mined (``unmined``)."""
         rec = self.recorder
         out: dict[str, Any] = {
             "version": VERSION,
@@ -825,6 +1369,29 @@ class Miner:
             "seconds": round(seconds, 2),
             "chains": self.chains() if self.ops else [],
         }
+        km = self.kernels
+        if km is not None:
+            ops = self.ops
+            mined = [op for op in ops if not op.hidden]
+            custom = sum(n for (kind, _), (n, _) in km.unmined.items() if kind == "custom")
+            out["kernel_map"] = {
+                "gpu_events": km.events,
+                "gpu_ms": round(km.ns / 1e6, 4),
+                # the run's eager launches (build's price per launch): the mined ops' and
+                # those outside the dispatcher; not a graph's, not compiled code's (its
+                # eager ops' launches here are not the run's)
+                "launches": sum(op.launches for op in mined) + custom,
+                "mined_ms": round(sum(op.kernel_ns for op in mined) / 1e6, 4),
+                "ops_without_launch": sum(op.launches == 0 for op in ops),
+                "ops_with_several": sum(op.launches > 1 for op in ops),
+                "launch_cuts": len(km.cuts),  # no chain crosses one (map_kernels)
+                "unrecorded_events": km.unrecorded[0],
+                "seconds": round(self.map_seconds, 2),
+            }
+        elif self.kernel_note:
+            out["kernel_map_note"] = self.kernel_note
+        if unmined := self.unmined():
+            out["unmined"] = unmined
         if rec is not None and rec.failed:
             out["unrecorded_ops"] = rec.failed
         if error:
@@ -920,10 +1487,16 @@ def build(
     floor_us = float(peaks.get("launch_floor_us") or 0.0)
     graph_us = float(peaks.get("launch_floor_graph_us") or 0.0)  # measured since peaks v8
     mode, mode_basis = launch_mode(profile)
-    # an eager launch saves at most what an op of this run takes on average: the launch
-    # floor (a module call with one kernel) includes Python a bare op does not pay
+    km = raw.get("kernel_map") or {}
+    if km and mode == "graph":  # graph-launched work is not mined: the mined ops are eager
+        mode_basis = f"the mined ops launch eagerly (the kernel map); {mode_basis}, not mined"
+        mode = "eager"
+    # an eager launch saves at most what a launch of this run takes on average: the launch
+    # floor (a module call with one kernel) includes Python a bare op does not pay. With
+    # the kernel map, per GPU launch of the recorded ops; without, per recorded op
     ops = int(raw.get("ops") or 0)
-    per_op_us = 1000.0 * window_ms / ops if ops and window_ms > 0 else None
+    count, unit = (int(km.get("launches") or 0), "GPU launch") if km else (ops, "recorded op")
+    per_op_us = 1000.0 * window_ms / count if count and window_ms > 0 else None
     notes = []
     if mode == "graph" and graph_us:
         boundary, basis = graph_us, f"the measured CUDA-graph launch floor; {mode_basis}"
@@ -933,7 +1506,7 @@ def build(
         boundary, basis = floor_us, f"the measured launch floor of an eager run; {mode_basis}"
     elif per_op_us is not None:
         boundary = per_op_us
-        basis = f"the run's time per recorded op, {window_ms:,.4g} ms / {ops:,}" + (
+        basis = f"the run's time per {unit}, {window_ms:,.4g} ms / {count:,}" + (
             f", below the measured launch floor {floor_us:.3g} us" if floor_us else ""
         )
         basis += f"; {mode_basis}"
@@ -943,6 +1516,9 @@ def build(
         notes.append("launch floor not measured (`kernel-agent doctor`): launches priced low")
     if dram <= 0:
         notes.append("DRAM bandwidth not measured (`kernel-agent doctor`): no byte saving")
+    if not km and raw.get("chains"):
+        why = raw.get("kernel_map_note") or "a table from before it"
+        notes.append(f"no kernel map ({why}): every recorded op counts one launch")
     priced: dict[str, dict[str, Any]] = {}  # id -> the chain and its options
     for chain in raw.get("chains") or []:
         options = []
@@ -951,11 +1527,17 @@ def build(
             if not p:
                 continue
             byte_ms = float(p["dram_bytes"]) / (dram * 1e6) if dram > 0 else 0.0
-            launch_ms = int(chain["calls"]) * int(p["launches_saved"]) * boundary / 1000
+            # fusing cannot save more GPU time than its kernels take now (the kernel map)
+            kernel_ms = float(p["kernel_ns"]) / 1e6 if "kernel_ns" in p else None
+            capped = kernel_ms is not None and byte_ms > kernel_ms
+            if capped:
+                byte_ms = float(kernel_ms or 0.0)
+            saved = p.get("launches_saved_run", int(chain["calls"]) * int(p["launches_saved"]))
+            launch_ms = int(saved) * boundary / 1000
             # a tie goes to the innermost parent (the smallest region), then the order
             depth = len(str(p["group"]).split(".")) if p["group"] else 0
             saving = round(byte_ms + launch_ms, 9)
-            options.append((saving, depth, -order, name, byte_ms, launch_ms))
+            options.append((saving, depth, -order, name, byte_ms, launch_ms, capped))
         if options:
             options.sort(reverse=True)  # the row's best first
             priced[str(chain["id"])] = {"chain": chain, "options": options}
@@ -964,7 +1546,7 @@ def build(
     for cid, entry in priced.items():
         chain, options = entry["chain"], entry["options"]
         name = shown[cid]
-        saving, _, _, _, byte_ms, launch_ms = next(o for o in options if o[3] == name)
+        saving, _, _, _, byte_ms, launch_ms, capped = next(o for o in options if o[3] == name)
         p = chain["placements"][name]
         kind = "glue" if not p["parent_class"] else "region" if p["boundaries"] > 0 else "module"
         # the other rows whose shown placement takes in an op of this one's
@@ -1006,6 +1588,10 @@ def build(
         }
         if better:
             candidate["blocked"] = better
+        if "kernel_ns" in p:  # what its kernels take now (the kernel map), per run
+            candidate["kernel_ms"] = round(float(p["kernel_ns"]) / 1e6, 6)
+        if capped:
+            candidate["byte_capped"] = True
         candidates.append(candidate)
     # the disjoint rows (their savings add up) by saving, then the rows that overlap them
     candidates.sort(key=lambda c: (not c["counted"], -c["saving_ms"], c["id"]))
@@ -1026,11 +1612,108 @@ def build(
         "seconds": raw.get("seconds"),
         "candidates": candidates,
     }
+    if km:
+        out["kernel_map"] = dict(km)
+    if unmined := not_mined(profile):
+        out["unmined"] = unmined
     if raw.get("error"):
         out["error"] = raw["error"]
     if notes:
         out["notes"] = notes
     return out
+
+
+#: The class of a ``torch.compile``'d module's calls in the module view (its wrapper's).
+COMPILED_CLASS = "OptimizedModule"
+
+
+def _module_view(profile: Mapping[str, Any]) -> tuple[dict[tuple[str, str], float], float]:
+    """Inclusive ms per class and instance group (folded qualname) of the profile's module
+    view, and its total (the largest class: the roots), as ``summarize`` shares it."""
+    groups: dict[tuple[str, str], float] = {}
+    total = 0.0
+    for c in profile.get("classes") or []:
+        total = max(total, float(c.get("inclusive_ms") or 0.0))
+        for w in c.get("work") or []:
+            key = (str(c.get("cls") or ""), str(w.get("group") or ""))
+            groups[key] = groups.get(key, 0.0) + float(w.get("inclusive_ms") or 0.0)
+    return groups, total
+
+
+def not_mined(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The regions of a profile whose ops the miner did not mine (the module docstring),
+    each with its ``share`` of the run and its ``basis``: the miner's ``unmined`` rows (a
+    graphed or custom region by its GPU time in the pass; a compiled one by the profile's
+    module view when it has the module, its eager kernels being no measure of the compiled
+    code) and, without a kernel map, the profile's own: the compiled modules and CUDA-graph
+    replays of its ``module_gaps`` (module view) and its graph-launched timeline stages
+    (their share of the timeline's GPU time). Largest share first."""
+    raw = profile.get("fusions") or {}
+    km = raw.get("kernel_map") or {}
+    gpu_ms = float(km.get("gpu_ms") or 0.0)
+    groups, total = _module_view(profile)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def inclusive(kind: str, where: str) -> float | None:
+        """The module view's ms of a region: a compiled one's wrapper calls (the other
+        instances of its group may run eagerly), else every class of its group."""
+        found = [
+            ms
+            for (cls, group), ms in groups.items()
+            if group == where and (kind != "compiled" or cls == COMPILED_CLASS)
+        ]
+        return sum(found) if found and total > 0 else None
+
+    def view(kind: str, where: str, extra: Mapping[str, Any]) -> None:
+        ms = inclusive(kind, where)
+        if (kind, where) in seen or ms is None:
+            return
+        seen.add((kind, where))
+        share = round(ms / total, 4)
+        basis = "the module view's inclusive time"
+        rows.append({**extra, "kind": kind, "where": where, "share": share, "basis": basis})
+
+    for r in raw.get("unmined") or []:
+        kind, where = str(r.get("kind")), str(r.get("where") or "")
+        if kind == "compiled" and inclusive(kind, where) is not None:
+            view(kind, where, r)
+        elif gpu_ms > 0:
+            share = float(r.get("gpu_ms") or 0.0) / gpu_ms
+            basis = "GPU time in the miner's pass"
+            if kind == "compiled":
+                basis += " (its eager kernels: the compiled code did not run under the miner)"
+            rows.append({**r, "share": round(share, 4), "basis": basis})
+            seen.add((kind, where))
+        else:
+            rows.append({**r, "share": None, "basis": "no kernel map: its time is unknown"})
+            seen.add((kind, where))
+    if not km:  # the profile's own view of what the miner could not see
+        gaps = profile.get("module_gaps") or {}
+        for qualname in gaps.get("compiled") or []:
+            view("compiled", fold(str(qualname)), {})
+        for where in gaps.get("graph_replays") or {}:
+            view("graphed", str(where), {})
+        tl = (profile.get("kernel_view") or {}).get("timeline") or {}
+        kernel_ms = float(tl.get("kernel_time_ms") or 0.0)
+        for s in tl.get("stages") or []:
+            events, graph = int(s.get("events") or 0), int(s.get("graph_events") or 0)
+            where = str(s.get("stage") or "")
+            graphed = kernel_ms > 0 and events and graph / events >= 0.5
+            if graphed and ("graphed", where) not in seen:
+                seen.add(("graphed", where))
+                share = float(s.get("gpu_ms") or 0.0) / kernel_ms
+                rows.append(
+                    {
+                        "kind": "graphed",
+                        "where": where,
+                        "gpu_events": events,
+                        "gpu_ms": s.get("gpu_ms"),
+                        "share": round(share, 4),
+                        "basis": "the timeline: a stage whose GPU work is mostly graph launched",
+                    }
+                )
+    return sorted(rows, key=lambda r: (-(r.get("share") or 0.0), r["kind"], r["where"]))
 
 
 def _disjoint(
@@ -1204,21 +1887,29 @@ def _intermediate_text(i: Mapping[str, Any], ops: Sequence[Mapping[str, Any]]) -
 def markdown(
     table: Mapping[str, Any], *, top: int = TOP, title: bool = True, details: bool = False
 ) -> str:
-    """``## Fusion candidates (measured)`` of ``summary.md`` ("" without chains): the top
-    counted rows (their savings add up), each followed by its alternatives (rows that share
-    an op with it); ``details``: why each intermediate of the rows shown counts or not."""
+    """``## Fusion candidates (measured)`` of ``summary.md`` ("" without chains and regions
+    not mined): the top counted rows (their savings add up), each followed by its
+    alternatives (rows that share an op with it), and the regions not mined; ``details``: why
+    each intermediate of the rows shown counts or not."""
     candidates = table.get("candidates") or []
-    if not candidates and not table.get("error"):
+    if not candidates and not table.get("error") and not table.get("unmined"):
         return ""
     lines = ["", "## Fusion candidates (measured)", ""] if title else [""]
     l2 = table.get("l2_bytes")
     l2_size = f"the {l2 / 2**20:.3g} MB L2" if l2 else "the L2 (unknown here: all of it counts)"
     dram = table.get("dram_gbps")
+    km = table.get("kernel_map") or {}
+    counts = (
+        f"{table.get('ops', 0):,} recorded ops, {int(km.get('launches') or 0):,} GPU launches "
+        "(the kernel map: each op's own launches and kernel time)"
+        if km
+        else f"{table.get('ops', 0):,} kernel ops"
+    )
     lines.append(
         f"Chains of memory-bound ops (element-wise, norms, reductions, casts, copies) with the "
         "GEMM / convolution / attention next to them that could take them as an epilogue or "
         f"prologue, from the tensor storages of every op of one run "
-        f"({table.get('ops', 0):,} kernel ops, {table.get('host_syncs', 0)} host syncs; no "
+        f"({counts}, {table.get('host_syncs', 0)} host syncs; no "
         "chain crosses one). *saves* (ms "
         f"{table.get('per', 'per run')}) = the DRAM round trips of the intermediates written "
         f"and read back / "
@@ -1236,6 +1927,7 @@ def markdown(
         lines += ["", f"* the recorded run failed ({table['error']}); chains recorded until then"]
     for note in table.get("notes") or []:
         lines.append(f"* {note}")
+    lines += unmined_lines(table.get("unmined") or [])
     if not candidates:
         return "\n".join(lines) + "\n"
     counted = [c for c in candidates if c.get("counted", True)]
@@ -1303,12 +1995,56 @@ def _table_row(c: Mapping[str, Any], host: Mapping[str, Any]) -> str:
         )
         fuse += ")"
     ident = f"`{c['id']}`" if c is host else f"↳ `{c['id']}` (alt. of `{host['id']}`)"
+    launches = int(c["launches"])
+    after = str(launches - int(c["launches_saved"]))
+    if "kernel_ms" in c:  # the kernel map: its kernels' GPU time now, per run
+        after += f"; {c['kernel_ms']:,.3g} ms GPU"
+    capped = " (≤ its kernels' time)" if c.get("byte_capped") else ""
     return (
-        f"| {ident} | {c['saving_ms']:,.4g} | {c['byte_ms']:,.3g} + "
+        f"| {ident} | {c['saving_ms']:,.4g} | {c['byte_ms']:,.3g}{capped} + "
         f"{c['launch_ms']:,.3g} | {c['calls']:,} | {fuse} | {where}{phase} | "
-        f"{c['boundaries']} | {c['launches']} → 1 | {_mb(c['intermediate_bytes'])} "
+        f"{c['boundaries']} | {launches} → {after} | {_mb(c['intermediate_bytes'])} "
         f"({_mb(c['largest_bytes'])}; {l2_text(c)}) | {region} |"
     )
+
+
+#: How each kind of region escaped the recorder, for the table.
+_UNMINED_TEXT = {
+    "graphed": "CUDA-graph replays",
+    "compiled": "compiled code",
+    "custom": "kernels launched outside the dispatcher",
+    "unattributed": "GPU work without a launch call in the trace",
+}
+
+
+def unmined_lines(rows: Sequence[Mapping[str, Any]], top: int = 6) -> list[str]:
+    """The bullet on the regions not mined (:func:`not_mined`; [] without)."""
+    if not rows:
+        return []
+    items = []
+    for r in rows[:top]:
+        where = f" in `{r['where']}`" if r.get("where") else " outside every module"
+        n = int(r.get("instances") or 0)
+        if n and "*" in str(r.get("where")):  # which of the group's instances
+            where += f" ({n} instance{'s' if n > 1 else ''})"
+        share = r.get("share")
+        amount = f"{share:.1%}" if share is not None else "time unknown"
+        if r.get("gpu_ms") and str(r.get("basis", "")).startswith("GPU time"):
+            amount += f", {float(r['gpu_ms']):,.3g} ms GPU"
+        if r.get("ops"):
+            amount += f", {int(r['ops']):,} ops recorded eagerly"
+        items.append(f"{_UNMINED_TEXT.get(str(r['kind']), r['kind'])}{where} ({amount})")
+    more = f" and {len(rows) - top} more" if len(rows) > top else ""
+    bases = sorted({str(r["basis"]) for r in rows[:top] if r.get("basis")})
+    return [
+        "* **not mined**: "
+        + "; ".join(items)
+        + more
+        + f" (shares: {'; '.join(bases)}). A CUDA-graph replay and a kernel launched outside "
+        "the dispatcher (Triton, an extension) dispatch no op to the recorder, and compiled "
+        "code runs eagerly under it: no chain inside these regions is listed, their fusions "
+        "are the graph's, the kernel's or the compiler's (`fusions.json` → `unmined`)"
+    ]
 
 
 def _details(rows: Sequence[Mapping[str, Any]]) -> list[str]:

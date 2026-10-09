@@ -566,7 +566,7 @@ def fusion_gain(spec: dict[str, Any], profiles: list[dict[str, Any]]) -> FusionG
 
     if spec.get("kind") != "region" and not spec.get("fusion"):
         return None
-    for prof in profiles:  # newest first: the analyze profile mines them (#231)
+    for prof in profiles:  # newest first: each re-profile mines what is left (#231)
         table = prof.get("fusions") or {}
         window = float(table.get("window_ms") or 0.0)
         found = fusion.match(table, spec) if window > 0 else None
