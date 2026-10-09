@@ -20,8 +20,9 @@ and says whether it works here and how:
   installed: skipped with that reason (the ``helion`` backend is then unavailable).
 * ``graph_conditional``: conditional graph nodes (CUDA 12.4+ driver, ``cuda.core``): a
   :func:`kernel_agent.graphloop.device_loop` WHILE graph with a chunk IF node runs its steps
-  on the device and stops on its own flag (skipped where they are unavailable: loops use
-  the K-step unrolled graphs there).
+  on the device and stops on its own flag, and a ``torch.compile`` step (no CUDA graphs of
+  its own) runs in a WHILE body (skipped where they are unavailable: loops use the K-step
+  unrolled graphs there; a compiled step that is not captured is reported, not failed).
 
 :func:`run` records the results with :func:`versions` in
 ``<cache>/probes-<gpu>-torch<version>.json``. A probe that fails says why; none of them

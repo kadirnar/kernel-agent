@@ -8,6 +8,7 @@ the skill links. GPU tests (marked) run the real graphs."""
 from __future__ import annotations
 
 import contextlib
+import gc
 import importlib.util
 import math
 import subprocess
@@ -300,7 +301,8 @@ def test_while_graph_structure_body_condition_and_pool(fake):
     assert limits == loop._limits.data_ptr() and host == loop._host.data_ptr()
     assert launches["ka_loop_begin"][1] == (loop_cond, index, active)
     assert launches["ka_chunk_signal"][1] == (index, host)
-    assert launches["ka_loop_end"][1] == (index, active, loop._status.data_ptr())
+    status, total = loop._status.data_ptr(), loop._total.data_ptr()
+    assert launches["ka_loop_end"][1] == (index, active, status, total)  # adds the run's steps
     assert loop.stats["launches"] == 1 and loop.stats["host_checks"] == 0
     # with torch's CUDA runtime the launch is a cudaGraphLaunch the profiler records
     fake.runtime = True
@@ -526,18 +528,264 @@ def test_chunks_poll_a_while_graphs_host_mapped_counter(fake, monkeypatch):
     assert loop._host is not None and loop._host.tolist() == [0, 0]  # reset for the next run
 
 
-def test_chunks_need_chunk_every_and_on_chunk_runs_on_the_host(fake):
+def test_chunks_need_chunk_every_and_on_chunk_runs_in_the_unrolled_blocks(fake):
     loop, _ = _counter_loop(fake)
     with pytest.raises(ValueError, match="chunk_every"):
         next(loop.chunks())
     marks: list[int] = []
-    loop, _ = _counter_loop(fake, stop_at=5, mode="unrolled", masked=True, chunk_every=2)
+    loop, _ = _counter_loop(fake, stop_at=5, mode="unrolled", masked=True, unroll=2, chunk_every=2)
     loop.on_chunk = lambda: marks.append(int(loop.index))
     assert list(loop.chunks()) == [2, 4, 5]  # the warm-up run: host steps
     assert marks == [2, 4, 5]
     loop.x.fill_(0)
-    list(loop.chunks())
-    assert loop.mode == "host" and "on_chunk runs at chunk boundaries" in loop.reason
+    assert list(loop.chunks()) == [2, 4, 5]
+    assert loop.mode == "unrolled" and loop.reason == "unrolled built"
+    assert marks == [2, 4, 5] * 2
+
+
+def _chunk_marks(
+    fake: FakeCuda, mode: str, stop_at: int, every: int, unroll: int, limit: int | None
+) -> tuple[Any, list[int], list[int], list[int]]:
+    """A counter loop's ``on_chunk`` steps in ``mode`` (after its warm-up host run): the
+    ones of ``run()`` and of ``chunks()``, and what ``chunks()`` yielded."""
+    marks: list[int] = []
+    loop, _ = _counter_loop(
+        fake, stop_at=stop_at, mode=mode, masked=True, unroll=unroll, chunk_every=every
+    )
+    loop.on_chunk = lambda: marks.append(int(loop.index))
+    loop.run(limit)  # the warm-up: host steps
+    del marks[:]
+    loop.x.fill_(0)
+    loop.run(limit)
+    ran, marks[:] = list(marks), []
+    loop.x.fill_(0)
+    yielded = list(loop.chunks(limit))
+    return loop, ran, list(marks), yielded
+
+
+@pytest.mark.parametrize(
+    ("stop_at", "every", "unroll", "limit", "want"),
+    [
+        (7, 3, 3, None, [3, 6, 7]),  # every block ends at a boundary; the stop in one
+        (7, 4, 2, None, [4, 7]),  # the stop in a block that ends with on_chunk
+        (5, 4, 2, None, [4, 5]),  # the stop in a plain block, the next one ends a chunk
+        (3, 6, 2, None, [3]),  # ... seen before the chunk block is launched
+        (3, 8, 2, None, [3]),  # ... seen one plain block later (launched, all masked)
+        (100, 3, 3, None, [3, 6, 8]),  # the limit (8) in a chunk block
+        (100, 4, 2, 5, [4, 5]),  # this run's limit (5) in a plain last block
+        (7, 3, 2, None, [3, 6, 7]),  # unroll 2 does not divide 3: blocks of 1
+    ],
+)
+def test_unrolled_on_chunk_runs_where_the_while_graph_runs_it_once_each(
+    fake, stop_at, every, unroll, limit, want
+):
+    _, ran, streamed, yielded = _chunk_marks(fake, "host", stop_at, every, unroll, limit)
+    assert ran == streamed == yielded == want  # the host loop: the WHILE graph's rule
+    loop, ran, streamed, yielded = _chunk_marks(fake, "unrolled", stop_at, every, unroll, limit)
+    assert loop.mode == "unrolled" and every % loop.stats["unroll"] == 0
+    assert ran == streamed == yielded == want
+
+
+def test_unrolled_chunk_blocks_wait_for_the_block_before_and_nothing_else(fake):
+    loop, ran, _, yielded = _chunk_marks(fake, "unrolled", 5, 4, 2, None)
+    assert ran == yielded == [4, 5]
+    # run() and chunks(): blocks [1, 2] plain, [3, 4] with on_chunk (after reading [1, 2]),
+    # [5, 6] plain (stops at 5; read when the next would end a chunk), then on_chunk for the
+    # stop (its two steps masked), whose status chunks() reads before it yields the count;
+    # the warm-up host run read all of its 5 steps
+    assert loop.stats["launches"] == 2 * 4 and loop.stats["host_checks"] == 5 + 3 + 4
+
+    blocks: list[str] = []
+    loop, _ = _counter_loop(fake, stop_at=100, mode="unrolled", masked=True, unroll=2)
+    loop.chunk_every, loop.on_chunk = 4, lambda: blocks.append("chunk")
+    loop.warmup_runs = 0
+    loop.build()
+    plain, chunk = loop._graph, loop._chunk_graph
+    loop._graph = SimpleNamespace(replay=lambda: (blocks.append("plain"), plain.replay()))
+    loop._chunk_graph = SimpleNamespace(replay=lambda: (blocks.append("with"), chunk.replay()))
+    checks = loop.stats["host_checks"]
+    loop.run()  # the limit (8): blocks to step 2, 4, 6 and 8
+    assert blocks == ["plain", "with", "chunk", "plain", "with", "chunk"]
+    # the reads of run(): before each chunk block and one block behind; none at the end
+    assert loop.stats["host_checks"] - checks == 3 and int(loop.x) == 8
+
+
+def test_unrolled_streaming_toy_decoder_matches_the_host_loop(fake, toy):
+    """A non-idempotent on_chunk (a device log of the chunk's step count and its tokens so
+    far): the same log as the host loop's, so on_chunk ran once per boundary and stop."""
+    ex, req, prompt = toy.ex, toy.req, toy.prompt
+    reference, _ = ex.generate_host(req, prompt, toy.eos)
+
+    def streamed(mode: str, unroll: int) -> tuple[list[int], list[int], list[int]]:
+        log = torch.full((16, 2), -1, dtype=torch.int64)
+        n = torch.zeros(1, dtype=torch.int64)
+        gen = ex.DeviceGenerator(
+            req, toy.eos, mode=mode, unroll=unroll, chunk_every=4, device="cpu", warmup_runs=0
+        )
+
+        def on_chunk() -> None:
+            index = gen.loop.index.view(1)
+            row = torch.stack([index[0], req.out.ne(-1).sum()]).view(1, 2)
+            log.index_copy_(0, n, row)
+            n.add_(1)
+
+        gen.loop.on_chunk = on_chunk
+        tokens, _ = gen.generate(prompt)
+        return tokens, log[: int(n)].flatten().tolist(), [gen.loop.mode]
+
+    want = streamed("host", 1)
+    assert want[0] == reference
+    for unroll in (1, 2, 4, 8):
+        assert streamed("unrolled", unroll) == (*want[:2], ["unrolled"]), unroll
+
+
+def test_the_measured_k_is_aligned_to_the_chunks(fake, monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(graphloop, "time", clock)
+    x = torch.zeros((), dtype=torch.int64)
+    loop = graphloop.device_loop(
+        lambda i, a: x.add_(a.to(x.dtype)),
+        None,
+        256,
+        mode="unrolled",
+        masked=True,
+        chunk_every=24,
+        on_chunk=lambda: None,
+        warmup_runs=0,
+        device="cpu",
+    )
+    gpu = SimulatedGpu(clock, step_s=1e-6, host_s=2e-6, wake_s=30e-6)  # host bound
+    pools = iter(range(10))
+    captured: list[str] = []
+
+    def capture(fn: Any, pool: Any) -> Any:
+        captured.append(pool)
+        return SimpleNamespace(replay=lambda: (fn(), gpu.replay()))
+
+    monkeypatch.setattr(fake, "capture_graph", capture)
+    monkeypatch.setattr(fake, "pool_handle", lambda: f"pool {next(pools)}")
+    monkeypatch.setattr(fake, "synchronize", lambda device: gpu.sync())
+    loop.build()
+    assert (loop.stats["step_us"], loop.stats["launch_us"]) == (2.0, 31.0)
+    assert graphloop.choose_unroll(2e-6, 31e-6, 256) == 16
+    assert loop.stats["unroll"] == 12  # the largest divisor of chunk_every up to 16
+    # K = 1 measured in the first pool, then both blocks; the one with on_chunk in its own
+    assert captured == ["pool 0", "pool 0", "pool 1"]
+
+
+def test_aligned_unroll():
+    assert graphloop.aligned_unroll(16, 24) == 12
+    assert graphloop.aligned_unroll(5, 4) == 4
+    assert graphloop.aligned_unroll(3, 4) == 2
+    assert graphloop.aligned_unroll(64, 7) == 7
+    assert graphloop.aligned_unroll(6, 7) == 1
+
+
+# ------------------------------------------------------------------ counters
+
+
+def _toy_workload() -> Any:
+    from diverse_toy import DiverseToy
+
+    from kernel_agent.workloads.base import WorkloadSpec
+
+    return DiverseToy(WorkloadSpec(repo_id="toy", modality="llm", device="cpu"))
+
+
+class RecordingClock:
+    """``time`` of ``workloads.base``: logs every read of the timed run's clock."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log, self.now = log, 1000.0
+
+    def perf_counter(self) -> float:
+        self.log.append("clock")
+        self.now += 1.0
+        return self.now
+
+
+@pytest.mark.parametrize("mode", ["host", "unrolled", "while"])
+def test_a_loops_steps_reach_decode_stats_read_outside_the_timed_run(fake, monkeypatch, mode):
+    from kernel_agent.workloads import base
+
+    workload = _toy_workload()
+    x = torch.zeros((), dtype=torch.int64)
+    stop = torch.zeros((), dtype=torch.int64)
+
+    def step(index: torch.Tensor, active: torch.Tensor) -> None:
+        x.add_(active.to(x.dtype))
+
+    loop = graphloop.device_loop(
+        step,
+        lambda: x >= stop,
+        16,
+        mode=mode,
+        masked=True,
+        unroll=2,
+        device="cpu",
+        workload=workload,
+        report=("steps", "tokens"),
+    )
+    if mode == "while":
+
+        def launch(graph: Any, stream: Any) -> None:  # the fake graph runs until the stop
+            loop._reset()
+            while bool(loop.active):
+                loop._body()
+
+        monkeypatch.setattr(FakeGraph, "launch", launch)
+    log: list[str] = []
+    total = loop.steps_total
+    monkeypatch.setattr(loop, "steps_total", lambda: (log.append("read"), total())[1])
+
+    def run(inputs: Any) -> dict[str, Any]:  # two requests of 3 and 5 steps
+        for n in (3, 5):
+            x.zero_()
+            stop.fill_(n)
+            loop.run()
+        log.append("run")
+        return {}
+
+    workload.run = run
+    run(None)  # untimed: the warm-up host run and the build are not counted
+    log.clear()
+    monkeypatch.setattr(base, "time", RecordingClock(log))
+    _, _, detail = base.timed_run(workload, None)
+    assert loop.mode == mode and detail["decode_stats"] == {"steps": 8, "tokens": 8}
+    assert log == ["read", "clock", "run", "clock", "read"]  # never inside the clock
+
+
+def test_stats_sources_report_only_loops_that_ran(fake, monkeypatch):
+    from kernel_agent.workloads import base
+
+    workload = _toy_workload()
+    loop, _ = _counter_loop(fake, stop_at=3, mode="host", workload=workload)
+    workload.add_stats_source(loop)  # once only
+    assert len(workload.stats_sources) == 1
+    mark = loop.stats_mark()
+    assert loop.stats_since(mark) == {}  # it did not run (an A/B's other state)
+    loop.run()
+    assert loop.stats_since(mark) == {"steps": 3}
+    assert loop.stats_since(None) == {"steps": 3}  # added during the run: since it was made
+    monkeypatch.setattr(base, "time", RecordingClock([]))
+    workload.run = lambda inputs: {}
+    assert "decode_stats" not in base.timed_run(workload, None)[2]  # the loop did not run
+
+    made: list[Any] = []
+
+    def run(inputs: Any) -> dict[str, Any]:  # a transform that makes its loop in the run
+        made.append(_counter_loop(fake, stop_at=4, mode="host", workload=workload)[0])
+        made[0].run()
+        return {}
+
+    workload.run = run
+    assert base.timed_run(workload, None)[2]["decode_stats"] == {"steps": 4}
+    del loop, made[:]
+    gc.collect()
+    assert base._stats_sources(workload) == []  # held weakly: gone with the loops
+    quiet, _ = _counter_loop(fake, stop_at=2, mode="host", workload=workload, report=())
+    quiet.run()
+    assert quiet.stats_since(None) == {}
 
 
 # ------------------------------------------------------------------ teacher forcing
@@ -711,6 +959,19 @@ def test_doctor_probe_reports_support_skip_and_failure(monkeypatch, tmp_path):
         assert f"  graph_conditional: {mark}: detail {verdict}" in probes.describe(result)
 
 
+@pytest.mark.parametrize(
+    ("compiled", "want"),
+    [(True, True), (None, True), (False, False)],  # None: no torch.compile step here
+)
+def test_the_probe_adds_the_torch_compile_check(monkeypatch, compiled, want):
+    monkeypatch.setattr(graphloop, "conditional_support", lambda: None)
+    monkeypatch.setattr(graphloop, "_probe_while", lambda: (True, "while ok"))
+    monkeypatch.setattr(graphloop, "_probe_compiled", lambda: (compiled, f"compile {compiled}"))
+    assert graphloop.probe() == (want, f"while ok; compile {compiled}")
+    monkeypatch.setattr(graphloop, "_probe_while", lambda: (False, "while wrong"))
+    assert graphloop.probe() == (False, "while wrong")  # not tried after a wrong graph
+
+
 def test_probe_without_conditional_support_is_a_skip(monkeypatch):
     monkeypatch.setattr(graphloop, "conditional_support", lambda: "no CUDA device")
     ok, detail = graphloop.probe()
@@ -833,10 +1094,18 @@ def test_a_step_that_syncs_or_draws_falls_back_and_leaves_no_capture_open():
     def syncs(index: torch.Tensor, active: torch.Tensor) -> None:
         x[0] += float(x[0, 0].item())  # a host sync: refused under a capture
 
+    caller = torch.cuda.current_stream()
     loop = graphloop.device_loop(syncs, None, 4, masked=True, warmup_runs=0)
     loop.run()
     assert loop.mode == "host" and "while: " in loop.reason and "unrolled: " in loop.reason
     torch.cuda.synchronize()  # no capture left open by the failed builds
+    # torch 2.10 (A10): its failed torch.cuda.graph left the capture stream current and
+    # the allocator routing to the pool, and the next MemPool destructor aborted
+    assert torch.cuda.current_stream() == caller
+    pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(pool):
+        torch.ones(1, device="cuda")
+    del pool
 
     def draws(index: torch.Tensor, active: torch.Tensor) -> None:
         graphloop.masked_index_copy_(x, 0, index.view(1), torch.randn(1, 8, device="cuda"), active)
@@ -844,8 +1113,131 @@ def test_a_step_that_syncs_or_draws_falls_back_and_leaves_no_capture_open():
     loop = graphloop.device_loop(draws, None, 4, masked=True, warmup_runs=0)
     loop.run()
     torch.cuda.synchronize()
-    assert loop.mode == "unrolled" and "RNG op during graph capture" in loop.reason
+    # torch refuses the draw under the WHILE capture; the words depend on its version (2.14:
+    # "RNG op during graph capture"; 2.10: "expected scalar type Long but found
+    # UNKNOWN_SCALAR", A10)
+    assert loop.mode == "unrolled" and loop.reason.startswith("while: RuntimeError: ")
     assert len({tuple(row.tolist()) for row in x.cpu()}) == 4  # every step drew its own
+
+
+@pytest.mark.gpu
+@gpu
+@pytest.mark.parametrize("mode", ["while", "unrolled"])
+def test_a_device_loops_steps_reach_decode_stats_without_a_sync(mode):
+    from kernel_agent.workloads import base
+
+    if mode == "while" and graphloop.conditional_support() is not None:
+        pytest.skip(graphloop.conditional_support())
+    workload = _toy_workload()
+    with torch.inference_mode(False):
+        x = torch.zeros((), dtype=torch.int64, device="cuda")
+        stop = torch.zeros((), dtype=torch.int64, device="cuda")
+
+    def step(index: torch.Tensor, active: torch.Tensor) -> None:
+        graphloop.masked_copy_(x, x + 1, active)
+
+    loop = graphloop.device_loop(
+        step,
+        lambda: x >= stop,
+        64,
+        mode=mode,
+        masked=True,
+        unroll=4,
+        strict=True,
+        workload=workload,
+        report=("steps", "tokens"),
+    )
+
+    def run(inputs: Any) -> dict[str, Any]:  # two requests of 3 and 5 steps
+        # a WHILE run makes no host sync (torch raises on one in this mode)
+        torch.cuda.set_sync_debug_mode("error" if loop.mode == "while" else 0)
+        try:
+            for n in (3, 5):
+                x.zero_()
+                stop.fill_(n)
+                loop.run()
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+        return {}
+
+    workload.run = run
+    run(None)  # the warm-up host run
+    run(None)  # the build
+    _, _, detail = base.timed_run(workload, None)
+    assert loop.mode == mode and detail["decode_stats"] == {"steps": 8, "tokens": 8}
+
+
+@pytest.mark.gpu
+@gpu
+@pytest.mark.parametrize("stop_at", [5, 8, 11, 40])
+def test_unrolled_on_chunk_runs_where_the_while_graph_runs_it(stop_at):
+    """A device-side, non-idempotent on_chunk (it appends the step count to a log): the
+    unrolled blocks give the host loop's log (and the WHILE graph's, where it builds)."""
+
+    def logs(mode: str, unroll: int = 1) -> tuple[list[list[int]], list[int], str | None]:
+        with torch.inference_mode(False):
+            x = torch.zeros((), dtype=torch.int64, device="cuda")
+            log = torch.full((32,), -1, dtype=torch.int64, device="cuda")
+            n = torch.zeros(1, dtype=torch.int64, device="cuda")
+
+        def step(index: torch.Tensor, active: torch.Tensor) -> None:
+            graphloop.masked_copy_(x, x + 1, active)
+
+        def on_chunk() -> None:
+            log.index_copy_(0, n, loop.index.view(1))
+            n.add_(1)
+
+        loop = graphloop.device_loop(
+            step,
+            lambda: x >= stop_at,
+            30,
+            mode=mode,
+            masked=True,
+            unroll=unroll,
+            chunk_every=4,
+            on_chunk=on_chunk,
+            warmup_runs=0,
+            strict=mode != "host",
+        )
+        out, seen = [], []
+        for streamed in (False, False, True):  # run() twice, then chunks()
+            x.zero_()
+            log.fill_(-1)
+            n.zero_()
+            if streamed:
+                seen = list(loop.chunks())
+            else:
+                loop.run()
+            torch.cuda.synchronize()
+            out.append(log[: int(n)].tolist())
+        return out, seen, loop.mode
+
+    runs, seen, _ = logs("host")
+    last = min(stop_at, 30)  # the stop flag or the limit
+    want = [*range(4, last + 1, 4)] + ([last] if last % 4 else [])
+    assert runs == [want] * 3 and seen == want
+    for unroll in (1, 2, 4, 3):  # 3 does not divide 4: blocks of 2
+        assert logs("unrolled", unroll) == (runs, seen, "unrolled"), unroll
+    if graphloop.conditional_support() is None:
+        got, streamed, mode = logs("while")
+        assert got == runs and mode == "while" and streamed[-1:] == seen[-1:]
+
+
+@pytest.mark.gpu
+@gpu
+def test_a_torch_compile_step_in_the_while_body():
+    if graphloop.conditional_support() is not None:
+        pytest.skip(graphloop.conditional_support())
+    ok, detail = graphloop._probe_compiled()
+    assert ok is True, detail
+    ex = _example()
+    with torch.inference_mode():
+        rows = ex.compare(max_new=96, runs=3, compile=True, layers=1, dim=128, vocab=512)
+    for name, row in rows.items():
+        print(f"{name:42s} {row}")
+        assert row["same_tokens"], name
+    compiled = rows["device loop (while, torch.compile step)"]
+    assert compiled["mode"] == "while" and compiled["host_checks"] == 0
 
 
 FAILED_CAPTURE_EXIT = """

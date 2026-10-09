@@ -2364,14 +2364,61 @@ call) and no graph is built; for a chaotic workload the teacher-forced call stay
 device loop. For streaming (`metric=ttfa`), `chunk_every=n` adds an IF node that runs
 `on_chunk()` at chunk boundaries and writes the steps done to a host-mapped counter;
 `loop.chunks()` yields them as they happen and, left early (the metric window), cancels
-the loop through a host-mapped flag and joins it. `examples/graph_while_decode.py` runs a toy
-decoder with a static KV cache all four ways (RTX 5070 Ti, ~193 tokens, the same tokens
-every way): against a graph per step with a `.item()` stop check the WHILE loop took
-0.269 → 0.253 ms per token (4 layers) and 0.067 → 0.062 ms (1 layer), with ~0.3 µs of host
-time per token and no host check (eager host loop: 1.87 and 0.58 ms). With a one-kernel
-step a step costs 7.8 µs with the host check, 5.2 µs in the WHILE loop and 2.6 µs as graph
-replays without any stop check: the loop pays where a stop is checked every step or the
-host is the bottleneck, not for a fixed-length loop whose host already runs ahead. The
+the loop through a host-mapped flag and joins it. The unrolled fallback streams with two
+block graphs, K steps and K steps then `on_chunk()`, K a divisor of n so that every chunk
+boundary ends a block. The second graph is launched once the block before it is seen
+active (after a stop it would run `on_chunk` again: the host waits there once per chunk)
+and once more, its steps masked, for a stop in a plain block, so `on_chunk` runs at the
+WHILE graph's steps, once each (CPU- and GPU-tested with a non-idempotent `on_chunk`).
+Measured on an NVIDIA A10, sm_86 (a streaming toy decoder, `chunk_every=8`, the same
+tokens and chunks every way): 0.711 → 0.120 ms per token (1 x 256) and 1.972 → 0.418 ms
+(4 x 512) against the host steps this fallback took before; the WHILE graph with its IF
+node took 0.127 and 0.412 ms.
+
+A run's steps stay on the device (`run()` returns them as a tensor). With
+`device_loop(..., workload=workload, report=("steps", "tokens"))` the loop is a stats
+source of the workload (`Workload.add_stats_source`): its own kernels add each run's steps
+to a device total (no extra launch), which `timed_run` reads after the synchronize before
+the clock starts and after the one that ends the run, and counts like `report_stats`
+(`report` names the counters; default `steps`). So `metric_detail.decode_stats`, an A/B's
+counters and the diverse set's steps per token see a device loop's steps with no host sync
+in the timed run (GPU-tested under torch's sync debug mode).
+
+A `torch.compile` step in the default mode (Inductor's kernels, no CUDA graphs of its own)
+is captured into the WHILE body like eager ops. The warm-up run compiles it on the loop's
+own buffers; a compilation under a capture fails. `doctor`'s `graph_conditional` probe runs
+one; `examples/graph_while_decode.py --compile` adds the compiled ways.
+
+`examples/graph_while_decode.py` runs a toy decoder with a static KV cache all four ways
+(the same tokens every way). RTX 5070 Ti (~193 tokens): against a graph per step with a
+`.item()` stop check the WHILE loop took 0.269 → 0.253 ms per token (4 layers) and
+0.067 → 0.062 ms (1 layer), with ~0.3 µs of host time per token and no host check (eager
+host loop: 1.87 and 0.58 ms). With a one-kernel step a step costs 7.8 µs with the host
+check, 5.2 µs in the WHILE loop and 2.6 µs as graph replays without any stop check: the
+loop pays where a stop is checked every step or the host is the bottleneck, not for a
+fixed-length loop whose host already runs ahead.
+
+Measured on an NVIDIA A10, sm_86 (driver 570, CUDA 12.9, torch 2.10, cuda.core 1.2.1; ms
+per token, median of 3 × 20 runs; the WHILE loop held the host 0.25-0.35 µs per token):
+
+| way | 4 x 512 | 1 x 256 | 1 x 128, vocab 512 |
+|---|---|---|---|
+| host loop | 1.861 | 0.650 | 0.617 |
+| graph per step | 0.377 | 0.120 | 0.099 |
+| device loop (WHILE) | 0.369 | 0.095 | 0.092 |
+| device loop (WHILE, masked step) | 0.409 | 0.108 | 0.102 |
+| device loop (unrolled, K = 1) | 0.428 | 0.113 | 0.111 |
+| graph per step, `torch.compile` step | 0.270 | | |
+| device loop (WHILE), `torch.compile` step | 0.258 | | |
+
+The compiled ways ran 256 tokens and gave the compiled host loop's tokens (0.866 ms per
+token); Inductor's numerics change the tokens, so they are judged against that loop. A
+one-kernel step: 13.1 µs a step with the host check, 8.6 µs in the WHILE loop, 6.2 µs
+unrolled with K = 16 and 4.2 µs as graph replays without any check. The measured K there
+was 2 (12.9 µs): one-step replays cannot tell the GPU's step time from the host's launch
+time when the host is the bottleneck. On torch 2.10 a failed `torch.cuda.graph` capture
+left its capture stream current and the allocator routing to its pool, and the next
+`MemPool` destructor aborted the process; the loop's captures restore both. The
 `systems-patterns` skill tells the agents how to use it.
 
 ### Calls behind a kernel's estimate
