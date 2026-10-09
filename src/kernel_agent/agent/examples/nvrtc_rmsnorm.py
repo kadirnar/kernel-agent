@@ -9,7 +9,7 @@ import torch
 from cuda.core import Device, LaunchConfig, Program, ProgramOptions, launch
 from torch import nn
 
-from kernel_agent.toolchain import cuda_include_dirs
+from kernel_agent.toolchain import cuda_include_dirs, nvrtc_target
 
 SRC = r"""
 #include <cuda_bf16.h>
@@ -49,9 +49,11 @@ def _get_kernel():
     if _kernel is None:
         dev = Device(torch.cuda.current_device())
         dev.set_current()
-        opts = ProgramOptions(arch=f"sm_{dev.arch}", std="c++17", include_path=cuda_include_dirs())
+        # sm_XY and a cubin; an emulated older GPU (KERNEL_AGENT_EMULATE_ARCH): its PTX
+        arch, kind = nvrtc_target(torch.cuda.get_device_capability())
+        opts = ProgramOptions(arch=arch, std="c++17", include_path=cuda_include_dirs())
         _kernel = (
-            Program(SRC, code_type="c++", options=opts).compile("cubin").get_kernel("rmsnorm_bf16")
+            Program(SRC, code_type="c++", options=opts).compile(kind).get_kernel("rmsnorm_bf16")
         )
     return _kernel
 

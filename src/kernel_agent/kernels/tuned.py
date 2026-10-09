@@ -223,6 +223,14 @@ def gpu_name(device: int | None = None) -> str:
     return f"{props.name} sm_{props.major}{props.minor}"
 
 
+def _emulated() -> bool:
+    """Whether this process emulates an older GPU (``KERNEL_AGENT_EMULATE_ARCH``): nothing it
+    times is stored."""
+    from kernel_agent.emulate import active
+
+    return active()
+
+
 def _normal(config: Any) -> Any:
     """``config`` as it comes back from the database (JSON: tuples become lists)."""
     return json.loads(json.dumps(config))
@@ -331,10 +339,14 @@ class TunedConfigs:
         source: str | None = None,
     ) -> Any:
         """Store ``config`` for ``op`` at ``shape``'s bucket under the current versions
-        (replacing what was there); returns it as :meth:`get` will (JSON round trip)."""
+        (replacing what was there); returns it as :meth:`get` will (JSON round trip). Under
+        emulation (``emulate.py``) only for this process: its timings are not that GPU's."""
         key = self._key(backend, op, _bucket_of(shape, exact))
         text = json.dumps(config, sort_keys=True)
         versions = json.dumps(self.versions(backend), sort_keys=True)
+        if _emulated():
+            self._memo[key] = json.loads(text)
+            return self._memo[key]
         with self._db() as db:
             db.execute(
                 "INSERT OR REPLACE INTO configs (gpu, backend, op, bucket, versions, config, "
@@ -409,7 +421,10 @@ class TunedConfigs:
     ) -> int:
         """Store measured points of ``op`` at ``shape``'s bucket under the current versions:
         each ``{"config", "score" (higher is better; None: it failed), "status"}``, replacing
-        an earlier measurement of the same config. Returns how many."""
+        an earlier measurement of the same config. Returns how many (none under emulation,
+        ``emulate.py``: its timings are not that GPU's)."""
+        if _emulated():
+            return 0
         key = self._key(backend, op, _bucket_of(shape, exact))
         versions = json.dumps(self.versions(backend), sort_keys=True)
         now = time.time()

@@ -189,8 +189,9 @@ def probe_pdl() -> Probe:
         return Probe("pdl", None, f"needs sm_90+, this GPU is sm_{major}{minor}")
     dev = Device(index)
     dev.set_current()
-    options = ProgramOptions(arch=f"sm_{major}{minor}", std="c++17")
-    code = Program(PDL_SRC, code_type="c++", options=options).compile("cubin")
+    arch, kind = toolchain.nvrtc_target((major, minor))  # emulated GPU: its PTX (#252)
+    options = ProgramOptions(arch=arch, std="c++17")
+    code = Program(PDL_SRC, code_type="c++", options=options).compile(kind)
     producer, consumer = code.get_kernel("pdl_producer"), code.get_kernel("pdl_consumer")
     stream = dev.create_stream(torch.cuda.current_stream())
     x = torch.zeros(32, device="cuda", dtype=torch.int32)
@@ -339,13 +340,17 @@ def run(
             found.append(probe())
         except Exception as exc:  # the feature does not work here: say why
             found.append(Probe(name, False, f"{type(exc).__name__}: {exc}"[:300]))
-    result = {
+    result: dict[str, Any] = {
         "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "versions": versions(),
         "probes": [asdict(p) for p in found],
     }
     tc = toolchain.setup()
-    if tc.gpu is not None:
+    from kernel_agent import emulate
+
+    if (emulated := emulate.record(tc.gpu)) is not None:
+        result["emulated"] = emulated  # an emulated GPU's probes are not cached (#252)
+    elif tc.gpu is not None:
         from kernel_agent.workspace import write_json
 
         name = toolchain.peaks_path(tc.gpu.name, tc.torch_version).name
@@ -357,6 +362,7 @@ def run(
 def describe(result: dict[str, Any]) -> str:
     """``doctor`` lines."""
     lines = ["versions: " + ", ".join(f"{k} {v}" for k, v in result["versions"].items() if v)]
-    lines.append("probes:")
+    emulated = result.get("emulated") or {}
+    lines.append(f"probes (emulated {emulated['arch']}):" if emulated else "probes:")
     lines += [Probe(**p).line() for p in result["probes"]]
     return "\n".join(lines)

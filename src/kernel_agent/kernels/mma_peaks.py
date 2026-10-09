@@ -300,12 +300,15 @@ def measure(
     import torch
     from cuda.core import Device, LaunchConfig, Program, ProgramOptions, launch
 
+    from kernel_agent.toolchain import nvrtc_target
+
     index = torch.cuda.current_device()
     native = torch.cuda.get_device_capability(index)
     capability = native if capability is None else capability
     if tuple(capability) > tuple(native):
         raise ValueError(f"sm_{capability[0]}{capability[1]} is newer than this GPU")
-    jit = tuple(capability) != tuple(native)
+    # an emulated GPU (#252) is "native" here but runs its PTX too
+    jit = tuple(capability) != tuple(native) or nvrtc_target(capability)[1] == "ptx"
     target = f"compute_{capability[0]}{capability[1]}" if jit else arch(capability)
     sms = torch.cuda.get_device_properties(index).multi_processor_count
     dev = Device(index)

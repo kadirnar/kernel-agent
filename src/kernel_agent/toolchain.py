@@ -41,6 +41,7 @@ class GPUInfo:
     l2_cache_mb: float
     smem_per_block_kb: float = 0.0  # opt-in maximum per block (0: unknown)
     smem_per_sm_kb: float = 0.0
+    emulated_on: str | None = None  # an emulated GPU (emulate.py): the real GPU's arch
 
     @property
     def arch(self) -> str:
@@ -76,6 +77,10 @@ class Toolchain:
                 f"GPU: {g.name} ({g.arch}, {g.memory_gb:.1f} GB, {g.sm_count} SMs, "
                 f"L2 {g.l2_cache_mb:.0f} MB{smem})"
             )
+            from kernel_agent.emulate import summary_line
+
+            if (emulated := summary_line(g)) is not None:
+                lines.append(emulated)
         else:
             lines.append("GPU: none detected")
         lines.append(f"torch {self.torch_version} (CUDA {self.torch_cuda})")
@@ -89,6 +94,8 @@ class Toolchain:
             lines.append(f"backends unavailable: {', '.join(off)}")
         if self.peaks:
             lines.append(f"measured peaks: {format_peaks(self.peaks)}")
+        elif self.gpu and self.gpu.emulated_on:
+            lines.append(f"measured peaks: none under emulation (the {self.gpu.emulated_on}'s)")
         elif self.gpu:
             lines.append("measured peaks: not yet (`kernel-agent doctor` measures them)")
         from kernel_agent.gpu_arch import summary_lines
@@ -99,22 +106,28 @@ class Toolchain:
 
 
 def gpu_info() -> GPUInfo | None:
+    """The GPU of this process: the current device, or under emulation (:mod:`kernel_agent.
+    emulate`) the emulated GPU's facts on it (``emulate.Refused``: it cannot emulate that)."""
     try:
         import torch
     except ImportError:
         return None
     if not torch.cuda.is_available():
         return None
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    from kernel_agent import emulate
+
+    props = emulate.real_properties(torch.cuda.current_device())
     l2 = getattr(props, "L2_cache_size", 0) or 0
-    return GPUInfo(
-        name=props.name,
-        capability=(props.major, props.minor),
-        memory_gb=props.total_memory / 1024**3,
-        sm_count=props.multi_processor_count,
-        l2_cache_mb=l2 / 1024**2,
-        smem_per_block_kb=(getattr(props, "shared_memory_per_block_optin", 0) or 0) / 1024,
-        smem_per_sm_kb=(getattr(props, "shared_memory_per_multiprocessor", 0) or 0) / 1024,
+    return emulate.apply(
+        GPUInfo(
+            name=props.name,
+            capability=(props.major, props.minor),
+            memory_gb=props.total_memory / 1024**3,
+            sm_count=props.multi_processor_count,
+            l2_cache_mb=l2 / 1024**2,
+            smem_per_block_kb=(getattr(props, "shared_memory_per_block_optin", 0) or 0) / 1024,
+            smem_per_sm_kb=(getattr(props, "shared_memory_per_multiprocessor", 0) or 0) / 1024,
+        )
     )
 
 
@@ -252,10 +265,39 @@ def _gcc_major() -> int | None:
 ARCH_SPECIFIC = {(9, 0), (10, 0), (10, 3), (11, 0)}
 
 
-def cuda_arch_list(capability: tuple[int, int]) -> str:
-    """``TORCH_CUDA_ARCH_LIST`` for a GPU of ``capability`` (``9.0a`` on Hopper)."""
+def cuda_arch_list(capability: tuple[int, int], ptx: bool | None = None) -> str:
+    """``TORCH_CUDA_ARCH_LIST`` for a GPU of ``capability`` (``9.0a`` on Hopper). With ``ptx``
+    (default: under emulation, :mod:`kernel_agent.emulate`) ``8.6+PTX``: the build embeds the
+    PTX, which the driver JIT-compiles for the real GPU (an sm_86 cubin does not load there)."""
     major, minor = int(capability[0]), int(capability[1])
+    if ptx is None:
+        ptx = _emulating()
+    if ptx:
+        return f"{major}.{minor}+PTX"
     return f"{major}.{minor}" + ("a" if (major, minor) in ARCH_SPECIFIC else "")
+
+
+def _emulating() -> bool:
+    from kernel_agent.emulate import active
+
+    return active()
+
+
+def nvrtc_target(capability: tuple[int, ...] | None = None) -> tuple[str, str]:
+    """``(arch, code type)`` NVRTC compiles for (``ProgramOptions(arch=...)``,
+    ``Program.compile(code type)``) on a GPU of ``capability`` (default: this process's):
+    ``("sm_120", "cubin")``; under emulation (:mod:`kernel_agent.emulate`) ``("compute_86",
+    "ptx")``: ``get_kernel`` hands the PTX to the driver, which JIT-compiles it for the real
+    GPU (an sm_86 cubin does not load there)."""
+    if capability is None:
+        gpu = setup().gpu
+        if gpu is None:
+            raise RuntimeError("no CUDA GPU to compile for")
+        capability = gpu.capability
+    major, minor = int(capability[0]), int(capability[1])
+    if _emulating():
+        return f"compute_{major}{minor}", "ptx"
+    return f"sm_{major}{minor}", "cubin"
 
 
 # Newest GCC major officially accepted by nvcc, per CUDA major version.  Forcing
@@ -344,8 +386,9 @@ def setup(apply_env: bool = True) -> Toolchain:
             notes.append(f"nvcc {nvcc_ver} differs from torch CUDA {torch_cuda}")
         if flags:
             env["NVCC_APPEND_FLAGS"] = " ".join(dict.fromkeys(flags))
-        if gpu is not None and "TORCH_CUDA_ARCH_LIST" not in os.environ:
-            env["TORCH_CUDA_ARCH_LIST"] = cuda_arch_list(gpu.capability)
+        emulated = gpu is not None and gpu.emulated_on is not None  # its PTX, always
+        if gpu is not None and (emulated or "TORCH_CUDA_ARCH_LIST" not in os.environ):
+            env["TORCH_CUDA_ARCH_LIST"] = cuda_arch_list(gpu.capability, ptx=emulated)
 
     has_ninja = _module_available("ninja") or shutil.which("ninja") is not None
     if apply_env and shutil.which("ninja") is None and _module_available("ninja"):
@@ -370,9 +413,17 @@ def setup(apply_env: bool = True) -> Toolchain:
     backends.update(dict.fromkeys(unavailable, False))
     if nvcc_ver is not None and not has_ninja:
         notes.append("ninja missing: torch load_inline (cuda backend) disabled")
+    if gpu is not None and gpu.emulated_on:
+        _emulated_env(gpu, env, backends, unavailable)
 
     if apply_env:
         os.environ.update(env)
+        if gpu is not None and gpu.emulated_on:
+            from kernel_agent import emulate
+
+            emulate.install(gpu)  # torch's device properties, Triton's target and loading
+    # under emulation no peaks: the real GPU's are not the emulated one's (emulate.py)
+    measured = gpu is not None and not gpu.emulated_on
 
     return Toolchain(
         gpu=gpu,
@@ -383,9 +434,57 @@ def setup(apply_env: bool = True) -> Toolchain:
         backends=backends,
         notes=notes,
         env=env,
-        peaks=load_peaks(peaks_path(gpu.name, torch.__version__)) if gpu else None,
+        peaks=load_peaks(peaks_path(gpu.name, torch.__version__)) if gpu and measured else None,
         unavailable=unavailable,
     )
+
+
+def _emulated_env(
+    gpu: GPUInfo, env: dict[str, str], backends: dict[str, bool], unavailable: dict[str, str]
+) -> None:
+    """The builds of an emulated ``gpu`` (:mod:`kernel_agent.emulate`): extensions and
+    Inductor's cache in their own directories (nothing built for the real GPU is reused),
+    Inductor without its cubin-loading launcher, CuTe DSL compiling for it and the driver's
+    JIT cache large enough; CuTe DSL and TileLang cannot run (SASS)."""
+    import getpass
+    import sys
+    import tempfile
+
+    import torch
+
+    from kernel_agent import emulate
+
+    # torch's own default (cpp_extension._get_build_directory: per Python and CUDA version),
+    # without importing torch.utils.cpp_extension: it reads CUDA_HOME once, at its import,
+    # and this env has not set it yet
+    try:
+        from torch._appdirs import user_cache_dir
+
+        root = os.path.realpath(user_cache_dir(appname="torch_extensions"))
+    except ImportError:
+        root = str(Path.home() / ".cache" / "torch_extensions")
+    cuda = f"cu{torch.version.cuda.replace('.', '')}" if torch.version.cuda else "cpu"
+    python = f"py{sys.version_info.major}{sys.version_info.minor}{getattr(sys, 'abiflags', '')}"
+    default = os.path.join(root, f"{python}_{cuda}")
+    current = os.environ.get("TORCH_EXTENSIONS_DIR")
+    env["TORCH_EXTENSIONS_DIR"] = emulate.arch_dir(gpu.arch, current, default)
+    # Inductor: its own cache (its key names the GPU, not the target) and no static launcher
+    # (it loads the cubin, which is the emulated GPU's)
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError):  # no user name (a container): torch falls back the same way
+        user = f"uid_{os.getuid()}"
+    inductor = os.path.join(tempfile.gettempdir(), f"torchinductor_{user}")
+    current = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    env["TORCHINDUCTOR_CACHE_DIR"] = emulate.arch_dir(gpu.arch, current, inductor)
+    env["TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER"] = "0"
+    env["CUTE_DSL_ARCH"] = gpu.arch
+    if not os.environ.get("CUDA_CACHE_MAXSIZE"):  # read when a process's CUDA starts
+        env["CUDA_CACHE_MAXSIZE"] = str(emulate.JIT_CACHE_BYTES)
+    for name in emulate.COMPILE_ONLY:
+        if backends.get(name):
+            backends[name] = False
+            unavailable[name] = emulate.compile_only(name, gpu) or ""
 
 
 # ------------------------------------------------------------------ compute-sanitizer

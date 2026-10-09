@@ -34,8 +34,9 @@ def _repeat():
 
 def pytest_configure(config):
     """With several GPUs in kernel-agent's lock pool, this process and its children use
-    the first one, the GPU `gpu` tests lock (set before CUDA starts). ``--load N``: the
-    busy processes start."""
+    the first one, the GPU `gpu` tests lock (set before CUDA starts). Under
+    ``KERNEL_AGENT_EMULATE_ARCH`` (``emulate.py``) the GPU tests run as on that GPU.
+    ``--load N``: the busy processes start."""
     from kernel_agent import gpulock
 
     pool = gpulock.pool()
@@ -43,6 +44,10 @@ def pytest_configure(config):
         first = pool.gpus[0].index
         os.environ.update(gpulock.pinned(first), **{gpulock.GPUS_ENV: str(first)})
         gpulock.pool.cache_clear()
+    if os.environ.get("KERNEL_AGENT_EMULATE_ARCH"):  # `-m gpu` as on that older GPU (#252)
+        from kernel_agent import toolchain
+
+        toolchain.setup()  # this process emulates too, not only the evaluator's children
     n = config.getoption("load")
     config.stash[_BUSY] = [subprocess.Popen([sys.executable, "-c", BUSY]) for _ in range(n)]
 

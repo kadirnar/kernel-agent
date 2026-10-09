@@ -952,6 +952,10 @@ def _stages(
         "status": "error",
         "correct": False,
     }
+    from kernel_agent import emulate
+
+    if device.startswith("cuda") and (emulated := emulate.record()) is not None:
+        result["emulated"] = emulated  # an older GPU's code paths; timings not its (#252)
     t0 = time.perf_counter()
     try:
         capture = session.get("capture") or load_capture(

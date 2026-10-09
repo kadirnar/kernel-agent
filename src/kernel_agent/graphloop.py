@@ -89,6 +89,8 @@ from typing import Any
 
 import torch
 
+from kernel_agent import toolchain
+
 #: The loop's modes, in fallback order.
 MODES = ("while", "unrolled", "host")
 #: Conditional graph nodes (IF / WHILE) need a driver of at least this CUDA version.
@@ -364,7 +366,8 @@ def _kernels(core: Any, arch: str, which: str = "while") -> dict[str, Any]:
     process, ``cuda.core`` and architecture."""
     source = KERNELS_SRC if which == "while" else COUNT_SRC
     options = core.ProgramOptions(arch=arch, std="c++17")
-    module = core.Program(source, code_type="c++", options=options).compile("cubin")
+    kind = "ptx" if arch.startswith("compute_") else "cubin"  # emulated GPU: PTX (#252)
+    module = core.Program(source, code_type="c++", options=options).compile(kind)
     return {name: module.get_kernel(name) for name in NAMES[which]}
 
 
@@ -535,9 +538,9 @@ class DeviceLoop:
             try:
                 if self.device.type != "cuda":
                     raise Unsupported(f"the loop runs on {self.device}")
-                major, minor = _cuda.capability(self._dev)
+                arch, _ = toolchain.nvrtc_target(_cuda.capability(self._dev))
                 core, _ = self._core_device()
-                self._count = _kernels(core, f"sm_{major}{minor}", "count")["ka_loop_count"]
+                self._count = _kernels(core, arch, "count")["ka_loop_count"]
                 self.stats["counter"] = "kernel"
             except Exception as exc:
                 self._count = None
@@ -630,8 +633,7 @@ class DeviceLoop:
         if (why := conditional_support()) is not None:
             raise Unsupported(why)
         core = _cuda.core()
-        major, minor = _cuda.capability(self._dev)
-        kernels = _kernels(core, f"sm_{major}{minor}")
+        kernels = _kernels(core, toolchain.nvrtc_target(_cuda.capability(self._dev))[0])
         _, dev = self._core_device()
         one = core.LaunchConfig(grid=1, block=1)
         index, active = self.index.data_ptr(), self.active.data_ptr()

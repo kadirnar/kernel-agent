@@ -365,6 +365,10 @@ def run_memcheck(
     if not tool.path:
         return {"status": "skipped", "reason": tool.reason, "seconds": 0.0}
     result: dict[str, Any] = {"status": "error", "sanitizer": tool.version}
+    from kernel_agent import emulate
+
+    if (emulated := emulate.record()) is not None:
+        result["emulated"] = emulated  # the child checks an older GPU's code paths (#252)
     start = time.perf_counter()
     workdir = Path(tempfile.mkdtemp(prefix="ka-memcheck-"))
     cmd = [sys.executable, "-m", "kernel_agent.kernels.memcheck"]
