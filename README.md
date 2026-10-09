@@ -4462,7 +4462,7 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   the CuTe DSL check names the family's peak MMA. The library scout's adapters declare
   their architectures the same way; `doctor` lists which run here (FlashAttention 3 needs
   sm_90, QuACK lists Hopper / Blackwell / RTX 50; see "Library scout"). Where a limit is
-  runtime-only (PDL, cuBLASLt's FP8, `tl.dot` on FMA units below sm_80), `ARCHS_COMPILES`
+  runtime-only (PDL, cuBLASLt's FP8, the block-scaled `F.scaled_mm` modes), `ARCHS_COMPILES`
   names the wider set its device code compiles for (`gpu_arch.example_compiles`).
 * **Compile matrix** (#256, CPU only). `tests/test_arch_matrix.py` compiles every bundled
   example and kernel-agent's own device code (graphloop, `mma_peaks`, the PDL probe, the
