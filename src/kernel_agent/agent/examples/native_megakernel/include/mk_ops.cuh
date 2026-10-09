@@ -9,9 +9,15 @@
 //   GEMV_FP8       the same with e4m3 weights and an fp32 scale per output row
 //   RESIDUAL       y = a + b over a range
 //   SPLITK_REDUCE  y[r] = bf16(sum_s part[s][r]) (+ a residual)
-//   ARGMAX         out = argmax(x[0:n]) (first maximum; NaN counts as the largest, as torch)
+//   ARGMAX         out = argmax(x[0:n]) (first maximum; NaN counts as the largest, as torch);
+//                  with A_ADVANCE also the token advance of a decode step: the step state's
+//                  token := the argmax, position += 1, history[position] := the argmax
 //   GLU            y = bf16(act(a)) * b over a range (act: silu, gelu tanh, gelu erf; a
 //                  gated MLP's activation)
+//
+// and, in DecodeOps (mk_decode.cuh, included at the end), the decode-step opcodes: EMBED,
+// ROPE_KV, ATTN_DECODE, ATTN_COMBINE (split-KV attention over a KV cache, milestones 6 and 7
+// of the megakernel ladder).
 //
 // A whole-row GEMV tile (K of 1024 or 2048, up to 16 rows) splits K across the threads
 // (gemv_split); the other shapes (split-K slices, wider K, more rows) stage h in shared memory
@@ -44,7 +50,13 @@ enum ResidualArg : int { R_A = 0, R_A_OFF, R_B, R_B_OFF, R_OUT, R_OUT_OFF, R_I0,
 enum ReduceArg : int {
   S_PART = 0, S_PART_OFF, S_SPLITS, S_STRIDE, S_ROW0, S_ROWS, S_OUT, S_OUT_OFF, S_RES, S_RES_OFF
 };
-enum ArgmaxArg : int { A_X = 0, A_X_OFF, A_N, A_OUT, A_OUT_OFF };
+enum ArgmaxArg : int {
+  A_X = 0, A_X_OFF, A_N, A_OUT, A_OUT_OFF, A_ADVANCE, A_STEP, A_STEP_OFF, A_HIST, A_HIST_LEN
+};
+// The step state of a decode step (int32 words on the device): the token it embeds and the
+// position it appends at; ARGMAX with A_ADVANCE writes the next ones. A_ADVANCE 0 (a word the
+// schedule leaves zero) is a plain argmax.
+enum StepWord : int { STEP_TOKEN = 0, STEP_POS = 1 };
 enum GluArg : int { U_A = 0, U_A_OFF, U_B, U_B_OFF, U_OUT, U_OUT_OFF, U_I0, U_N, U_ACT };
 enum GluAct : int { GLU_SILU = 0, GLU_GELU_TANH = 1, GLU_GELU = 2 };
 
@@ -514,12 +526,25 @@ __device__ __forceinline__ bool beats(float a, int ia, float b, int ib) {
   return ia < ib;
 }
 
+// The visiting order does not matter: beats() is a total order (NaN, value, index).
 __device__ __forceinline__ void argmax(const Ctx& c) {
   const bf16* x = c.ptr<const bf16>(c.arg(A_X)) + c.arg(A_X_OFF);
   const int n = c.arg(A_N);
   float best = -INFINITY;
   int at = 0x7fffffff;
-  for (int i = threadIdx.x; i < n; i += kThreads) {
+  // 16-byte loads where x is aligned (a vocabulary of logits: 4 loads per thread at 8192)
+  const int vec = reinterpret_cast<uintptr_t>(x) % 16 == 0 ? n / 8 : 0;
+  for (int v = threadIdx.x; v < vec; v += kThreads) {
+    const uint4 u = __ldcg(reinterpret_cast<const uint4*>(x) + v);
+    const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 f = bf2(w[j]);
+      if (beats(f.x, 8 * v + 2 * j, best, at)) best = f.x, at = 8 * v + 2 * j;
+      if (beats(f.y, 8 * v + 2 * j + 1, best, at)) best = f.y, at = 8 * v + 2 * j + 1;
+    }
+  }
+  for (int i = vec * 8 + threadIdx.x; i < n; i += kThreads) {
     const float v = __bfloat162float(__ldcg(x + i));
     if (beats(v, i, best, at)) best = v, at = i;
   }
@@ -536,7 +561,19 @@ __device__ __forceinline__ void argmax(const Ctx& c) {
   if (threadIdx.x == 0) {
     for (int k = 1; k < kWarps; ++k)
       if (beats(vals[k], idx[k], best, at)) best = vals[k], at = idx[k];
-    c.ptr<long long>(c.arg(A_OUT))[c.arg(A_OUT_OFF)] = at < n ? at : 0;
+    const int token = at < n ? at : 0;
+    c.ptr<long long>(c.arg(A_OUT))[c.arg(A_OUT_OFF)] = token;
+    if (c.arg(A_ADVANCE)) {
+      // the next step's inputs, on the device: every reader of the state in this launch (the
+      // embedding, the RoPE / KV append, the attention) precedes this instruction through
+      // the schedule's edges, and the next launch starts after this one
+      int* st = c.ptr<int>(c.arg(A_STEP)) + c.arg(A_STEP_OFF);
+      const int pos = __ldcg(st + STEP_POS) + 1;
+      st[STEP_TOKEN] = token;
+      st[STEP_POS] = pos;
+      const int hist = c.arg(A_HIST);
+      if (hist >= 0 && pos >= 0 && pos < c.arg(A_HIST_LEN)) c.ptr<int>(hist)[pos] = token;
+    }
   }
 }
 
@@ -565,3 +602,7 @@ struct Ops {
 };
 
 }  // namespace mk
+
+// The decode-step opcodes and DecodeOps (the generic opcodes and those): a separate
+// instantiation of the interpreter, so the chain's kernel<Ops> keeps its own registers.
+#include "mk_decode.cuh"

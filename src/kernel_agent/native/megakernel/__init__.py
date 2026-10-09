@@ -17,11 +17,16 @@ dependencies are global-memory counters instead of grid barriers.
 * :mod:`.simulate`: a discrete-event simulation of a schedule (deadlocks, ordering, the
   predicted time from per-op costs or a trace);
 * :mod:`.runtime`: the device buffers of one schedule (program, counters, tensor table,
-  watchdog status, trace) and :class:`.runtime.MegakernelHang`.
+  watchdog status, trace) and :class:`.runtime.MegakernelHang`;
+* :mod:`.decode`: a decode step's pieces: split-KV attention tiles and their combine (one
+  counter per KV head), the chunk rule of a KV length the device holds, the costs and the
+  simulator's durations at a length, the token advance's check.
 
 The example project ``kernel_agent/agent/examples/native_megakernel`` builds an RMSNorm →
-GEMV → residual chain with it, next to a graph + PDL and a grid-barrier baseline; the
-``native-engines`` skill's ``megakernel.md`` is the milestone ladder.
+GEMV → residual chain with it, next to a graph + PDL and a grid-barrier baseline, and a
+decoder's whole decode step (split-KV attention, the token advanced on the device) next to a
+graph of per-op launches; the ``native-engines`` skill's ``megakernel.md`` is the milestone
+ladder, its ``decode.md`` the decode step.
 """
 
 from __future__ import annotations

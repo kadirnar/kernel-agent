@@ -14,8 +14,25 @@ GEMV            rows [row0, row0 + rows) of y = W h, bf16 weights from the page 
 GEMV_FP8        the same with e4m3 weights and an fp32 scale per output row
 RESIDUAL        y = a + b over a range of elements
 SPLITK_REDUCE   y[r] = bf16(sum_s part[s][r]) (+ a residual)
-ARGMAX          out = argmax(x[0:n]) (int64; the first maximum, NaN the largest, as torch)
+ARGMAX          out = argmax(x[0:n]) (int64; the first maximum, NaN the largest, as torch);
+                with ``advance`` also a decode step's token advance on the device: the step
+                state's token := the argmax, its position += 1, the history at it := the
+                argmax (:mod:`.decode`)
 GLU             y = bf16(act(a)) * b over a range (act: silu, gelu tanh, gelu erf)
+==============  ==========================================================================
+
+The decode-step opcodes (``include/mk_decode.cuh``, the interpreter ``mk::DecodeOps``: the
+generic opcodes and these; bf16 or fp16, :data:`DTYPE_BF16` / :data:`DTYPE_FP16`):
+
+==============  ==========================================================================
+EMBED           out = table[token]: the row of the token the step state holds
+ROPE_KV         one KV head: its q heads and its k head rotated at the step state's position
+                (rotate-half RoPE from fp32 cos / sin tables, rounded as an eager model
+                rounds), q into a buffer, k and v appended to the caches at the position
+ATTN_DECODE     one query token's attention over one chunk of a KV head's cache for up to 4
+                of its q heads: the chunk's max, sum and unnormalised output, fp32 (split-KV;
+                the length a device value, the chunks follow it: :func:`.decode.kv_split`)
+ATTN_COMBINE    the non-empty chunks of a KV head's q heads reduced (flash-decoding)
 ==============  ==========================================================================
 """
 
@@ -28,6 +45,10 @@ from kernel_agent.native.megakernel.schedule import EVICT_FIRST, EVICT_NORMAL
 NOP, RMSNORM, GEMV, GEMV_FP8, RESIDUAL, SPLITK_REDUCE, ARGMAX, GLU = range(8)
 #: ``GLU``'s activation argument.
 GLU_SILU, GLU_GELU_TANH, GLU_GELU = range(3)
+#: The decode-step opcodes (``mk::DecodeOps``).
+EMBED, ROPE_KV, ATTN_DECODE, ATTN_COMBINE = range(8, 12)
+#: The dtype argument of the decode opcodes (activations and KV caches).
+DTYPE_BF16, DTYPE_FP16 = 0, 1
 
 #: Bytes of one page of the pool (``mk::kPageBytes``).
 PAGE_BYTES = 8192
@@ -114,8 +135,130 @@ def reduce_args(
     return [part, part_off, splits, stride, row0, rows, out, out_off, res, res_off]
 
 
-def argmax_args(*, x: int, x_off: int, n: int, out: int, out_off: int) -> list[int]:
-    return [x, x_off, n, out, out_off]
+def argmax_args(
+    *,
+    x: int,
+    x_off: int,
+    n: int,
+    out: int,
+    out_off: int,
+    advance: int = 0,
+    step: int = -1,
+    step_off: int = 0,
+    hist: int = -1,
+    hist_len: int = 0,
+) -> list[int]:
+    """``advance`` 1: also the token advance of the step state at ``step`` (int32 words
+    :data:`.decode.STEP_TOKEN`, ``STEP_POS``): token := the argmax, position += 1, and
+    ``hist[position] :=`` the argmax where the position is below ``hist_len``."""
+    return [x, x_off, n, out, out_off, advance, step, step_off, hist, hist_len]
+
+
+def embed_args(
+    *,
+    table: int,
+    vocab: int,
+    dim: int,
+    esize: int,
+    token: int,
+    token_off: int,
+    out: int,
+    out_off: int,
+) -> list[int]:
+    """EMBED: ``out[out_off:] = table[token[token_off]]`` (rows of ``dim`` elements of
+    ``esize`` bytes; offsets in elements; a token outside ``[0, vocab)`` reads the nearest
+    row)."""
+    return [table, vocab, dim, esize, token, token_off, out, out_off]
+
+
+def rope_kv_args(
+    *,
+    qkv: int,
+    qkv_off: int,
+    qheads: int,
+    kvheads: int,
+    kv_head: int,
+    group: int,
+    dim: int,
+    qout: int,
+    qout_off: int,
+    k: int,
+    v: int,
+    cap: int,
+    pos: int,
+    pos_off: int,
+    cos: int = -1,
+    sin: int = -1,
+    dtype: int = DTYPE_BF16,
+) -> list[int]:
+    """ROPE_KV of KV head ``kv_head``: its ``group`` q heads and its k head of the QKV
+    output (``[q heads | kv heads (k) | kv heads (v)] x dim``) rotated at the position
+    ``pos[pos_off]`` (``cos`` / ``sin``: fp32 tables [cap, dim / 2]; -1: no rotation), q into
+    ``qout``, k and v into the caches ``k`` / ``v`` ([kv heads, cap, dim]) at the position."""
+    return [
+        qkv, qkv_off, qheads, kvheads, kv_head, group, dim, qout, qout_off, k, v, cap, pos,
+        pos_off, cos, sin, dtype,
+    ]  # fmt: skip
+
+
+def attn_args(
+    *,
+    q: int,
+    q_off: int,
+    k: int,
+    v: int,
+    cap: int,
+    kv_head: int,
+    q0: int,
+    qn: int,
+    split: int,
+    splits: int,
+    chunk: int,
+    length: int,
+    length_off: int,
+    length_add: int,
+    scale: float,
+    po: int,
+    pml: int,
+    prow0: int,
+    dim: int,
+    dtype: int = DTYPE_BF16,
+) -> list[int]:
+    """ATTN_DECODE: q heads ``[q0, q0 + qn)`` of KV head ``kv_head`` over chunk ``split`` of
+    ``splits`` (``chunk`` keys, 0: the length spread over the splits); the length is
+    ``length[length_off] + length_add`` (``length`` -1: ``length_add`` alone), at most
+    ``cap``; partials into rows ``prow0 + q_head * splits + split`` of ``po`` ([rows, dim]) and
+    ``pml`` ([rows, 2]: max in the log2 domain, sum)."""
+    return [
+        q, q_off, k, v, cap, kv_head, q0, qn, split, splits, chunk, length, length_off,
+        length_add, f32_bits(scale), po, pml, prow0, dim, dtype,
+    ]  # fmt: skip
+
+
+def combine_args(
+    *,
+    po: int,
+    pml: int,
+    prow0: int,
+    splits: int,
+    chunk: int,
+    length: int,
+    length_off: int,
+    length_add: int,
+    cap: int,
+    q0: int,
+    qn: int,
+    out: int,
+    out_off: int,
+    dim: int,
+    dtype: int = DTYPE_BF16,
+) -> list[int]:
+    """ATTN_COMBINE of q heads ``[q0, q0 + qn)``: their non-empty chunks (the same length
+    and chunk rule as their attention tiles) into ``out[out_off + q_head * dim + d]``."""
+    return [
+        po, pml, prow0, splits, chunk, length, length_off, length_add, cap, q0, qn, out,
+        out_off, dim, dtype,
+    ]  # fmt: skip
 
 
 def tile_rows(n_out: int, row_bytes: int, pool_bytes: int, want: int = ROWS) -> int:
