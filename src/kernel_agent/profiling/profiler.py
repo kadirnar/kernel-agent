@@ -48,7 +48,7 @@ import re
 import sys
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -269,24 +269,41 @@ def _kv_params(cls: type, method: str) -> tuple[inspect.Signature, tuple[str, ..
     return _KV_PARAMS[key]
 
 
-def _cache_tensors(value: Any) -> list[torch.Tensor]:
+def _cache_tensors(value: Any, layer: Any = None) -> list[torch.Tensor]:
+    """The tensors of a KV-cache argument: a tensor, a tuple / list of them, or a cache object
+    that keeps one entry per layer (transformers' ``Cache``: ``layers[i].keys`` / ``.values``,
+    or the older parallel ``key_cache`` / ``value_cache`` lists), of which a call reads the
+    layer of its module (``layer_idx``, #226). A cache object passed to a module without a
+    layer index gives none: it holds every layer, and the module's calls inside read them
+    (counted there, once)."""
     if isinstance(value, torch.Tensor):
         return [value]
     if isinstance(value, tuple | list):
         return [t for v in value for t in _cache_tensors(v)]
-    return []
+    if type(layer) is not int or layer < 0 or value is None:
+        return []
+    entries = getattr(value, "layers", None)
+    if isinstance(entries, Sequence) and layer < len(entries):
+        found = [getattr(entries[layer], "keys", None), getattr(entries[layer], "values", None)]
+    else:
+        found = [
+            seq[layer] if isinstance(seq, Sequence) and layer < len(seq) else None
+            for seq in (getattr(value, "key_cache", None), getattr(value, "value_cache", None))
+        ]
+    return [t for t in found if isinstance(t, torch.Tensor)]
 
 
 def _kv_cache(
     call: _Call, module: nn.Module, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> None:
     """The KV cache a decode call reads (issue #146): the tensors of its KV-cache arguments
-    (by name: ``kv_cache``, ``past_key_value``, ``layer_past``, ...) of at least 3 dims, each
-    holding ``slots`` positions along its longest non-last dim, read up to the call's
-    position argument (``position_id``, ``cache_position``, ...: the newest position), or
-    whole without one (a cache that grows holds exactly the context). A cache held by the
-    module instead of passed in is not seen; a position tensor updated in place after the
-    call counts its last value."""
+    (by name: ``kv_cache``, ``past_key_value``, ``layer_past``, ...; of a cache object, its
+    module's layer: :func:`_cache_tensors`) of at least 3 dims, each holding ``slots``
+    positions along its longest non-last dim, read up to the call's position argument
+    (``position_id``, ``cache_position``, ...: the newest position; named or in its
+    ``**kwargs``), or whole without one (a cache that grows holds exactly the context). A
+    cache held by the module instead of passed in is not seen; a position tensor updated in
+    place after the call counts its last value."""
     found = _kv_params(type(module), method)
     if found is None:
         return
@@ -296,8 +313,9 @@ def _kv_cache(
     except TypeError:
         return
     per_slot = slots = 0
+    layer = getattr(module, "layer_idx", None)
     for name in names:
-        for t in _cache_tensors(bound.get(name)):
+        for t in _cache_tensors(bound.get(name), layer):
             if t.dim() < 3 or not t.numel():
                 continue
             n = max(t.shape[:-1])
@@ -306,7 +324,11 @@ def _kv_cache(
     if not per_slot:
         return
     call.kv_slot_bytes, call.kv_slots = per_slot, slots
-    call.kv_position = next((bound[n] for n in _POSITION_ARGS if bound.get(n) is not None), None)
+    # the position may come in the method's ``**kwargs`` (transformers' attention modules)
+    var = next((p.name for p in sig.parameters.values() if p.kind is p.VAR_KEYWORD), None)
+    extra = bound.get(var) if var else None
+    named = {**(extra if isinstance(extra, dict) else {}), **bound}
+    call.kv_position = next((named[n] for n in _POSITION_ARGS if named.get(n) is not None), None)
 
 
 def _read_kv(call: _Call) -> None:

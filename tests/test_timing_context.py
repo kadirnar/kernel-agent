@@ -79,7 +79,13 @@ def test_an_eager_profile_times_eagerly_with_a_cold_l2(tmp_path):
     found = timing_context.for_target(make_run(tmp_path, [qwen_profile()], DECODER), "t")
     assert (found.context, found.l2) == ("eager", "cold")
     assert "0% of the 103268 GPU events of stage model.model" in found.reason
-    assert "about 1,144 MB of other work" in found.reason and "48 MB L2" in found.reason
+    # per call: every call of a layer follows the rest of the model (no loop around it)
+    assert (
+        "100% of the 64 calls per run of one instance of model.model.layers.* follow about "
+        "1,125 MB of other work since its previous call (the rest of the run: no loop around "
+        "it); 100% follow more than the 48 MB L2"
+    ) in found.reason
+    assert "the profile records no KV-cache reads" in found.reason  # a cache object, unseen
     assert found.kwargs() == {"context": "eager", "l2_flush": True, "context_reason": found.reason}
 
 
@@ -93,7 +99,8 @@ def test_a_graph_launched_stage_in_the_newest_profile_times_in_a_graph(tmp_path)
     assert "rounds/3/profile/profile.json" in found.reason
     # the L2 from the analyze profile: the re-profiles do not see inside the graphed stage
     assert found.l2 == "cold" and "MB of other work" in found.reason
-    assert "(63 calls per run, profile/profile.json)" in found.reason
+    assert "the 64 calls per run of one instance of model.model.layers.*" in found.reason
+    assert "48 MB L2 (profile/profile.json;" in found.reason
 
     below = make_run(
         tmp_path / "b", [base, graphed(base, "model.model", GRAPH_SHARE - 0.01)], DECODER
@@ -168,6 +175,120 @@ def test_missing_facts_choose_eager_and_warm_and_say_which(tmp_path):
     broken = make_run(tmp_path, [{"classes": "not a list"}], BLOCK)
     assert timing_context.for_target(broken, "t").context == "eager"  # never raises
     assert TimingContext().kwargs()["l2_flush"] is False
+
+
+def fixture(name: str) -> dict[str, Any]:
+    profile: dict[str, Any] = json.loads((FIXTURES / name).read_text())
+    return profile
+
+
+def without_ancestors(profile: dict[str, Any], keep: tuple[str, ...]) -> dict[str, Any]:
+    """``profile`` with only its leaf classes and ``keep``: no calls of the modules around
+    the target's (an older or partial profile), so per-call facts are missing."""
+    out = copy.deepcopy(profile)
+    out["classes"] = [c for c in out["classes"] if c["is_leaf"] or c["cls"] in keep]
+    return out
+
+
+SOLVER_LAYER = {
+    "id": "t",
+    "module_class": "DiTLayer",
+    "capture": {"qualname": "tts.solver.estimator.layers.0"},
+}
+
+
+def test_a_tight_loop_is_warm_per_call_where_the_run_average_says_cold():
+    """A layer of an estimator its CFM solver calls 10 times per decode step: 9 of 10 calls
+    follow ~4 MB of other work (the other layer and the solver's projection), the first of a
+    step the whole 1 GB language model. The average over the run (~104 MB between two calls)
+    said cold; per call most calls find their weights in a 48 MB L2."""
+    profile = fixture("solver_loop_profile.json")
+    found = timing_context.select([("p", profile)], SOLVER_LAYER, 48.0)
+    assert found.l2 == "warm", found.reason
+    assert (
+        "warm L2, per call: 90% of the 100 calls per run of one instance of "
+        "tts.solver.estimator.layers.* follow about 4 MB of other work since its previous call "
+        "(inside one call of tts.solver, which calls it 10 times); 10% follow about 1,004 MB of "
+        "other work (the first in a call of tts.solver, the rest of the run: no loop around "
+        "it); 10% follow more than the 48 MB L2 (p)"
+    ) in found.reason
+    assert timing_context.select([("p", profile)], SOLVER_LAYER, 2.0).l2 == "cold"  # 4 > 2 MB
+    # the language model's layers run once per step: the rest of the run between their calls
+    lm = {"id": "t", "module_class": "LMLayer", "capture": {"qualname": "tts.lm.layers.2"}}
+    found = timing_context.select([("p", profile)], lm, 48.0)
+    assert found.l2 == "cold"
+    assert (
+        "100% of the 10 calls per run of one instance of tts.lm.layers.* follow about 831 MB "
+        "of other work since its previous call (the rest of the run: no loop around it)"
+    ) in found.reason
+
+
+def test_without_the_calls_around_the_target_the_run_average_decides_and_says_so():
+    found = timing_context.select(
+        [("p", without_ancestors(fixture("solver_loop_profile.json"), ("DiTLayer",)))],
+        SOLVER_LAYER,
+        48.0,
+    )
+    assert found.l2 == "cold"  # the choice before per-call facts
+    assert (
+        "cold L2: about 104 MB of other work between two calls of one instance of "
+        "tts.solver.estimator.layers.* (100 calls per run, p) exceeds the 48 MB L2 (an average "
+        "over the run: the profile has no calls of the modules around "
+        "tts.solver.estimator.layers.*, so a call in a tight loop cannot be told from one the "
+        "whole model separates)"
+    ) in found.reason
+    # a profile from before (no module above the target): the same average
+    found = timing_context.select([("p", synthetic(60.0))], BLOCK, 48.0)
+    assert "an average over the run" in found.reason
+
+
+KV_LAYER = {
+    "id": "t",
+    "module_class": "Layer",
+    "phase": "decode",
+    "capture": {"qualname": "lm.layers.0"},
+}
+
+
+def test_kv_cache_reads_between_two_calls_tip_a_decode_layer_to_cold():
+    """A decode step of 4 layers of 12 MB of weights each: between two calls of one layer the
+    other three read 36 MB of weights (fit in a 48 MB L2) and 18 MB of KV cache (then they do
+    not). The KV bytes count once, though the layer and the model pass the cache on and record
+    the same bytes as the attention."""
+    profile = fixture("kv_decode_profile.json")
+    found = timing_context.select([("p", profile)], KV_LAYER, 48.0)
+    assert found.l2 == "cold", found.reason
+    assert (
+        "100% of the 64 calls per run of one instance of lm.layers.* follow about 54 MB of "
+        "other work (18 MB of it KV-cache reads) since its previous call"
+    ) in found.reason
+    no_kv = copy.deepcopy(profile)
+    for cls in no_kv["classes"]:
+        for row in cls["work"]:
+            row.pop("kv_bytes", None)
+    found = timing_context.select([("p", no_kv)], KV_LAYER, 48.0)
+    assert found.l2 == "warm" and "about 36 MB of other work since" in found.reason
+    assert "the profile records no KV-cache reads" in found.reason
+    # the run average counts them too
+    flat = without_ancestors(profile, ("Layer", "Attn"))
+    found = timing_context.select([("p", flat)], KV_LAYER, 48.0)
+    assert found.l2 == "cold" and "an average over the run" in found.reason
+    assert "about 54 MB of other work (18 MB of it KV-cache reads) between two" in found.reason
+
+
+def test_a_transformers_decode_profile_counts_each_layers_kv_reads():
+    """Qwen3-0.6B profiled on an A10 with the attention reading its layer of transformers'
+    cache object (``kv_bytes``, ~2.1 MB per call at a ~500-token context): between two decode
+    calls of one decoder layer the other 27 layers read ~56 MB of KV cache, next to ~1.1 GB
+    of weights; a 6 MB L2 holds neither."""
+    profile = fixture("qwen3_decode_kv_a10_profile.json")
+    found = timing_context.select([("profile/profile.json", profile)], DECODER, 6.0)
+    assert found.l2 == "cold"
+    assert (
+        "100% of the 64 calls per run of one instance of model.model.layers.* follow about "
+        "1,181 MB of other work (56 MB of it KV-cache reads) since its previous call"
+    ) in found.reason
+    assert "no KV-cache reads" not in found.reason
 
 
 def test_stage_of_takes_the_innermost_stage_and_entrypoint_suffixes():

@@ -1487,14 +1487,24 @@ way it runs in the model, read from the run's newest profile, never from names:
   L2, the verdict that flipped VoxCPM2's slice 8 (9.74 → 9.03 ms per audio second once
   kept). A call that cannot be captured (a host sync, a CPU tensor, a cache grown with
   `torch.cat`) leaves the evaluation eager, and the result says why.
-* *warm* or *cold* L2: cold when the work the rest of the model touches between two
-  calls of one instance exceeds the GPU's L2 (`classes[].work` of a profile that sees
-  the whole model, `GPUInfo.l2_cache_mb`: Qwen3-0.6B's decoder layer has ~1.1 GB
-  between its decode calls). Cold reads a random buffer of twice the L2 before every
-  call: in a graph, a graph of the flushes alone is replayed next to it and subtracted
-  (a read, not a memset: a memset's dirty lines made the subtraction 10-13 µs short per
-  call); eagerly, the flush is waited for, so the call's host time still counts. The
-  speed of light uses DRAM bandwidth then.
+* *warm* or *cold* L2: cold when most calls of one instance of the target follow more
+  bytes of other work since its previous call than the GPU's L2 holds
+  (`GPUInfo.l2_cache_mb`); its weights and KV cache are reused by its own calls only.
+  The bytes are a profile's that sees the whole model (`classes[].work`: the weights,
+  first input and output of the leaf calls, and the KV cache the decode calls read,
+  counted once), placed per call by the calls of the modules around the target: called
+  k times per call of the module around it (a CFM solver's estimator), k − 1 of its k
+  calls follow only that module's other work and the first the gap between that
+  module's calls; with no loop around it every call follows the rest of the run
+  (Qwen3-0.6B's decoder layer: 1,181 MB between two decode calls, 56 MB of them the
+  other layers' KV-cache reads at a ~500-token context, measured on an NVIDIA A10,
+  sm_86: cold on its 6 MB L2, as before). Without the calls of the modules around the
+  target (a partial profile) the average over the run decides (its other work over the
+  instance's calls), and `context_reason` says which. Cold reads a random buffer of
+  twice the L2 before every call: in a graph, a graph of the flushes alone is replayed
+  next to it and subtracted (a read, not a memset: a memset's dirty lines made the
+  subtraction 10-13 µs short per call); eagerly, the flush is waited for, so the call's
+  host time still counts. The speed of light uses DRAM bandwidth then.
 
 The result names the context (`context`, `l2`, `context_reason`); `speedup` and
 `pct_of_sol` are measured in it. A winner (or `profile=true`) is timed in the other
@@ -2967,8 +2977,10 @@ re-profile makes a new one for its re-plan.
   read once per call) and the bytes of its first input and output. A decode call
   also counts the KV cache it is given (`kv_bytes`: the tensors of arguments
   named like `kv_cache`, `past_key_value`, `layer_past`, read up to its position
-  argument such as `position_id` or `cache_position`, else whole; a layer that
-  passes its cache on to its attention counts it once).
+  argument such as `position_id` or `cache_position`, named or in its `**kwargs`,
+  else whole; of a cache object that holds every layer, such as transformers'
+  `Cache`, the layer of the module's `layer_idx`; a layer that passes its cache on
+  to its attention counts it once).
   `profile.json` → `classes[].work` sums them per instance group (qualname with
   layer indices folded) and phase.
 * **Optimised models.** The model an improve round re-profiles hides work from the

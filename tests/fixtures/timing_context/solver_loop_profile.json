@@ -1,0 +1,146 @@
+{
+ "_note": "Synthetic (#226 follow-up 4): a decode loop whose CFM solver calls its estimator 10 times per step; the fields kernels/context.py reads",
+ "entrypoints": [],
+ "module_gaps": {},
+ "classes": [
+  {
+   "cls": "TTS",
+   "is_leaf": false,
+   "example_qualname": "tts",
+   "work": [
+    {
+     "group": "tts",
+     "phase": "decode",
+     "instances": 1,
+     "calls": 10,
+     "weight_bytes": 11335106560,
+     "io_bytes": 10485
+    }
+   ]
+  },
+  {
+   "cls": "LM",
+   "is_leaf": false,
+   "example_qualname": "tts.lm",
+   "work": [
+    {
+     "group": "tts.lm",
+     "phase": "decode",
+     "instances": 1,
+     "calls": 10,
+     "weight_bytes": 10485760000,
+     "io_bytes": 10485
+    }
+   ]
+  },
+  {
+   "cls": "LMLayer",
+   "is_leaf": false,
+   "example_qualname": "tts.lm.layers.0",
+   "work": [
+    {
+     "group": "tts.lm.layers.*",
+     "phase": "decode",
+     "instances": 4,
+     "calls": 40,
+     "weight_bytes": 10485760000,
+     "io_bytes": 41943
+    }
+   ]
+  },
+  {
+   "cls": "Solver",
+   "is_leaf": false,
+   "example_qualname": "tts.solver",
+   "work": [
+    {
+     "group": "tts.solver",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 10,
+     "weight_bytes": 849346560,
+     "io_bytes": 104857
+    }
+   ]
+  },
+  {
+   "cls": "Estimator",
+   "is_leaf": false,
+   "example_qualname": "tts.solver.estimator",
+   "work": [
+    {
+     "group": "tts.solver.estimator",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 100,
+     "weight_bytes": 838860800,
+     "io_bytes": 524288
+    }
+   ]
+  },
+  {
+   "cls": "DiTLayer",
+   "is_leaf": false,
+   "example_qualname": "tts.solver.estimator.layers.0",
+   "work": [
+    {
+     "group": "tts.solver.estimator.layers.*",
+     "phase": "prefill",
+     "instances": 2,
+     "calls": 200,
+     "weight_bytes": 838860800,
+     "io_bytes": 1048576
+    }
+   ]
+  },
+  {
+   "cls": "Linear",
+   "is_leaf": true,
+   "example_qualname": "tts.lm.layers.0.proj",
+   "work": [
+    {
+     "group": "tts.lm.layers.*.proj",
+     "phase": "decode",
+     "instances": 4,
+     "calls": 40,
+     "weight_bytes": 10485760000,
+     "io_bytes": 41943
+    },
+    {
+     "group": "tts.solver.estimator.layers.*.proj",
+     "phase": "prefill",
+     "instances": 2,
+     "calls": 200,
+     "weight_bytes": 838860800,
+     "io_bytes": 1048576
+    },
+    {
+     "group": "tts.solver.proj",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 10,
+     "weight_bytes": 10485760,
+     "io_bytes": 10485
+    }
+   ]
+  }
+ ],
+ "kernel_view": {
+  "timeline": {
+   "stages": [
+    {
+     "stage": "tts.lm",
+     "calls": 10,
+     "events": 4000,
+     "graph_events": 0
+    },
+    {
+     "stage": "tts.solver",
+     "calls": 10,
+     "events": 3000,
+     "graph_events": 0
+    }
+   ]
+  }
+ }
+}

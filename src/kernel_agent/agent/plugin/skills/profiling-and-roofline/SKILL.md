@@ -89,13 +89,15 @@ between copies and mutable ones are copied outside the timed region.
 Timing context (`context`, `l2`, `context_reason` in every timed result): the module is
 timed as it runs in the model, from the newest profile. `graph` when its timeline stage is
 mostly launched by CUDA-graph replays (12 calls captured in one graph: host launch time does
-not count, as inside a graphed stage), else `eager` (host time counts); `cold` L2 when the
-rest of the model touches more than the L2 between two of its calls (weights stream from
-DRAM, and `l2_resident` no longer applies), else `warm`. A winner is timed in the other
-context too: `speedup_by_context` and per case `timing`. `graph: unavailable (<why>)` means
-the candidate cannot be captured in a CUDA graph (a host sync, a CPU tensor, a tensor of its
-inputs replaced instead of written in place) or computes something else when replayed: it
-would break a graphed stage, whatever its eager speedup. Measured: an FP8 GEMM of two Triton
+not count, as inside a graphed stage), else `eager` (host time counts); `cold` L2 when most
+of its calls follow more other work than the L2 holds (the rest of the model or, in a loop,
+the other work of the module that loops over it; KV-cache reads count: weights stream from
+DRAM, and `l2_resident` no longer applies), else `warm`; `context_reason` gives the bytes
+per call. A winner is timed in the other context too: `speedup_by_context` and per case
+`timing`. `graph: unavailable (<why>)` means the candidate cannot be captured in a CUDA graph
+(a host sync, a CPU tensor, a tensor of its inputs replaced instead of written in place) or
+computes something else when replayed: it would break a graphed stage, whatever its eager
+speedup. Measured: an FP8 GEMM of two Triton
 launches at M = 352 was 0.58x eagerly and 2.01x graph-timed with a cold L2 (RTX 5070 Ti),
 so compare candidates in the context the result names. When a re-profile changes the
 target's context, earlier records compare at their `speedup_by_context` there (`measured_in`
