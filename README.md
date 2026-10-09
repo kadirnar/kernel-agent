@@ -2867,7 +2867,11 @@ waves, occupancy and top stalls); a metric this ncu does not know is dropped and
 the run repeated. Without ncu, or when the driver restricts the performance
 counters to admin users (`RmProfilingAdminOnly: 1`, ncu's `ERR_NVGPUCTRPERM`; set
 `options nvidia NVreg_RestrictProfilingToAdminUsers=0`), the result says so
-(`ncu.status: unavailable` with the fix) and the evaluation is unchanged.
+(`ncu.status: unavailable` with the fix) and the evaluation is unchanged. An admin
+is a process with CAP_SYS_ADMIN (`ncu.is_admin`): root in an unprivileged
+container is not one (measured in an NVIDIA A10 container: euid 0, no
+CAP_SYS_ADMIN, ncu refused), so there the counters are unavailable without an ncu
+run.
 `kernel-agent doctor` says whether ncu can profile here. The ncu numbers are per
 launch with caches flushed and base clocks (ncu's defaults): compare kernels
 with each other, not with the evaluator's timings. After the metrics, a second ncu

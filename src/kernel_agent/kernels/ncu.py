@@ -114,9 +114,12 @@ NCU_ENV = "KERNEL_AGENT_NCU"
 PERMISSION_HINT = (
     "the driver restricts GPU performance counters to admin users (ERR_NVGPUCTRPERM): set "
     "`options nvidia NVreg_RestrictProfilingToAdminUsers=0` in a file in /etc/modprobe.d/, "
-    "rebuild the initramfs and reboot (or run as root); "
-    "https://developer.nvidia.com/ERR_NVGPUCTRPERM"
+    "rebuild the initramfs and reboot (or run with CAP_SYS_ADMIN: root on the host; root in "
+    "a container only when it was started with that capability, and the host's setting "
+    "cannot be changed from inside one); https://developer.nvidia.com/ERR_NVGPUCTRPERM"
 )
+#: CAP_SYS_ADMIN's bit in a capability set (linux/capability.h)
+_CAP_SYS_ADMIN = 21
 _TIME_UNITS = {"nsecond": 1.0, "usecond": 1e3, "msecond": 1e6, "second": 1e9}
 _BYTE_UNITS = {"byte": 1.0, "Kbyte": 1e3, "Mbyte": 1e6, "Gbyte": 1e9, "Tbyte": 1e12}
 
@@ -156,10 +159,29 @@ def ncu_version(ncu: str) -> str | None:
     return match.group(1) if match else None
 
 
+def is_admin(status: str | None = None) -> bool:
+    """Whether this process is an admin user to the driver's counter restriction: it holds
+    CAP_SYS_ADMIN in its effective capabilities (``status``: the text of
+    ``/proc/self/status``, its ``CapEff``). Root is not enough in an unprivileged container:
+    measured in one on an NVIDIA A10 host with ``RmProfilingAdminOnly: 1`` (euid 0, ``CapEff:
+    00000000a80405fb``, no CAP_SYS_ADMIN), ncu failed with ERR_NVGPUCTRPERM. Without
+    ``/proc``: euid 0."""
+    if status is None:
+        try:
+            status = Path("/proc/self/status").read_text()
+        except OSError:
+            return hasattr(os, "geteuid") and os.geteuid() == 0
+    match = re.search(r"^CapEff:\s*([0-9a-fA-F]+)", status, re.M)
+    if match is None:
+        return hasattr(os, "geteuid") and os.geteuid() == 0
+    return bool(int(match.group(1), 16) >> _CAP_SYS_ADMIN & 1)
+
+
 def counters_restricted(params: str | None = None, *, root: bool | None = None) -> bool | None:
     """Whether the NVIDIA driver restricts the performance counters to admin users and this
     process is not one (``params``: the text of ``/proc/driver/nvidia/params``; None: it
-    cannot be read, so unknown)."""
+    cannot be read, so unknown; ``root``: whether this process is an admin, default
+    :func:`is_admin`)."""
     if params is None:
         try:
             params = Path("/proc/driver/nvidia/params").read_text()
@@ -169,7 +191,7 @@ def counters_restricted(params: str | None = None, *, root: bool | None = None) 
     if match is None:
         return None
     if root is None:
-        root = hasattr(os, "geteuid") and os.geteuid() == 0
+        root = is_admin()
     return match.group(1) != "0" and not root
 
 
