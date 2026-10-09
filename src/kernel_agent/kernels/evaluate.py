@@ -55,7 +55,12 @@ Native candidates (projects, issue #225) also run every case twice from the same
 module state after stage 2: their outputs and in-place side effects must agree bit for bit
 (``incorrect`` at stage ``determinism``; ``determinism`` in the result), unless the entry
 declares ``ORDER_DEPENDENT_ATOMICS = "<why>"`` (split-K partials summed with float atomics):
-races on global memory and counter-ordering bugs that pass one comparison show up here. A
+races on global memory and counter-ordering bugs that pass one comparison show up here.
+Those whose sources synchronise blocks through global memory (counters, atomics, the
+megakernel kit) then run :data:`STRESS_CALLS` calls of the main case back to back, on four
+inputs in turn and with GPU-side gaps before some, each bit for bit equal to an isolated call
+on the same input (``determinism.stress``; issue #248): state one launch leaves for the next
+(self-resetting counters, reused pages and buffers) must not be reused early. A
 megakernel stopped by its watchdog (:mod:`kernel_agent.native.megakernel.runtime`) turns the
 failure it caused into status ``hang``, with the instruction, counter, value and target in
 ``hang``.
@@ -111,6 +116,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import random
+import re
 import secrets
 import shutil
 import subprocess
@@ -163,6 +170,14 @@ _run = subprocess.run  # bound at import: tests replace subprocess.run for the e
 #: The entry-module attribute of a native candidate whose results depend on the order of its
 #: atomics (the determinism check is skipped; its value says why).
 ORDER_DEPENDENT = "ORDER_DEPENDENT_ATOMICS"
+#: Back-to-back calls of the stress check of native candidates that synchronise blocks through
+#: global memory (``$KERNEL_AGENT_STRESS_CALLS`` overrides it; 0: off).
+STRESS_CALLS = 256
+STRESS_ENV = "KERNEL_AGENT_STRESS_CALLS"
+#: What makes a native candidate's sources synchronise blocks through global memory.
+_COUNTER_SOURCE = re.compile(
+    r"ka_mk|ld\.acquire|red\.release|atom\.|atomicAdd|atomicCAS|atomicExch|cuda::atomic"
+)
 #: Failures a megakernel's watchdog can be behind: its kernel stopped early (wrong outputs) or
 #: its runtime refused the next launch.
 _HANG_CAN_CAUSE = ("runtime_error", "incorrect", "incorrect_timed_output", "incorrect_perturbed")
@@ -760,6 +775,119 @@ def _determinism(
     return None
 
 
+def stress_calls() -> int:
+    """Calls of the stress check (:data:`STRESS_CALLS`, ``$KERNEL_AGENT_STRESS_CALLS``)."""
+    try:
+        return max(0, int(os.environ.get(STRESS_ENV, STRESS_CALLS)))
+    except ValueError:
+        return STRESS_CALLS
+
+
+def _uses_counters(module: Any) -> bool:
+    """Whether a native candidate's project files synchronise blocks through global memory
+    (:data:`_COUNTER_SOURCE`): those of its materialised source directory."""
+    from kernel_agent.native import project
+
+    digest = (getattr(module, "__ka_project__", None) or {}).get("digest")
+    root = project.src_dir(str(digest)) if digest else None
+    if root is None or not root.is_dir():
+        return False
+    sources = (".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc", ".py")
+    return any(
+        path.is_file()
+        and path.suffix in sources
+        and _COUNTER_SOURCE.search(path.read_text(errors="replace")) is not None
+        for path in sorted(root.rglob("*"))
+    )
+
+
+def _tensors(value: Any) -> list[Any]:
+    """The tensors of a (nested) structure, in order."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return [value.detach()]
+    if isinstance(value, dict):
+        return [t for v in value.values() for t in _tensors(v)]
+    if isinstance(value, list | tuple):
+        return [t for v in value for t in _tensors(v)]
+    return []
+
+
+def _variant(args: Any, kwargs: Any, k: int) -> tuple[Any, Any]:
+    """A copy of a case's inputs whose floating tensors are the captured ones (k = 0), negated,
+    rolled by one along their last dimension or halved: four inputs with exact values."""
+    import torch
+
+    a, kw = copy.deepcopy((args, kwargs))
+    if k:
+        seen: set[int] = set()  # a tensor passed twice is changed once
+        for t in _tensors((a, kw)):
+            if t.is_floating_point() and t.numel() and t.data_ptr() not in seen:
+                seen.add(t.data_ptr())
+                with torch.no_grad():
+                    if k == 1:
+                        t.neg_()
+                    elif k == 2:
+                        t.copy_(t.roll(1, -1))
+                    else:
+                        t.mul_(0.5)
+    return a, kw
+
+
+def _differs(got: list[Any], want: list[Any]) -> Any:
+    """Whether two tensor lists differ in a bit: a device boolean (no synchronisation), or
+    True when their shapes or dtypes differ."""
+    import torch
+
+    if len(got) != len(want):
+        return True
+    flag: Any = False
+    for a, b in zip(got, want, strict=True):
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return True
+        d = (a.reshape(-1).view(torch.uint8) != b.reshape(-1).view(torch.uint8)).any()
+        flag = d if flag is False else flag | d
+    return flag
+
+
+def _stress(
+    case: dict[str, Any], replay: Any, holders: tuple[Any, ...], calls: int
+) -> dict[str, Any]:
+    """``calls`` calls of ``case`` back to back (no synchronisation between them; on CUDA a
+    GPU-side gap of up to ~0.1 ms before a quarter of them), on four inputs in turn
+    (:func:`_variant`), each from the case's module state: how many differ, bit for bit, from
+    an isolated call on the same input (outputs and in-place updated arguments), the first."""
+    import torch
+
+    from kernel_agent.workloads.base import synchronize
+
+    rng = random.Random(0)
+    variants = [_variant(case["args"], case["kwargs"], k) for k in range(4)]
+    golden = []
+    for a, kw in variants:
+        a2, kw2 = copy.deepcopy((a, kw))
+        synchronize()
+        with torch.inference_mode():
+            out = replay.call(case, *holders)(*a2, **kw2)
+        synchronize()
+        golden.append(_tensors(_snapshot({"output": out, "args": a2, "kwargs": kw2})))
+    cuda = any(t.is_cuda for g in golden for t in g)
+    flags = []
+    for i in range(calls):
+        k = i % len(variants)
+        a2, kw2 = copy.deepcopy(variants[k])
+        if cuda and rng.random() < 0.25:
+            torch.cuda._sleep(rng.randrange(1_000, 300_000))
+        with torch.inference_mode():
+            out = replay.call(case, *holders)(*a2, **kw2)
+            got = _tensors({"output": out, "args": a2, "kwargs": kw2})
+            flags.append(_differs(got, golden[k]))
+    synchronize()
+    wrong = [i for i, f in enumerate(flags) if bool(f)]
+    return {"calls": calls, "wrong": len(wrong), "first": wrong[0] if wrong else None}
+
+
 def _stages(
     capture_path: Path,
     candidate_path: Path,
@@ -984,6 +1112,29 @@ def _stages(
                 result.update(status="runtime_error", error=_short_tb(), stage="determinism")
                 return result
             result["determinism"] = {"checked": True, "cases": len(cases)}
+            if diff is None and (n := stress_calls()) and _uses_counters(module):
+                main = integrity.main_case(cases, case_reports)
+                try:
+                    stress = _stress(cases[main], replay, holders, n)
+                except Exception:
+                    result.update(status="runtime_error", error=_short_tb(), stage="determinism")
+                    return result
+                result["determinism"]["stress"] = {"case": main, **stress}
+                if stress["wrong"]:
+                    result.update(
+                        status="incorrect",
+                        stage="determinism",
+                        failed_check={"case": main, "check": "stress"},
+                        error=(
+                            f"case {main}: {stress['wrong']} of {n} back-to-back calls differ "
+                            "bit for bit from an isolated call on the same input (the first: "
+                            f"call {stress['first']}): state one launch leaves for the next "
+                            "(counters, flags, pages, buffers) is reused before every block of "
+                            "the previous launch is done with it, or blocks race on global "
+                            "memory; see the native-engines skill's megakernel.md"
+                        ),
+                    )
+                    return result
             if diff is not None:
                 result["determinism"].update(diff)
                 result.update(

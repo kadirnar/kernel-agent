@@ -295,9 +295,13 @@ class NormGemvChain(nn.Module):
 
 
 #: The megakernel example (kernel_agent.native.megakernel) and its capture: hidden, layers,
-#: (leading shape, calls per run).
+#: (leading shape, calls per run). 4 layers: the exact tier's bf16 tolerance against eager
+#: (cuBLAS) rounding is reached with depth (issue #248, RTX 5070 Ti, 3000 random inputs: at 8
+#: layers 1.3 % of the draws had > 0.1 % of elements outside it for the megakernel and 1.0 %
+#: for the graph + PDL and grid-barrier baselines, which use no counters; at 4 layers none),
+#: and the evaluator draws fresh inputs for its timed-output and perturbed checks.
 MEGAKERNEL_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
-    "native_megakernel": (1024, 8, [((1,), 64), ((4,), 0)]),
+    "native_megakernel": (1024, 4, [((1,), 64), ((4,), 0)]),
 }
 
 

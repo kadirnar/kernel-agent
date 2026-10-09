@@ -47,7 +47,8 @@
 // stops, the first one writes the instruction id, counter, value and target into p.status
 // (pinned host memory, readable after a hang without a CUDA call) and the kernel returns.
 // The last block to finish zeroes the counters, so the next launch starts clean without a
-// memset (also after an abort). KA_MK_TRACE (compile flag): per-instruction globaltimer
+// memset (also after an abort). A runtime's buffers (counters, activations, status) serve one
+// launch at a time: launch its calls in stream order, never two at once (issue #248). KA_MK_TRACE (compile flag): per-instruction globaltimer
 // stamps into p.trace (weights issued, wait start, counters met, weights landed, end; SM;
 // two opcode marks).
 //
@@ -622,6 +623,9 @@ __device__ __forceinline__ void interpret(const Params& p) {
       }
       const int* w = detail::row_of(rows, rel);
       const int need = detail::pages_of(w[PF_TENSOR], w[PF_BYTES], PB);
+      // the words used after the run, read now: once the run's last barrier is passed, warp 0
+      // may already refill this row's slot of the ring for a later chunk
+      const int op = w[OP], sig = w[SIGNAL], sig_n = w[SIGNAL_N];
       if (need > p.n_pages) {
         if (t == 0)
           detail::report(p, internal + C_ABORT, kPoolTooSmall, i, q, w[OP], -1, w[PF_BYTES],
@@ -657,9 +661,9 @@ __device__ __forceinline__ void interpret(const Params& p) {
       if (t == 0) {
         // the signal first: the waiting blocks are on the critical path, the producer is not
         if (!known) {
-          detail::report(p, internal + C_ABORT, kBadOpcode, i, q, w[OP], -1, 0, 0);
-        } else if (w[SIGNAL] >= 0) {
-          signal(p.counters + w[SIGNAL], w[SIGNAL_N]);
+          detail::report(p, internal + C_ABORT, kBadOpcode, i, q, op, -1, 0, 0);
+        } else if (sig >= 0) {
+          signal(p.counters + sig, sig_n);
         }
         KA_MK_STAMP(p, i, 4, static_cast<long long>(now_ns()));
       }

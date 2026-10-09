@@ -246,6 +246,51 @@ def test_a_native_candidate_must_give_the_same_bits_twice(tmp_path):
     }
 
 
+#: A native entry whose sources synchronise blocks through global memory (the stress check's
+#: trigger: here only words of a comment, the entry being pure torch).
+COUNTERS = "# its CUDA side would signal counters with red.release.gpu and poll with ld.acquire"
+#: Wrong on one call (#150), as a counter reset racing the next launch would be.
+ONCE = """
+if self.calls == 150:
+    out = out.clone()
+    out.view(-1)[0] = torch.nextafter(out.view(-1)[0], torch.tensor(float("inf")))
+"""
+
+
+def test_native_candidates_with_counters_are_stressed_back_to_back(tmp_path, monkeypatch):
+    """Issue #248: two runs agree, yet one call of hundreds is wrong; the stress check finds it."""
+    monkeypatch.setenv(evaluate_mod.STRESS_ENV, "200")
+    capture = make_capture("rmsnorm", tmp_path / "rms.pt", "cpu")
+    racy = native(tmp_path / "racy", "racy", body=ONCE, head=COUNTERS)
+    clean = native(tmp_path / "clean", "clean", head=COUNTERS)
+    with restored_globals():
+        bad = evaluate(capture, racy, device="cpu")
+        ok = evaluate(capture, clean, device="cpu")
+    assert bad["status"] == "incorrect" and bad["stage"] == "determinism", bad
+    assert bad["failed_check"]["check"] == "stress"
+    stress = bad["determinism"]["stress"]
+    assert (stress["calls"], stress["wrong"]) == (200, 1) and stress["first"] is not None
+    assert "back-to-back calls differ bit for bit" in bad["error"]
+    assert ok["status"] == "ok", ok
+    assert ok["determinism"]["stress"]["wrong"] == 0 and ok["determinism"]["stress"]["calls"] == 200
+    monkeypatch.setenv(evaluate_mod.STRESS_ENV, "0")  # switched off: two runs only
+    with restored_globals():
+        assert "stress" not in evaluate(capture, clean, device="cpu")["determinism"]
+
+
+def test_the_stress_inputs_are_exact_variants_of_the_captured_ones():
+    x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    ids = torch.tensor([1, 2])
+    variants = [evaluate_mod._variant((x, ids), {"s": x}, k) for k in range(4)]
+    assert torch.equal(variants[0][0][0], x) and variants[0][0][0] is not x
+    assert torch.equal(variants[1][0][0], -x) and torch.equal(variants[2][0][0], x.roll(1, -1))
+    assert torch.equal(variants[3][1]["s"], x * 0.5) and variants[3][1]["s"] is variants[3][0][0]
+    assert all(torch.equal(v[0][1], ids) for v in variants)  # integer tensors stay
+    assert not bool(evaluate_mod._differs([x], [x.clone()]))
+    assert bool(evaluate_mod._differs([x], [variants[1][0][0]]))
+    assert evaluate_mod._differs([x], [x[:1]]) is True
+
+
 def test_single_file_candidates_are_not_run_twice(tmp_path):
     capture = make_capture("rmsnorm", tmp_path / "rms.pt", "cpu")
     plain = tmp_path / "plain.py"
