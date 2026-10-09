@@ -1,6 +1,6 @@
 ---
 name: int8-weights
-description: INT8 weight-only kernels (precision int8_weights) — symmetric int8 codes per output channel, bf16 activations, exact in-register conversion without e4m3 emulation, the decode GEMV, accuracy against FP8 weights, measured numbers. Use for memory-bound decode GEMVs and skinny GEMMs whose spec says int8_weights, above all on GPUs before sm_89.
+description: INT8 weight-only kernels (precision int8_weights) — symmetric int8 codes per output channel, bf16 or fp16 activations, exact in-register conversion without e4m3 emulation, the decode GEMV, accuracy against FP8 weights, measured numbers. Use for memory-bound decode GEMVs and skinny GEMMs whose spec says int8_weights, above all on GPUs before sm_89.
 ---
 
 # INT8 weight-only (`precision: int8_weights`)
@@ -19,10 +19,10 @@ more accurate 8-bit weight format on rows without outliers, at the same speed.
   codes in [-127, 127] (-128 unused), one fp32 scale per output channel, `scale = amax(|row|) *
   (1 / 127)` (the fp32 constant `quant.INT8_STEP`), codes `round(w / scale)` to nearest even;
   keep no bf16 copy of a quantised weight.
-* **Activations stay bf16.** Never quantise them in an `int8_weights` target (that is
-  `int8_w8a8`).
+* **Activations stay in the model's dtype** (bf16 or fp16; the example is a template on
+  it). Never quantise them in an `int8_weights` target (that is `int8_w8a8`).
 * **Accumulate in fp32**; apply the scale (and the bias) once per output in the epilogue,
-  `y[m, n] = scale[n] * sum_k x[m, k] q[n, k] + bias[n]`, and round to bf16 once.
+  `y[m, n] = scale[n] * sum_k x[m, k] q[n, k] + bias[n]`, and round to that dtype once.
 * **Report** `int8_error(weight, q, scale)` (`rel_l2`, `worst_channel_rel_l2`, `underflow`,
   `crest`: a row with an outlier loses its small weights to the uniform step) and the
   evaluator's per-case `min_cosine` / `max_rel_l2` in `NOTES.md`.

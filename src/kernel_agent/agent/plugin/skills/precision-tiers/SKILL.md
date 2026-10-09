@@ -30,13 +30,13 @@ One skill per precision class (load the one of your target's `precision`):
 
 | precision | skill | for |
 |---|---|---|
-| `fp8_weights` | `fp8-weights` | memory-bound decode GEMVs and skinny GEMMs: e4m3 weights, bf16 activations |
+| `fp8_weights` | `fp8-weights` | memory-bound decode GEMVs and skinny GEMMs: e4m3 weights, activations in the model's dtype (bf16 or fp16) |
 | `fp8_w8a8` | `fp8-w8a8` | compute-bound GEMMs: e4m3 weights and per-token activations on the FP8 tensor cores |
 | `fp8_mx` | `mxfp8` | compute-bound GEMMs with wide outputs on block-scaled tensor cores (sm_100 / sm_120) |
 | `fp8_kv` | `fp8-kv-cache` | decode attention over long KV caches (opt-in) |
 | `fp4_weights` | `fp4-weights` | memory-bound decode GEMVs where FP8 weights are not enough (NVFP4; opt-in) |
 | `fp4_w4a4` | `fp4-w4a4` | compute-bound GEMMs past FP8 on block-scaled FP4 tensor cores: NVFP4 weights and per-token activations (sm_100+; opt-in) |
-| `int8_weights` | `int8-weights` | memory-bound decode GEMVs and skinny GEMMs: int8 weights, bf16 activations (no e4m3 conversion: GPUs before sm_89) |
+| `int8_weights` | `int8-weights` | memory-bound decode GEMVs and skinny GEMMs: int8 weights, activations in the model's dtype (no e4m3 conversion: GPUs before sm_89) |
 | `int8_w8a8` | `int8-w8a8` | compute-bound GEMMs on the IMMA tensor cores: int8 weights and per-token activations (the 8-bit compute class of Turing / Ampere) |
 
 ## When it is allowed

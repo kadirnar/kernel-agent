@@ -342,7 +342,8 @@ def _gpu_ready():
 
 
 @pytest.mark.gpu
-def test_fp4_gemv_matches_its_dequantised_weight():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])  # an fp16 model too (#258)
+def test_fp4_gemv_matches_its_dequantised_weight(dtype):
     _gpu_ready()
     from importlib import util
 
@@ -351,16 +352,16 @@ def test_fp4_gemv_matches_its_dequantised_weight():
     module = util.module_from_spec(spec)
     spec.loader.exec_module(module)
     torch.manual_seed(0)
-    lin = nn.Linear(1024, 768, bias=True).cuda().to(torch.bfloat16)
+    lin = nn.Linear(1024, 768, bias=True).cuda().to(dtype)
     fp4 = module.build(lin)
     assert type(fp4).__name__ == "Fp4Linear" and fp4.quant_error["format"] == "nvfp4"
     w = quant.dequantize_fp4(fp4.weight_codes, fp4.weight_scales, fp4.weight_tensor_scale)
     for shape in ((1, 1024), (3, 1024), (2, 11, 1024)):  # GEMV, 3 rows, the fallback
-        x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
-        want = (x.float() @ w.float().T + lin.bias.detach().float()).to(torch.bfloat16)
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        want = (x.float() @ w.float().T + lin.bias.detach().float()).to(dtype)
         with torch.no_grad():
             got = fp4(x)
-        assert got.shape == want.shape and got.dtype == torch.bfloat16
+        assert got.shape == want.shape and got.dtype == dtype
         # the same weights: only the summation order and bf16 rounding differ (1 ulp)
         err = float((got.float() - want.float()).norm() / want.float().norm())
         assert err < 4e-3, err
@@ -368,15 +369,22 @@ def test_fp4_gemv_matches_its_dequantised_weight():
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])  # an fp16 model too (#258)
 @pytest.mark.parametrize("name", sorted(selftest.FP4_EXAMPLES))
-def test_fp4_example_passes_its_tier_and_fails_the_fp8_tier(name, tmp_path):
+def test_fp4_example_passes_its_tier_and_fails_the_fp8_tier(name, dtype, tmp_path):
     _gpu_ready()
     k, n, calls = selftest.FP4_EXAMPLES[name]
     fp4 = selftest.make_linear_capture(
-        tmp_path / "fp4.pt", k, n, calls, tier=FP4, precision="fp4_weights"
+        tmp_path / "fp4.pt", k, n, calls, tier=FP4, precision="fp4_weights", dtype=dtype
     )
     fp8 = selftest.make_linear_capture(
-        tmp_path / "fp8.pt", k, n, calls, tier="near-lossless", precision="fp8_weights"
+        tmp_path / "fp8.pt",
+        k,
+        n,
+        calls,
+        tier="near-lossless",
+        precision="fp8_weights",
+        dtype=dtype,
     )
     example = prompts.EXAMPLES_DIR / name
 

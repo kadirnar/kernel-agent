@@ -62,10 +62,11 @@ from kernel_agent.kernels.triton_launch import CachedLaunch
 
 #: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
 #: it elsewhere and says why).
-ARCHS = "sm_80+"
-ARCHS_WHY = "bf16 tl.dot (Triton has no MMA below sm_80)"
-#: GPUs it compiles for (sm_75: tl.dot on FMA units, correct but without tensor cores).
-ARCHS_COMPILES = "sm_75+"
+ARCHS = "sm_75+"
+ARCHS_WHY = (
+    "tl.dot on the tensor cores from sm_80; below, Triton lowers the fp16 / bf16 tl.dot to FMA "
+    "(correct through sm_75's PTX on an RTX 5070 Ti, no tensor cores: time it against SDPA)"
+)
 
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)

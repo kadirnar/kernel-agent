@@ -17,15 +17,17 @@ CUDA graphs host time does not count: then this is the same kernel as ``_scaled_
   - **tensor-wise** (0, default; ``fp8_w8a8``): weights e4m3 with one fp32 scale per output
     channel (``quantize_fp8``, once in ``build()``), activations per token on every call
     (``_quant_token_k``), the GEMM with unit scalar scales (``SCALAR_32F``: cuBLASLt's nvjet
-    kernels, 325-338 TFLOP/s at 8192^3 on sm_120) writes the unscaled product in bf16, and
-    ``_scale_k`` applies ``sx[m] * sw[n]`` (+ bias) in fp32 with one more bf16 rounding
-    (2^-9 relative, next to FP8's ~3 %). In a fused layer apply the scales where the output
-    is read next instead (the SiLU-mul, the residual add): ``fp8_gemm`` is the GEMM alone.
+    kernels, 325-338 TFLOP/s at 8192^3 on sm_120) writes the unscaled product in bf16 (for
+    fp16 models too: in fp16 it would overflow), and ``_scale_k`` applies ``sx[m] * sw[n]``
+    (+ bias) in fp32 with one more rounding to the activations' dtype (2^-9 relative, next
+    to FP8's ~3 %). In a fused layer apply the scales where the output is read next instead
+    (the SiLU-mul, the residual add): ``fp8_gemm`` is the GEMM alone.
     Split-K over K slices (a strided batch; ``_scale_k`` sums the partials) fills the SMs
     when N is small for M: chosen by timing (``splits=0``) or forced (1, 2).
   - **MXFP8** (1, ``fp8_mx``; ``VEC32_UE8M0``, sm_100+ / sm_120): e4m3 with one
     power-of-two ue8m0 scale per 32 elements along K on both operands, applied by the tensor
-    core (``QMMA.SF``), so the output arrives scaled. The scale rule is ``fp8_mx``'s
+    core (``QMMA.SF``), so the output arrives scaled (in the activations' dtype). The scale
+    rule is ``fp8_mx``'s
     non-saturating ``2^ceil(log2(amax / 448))``, exact from the exponent bits in
     ``quant_mx_k`` as in ``quant.quantize_mxfp8`` (never the OCP floor rule, which
     saturates; the evaluator's scale-rule guard runs :func:`quantize_activations`). Weight
@@ -39,7 +41,10 @@ CUDA graphs host time does not count: then this is the same kernel as ``_scaled_
   split-K 2; K = 4096: 26.6 vs 15.2); at M <= ~80 (memory bound) both stream the same weight
   bytes and MXFP8 is never faster. cuBLASLt on sm_120 has no ``OUTER_VEC_32F`` (row-wise),
   ``VEC128_32F`` or ``BLK128x128_32F`` (DeepSeek blockwise) mode: ``NOT_SUPPORTED``.
-* Plans: one per (device, M, N, K, mode, split request). The heuristic's <= 8 algorithms
+* Activations: bf16 or fp16 (:data:`DTYPES`; the quantisers and the epilogue are templates
+  on the type), outputs in the same dtype.
+* Plans: one per (device, M, N, K, mode, split request, output type). The heuristic's <= 8
+  algorithms
   (and the split options) are timed interleaved, 3 rounds, on scratch operands (sequential
   timing on a busy GPU once picked a 10 % slower kernel; the top-1 of the heuristic picked a
   slower ``sm89_xmma`` split-K kernel for one shape). Each new M is a new plan (~ms once):
@@ -48,7 +53,7 @@ CUDA graphs host time does not count: then this is the same kernel as ``_scaled_
   caching allocator, so calls capture. A plan first needed during capture is not timed (the
   heuristic's first algorithm); call each shape once eagerly before capturing. One workspace
   per device: do not run these GEMMs on two streams at once.
-* Fallback (other shapes, CPU, non-bf16): ``kernel_agent.kernels.quant.fp8_w8a8_linear``
+* Fallback (other shapes, CPU, other dtypes): ``kernel_agent.kernels.quant.fp8_w8a8_linear``
   (tensor-wise) or ``quant.mxfp8_linear`` (MXFP8): the same numerics in torch.
 
 Requirements: tensor-wise K and N multiples of 16 (sm_89+); MXFP8 K a multiple of 128 and N
@@ -81,6 +86,8 @@ ARCHS = "sm_89+"
 ARCHS_WHY = "cuBLASLt FP8 GEMMs (tensor-wise: sm_89+; the MXFP8 mode needs sm_100+)"
 #: GPUs its device code compiles for (the FP8 limit is cuBLASLt's, at run time).
 ARCHS_COMPILES = "sm_75+"
+#: Activation dtypes the kernels take (templates on the type; the output keeps it).
+DTYPES = (torch.bfloat16, torch.float16)
 
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)
@@ -94,6 +101,7 @@ CUDA_SRC = r"""
 #include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <algorithm>
 #include <map>
@@ -102,6 +110,23 @@ CUDA_SRC = r"""
 #include <vector>
 
 typedef __nv_bfloat16 bf16;
+
+// The activation type T: bf16 or __half (the model's dtype; the output keeps it)
+template <typename T> struct Act;
+template <> struct Act<bf16> {
+  typedef __nv_bfloat162 T2;
+  static __device__ __forceinline__ float2 f2(T2 v) { return __bfloat1622float2(v); }
+  static __device__ __forceinline__ float f(bf16 v) { return __bfloat162float(v); }
+  static __device__ __forceinline__ T2 from2(float a, float b) {
+    return __floats2bfloat162_rn(a, b);
+  }
+};
+template <> struct Act<__half> {
+  typedef __half2 T2;
+  static __device__ __forceinline__ float2 f2(T2 v) { return __half22float2(v); }
+  static __device__ __forceinline__ float f(__half v) { return __half2float(v); }
+  static __device__ __forceinline__ T2 from2(float a, float b) { return __floats2half2_rn(a, b); }
+};
 
 #define LT_CHECK(x)                                                                     \
   do {                                                                                  \
@@ -132,46 +157,49 @@ __device__ __forceinline__ float block_max(float v, float* red) {
   return v;
 }
 
+template <typename T>
 __device__ __forceinline__ float amax8(const uint4& v, float m) {
-  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v);
+  const typename Act<T>::T2* h = reinterpret_cast<const typename Act<T>::T2*>(&v);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const float2 f = __bfloat1622float2(h[i]);
+    const float2 f = Act<T>::f2(h[i]);
     m = fmaxf(m, fmaxf(fabsf(f.x), fabsf(f.y)));
   }
   return m;
 }
 
-// 8 bf16 (one uint4) -> 8 e4m3 codes (one uint2): v / s rounded to nearest even, saturated
-// to +-448 (the math of quant.quantize_fp8_activations: clamp, then round)
+// 8 activations (one uint4) -> 8 e4m3 codes (one uint2): v / s rounded to nearest even,
+// saturated to +-448 (the math of quant.quantize_fp8_activations: clamp, then round)
+template <typename T>
 __device__ __forceinline__ uint2 to_e4m3x8(const uint4& v, float s) {
-  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v);
+  const typename Act<T>::T2* h = reinterpret_cast<const typename Act<T>::T2*>(&v);
   uint2 out;
   __nv_fp8x2_storage_t* o = reinterpret_cast<__nv_fp8x2_storage_t*>(&out);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const float2 f = __bfloat1622float2(h[i]);
+    const float2 f = Act<T>::f2(h[i]);
     o[i] = __nv_cvt_float2_to_fp8x2(make_float2(f.x / s, f.y / s), __NV_SATFINITE, __NV_E4M3);
   }
   return out;
 }
 
 // Per token: one block per row; s[row] = amax / 448 (1 for a row of zeros), q = x / s.
-__global__ void __launch_bounds__(256) quant_token_k(const bf16* __restrict__ x, int64_t ldx,
+template <typename T>
+__global__ void __launch_bounds__(256) quant_token_k(const T* __restrict__ x, int64_t ldx,
                                                      uint8_t* __restrict__ q,
                                                      float* __restrict__ s, int K) {
   __shared__ float red[8];
-  const bf16* xr = x + (int64_t)blockIdx.x * ldx;
+  const T* xr = x + (int64_t)blockIdx.x * ldx;
   float amax = 0.f;
   for (int c = threadIdx.x * 8; c < K; c += 256 * 8)
-    amax = amax8(__ldg(reinterpret_cast<const uint4*>(xr + c)), amax);
+    amax = amax8<T>(__ldg(reinterpret_cast<const uint4*>(xr + c)), amax);
   amax = block_max(amax, red);
   const float sc = amax > 0.f ? amax / 448.f : 1.f;
   if (threadIdx.x == 0) s[blockIdx.x] = sc;
   uint8_t* qr = q + (int64_t)blockIdx.x * K;
   for (int c = threadIdx.x * 8; c < K; c += 256 * 8)
     *reinterpret_cast<uint2*>(qr + c) =
-        to_e4m3x8(__ldg(reinterpret_cast<const uint4*>(xr + c)), sc);
+        to_e4m3x8<T>(__ldg(reinterpret_cast<const uint4*>(xr + c)), sc);
 }
 
 // ue8m0 exponent of a block: the smallest e with amax / 2^e <= 448, ceil(log2(amax / 448)),
@@ -196,7 +224,8 @@ __device__ __forceinline__ int64_t blocked_offset(int row, int col, int ncb) {
 
 // MXFP8: one thread per 32 consecutive elements of a row: codes x / 2^e and the scale byte at
 // its blocked place; the padding rows M..Mpad-1 get code 0 (as quant.swizzle_mx_scales).
-__global__ void __launch_bounds__(256) quant_mx_k(const bf16* __restrict__ x, int64_t ldx,
+template <typename T>
+__global__ void __launch_bounds__(256) quant_mx_k(const T* __restrict__ x, int64_t ldx,
                                                   uint8_t* __restrict__ q,
                                                   uint8_t* __restrict__ sf, int M, int Mpad,
                                                   int K) {
@@ -214,22 +243,25 @@ __global__ void __launch_bounds__(256) quant_mx_k(const bf16* __restrict__ x, in
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     v[i] = __ldg(xr + i);
-    amax = amax8(v[i], amax);
+    amax = amax8<T>(v[i], amax);
   }
   const int e = ue8m0_ceil(amax);
   const float sc = ldexpf(1.f, e);  // a power of two: x / sc is exact before the rounding
   uint2* qr = reinterpret_cast<uint2*>(q + (int64_t)row * K + col * 32);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) qr[i] = to_e4m3x8(v[i], sc);
+  for (int i = 0; i < 4; ++i) qr[i] = to_e4m3x8<T>(v[i], sc);
   sf[blocked_offset(row, col, ncb)] = (uint8_t)(e + 127);
 }
 
-// Tensor-wise epilogue: y[m, n] = bf16((sum over splits of p[s, m, n]) * sx[m] * sw[n] + b[n]),
-// 8 outputs per thread (N % 8 == 0). p may be y (one split: in place).
+// Tensor-wise epilogue: y[m, n] = T((sum over splits of p[s, m, n]) * sx[m] * sw[n] + b[n]),
+// 8 outputs per thread (N % 8 == 0). The unscaled partials p are bf16 for either T (in fp16
+// they would overflow: |codes| up to 448 times 448 times K); p may be y (bf16, one split: in
+// place).
+template <typename T>
 __global__ void __launch_bounds__(256) scale_k(const bf16* p, int splits, int64_t MN,
                                                const float* __restrict__ sx,
                                                const float* __restrict__ sw,
-                                               const bf16* __restrict__ bias, bf16* y, int N) {
+                                               const T* __restrict__ bias, T* y, int N) {
   const int64_t i = ((int64_t)blockIdx.x * 256 + threadIdx.x) * 8;
   if (i >= MN) return;
   const int m = (int)(i / N), n = (int)(i % N);
@@ -248,15 +280,15 @@ __global__ void __launch_bounds__(256) scale_k(const bf16* p, int splits, int64_
   }
   const float a = sx[m];
   uint4 out;
-  __nv_bfloat162* o = reinterpret_cast<__nv_bfloat162*>(&out);
+  typename Act<T>::T2* o = reinterpret_cast<typename Act<T>::T2*>(&out);
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     float r0 = acc[2 * j] * a * sw[n + 2 * j], r1 = acc[2 * j + 1] * a * sw[n + 2 * j + 1];
     if (bias) {
-      r0 += __bfloat162float(bias[n + 2 * j]);
-      r1 += __bfloat162float(bias[n + 2 * j + 1]);
+      r0 += Act<T>::f(bias[n + 2 * j]);
+      r1 += Act<T>::f(bias[n + 2 * j + 1]);
     }
-    o[j] = __floats2bfloat162_rn(r0, r1);
+    o[j] = Act<T>::from2(r0, r1);
   }
   *reinterpret_cast<uint4*>(y + i) = out;
 }
@@ -279,7 +311,8 @@ struct Plan {
 static constexpr size_t kWs = 32u << 20;
 static std::mutex g_mu;
 static std::map<int, void*> g_ws;  // one fixed workspace per device (graph-capturable)
-static std::map<std::tuple<int, int64_t, int64_t, int64_t, int, int>, Plan> g_plans;
+// (device, M, N, K, mode, split request, D type)
+static std::map<std::tuple<int, int64_t, int64_t, int64_t, int, int, int>, Plan> g_plans;
 
 static cublasLtHandle_t handle() {
   static cublasLtHandle_t h = nullptr;
@@ -305,7 +338,10 @@ static void destroy(Plan& p) {
 }
 
 // Descriptors, layouts and the heuristic's algorithms (<= 8; none if the mode is unsupported).
-static Plan make_plan(int dev, int64_t M, int64_t N, int64_t K, int mode, int splits) {
+// dtype: D's type, CUDA_R_16BF or CUDA_R_16F (MXFP8's scaled output in the activations' type;
+// tensor-wise always writes its unscaled product in bf16).
+static Plan make_plan(int dev, int64_t M, int64_t N, int64_t K, int mode, int splits,
+                      cudaDataType_t dtype) {
   Plan p;
   p.splits = splits;
   p.ws = workspace(dev);
@@ -328,7 +364,7 @@ static Plan make_plan(int dev, int64_t M, int64_t N, int64_t K, int mode, int sp
   const int64_t kb = K / splits;
   LT_CHECK(cublasLtMatrixLayoutCreate(&p.la, CUDA_R_8F_E4M3, kb, N, K));
   LT_CHECK(cublasLtMatrixLayoutCreate(&p.lb, CUDA_R_8F_E4M3, kb, M, K));
-  LT_CHECK(cublasLtMatrixLayoutCreate(&p.lc, CUDA_R_16BF, N, M, N));
+  LT_CHECK(cublasLtMatrixLayoutCreate(&p.lc, dtype, N, M, N));
   if (splits > 1) {  // batch b reads K slice b of both operands and writes partial b of D
     const int32_t count = splits;
     const int64_t mn = M * N;
@@ -372,15 +408,15 @@ static cublasStatus_t matmul(const Plan& p, int algo, const void* w, const void*
 // The plan for a shape: every (split, algorithm) candidate timed interleaved (3 rounds of 10
 // calls each, minimum per candidate) on scratch operands; inside a graph capture the
 // heuristic's first algorithm, untimed.
-static Plan choose(int dev, int64_t M, int64_t N, int64_t K, int mode, int splits, cudaStream_t st,
-                   bool capturing) {
+static Plan choose(int dev, int64_t M, int64_t N, int64_t K, int mode, int splits,
+                   cudaDataType_t dtype, cudaStream_t st, bool capturing) {
   std::vector<int> options;
   if (splits > 0) options = {splits};
   else if (mode == TENSORWISE && K % 64 == 0 && K >= 1024) options = {1, 2};
   else options = {1};
   std::vector<Plan> cands;
   for (int s : options) {
-    Plan p = make_plan(dev, M, N, K, mode, s);
+    Plan p = make_plan(dev, M, N, K, mode, s, dtype);
     if (p.algos.empty()) destroy(p);
     else cands.push_back(p);
   }
@@ -438,10 +474,12 @@ static Plan choose(int dev, int64_t M, int64_t N, int64_t K, int mode, int split
   return out;
 }
 
+// The plan of a shape; out: the activations' dtype (D is bf16 in the tensor-wise mode for both).
 static const Plan& get_plan(int64_t M, int64_t N, int64_t K, int mode, int splits,
-                            cudaStream_t st) {
+                            at::ScalarType out, cudaStream_t st) {
+  const cudaDataType_t dtype = mode == MXFP8 && out == at::kHalf ? CUDA_R_16F : CUDA_R_16BF;
   const int dev = c10::cuda::current_device();
-  const auto key = std::make_tuple(dev, M, N, K, mode, splits);
+  const auto key = std::make_tuple(dev, M, N, K, mode, splits, (int)dtype);
   std::lock_guard<std::mutex> lock(g_mu);
   auto it = g_plans.find(key);
   if (it != g_plans.end()) return it->second;
@@ -450,7 +488,8 @@ static const Plan& get_plan(int64_t M, int64_t N, int64_t K, int mode, int split
   const bool capturing = cs != cudaStreamCaptureStatusNone;
   TORCH_CHECK(!capturing || g_ws.count(dev),
               "FP8 cuBLASLt helper: call it once outside CUDA graph capture first (workspace)");
-  return g_plans.emplace(key, choose(dev, M, N, K, mode, splits, st, capturing)).first->second;
+  Plan p = choose(dev, M, N, K, mode, splits, dtype, st, capturing);
+  return g_plans.emplace(key, p).first->second;
 }
 
 // ------------------------------------------------------------------ entry points
@@ -462,17 +501,50 @@ static at::Tensor rows_of(const at::Tensor& x, int64_t M, int64_t K) {
   return x2;
 }
 
+// The activations x2 [M, K] of type T quantised into xq (e4m3 codes) and xs (per-token fp32
+// scales, or MXFP8's blocked ue8m0 scales).
+template <typename T>
+void quantise(const at::Tensor& x2, const at::Tensor& xq, const at::Tensor& xs, int64_t mode,
+              int64_t M, int64_t K, cudaStream_t st) {
+  if (mode == MXFP8) {
+    const int64_t Mpad = (M + 127) / 128 * 128, groups = K / 32;
+    quant_mx_k<T><<<(unsigned)((Mpad * groups + 255) / 256), 256, 0, st>>>(
+        (const T*)x2.data_ptr(), x2.stride(0), xq.data_ptr<uint8_t>(), xs.data_ptr<uint8_t>(),
+        (int)M, (int)Mpad, (int)K);
+  } else {
+    quant_token_k<T><<<(unsigned)M, 256, 0, st>>>((const T*)x2.data_ptr(), x2.stride(0),
+                                                   xq.data_ptr<uint8_t>(), xs.data_ptr<float>(),
+                                                   (int)K);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// The tensor-wise epilogue (scale_k) into y [M, N] of type T.
+template <typename T>
+void scale(const at::Tensor& part, int splits, const at::Tensor& xs, const at::Tensor& ws,
+           const at::Tensor& bias, const at::Tensor& y, int64_t M, int64_t N, cudaStream_t st) {
+  const int64_t mn = M * N;
+  scale_k<T><<<(unsigned)((mn / 8 + 255) / 256), 256, 0, st>>>(
+      (const bf16*)part.data_ptr(), splits, mn, xs.data_ptr<float>(), ws.data_ptr<float>(),
+      bias.numel() ? (const T*)bias.data_ptr() : nullptr, (T*)y.data_ptr(), (int)N);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // y_i = x . w_i^T (+ bias_i) for every weight w_i [N_i, K] e4m3 (one pybind call): x [..., K]
-// bf16 is quantised once (per token, or MXFP8), then one cached cuBLASLt matmul per weight.
-// ws_i: fp32 [N_i] per-channel scales (tensor-wise) or uint8 blocked ue8m0 scales (MXFP8);
-// bias_i: bf16 [N_i] or empty. splits: 0 timed, else forced (tensor-wise only).
+// bf16 or fp16 is quantised once (per token, or MXFP8), then one cached cuBLASLt matmul per
+// weight; y_i in x's dtype. ws_i: fp32 [N_i] per-channel scales (tensor-wise) or uint8 blocked
+// ue8m0 scales (MXFP8); bias_i: [N_i] in x's dtype, or empty. splits: 0 timed, else forced
+// (tensor-wise only).
 std::vector<at::Tensor> fp8_linears(at::Tensor x, std::vector<at::Tensor> w,
                                     std::vector<at::Tensor> ws, std::vector<at::Tensor> bias,
                                     int64_t mode, int64_t splits) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() >= 1,
-              "fp8_linears: x must be bf16 on a CUDA device");
+  const auto dt = x.scalar_type();
+  TORCH_CHECK(x.is_cuda() && (dt == at::kBFloat16 || dt == at::kHalf) && x.dim() >= 1,
+              "fp8_linears: x must be bf16 or fp16 on a CUDA device");
   TORCH_CHECK(!w.empty() && w.size() == ws.size() && w.size() == bias.size(),
               "fp8_linears: one scale and one (possibly empty) bias per weight");
+  for (auto& b : bias)
+    TORCH_CHECK(!b.numel() || b.scalar_type() == dt, "fp8_linears: a bias of another dtype");
   TORCH_CHECK(mode == TENSORWISE || splits <= 1, "fp8_linears: MXFP8 has no split-K");
   const c10::cuda::CUDAGuard guard(x.device());
   const int64_t K = x.size(-1), M = K ? x.numel() / K : 0;
@@ -493,37 +565,27 @@ std::vector<at::Tensor> fp8_linears(at::Tensor x, std::vector<at::Tensor> w,
   const at::Tensor x2 = rows_of(x, M, K);
   const auto bytes = x.options().dtype(at::kByte);
   const at::Tensor xq = at::empty({M, K}, bytes);
-  at::Tensor xs;
-  if (mode == MXFP8) {
-    const int64_t Mpad = (M + 127) / 128 * 128, groups = K / 32;
-    xs = at::empty({Mpad * ((groups + 3) / 4 * 4)}, bytes);
-    quant_mx_k<<<(unsigned)((Mpad * groups + 255) / 256), 256, 0, st>>>(
-        (const bf16*)x2.data_ptr(), x2.stride(0), xq.data_ptr<uint8_t>(), xs.data_ptr<uint8_t>(),
-        (int)M, (int)Mpad, (int)K);
-  } else {
-    xs = at::empty({M}, x.options().dtype(at::kFloat));
-    quant_token_k<<<(unsigned)M, 256, 0, st>>>((const bf16*)x2.data_ptr(), x2.stride(0),
-                                                xq.data_ptr<uint8_t>(), xs.data_ptr<float>(),
-                                                (int)K);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t Mpad = (M + 127) / 128 * 128, groups = K / 32;
+  const at::Tensor xs = mode == MXFP8 ? at::empty({Mpad * ((groups + 3) / 4 * 4)}, bytes)
+                                      : at::empty({M}, x.options().dtype(at::kFloat));
+  if (dt == at::kHalf) quantise<__half>(x2, xq, xs, mode, M, K, st);
+  else quantise<bf16>(x2, xq, xs, mode, M, K, st);
   for (size_t i = 0; i < w.size(); ++i) {
     const int64_t N = w[i].size(0);
     TORCH_CHECK(w[i].dim() == 2 && w[i].size(1) == K && w[i].is_contiguous(),
                 "fp8_linears: weight ", i, " must be a contiguous [N, K] e4m3 tensor");
-    const Plan& p = get_plan(M, N, K, (int)mode, (int)splits, st);
+    const Plan& p = get_plan(M, N, K, (int)mode, (int)splits, dt, st);
     sizes.back() = N;
     at::Tensor y = at::empty(sizes, x.options());
-    at::Tensor part = p.splits > 1 ? at::empty({p.splits, M, N}, x.options()) : y;
+    // tensor-wise: the unscaled product in bf16 ([splits, M, N]; in place in a bf16 y)
+    const bool in_place = mode == MXFP8 || (p.splits == 1 && dt == at::kBFloat16);
+    at::Tensor part = in_place ? y : at::empty({p.splits, M, N}, x.options().dtype(at::kBFloat16));
     const void* sw = mode == MXFP8 ? ws[i].data_ptr() : nullptr;
     const void* sx = mode == MXFP8 ? xs.data_ptr() : nullptr;
     LT_CHECK(matmul(p, p.pick, w[i].data_ptr(), xq.data_ptr(), sw, sx, part.data_ptr(), st));
     if (mode == TENSORWISE) {
-      const int64_t mn = M * N;
-      scale_k<<<(unsigned)((mn / 8 + 255) / 256), 256, 0, st>>>(
-          (const bf16*)part.data_ptr(), p.splits, mn, xs.data_ptr<float>(), ws[i].data_ptr<float>(),
-          bias[i].numel() ? (const bf16*)bias[i].data_ptr() : nullptr, (bf16*)y.data_ptr(), (int)N);
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      if (dt == at::kHalf) scale<__half>(part, p.splits, xs, ws[i], bias[i], y, M, N, st);
+      else scale<bf16>(part, p.splits, xs, ws[i], bias[i], y, M, N, st);
     } else if (bias[i].numel()) {
       y.add_(bias[i]);
     }
@@ -533,21 +595,23 @@ std::vector<at::Tensor> fp8_linears(at::Tensor x, std::vector<at::Tensor> w,
 }
 
 // The GEMM alone on activations a producer already quantised (xq [M, K] e4m3 as uint8 or
-// float8): tensor-wise writes the UNSCALED product into out ([splits, M, N] bf16; apply
-// x_scale[m] * w_scale[n] where the output is read next), MXFP8 the scaled one into out
-// [M, N] (xs, ws: blocked ue8m0 scales). splits: forced, >= 1.
+// float8): tensor-wise writes the UNSCALED product into out ([splits, M, N] bf16, whatever the
+// model's dtype; apply x_scale[m] * w_scale[n] where the output is read next), MXFP8 the
+// scaled one into out [M, N] (bf16 or fp16; xs, ws: blocked ue8m0 scales). splits: forced,
+// >= 1.
 void fp8_gemm(at::Tensor xq, at::Tensor xs, at::Tensor w, at::Tensor ws, at::Tensor out,
               int64_t mode, int64_t splits) {
   TORCH_CHECK(splits >= 1 && (mode == TENSORWISE || splits == 1), "fp8_gemm: bad splits");
   const c10::cuda::CUDAGuard guard(xq.device());
   const int64_t M = xq.size(0), K = xq.size(1), N = w.size(0);
   TORCH_CHECK(xq.is_contiguous() && w.is_contiguous() && w.size(1) == K, "fp8_gemm: bad operands");
-  TORCH_CHECK(out.is_contiguous() && out.scalar_type() == at::kBFloat16 &&
-                  out.numel() == splits * M * N,
-              "fp8_gemm: out must be contiguous bf16 [splits, M, N]");
+  const auto dt = out.scalar_type();
+  TORCH_CHECK(out.is_contiguous() && out.numel() == splits * M * N &&
+                  (dt == at::kBFloat16 || (mode == MXFP8 && dt == at::kHalf)),
+              "fp8_gemm: out must be contiguous bf16 [splits, M, N] (MXFP8: bf16 or fp16)");
   if (M == 0) return;
   const cudaStream_t st = at::cuda::getCurrentCUDAStream();
-  const Plan& p = get_plan(M, N, K, (int)mode, (int)splits, st);
+  const Plan& p = get_plan(M, N, K, (int)mode, (int)splits, dt, st);
   LT_CHECK(matmul(p, p.pick, w.data_ptr(), xq.data_ptr(), mode == MXFP8 ? ws.data_ptr() : nullptr,
                   mode == MXFP8 ? xs.data_ptr() : nullptr, out.data_ptr(), st));
 }
@@ -555,8 +619,9 @@ void fp8_gemm(at::Tensor xq, at::Tensor xs, at::Tensor w, at::Tensor ws, at::Ten
 // The MXFP8 activation quantisation of fp8_linears alone: codes [M, K] (uint8) and the scales
 // in the blocked layout (flat uint8): what the fp8_mx scale-rule guard checks.
 std::vector<at::Tensor> quant_mx(at::Tensor x) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.size(-1) % 32 == 0,
-              "quant_mx: bf16 CUDA x [..., K], K % 32 == 0");
+  const auto dt = x.scalar_type();
+  TORCH_CHECK(x.is_cuda() && (dt == at::kBFloat16 || dt == at::kHalf) && x.size(-1) % 32 == 0,
+              "quant_mx: bf16 or fp16 CUDA x [..., K], K % 32 == 0");
   const c10::cuda::CUDAGuard guard(x.device());
   const int64_t K = x.size(-1), M = x.numel() / K;
   const int64_t Mpad = (M + 127) / 128 * 128, groups = K / 32;
@@ -565,17 +630,18 @@ std::vector<at::Tensor> quant_mx(at::Tensor x) {
   at::Tensor sf = at::empty({Mpad * ((groups + 3) / 4 * 4)}, bytes);
   if (M == 0) return {q, sf};
   const at::Tensor x2 = rows_of(x, M, K);
-  quant_mx_k<<<(unsigned)((Mpad * groups + 255) / 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      (const bf16*)x2.data_ptr(), x2.stride(0), q.data_ptr<uint8_t>(), sf.data_ptr<uint8_t>(),
-      (int)M, (int)Mpad, (int)K);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  if (dt == at::kHalf) quantise<__half>(x2, q, sf, MXFP8, M, K, st);
+  else quantise<bf16>(x2, q, sf, MXFP8, M, K, st);
   return {q, sf};
 }
 
 // [splits, algorithms the heuristic offered, us per call (-1: untimed)] of the plan for a
-// shape and mode (timed now unless capturing): which mode and split run here, measured.
+// shape and mode (timed now unless capturing; bf16 output): which mode and split run here,
+// measured.
 std::vector<double> plan_info(int64_t M, int64_t N, int64_t K, int64_t mode, int64_t splits) {
-  const Plan& p = get_plan(M, N, K, (int)mode, (int)splits, at::cuda::getCurrentCUDAStream());
+  const Plan& p = get_plan(M, N, K, (int)mode, (int)splits, at::kBFloat16,
+                           at::cuda::getCurrentCUDAStream());
   return {(double)p.splits, (double)p.algos.size(), (double)p.us};
 }
 """
@@ -621,11 +687,12 @@ def plan_info(m: int, n: int, k: int, mode: int = TENSORWISE, splits: int = 0) -
 def quantize_activations(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """The MXFP8 mode's activation quantisation of ``x [..., K]``: codes e4m3 ``[rows, K]``
     and unswizzled e8m0 scales ``[rows, K / 32]`` (what the ``fp8_mx`` scale-rule guard
-    checks). CUDA bf16 with K % 128 == 0: this file's ``quant_mx_k`` (its blocked scales read
+    checks). CUDA bf16 / fp16 with K % 128 == 0: this file's ``quant_mx_k`` (its blocked
+    scales read
     back through ``quant.mx_scale_offset``); else ``quant.quantize_mxfp8``, the same rule."""
     x2 = x.reshape(-1, x.shape[-1])
     rows, k = x2.shape
-    if not (x2.is_cuda and x2.dtype == torch.bfloat16 and k % 128 == 0):
+    if not (x2.is_cuda and x2.dtype in DTYPES and k % 128 == 0):
         return quantize_mxfp8(x2)
     codes, flat = _load().quant_mx(x2)
     r = torch.arange(rows, device=x2.device)[:, None]
@@ -672,8 +739,9 @@ class _Quantised:
         else:
             self.codes, self.scales = quantize_fp8(w)  # once, here: never per call
             self.error = fp8_error(w, self.codes, self.scales)
-        none = torch.empty(0, dtype=torch.bfloat16, device=w.device)
+        none = torch.empty(0, dtype=w.dtype, device=w.device)
         self.bias_arg = reference.bias.detach() if reference.bias is not None else none
+        self.dtype = w.dtype  # the kernels' activations (and bias) dtype
 
     def fallback(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == MXFP8:
@@ -695,10 +763,11 @@ class Fp8LtLinear(nn.Module):
         self._q = q
         # plain attributes: the forward does no nn.Module lookups
         self._args = (q.codes, q.scales, q.bias_arg, mode, splits)
+        self._dtype = q.dtype
         self._fn = _load().fp8_linears
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != torch.bfloat16 or not x.is_cuda:
+        if x.dtype != self._dtype or not x.is_cuda:
             return self._q.fallback(x)
         if torch.compiler.is_compiling():
             return lt_linear(x, *self._args)
@@ -718,10 +787,11 @@ class Fp8LtGroup(nn.Module):
         self._qs = qs
         self._lists = ([q.codes for q in qs], [q.scales for q in qs], [q.bias_arg for q in qs])
         self._mode, self._splits = mode, splits
+        self._dtypes = {q.dtype for q in qs}
         self._fn = _load().fp8_linears
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        if x.dtype != torch.bfloat16 or not x.is_cuda:
+        if self._dtypes != {x.dtype} or x.dtype not in DTYPES or not x.is_cuda:
             return tuple(q.fallback(x) for q in self._qs)
         return tuple(self._fn(x, *self._lists, self._mode, self._splits))
 
@@ -731,9 +801,9 @@ def build(reference: nn.Module, mxfp8: int = 0, splits: int = 0) -> nn.Module:
     timed per shape, 1 or 2 forced (tensor-wise). Tuning keywords for ``sweep_candidate``."""
     ok = (
         isinstance(reference, nn.Linear)
-        and reference.weight.dtype == torch.bfloat16
+        and reference.weight.dtype in DTYPES
         and reference.weight.is_cuda
-        and (reference.bias is None or reference.bias.dtype == torch.bfloat16)
+        and (reference.bias is None or reference.bias.dtype == reference.weight.dtype)
     )
     if not ok:
         return reference

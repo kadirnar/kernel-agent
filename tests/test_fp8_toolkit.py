@@ -421,18 +421,20 @@ def test_w8a8_dot_scaled_is_bit_identical_to_dot():
 
 
 @pytest.mark.gpu
-def test_cublaslt_helper_against_the_reference_math():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])  # fp16 models too (#258)
+def test_cublaslt_helper_against_the_reference_math(dtype):
     capability = _gpu("cuda", "cuda_cublaslt_fp8.py")
     from kernel_agent.kernels.quant import fp8_w8a8_linear
 
     lt = _example("cuda_cublaslt_fp8.py")
     torch.manual_seed(0)
-    lins = [torch.nn.Linear(1024, n).cuda().to(torch.bfloat16) for n in (2560, 1024)]
-    x = torch.randn(2, 176, 1024, device="cuda", dtype=torch.bfloat16)
+    lins = [torch.nn.Linear(1024, n).cuda().to(dtype) for n in (2560, 1024)]
+    x = torch.randn(2, 176, 1024, device="cuda", dtype=dtype)
     with torch.no_grad():
         for lin in lins:
             for splits in (0, 1, 2):
                 mod = lt.build(lin, splits=splits)
+                assert mod is not lin and mod(x).dtype == dtype
                 ref = fp8_w8a8_linear(x, mod.weight_fp8, mod.weight_scale, lin.bias)
                 rel = float((mod(x).float() - ref.float()).norm() / ref.float().norm())
                 assert rel < 5e-3, (lin.out_features, splits, rel)  # one more bf16 rounding
