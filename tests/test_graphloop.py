@@ -87,6 +87,7 @@ class FakeGraph:
 
     def launch(self, stream: Any) -> None:
         self.core.log.append(("launch graph", stream.handle))
+        self.core.ran()
 
 
 class FakeCore:
@@ -100,6 +101,7 @@ class FakeCore:
         self.launches: list[tuple[str, str, tuple[Any, ...]]] = []
         self.handles = iter(range(500, 10_000))
         self.fail_complete = False
+        self.on_launch: Any = None  # what a launched graph "does" (the fake runs nothing)
         core = self
 
         class Device:
@@ -131,6 +133,75 @@ class FakeCore:
         self.log.append(("launch", builder.name, kernel))
         self.launches.append((builder.name, kernel, args))
 
+    def ran(self) -> None:
+        if self.on_launch is not None:
+            self.on_launch()
+
+
+def _round4(n: int) -> int:
+    return (n + 3) // 4 * 4
+
+
+class FakeGenerator:
+    """torch's CUDA generator as graphloop uses it: a seed and a Philox offset (a multiple
+    of 4) that each draw advances by its count rounded up to 4. Under a capture a draw is
+    refused (torch: the generator state is not in capture mode) unless a FakeGraphRng has
+    it in capture mode: then the draw is counted there (torch's offset within a capture)."""
+
+    def __init__(self, cuda: FakeCuda) -> None:
+        self.cuda = cuda
+        self.seed = self.offset = 0
+        self.capture: FakeGraphRng | None = None
+
+    def initial_seed(self) -> int:
+        return self.seed
+
+    def manual_seed(self, seed: int) -> None:
+        self.seed, self.offset = seed, 0
+
+    def get_offset(self) -> int:
+        return self.offset
+
+    def set_offset(self, offset: int) -> None:
+        assert offset % 4 == 0 and offset >= 0, offset
+        self.offset = offset
+
+    def draw(self, n: int) -> torch.Tensor:
+        """``n`` numbers that only the seed and the offset decide (a Philox draw)."""
+        if self.capture is not None:
+            self.capture.counted += _round4(n)
+            return torch.zeros(n)
+        if self.cuda.current != "caller":
+            raise RuntimeError(
+                "Attempt to increase offset for a CUDA generator not in capture mode."
+            )
+        out = torch.rand(n, generator=torch.Generator().manual_seed(self.seed * 7919 + self.offset))
+        self.offset += _round4(n)
+        return out
+
+
+class FakeGraphRng:
+    """graphloop._GraphRng on the CPU: the device scalars are CPU tensors."""
+
+    def __init__(self, cuda: FakeCuda, generator: FakeGenerator) -> None:
+        self.cuda, self.generator = cuda, generator
+        self.seed = torch.zeros(1, dtype=torch.int64)
+        self.offset = torch.zeros(1, dtype=torch.int64)
+        self.counted = 0
+
+    @contextlib.contextmanager
+    def capture(self) -> Iterator[None]:
+        self.cuda._core.log.append(("rng", "capture"))
+        self.generator.capture = self
+        try:
+            yield
+        finally:
+            self.generator.capture = None
+            self.cuda._core.log.append(("rng", "end"))
+
+    def increment(self) -> int:
+        return self.counted
+
 
 class FakeEvent:
     def record(self, stream: Any) -> None:
@@ -159,6 +230,9 @@ class FakeCuda(graphloop._Cuda):
         self.current: Any = "caller"
         self.pool: Any = None
         self.captures = 0
+        self.gen = FakeGenerator(self)
+        self.graph_rngs: list[FakeGraphRng] = []
+        self.rng_error: str | None = None  # graph_rng raises it
 
     def core(self) -> Any:
         return self._core
@@ -226,7 +300,20 @@ class FakeCuda(graphloop._Cuda):
     def runtime_launch(self, graph: Any, stream: Any) -> bool:
         if self.runtime:
             self._core.log.append(("cudaGraphLaunch", stream.cuda_stream))
+            self._core.ran()
         return self.runtime
+
+    def generator(self, device: int) -> Any:
+        return self.gen
+
+    def graph_rng(self, generator: Any, device: int) -> Any:
+        if self.rng_error is not None:
+            raise RuntimeError(self.rng_error)
+        self.graph_rngs.append(FakeGraphRng(self, generator))
+        return self.graph_rngs[-1]
+
+    def leave_rng_capture(self, device: int, *states: Any) -> None:
+        self._core.log.append(("leave rng capture", len(states)))
 
 
 @pytest.fixture
@@ -271,8 +358,10 @@ def test_while_graph_structure_body_condition_and_pool(fake):
         ("launch", "main", "ka_loop_begin"),
         ("while", "main", "main"),
         ("begin", "body"),
+        ("rng", "capture"),  # no warm-up run said whether the step draws
         ("external stream", body),
         ("pool", "private pool"),
+        ("rng", "end"),
         ("condition", "body", 0),
         ("launch", "body", "ka_loop_step"),
         ("if", "body", "body"),
@@ -292,9 +381,10 @@ def test_while_graph_structure_body_condition_and_pool(fake):
     assert seen == [("step", f"ext{body}", "private pool")]
     assert chunks == [("chunk", f"ext{then}", "private pool")]
     launches = {kernel: (where, args) for where, kernel, args in fake._core.launches}
-    loop_cond, chunk_cond, flags, n_flags, index, active, limits, every, host = launches[
+    loop_cond, chunk_cond, flags, n_flags, index, active, limits, every, host, *rng = launches[
         "ka_loop_step"
     ][1]
+    assert rng == [0, 0]  # the step draws nothing: no offset to advance
     assert (loop_cond.graph, chunk_cond.graph) == ("main", "body")
     assert (n_flags, every) == (1, 2) and flags != 0
     assert (index, active) == (loop.index.data_ptr(), loop.active.data_ptr())
@@ -318,7 +408,7 @@ def test_while_graph_without_stop_flags_or_chunks(fake):
     kinds = [entry[0] for entry in fake._core.log]
     assert "if" not in kinds and kinds.count("condition") == 1
     (args,) = [a for _, kernel, a in fake._core.launches if kernel == "ka_loop_step"]
-    assert args[1:4] == (0, 0, 0) and args[-2:] == (0, 0)  # no chunk, no flags, no host
+    assert args[1:4] == (0, 0, 0) and args[-4:] == (0, 0, 0, 0)  # no chunk, flags, host, draws
 
 
 def test_the_warm_up_runs_are_host_runs_then_the_graph_is_built(fake):
@@ -788,6 +878,131 @@ def test_stats_sources_report_only_loops_that_ran(fake, monkeypatch):
     assert quiet.stats_since(None) == {}
 
 
+# ------------------------------------------------------------------ random numbers
+
+LIMIT, STOP, PER_STEP = 8, 5, 8  # a step draws 6 numbers: 8 Philox offsets (rounded to 4)
+
+
+def _drawing_loop(fake: FakeCuda, **options: Any) -> tuple[Any, torch.Tensor, torch.Tensor]:
+    """A loop whose step draws 6 numbers from the device's generator into ``out[index]``
+    (masked) and stops after STOP steps."""
+    out = torch.zeros(LIMIT, 6)
+    count = torch.zeros((), dtype=torch.int64)
+
+    def step(index: torch.Tensor, active: torch.Tensor) -> None:
+        noise = fake.gen.draw(6).view(1, 6)
+        graphloop.masked_index_copy_(out, 0, index.view(1), noise, active)
+        graphloop.masked_copy_(count, count + 1, active)
+
+    options = {"masked": True, "device": "cpu", **options}
+    loop = graphloop.device_loop(step, lambda: count >= STOP, LIMIT, **options)
+    return loop, out, count
+
+
+def _plain_draws(fake: FakeCuda, seed: int) -> tuple[torch.Tensor, int]:
+    """The plain loop's draws (seeded) and where it leaves the generator."""
+    fake.gen.manual_seed(seed)
+    out = torch.zeros(LIMIT, 6)
+    for i in range(STOP):
+        out[i] = fake.gen.draw(6)
+    return out, fake.gen.offset
+
+
+@pytest.mark.parametrize("rng", ["exact", "reserve"])
+@pytest.mark.parametrize("mode", ["host", "unrolled"])
+def test_draws_are_the_plain_loops_and_rng_says_where_the_generator_ends(fake, mode, rng):
+    """The unrolled blocks replay torch's graphs (draws from the replay's offset on), so a
+    block's steps draw the plain loop's numbers; its masked steps after the stop draw too
+    and the run corrects the generator: ``exact`` leaves it where the plain loop does,
+    ``reserve`` at max_steps' draws, in every mode. The build's own draws (the masked check
+    and the measuring replay) are put back."""
+    want, plain_end = _plain_draws(fake, seed=11)
+    assert plain_end == STOP * PER_STEP
+    loop, out, count = _drawing_loop(fake, mode=mode, unroll=3, rng=rng)
+    for _ in range(3):  # the warm-up host run, then the built mode's runs
+        fake.gen.manual_seed(11)
+        out.zero_()
+        count.zero_()
+        loop.run()
+        assert torch.equal(out, want)
+        assert fake.gen.offset == (plain_end if rng == "exact" else LIMIT * PER_STEP)
+    assert loop.mode == mode and loop.stats["rng_offsets_per_step"] == PER_STEP
+    if mode == "unrolled":  # blocks of 3, read one behind: 9 steps drew
+        assert loop.stats["launches"] == 2 * 3
+
+
+def _launched(fake: FakeCuda, loop: Any, steps: int) -> list[tuple[int, int]]:
+    """What each launch of the fake WHILE graph saw in the RNG scalars (seed, offset); the
+    "graph" runs ``steps`` steps."""
+    seen: list[tuple[int, int]] = []
+
+    def run() -> None:
+        rng = fake.graph_rngs[-1]
+        seen.append((int(rng.seed), int(rng.offset)))
+        loop.index.fill_(steps)
+
+    fake._core.on_launch = run
+    return seen
+
+
+@pytest.mark.parametrize("rng", ["exact", "reserve"])
+def test_a_while_body_that_draws_reads_offsets_its_step_kernel_advances(fake, rng):
+    """The step is captured with the RNG state in capture mode (on_chunk is not: its draws
+    are refused); ka_loop_step advances the offset scalar by the step's increment; each
+    launch fills the scalars from the generator (the seed only when it changed) and takes
+    max_steps' offsets; ``exact`` then reads the steps and gives back the rest."""
+    loop, _, _ = _drawing_loop(fake, mode="while", rng=rng, chunk_every=4)
+    fake.gen.manual_seed(11)
+    loop.run()  # the warm-up host run measures the step's draws
+    assert loop.mode is None and loop.stats["rng_offsets_per_step"] == PER_STEP
+    seen = _launched(fake, loop, steps=STOP)
+    loop.run()
+    assert loop.mode == "while" and loop.reason == "while built"
+    log = fake._core.log
+    begin = log.index(("begin", "body"))
+    assert log[begin + 1 : begin + 5] == [
+        ("rng", "capture"),
+        ("external stream", 501),
+        ("pool", "private pool"),
+        ("rng", "end"),
+    ]
+    assert log.index(("rng", "end")) < log.index(("begin", "then"))  # on_chunk's: refused
+    (graph_rng,) = fake.graph_rngs
+    (args,) = [a for _, kernel, a in fake._core.launches if kernel == "ka_loop_step"]
+    assert args[-2:] == (graph_rng.offset.data_ptr(), PER_STEP)
+    base = STOP * PER_STEP if rng == "exact" else LIMIT * PER_STEP  # after the warm-up
+    assert seen == [(11, base)]
+    after = base + (STOP if rng == "exact" else LIMIT) * PER_STEP
+    assert fake.gen.offset == after
+    graph_rng.seed.fill_(-1)  # the seed is not filled again while it stays the same
+    assert list(loop.chunks()) == []  # (the fake's IF node signals nothing)
+    assert seen[-1] == (-1, after) and fake.gen.offset == after + (after - base)
+    fake.gen.manual_seed(12)
+    loop.run()
+    assert seen[-1] == (12, 0)
+
+
+def test_a_while_build_sets_no_rng_state_up_for_a_step_that_drew_nothing(fake):
+    loop, _ = _counter_loop(fake, mode="while")
+    loop.run()  # the warm-up: no draws
+    loop.run()
+    assert loop.mode == "while" and not fake.graph_rngs and ("rng", "capture") not in fake._core.log
+    assert "rng_offsets_per_step" not in loop.stats
+
+
+def test_without_a_graph_safe_rng_state_a_drawing_step_falls_back(fake):
+    fake.rng_error = "torch 9.9: a generator state's device seed and offset were not found"
+    plain, _ = _counter_loop(fake, mode="while", warmup_runs=0)
+    plain.run()  # draws nothing: built without it
+    assert plain.mode == "while" and "were not found" in plain.stats["rng"]
+    want, plain_end = _plain_draws(fake, seed=3)
+    loop, out, _ = _drawing_loop(fake, warmup_runs=0, unroll=2)
+    fake.gen.manual_seed(3)
+    loop.run()
+    assert loop.mode == "unrolled" and "not in capture mode" in loop.reason
+    assert torch.equal(out, want) and fake.gen.offset == plain_end
+
+
 # ------------------------------------------------------------------ teacher forcing
 
 
@@ -933,6 +1148,9 @@ def test_option_errors():
         graphloop.device_loop(step, None, 3, on_chunk=lambda: None, device="cpu")
     with pytest.raises(ValueError, match="no stop flags"):
         graphloop.device_loop(step, torch.zeros(0), 3, mode="host", device="cpu").run()
+    with pytest.raises(ValueError, match="rng must be one of"):
+        graphloop.device_loop(step, None, 3, rng="fresh", device="cpu")
+    assert graphloop._int64(2**64 - 1) == -1 and graphloop._int64(5) == 5  # a seed's bits
 
 
 # ------------------------------------------------------------------ doctor and skills
@@ -960,14 +1178,20 @@ def test_doctor_probe_reports_support_skip_and_failure(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("compiled", "want"),
-    [(True, True), (None, True), (False, False)],  # None: no torch.compile step here
+    ("compiled", "drawn", "want"),
+    [
+        (True, True, True),
+        (None, None, True),  # None: no torch.compile step / no RNG capture here
+        (False, True, False),
+        (True, False, False),
+    ],
 )
-def test_the_probe_adds_the_torch_compile_check(monkeypatch, compiled, want):
+def test_the_probe_adds_the_torch_compile_and_rng_checks(monkeypatch, compiled, drawn, want):
     monkeypatch.setattr(graphloop, "conditional_support", lambda: None)
     monkeypatch.setattr(graphloop, "_probe_while", lambda: (True, "while ok"))
     monkeypatch.setattr(graphloop, "_probe_compiled", lambda: (compiled, f"compile {compiled}"))
-    assert graphloop.probe() == (want, f"while ok; compile {compiled}")
+    monkeypatch.setattr(graphloop, "_probe_rng", lambda: (drawn, f"rng {drawn}"))
+    assert graphloop.probe() == (want, f"while ok; compile {compiled}; rng {drawn}")
     monkeypatch.setattr(graphloop, "_probe_while", lambda: (False, "while wrong"))
     assert graphloop.probe() == (False, "while wrong")  # not tried after a wrong graph
 
@@ -1015,6 +1239,29 @@ def test_toy_decoder_while_and_unrolled_vs_host_loop():
         assert while_row["ms_per_token"] < rows["host loop"]["ms_per_token"]
     unrolled = rows["device loop (unrolled)"]
     assert unrolled["mode"] == "unrolled" and unrolled["host_checks"] <= n
+
+
+@pytest.mark.gpu
+@gpu
+def test_toy_decoder_sampling_gives_the_host_loops_tokens():
+    """#232: temperature sampling (torch.multinomial) in the toy decoder's step: the WHILE
+    graph and the unrolled blocks give the host loop's tokens, run after run."""
+    ex = _example()
+    with torch.inference_mode():
+        model = ex.ToyDecoder(vocab=512, dim=128, heads=4, layers=1, max_len=160)
+        req = ex.Request(model, 128, temperature=0.8, seed=5)
+        prompt = list(range(3, 19))
+        free, _ = ex.generate_host(req, prompt, eos=-1)
+        eos = next(t for i, t in enumerate(free) if i >= 64 and t not in free[:i])
+        reference, _ = ex.generate_host(req, prompt, eos)
+        assert 64 < len(reference) <= 128
+        modes = ["unrolled"] + (["while"] if graphloop.conditional_support() is None else [])
+        for mode in modes:
+            gen = ex.DeviceGenerator(req, eos, mode=mode)
+            for _ in range(4):  # the warm-up host run, then the graph's
+                tokens, _ = gen.generate(prompt)
+                assert tokens == reference, mode
+            assert gen.loop.mode == mode and gen.loop.stats["rng_offsets_per_step"] > 0
 
 
 @pytest.mark.gpu
@@ -1092,7 +1339,7 @@ def test_while_chunks_reach_the_host_and_leaving_early_cancels():
 
 @pytest.mark.gpu
 @gpu
-def test_a_step_that_syncs_or_draws_falls_back_and_leaves_no_capture_open():
+def test_a_step_that_syncs_falls_back_and_leaves_no_capture_open():
     if graphloop.conditional_support() is not None:
         pytest.skip(graphloop.conditional_support())
     x = torch.zeros(4, 8, device="cuda")
@@ -1119,11 +1366,77 @@ def test_a_step_that_syncs_or_draws_falls_back_and_leaves_no_capture_open():
     loop = graphloop.device_loop(draws, None, 4, masked=True, warmup_runs=0)
     loop.run()
     torch.cuda.synchronize()
-    # torch refuses the draw under the WHILE capture; the words depend on its version (2.14:
-    # "RNG op during graph capture"; 2.10: "expected scalar type Long but found
-    # UNKNOWN_SCALAR", A10)
-    assert loop.mode == "unrolled" and loop.reason.startswith("while: RuntimeError: ")
+    assert loop.mode == "while" and loop.stats["rng_offsets_per_step"] > 0  # captured (#232)
     assert len({tuple(row.tolist()) for row in x.cpu()}) == 4  # every step drew its own
+
+    def draws_and_syncs(index: torch.Tensor, active: torch.Tensor) -> None:
+        x[0] += float(torch.randn(1, device="cuda").item())
+
+    # torch 2.10 (A10): its failed capture of a step that drew left the default generator in
+    # capture mode, and every later draw of the process raised
+    loop = graphloop.device_loop(draws_and_syncs, None, 4, masked=True, warmup_runs=0)
+    loop.run()
+    assert loop.mode == "host" and "while: " in loop.reason and "unrolled: " in loop.reason
+    torch.manual_seed(3)
+    eager = torch.randn(4, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graphed = torch.randn(4, device="cuda")
+    torch.manual_seed(3)
+    graph.replay()
+    assert torch.equal(graphed, eager)
+
+
+def _drawing_step(out: torch.Tensor, tok: torch.Tensor, count: torch.Tensor) -> Any:
+    """A sampling step: noise from torch.randn, a token from torch.multinomial, masked."""
+
+    def step(index: torch.Tensor, active: torch.Tensor) -> None:
+        noise = torch.randn(8, device="cuda")
+        token = torch.multinomial(torch.softmax(noise * 3, 0), 1)
+        graphloop.masked_index_copy_(out, 0, index.view(1), (noise + token).view(1, 8), active)
+        graphloop.masked_copy_(tok, token, active)
+        graphloop.masked_copy_(count, count + 1, active)
+
+    return step
+
+
+@pytest.mark.gpu
+@gpu
+@pytest.mark.parametrize("rng", ["exact", "reserve"])
+@pytest.mark.parametrize("mode", ["while", "unrolled", "host"])
+def test_a_step_that_draws_gives_the_plain_loops_numbers_in_every_mode(mode, rng):
+    """#232: torch.randn / torch.multinomial in the step, the stop after 13 of 24 steps. Every
+    run draws the plain loop's numbers, step for step; ``exact`` leaves the generator where
+    the plain loop does (the next draw is the plain loop's next draw), ``reserve`` at 24
+    steps' draws, in every mode."""
+    if mode == "while" and graphloop.conditional_support() is not None:
+        pytest.skip(graphloop.conditional_support())
+    limit, stop = 24, 13
+    with torch.inference_mode(False):
+        out = torch.zeros(limit, 8, device="cuda")
+        tok = torch.zeros(1, dtype=torch.int64, device="cuda")
+        count = torch.zeros((), dtype=torch.int64, device="cuda")
+    step = _drawing_step(out, tok, count)
+    torch.manual_seed(7)
+    for i in range(stop):  # the plain loop
+        step(torch.tensor(i, device="cuda"), torch.ones((), dtype=torch.bool, device="cuda"))
+    want, offset = out.clone(), torch.cuda.default_generators[0].get_offset()
+    following = torch.randn(4, device="cuda")
+    loop = graphloop.device_loop(
+        step, lambda: count >= stop, limit, mode=mode, masked=True, unroll=4, rng=rng
+    )
+    per_step = None
+    for _ in range(4):  # the warm-up host run, then the built mode's runs
+        torch.manual_seed(7)
+        out.zero_()
+        count.zero_()
+        loop.run()
+        assert torch.equal(out, want) and int(loop.index) == stop
+        per_step = loop.stats["rng_offsets_per_step"]
+        at = torch.cuda.default_generators[0].get_offset()
+        assert at == (offset if rng == "exact" else offset // stop * limit)
+        assert torch.equal(torch.randn(4, device="cuda"), following) == (rng == "exact")
+    assert loop.mode == mode and per_step == offset // stop
 
 
 @pytest.mark.gpu
@@ -1259,6 +1572,14 @@ loop = graphloop.device_loop(syncs, None, 4, masked=True, warmup_runs=0)
 loop.run()
 torch.cuda.synchronize()
 print("mode", loop.mode)
+
+def draws(index, active):  # a WHILE graph that reads its RNG state's scalars, alive at exit
+    graphloop.masked_index_copy_(x, 0, index.view(1), torch.randn(1, 8, device="cuda"), active)
+
+drawing = graphloop.device_loop(draws, None, 4, masked=True, warmup_runs=0)
+drawing.run()
+torch.cuda.synchronize()
+print("drawing", drawing.mode)
 """
 
 
@@ -1273,7 +1594,7 @@ def test_a_process_with_a_failed_capture_exits_cleanly():
         [sys.executable, "-c", FAILED_CAPTURE_EXIT], capture_output=True, text=True, timeout=300
     )
     assert done.returncode == 0, (done.returncode, done.stderr[-2000:])
-    assert "mode host" in done.stdout
+    assert "mode host" in done.stdout and "drawing while" in done.stdout
 
 
 @pytest.mark.gpu
@@ -1281,3 +1602,5 @@ def test_a_process_with_a_failed_capture_exits_cleanly():
 def test_probe_on_this_gpu():  # last: the tests above start from a fresh cuda.core context
     ok, detail = graphloop.probe()
     assert ok in (True, None), detail
+    if graphloop.conditional_support() is None:
+        assert ok is True and "with the plain loop's numbers" in detail, detail

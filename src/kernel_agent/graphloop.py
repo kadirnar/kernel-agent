@@ -48,11 +48,25 @@ the default mode (Inductor's kernels, no CUDA graphs of its own) is captured int
 body like eager ops: the warm-up run compiles it, the graph replays its kernels (the same
 tokens as the compiled step's host loop; measured on an NVIDIA A10, sm_86, torch 2.10, and
 probed by ``doctor``). ``mode="reduce-overhead"`` makes CUDA graphs of its own: not inside a
-device loop. Torch's RNG cannot be
-captured into the WHILE body (torch refuses an RNG op under a capture it did not start):
-such a step falls back to the unrolled graph, whose masked steps after the stop still draw
-numbers, so the generator's state after the loop differs from the host loop's; draw the
-noise from the loop's own generator or precompute it when later draws must match.
+device loop.
+
+Random numbers: a step may draw from the device's default CUDA generator (``torch.randn``,
+``rand``, ``multinomial``, dropout, without ``generator=``), and every mode gives the plain
+loop's draws, step for step. Torch makes RNG kernels graph-safe for its own graphs (Note
+[CUDA Graph-safe RNG states], ``ATen/cuda/CUDAGeneratorImpl.h``): under a capture they read
+the seed and the Philox offset from two device scalars of the generator state, plus the
+offset the capture counted so far; a replay fills the scalars from the host generator and
+advances it by the graph's whole increment. A WHILE body runs many times per launch, so the
+loop does the same per iteration (:class:`_GraphRng`): the step is captured while a clone of
+the generator state is in capture mode, the launch fills the clone's scalars, and
+``ka_loop_step`` advances the offset by the step's increment on the device, so step ``i``
+reads base + ``i`` x increment, the plain loop's offsets. The unrolled blocks are torch's
+own graphs. ``rng`` says where a run leaves the generator: ``"exact"`` (default) where the
+plain loop leaves it (steps x increment; a WHILE ``run()`` then waits for the loop to read
+its steps, an unrolled run corrects its masked steps' draws), ``"reserve"`` at max_steps x
+increment in every mode whatever the stop (no wait; later draws differ from the plain
+loop's after an early stop, they never repeat the loop's). ``on_chunk`` must not draw. Draws
+from another generator (``generator=g``) are not captured: such a step runs host steps.
 
 Streaming (``metric=ttfa``): with ``chunk_every=n`` the WHILE body ends with an IF node that
 runs at every n-th step and at the stop: ``on_chunk()`` (captured, optional) and a kernel
@@ -123,6 +137,8 @@ MAX_UNROLL = 64
 POLL_S = 50e-6
 #: Replays per measurement of :func:`measure_unroll`.
 MEASURE_REPLAYS = 8
+#: Where a run leaves the CUDA generator when the step draws random numbers (``rng=``).
+RNG_POLICIES = ("exact", "reserve")
 
 #: The device side of the WHILE graph (NVRTC through cuda.core). ``index``: steps done
 #: (int64), ``active``: the loop goes on (bool), ``limits``: (min_steps, max_steps),
@@ -142,17 +158,21 @@ extern "C" __global__ void ka_loop_begin(cudaGraphConditionalHandle loop, long l
 // After the step and its stop flags (the same rule as DeviceLoop._advance): count the step;
 // stop at max_steps, when every flag is set (from min_steps on) or when the host cancelled;
 // set the WHILE condition and, with every > 0, the chunk IF condition (every ``every``
-// steps and at the stop). One thread: ``n_flags`` is a batch's flags at most.
+// steps and at the stop). One thread: ``n_flags`` is a batch's flags at most. A step that
+// draws random numbers: its RNG kernels read the Philox offset at ``rng_offset`` (plus their
+// offsets within the step), so step i reads the launch's base + i * rng_inc.
 extern "C" __global__ void ka_loop_step(cudaGraphConditionalHandle loop,
                                         cudaGraphConditionalHandle chunk, const bool* flags,
                                         long long n_flags, long long* index, bool* active,
                                         const long long* limits, long long every,
-                                        const volatile long long* host) {
+                                        const volatile long long* host, long long* rng_offset,
+                                        long long rng_inc) {
   const long long i = *index + 1;
   bool done = n_flags > 0 && i >= limits[0];
   for (long long f = 0; done && f < n_flags; ++f) done = flags[f];
   bool stop = done || i >= limits[1];
   if (host != nullptr && host[1] != 0) stop = true;
+  if (rng_offset != nullptr) *rng_offset += rng_inc;
   *index = i;
   *active = !stop;
   cudaGraphSetConditional(loop, stop ? 0u : 1u);
@@ -263,16 +283,36 @@ class _Cuda:
         next ``MemPool`` destructor aborts the process (``captures_underway.empty()``;
         measured on an A10 with torch 2.10). The outer stream context restores the stream,
         and ending the allocation to the pool clears the allocator (an error where torch
-        already did it is ignored)."""
+        already did it is ignored). It also leaves the default CUDA generator in capture mode
+        (a step that draws, then syncs: every later draw of the process raised "Offset
+        increment outside graph capture encountered unexpectedly"; A10, torch 2.10):
+        :meth:`leave_rng_capture` ends it."""
         graph = torch.cuda.CUDAGraph()
         try:
             with torch.cuda.stream(torch.cuda.current_stream()), torch.cuda.graph(graph, pool=pool):
                 fn()
         except BaseException:
+            device = torch.cuda.current_device()
             with contextlib.suppress(Exception):
-                torch._C._cuda_endAllocateToPool(torch.cuda.current_device(), pool)
+                torch._C._cuda_endAllocateToPool(device, pool)
+            with contextlib.suppress(Exception):
+                self.leave_rng_capture(device)
             raise
         return graph
+
+    def leave_rng_capture(self, device: int, *states: Any) -> None:
+        """End the capture mode of the device's default generator state and of ``states``
+        (generators): torch's capture end runs the generator states' capture epilogue only
+        when the capture ended cleanly. A clean capture of a torch graph registered with
+        them runs it (its prologue resets what a failed capture counted)."""
+        side = torch.cuda.Stream(device=device)
+        fix = torch.cuda.CUDAGraph()
+        for state in states:
+            fix.register_generator_state(state)
+        with torch.cuda.stream(side):
+            fix.capture_begin(capture_error_mode="relaxed")
+            torch.cuda._sleep(1)  # not an empty graph
+            fix.capture_end()
 
     def event(self) -> Any:
         return torch.cuda.Event()
@@ -311,6 +351,136 @@ class _Cuda:
         if err != 0:
             raise RuntimeError(f"cudaGraphLaunch failed with CUDA error {err}")
         return True
+
+    def generator(self, device: int) -> Any:
+        """The device's default CUDA generator (``torch.randn`` & co. without
+        ``generator=``)."""
+        torch.cuda.init()
+        return torch.cuda.default_generators[device]
+
+    def graph_rng(self, generator: Any, device: int) -> Any:
+        """A :class:`_GraphRng` of ``generator`` (raises where torch does not allow it)."""
+        return _GraphRng(generator, device)
+
+
+#: The seed of the loop's clone of a generator state while its device scalars are told
+#: apart (any value other than 0, the offset a capture prologue writes).
+_SENTINEL = 0x5EED_1DE5_7A7E
+
+
+def _int64(value: int) -> int:
+    """A uint64 (a generator's seed) as the int64 of the same bits (a tensor's fill value)."""
+    return value - (1 << 64) if value >= 1 << 63 else value
+
+
+class _DeviceInt64:
+    """``__cuda_array_interface__`` of one int64 at a device address (a tensor view of
+    memory torch's generator state owns)."""
+
+    def __init__(self, address: int) -> None:
+        self.__cuda_array_interface__ = {
+            "shape": (1,),
+            "typestr": "<i8",
+            "data": (address, False),
+            "version": 3,
+        }
+
+
+class _GraphRng:
+    """Torch's graph-safe Philox state, for a WHILE body (see the module docstring).
+
+    Under a capture, an RNG kernel reads the seed and the Philox offset from two device
+    scalars of the generator state (``seed_extragraph_``, ``offset_extragraph_``) plus the
+    offset counted since the capture began; only torch's own captures put a state in that
+    mode, and torch exposes neither scalar. So:
+
+    * the scalars: a clone of the generator's state (``clone_state``) registered with a torch
+      graph (``register_generator_state``, which allocates them) while the allocator routes
+      to a private pool: they are that pool's two blocks (``MemPool.snapshot``), told apart
+      by what a capture prologue writes (the clone's seed, offset 0);
+    * capture mode (:meth:`capture`): a torch graph capture (the anchor, on a side stream) is
+      open around the step's capture into the WHILE body, with the clone in the generator
+      (``graphsafe_set_state``); the anchor's capture end ends capture mode and one replay of
+      the anchor graph reads the step's increment (:meth:`increment`: torch advances the
+      clone's offset by the graph's whole increment).
+
+    The WHILE graph's RNG kernels then read the clone's scalars: each launch fills them from
+    the generator (:attr:`seed`, :attr:`offset`) and ``ka_loop_step`` advances the offset.
+    Measured on an NVIDIA A10 (torch 2.10): ``randn``, ``rand`` and ``multinomial`` steps
+    draw the plain loop's numbers."""
+
+    def __init__(self, generator: Any, device: int) -> None:
+        self.generator = generator
+        self.side = torch.cuda.Stream(device=device)
+        self.clone = generator.clone_state()
+        self.clone.manual_seed(_SENTINEL)
+        self.pool = torch.cuda.MemPool()
+        self.holder = torch.cuda.CUDAGraph()  # keeps the clone's scalars allocated
+        with torch.cuda.use_mem_pool(self.pool, device):
+            self.holder.register_generator_state(self.clone)
+        blocks = [
+            int(block["address"])
+            for segment in self.pool.snapshot()
+            for block in segment["blocks"]
+            if block["state"] == "active_allocated"
+        ]
+        if len(blocks) != 2:
+            raise Unsupported(
+                f"torch {torch.__version__}: a generator state's device seed and offset were "
+                f"not found ({len(blocks)} blocks in its pool, want 2)"
+            )
+        with torch.cuda.stream(self.side):
+            self.holder.capture_begin(capture_error_mode="relaxed")  # its prologue writes them
+            torch.cuda._sleep(1)  # not an empty graph
+            self.holder.capture_end()
+        self.side.synchronize()
+        cuda = torch.device("cuda", device)
+        views = [torch.as_tensor(_DeviceInt64(address), device=cuda) for address in blocks]
+        values = [int(view) for view in views]
+        if sorted(values) != sorted([0, _SENTINEL]):
+            raise Unsupported(
+                f"torch {torch.__version__}: a generator state's device scalars hold {values} "
+                f"after a capture prologue, want its seed and offset 0"
+            )
+        #: The device scalars the captured RNG kernels read (int64 views).
+        self.seed = views[values.index(_SENTINEL)]
+        self.offset = views[values.index(0)]
+        self.anchor = torch.cuda.CUDAGraph()
+        self.anchor.register_generator_state(self.clone)
+
+    @contextlib.contextmanager
+    def capture(self) -> Iterator[None]:
+        """The clone in capture mode and in the generator, for the step's capture."""
+        with torch.cuda.stream(self.side):
+            self.anchor.capture_begin(capture_error_mode="relaxed")
+        original = self.generator.graphsafe_get_state()
+        self.generator.graphsafe_set_state(self.clone)
+        try:
+            yield
+        except BaseException:
+            self._end(original, failed=True)
+            raise
+        self._end(original, failed=False)
+
+    def _end(self, original: Any, failed: bool) -> None:
+        """The generator's own state back, the anchor's capture ended; where that fails, the
+        states still leave capture mode (the step's error is the one raised)."""
+        self.generator.graphsafe_set_state(original)
+        try:
+            with torch.cuda.stream(self.side):
+                torch.cuda._sleep(1)  # not an empty graph
+                self.anchor.capture_end()
+        except Exception:
+            _cuda.leave_rng_capture(self.side.device.index, self.clone)
+            if not failed:
+                raise
+
+    def increment(self) -> int:
+        """The Philox offsets the captured step takes (0: it draws nothing)."""
+        before = self.clone.get_offset()
+        with torch.cuda.stream(self.side):
+            self.anchor.replay()
+        return int(self.clone.get_offset() - before)
 
 
 _cuda: Any = _Cuda()
@@ -511,9 +681,12 @@ class DeviceLoop:
         device: torch.device | str | int | None = None,
         workload: Any = None,
         report: Sequence[str] = ("steps",),
+        rng: str = "exact",
     ) -> None:
         if mode not in ("auto", *MODES):
             raise ValueError(f"mode must be auto or one of {MODES}, got {mode!r}")
+        if rng not in RNG_POLICIES:
+            raise ValueError(f"rng must be one of {RNG_POLICIES}, got {rng!r}")
         if max_steps < 1 or min_steps < 0:
             raise ValueError(
                 f"need max_steps >= 1 and min_steps >= 0, got {max_steps}, {min_steps}"
@@ -572,6 +745,15 @@ class DeviceLoop:
         self._cancel = False
         self._keep: list[Any] = []  # what the graph references (streams, buffers)
         self._count: Any = False  # ka_loop_count (None: torch ops; False: not looked up)
+        self.rng = rng
+        #: Philox offsets a step takes from the device's default generator (None: not yet
+        #: measured; 0: the step draws nothing), the WHILE graph's :class:`_GraphRng`, the
+        #: offsets this run took (``limit`` or the steps run, masked ones too) and the seed
+        #: the WHILE graph's scalar holds.
+        self._rng_inc: int | None = None
+        self._graph_rng: Any = None
+        self._rng_drawn = 0
+        self._rng_seed: int | None = None
         #: The counters each run's steps are reported as (``workload``'s stats source).
         self.report = tuple(report)
         if workload is not None:
@@ -643,6 +825,62 @@ class DeviceLoop:
             self._limits[1].fill_(limit)
             self._limit = limit
 
+    # -------------------------------------------------------------- random numbers
+
+    def _generator(self) -> Any:
+        """The device's default CUDA generator, which the step's draws advance (None off a
+        CUDA device: host steps draw as the plain loop does)."""
+        return _cuda.generator(self._dev) if _cuda.graphs(self.device) else None
+
+    def _set_rng_inc(self, inc: int) -> None:
+        self._rng_inc = int(inc)
+        if inc:
+            self.stats["rng_offsets_per_step"] = int(inc)
+
+    def _new_graph_rng(self) -> Any:
+        """A :class:`_GraphRng` for the WHILE body (None: the warm-up saw a step that draws
+        nothing, or torch does not allow it here: a step that draws then fails its capture
+        and the loop falls back; ``stats["rng"]`` says why)."""
+        gen = self._generator()
+        if gen is None or self._rng_inc == 0:
+            return None
+        try:
+            return _cuda.graph_rng(gen, self._dev)
+        except Exception as exc:
+            self.stats["rng"] = f"no graph-safe RNG state: {type(exc).__name__}: {exc}"[:300]
+            return None
+
+    def _rng_launch(self) -> None:
+        """Before a WHILE launch whose step draws: the graph's seed and offset scalars from
+        the generator (stream-ordered fills, as torch's own replays make), and the generator
+        past the run's draws, ``limit`` steps (:meth:`_rng_settle` moves it to the steps
+        run where ``rng="exact"``)."""
+        gen, rng, inc = self._generator(), self._graph_rng, int(self._rng_inc or 0)
+        seed = int(gen.initial_seed())
+        if seed != self._rng_seed:  # the scalar is the loop's own: only a new seed changes it
+            rng.seed.fill_(_int64(seed))
+            self._rng_seed = seed
+        offset = int(gen.get_offset())
+        rng.offset.fill_(offset)
+        gen.set_offset(offset + self._limit * inc)
+        self._rng_drawn = self._limit
+
+    def _rng_settle(self, steps: int | None) -> None:
+        """After a run whose step draws: the generator where ``rng`` leaves it, from where the
+        run's draws left it (``_rng_drawn`` steps: a WHILE graph's ``limit``, an unrolled
+        run's masked steps too): ``exact`` the run's ``steps`` (None: read from the device,
+        which waits for the loop), ``reserve`` its limit."""
+        inc = self._rng_inc
+        if not inc or (gen := self._generator()) is None:
+            return
+        if self.rng == "reserve":
+            target = self._limit
+        else:
+            target = int(self.index) if steps is None else int(steps)
+        if target != self._rng_drawn:
+            gen.set_offset(gen.get_offset() + (target - self._rng_drawn) * inc)
+            self._rng_drawn = target
+
     # -------------------------------------------------------------- building
 
     def _replaced(self) -> str | None:
@@ -653,11 +891,21 @@ class DeviceLoop:
 
     def build(self) -> str:
         """Build the loop's graph now (the first mode of the fallback chain that works) and
-        return the mode; ``reason`` says why the modes before it did not."""
+        return the mode; ``reason`` says why the modes before it did not. The generator is
+        where it was (the build's masked and measuring steps draw too)."""
         if self.mode is not None:
             return self.mode
         if (why := self._replaced()) is not None:
             raise Unsupported(f"not built while {why}")
+        gen = self._generator()
+        offset = gen.get_offset() if gen is not None else None
+        try:
+            return self._build()
+        finally:
+            if offset is not None:
+                gen.set_offset(offset)
+
+    def _build(self) -> str:
         start = MODES.index(self.preferred) if self.preferred != "auto" else 0
         reasons: list[str] = []
         for mode in MODES[start:]:
@@ -702,6 +950,7 @@ class DeviceLoop:
             host = self._host.data_ptr()
         self._pool = _cuda.mem_pool()
         limits, every = self._limits.data_ptr(), int(self.chunk_every or 0)
+        rng = self._new_graph_rng()
         builder = dev.create_graph_builder()
         opened = [builder]  # the builders, outermost first (a failure ends them innermost first)
         builder.begin_building()  # relaxed: torch's allocator may cudaMalloc while capturing
@@ -717,15 +966,22 @@ class DeviceLoop:
                 self.step(self.index, self.active)
                 found.append(self._flags())
 
-            self._capture_torch(body, step)
+            # the step's draws (and cond's) read the RNG state's device scalars; on_chunk's
+            # are refused (captured after the RNG state left capture mode)
+            with rng.capture() if rng is not None else contextlib.nullcontext():
+                self._capture_torch(body, step)
+            inc = rng.increment() if rng is not None else 0
             flags = found[0]
             self._keep.append(flags)  # its address is in the graph
             chunk = body.create_condition(default_value=0) if every else 0
             args = (
                 (flags.data_ptr(), flags.numel()) if flags is not None else (0, 0),
                 (index, active, limits, every, host),
+                (rng.offset.data_ptr(), inc) if inc else (0, 0),
             )
-            core.launch(body, one, kernels["ka_loop_step"], loop, chunk, *args[0], *args[1])
+            core.launch(
+                body, one, kernels["ka_loop_step"], loop, chunk, *args[0], *args[1], *args[2]
+            )
             if every:
                 then = body.if_then(chunk)
                 opened.append(then)
@@ -745,6 +1001,10 @@ class DeviceLoop:
         graph.upload(self._core_stream())
         self._graph = graph
         self._keep.append(builder)
+        self._set_rng_inc(inc)
+        if inc:
+            self._graph_rng = rng  # the graph reads its scalars
+            self._keep.append(rng)
 
     def _block(self, k: int) -> Callable[[], None]:
         def block() -> None:
@@ -808,6 +1068,14 @@ class DeviceLoop:
         self._graph = one if one is not None and k == 1 else None
         if self._graph is None:
             self._graph = _cuda.capture_graph(self._block(k), pool)
+        if (gen := self._generator()) is not None:
+            # a masked block's replay: its steps draw (torch advances the generator by the
+            # graph's increment), they write nothing; build() puts the generator back
+            self.active.fill_(False)
+            before = gen.get_offset()
+            self._graph.replay()
+            self._set_rng_inc((gen.get_offset() - before) // k)
+            self._reset()
         if self.on_chunk is not None:
             # its own pool: the two block graphs replay in any order
             self._chunk_graph = _cuda.capture_graph(self._chunk_block(k), _cuda.pool_handle())
@@ -843,6 +1111,7 @@ class DeviceLoop:
         """The mode of this run (host for the warm-up runs and while a watched callable is
         replaced; builds the graph after the warm-up)."""
         self._set_limit(max_steps)
+        self._rng_drawn = 0
         self.stats["runs"] += 1
         if (why := self._replaced()) is not None:
             self.stats["host_runs"] += 1
@@ -862,6 +1131,7 @@ class DeviceLoop:
         mode = self._call_mode(max_steps)
         if mode == "while":
             self._launch()
+            self._rng_settle(None)  # rng="exact" and a step that draws: waits for the loop
         else:
             for _ in self._drive(mode, streaming=False):
                 pass
@@ -890,6 +1160,8 @@ class DeviceLoop:
                 self._host[1] = 1  # the condition kernel ends the loop after this step
             steps.close()
             self.join()
+            if mode == "while":
+                self._rng_settle(None)  # joined: the read does not wait
             if self._host is not None:
                 self._host.zero_()
             self._cancel = False
@@ -931,6 +1203,8 @@ class DeviceLoop:
 
     def _launch(self) -> None:
         """The WHILE graph on the caller's stream, launched where the profiler sees it."""
+        if self._graph_rng is not None:
+            self._rng_launch()
         if not _cuda.runtime_launch(self._graph, _cuda.current_stream(self._dev)):
             self._graph.launch(self._core_stream())
             # the profiler may not record a driver-API launch: a torch op ordered after the
@@ -970,11 +1244,15 @@ class DeviceLoop:
     def _drive_host(self) -> Generator[int]:
         self._reset()
         done = 0
+        gen = self._generator()
         try:
             for _ in range(self._limit):
                 if self._cancel:
                     break
+                before = gen.get_offset() if gen is not None else 0
                 self._body()
+                if gen is not None and self._rng_inc is None:  # the step's draws, measured
+                    self._set_rng_inc(gen.get_offset() - before)
                 self.stats["host_checks"] += 1
                 active = bool(self.active.item())  # the plain loop: one read per step
                 if self._boundary(done, done + 1, active):
@@ -985,6 +1263,8 @@ class DeviceLoop:
                 if not active:
                     break
         finally:
+            self._rng_drawn = done
+            self._rng_settle(done)
             self._record()
 
     def _drive_unrolled(self, streaming: bool) -> Generator[int]:
@@ -1000,10 +1280,12 @@ class DeviceLoop:
         k, chunk, every = int(self.stats["unroll"]), self._chunk_graph, self.chunk_every or 0
         flags = AsyncFlags(depth=2)
         done = 0
+        stopped_at: int | None = None  # the steps, once a block's status showed the stop
 
         def launch(graph: Any) -> tuple[int, bool]:
             graph.replay()
             self.stats["launches"] += 1
+            self._rng_drawn += k  # masked steps draw too
             return flags.send(self._status), graph is chunk
 
         def read(ticket: int) -> tuple[int, bool]:
@@ -1014,8 +1296,10 @@ class DeviceLoop:
         def settle(ticket: int, chunked: bool) -> Generator[int, None, bool]:
             """A block's status on the host: yields the count at a chunk boundary or the
             stop, returns whether the loop stopped in it."""
-            nonlocal done
+            nonlocal done, stopped_at
             index, active = read(ticket)
+            if not active:
+                stopped_at = index
             if not active and chunk is not None and not chunked:
                 ticket, _ = launch(chunk)  # the stop's on_chunk
                 if streaming:
@@ -1050,6 +1334,7 @@ class DeviceLoop:
                 if pending is not None and streaming:
                     yield from settle(*pending)  # the last chunk's count
         finally:
+            self._rng_settle(stopped_at)  # unseen (rng="exact"): reads the index
             self._record()
 
 
@@ -1070,7 +1355,9 @@ def device_loop(
     checked once before the unrolled capture), ``warmup_runs``, ``strict`` (raise instead
     of falling back), ``device``, ``workload`` / ``report`` (the workload whose timed runs
     count the loop's steps, read outside the clock, and the counters they are reported as;
-    default ``("steps",)``)."""
+    default ``("steps",)``), ``rng`` (a step that draws random numbers: ``"exact"`` leaves
+    the generator where the plain loop does, a WHILE ``run()`` waiting for the loop's end;
+    ``"reserve"`` at ``max_steps`` steps' draws, no wait)."""
     return DeviceLoop(step, cond, max_steps, **options)
 
 
@@ -1080,16 +1367,18 @@ def device_loop(
 def probe() -> tuple[bool | None, str]:
     """``doctor``: a loop of three steps on the device, run twice through a WHILE graph with
     a chunk IF node (and once through :meth:`DeviceLoop.chunks`), then a ``torch.compile``
-    step in a WHILE body (:func:`_probe_compiled`): ``(True, detail)`` when every count is
-    right, ``(None, why)`` where conditional nodes are unavailable (loops use the unrolled
-    graphs there), ``(False, why)`` when a graph is wrong."""
+    step (:func:`_probe_compiled`) and a step that draws random numbers (:func:`_probe_rng`)
+    in a WHILE body: ``(True, detail)`` when every count is right, ``(None, why)`` where
+    conditional nodes are unavailable (loops use the unrolled graphs there), ``(False,
+    why)`` when a graph is wrong."""
     if (why := conditional_support()) is not None:
         return None, f"{why}; device_loop uses K-step unrolled CUDA graphs"
     ok, detail = _probe_while()
     if not ok:
         return ok, detail
     compiled, what = _probe_compiled()
-    return compiled is not False, f"{detail}; {what}"
+    drawn, how = _probe_rng()
+    return compiled is not False and drawn is not False, f"{detail}; {what}; {how}"
 
 
 def _probe_while() -> tuple[bool, str]:
@@ -1176,4 +1465,51 @@ def _probe_compiled() -> tuple[bool | None, str]:
     return True, (
         "a torch.compile step (no CUDA graphs of its own) ran 3 steps twice in a WHILE body "
         f"({seconds:.1f} s incl. compilation)"
+    )
+
+
+def _probe_rng() -> tuple[bool | None, str]:
+    """A step that draws (``torch.rand``, ``torch.multinomial``) in a WHILE body: two runs of
+    three steps against the plain loop's numbers and where it leaves the generator.
+    ``(None, why)``: not captured here (``device_loop`` falls back for such a step; the
+    unrolled blocks draw the plain loop's numbers too), ``(False, why)``: other numbers."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    gen = _cuda.generator(device.index)
+    with torch.inference_mode(False):
+        out = torch.zeros(3, 8, device=device)
+
+    def step(index: torch.Tensor, active: torch.Tensor | None) -> None:
+        noise = torch.rand(1, 8, device=device)
+        out.index_copy_(0, index.view(1), noise + torch.multinomial(noise[0], 1))
+
+    saved = torch.cuda.get_rng_state(device)
+    try:
+        torch.cuda.manual_seed(5)
+        for i in range(3):
+            step(torch.tensor(i, device=device), None)
+        want, offset = out.clone(), gen.get_offset()
+        loop = DeviceLoop(step, None, 3, mode="while", warmup_runs=0, strict=True, device=device)
+        got = []
+        for _ in range(2):
+            torch.cuda.manual_seed(5)
+            out.zero_()
+            loop.run()
+            got.append((bool(out.equal(want)), gen.get_offset()))
+    except Exception as exc:
+        return None, (
+            "a step that draws random numbers is not captured into a WHILE body here "
+            f"({type(exc).__name__}: {exc}"[:300]
+            + "): device_loop falls back for such a step"
+        )
+    finally:
+        torch.cuda.set_rng_state(saved, device)
+    if got != [(True, offset)] * 2:
+        return False, (
+            "a step that draws ran wrong in a WHILE body: (the plain loop's numbers, the "
+            f"generator's offset) = {got}, want {[(True, offset)] * 2}"
+        )
+    per_step = loop.stats.get("rng_offsets_per_step")
+    return True, (
+        "a step that draws (torch.rand, torch.multinomial) ran in a WHILE body with the "
+        f"plain loop's numbers ({per_step} Philox offsets a step)"
     )

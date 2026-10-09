@@ -2522,6 +2522,33 @@ is captured into the WHILE body like eager ops. The warm-up run compiles it on t
 own buffers; a compilation under a capture fails. `doctor`'s `graph_conditional` probe runs
 one; `examples/graph_while_decode.py --compile` adds the compiled ways.
 
+A step may draw random numbers from the device's default CUDA generator (`torch.randn`,
+`rand`, `multinomial`, dropout; not `generator=g`), and every mode gives the plain loop's
+numbers step for step. Torch's own graphs make RNG kernels read the seed and the Philox
+offset from two device scalars of a graph-safe generator state, plus the offset counted
+within the capture, and fill the scalars at each replay. The WHILE graph does that per
+iteration: the step is captured while a clone of the generator state is in capture mode
+(a torch graph capture held open on a side stream around it), each launch fills the
+clone's scalars from the generator, and `ka_loop_step` advances the offset scalar by the
+step's increment, so step i reads base + i × increment, the plain loop's offsets. Torch
+exposes neither scalar: they are the two blocks the clone's registration allocates in a
+private `MemPool` (`MemPool.snapshot`), told apart by what a capture prologue writes into
+them. The unrolled blocks are torch's own graphs. `rng=` says where a run leaves the
+generator: `"exact"` (default) where the plain loop does (a WHILE `run()` then waits for
+the loop at its end to read the steps; an unrolled run gives back its masked steps'
+draws), `"reserve"` at max_steps × increment in every mode, without the wait (after an
+early stop later draws differ from the plain loop's, they never repeat the loop's). The
+build's own draws (the masked check, the measuring replays) are put back. `on_chunk` must
+not draw (refused in the WHILE graph). On torch 2.10 a failed capture of a step that drew
+left the default generator in capture mode, and every later draw of the process raised;
+the loop's captures end it. `doctor` probes a drawing step; `--temperature` samples the
+example's tokens (`torch.multinomial`), the same tokens every way (GPU-tested on the A10).
+Measured on an NVIDIA A10, sm_86 (shared with another tenant; torch 2.10; temperature 0.8,
+~193 tokens, median of 5 interleaved rounds of 20 runs, ms per token): 4 x 512: host loop
+1.853, graph per step 0.455, WHILE 0.435, unrolled (K = 4) 0.492; 1 x 256: 0.874, 0.178,
+0.162, 0.178. `rng="reserve"` took the same (0.435, 0.162: the example reads each run's
+steps anyway) and held the host ~0.4 µs per token where `"exact"` holds it for the loop.
+
 `examples/graph_while_decode.py` runs a toy decoder with a static KV cache all four ways
 (the same tokens every way). RTX 5070 Ti (~193 tokens): against a graph per step with a
 `.item()` stop check the WHILE loop took 0.269 → 0.253 ms per token (4 layers) and

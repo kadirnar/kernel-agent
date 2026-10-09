@@ -98,9 +98,14 @@ steps = loop.run()  # a device tensor: read it once per request, not per step
 Rules: the step is a function of device state (static buffers updated in place, fixed
 shapes, no `.item()`, no Python state that changes per step). The first run is a host run
 that warms the step up (compilations, cuBLAS handles); the graph is built at the next.
-Torch RNG cannot be captured into the WHILE body (it falls back to unrolled, whose masked
-steps still draw, so the generator's state after the loop differs: draw from your own
-generator or precompute the noise). A `torch.compile` step in the default mode is captured
+A step may sample: draws from the device's default CUDA generator (`torch.randn`, `rand`,
+`multinomial`, dropout; not `generator=g`) give the plain loop's numbers step for step in
+every mode (the WHILE body reads Philox offsets its loop kernel advances each iteration).
+`rng="exact"` (default) leaves the generator where the plain loop does, so a WHILE `run()`
+waits for the loop at its end; `rng="reserve"` skips that wait and leaves it at max_steps'
+draws (later draws then differ after an early stop: fine when each request reseeds).
+`on_chunk` must not draw. Measured on an NVIDIA A10 (a sampled toy decoder, 4 x 512): 1.853
+ms per token as a host loop, 0.455 as a graph per step, 0.435 in the WHILE loop. A `torch.compile` step in the default mode is captured
 into the WHILE body (the warm-up run compiles it; `doctor` probes it);
 `mode="reduce-overhead"` makes graphs of its own: not inside a device loop. The graph runs
 on the caller's stream: the timing sees all of it and the hidden-work check its launch and
