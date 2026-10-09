@@ -56,6 +56,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from kernel_agent.profiling.timeline import activity_type as _activity_type
+
 #: A reference entrypoint that runs on the main case with less than this share of
 #: the candidate's GPU time in kernels of its own is a fallback to the reference.
 MIN_CUSTOM_SHARE = 0.5
@@ -432,7 +434,7 @@ def _events(prof: Any) -> list[_Event]:
         start = int(e.start_ns())
         out.append(
             _Event(
-                str(e.activity_type()),
+                _activity_type(e),
                 e.name(),
                 start,
                 start + int(e.duration_ns()),

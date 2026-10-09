@@ -323,6 +323,113 @@ def test_from_profiler_reads_kineto_events():
     assert tl["busy_ms"] == 0.04 and tl["host_lead_ms"] == 0.004
 
 
+class OldKineto(FakeKineto):
+    """A ``_KinetoEvent`` of torch 2.10: no ``activity_type()``, a device type and whether it
+    is a user annotation instead."""
+
+    activity_type = None  # type: ignore[assignment]
+
+    def __init__(self, device: str, name: str, annotation: bool = False, corr: int = 9) -> None:
+        super().__init__("", name, 1_000, 2_000, corr, 7 if device == "CUDA" else 1)
+        self.device, self.annotation = device, annotation
+
+    def device_type(self) -> str:
+        return f"DeviceType.{self.device}"
+
+    def is_user_annotation(self) -> bool:
+        return self.annotation
+
+    def duration_ns(self) -> int:
+        return self.end - self.start
+
+
+#: The events of one profiled step on torch 2.10 and the ``cat`` of each in its chrome trace
+#: (record_function, an add, copies both ways, a Triton launch, a memset, a graph replay;
+#: measured on an NVIDIA A10).
+TORCH_2_10_EVENTS = [
+    (OldKineto("CPU", "ka::ref", annotation=True), "user_annotation"),
+    (OldKineto("CUDA", "ka::ref", annotation=True), "gpu_user_annotation"),
+    (OldKineto("CPU", "aten::add"), "cpu_op"),
+    (OldKineto("CPU", "cudaLaunchKernel"), "cuda_runtime"),
+    (OldKineto("CUDA", "void at::native::vectorized_elementwise_kernel<4>"), "kernel"),
+    (OldKineto("CPU", "cudaMemcpyAsync"), "cuda_runtime"),
+    (OldKineto("CUDA", "Memcpy HtoD (Pinned -> Device)"), "gpu_memcpy"),
+    (OldKineto("CUDA", "Memcpy DtoH (Device -> Pageable)"), "gpu_memcpy"),
+    (OldKineto("CPU", "cudaStreamSynchronize"), "cuda_runtime"),
+    (OldKineto("CPU", "cuLaunchKernelEx"), "cuda_driver"),
+    (OldKineto("CUDA", "k"), "kernel"),
+    (OldKineto("CPU", "cudaMemsetAsync"), "cuda_runtime"),
+    (OldKineto("CUDA", "Memset (Device)"), "gpu_memset"),
+    (OldKineto("CPU", "cudaGraphLaunch"), "cuda_runtime"),
+    (OldKineto("CPU", "Activity Buffer Request"), "cpu_op"),  # trace: overhead; unused
+]
+
+
+def test_activity_types_without_activity_type_follow_the_chrome_trace():
+    """torch 2.10's events have no ``activity_type()``: every reader of Kineto events
+    (timeline, the evaluator's activity check, the end-to-end hidden-work check) derives it
+    as the chrome trace labels the event, and a version that has it is read as it says."""
+    from kernel_agent.kernels import e2e_activity, integrity
+
+    events = [e for e, _ in TORCH_2_10_EVENTS]
+    assert [timeline.activity_type(e) for e in events] == [k for _, k in TORCH_2_10_EVENTS]
+    assert timeline.activity_type(FakeKineto("gpu_memset", "x", 0, 1, -1, 1)) == "gpu_memset"
+    prof = FakeProf(events)
+    keep = timeline.GPU_KINDS | timeline.API_KINDS | {timeline.ANNOTATION}
+    kinds = [e.kind for e in timeline.from_profiler(prof)]
+    assert kinds == [k for _, k in TORCH_2_10_EVENTS if k in keep]
+    assert kinds.count("kernel") == 2 and "cuda_driver" in kinds and "gpu_memset" in kinds
+    old = [OldKineto("CPU", "ka::run", annotation=True, corr=-1), *events]
+    assert [e.kind for e in integrity._events(FakeProf(old))][:3] == [
+        "user_annotation",
+        "user_annotation",
+        "gpu_user_annotation",
+    ]
+    gpu = [e for e in e2e_activity.events(FakeProf(events)) if e.kind in e2e_activity.GPU_WORK]
+    assert len(gpu) == 5  # the GPU-side annotation is not GPU work
+
+
+@pytest.mark.gpu
+def test_activity_types_match_the_chrome_trace_on_the_gpu(tmp_path):
+    """On the torch at hand, the activity type of every event of a real profile (native or
+    derived) is the category its chrome trace gives it."""
+    import json
+
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    x = torch.ones(1024, device="cuda")
+    host = torch.ones(1024, pin_memory=True)
+    graph = torch.cuda.CUDAGraph()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        x.add_(0)  # warm up outside the default stream before the capture
+    torch.cuda.current_stream().wait_stream(side)
+    with torch.cuda.graph(graph):
+        y = x * 3
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        with record_function("ka::ref"):
+            y = x + 1
+        x.copy_(host, non_blocking=True)
+        host.copy_(y)
+        graph.replay()
+        torch.cuda.synchronize()
+    path = tmp_path / "trace.json"
+    prof.export_chrome_trace(str(path))
+    cats: dict[str, set[str]] = {}
+    for ev in json.loads(path.read_text())["traceEvents"]:
+        if "ts" in ev and "cat" in ev:
+            cats.setdefault(ev["name"], set()).add(ev["cat"])
+    checked = 0
+    for e in prof.profiler.kineto_results.events():
+        kind = timeline.activity_type(e)
+        if kind in timeline.GPU_KINDS | timeline.API_KINDS | {timeline.ANNOTATION}:
+            assert kind in cats.get(e.name(), set()), (e.name(), kind, cats.get(e.name()))
+            checked += 1
+    assert checked >= 6
+
+
 def test_the_kernel_view_uses_the_union_and_summarize_prints_the_timeline(monkeypatch):
     monkeypatch.setattr(profiler, "_roofline_note", list)  # no toolchain (CUDA) lookup
     view = profiler.timeline_view(fake_prof(), None)
