@@ -1,0 +1,29 @@
+## CuTe DSL 4.8.0: Arch targets ['sm_80', 'sm_86', 'sm_87', 'sm_89', 'sm_90', 'sm_90a', 'sm_100', 'sm_100a', 'sm_100f', 'sm_110', 'sm_110a', 'sm_110f', 'sm_103', 'sm_103a', 'sm_103f', 'sm_107', 'sm_107a', 'sm_107f', 'sm_120', 'sm_120a', 'sm_120f', 'sm_121', 'sm_121a', 'sm_121f']
+cute_rmsnorm fp16 sm_75: FAIL KeyError 'sm_75'
+cute_rmsnorm fp16 sm_80: OK
+cute_rmsnorm fp16 sm_86: OK
+cute_rmsnorm fp16 sm_89: OK
+
+## TileLang 0.1.15
+sm_75 rmsnorm fp16: OK
+sm_75 gemm float16: OK; tl:: calls ['tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 8, false, true>', 'tl::ptx_ldmatrix_x2_trans', 'tl::ptx_ldmatrix_x4']
+sm_75 gemm bfloat16: OK; tl:: calls none (no tensor-core MMA)
+sm_80 rmsnorm fp16: OK
+sm_80 gemm float16: OK; tl:: calls ['tl::cp_async_commit', 'tl::cp_async_gs', 'tl::cp_async_wait', 'tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>', 'tl::ptx_ldmatrix_x4', 'tl::ptx_ldmatrix_x4_trans']
+sm_80 gemm bfloat16: OK; tl:: calls ['tl::cp_async_commit', 'tl::cp_async_gs', 'tl::cp_async_wait', 'tl::mma_sync<tl::DataType::kBFloat16, tl::DataType::kBFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>', 'tl::ptx_ldmatrix_x4', 'tl::ptx_ldmatrix_x4_trans']
+sm_86 rmsnorm fp16: OK
+sm_86 gemm float16: OK; tl:: calls ['tl::cp_async_commit', 'tl::cp_async_gs', 'tl::cp_async_wait', 'tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>', 'tl::ptx_ldmatrix_x4', 'tl::ptx_ldmatrix_x4_trans']
+sm_86 gemm bfloat16: OK; tl:: calls ['tl::cp_async_commit', 'tl::cp_async_gs', 'tl::cp_async_wait', 'tl::mma_sync<tl::DataType::kBFloat16, tl::DataType::kBFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>', 'tl::ptx_ldmatrix_x4', 'tl::ptx_ldmatrix_x4_trans']
+sm_89 rmsnorm fp16: OK
+sm_89 gemm float16: OK; tl:: calls ['tl::cp_async_commit', 'tl::cp_async_gs', 'tl::cp_async_wait', 'tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>', 'tl::ptx_ldmatrix_x4', 'tl::ptx_ldmatrix_x4_trans']
+sm_89 gemm bfloat16: OK; tl:: calls ['tl::cp_async_commit', 'tl::cp_async_gs', 'tl::cp_async_wait', 'tl::mma_sync<tl::DataType::kBFloat16, tl::DataType::kBFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>', 'tl::ptx_ldmatrix_x4', 'tl::ptx_ldmatrix_x4_trans']
+
+## PyTorch 2.14.1+cu130 SDPA (libtorch_cuda.so)
+message: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm
+message: Mem Efficient Attention only supports gpu architectures in the range [sm50, sm121]. Attempting to run on a sm
+message: cuDNN MHA only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm
+memory-efficient forward kernels bf16: ['sm80']
+memory-efficient forward kernels f16: ['sm50', 'sm70', 'sm75', 'sm80']
+memory-efficient forward kernels f32: ['sm50', 'sm70', 'sm75', 'sm80']
+TF32 defaults: torch.backends.cuda.matmul.allow_tf32=False, torch.backends.cudnn.allow_tf32=True
+fp16 max 65504.0, bf16 max 3.390e+38

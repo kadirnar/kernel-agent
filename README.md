@@ -4421,7 +4421,16 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   ISA target notes, tuning guides, cuBLAS scale modes, Triton's lowering, CUTLASS,
   papers); every prompt gets its GPU's section under "# This GPU", with the note that
   numbers measured on another GPU are evidence from that GPU. The RTX 5070 Ti
-  measurements in the other guides stay, labelled with the GPU.
+  measurements in the other guides stay, labelled with the GPU. Turing, Ampere and Ada
+  each have a file (`turing.md`, `ampere.md`, `ada.md`, linked from their section; #259)
+  with the instruction forms per arch, the behaviour of Triton, CuTe DSL, TileLang,
+  PyTorch SDPA and cuBLASLt there, datasheet rows from NVIDIA's pages, and the code paths
+  verified by running the older arch's PTX on the RTX 5070 Ti (correctness only).
+  `measure-first.md` lists what to measure on such a GPU before relying on any number
+  (doctor, every `mma.sync` form incl. fp32 vs fp16 accumulation, sustained clocks) and
+  how to run an older arch's code path on a newer GPU. The `triton-kernels` skill's
+  `sm75-sm89.md` has what `tl.dot` becomes per dtype and arch. Scripts and raw results:
+  `docs/research-scripts/older-gpus-259/`.
 * **Boards of one architecture: the NVIDIA A10** (#253). Nothing keys on GPU names: an
   A10, an A40 and a GeForce RTX 3090 are all sm_86 Ampere. What tells them apart is
   measured: the fp32-accumulating HMMA line above (100 % on a datacenter board, 50 % on

@@ -43,9 +43,10 @@ in this file was measured on the boards it describes yet.
   the end-to-end run it is projected into ("Power-capped boards" below).
 * **Verified so far**: the CUDA and Triton sm_86 code paths of the bundled examples ran
   correctly through compute_86 PTX on an RTX 5070 Ti (correctness only, not speed; FP8
-  W8A8 refused). On an A10, run `kernel-agent doctor --remeasure-peaks` and `doctor
-  --smoke` first: the peaks, the instruction rates and the sustained line are the facts
-  to decide with.
+  W8A8 refused). [ampere.md](ampere.md) has the error of each path, the instruction forms
+  and the backends on sm_86. On an A10, run `kernel-agent doctor --remeasure-peaks` and
+  `doctor --smoke` first: the peaks, the instruction rates and the sustained line are the
+  facts to decide with.
 
 ## Ampere SKU classes
 

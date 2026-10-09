@@ -1,0 +1,111 @@
+# Triton 3.8.0; 64x64x64 tiles, 4 warps, num_stages=3 unless noted
+
+## tl.dot, B [K, N]
+fp16                   sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+fp16                   sm_80   mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+fp16                   sm_86   mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+fp16                   sm_89   mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+fp16                   sm_120  mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 16; smem 32768 B
+bf16                   sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+bf16                   sm_80   mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+bf16                   sm_86   mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+bf16                   sm_89   mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+bf16                   sm_120  mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 16; smem 32768 B
+fp32 (default tf32)    sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 32768 B
+fp32 (default tf32)    sm_80   mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 18; smem 65536 B
+fp32 (default tf32)    sm_86   mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 18; smem 65536 B
+fp32 (default tf32)    sm_89   mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 18; smem 65536 B
+fp32 (default tf32)    sm_120  mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 16; smem 65536 B
+fp32 ieee              sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 32768 B
+fp32 ieee              sm_80   mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+fp32 ieee              sm_86   mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+fp32 ieee              sm_89   mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+fp32 ieee              sm_120  mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+int8                   sm_75   FAIL RuntimeError: PassManager::run failed
+int8                   sm_80   mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 18; ldmatrix 6; smem 16384 B
+int8                   sm_86   mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 18; ldmatrix 6; smem 16384 B
+int8                   sm_89   mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 18; ldmatrix 6; smem 16384 B
+int8                   sm_120  mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 18; ldmatrix 4; smem 16384 B
+fp8e4nv (e4m3)         sm_75   FAIL CompilationError: at 1:0: def gemm( ^ ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+fp8e4nv (e4m3)         sm_80   FAIL CompilationError: at 1:0: def gemm( ^ ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+fp8e4nv (e4m3)         sm_86   FAIL CompilationError: at 1:0: def gemm( ^ ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+fp8e4nv (e4m3)         sm_89   mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 18; ldmatrix 6; smem 16384 B
+fp8e4nv (e4m3)         sm_120  mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 18; ldmatrix 4; smem 16384 B
+fp8e5 (e5m2)           sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+fp8e5 (e5m2)           sm_80   mma m16n8k16.f32.f16.f16.f32; cp.async 18; ldmatrix 6; smem 16384 B
+fp8e5 (e5m2)           sm_86   mma m16n8k16.f32.f16.f16.f32; cp.async 18; ldmatrix 6; smem 16384 B
+fp8e5 (e5m2)           sm_89   mma m16n8k32.f32.e5m2.e5m2.f32; cp.async 18; ldmatrix 6; smem 16384 B
+fp8e5 (e5m2)           sm_120  mma m16n8k32.f32.e5m2.e5m2.f32; cp.async 18; ldmatrix 4; smem 16384 B
+fp8e4b15               sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+fp8e4b15               sm_80   mma m16n8k16.f32.f16.f16.f32; cp.async 18; ldmatrix 6; smem 16384 B
+fp8e4b15               sm_86   mma m16n8k16.f32.f16.f16.f32; cp.async 18; ldmatrix 6; smem 16384 B
+fp8e4b15               sm_89   mma m16n8k16.f32.f16.f16.f32; cp.async 18; ldmatrix 6; smem 16384 B
+fp8e4b15               sm_120  mma m16n8k16.f32.f16.f16.f32; cp.async 18; ldmatrix 4; smem 16384 B
+
+## tl.dot, B [N, K] (nn.Linear)
+fp16                   sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+fp16                   sm_80   mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+fp16                   sm_86   mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+fp16                   sm_89   mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+fp16                   sm_120  mma m16n8k16.f32.f16.f16.f32; cp.async 24; ldmatrix 16; smem 32768 B
+bf16                   sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+bf16                   sm_80   mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+bf16                   sm_86   mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+bf16                   sm_89   mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 20; smem 32768 B
+bf16                   sm_120  mma m16n8k16.f32.bf16.bf16.f32; cp.async 24; ldmatrix 16; smem 32768 B
+fp32 (default tf32)    sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 32768 B
+fp32 (default tf32)    sm_80   mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 36; smem 65536 B
+fp32 (default tf32)    sm_86   mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 36; smem 65536 B
+fp32 (default tf32)    sm_89   mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 36; smem 65536 B
+fp32 (default tf32)    sm_120  mma m16n8k8.f32.tf32.tf32.f32; cp.async 48; ldmatrix 32; smem 65536 B
+fp32 ieee              sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 32768 B
+fp32 ieee              sm_80   mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+fp32 ieee              sm_86   mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+fp32 ieee              sm_89   mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+fp32 ieee              sm_120  mma none (FMA); cp.async 48; ldmatrix 0; smem 65536 B
+int8                   sm_75   FAIL RuntimeError: PassManager::run failed
+int8                   sm_80   mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 12; ldmatrix 12; smem 16384 B
+int8                   sm_86   mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 12; ldmatrix 12; smem 16384 B
+int8                   sm_89   mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 12; ldmatrix 12; smem 16384 B
+int8                   sm_120  mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 12; ldmatrix 8; smem 16384 B
+fp8e4nv (e4m3)         sm_75   FAIL CompilationError: at 1:0: def gemm( ^ ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+fp8e4nv (e4m3)         sm_80   FAIL CompilationError: at 1:0: def gemm( ^ ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+fp8e4nv (e4m3)         sm_86   FAIL CompilationError: at 1:0: def gemm( ^ ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+fp8e4nv (e4m3)         sm_89   mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 12; ldmatrix 12; smem 16384 B
+fp8e4nv (e4m3)         sm_120  mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 12; ldmatrix 8; smem 16384 B
+fp8e5 (e5m2)           sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+fp8e5 (e5m2)           sm_80   mma m16n8k16.f32.f16.f16.f32; cp.async 12; ldmatrix 12; smem 16384 B
+fp8e5 (e5m2)           sm_86   mma m16n8k16.f32.f16.f16.f32; cp.async 12; ldmatrix 12; smem 16384 B
+fp8e5 (e5m2)           sm_89   mma m16n8k32.f32.e5m2.e5m2.f32; cp.async 12; ldmatrix 12; smem 16384 B
+fp8e5 (e5m2)           sm_120  mma m16n8k32.f32.e5m2.e5m2.f32; cp.async 12; ldmatrix 8; smem 16384 B
+fp8e4b15               sm_75   mma none (FMA); cp.async 0; ldmatrix 0; smem 16384 B
+fp8e4b15               sm_80   mma m16n8k16.f32.f16.f16.f32; cp.async 12; ldmatrix 12; smem 16384 B
+fp8e4b15               sm_86   mma m16n8k16.f32.f16.f16.f32; cp.async 12; ldmatrix 12; smem 16384 B
+fp8e4b15               sm_89   mma m16n8k16.f32.f16.f16.f32; cp.async 12; ldmatrix 12; smem 16384 B
+fp8e4b15               sm_120  mma m16n8k16.f32.f16.f16.f32; cp.async 12; ldmatrix 8; smem 16384 B
+
+## tl.dot_scaled e4m3, unit ue8m0 scales, B [N, K]
+dot_scaled e4m3        sm_75   FAIL CompilationError: at 1:0: def gemm_scaled(a, b, c, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr): ^ ValueError("type fp8e4nv not supported in this architectu
+dot_scaled e4m3        sm_80   FAIL CompilationError: at 1:0: def gemm_scaled(a, b, c, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr): ^ ValueError("type fp8e4nv not supported in this architectu
+dot_scaled e4m3        sm_86   FAIL CompilationError: at 1:0: def gemm_scaled(a, b, c, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr): ^ ValueError("type fp8e4nv not supported in this architectu
+dot_scaled e4m3        sm_89   mma m16n8k16.f32.bf16.bf16.f32; cp.async 12; ldmatrix 8; smem 16384 B
+dot_scaled e4m3        sm_120  mma m16n8k32.kind; cp.async 12; ldmatrix 8; smem 16384 B
+
+## the same GEMMs without the divisibility specialisation (unaligned pointers)
+fp16 unaligned         sm_80   mma m16n8k16.f32.f16.f16.f32; cp.async 0; ldmatrix 16; smem 16384 B
+fp16 unaligned         sm_89   mma m16n8k16.f32.f16.f16.f32; cp.async 0; ldmatrix 16; smem 16384 B
+fp32 (tf32) unaligned  sm_80   mma m16n8k8.f32.tf32.tf32.f32; cp.async 192; ldmatrix 36; smem 65536 B
+fp32 (tf32) unaligned  sm_89   mma m16n8k8.f32.tf32.tf32.f32; cp.async 192; ldmatrix 36; smem 65536 B
+
+## bundled W8A8 GEMMs (their kernels, BM, BN, BK, warps, stages)
+triton_fp8_w8a8_gemm tl.dot sm_89 (64, 64, 128, 4, 3): mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 24; ldmatrix 20; smem 32768 B
+triton_fp8_w8a8_gemm tl.dot sm_89 (128, 64, 128, 8, 3): mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 18; ldmatrix 20; smem 49152 B
+triton_fp8_w8a8_gemm tl.dot sm_89 (64, 64, 64, 4, 4): mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 16; ldmatrix 12; smem 24576 B
+triton_fp8_w8a8_gemm tl.dot sm_120 (64, 64, 128, 4, 3): mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 24; ldmatrix 16; smem 32768 B
+triton_fp8_w8a8_gemm tl.dot sm_120 (128, 64, 128, 8, 3): mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 18; ldmatrix 16; smem 49152 B
+triton_fp8_w8a8_gemm tl.dot sm_120 (64, 64, 64, 4, 4): mma m16n8k32.f32.e4m3.e4m3.f32; cp.async 16; ldmatrix 8; smem 24576 B
+triton_int8_w8a8_gemm sm_75 (64, 64, 128, 4, 3): FAIL RuntimeError: PassManager::run failed
+triton_int8_w8a8_gemm sm_80 (64, 64, 128, 4, 3): mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 24; ldmatrix 20; smem 32768 B
+triton_int8_w8a8_gemm sm_86 (64, 64, 128, 4, 3): mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 24; ldmatrix 20; smem 32768 B
+triton_int8_w8a8_gemm sm_89 (64, 64, 128, 4, 3): mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 24; ldmatrix 20; smem 32768 B
+triton_int8_w8a8_gemm sm_120 (64, 64, 128, 4, 3): mma m16n8k32.satfinite.s32.s8.s8.s32; cp.async 24; ldmatrix 16; smem 32768 B

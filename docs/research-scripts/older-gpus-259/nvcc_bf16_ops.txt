@@ -1,0 +1,13 @@
+# Build cuda_13.4.r13.4/compiler.38855100_0
+OP_BF16_HFMA         sm_75: FAIL : no suitable user-defined conversion from "__nv_bfloat16" to "__half" exists
+OP_BF16_HFMA         sm_80: OK
+OP_BF16_HADD         sm_75: OK
+OP_BF16_HADD         sm_80: OK
+OP_BF16_OPERATOR     sm_75: OK
+OP_BF16_OPERATOR     sm_80: OK
+OP_BF16_HFMA2        sm_75: FAIL : no suitable user-defined conversion from "__nv_bfloat162" to "__half2" exists
+OP_BF16_HFMA2        sm_80: OK
+OP_BF16_VIA_FLOAT    sm_75: OK
+OP_BF16_VIA_FLOAT    sm_80: OK
+OP_FP16_HFMA2        sm_75: OK
+OP_FP16_HFMA2        sm_80: OK

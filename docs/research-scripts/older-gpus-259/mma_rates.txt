@@ -1,0 +1,11 @@
+# NVIDIA GeForce RTX 5070 Ti sm_120, 70 SMs; best of 5
+f16 m16n8k16 fp32 acc                    103.1 TFLOP/s
+f16 m16n8k16 fp16 acc                    206.3 TFLOP/s
+bf16 m16n8k16 fp32 acc                   103.5 TFLOP/s
+tf32 m16n8k8 fp32 acc                     51.4 TFLOP/s
+f16 m16n8k8 fp32 acc (Turing form)        51.4 TFLOP/s
+f16 m16n8k8 fp16 acc (Turing form)       102.2 TFLOP/s
+s8 m16n8k32 s32 acc                      405.9 TOPS
+s8 m8n8k16 s32 acc (Turing form)          98.2 TOPS
+e4m3 m16n8k32 fp32 acc                   206.6 TFLOP/s
+e4m3 m16n8k32 fp16 acc                   413.5 TFLOP/s

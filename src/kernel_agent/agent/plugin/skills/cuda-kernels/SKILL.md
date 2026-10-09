@@ -47,7 +47,9 @@ Verified example: `examples/nvrtc_rmsnorm.py`.
 
 | Arch | GPUs | Tensor-core path | Async copy |
 |---|---|---|---|
-| sm_80/86/89 | A100, RTX 30xx/40xx | `mma.sync` (bf16/fp16/tf32/int8, fp8 on sm_89) | `cp.async` |
+| sm_75 | T4, RTX 20xx | `mma.sync` m16n8k8 fp16 (fp32 or fp16 accumulation), m8n8k16 s8 / m8n8k32 s4 (IMMA), `ldmatrix`; WMMA 16x16x16 `half` / `signed char`; **no bf16, tf32 or FP8** (bf16 `__hfma` does not compile: math in fp32) | none (`cp.async` is sm_80+): plain loads into shared memory; 64 KB SMEM per block |
+| sm_80 | A100, A30 | `mma.sync` m16n8k16 bf16/fp16, m16n8k8 tf32, m16n8k32 s8 | `cp.async` + `mbarrier`, 163 KB SMEM per block |
+| sm_86 / sm_89 | A10, A40, RTX 30xx / L4, L40S, RTX 40xx | as sm_80; on sm_89 also FP8 `mma.sync` m16n8k32 e4m3 / e5m2 and the hardware e4m3 `cvt` | `cp.async`, 99 KB SMEM per block |
 | sm_90a | H100/H200 | WGMMA (warpgroup) for the peak; `mma.sync` ~2/3 of it | TMA + mbarrier, clusters |
 | sm_100a | B200/GB200 | `tcgen05` MMA + TMEM, 2-CTA, block-scaled; no WGMMA | TMA |
 | sm_120 | RTX 50xx (consumer Blackwell) | `mma.sync` incl. FP8 and block-scaled FP4/FP6/FP8 (`mma.sync...kind::mxf8f6f4`); **no WGMMA, no tcgen05/TMEM** | TMA + `cp.async`, ~99 KB SMEM per block |
@@ -69,6 +71,8 @@ kind::mxf8f6f4.block_scale`, `sm_120a`, 416 TFLOP/s on an RTX 5070 Ti; unit ue8m
 e4m3.e4m3.f32` runs at half that rate on GeForce; on sm_89 plain e4m3 `mma.sync`; on
 sm_90 `wgmma` and on sm_100 `tcgen05.mma` (e4m3 `mma.sync` is emulated through fp16
 there).
+
+Per-arch details, verified compiles and what to measure first: the `gpu-architectures` skill (`turing.md`, `ampere.md`, `ada.md`, `measure-first.md`). On a newer GPU, `TORCH_CUDA_ARCH_LIST="8.6+PTX"` (with its own `TORCH_EXTENSIONS_DIR`) runs a `load_inline` kernel's sm_86 code path through PTX JIT: a correctness check, never a timing.
 
 General rules: coalesced 128-bit global loads, avoid SMEM bank conflicts
 (swizzle / padding), keep occupancy reasonable (registers ≤ 128/thread for

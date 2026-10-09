@@ -1,0 +1,12 @@
+# NVIDIA GeForce RTX 5070 Ti; power.limit, power.max_limit, clocks.max.sm: 300.00 W, 350.00 W, 3105 MHz
+burst 60 ms: 97.1 TFLOP/s; {'t_s': 2.64, 'label': 'burst', 'sm_mhz': 2902, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 45, 'power_w': 82.4, 'reasons': []}
+second  1: 93.5 TFLOP/s; {'t_s': 3.72, 'label': 's1', 'sm_mhz': 2707, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 65, 'power_w': 296.7, 'reasons': ['sw_power_cap']}
+second  2: 93.6 TFLOP/s; {'t_s': 4.79, 'label': 's2', 'sm_mhz': 2685, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 65, 'power_w': 303.5, 'reasons': ['sw_power_cap']}
+second  3: 93.6 TFLOP/s; {'t_s': 5.87, 'label': 's3', 'sm_mhz': 2700, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 65, 'power_w': 299.8, 'reasons': ['sw_power_cap']}
+second  4: 94.1 TFLOP/s; {'t_s': 6.95, 'label': 's4', 'sm_mhz': 2670, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 66, 'power_w': 299.1, 'reasons': ['sw_power_cap']}
+second  5: 93.5 TFLOP/s; {'t_s': 8.02, 'label': 's5', 'sm_mhz': 2677, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 67, 'power_w': 298.5, 'reasons': ['sw_power_cap']}
+second  6: 93.2 TFLOP/s; {'t_s': 9.1, 'label': 's6', 'sm_mhz': 2677, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 67, 'power_w': 298.0, 'reasons': ['sw_power_cap']}
+second  7: 93.1 TFLOP/s; {'t_s': 10.18, 'label': 's7', 'sm_mhz': 2677, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 67, 'power_w': 299.4, 'reasons': ['sw_power_cap']}
+second  8: 93.1 TFLOP/s; {'t_s': 11.28, 'label': 's8', 'sm_mhz': 2692, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 67, 'power_w': 300.3, 'reasons': ['sw_power_cap']}
+second  9: 92.1 TFLOP/s; {'t_s': 12.33, 'label': 's9', 'sm_mhz': 2715, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 67, 'power_w': 296.8, 'reasons': ['sw_power_cap']}
+second 10: 93.0 TFLOP/s; {'t_s': 13.41, 'label': 's10', 'sm_mhz': 2670, 'sm_max_mhz': 3105, 'mem_mhz': 13801, 'temp_c': 68, 'power_w': 297.6, 'reasons': ['sw_power_cap']}

@@ -1,0 +1,29 @@
+# real GPU sm_120, emulated sm_75; Triton 3.8.0
+sm_75 tl.dot GEMM [float16]        rel L2 4.12e-07 [gemm: no mma (FMA), cp.async 0, smem 16384]
+sm_75 triton_rmsnorm [float16]     rel L2 0.0000 [_rmsnorm_kernel: no mma (FMA), cp.async 0, smem 16]
+sm_75 triton_short_attention [float16] rel L2 vs fp32 SDPA 0.0003 [_attn_kernel: no mma (FMA), cp.async 0, smem 8192]
+sm_75 tl.dot GEMM [bfloat16]       rel L2 1.75e-07 [gemm: no mma (FMA), cp.async 0, smem 16384]
+sm_75 triton_rmsnorm [bfloat16]    rel L2 0.0000 [_rmsnorm_kernel: no mma (FMA), cp.async 0, smem 16]
+sm_75 triton_short_attention [bfloat16] rel L2 vs fp32 SDPA 0.0020 [_attn_kernel: no mma (FMA), cp.async 0, smem 8192]
+sm_75 triton_int8_w8a8_gemm [bf16] build() returned the reference (its capability check) []
+sm_75 triton_fp8_w8a8_gemm [bf16]  build() returned the reference (its capability check) []
+
+# real GPU sm_120, emulated sm_86; Triton 3.8.0
+sm_86 tl.dot GEMM [float16]        rel L2 6.62e-07 [gemm: m16n8k16.f32.f16.f16.f32, cp.async 24, smem 32768]
+sm_86 triton_rmsnorm [float16]     rel L2 0.0000 [_rmsnorm_kernel: no mma (FMA), cp.async 0, smem 16]
+sm_86 triton_short_attention [float16] rel L2 vs fp32 SDPA 0.0003 [_attn_kernel: m16n8k16.f32.f16.f16.f32, cp.async 0, smem 8192]
+sm_86 tl.dot GEMM [bfloat16]       rel L2 4.80e-07 [gemm: m16n8k16.f32.bf16.bf16.f32, cp.async 24, smem 32768]
+sm_86 triton_rmsnorm [bfloat16]    rel L2 0.0000 [_rmsnorm_kernel: no mma (FMA), cp.async 0, smem 16]
+sm_86 triton_short_attention [bfloat16] rel L2 vs fp32 SDPA 0.0020 [_attn_kernel: m16n8k16.f32.bf16.bf16.f32, cp.async 0, smem 8192]
+sm_86 triton_int8_w8a8_gemm [bf16] rel L2 vs nn.Linear 0.0091 [_quant_kernel: no mma (FMA), cp.async 0, smem 16; _gemm_kernel: m16n8k32.satfinite.s32.s8.s8.s32, cp.async 12, smem 32768]
+sm_86 triton_fp8_w8a8_gemm [bf16]  build() returned the reference (its capability check) []
+
+# real GPU sm_120, emulated sm_89; Triton 3.8.0
+sm_89 tl.dot GEMM [float16]        rel L2 6.62e-07 [gemm: m16n8k16.f32.f16.f16.f32, cp.async 24, smem 32768]
+sm_89 triton_rmsnorm [float16]     rel L2 0.0000 [_rmsnorm_kernel: no mma (FMA), cp.async 0, smem 16]
+sm_89 triton_short_attention [float16] rel L2 vs fp32 SDPA 0.0003 [_attn_kernel: m16n8k16.f32.f16.f16.f32, cp.async 0, smem 8192]
+sm_89 tl.dot GEMM [bfloat16]       rel L2 4.80e-07 [gemm: m16n8k16.f32.bf16.bf16.f32, cp.async 24, smem 32768]
+sm_89 triton_rmsnorm [bfloat16]    rel L2 0.0000 [_rmsnorm_kernel: no mma (FMA), cp.async 0, smem 16]
+sm_89 triton_short_attention [bfloat16] rel L2 vs fp32 SDPA 0.0020 [_attn_kernel: m16n8k16.f32.bf16.bf16.f32, cp.async 0, smem 8192]
+sm_89 triton_int8_w8a8_gemm [bf16] rel L2 vs nn.Linear 0.0091 [_quant_kernel: no mma (FMA), cp.async 0, smem 16; _gemm_kernel: m16n8k32.satfinite.s32.s8.s8.s32, cp.async 12, smem 32768]
+sm_89 triton_fp8_w8a8_gemm [bf16]  rel L2 vs nn.Linear 0.0368 [_quant_kernel: no mma (FMA), cp.async 0, smem 16; _gemm_kernel: m16n8k32.f32.e4m3.e4m3.f32, cp.async 24, smem 32768]

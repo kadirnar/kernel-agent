@@ -7,6 +7,8 @@ description: Triton kernels for kernel-agent candidates — GEMM template, numer
 
 Measured facts for GeForce Blackwell (sm_120: codegen, FP8 rates, `tl.dot_scaled`, TMA, warp specialisation, winning tiles, short attention) are in [sm120.md](sm120.md); read it on that GPU and before any FP8 Triton GEMM.
 
+On Turing, Ampere and Ada (sm_75 to sm_89), read [sm75-sm89.md](sm75-sm89.md). It covers what `tl.dot` becomes per dtype and arch: FMA on sm_75, where int8 fails to compile; TF32 by default for fp32; the FP8 types. It also covers the alignment that `cp.async` pipelining needs, and how to run an older arch's lowering on a newer GPU.
+
 Verified example: `examples/triton_rmsnorm.py`.
 
 ```python
