@@ -86,6 +86,16 @@ def test_counters_restricted_reads_the_driver_parameter():
     assert ncu.counters_restricted("RmGpuComputeExecTimeout: 0\n", root=False) is None
 
 
+def test_root_without_cap_sys_admin_is_no_admin_to_the_driver():
+    """Root in an unprivileged container (the A10 container's CapEff: no CAP_SYS_ADMIN) is
+    refused the counters (ERR_NVGPUCTRPERM): only CAP_SYS_ADMIN counts."""
+    container = "Name:\tpython\nUid:\t0\t0\t0\t0\nCapEff:\t00000000a80405fb\n"
+    privileged = "Uid:\t0\t0\t0\t0\nCapEff:\t000001ffffffffff\n"
+    assert not ncu.is_admin(container)
+    assert ncu.is_admin(privileged)
+    assert ncu.is_admin("CapEff:\t0000000000200000\n")  # CAP_SYS_ADMIN alone
+
+
 def test_the_command_profiles_the_candidate_range_only(tmp_path):
     cmd = ncu.command(
         "/opt/ncu",
