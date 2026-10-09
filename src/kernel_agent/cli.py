@@ -508,7 +508,7 @@ def cmd_recheck(ns: argparse.Namespace) -> int:
 
 
 def cmd_memcheck(ns: argparse.Namespace) -> int:
-    from kernel_agent.kernels.memcheck import STATUS, describe, run_memcheck
+    from kernel_agent.kernels.memcheck import describe, failed, run_memcheck
 
     result = run_memcheck(
         Path(ns.capture), Path(ns.candidate), timeout=ns.timeout, variants=not ns.no_variants
@@ -517,7 +517,7 @@ def cmd_memcheck(ns: argparse.Namespace) -> int:
     if result.get("report"):
         print(result["report"])
     print(describe(result))
-    return 1 if result.get("status") == STATUS else 0
+    return 1 if failed(result) else 0
 
 
 def cmd_install_claude_code(ns: argparse.Namespace) -> int:

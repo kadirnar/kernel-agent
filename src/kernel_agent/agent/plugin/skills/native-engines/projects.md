@@ -17,7 +17,8 @@ Part of the `native-engines` skill.
   returns it; its attributes are the functions `binding.cpp` binds.
 * kernel-agent's toolkit headers are on every build's include path:
   `#include "ka_launch.cuh"` for PDL and cooperative launches (`ka_launch`,
-  `ka_pdl_wait`, `ka_pdl_launch_dependents`, `ka_coresident_blocks`; see the `cuda-graphs-streams-pdl` skill).
+  `ka_pdl_wait`, `ka_pdl_launch_dependents`, `ka_coresident_blocks`; see the `cuda-graphs-streams-pdl` skill)
+  and `#include "ka_mk.cuh"` for the megakernel interpreter ([megakernel.md](megakernel.md)).
 * `python -m kernel_agent.native.project check <dir>` validates the manifest and files;
   `... build <dir>` compiles on the CPU (no GPU, no evaluation used): fix compiler errors
   there. The tools also compile a project before its evaluation, outside the GPU lock.

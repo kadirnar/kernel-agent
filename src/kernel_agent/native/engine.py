@@ -72,7 +72,7 @@ from typing import Any
 from kernel_agent import ledger
 from kernel_agent.budget import improves
 from kernel_agent.native import project
-from kernel_agent.workspace import RunDir, read_json
+from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 MODES = ("off", "plan", "on")
 DEFAULT_MODE = "plan"  # the native arm exists only when the plan asks for it
@@ -779,3 +779,57 @@ def status(
 
 def native_dir(run: RunDir) -> Path:
     return run.transforms_dir / DIR
+
+
+# ------------------------------------------------------------------ the megakernel kit
+
+#: Grid-wide synchronisation in a native kernel's sources: cooperative-groups grid syncs,
+#: cooperative launches (hand-rolled grid barriers ride on them).
+GRID_SYNC = re.compile(
+    r"\bthis_grid\s*\(|\bgrid_group\b|\bgrid\.sync\s*\(|cudaLaunchCooperativeKernel"
+    r"|\bcooperative\s*=\s*true|\bgrid_barrier\b|\bgrid_sync\b"
+)
+#: More kernel launches per call than this: one megakernel launch may pay (issue #225).
+MEGAKERNEL_LAUNCHES = 3
+
+
+def megakernel_hint(run: RunDir, rows: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Digest lines pointing to the megakernel kit (issue #225) for every native stage target
+    whose best kernel so far synchronises its whole grid (:data:`GRID_SYNC` in its project's
+    sources) or launches more than :data:`MEGAKERNEL_LAUNCHES` kernels per call (the
+    evaluator's ``kernel_launches_candidate``). Empty when none does."""
+    best: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        target, speedup = str(row.get("target") or ""), row.get("speedup")
+        if not target.startswith(TARGET_PREFIX) or not row.get("correct") or not speedup:
+            continue
+        if target not in best or float(speedup) > float(best[target]["speedup"]):
+            best[target] = row
+    hints = []
+    for target, row in sorted(best.items()):
+        why = []
+        snap = run.history_dir(target) / str(row.get("snapshot") or "")
+        payload = project.read_bundle(snap) if snap.is_file() else None
+        files = (payload or {}).get("files") or {}
+        if any(GRID_SYNC.search(str(text)) for text in files.values()):
+            why.append("synchronises its whole grid")
+        records = read_jsonl(run.results_file(target))
+        rec = next((r for r in records if Path(str(r.get("snapshot"))).name == snap.name), {})
+        launches = rec.get("kernel_launches_candidate")
+        if isinstance(launches, int | float) and launches > MEGAKERNEL_LAUNCHES:
+            why.append(f"launches {launches:g} kernels per call")
+        if why:
+            hints.append(f"* `{target}`: its best kernel `{snap.name}` {' and '.join(why)}.")
+    if not hints:
+        return []
+    return [
+        "",
+        "## Megakernel kit",
+        *hints,
+        "* Grid barriers and launch boundaries drain the weight stream (~2.2-2.4 us per hand-"
+        "rolled grid barrier, ~0.9 us per graph kernel boundary, measured on an RTX 5070 Ti). "
+        "The megakernel kit (`kernel_agent.native.megakernel`: `ka_mk.cuh` on every project's "
+        "include path, the scheduler and its simulator) replaces them by counter dependencies "
+        "and loads the next instructions' weights while a block waits: the `native-engines` "
+        "skill's `megakernel.md` and `examples/native_megakernel`.",
+    ]

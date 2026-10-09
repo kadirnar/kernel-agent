@@ -477,6 +477,7 @@ def native_digest(
         lines.append("* (no stage graph: no ceilings table; derive the stages from the profile)")
     if status.complete:
         lines += _after_plan(run, status, policy)
+    lines += native_engine.megakernel_hint(run, arm.rows)  # grid syncs, many launches (#225)
     module = [a for a in arms if a.kind == KERNEL]
     if module:
         lines += ["", "## Module arms (their kernels are your building blocks)"]

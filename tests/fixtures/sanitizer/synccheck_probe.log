@@ -1,0 +1,43 @@
+========= COMPUTE-SANITIZER
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (0,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (1,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (2,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (3,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (4,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (5,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (6,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (7,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (8,0,0) in block (0,0,0)
+========= 
+========= Barrier error detected. Divergent thread(s) in warp.
+=========     at ka_divergent(int *)+0xb0 in probe.cu:20
+=========     by thread (9,0,0) in block (0,0,0)
+========= 
+========= ERROR SUMMARY: 16 errors
+========= ERROR SUMMARY: 6 errors were not printed. Use --print-limit option to adjust the number of printed errors

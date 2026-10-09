@@ -39,6 +39,7 @@ REPEATABLE = (
     "fallback",  # not integrity_violation: its timing checks can depend on the moment
     "build_error",
     "runtime_error",
+    "hang",  # a deadlocked schedule deadlocks again
 )
 QUICK = "quick"
 FULL = "full"

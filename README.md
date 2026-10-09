@@ -1950,6 +1950,16 @@ integration`). A missing or failing sanitizer is recorded with its reason
 (`skipped`, `error`, `timeout`) and the kernel kept; a re-integration runs such a
 memcheck again, and reuses a decided one.
 
+A kernel that synchronises inside (every native project; a single file whose source has
+shared memory, `cp.async` / mbarrier pipelines, acquire / release counters or atomics:
+`memcheck.extra_tools`) also runs once on its captured cases under `--tool racecheck`
+(hazards between a block's threads on shared memory) and `--tool synccheck` (barriers some
+threads never reach), after a clean memcheck. Their errors refuse it the same way (status
+`racecheck` / `synccheck`, the first hazard report); `memcheck` → `tools` in the record has
+each tool's status, error count, report and seconds. Racecheck sees shared memory only;
+global-memory races are what the evaluator's determinism check of native candidates is for
+([megakernel kit](#native-engines-when-module-kernels-plateau)).
+
 Issue #115's VAE decoder kernel (`vae_decoder__reduced` 004, Triton, accepted at
 7.88×) is clean on its captured cases alone (`[16, 64, 240]`, `[16, 64, 32]`,
 `[8, 64, 32]`: every row count a whole tile; 7 s) and fails on their variants
@@ -3942,6 +3952,29 @@ evaluator, the snapshot digests, duplicates, sweeps, memcheck, the integration a
 the export treat it like a single-file candidate; a project is compiled outside the
 GPU lock before its evaluation. `python -m kernel_agent.native.project
 check|pack|build DIR` validates, packs or compiles one by hand.
+
+**Megakernel kit** (`kernel_agent/native/megakernel/`, issue #225). A stage as one launch
+whose instructions wait on counters instead of grid barriers: `ka_mk.cuh` (on every
+project's include path) is an interpreter with one block per SM (cooperative launch, grid
+from `ka_coresident_blocks`), `ka_mk::wait` / `ka_mk::signal` (`ld.acquire.gpu` /
+`red.release.gpu`), a producer warp per block that streams the next instructions' weights
+into a shared-memory page pool while the consumer threads wait and compute
+(`cp.async.bulk` + mbarrier on sm_90+ including sm_120, `cp.async` + mbarrier on
+sm_80–sm_89), a watchdog and `KA_MK_TRACE` time stamps; `schedule.py` turns a stage's ops
+and tile-level edges into per-SM queues (static wave order, longest-first placement),
+counter targets and an int32 program built once in `build()`; `simulate.py` checks a
+schedule for deadlocks and early starts over random SM speeds and predicts its time from
+a trace. Template: `agent/examples/native_megakernel/` (RMSNorm → GEMV → residual layers,
+generic opcodes, and a graph + PDL and a grid-barrier baseline from the same math; 28
+layers of [1024, 1024] on an RTX 5070 Ti: 84–87 µs against 77.9 µs for graph + PDL and
+198 µs for the grid-barrier kernel, DRAM floor 70.5 µs); the
+`native-engines` skill's `megakernel.md` is the milestone ladder, and a native digest
+points to it when a stage's best kernel synchronises its grid or launches more than 3
+kernels per call. Native candidates must give the same bits twice: the evaluator runs
+every case twice from the same inputs and state (`incorrect` at stage `determinism`,
+unless the entry declares `ORDER_DEPENDENT_ATOMICS = "<why>"`), and a megakernel stopped
+by its watchdog is recorded as status `hang` with the instruction, counter, value and
+target.
 
 ### Parameter sweeps
 

@@ -1,0 +1,18 @@
+# A megakernel project (issue #225): kernel-agent's interpreter (ka_mk.cuh, on every
+# project's include path) with this project's opcodes (include/mk_ops.cuh), scheduled by
+# kernel_agent.native.megakernel.schedule. Copy the directory to start one.
+
+[project]
+name = "native_megakernel"
+entry = "candidate.py"
+kind = "kernel"
+description = "RMSNorm -> GEMV -> residual chain as one megakernel; graph+PDL and grid-barrier baselines"
+
+[build]
+backend = "torch_extension"
+sources = ["csrc/*.cpp", "csrc/*.cu"]
+include_dirs = ["include"]
+cflags = ["-O3"]
+# KA_MK_TRACE: build(reference, trace=True) records per-instruction timestamps
+cuda_cflags = ["-O3", "-lineinfo", "-DKA_MK_TRACE=1"]
+timeout_s = 900

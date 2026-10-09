@@ -21,6 +21,17 @@ the sanitizer's first report in ``report``), ``skipped`` (no usable ``compute-sa
 :func:`kernel_agent.toolchain.find_sanitizer`; no CUDA device), ``error`` (the sanitizer or
 the process failed without a memory error) or ``timeout``; ``seconds`` is its wall time.
 
+**racecheck and synccheck** (issue #225). A candidate that synchronises inside a kernel
+(:func:`extra_tools`: every native project; a source with shared memory, ``cp.async`` or
+mbarrier pipelines, acquire / release counters or atomics) also runs once on its captured
+cases under ``--tool racecheck`` (hazards between a block's threads on shared memory: a read
+before the barrier that orders it, a page reused while still read) and ``--tool synccheck``
+(a barrier some threads of a block or warp never reach). Either one's errors refuse it like a
+memory error (status ``racecheck`` / ``synccheck``, :data:`FAILED`); ``tools`` in the
+result has every tool's own record (status, errors, first report, seconds). Racecheck sees
+shared memory only: ordering bugs of global memory are what the evaluator's determinism and
+perturbed checks are for.
+
 :func:`selftest` proves that the sanitizer works here (``kernel-agent doctor``): a deliberate
 one-block overrun of a Triton kernel (:mod:`kernel_agent.kernels.memcheck_probe`) must be
 reported, an in-bounds kernel must not.
@@ -53,15 +64,23 @@ from kernel_agent.gpulock import child_env, gpu_lock
 
 #: ``status`` of a kernel with memory errors under memcheck; the integration refuses it.
 STATUS = "memcheck"
+#: The sanitizer tools for kernels that synchronise inside (:func:`extra_tools`), and the
+#: statuses the integration refuses (each tool's name: its errors).
+EXTRA_TOOLS = ("racecheck", "synccheck")
+FAILED = (STATUS, *EXTRA_TOOLS)
+#: What makes a single-file candidate synchronise inside its kernels (native projects always
+#: run every tool): shared-memory pipelines, mbarriers, counters and atomics, the megakernel kit.
+_SYNC_SOURCE = re.compile(
+    r"__shared__|mbarrier|cp\.async|ld\.acquire|red\.release|atomicAdd|atomicCAS|atomicExch"
+    r"|tl\.atomic_|ka_mk"
+)
 RESULT_MARKER = "@@KA_MEMCHECK@@"
 #: The sanitizer's options: memory errors only (no CUDA API errors, which libraries make on
 #: purpose, nor the exit code); a faulting kernel is stopped, not the CUDA context (with no
 #: caching allocator, the first ``cudaFree`` in a dead context aborts the process: no
 #: result line); device backtraces (the host's are interpreter frames); the Python process
 #: alone (not the ptxas a Triton compile starts).
-SANITIZER_ARGS = [
-    "--tool",
-    "memcheck",
+_COMMON_ARGS = [
     "--report-api-errors",
     "no",
     "--check-exit-code",
@@ -75,13 +94,24 @@ SANITIZER_ARGS = [
     "--target-processes",
     "application-only",
 ]
-#: Every tensor its own ``cudaMalloc``: the caching allocator would hide overruns.
-ENV = {"PYTORCH_NO_CUDA_MEMORY_CACHING": "1"}
+SANITIZER_ARGS = ["--tool", "memcheck", *_COMMON_ARGS]
+#: Each tool's options: racecheck reports the hazards it can prove (errors) and the
+#: likely ones (warnings) per access pair, synccheck every divergent or misused barrier.
+TOOL_ARGS = {
+    "memcheck": SANITIZER_ARGS,
+    "racecheck": ["--tool", "racecheck", "--racecheck-report", "analysis", *_COMMON_ARGS],
+    "synccheck": ["--tool", "synccheck", *_COMMON_ARGS],
+}
+#: Every tensor its own ``cudaMalloc``: the caching allocator would hide overruns. A
+#: megakernel's counter waits last ~100x longer under a sanitizer: its watchdog
+#: (``kernel_agent.native.megakernel.runtime``) gets 10 minutes, not 2 s.
+ENV = {"PYTORCH_NO_CUDA_MEMORY_CACHING": "1", "KA_MK_WATCHDOG_MS": "600000"}
 PREFIX = "========="
 #: Lines of the sanitizer's log that are not an error report.
 _META = (
     "COMPUTE-SANITIZER",
     "ERROR SUMMARY",
+    "RACECHECK SUMMARY",
     "LEAK SUMMARY",
     "Error: process didn't terminate successfully",
     "Target application returned an error",
@@ -247,20 +277,48 @@ def parse_log(text: str) -> tuple[int, str]:
     return errors, "\n".join(lines)
 
 
+def parse_race_log(text: str) -> tuple[int, int, str]:
+    """``(errors, warnings, the first hazard report)`` of a racecheck log: its ``RACECHECK
+    SUMMARY: N hazards displayed (E errors, W warnings)``, else one error per report."""
+    _, report = parse_log(text)
+    summary = re.findall(
+        r"RACECHECK SUMMARY: \d+ hazards? displayed \((\d+) errors?, (\d+) warn", text
+    )
+    if summary:
+        return int(summary[-1][0]), int(summary[-1][1]), report
+    return (1 if report else 0), 0, report
+
+
+def extra_tools(candidate: Path) -> tuple[tuple[str, ...], str]:
+    """The tools beyond memcheck that ``candidate`` gets (:data:`EXTRA_TOOLS` or none) and
+    why: a native project (a directory or its bundle) always, a single file when its source
+    synchronises inside its kernels (:data:`_SYNC_SOURCE`)."""
+    from kernel_agent.native import project as native_project
+
+    candidate = Path(candidate)
+    if candidate.is_dir() or native_project.read_bundle(candidate) is not None:
+        return EXTRA_TOOLS, "a native project"
+    try:
+        found = _SYNC_SOURCE.search(candidate.read_text(errors="replace"))
+    except OSError:
+        return (), ""
+    return (EXTRA_TOOLS, f"its source uses {found.group(0)}") if found else ((), "")
+
+
 def _first_lines(report: str, n: int = 2) -> str:
     return " ".join(line for line in report.splitlines()[:n])
 
 
 def _sanitize(
-    cmd: list[str], timeout: float, workdir: Path, tool: Any
+    cmd: list[str], timeout: float, workdir: Path, tool: Any, name: str = "memcheck"
 ) -> tuple[dict[str, Any] | None, str, str]:
     """Run ``cmd`` (a Python command line) under the sanitizer: ``(the result line of the
     process or None, the sanitizer's log, the process's output tail)``; raises
     ``subprocess.TimeoutExpired`` after killing the sanitizer and what it launched (the
     process runs under its launcher, so it does not die with this one)."""
     nonce = secrets.token_hex(16)
-    log_path = workdir / "memcheck.log"
-    full = [tool.path, *SANITIZER_ARGS, "--log-file", str(log_path), *cmd]
+    log_path = workdir / f"{name}.log"
+    full = [tool.path, *TOOL_ARGS[name], "--log-file", str(log_path), *cmd]
     with subprocess.Popen(
         full,
         stdin=subprocess.PIPE,
@@ -341,29 +399,108 @@ def run_memcheck(
             result["reason"] = child["reason"]
     else:
         result["reason"] = f"{child.get('status')}: {str(child.get('error') or '')[-1500:]}"
+    tools, why = extra_tools(Path(candidate))
+    if tools:
+        result["tools"] = {"memcheck": _tool_record(result)}
+        first = result["status"]  # memcheck's verdict: the others run only after a clean one
+        for name in tools:
+            if first != "ok":
+                result["tools"][name] = {"status": "skipped", "reason": f"memcheck {first}"}
+                continue
+            check = _run_tool(name, [*cmd, "--no-variants"], timeout, tool)
+            check["why"] = why
+            result["tools"][name] = check
+            if check["status"] == name and result["status"] == "ok":  # refused: the first
+                result.update(status=name, errors=check["errors"], report=check["report"])
+                result["reason"] = check["reason"]
+        result["seconds"] = round(time.perf_counter() - start, 1)
     return result
 
 
+def _tool_record(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: result[k] for k in ("status", "errors", "report", "reason", "seconds") if k in result
+    }
+
+
+def _run_tool(name: str, cmd: list[str], timeout: float, tool: Any) -> dict[str, Any]:
+    """One run of ``cmd`` (the checked process, captured cases only) under ``--tool name``:
+    status ``ok``, ``name`` (its errors), ``error`` or ``timeout``."""
+    start = time.perf_counter()
+    workdir = Path(tempfile.mkdtemp(prefix=f"ka-{name}-"))
+    out: dict[str, Any] = {"status": "error"}
+    try:
+        with gpu_lock():
+            child, log, tail = _sanitize(cmd, timeout, workdir, tool, name)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "reason": f"exceeded {timeout:.0f}s under {name}",
+                "seconds": round(time.perf_counter() - start, 1)}  # fmt: skip
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    out["seconds"] = round(time.perf_counter() - start, 1)
+    if name == "racecheck":
+        errors, warnings, report = parse_race_log(log)
+        out["warnings"] = warnings
+    else:
+        errors, report = parse_log(log)
+    if errors:
+        what = "shared-memory race(s)" if name == "racecheck" else "barrier error(s)"
+        out.update(status=name, errors=errors, report=report)
+        out["reason"] = (
+            f"{errors} {what} under compute-sanitizer {name}, the first: {_first_lines(report)}"
+        )
+    elif child is not None and child.get("status") in ("ok", "skipped"):
+        out["status"] = child["status"]
+    else:
+        why = (log.strip().splitlines() or [""])[-1] if child is None else child.get("error")
+        out["reason"] = f"the checked process gave no result: {str(why or tail)[-1500:]}"
+    return out
+
+
 def describe(result: dict[str, Any]) -> str:
-    """One line on a memcheck result."""
+    """One line on a memcheck result (and its racecheck and synccheck, when they ran)."""
     status, seconds = result.get("status"), result.get("seconds")
     took = f" ({seconds} s)" if seconds else ""
+    others = [
+        f"{name} {'clean' if rec.get('status') == 'ok' else rec.get('status')}"
+        for name, rec in (result.get("tools") or {}).items()
+        if name != "memcheck"
+    ]
+    also = f"; {', '.join(others)}" if others else ""
     if status == "ok":
         n = len(result.get("variants") or [])
         on = f"{result.get('cases')} case(s)" + (f" + {n} odd-size variant(s)" if n else "")
-        return f"memcheck clean on {on}{took}"
-    if status == STATUS:
-        return f"memcheck FAILED{took}: {result.get('reason')}"
-    return f"memcheck {status}{took}: {result.get('reason')}"
+        return f"memcheck clean on {on}{also}{took}"
+    if status in FAILED:
+        return f"{status} FAILED{took}: {result.get('reason')}"
+    return f"memcheck {status}{took}: {result.get('reason')}{also}"
+
+
+#: Why a kernel that passed the evaluator and the re-check is refused anyway, per tool.
+_REFUSED = {
+    STATUS: "the overrun is masked out of its outputs, but faults once the memory after the "
+    "buffer is released",
+    "racecheck": "the race is lost the same way on this GPU today, another clock, schedule or "
+    "GPU changes its outputs",
+    "synccheck": "a barrier not every thread reaches is undefined behaviour: it hangs or "
+    "corrupts on another GPU or driver",
+}
+
+
+def failed(check: dict[str, Any]) -> bool:
+    """Whether a memcheck record refuses its kernel (memory, race or barrier errors)."""
+    return check.get("status") in FAILED
 
 
 def refuse(result: dict[str, Any], check: dict[str, Any]) -> dict[str, Any]:
-    """A passed re-check ``result`` refused for the memory errors of ``check``."""
-    result.update(status=STATUS, passed=False, memcheck=check)
+    """A passed re-check ``result`` refused for the errors of ``check`` (memcheck,
+    racecheck or synccheck)."""
+    status = str(check.get("status") or STATUS)
+    result.update(status=status, passed=False, memcheck=check)
     result.pop("warning", None)
     result["reason"] = (
-        f"{check.get('reason')} (it passed the evaluator and the re-check: the overrun is "
-        "masked out of its outputs, but faults once the memory after the buffer is released)"
+        f"{check.get('reason')} (it passed the evaluator and the re-check: "
+        f"{_REFUSED.get(status, _REFUSED[STATUS])})"
     )
     return result
 
@@ -371,7 +508,7 @@ def refuse(result: dict[str, Any], check: dict[str, Any]) -> dict[str, Any]:
 def pending(result: dict[str, Any]) -> bool:
     """Whether a passed re-check record still needs its memcheck: none yet, or one that
     did not decide (skipped, error, timeout)."""
-    done = (result.get("memcheck") or {}).get("status") in ("ok", STATUS)
+    done = (result.get("memcheck") or {}).get("status") in ("ok", *FAILED)
     return bool(result.get("passed")) and not done
 
 

@@ -51,6 +51,15 @@ Stages and their failure statuses:
    scaled by 3, 0.01 and −1 (:mod:`kernels.verify`; ``redraws`` in the result: the
    scaled checks that ran and any skipped for a non-finite reference output).
 
+Native candidates (projects, issue #225) also run every case twice from the same inputs and
+module state after stage 2: their outputs and in-place side effects must agree bit for bit
+(``incorrect`` at stage ``determinism``; ``determinism`` in the result), unless the entry
+declares ``ORDER_DEPENDENT_ATOMICS = "<why>"`` (split-K partials summed with float atomics):
+races on global memory and counter-ordering bugs that pass one comparison show up here. A
+megakernel stopped by its watchdog (:mod:`kernel_agent.native.megakernel.runtime`) turns the
+failure it caused into status ``hang``, with the instruction, counter, value and target in
+``hang``.
+
 Peak memory (CUDA, not a failure): per timed case the peak GPU memory of one call of
 the reference and of the candidate (:func:`kernels.bench.peak_memory`; ``ref_peak_mib``,
 ``new_peak_mib``, ``peak_delta_mib``) and ``peak_memory`` for the case with the largest
@@ -151,6 +160,13 @@ OTHER_ROUNDS = 2
 
 
 _run = subprocess.run  # bound at import: tests replace subprocess.run for the evaluator
+#: The entry-module attribute of a native candidate whose results depend on the order of its
+#: atomics (the determinism check is skipped; its value says why).
+ORDER_DEPENDENT = "ORDER_DEPENDENT_ATOMICS"
+#: Failures a megakernel's watchdog can be behind: its kernel stopped early (wrong outputs) or
+#: its runtime refused the next launch.
+_HANG_CAN_CAUSE = ("runtime_error", "incorrect", "incorrect_timed_output", "incorrect_perturbed")
+_MK_RUNTIME = "kernel_agent.native.megakernel.runtime"
 
 
 @functools.cache
@@ -668,7 +684,80 @@ def _finish(stages: Generator[None, None, dict[str, Any]]) -> dict[str, Any]:
             next(stages)
     except StopIteration as done:
         result: dict[str, Any] = done.value
+        return _hang(result)
+
+
+def _hang(result: dict[str, Any]) -> dict[str, Any]:
+    """A failed ``result`` whose cause was a megakernel's watchdog: status ``hang`` with where
+    it stopped (the instruction id, counter, value and target) in ``hang``."""
+    runtime = sys.modules.get(_MK_RUNTIME)  # imported only by candidates that use the kit
+    if result.get("status") not in _HANG_CAN_CAUSE or runtime is None:
         return result
+    if found := runtime.hangs():
+        before = str(result.get("error") or "")
+        result.update(status="hang", correct=False, hang=found[0])
+        result["error"] = runtime.describe(found[0]) + (f"\n{before[-1500:]}" if before else "")
+    return result
+
+
+def _snapshot(value: Any) -> Any:
+    """The tensors of a (nested) output as detached copies (a later call may reuse them)."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _snapshot(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_snapshot(v) for v in value]
+    return value
+
+
+def _bitwise_diff(a: Any, b: Any, name: str) -> str | None:
+    """The first place two snapshots differ in a bit (shape, dtype or bytes), or None."""
+    import torch
+
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return f"{name}: {tuple(a.shape)} {a.dtype} vs {tuple(b.shape)} {b.dtype}"
+        bits_a, bits_b = a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
+        if not torch.equal(bits_a, bits_b):
+            per_element = (bits_a != bits_b).reshape(a.numel(), -1).any(dim=1)
+            return f"{name}: {int(per_element.sum())} of {a.numel()} elements differ"
+        return None
+    if isinstance(a, dict) and isinstance(b, dict):
+        for key in a:
+            if (found := _bitwise_diff(a[key], b.get(key), f"{name}.{key}")) is not None:
+                return found
+        return None
+    if isinstance(a, list) and isinstance(b, list):
+        for k, (x, y) in enumerate(zip(a, b, strict=False)):
+            if (found := _bitwise_diff(x, y, f"{name}[{k}]")) is not None:
+                return found
+        return None
+    return None
+
+
+def _determinism(
+    cases: list[dict[str, Any]], replay: Any, holders: tuple[Any, ...]
+) -> dict[str, Any] | None:
+    """Every case twice from its captured inputs and module state: the first difference
+    between the two calls' outputs and in-place updated arguments (case, where), or None."""
+    import torch
+
+    from kernel_agent.workloads.base import synchronize
+
+    for i, case in enumerate(cases):
+        runs = []
+        for _ in range(2):
+            args, kwargs = copy.deepcopy(case["args"]), copy.deepcopy(case["kwargs"])
+            with torch.inference_mode():
+                out = replay.call(case, *holders)(*args, **kwargs)
+            synchronize()
+            runs.append(_snapshot({"output": out, "args": args, "kwargs": kwargs}))
+        if (where := _bitwise_diff(runs[0], runs[1], "call")) is not None:
+            return {"case": i, "where": where}
+    return None
 
 
 def _stages(
@@ -755,6 +844,8 @@ def _stages(
         result["tolerance_tier"] = comparator.TIER
     guard = integrity.Snapshot(reference, state=replay.keys)  # before the candidate is imported
     guards.append(guard)
+    if (mk := sys.modules.get(_MK_RUNTIME)) is not None:
+        mk.forget()  # an earlier candidate's megakernels (a batch) are not this one's
     _code_dirs(candidate_path)  # a bundle's code directory, read before it is imported
 
     # 1. import + build
@@ -882,6 +973,32 @@ def _stages(
             failed_check={"case": failed, "check": "captured"},
         )
         return result
+    if getattr(module, "__ka_project__", None):  # native: the same call twice, the same bits
+        declared = getattr(module, ORDER_DEPENDENT, None)
+        if declared:
+            result["determinism"] = {"checked": False, "declared": str(declared)[:300]}
+        else:
+            try:
+                diff = _determinism(cases, replay, holders)
+            except Exception:
+                result.update(status="runtime_error", error=_short_tb(), stage="determinism")
+                return result
+            result["determinism"] = {"checked": True, "cases": len(cases)}
+            if diff is not None:
+                result["determinism"].update(diff)
+                result.update(
+                    status="incorrect",
+                    stage="determinism",
+                    failed_check={"case": diff["case"], "check": "determinism"},
+                    error=(
+                        f"case {diff['case']}: two calls from the same inputs and state gave "
+                        f"different results ({diff['where']}): a race on global memory or an "
+                        "order-dependent reduction; fix the race, or declare "
+                        f'{ORDER_DEPENDENT} = "<why>" in the entry when float atomics sum '
+                        "in a varying order on purpose"
+                    ),
+                )
+                return result
     if compile_check:  # optional stage on a fresh build: graph breaks + compiled outputs
         from kernel_agent.kernels.compile_check import check
 
@@ -1972,7 +2089,7 @@ def _batch_main(ns: argparse.Namespace, tag: str) -> int:
             next(stages)
             paused[i] = (stages, guards)  # timed: the rest after the others' timing
         except StopIteration as done:  # it failed or is not timed (CPU): done now
-            result = done.value
+            result = _hang(done.value)
         except Exception:
             result = {"status": "harness_error", "correct": False, "error": _short_tb()}
         shared.update({k: session[k] for k in ("capture", "replay") if k in session})

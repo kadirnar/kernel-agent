@@ -1511,7 +1511,7 @@ class Orchestrator:
             reason=str(check.get("reason") or "")[:500],
         )
         result = {**result, "memcheck": check}
-        return memcheck.refuse(result, check) if check.get("status") == memcheck.STATUS else result
+        return memcheck.refuse(result, check) if memcheck.failed(check) else result
 
     def _recheck_one(
         self, target_id: str, snap: Path, rec: dict[str, Any] | None
