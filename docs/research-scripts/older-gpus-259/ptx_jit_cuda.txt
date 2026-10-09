@@ -1,0 +1,12 @@
+# build (CPU), TORCH_CUDA_ARCH_LIST=8.6+PTX: nvcc gencodes from each extension's build.ninja
+cuda_int8_gemv, cuda_fp8_gemv, cuda_int8_skinny_gemm: -gencode=arch=compute_86,code=compute_86 -gencode=arch=compute_86,code=sm_86
+# GPU NVIDIA GeForce RTX 5070 Ti sm_120; TORCH_CUDA_ARCH_LIST=8.6+PTX
+cuda_int8_gemv: ran through compute_86 PTX; rel L2 vs nn.Linear M=1: 0.0045, M=4: 0.0046
+cuda_fp8_gemv: ran through compute_86 PTX; rel L2 vs nn.Linear M=1: 0.0259, M=4: 0.0256
+cuda_int8_skinny_gemm: ran through compute_86 PTX; rel L2 vs nn.Linear M=3: 0.0097, M=16: 0.0096
+
+# build (CPU), TORCH_CUDA_ARCH_LIST=7.5+PTX
+cuda_int8_gemv, cuda_fp8_gemv: -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75
+# GPU NVIDIA GeForce RTX 5070 Ti sm_120; TORCH_CUDA_ARCH_LIST=7.5+PTX
+cuda_int8_gemv: ran through compute_75 PTX; rel L2 vs nn.Linear M=1: 0.0045, M=4: 0.0046
+cuda_fp8_gemv: ran through compute_75 PTX; rel L2 vs nn.Linear M=1: 0.0259, M=4: 0.0256

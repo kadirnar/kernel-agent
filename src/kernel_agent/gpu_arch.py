@@ -637,10 +637,21 @@ def knowledge_section(key: str | None, text: str | None = None) -> str:
     return ""
 
 
+def _absolute_links(section: str) -> str:
+    """A section's links to the skill's files (``[turing.md](turing.md)``) as absolute paths,
+    so a session reads the family's file without resolving it against ``gpus.md``."""
+    return re.sub(
+        r"\]\(([\w.-]+\.md)\)",
+        lambda m: f"]({KNOWLEDGE.parent / m[1]})" if (KNOWLEDGE.parent / m[1]).is_file() else m[0],
+        section,
+    )
+
+
 def prompt_section(toolchain_summary: str | None) -> str:
     """The ``# This GPU`` section of an agent prompt: what the toolchain summary's GPU is,
     that numbers measured on another GPU are evidence from it, and this family's section
-    of ``gpu-architectures/gpus.md`` ("" when the summary names no GPU)."""
+    of ``gpu-architectures/gpus.md`` with its links as absolute paths ("" when the summary
+    names no GPU)."""
     facts = from_summary(toolchain_summary)
     fam = facts.family
     if fam is None:
@@ -655,5 +666,5 @@ def prompt_section(toolchain_summary: str | None) -> str:
         f"(`{KNOWLEDGE}`).",
     ]
     if section := knowledge_section(fam.key):
-        lines += ["", section]
+        lines += ["", _absolute_links(section)]
     return "\n".join(lines) + "\n"

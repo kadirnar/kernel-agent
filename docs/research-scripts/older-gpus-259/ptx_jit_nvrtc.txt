@@ -1,0 +1,6 @@
+# GPU: NVIDIA GeForce RTX 5070 Ti sm_120
+compute_75  ran: __CUDA_ARCH__=750; hardware e4m3 cvt in PTX: False; 256 e4m3 codes equal torch's decoding: True
+compute_80  ran: __CUDA_ARCH__=800; hardware e4m3 cvt in PTX: False; 256 e4m3 codes equal torch's decoding: True
+compute_86  ran: __CUDA_ARCH__=860; hardware e4m3 cvt in PTX: False; 256 e4m3 codes equal torch's decoding: True
+compute_89  ran: __CUDA_ARCH__=890; hardware e4m3 cvt in PTX: True; 256 e4m3 codes equal torch's decoding: True
+sm_120      ran: __CUDA_ARCH__=1200; hardware e4m3 cvt in PTX: n/a (cubin); 256 e4m3 codes equal torch's decoding: True

@@ -10,11 +10,19 @@ block's measured peaks and instruction rates are the numbers to use.
 ## [pre_ampere] Volta / Turing (sm_70, sm_75: V100, T4, RTX 20xx)
 
 * Tensor cores: fp16 `mma.sync` only (int8 on sm_75); **no bf16, TF32 or FP8 tensor
-  cores**. A bf16 model's matmuls do not get tensor-core rates here; fp16 does.
-* Triton's `tl.dot` falls back to FMA (CUDA cores) below sm_80 for fp16 / bf16 / tf32
-  (no `mma` in the PTX), and an int8 `tl.dot` does not compile for sm_75 (Triton 3.8:
-  `PassManager::run failed` in `TritonGPUAccelerateMatmul`): use Triton for memory-bound
-  glue, cuBLAS or CUDA C++ fp16 `mma.sync` (m16n8k8; `m16n8k16` needs sm_80) for GEMMs.
+  cores**. **Run 16-bit work in fp16 here.** A bf16 model's GEMMs and attention get no
+  tensor cores:
+  * Triton and TileLang compile bf16 GEMMs without an MMA;
+  * PyTorch's flash and cuDNN attention need sm_80;
+  * its memory-efficient attention has no bf16 kernel below sm_80.
+
+  First check the fp16 run against an fp32 run: fp16 overflows above 65504. `--dtype auto`
+  (the default) makes that check in `analyze`.
+* Triton's `tl.dot` on fp16 / bf16 / fp32 compiles to FMA (CUDA cores) below sm_80 (no
+  `mma` in the PTX). Its int8 `tl.dot` does not compile for sm_75 (Triton 3.8:
+  `PassManager::run failed` in `TritonGPUAccelerateMatmul`). Use Triton for memory-bound
+  glue, and cuBLAS fp16, CUDA C++ fp16 `mma.sync` (m16n8k8; `m16n8k16` needs sm_80) or
+  TileLang for GEMMs.
 * CuTe DSL 4.8 has no sm_75 target (its targets start at sm_80): `doctor` lists `cute`
   under `backends unavailable` with the reason; CUTLASS C++ has sm_75 tensor-core GEMMs.
 * No `cp.async`, TMA, clusters or PDL. Shared memory: 64 KB per block on sm_75, 96 KB on
@@ -22,9 +30,12 @@ block's measured peaks and instruction rates are the numbers to use.
 * Weight-only FP8 / FP4 and FP8 KV caches still run (software dequantisation, as on
   Ampere); W8A8 and MXFP8 do not.
 * INT8 tensor cores on sm_75 (IMMA, `mma.sync` m8n8k16 s8, 2x the fp16 rate): `int8_w8a8`
-  runs there through cuBLASLt (`torch._int_mm`) or CUDA C++ (Triton's int8 `tl.dot` does
-  not compile below sm_80; the `m16n8k32` form needs sm_80). sm_70 has no INT8 MMA:
+  runs there through cuBLASLt (`torch._int_mm`) or CUDA C++. Triton's int8 `tl.dot` does
+  not compile for sm_75, and the `m16n8k32` form needs sm_80. sm_70 has no INT8 MMA, so
   `int8_w8a8` is refused there; `int8_weights` runs everywhere.
+* Turing in depth: [turing.md](turing.md) has the instruction table, the backends on
+  sm_75, the datasheet rows, the code paths verified through PTX JIT and what to measure
+  first.
 
 ## [ampere] Ampere (sm_80: A100, A30; sm_86 / sm_87: A10, A40, RTX A6000, RTX 30xx, Orin)
 
@@ -50,6 +61,10 @@ block's measured peaks and instruction rates are the numbers to use.
   150-300 W caps; GeForce RTX 30xx: fp32 accumulation at half rate, INT8 4x bf16): the
   toolchain block's measured lines say which this GPU is; `skus.md` next to this file has
   the SKU classes and the NVIDIA A10.
+* Ampere in depth: [ampere.md](ampere.md) covers sm_80 vs sm_86 (A100 vs A10 / A40 / RTX
+  30xx: shared memory, L2, power), the instruction table, the backends, TF32, the
+  datasheet rows, the code paths verified through PTX JIT and what to measure first
+  (fp32 vs fp16 accumulation rate, the INT8 : bf16 ratio, sustained clocks).
 
 ## [ada] Ada Lovelace (sm_89: RTX 40xx, RTX 6000 Ada, L4, L40S)
 
@@ -71,6 +86,9 @@ block's measured peaks and instruction rates are the numbers to use.
 * No TMA, clusters or PDL: `cp.async` pipelines, CUDA graphs for launch gaps.
   Shared memory 99 KB per block; large L2 (the AD102 die has 96 MB; products enable less:
   the toolchain block has this GPU's).
+* Ada in depth: [ada.md](ada.md) covers the FP8 instruction table, Triton's FP8 lowering
+  and pipelining, the cuBLASLt FP8 modes on 8.9, the datasheet rows, the code paths
+  verified through PTX JIT and what to measure first.
 
 ## [hopper] Hopper (sm_90: H100, H200, GH200, H20)
 
