@@ -974,6 +974,54 @@ def _weight_shares(module: Any, precision: str | None) -> dict[tuple[str, int], 
     return shares
 
 
+#: The attention ops SDPA dispatches to whose FLOP formula (``torch.utils.flop_counter``)
+#: before torch 2.14 requires as many K / V heads as query heads (their layout: [batch, heads,
+#: seq, dim] on every torch). Grouped-query attention broadcasts the K / V heads, the same math
+#: per query head, but torch 2.10 raised ``sdpa_flop_count: query/key/value shapes are
+#: incompatible`` and every GQA target got no speed of light (``sol_error``; measured on an
+#: NVIDIA A10 with torch 2.10). The fused ops behind them (``_flash_attention_forward``, ...)
+#: are not dispatched from SDPA, and torch's formulas read their layout differently by version.
+_GQA_OPS = (
+    "_scaled_dot_product_flash_attention",
+    "_scaled_dot_product_efficient_attention",
+    "_scaled_dot_product_cudnn_attention",
+)
+_HEADS = 1  # [batch, heads, seq, dim]
+
+
+def gqa_flop_formulas() -> dict[Any, Any]:
+    """``FlopCounterMode(custom_mapping=...)`` entries for the attention ops of
+    :data:`_GQA_OPS`: torch's own formula with the K / V heads widened to the query's (meta
+    tensors: nothing is allocated) when there are fewer of them and the query's are a
+    multiple. The same count as torch 2.14's own GQA formula; MHA calls are unchanged."""
+    import torch
+    from torch.utils.flop_counter import flop_registry
+
+    def widened(t: Any, heads: int) -> Any:
+        shape = list(t.shape)
+        shape[_HEADS] = heads
+        return torch.empty(shape, dtype=t.dtype, device="meta")
+
+    out: dict[Any, Any] = {}
+    for name in _GQA_OPS:
+        op = getattr(torch.ops.aten, name, None)
+        base = flop_registry.get(op) if op is not None else None
+        if base is None:
+            continue
+
+        def formula(
+            query: Any, key: Any, value: Any, *args: Any, _base: Any = base, **kw: Any
+        ) -> Any:
+            heads, kv_heads = query.shape[_HEADS], key.shape[_HEADS]
+            if kv_heads and kv_heads != heads and heads % kv_heads == 0:
+                key, value = widened(key, heads), widened(value, heads)
+            return _base(query, key, value, *args, **kw)
+
+        formula._get_raw = True  # type: ignore[attr-defined]  # tensors in: FlopCounterMode's flag
+        out[op] = formula
+    return out
+
+
 def count_case(
     module: Any,
     args: tuple[Any, ...],
@@ -999,7 +1047,8 @@ def count_case(
             external[key] = t.untyped_storage().nbytes()
     narrow = _weight_shares(module, precision)
     fn = module if method in (None, "forward") else getattr(module, method)
-    with torch.inference_mode(), FlopCounterMode(display=False) as counter:
+    counting = FlopCounterMode(display=False, custom_mapping=gqa_flop_formulas())
+    with torch.inference_mode(), counting as counter:
         dtype = MATH_DTYPE.get(precision or "")
         tracker = _tracker(counter, external, (set(narrow), dtype) if dtype else None)
         with tracker:
