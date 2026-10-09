@@ -57,7 +57,13 @@ class OptimizeConfig:
     model_ref: str
     runs_dir: Path = Path("runs")
     modality: str | None = None
-    dtype: str = "bfloat16"
+    #: ``--dtype``: "auto" (#255: the checkpoint's where the GPU has tensor cores for it,
+    #: float16 checked against float32 where it has none for bf16; workloads/dtypes.py) or
+    #: an explicit dtype; a run.json records the dtype it resolved to.
+    dtype: str = "auto"
+    #: Refuse, before loading, a model whose estimated footprint does not fit the GPU
+    #: (memfit.py, #255; ``--no-memory-check``: try anyway).
+    memory_check: bool = True
     trust_remote_code: bool = False
     workload_options: dict[str, Any] = field(default_factory=dict)
     harness: str | None = None

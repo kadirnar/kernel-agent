@@ -31,6 +31,7 @@ from kernel_agent import (
     interrupt,
     ledger,
     library,
+    memfit,
     objective,
     precisions,
     program,
@@ -73,7 +74,7 @@ from kernel_agent.native import engine as native_engine
 from kernel_agent.phases import PHASES as CALL_PHASES
 from kernel_agent.report import write_report
 from kernel_agent.worker import call_worker
-from kernel_agent.workloads import validate_metric
+from kernel_agent.workloads import dtypes, validate_metric
 from kernel_agent.workloads.base import WorkloadSpec
 from kernel_agent.workloads.quality import probe_messages
 from kernel_agent.workspace import RunDir, coordinator_lock, read_json, write_json
@@ -168,11 +169,18 @@ class Orchestrator:
             f"{card.repo_id}: modality={card.modality.value} arch={card.architectures} "
             f"params={card.params} size={card.size_gb} GB"
         )
+        try:  # --dtype auto: the checkpoint's, or float16 to check on this GPU (#255)
+            choice = dtypes.resolve(cfg.dtype, dtypes.checkpoint_dtype(card.config), cap)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        log(f"dtype: {choice.runtime} ({choice.why})")
+        if choice.warning:
+            log(f"WARNING: {choice.warning}")
         spec = WorkloadSpec(
             repo_id=card.repo_id,
             revision=card.revision,
             modality=card.modality.value,
-            dtype=cfg.dtype,
+            dtype=choice.runtime,
             trust_remote_code=cfg.trust_remote_code,
             harness=str(Path(cfg.harness).resolve()) if cfg.harness else None,
             options=cfg.workload_options,
@@ -188,6 +196,7 @@ class Orchestrator:
             {
                 "card": card.to_dict(),
                 "workload": spec.to_dict(),
+                "dtype": choice.to_dict(),  # analyze settles a pending float16 check
                 "config": cfg.to_dict(),
                 "phases": {},
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -540,7 +549,62 @@ class Orchestrator:
 
     # ------------------------------------------------------------ phases
 
+    def _memory_fit(self, runtime: str) -> dict[str, Any]:
+        """The memory preflight of the run's model in ``runtime`` (``memfit.py``), recorded in
+        ``run.json`` → ``memory_fit``."""
+        data = self.run.load()
+        gpu_gb = memfit.gpu_memory_gb(getattr(self.tc, "gpu", None))
+        checkpoint = (data.get("dtype") or {}).get("checkpoint")
+        fit = memfit.preflight(
+            data["card"],
+            data["workload"],
+            runtime,
+            gpu_gb,
+            self.cfg.runs_dir,
+            checkpoint=checkpoint,
+        )
+        self.run.update(lambda d: d.__setitem__("memory_fit", fit))
+        return fit
+
+    async def settle_dtype(self, *, retry: bool = False) -> None:
+        """Before analyze loads the model (#255): the memory preflight (a model that does not
+        fit is refused with the options, unless ``--no-memory-check``), then a pending
+        float16 candidate checked against float32 where it fits (``worker dtype_check``,
+        ``workloads/dtypes.py``) and the run's dtype settled: ``run.json`` → ``dtype`` and
+        ``workload.dtype``. ``retry``: a harness was written, so a check that could not run
+        runs again. A run from before #255 (no ``dtype``) is left as it was."""
+        choice = self.run.load().get("dtype")
+        if not choice:
+            return
+        candidate = choice.get("candidate") or choice["runtime"]
+        check = dtypes.needs_check(choice, retry=retry)
+        fit = self._memory_fit(candidate if check else choice["runtime"])
+        log(f"memory preflight: {memfit.describe(fit)}")
+        if not fit["fits"]:
+            if self.cfg.memory_check:
+                raise SystemExit(memfit.refusal(fit))
+            log(f"WARNING (--no-memory-check, trying anyway): {memfit.refusal(fit)}")
+        if not check:
+            return
+        reference = dtypes.FLOAT32 if fit["fp32_fits"] else dtypes.BFLOAT16
+        self.run.update(lambda d: d["dtype"].__setitem__("reference", reference))
+        log(f"dtype: checking {candidate} against {reference} on the workload's inputs")
+        result = await asyncio.to_thread(self.worker or call_worker, self.run, "dtype_check")
+        settled = dtypes.settle(
+            {**choice, "reference": reference}, result, fp32_fits=fit["fp32_fits"]
+        )
+
+        def record(data: dict[str, Any]) -> None:
+            data["dtype"] = settled
+            data["workload"]["dtype"] = settled["runtime"]
+
+        self.run.update(record)
+        log(f"dtype: {settled['runtime']} ({settled['why']})")
+        if settled["runtime"] != candidate:  # what the run now holds
+            self._memory_fit(settled["runtime"])
+
     async def analyze(self) -> None:
+        await self.settle_dtype()  # the memory preflight and the float16 check (#255)
         log("analyze: loading model, measuring baseline, profiling")
         # GPU worker calls run off the event loop (as every one in a coroutine): other
         # sessions and their tools keep going meanwhile
@@ -548,6 +612,7 @@ class Orchestrator:
         if "error" in result and self.cfg.allow_harness_agent:
             log("analyze: built-in workload failed; asking Claude to write a harness")
             await self.write_harness(result["error"])
+            await self.settle_dtype(retry=True)  # a float16 check that could not run before
             result = await asyncio.to_thread(call_worker, self.run, "analyze", "--iters", "3")
         if "error" in result:
             raise SystemExit(f"analyze failed:\n{result['error']}")
@@ -1719,8 +1784,12 @@ class Orchestrator:
         title = ledger.integration_title([x for _, x in b], [x for _, x in a])
         full = next((c for c in crowded or [] if c <= a_items and c <= b_items), None)
         oom = full is not None
+        fit = self.run.load().get("memory_fit") or {}  # memfit.py: two states do not fit (#255)
         if full is not None:
             why = f"out of GPU memory before with {len(full)} of these items in both states"
+            log(f"integrate: no in-process A/B ({why}); separate processes")
+        elif fit.get("ab_in_process") is False:
+            why = f"the memory preflight: {fit.get('ab_why')}"
             log(f"integrate: no in-process A/B ({why}); separate processes")
         elif not irreversible.intersection(a_items | b_items):
             cli = [*_cli(a, warmup=2), *_cli(b, prefix="--b-")]

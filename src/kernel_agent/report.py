@@ -24,6 +24,7 @@ from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
 from kernel_agent.kernels import recheck, weights
+from kernel_agent.workloads import dtypes
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
 
@@ -346,6 +347,7 @@ def write_report(run: RunDir) -> Path:
         f"params: {card.get('params')}",
         f"* GPU: {gpu.get('name')} ({gpu.get('arch')}), torch {tc.get('torch_version')}",
         f"* workload: `{baseline.get('workload')}`",
+        *dtypes.report_lines(data),  # the run's dtype and why, the memory preflight (#255)
         *([f"* {line}"] if (line := objective.describe(baseline)) else []),
         *_quality_lines(data, baseline, gpu),
         "",

@@ -5,6 +5,8 @@ modules and code paths as the real model, a few hundred kilobytes of weights."""
 from __future__ import annotations
 
 import importlib.util
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -102,4 +104,29 @@ def tiny_voxcpm2(seed: int = 0) -> Any:
     torch.manual_seed(seed)
     model = VoxCPM2Model(config, SimpleNamespace(vocab={}), AudioVAEV2(vae), device="cpu")
     model.text_tokenizer = CharTokenizer()
+    model.tiny_vae_config = vae  # write_checkpoint: the checkpoint's audio_vae_config
     return model.eval()
+
+
+def write_checkpoint(path: Path, dtype: str = "bfloat16", seed: int = 0) -> Path:
+    """The tiny VoxCPM2 as a checkpoint directory ``from_local`` loads (``config.json`` with
+    ``architecture`` voxcpm2 and ``dtype``, ``model.safetensors`` in that dtype,
+    ``audiovae.safetensors``); its tokenizer is :class:`CharTokenizer` (patch
+    ``LlamaTokenizerFast.from_pretrained``)."""
+    from safetensors.torch import save_file
+
+    model = tiny_voxcpm2(seed)
+    path.mkdir(parents=True, exist_ok=True)
+    stored = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(dtype, torch.float32)
+    state = {k: v.detach().contiguous() for k, v in model.state_dict().items()}
+    lm = {k: v.to(stored) if v.is_floating_point() else v for k, v in state.items()}
+    lm = {k: v for k, v in lm.items() if not k.startswith("audio_vae.")}
+    save_file(lm, str(path / "model.safetensors"))
+    vae = {k.removeprefix("audio_vae."): v for k, v in state.items() if k.startswith("audio_vae.")}
+    save_file(vae, str(path / "audiovae.safetensors"))
+    config = model.config.model_dump(mode="json")
+    config.update(
+        architecture="voxcpm2", dtype=dtype, audio_vae_config=model.tiny_vae_config.model_dump()
+    )
+    (path / "config.json").write_text(json.dumps(config))
+    return path

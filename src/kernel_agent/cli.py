@@ -260,6 +260,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         runs_dir=Path(ns.runs_dir),
         modality=ns.modality,
         dtype=ns.dtype,
+        memory_check=not ns.no_memory_check,
         trust_remote_code=ns.trust_remote_code,
         workload_options=_options(ns.option),
         harness=ns.harness,
@@ -608,7 +609,18 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--modality", choices=["llm", "stt", "tts", "diffusion"], help="override detection"
     )
-    p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "bfloat16", "float16", "float32"],
+        help="auto (default): the checkpoint's dtype; on a GPU without bf16 tensor cores "
+        "(Turing) float16, checked against float32 by analyze (float32 when it fails)",
+    )
+    p.add_argument(
+        "--no-memory-check",
+        action="store_true",
+        help="analyze: try a model whose estimated footprint does not fit the GPU anyway",
+    )
     p.add_argument(
         "--option",
         "-o",

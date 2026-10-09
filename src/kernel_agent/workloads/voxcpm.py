@@ -26,8 +26,10 @@ Limitations: the candidate must keep calling ``model.feat_decoder`` from
 Python once per patch, with the noise drawn from the global RNG as in the
 original.  A transform that captures the whole step (LM + decoder) in one CUDA
 graph, or calls ``generate`` more than once per run, cannot be teacher-forced
-and is rejected with a clear reason.  The model runs in its checkpoint dtype
-(``config.json``, bfloat16 for VoxCPM2); ``--dtype`` is ignored.
+and is rejected with a clear reason.  The model runs in the run's dtype (``--dtype``, by
+default the checkpoint's, bfloat16 for VoxCPM2; float16 or float32 on a GPU without bf16
+tensor cores, ``workloads/dtypes.py``), which :meth:`VoxCPMWorkload.set_dtype` hands to
+VoxCPM's config; a run from before #255 keeps the checkpoint's.
 
 ``-o metric=ttfa`` (:mod:`kernel_agent.objective`) optimises the time to first audio:
 ``run`` goes through VoxCPM's streaming path, ``generate_streaming``
@@ -45,6 +47,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import tempfile
 import traceback
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -138,6 +141,16 @@ class VoxCPMWorkload(Workload):
     # `-o metric=ttfa`: the streaming path (`_stream`), time to the first audio chunk.
     metrics = (objective.LATENCY, objective.TTFA)
 
+    #: :meth:`set_dtype`'s dtype, passed to VoxCPM's config; None: the checkpoint's (a run
+    #: from before #255, whose ``run.json`` has no ``dtype``).
+    config_dtype: str | None = None
+
+    def set_dtype(self, dtype: str) -> None:
+        """VoxCPM reads its dtype from the checkpoint's ``config.json``: :meth:`load` hands
+        ``from_local`` a copy of the checkpoint whose config says ``dtype``."""
+        super().set_dtype(dtype)
+        self.config_dtype = self.spec.dtype
+
     def load(self) -> None:
         from huggingface_hub import snapshot_download
 
@@ -148,9 +161,10 @@ class VoxCPMWorkload(Workload):
         from voxcpm.model.voxcpm2 import VoxCPM2Model
 
         model_cls: Any = VoxCPM2Model if arch == "voxcpm2" else VoxCPMModel
-        self.model = model_cls.from_local(
-            path, optimize=bool(self.options["compile"]), device=self.spec.device
-        )
+        with _with_config_dtype(path, self.config_dtype) as checkpoint:
+            self.model = model_cls.from_local(
+                checkpoint, optimize=bool(self.options["compile"]), device=self.spec.device
+            )
         self.sampling_rate = int(getattr(self.model, "sample_rate", 0))
 
     def roots(self) -> dict[str, nn.Module]:
@@ -450,6 +464,25 @@ class VoxCPMWorkload(Workload):
             ),
             max_mos_drop=float(opt.get("max_mos_drop", p.MAX_MOS_DROP)),
         )
+
+
+@contextlib.contextmanager
+def _with_config_dtype(path: str, dtype: str | None) -> Iterator[str]:
+    """The checkpoint directory ``path`` for ``from_local``; with a ``dtype`` its config does
+    not say, a temporary directory of links to its files with a ``config.json`` that does
+    (``from_local`` takes the model's dtype from there only)."""
+    with open(os.path.join(path, "config.json")) as fh:
+        config = json.load(fh)
+    if dtype is None or config.get("dtype") == dtype:
+        yield path
+        return
+    with tempfile.TemporaryDirectory(prefix="voxcpm-dtype-") as tmp:
+        for name in os.listdir(path):
+            if name != "config.json":
+                os.symlink(os.path.join(path, name), os.path.join(tmp, name))
+        with open(os.path.join(tmp, "config.json"), "w") as fh:
+            json.dump({**config, "dtype": dtype}, fh)
+        yield tmp
 
 
 def _streaming_failure(exc: BaseException) -> str:
