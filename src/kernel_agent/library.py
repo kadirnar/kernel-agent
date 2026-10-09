@@ -397,9 +397,13 @@ def store_run(
     min_speedup: float,
 ) -> list[dict[str, Any]]:
     """Add the run's verified module winners and accepted kernels (``TARGET=path`` items of
-    the integration) to the library; returns one summary per stored entry."""
+    the integration) to the library; returns one summary per stored entry. Nothing under
+    emulation (``emulate.py``): a kernel run there is not a winner on that architecture."""
+    from kernel_agent import emulate
     from kernel_agent.agent.tools import best_for_target
 
+    if emulate.active():
+        return []
     picks: dict[tuple[str, str], dict[str, Any]] = {}
     for target_id in run.target_ids():
         best = best_for_target(run, target_id, keeper)

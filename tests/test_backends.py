@@ -228,3 +228,11 @@ def test_library_record_and_track_record(run, tmp_path, monkeypatch):
     note = backends.track_record_note("sm_120")
     assert "Backend track record on sm_120" in note and "| Compute-bound FP8 GEMM" in note
     assert backends.track_record_note("sm_89") == "" and backends.track_record_note(None) == ""
+
+
+def test_no_track_record_under_emulation(run, tmp_path, monkeypatch):
+    """An emulated GPU's outcomes (#252) are not that architecture's: nothing is recorded."""
+    monkeypatch.setenv(library.ENV, str(tmp_path / "lib"))
+    monkeypatch.setenv("KERNEL_AGENT_EMULATE_ARCH", "sm_86")
+    assert backends.record_run(run, "sm_86") is None
+    assert not backends.record_path("sm_86").exists() and backends.track_record("sm_86") == []

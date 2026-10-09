@@ -167,6 +167,14 @@ def test_store_after_integrate(tmp_path, monkeypatch, lib):
     assert again["rmsnorm"].meta["created"] == norm.meta["created"]
 
 
+def test_nothing_is_stored_under_emulation(tmp_path, monkeypatch, lib):
+    """A run's winners on an emulated GPU (#252) are not winners on that architecture."""
+    monkeypatch.setenv("KERNEL_AGENT_EMULATE_ARCH", "sm_86")
+    orch = stored_run(tmp_path, monkeypatch)
+    assert by_target() == {} and by_target("sm_86") == {} and not lib.exists()
+    assert not (orch.run.load().get("library") or {}).get("stored")
+
+
 def test_no_library_reads_or_writes_nothing(tmp_path, monkeypatch, lib):
     stored_run(tmp_path, monkeypatch)
     before = sorted(p for p in lib.rglob("*"))

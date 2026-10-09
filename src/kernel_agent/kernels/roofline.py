@@ -591,10 +591,11 @@ def measure_peaks() -> dict[str, Any]:
 
 
 def _peaks_file() -> tuple[Any, Path] | None:
-    """(toolchain, peaks cache file) of the current GPU, or None without one."""
+    """(toolchain, peaks cache file) of the current GPU, or None without one (or an emulated
+    one, ``emulate.py``: its peaks would be the real GPU's)."""
     tc = toolchain.setup()
     name = getattr(getattr(tc, "gpu", None), "name", None)
-    if not isinstance(name, str):
+    if not isinstance(name, str) or getattr(tc.gpu, "emulated_on", None):
         return None
     return tc, toolchain.peaks_path(name, tc.torch_version)
 
@@ -1136,11 +1137,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Measure and cache the GPU roofline peaks.")
     parser.add_argument("--out", default=None, help="JSON file (default: the peaks cache)")
     ns = parser.parse_args(argv)
+    from kernel_agent import emulate
+
+    if emulate.active() and ns.out is None:  # never cached as an emulated GPU's (#252)
+        parser.error(f"{emulate.ENV} is set: emulated peaks are not cached (give --out FILE)")
     with gpu_lock() as gpu:
         os.environ.update(pinned(gpu))  # before CUDA starts: measure the GPU we locked
         peaks = measure_peaks()
     tc = toolchain.setup()
     assert tc.gpu is not None
+    if (emulated := emulate.record(tc.gpu)) is not None:
+        peaks["emulated"] = emulated
     path = ns.out or toolchain.peaks_path(tc.gpu.name, tc.torch_version)
     write_json(Path(path), peaks)
     print(json.dumps(peaks))

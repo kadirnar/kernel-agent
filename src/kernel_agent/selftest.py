@@ -25,7 +25,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from kernel_agent import gpu_arch
+from kernel_agent import emulate, gpu_arch
 from kernel_agent.agent.prompts import EXAMPLES_DIR
 
 
@@ -362,10 +362,13 @@ def example_skip(name: str, tc: object, backend: str | None = None) -> str | Non
     not available (with the toolchain's reason: ``cute`` on sm_75), or this GPU is not one of
     its ``ARCHS`` (:func:`gpu_arch.example_skip`); None: it runs."""
     gpu = getattr(tc, "gpu", None)
+    cap = tuple(gpu.capability) if gpu is not None else None
     if backend is not None and not (getattr(tc, "backends", {}) or {}).get(backend):
+        arch = gpu_arch.example_skip(EXAMPLES_DIR / name, cap)
+        if arch and emulate.compile_only(backend, gpu):  # #252: its ARCHS, not "compile-only"
+            return arch
         why = (getattr(tc, "unavailable", {}) or {}).get(backend)
         return f"the {backend} backend is not available" + (f" ({why})" if why else "")
-    cap = tuple(gpu.capability) if gpu is not None else None
     return gpu_arch.example_skip(EXAMPLES_DIR / name, cap)
 
 
@@ -814,6 +817,11 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
     skipped: dict[str, str] = {}
     # the available backends, and those installed but refused on this GPU (listed with why)
     off = getattr(tc, "unavailable", {}) or {}
+    if verbose and (emulated := emulate.record(tc.gpu)) is not None:  # #252
+        print(
+            f"  emulating {emulated['arch']} on this {emulated['real']} (PTX JIT): its code "
+            f"paths' correctness; the speedups are not representative; {emulated['native']}"
+        )
     with tempfile.TemporaryDirectory() as tmp:
         capture = make_rmsnorm_capture(Path(tmp) / "rmsnorm.pt")
         for backend in backends or [b for b, avail in tc.backends.items() if avail or b in off]:

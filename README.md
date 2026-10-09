@@ -4476,6 +4476,30 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
 * **Builds.** `load_inline` compiles for the GPU's arch (`TORCH_CUDA_ARCH_LIST`, unless
   set); on Hopper and datacenter Blackwell for the arch-specific target (`9.0a`,
   `10.0a`), where `wgmma` / `tcgen05` and CUTLASS's sm_90 / sm_100 kernels live.
+  NVRTC code takes its target from `toolchain.nvrtc_target()` (`sm_XY` and a cubin).
+* **Emulating an older GPU** (#252, `kernel_agent/emulate.py`). `--emulate-arch sm_86`
+  on `doctor`, `eval`, `recheck` and `memcheck` (or `KERNEL_AGENT_EMULATE_ARCH=sm_86`,
+  inherited by every child process) runs an older GPU's exact code paths on this one:
+  the build embeds that architecture's PTX (`TORCH_CUDA_ARCH_LIST=8.6+PTX` in its own
+  `TORCH_EXTENSIONS_DIR`, NVRTC `compute_86`, Triton compiled for sm_86 and loaded from
+  its PTX) and the driver JIT-compiles it, so `__CUDA_ARCH__` is 860, Triton lowers for
+  sm_86 and the e4m3 conversion takes its software routine. The process sees that GPU's
+  facts: `GPUInfo` (`NVIDIA GeForce RTX 5070 Ti emulating sm_86`, sm_86, 99 KB shared
+  memory per block), `torch.cuda.get_device_capability` and `get_device_properties`
+  (so examples' and candidates' own `>= (8, 9)` checks take the old GPU's branch), the
+  precisions it cannot run, the examples' `ARCHS` and the summary (`emulated: sm_86 code
+  paths on this sm_120 ...`); a Triton kernel needing more shared memory than its opt-in
+  limit raises `OutOfResources` as there. Only architectures at or below the real one
+  (PTX runs on its own and newer ones), never `sm_90a` / `sm_100a`.
+  `KERNEL_AGENT_EMULATE_MEM_GB=16` caps the memory (a per-process fraction); the SM
+  count and L2 stay the real GPU's. It checks **correctness, not speed**: the SASS, SMs,
+  DRAM and L2 are the real GPU's, cuBLAS / cuDNN / SDPA / `_scaled_mm` / `_int_mm` run
+  natively, CuTe DSL and TileLang compile for it but cannot run (SASS), and it misses
+  older-`ptxas` bugs, register and occupancy effects and SM-count-dependent races. Every
+  evaluation, memcheck and probe result carries `emulated: {"arch": "sm_86", "real":
+  "sm_120", ...}` with those caveats; nothing measured is kept (no peaks, probes cache,
+  backend track record, library entry or tuned config), and `optimize`, `analyze`,
+  `improve`, `resume` and `integrate` refuse to run under it.
 * **Hopper and datacenter Blackwell templates** (#228): `cute_sm90_gemm_ws.py` (TMA +
   `wgmma`, producer / consumer warpgroups, persistent, fused epilogue, swap-AB for
   M ≤ 64) and `cute_sm100_gemm_tcgen05.py` (TMA + `tcgen05.mma` into TMEM, warp roles,
@@ -4488,8 +4512,9 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   L40S and L4 sm_89, sm_90, sm_100, sm_120: `tests/test_gpu_arch.py`; a T4 with its
   toolchain, `doctor --smoke` and policy: `tests/test_turing.py`), the compile matrix
   above, and run on an RTX 5070 Ti; the CuTe DSL templates compile for sm_90a / sm_100a.
-  On other GPUs nothing has run yet: `kernel-agent doctor --smoke` is the first check
-  there.
+  The sm_75 / sm_80 / sm_86 / sm_89 code paths ran on the RTX 5070 Ti under emulation
+  (`doctor --smoke --emulate-arch ...` passes for each: correctness only). On other GPUs
+  nothing has run yet: `kernel-agent doctor --smoke` is the first check there.
 
 ### Dtype and memory by GPU
 
@@ -5061,11 +5086,13 @@ kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--co
                                        [--quick] [--timeout 300]
                                        [--sweep configs.json [--max-configs 32]]
                                        [--context eager|graph] [--l2 warm|cold]
+                                       [--emulate-arch sm_86]
                                        (a full capture, e.g. <run_dir>/.truth/captures/<id>.pt)
 kernel-agent recheck capture.pt candidate.py [--seeds 3] [--seed S] [--speedup X] [--no-evaluate]
+                                       [--emulate-arch sm_86]
                                        fresh inputs, reference and candidate in separate
                                        processes (see "Independent re-check of winners")
-kernel-agent memcheck capture.pt candidate.py [--no-variants] [--timeout 900]
+kernel-agent memcheck capture.pt candidate.py [--no-variants] [--timeout 900] [--emulate-arch sm_86]
                                        the captured cases (+ odd-size variants) under
                                        compute-sanitizer memcheck (see "Out-of-bounds accesses")
 kernel-agent bench-suite [--kernelbench-level 1] [--n 20 | --problems 1,19,36] [--evaluations 4]
@@ -5087,6 +5114,8 @@ kernel-agent library import-memory DIR [--write]   Claude Code memory notes → 
 kernel-agent docs build [--offline] [--refresh] | status | search QUERY [--library L] | read ID | path
                                        the local doc library the agents search (see "Doc library")
 kernel-agent doctor [--smoke] [--remeasure-peaks] [--fetch-sanitizer] [--no-probes]
+  [--emulate-arch sm_75|sm_80|sm_86|sm_89]   an older GPU's code paths on this one, through
+                                       PTX JIT (correctness only; see "Any NVIDIA GPU")
 python -m kernel_agent.libscout CAPTURE [--no-sweep]   the library scout on one capture
 kernel-agent install-claude-code <project-dir>
 ```

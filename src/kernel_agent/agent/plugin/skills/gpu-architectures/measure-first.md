@@ -71,8 +71,11 @@ Scripts and raw results: `docs/research-scripts/older-gpus-259/` (`results.md`).
 A newer GPU's driver JIT-compiles older PTX. The kernel then runs with the older
 `__CUDA_ARCH__` and the older Triton lowering. This checks **correctness only**. The SASS,
 clocks, SM count, DRAM, L2 and the libraries (cuBLAS, cuDNN, SDPA backend choice,
-`torch._int_mm`) stay the newer GPU's, so never record a time measured this way. The three
-routes below were verified on the RTX 5070 Ti for sm_75, sm_80, sm_86 and sm_89:
+`torch._int_mm`) stay the newer GPU's, so never record a time measured this way.
+`--emulate-arch sm_86` on `doctor --smoke`, `eval`, `recheck` and `memcheck` (the variable
+`KERNEL_AGENT_EMULATE_ARCH`, also for `pytest -m gpu`; `kernel_agent/emulate.py`) applies
+all three routes in every process, with the old GPU's facts, and keeps nothing it measures.
+The three routes below were verified on the RTX 5070 Ti for sm_75, sm_80, sm_86 and sm_89:
 
 * **CUDA C++ (`load_inline`):** set `TORCH_CUDA_ARCH_LIST="8.6+PTX"` (or `"7.5+PTX"`) and a
   separate `TORCH_EXTENSIONS_DIR`. nvcc then builds `-gencode=arch=compute_86,code=sm_86`

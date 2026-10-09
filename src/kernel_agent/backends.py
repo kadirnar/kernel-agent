@@ -1044,7 +1044,12 @@ def run_records(run: RunDir, rows: list[dict[str, Any]] | None = None) -> list[d
 
 def record_run(run: RunDir, arch: str, rows: list[dict[str, Any]] | None = None) -> Path | None:
     """Write the run's per-target backend outcomes into the library's record of ``arch``
-    (this run's earlier lines are replaced: a re-integration records the run again)."""
+    (this run's earlier lines are replaced: a re-integration records the run again). Never
+    under emulation (``emulate.py``): its outcomes are not that architecture's."""
+    from kernel_agent import emulate
+
+    if emulate.active():
+        return None
     records = run_records(run, rows)
     if not records:
         return None

@@ -848,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
         help="install compute-sanitizer from NVIDIA's CUDA redistributables (the pip wheel "
         "cannot launch anything)",
     )
+    _add_emulate_arch(p)
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("optimize", help="full pipeline: profile, plan, write kernels, integrate")
@@ -1080,6 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
         default="warm",
         help="cold: evict the L2 before every timed call",
     )
+    _add_emulate_arch(p)
     p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser(
@@ -1097,6 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--no-evaluate", action="store_true", help="no evaluator verdict to compare")
     p.add_argument("--timeout", type=float, default=600.0, help="seconds per subprocess")
+    _add_emulate_arch(p)
     p.set_defaults(func=cmd_recheck)
 
     p = sub.add_parser(
@@ -1107,6 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("candidate")
     p.add_argument("--no-variants", action="store_true", help="the captured shapes only")
     p.add_argument("--timeout", type=float, default=900.0, help="seconds")
+    _add_emulate_arch(p)
     p.set_defaults(func=cmd_memcheck)
 
     p = sub.add_parser(
@@ -1155,7 +1159,57 @@ def main(argv: list[str] | None = None) -> int:
     experiments.add_parser(sub).set_defaults(func=experiments.main)  # exp: the ledger (#222)
 
     ns = parser.parse_args(argv)
+    if (refused := _emulation(ns)) is not None:
+        print(f"kernel-agent {ns.command}: {refused}", file=sys.stderr)
+        return 2
     return int(ns.func(ns))
+
+
+#: Commands that keep what they measure (track records, library, run directories): they
+#: never run under emulation (``emulate.refuse_runs``).
+_RUN_COMMANDS = ("optimize", "analyze", "resume", "integrate", "improve")
+
+
+def _add_emulate_arch(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--emulate-arch",
+        metavar="sm_XY",
+        type=_emulate_arch,
+        help="run an older GPU's code paths on this one through the driver's PTX JIT (sm_75, "
+        "sm_80, sm_86, sm_89: at most this GPU's): correctness only, timings are not "
+        "representative (KERNEL_AGENT_EMULATE_ARCH, inherited by every child process)",
+    )
+
+
+def _emulate_arch(raw: str) -> str:
+    """``--emulate-arch``: an architecture (``sm_86``)."""
+    from kernel_agent import emulate
+
+    try:
+        major, minor = emulate.parse(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return f"sm_{major}{minor}"
+
+
+def _emulation(ns: argparse.Namespace) -> str | None:
+    """``--emulate-arch`` into the environment (children inherit it); why the command does
+    not run under emulation (a run, or an architecture this GPU cannot emulate), or None."""
+    from kernel_agent import emulate
+
+    if arch := getattr(ns, "emulate_arch", None):
+        os.environ[emulate.ENV] = arch
+    if ns.command in _RUN_COMMANDS:
+        return emulate.refuse_runs(ns.command)
+    if not emulate.active() or not hasattr(ns, "emulate_arch"):
+        return None
+    from kernel_agent import toolchain
+
+    try:  # checked here: a child would only report it as its own error
+        toolchain.setup()
+    except emulate.Refused as exc:
+        return str(exc)
+    return None
 
 
 if __name__ == "__main__":

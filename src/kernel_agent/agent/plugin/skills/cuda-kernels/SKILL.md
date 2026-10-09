@@ -33,8 +33,12 @@ Verified example: `examples/cuda_rmsnorm.py`.
 ## B. `nvrtc` — runtime compilation with `cuda.core`
 
 Verified example: `examples/nvrtc_rmsnorm.py`.
-* No nvcc / no build step: `Program(src, code_type="c++", options=ProgramOptions(arch=f"sm_{dev.arch}", std="c++17", include_path=cuda_include_dirs()))`
-  `.compile("cubin").get_kernel("name")`; kernels must be `extern "C"` (or use
+* No nvcc / no build step: `arch, kind = nvrtc_target(torch.cuda.get_device_capability())`
+  (`from kernel_agent.toolchain import nvrtc_target`: `sm_XY` and `"cubin"`; under an
+  emulated older GPU, `KERNEL_AGENT_EMULATE_ARCH`, `compute_XY` and `"ptx"`, which the
+  driver JIT-compiles: a hard-coded `sm_XY` cubin does not load there), then
+  `Program(src, code_type="c++", options=ProgramOptions(arch=arch, std="c++17", include_path=cuda_include_dirs()))`
+  `.compile(kind).get_kernel("name")`; kernels must be `extern "C"` (or use
   `name_expressions` for templates).
 * Launch on torch's stream:
   `launch(dev.create_stream(torch.cuda.current_stream()), LaunchConfig(grid=..., block=..., shmem_size=...), kernel, t.data_ptr(), np.int32(n), np.float32(x))`.
