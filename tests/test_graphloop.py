@@ -1030,6 +1030,11 @@ def test_the_hidden_work_check_sees_the_while_loop():
         torch.cuda._sleep(20_000)  # ~10 us: the loop's span is far above the join slack
         x.add_(1.0)
 
+    # A profiled run before the graph is built (an earlier check in the process): CUPTI then
+    # records every body iteration under correlation ids of other calls, now and then the
+    # check's own marker's, which made the joined loop fail now and then (#232, A10)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]):
+        x.add_(0.0)
     loop = graphloop.device_loop(step, lambda: x[0] >= 50, 100, mode="while", warmup_runs=0)
     loop.run()
 
@@ -1037,9 +1042,10 @@ def test_the_hidden_work_check_sees_the_while_loop():
         x.zero_()
         loop.run()
 
-    evts, state = e2e_activity.profiled_run(joined, None, device=0)
-    verdict = e2e_activity.analyse(evts, devices={0}, tag=state["tag"])
-    assert verdict["passed"], verdict
+    for _ in range(8):  # a body kernel takes the marker's id in about one run in three
+        evts, state = e2e_activity.profiled_run(joined, None, device=0)
+        verdict = e2e_activity.analyse(evts, devices={0}, tag=state["tag"])
+        assert verdict["passed"], verdict
     names = [e.name for e in evts if e.kind == "kernel"]
     print(f"{len(names)} kernels reported: {sorted(set(names))}")
     begin = next(e for e in evts if e.kind == "kernel" and "ka_loop_begin" in e.name)

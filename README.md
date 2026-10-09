@@ -2001,7 +2001,9 @@ workload does not use fails the evaluation, as do unjoined `cc.launch`
 handles, a changed current stream and threads still running the evaluated
 transforms' or kernels' code. The result lists the declared streams
 (`streams`); the analysis of the profiler events is a pure function, tested on
-synthetic traces.
+synthetic traces. The streams are named by marker kernels launched once the
+device is idle (the caller's: `ka::caller`): a CUDA graph's conditional body
+can be recorded under the correlation id of the drain marker's launch.
 
 ### Independent re-check of winners
 
@@ -2480,11 +2482,16 @@ scalars: the steps done, whether the loop goes on) until every flag of `cond()` 
 
 Every fallback says why (`loop.mode`, `loop.reason`, `loop.stats`: launches, host checks,
 K). The graph runs on the caller's stream, so the evaluator's timing sees all of it. The
-profiler lists only the last iteration's body kernels and does not record cuda.core's
-driver-API launch, so the loop is launched with the `cudaGraphLaunch` of torch's CUDA
-runtime and begins and ends with a kernel outside the WHILE node: the end-to-end
-hidden-work check sees the launch and the loop's whole span (a loop on a side stream that
-is never joined fails it, GPU-tested). `watch=[(module, "forward")]` names callables
+profiler does not list the body's kernels under the launch (the last iteration's only or,
+once an earlier profiled run initialised CUPTI, every iteration's on a stream of their own
+under other calls' correlation ids) and does not record cuda.core's driver-API launch, so
+the loop is launched with the `cudaGraphLaunch` of torch's CUDA runtime and begins and ends
+with a kernel outside the WHILE node: the end-to-end hidden-work check sees the launch and
+the loop's whole span (a loop on a side stream that is never joined fails it, GPU-tested).
+Since a body kernel can carry the correlation id of the check's own marker launch, the
+check names the caller's stream by a second marker launched once the device is idle
+(`ka::caller`): a joined loop failed it now and then in a process with an earlier profiled
+run before (A10, torch 2.10). `watch=[(module, "forward")]` names callables
 teacher forcing wraps: while one is replaced, runs take host steps (the wrapper sees every
 call) and no graph is built; for a chaotic workload the teacher-forced call stays out of the
 device loop. For streaming (`metric=ttfa`), `chunk_every=n` adds an IF node that runs

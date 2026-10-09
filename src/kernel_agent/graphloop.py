@@ -79,8 +79,11 @@ Integrity: the graph runs on the caller's current stream, so it is joined with t
 and the evaluator's timing sees all of it; :meth:`DeviceLoop.chunks` waits for it before
 it returns. It is launched with ``cudaGraphLaunch`` of the CUDA runtime torch loaded (the
 profiler does not record cuda.core's driver-API launch), and it begins and ends with a
-kernel outside the WHILE node, because the profiler lists only the last iteration's body
-kernels (measured with torch 2.14, CUDA 13.0). So the end-to-end hidden-work check
+kernel outside the WHILE node, because the profiler does not list the body's kernels under
+the launch: it lists the last iteration's only (measured with torch 2.14, CUDA 13.0) or,
+once CUPTI was initialised before the graph was built (an earlier profiled run in the
+process), every iteration's on a stream id of their own under correlation ids that are not
+the launch's (measured on an NVIDIA A10, torch 2.10). So the end-to-end hidden-work check
 (:mod:`kernel_agent.kernels.e2e_activity`) sees the launch and the loop's whole span: a
 loop launched on a stream the caller never joins fails it as unjoined work.
 

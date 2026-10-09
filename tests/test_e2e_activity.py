@@ -26,22 +26,29 @@ from kernel_agent.workspace import RunDir
 TOY = Path(__file__).with_name("chaotic_toy.py")
 TAG = "#t1"
 MAIN, OTHER = 1, 2  # threads
-CALLER, AUX, RAW = 7, 9, 11  # streams
+CALLER, AUX, RAW, BODY = 7, 9, 11, 143  # streams (BODY: a WHILE body's, as CUPTI names it)
 
 
 class Trace:
     """A synthetic profile of one checked run: ``run()`` from 0 to 1000 ns with one kernel
-    on the caller's stream, then the check's markers (the caller's stream drains at 1200)."""
+    on the caller's stream, then the check's markers: ``ka::mark`` (the caller's stream
+    drains at ``drain``) and, once the device is idle, ``ka::caller`` and the declared
+    stream's."""
 
-    def __init__(self) -> None:
+    def __init__(self, drain: int = 1200, ident: bool = True) -> None:
         self.events: list[Event] = []
         self.corr = 0
         self.range(f"ka::run{TAG}", 0, 1000)
         self.launch(10, CALLER, 100, 900)
         self.range(f"ka::mark{TAG}", 1010, 1020)
-        self.launch(1012, CALLER, 1200, 1201, name="spin")
-        self.range(f"ka::stream:aux{TAG}", 1030, 1040)
-        self.launch(1032, AUX, 1300, 1301, name="spin")
+        self.launch(1012, CALLER, drain, drain + 1, name="spin")
+        self.mark_corr = self.corr
+        idle = drain + 50_000  # after the settle wait and the device-wide synchronize
+        if ident:
+            self.range(f"ka::caller{TAG}", idle, idle + 10)
+            self.launch(idle + 2, CALLER, idle + 100, idle + 101, name="spin")
+        self.range(f"ka::stream:aux{TAG}", idle + 20, idle + 30)
+        self.launch(idle + 22, AUX, idle + 200, idle + 201, name="spin")
 
     def range(self, name: str, start: int, end: int) -> None:
         self.events.append(Event("user_annotation", name, start, end, 0, MAIN))
@@ -66,6 +73,11 @@ class Trace:
             self.events.append(
                 Event("kernel", name, begin, begin + step, self.corr, stream, device)
             )
+
+    def record(self, corr: int, stream: int, start: int, end: int, name: str) -> None:
+        """A kernel recorded under correlation id ``corr``, listed before that id's others."""
+        at = next(i for i, e in enumerate(self.events) if e.kind == "kernel" and e.corr == corr)
+        self.events.insert(at, Event("kernel", name, start, end, corr, stream, 0))
 
     def verdict(self, **kwargs: Any) -> dict[str, Any]:
         return analyse(self.events, devices=kwargs.pop("devices", {0}), tag=TAG, **kwargs)
@@ -133,6 +145,48 @@ def test_work_on_the_callers_stream_is_joined_whatever_its_timestamps() -> None:
     side.launch(50, RAW, 120, 5000, kernels=3, name="ka_loop_end")
     verdict = side.verdict()
     assert not verdict["passed"] and "ka_loop_end (stream 11)" in verdict["unjoined"][0]
+
+
+def _while_loop(trace: Trace, stream: int, end: int) -> None:
+    """A WHILE graph launched in run() on ``stream`` (its kernels before and after the WHILE
+    node, the last ending at ``end``) whose body kernels the profiler recorded as CUPTI did
+    on an A10 once an earlier profiled run had initialised it: on a stream of their own,
+    under correlation ids that are not the launch's, one of them the ``ka::mark`` marker's
+    (the API call the host was making when that body kernel started)."""
+    trace.launch(50, stream, 60, 61, name="ka_loop_begin")
+    trace.record(trace.corr, stream, end - 10, end, name="ka_loop_end")
+    trace.events.append(Event("kernel", "spin_kernel", 100, 110, 0, BODY, 0))
+    trace.record(trace.mark_corr, BODY, 1015, 1030, name="spin_kernel")
+
+
+def test_a_loop_body_recorded_under_the_markers_correlation_id_is_not_the_marker() -> None:
+    """#232: a joined WHILE loop failed as unjoined in a process with an earlier profiled
+    run (A10, torch 2.10): the check took the body kernel listed first under the marker's
+    correlation id for the marker, its stream (143) for the caller's and its start for the
+    time the caller's stream drained. The ``ka::caller`` marker, launched once the device is
+    idle, names the caller's stream; the drain is the marker's own record on it."""
+    joined = Trace(drain=20_000)  # the caller's stream drains after the loop
+    _while_loop(joined, CALLER, end=19_000)
+    verdict = joined.verdict()
+    assert verdict["passed"], verdict
+    unjoined = Trace()  # the loop on a side stream: the caller's stream drains at 1200
+    _while_loop(unjoined, RAW, end=19_000)
+    verdict = unjoined.verdict()
+    assert not verdict["passed"] and "ka_loop_end (stream 11)" in verdict["unjoined"][0]
+    # without the identity marker (the earlier rule) the joined loop was refused
+    old = Trace(drain=20_000, ident=False)
+    _while_loop(old, CALLER, end=19_000)
+    verdict = old.verdict()
+    assert not verdict["passed"] and "ka_loop_end (stream 7)" in verdict["unjoined"][0]
+
+
+def test_caller_stream_prefers_the_identity_markers_stream() -> None:
+    def k(stream: int) -> Event:
+        return Event("kernel", "spin", 0, 1, 5, stream, 0)
+
+    assert e2e_activity.caller_stream([k(BODY), k(CALLER)], [k(CALLER)]) == CALLER
+    assert e2e_activity.caller_stream([k(BODY), k(CALLER)], []) == BODY  # the earlier rule
+    assert e2e_activity.caller_stream([k(CALLER)], [k(AUX)]) == CALLER  # no common stream
 
 
 def test_ranges_without_the_checks_tag_are_not_trusted() -> None:
