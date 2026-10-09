@@ -8,11 +8,12 @@
 
 namespace ka_native {
 
-// The megakernel (csrc/megakernel.cu): pool pages and resident queues on this GPU, one launch.
-std::vector<int64_t> mk_info();
+// The megakernel (csrc/megakernel.cu): pool pages and resident queues on this GPU, one launch;
+// `decode`: the interpreter with the decode-step opcodes too (mk::DecodeOps).
+std::vector<int64_t> mk_info(bool decode);
 void mk_run(const at::Tensor& program, const at::Tensor& counters, const at::Tensor& table,
             int64_t status_ptr, const std::optional<at::Tensor>& trace, int64_t timeout_ns,
-            int64_t n_pages, int64_t n_queues, int64_t inflight);
+            int64_t n_pages, int64_t n_queues, int64_t inflight, bool decode);
 
 // The baselines from the same math (csrc/baselines.cu): one kernel per layer with PDL edges,
 // and one cooperative kernel with a grid barrier per layer.

@@ -1,0 +1,56 @@
+GPU: NVIDIA A10 (sm_86), 72 SMs, L2 6 MB
+torch 2.10.0+cu128 (CUDA 12.8), nvcc 12.9
+date 2026-10-09 17:35; decoder: 2 layers, hidden 1024, 16 q / 4 kv heads of 64, inter 2048, vocab 8192, KV capacity 4096; 52.4 MB of weights per step
+megakernel: 11 pages, 72 queues; 1650 instructions (embed x1, l0.qkv x96, l0.attn x72, l0.o x64, l0.gate_up x256, l0.down x64, l1.qkv x96, l1.attn x72, l1.gate_up x256, l1.down x64, lm x512, l1.o x64, l1.glu x8, l0.combine x4, l0.rope x4, l1.rope x4, l0.glu x8, l1.combine x4, argmax x1) on 72 queues (22-26 each), 50 counters, 1649 waits, estimated makespan 1.016e+06
+split-KV: 18 splits per KV head (chunk balanced over the splits), 72 attention tiles per layer
+DRAM: copy 487.2 GB/s; 15 trials of 16 steps per engine (per-step us: min / median)
+
+KV length 16 (timed: lengths 1..16): logits max |diff| vs torch 0.0156, argmax 2148 (torch 2148), every engine bit for bit the same: True
+  DRAM floor (copy bandwidth)                    107.7 us
+  megakernel (inflight 1)                        152.4 /   159.8 us (67% of floor)
+  megakernel (inflight 2)                        151.6 /   158.7 us (68% of floor)
+  graph (19 launches per step)                   248.7 /   257.1 us (42% of floor)
+
+KV length 128 (timed: lengths 113..128): logits max |diff| vs torch 0.0156, argmax 4644 (torch 4644), every engine bit for bit the same: True
+  DRAM floor (copy bandwidth)                    108.1 us
+  megakernel (inflight 1)                        157.4 /   162.0 us (67% of floor)
+  megakernel (inflight 2)                        156.8 /   160.9 us (67% of floor)
+  graph (19 launches per step)                   253.2 /   258.4 us (42% of floor)
+
+KV length 1024 (timed: lengths 1009..1024): logits max |diff| vs torch 0.0156, argmax 4644 (torch 4644), every engine bit for bit the same: True
+  DRAM floor (copy bandwidth)                    111.9 us
+  megakernel (inflight 1)                        164.9 /   167.4 us (67% of floor)
+  megakernel (inflight 2)                        164.5 /   166.8 us (67% of floor)
+  graph (19 launches per step)                   263.4 /   266.4 us (42% of floor)
+
+KV length 4096 (timed: lengths 4081..4096): logits max |diff| vs torch 0.0156, argmax 4644 (torch 4644), every engine bit for bit the same: True
+  DRAM floor (copy bandwidth)                    124.8 us
+  megakernel (inflight 1)                        187.4 /   189.8 us (66% of floor)
+  megakernel (inflight 2)                        185.9 /   188.0 us (66% of floor)
+  graph (19 launches per step)                   300.0 /   303.3 us (41% of floor)
+
+trace at KV length 16 (the last step; per op: mean wait for its counters / weights landing after them / run, us; tiles): span 151.6 us
+  embed     x   1: wait   1.02, land  0.00, run   1.02
+  qkv       x 192: wait   1.32, land  1.29, run   3.24
+  attn      x 144: wait   5.35, land  0.01, run   1.18
+  o         x 128: wait   8.03, land  0.50, run   2.62
+  gate_up   x 512: wait   0.89, land  0.36, run   3.16
+  down      x 128: wait   4.70, land  0.91, run   3.00
+  lm        x 512: wait   0.60, land  0.58, run   2.97
+  glu       x  16: wait   1.66, land  0.00, run   1.09
+  combine   x   8: wait   5.38, land  0.00, run   2.30
+  rope      x   8: wait   3.46, land  0.00, run   1.54
+  argmax    x   1: wait   2.05, land  0.00, run   3.07
+
+trace at KV length 4096 (the last step; per op: mean wait for its counters / weights landing after them / run, us; tiles): span 177.2 us
+  embed     x   1: wait   0.00, land  1.02, run   2.05
+  qkv       x 192: wait   1.77, land  1.10, run   3.33
+  attn      x 144: wait   5.14, land  0.06, run  15.51
+  o         x 128: wait   5.46, land  0.01, run   3.19
+  gate_up   x 512: wait   0.81, land  0.42, run   3.19
+  down      x 128: wait   4.37, land  0.54, run   3.47
+  lm        x 512: wait   0.53, land  0.70, run   3.01
+  glu       x  16: wait   1.73, land  0.00, run   1.15
+  combine   x   8: wait   7.17, land  0.00, run   3.46
+  rope      x   8: wait   3.33, land  0.00, run   1.79
+  argmax    x   1: wait   1.02, land  0.00, run   4.10

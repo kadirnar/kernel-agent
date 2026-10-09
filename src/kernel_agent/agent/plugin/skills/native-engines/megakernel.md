@@ -17,8 +17,9 @@ per barrier, a graph kernel boundary ~0.9 µs; measured on an RTX 5070 Ti, docs/
 | `schedule.py` | `Op` (opcode, tiles, cost per tile, `Prefetch` per tile, opcode arguments) and `Edge` (`ALL`, `SAME`, `span(k)`, `shard(k)` or any tile map) → per-SM queues (static wave order + longest-first, earliest-finish placement), every counter's target (its producers' tile count; chunked per output tile where consumers need only part of a producer), the int32 program (`Schedule.tensor()`, built once in `build()` / `apply()`) |
 | `simulate.py` | `check(schedule, draws=1000)`: deadlocks (the stuck counter and instruction first) and instructions started before their producers, over random SM speeds; `simulate(..., durations=costs_from_trace(...))` predicts the time; `report()` and `trace_summary()` say where it goes (wait, land, run per op; how often a weight load overlapped a counter wait) |
 | `captured.py` | the schedule's input built from one recorded call of the stage instead of by hand: `python -m kernel_agent.native.megakernel.schedule --from-capture <capture>` (a target's `capture.pt` / `capture_inputs.pt`) or `captured.from_module(reference, args)` in `build()` → a `Plan`: ops mapped to opcode families, unsupported ops with why, tiles, the tensor table (`plan.tensors()`, `plan.bind()`), tile-level edges from the storages, roofline costs; `plan.schedule(queues)` (next section) |
-| `opcodes.py` | the generic opcodes' numbers and argument slots (`gemv_args`, `rmsnorm_args`, ...; the example's `include/mk_ops.cuh` is their device code), `tile_rows`, `l2_hint` |
+| `opcodes.py` | the generic opcodes' numbers and argument slots (`gemv_args`, `rmsnorm_args`, ...; the example's `include/mk_ops.cuh` is their device code), the decode-step opcodes' (`attn_args`, `combine_args`, `rope_kv_args`, `embed_args`, `argmax_args(advance=1)`: `include/mk_decode.cuh`), `tile_rows`, `l2_hint` |
 | `runtime.py` | `Runtime(schedule, tensors, trace=..., pool_bytes=...)`: program, counters (self-zeroing: the last block of a launch resets them), tensor table, pinned status words; `check()` raises `MegakernelHang` before a launch after a hang |
+| `decode.py` | decode-step pieces: `SplitKV` (split-KV attention tiles per KV head / q block / split, the combine's edge with one counter per KV head, costs at a KV length), `kv_split(length, splits, chunk)` (the opcode's chunk rule), `attention_durations` (the simulator at any length), `check_advance` (every reader of the step state precedes the token advance), `STEP_TOKEN` / `STEP_POS` |
 
 An `Ops` struct holds the project's opcodes (`kThreads` consumer threads, `kPageBytes`,
 `kScratchBytes`, `run(ctx)`: `ctx.op()`, `ctx.arg(k)`, `ctx.ptr<T>(tensor)`,
@@ -42,6 +43,14 @@ same math in the same project (`mode="graph_pdl"`: one kernel per layer with PDL
 against it as a graph, not as graph + PDL. `rows=0` (the default) takes 16 rows per tile
 where they fit the page pool and fewer where not (`tile_rows`: 16 rows of a 4096-wide layer
 are 128 KB, a 99 KB GPU's pool holds 88 KB, so 8).
+
+The same example has a **decode step** ([decode.md](decode.md)): `TinyDecoder` (a
+pre-norm GQA decoder, its torch reference) → `build_decode(reference, mode=...)`: embedding of the token
+the device holds → per layer RMSNorm + QKV GEMV → RoPE + KV append → split-KV attention →
+combine → O GEMV + residual → RMSNorm + gate/up GEMV → SwiGLU (`GLU`) → down GEMV + residual → final
+norm + LM head → argmax + token advance, one launch per step with no host value
+(`mode="graph"`: the same opcodes, one launch per op in a CUDA graph). The captured-op schedule below does not map attention yet: the decode step's program is
+declared in the example (`decode_program`, built and simulated on the CPU).
 
 ## Schedules from the stage's captured ops
 
@@ -218,11 +227,18 @@ rungs attack other costs.
    waits only for the producer tiles it reads (a down projection per chunk of its input).
 5. **Split-K across SMs.** Skinny GEMMs with too few output tiles to fill the SMs: K splits
    write fp32 partials, a reduce instruction sums them (deterministic, unlike atomics).
-6. **Attention opcode.** Split-KV attention per (head, KV chunk) and a combine opcode for
-   decode; prefill keeps its own kernels (not in the kit's example yet: write it in the
-   project's `Ops`).
-7. **On-device argmax and token advance.** The sampler (argmax opcode) and the next step's
-   inputs inside the kernel: no host round trip between tokens.
+6. **Attention opcode.** Split-KV decode attention: one tile per (KV head, q block, split)
+   reads its chunk of the cache once for up to 4 q heads (GQA) and writes fp32 partial max,
+   sum and output; a combine per KV head waits on one counter (target: its tiles) and
+   reduces them. The KV length is a device value, the chunks follow it (`decode.kv_split`);
+   the example's `ATTN_DECODE` / `ATTN_COMBINE` (bf16 / fp16, head dim 64 / 128 / 256) and
+   `SplitKV.ops` build it ([decode.md](decode.md)). Check against the fp32 softmax at
+   lengths 1, not a multiple of the chunk and the maximum; prefill keeps its own kernels.
+7. **On-device argmax and token advance.** The sampler (argmax opcode) writes the next token
+   and position into the step state on the device; the embedding, RoPE / KV append and
+   attention of the next launch read them: a run of steps is a run of graph replays, no
+   host round trip between tokens. Every reader of the state must precede the advance
+   (`decode.check_advance`).
 8. **Tuned wave order.** `Op.wave` overrides the depth order (start the next layer's
    independent work earlier); the scheduler checks every edge still goes forward.
 9. **Trace-driven rebalancing.** `trace=True` → `costs_from_trace` → `simulate` with the
@@ -233,7 +249,8 @@ rungs attack other costs.
 
 ## Examples and sources
 
-* Example: `examples/native_megakernel` (in kernel-agent's examples directory; its `ARCHS`).
+* Example: `examples/native_megakernel` (in kernel-agent's examples directory; its `ARCHS`):
+  the chain and the decode step ([decode.md](decode.md)).
 * Sources: the `documentation-sources` skill's `sources.md`, section "CUDA C++ and PTX"
   (memory consistency model: release / acquire patterns; `cp.async.bulk`, mbarrier).
 * Design: docs/PARALLEL.md §4.6 (grid barrier vs PDL measurements) in the repository.

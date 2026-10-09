@@ -16,7 +16,8 @@ Project layout, building and timing: [projects.md](projects.md). A stage as one 
 counter dependencies instead of grid barriers (the megakernel kit, its milestone ladder, its
 schedule built from the stage's captured ops: `python -m
 kernel_agent.native.megakernel.schedule --from-capture <capture>`):
-[megakernel.md](megakernel.md).
+[megakernel.md](megakernel.md); a decode step in it (split-KV attention, the token advanced
+on the device): [decode.md](decode.md).
 
 ## Scopes (what you may replace)
 

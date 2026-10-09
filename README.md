@@ -4557,6 +4557,42 @@ next to it). The example's tiles fit the GPU's page pool by default (`rows=0`:
 fail), and each consumer thread observes its previous empty phase of a page before arriving
 again, without which synccheck refused the example from 6 layers on (151552 "Missing wait"
 errors at 28 layers on the A10; the protocol was correct, the check could not tell).
+
+**Decode step** (#225, milestones 6 and 7). The example's second variant runs a whole
+decode step of a pre-norm GQA decoder as one launch: `TinyDecoder` (its torch reference) →
+`build_decode`. Next to the GEMV and the GLU it uses the decode opcodes of
+`include/mk_decode.cuh` (`kernel<DecodeOps>`: embedding, RoPE + KV append, split-KV
+attention, combine; numbers and argument slots in `kernel_agent.native.megakernel.opcodes`).
+The argmax also advances the step state (token, position) on the device, so a run of
+steps is a run of graph replays with no host value between them.
+
+* **Split-KV attention.** One tile per KV head, block of up to 4 of its q heads (GQA) and
+  split of the cache; bf16 or fp16, head dims 64, 128 and 256. Each tile writes fp32
+  partials, and a combine per KV head waits on one counter of its tiles.
+* **The length.** The KV length is read on the device and the chunks follow it, so the
+  schedule is built once for every length.
+* **The schedule helpers.** `kernel_agent.native.megakernel.decode` holds the split-KV
+  tiles, edges and counters (`SplitKV`), the chunk rule (`kv_split`), costs and simulator
+  durations at a length, and `check_advance` (every reader of the state precedes the
+  advance).
+
+Measured on an NVIDIA A10 (sm_86): 2 layers (hidden 1024, 16 q / 4 KV heads of 64, vocab
+8192, 52.4 MB of weights per step), against the same opcodes launched per op in a CUDA
+graph (19 launches per step):
+
+| KV length | 16 | 128 | 1024 | 4096 |
+|---|---|---|---|---|
+| megakernel | 158.7 µs | 160.9 µs | 166.8 µs | 188.0 µs |
+| graph, one launch per op | 257.1 µs | 258.4 µs | 266.4 µs | 303.3 µs |
+| DRAM floor (487 GB/s) | 107.7 µs | 108.1 µs | 111.9 µs | 124.8 µs |
+
+(`docs/research-scripts/megakernel-a10-225/bench_decode.py`, its output next to it). The
+attention matches torch's fp32 softmax at KV lengths from 1 to the maximum and gives the
+same bits on every call. The step follows the reference token by token (or within a bf16
+near tie), and both modes give the same bits. compute-sanitizer memcheck, racecheck and
+synccheck are clean, and memcheck does report a deliberately short cache. The
+`native-engines` skill's `decode.md` has the rules and the next rungs.
+
 The
 `native-engines` skill's `megakernel.md` is the milestone ladder, and a native digest
 points to it when a stage's best kernel synchronises its grid or launches more than 3
@@ -5302,7 +5338,9 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   (`doctor --smoke --emulate-arch ...` passes for each: correctness only). Run on an NVIDIA
   A10 (sm_86, #225): the megakernel kit's GPU tests and its example
   (correctness, the evaluator with its determinism stress, the trace, memcheck / racecheck /
-  synccheck at 2 and 28 layers, timings against both baselines: "Native engines") and
+  synccheck at 2 and 28 layers, timings against both baselines: "Native engines"), its
+  decode step (split-KV attention, the token advanced on the device, against torch and a
+  per-op graph) and
   `doctor`'s probes, `cp.async` page path, 99 KB pools, 72 resident blocks and the watchdog
   included. Elsewhere `kernel-agent doctor --smoke` is the first check.
 
