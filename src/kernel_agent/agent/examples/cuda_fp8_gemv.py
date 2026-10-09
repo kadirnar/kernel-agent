@@ -8,10 +8,13 @@ the near-lossless tier; the exact tier rejects it (FP8 moves every output by ~2.
   one fp32 scale per output channel) and keeps no bf16 copy: half the bytes to stream,
   half the memory. ``quant_error`` holds the error report of the stored weight.
 * Decode (M <= 4 rows): one warp per output row, 128-bit loads of 16 weights streamed past
-  L1, dequantised in registers (``cvt`` e4m3x2 -> f16x2 -> fp32), bf16 activations, fp32
+  L1, dequantised in registers (``cvt`` e4m3x2 -> f16x2 -> fp32), activations in the
+  model's dtype (bf16 or fp16: the kernel is a template on it, :data:`DTYPES`), fp32
   accumulation, warp-shuffle reduction; the per-channel scale (and the bias) are applied
-  once per output in the epilogue: ``y = scale[n] * sum_k x[k] q[n, k] + bias[n]``.
-* Other shapes: the dequantised weight through cuBLAS (the same FP8 math; slow, a fallback).
+  once per output in the epilogue, one rounding to the activations' dtype: ``y = scale[n] *
+  sum_k x[k] q[n, k] + bias[n]``.
+* Other shapes and dtypes: the dequantised weight through cuBLAS (the same FP8 math; slow,
+  a fallback).
 * The forward is one pybind call (shape logic and fallback in C++): at decode sizes the host
   overhead is a large part of the latency.
 
@@ -19,6 +22,8 @@ the near-lossless tier; the exact tier rejects it (FP8 moves every output by ~2.
 ``sweep_candidate``. RTX 5070 Ti, weights streamed from DRAM: [1, 2048] x [2048, 6144] in
 16.2 us (777 GB/s, 2.0x cuBLAS bf16). At M = 2..4 the per-row FMA work makes it ALU bound
 when the weight sits in L2; ``cuda_fp8_skinny_gemm.py`` (tensor cores) is faster there.
+Older GPUs (sm_75 / sm_86): bf16 and fp16 outputs verified through their PTX (``compute_75``,
+``compute_86``) JIT-compiled on an RTX 5070 Ti; not timed on such a GPU yet.
 """
 
 import hashlib
@@ -33,9 +38,12 @@ from kernel_agent.kernels.quant import fp8_error, quantize_fp8
 #: it elsewhere and says why).
 ARCHS = "sm_75+"
 ARCHS_WHY = (
-    "bf16 activations (cuda_bf16's software bf16 math before sm_80); e4m3 weights converted "
-    "in registers (hardware cvt from sm_89, CUDA's software conversion before)"
+    "CUDA cores only (bf16 activations through cuda_bf16's software math before sm_80); e4m3 "
+    "weights converted in registers (hardware cvt from sm_89, CUDA's software conversion "
+    "before)"
 )
+#: Activation dtypes the kernel takes (a template on the type; the output keeps it).
+DTYPES = (torch.bfloat16, torch.float16)
 
 CUDA_SRC = r"""
 #include <torch/extension.h>
@@ -46,6 +54,21 @@ CUDA_SRC = r"""
 #include <c10/cuda/CUDAException.h>
 
 typedef __nv_bfloat16 bf16;
+
+// The activation type T: bf16 or __half (the model's dtype; the output keeps it)
+template <typename T> struct Act;
+template <> struct Act<bf16> {
+  typedef __nv_bfloat162 T2;
+  static __device__ __forceinline__ float2 f2(T2 v) { return __bfloat1622float2(v); }
+  static __device__ __forceinline__ float f(bf16 v) { return __bfloat162float(v); }
+  static __device__ __forceinline__ bf16 from(float v) { return __float2bfloat16(v); }
+};
+template <> struct Act<__half> {
+  typedef __half2 T2;
+  static __device__ __forceinline__ float2 f2(T2 v) { return __half22float2(v); }
+  static __device__ __forceinline__ float f(__half v) { return __half2float(v); }
+  static __device__ __forceinline__ __half from(float v) { return __float2half(v); }
+};
 
 // 128-bit load that bypasses L1: every weight byte is read once
 __device__ __forceinline__ uint4 ld_stream(const void* p) {
@@ -67,14 +90,16 @@ __device__ __forceinline__ void dequant16(const uint4& w, float* f) {
   }
 }
 
-// 16 fp32 weights . 16 bf16 activations (two uint4), fp32 accumulation
+// 16 fp32 weights . 16 activations of type T (two uint4), fp32 accumulation
+template <typename T>
 __device__ __forceinline__ float dot16(const float* f, const uint4& xa, const uint4& xb) {
-  const __nv_bfloat162* x0 = reinterpret_cast<const __nv_bfloat162*>(&xa);
-  const __nv_bfloat162* x1 = reinterpret_cast<const __nv_bfloat162*>(&xb);
+  typedef typename Act<T>::T2 T2;
+  const T2* x0 = reinterpret_cast<const T2*>(&xa);
+  const T2* x1 = reinterpret_cast<const T2*>(&xb);
   float s = 0.f;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    float2 xf = __bfloat1622float2(i < 4 ? x0[i] : x1[i - 4]);
+    float2 xf = Act<T>::f2(i < 4 ? x0[i] : x1[i - 4]);
     s = fmaf(f[2 * i], xf.x, s);
     s = fmaf(f[2 * i + 1], xf.y, s);
   }
@@ -87,12 +112,12 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
-// x: [M, K] bf16, w: [N, K] e4m3 codes, scale: [N] fp32, bias: [N] bf16 or null,
-// y: [M, N] bf16. One warp per output row, MT activation rows at a time, U loads in flight.
-template <int MT, int U>
+// x: [M, K] T, w: [N, K] e4m3 codes, scale: [N] fp32, bias: [N] T or null, y: [M, N] T.
+// One warp per output row, MT activation rows at a time, U loads in flight.
+template <typename T, int MT, int U>
 __global__ void __launch_bounds__(256) fp8_gemv_kernel(
-    const bf16* __restrict__ x, const uint8_t* __restrict__ w, const float* __restrict__ scale,
-    const bf16* __restrict__ bias, bf16* __restrict__ y, int M, int K, int N) {
+    const T* __restrict__ x, const uint8_t* __restrict__ w, const float* __restrict__ scale,
+    const T* __restrict__ bias, T* __restrict__ y, int M, int K, int N) {
   const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
   if (row >= N) return;
@@ -117,7 +142,7 @@ __global__ void __launch_bounds__(256) fp8_gemv_kernel(
         for (int m = 0; m < MT; ++m) {
           const uint4* xr = reinterpret_cast<const uint4*>(x + (size_t)min(m0 + m, M - 1) * K) +
                             2 * (c + 32 * i);
-          acc[m] += dot16(f, __ldg(xr), __ldg(xr + 1));
+          acc[m] += dot16<T>(f, __ldg(xr), __ldg(xr + 1));
         }
       }
     }
@@ -125,25 +150,38 @@ __global__ void __launch_bounds__(256) fp8_gemv_kernel(
     for (int m = 0; m < MT; ++m) acc[m] = warp_sum(acc[m]);
     if (lane == 0) {
       const float s = scale[row];
-      const float b = bias ? __bfloat162float(bias[row]) : 0.f;
+      const float b = bias ? Act<T>::f(bias[row]) : 0.f;
 #pragma unroll
       for (int m = 0; m < MT; ++m)
-        if (m0 + m < M) y[(size_t)(m0 + m) * N + row] = __float2bfloat16(fmaf(acc[m], s, b));
+        if (m0 + m < M) y[(size_t)(m0 + m) * N + row] = Act<T>::from(fmaf(acc[m], s, b));
     }
   }
 }
 
-template <int MT>
-void launch(const bf16* x, const uint8_t* w, const float* s, const bf16* b, bf16* y, int M, int K,
-            int N, int unroll, cudaStream_t stream) {
+template <typename T, int MT>
+void launch(const T* x, const uint8_t* w, const float* s, const T* b, T* y, int M, int K, int N,
+            int unroll, cudaStream_t stream) {
   const dim3 grid((N + 7) / 8), block(256);
   switch (unroll) {
-    case 1: fp8_gemv_kernel<MT, 1><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
-    case 2: fp8_gemv_kernel<MT, 2><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
-    case 8: fp8_gemv_kernel<MT, 8><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
-    default: fp8_gemv_kernel<MT, 4><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
+    case 1: fp8_gemv_kernel<T, MT, 1><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
+    case 2: fp8_gemv_kernel<T, MT, 2><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
+    case 8: fp8_gemv_kernel<T, MT, 8><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
+    default: fp8_gemv_kernel<T, MT, 4><<<grid, block, 0, stream>>>(x, w, s, b, y, M, K, N); break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename T>
+void run(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& scale,
+         const torch::Tensor& bias, torch::Tensor& y, int M, int K, int N, int unroll) {
+  auto px = reinterpret_cast<const T*>(x.data_ptr());
+  auto pw = reinterpret_cast<const uint8_t*>(w.data_ptr());
+  auto ps = scale.data_ptr<float>();
+  auto pb = bias.numel() ? reinterpret_cast<const T*>(bias.data_ptr()) : nullptr;
+  auto py = reinterpret_cast<T*>(y.data_ptr());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (M == 1) launch<T, 1>(px, pw, ps, pb, py, M, K, N, unroll, stream);
+  else launch<T, 4>(px, pw, ps, pb, py, M, K, N, unroll, stream);
 }
 
 // y = x @ (q * scale)^T + bias for x [..., K]. One pybind call per forward: shape logic and
@@ -153,24 +191,20 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale, 
   const int64_t N = w.size(0), K = w.size(1);
   TORCH_CHECK(x.dim() >= 1 && x.size(-1) == K && x.device() == w.device(), "fp8_linear: bad input");
   const int64_t M = x.numel() / K;
-  if (M < 1 || M > max_rows || x.scalar_type() != at::kBFloat16) {
-    // other shapes: the same FP8 math through cuBLAS (dequantised weight; a fallback)
-    auto wd = (w.to(at::kFloat) * scale.unsqueeze(1)).to(x.scalar_type());
-    return bias.numel() ? at::linear(x, wd, bias.to(x.scalar_type())) : at::linear(x, wd);
+  const auto dt = x.scalar_type();
+  if (M < 1 || M > max_rows || (dt != at::kBFloat16 && dt != at::kHalf) ||
+      (bias.numel() && bias.scalar_type() != dt)) {
+    // other shapes and dtypes: the same FP8 math through cuBLAS (dequantised weight; a fallback)
+    auto wd = (w.to(at::kFloat) * scale.unsqueeze(1)).to(dt);
+    return bias.numel() ? at::linear(x, wd, bias.to(dt)) : at::linear(x, wd);
   }
   if (!x.is_contiguous() || (reinterpret_cast<uintptr_t>(x.data_ptr()) & 15))
     x = x.clone(at::MemoryFormat::Contiguous);  // 128-bit loads need 16-byte alignment
   auto sizes = x.sizes().vec();
   sizes.back() = N;
   auto y = torch::empty(sizes, x.options());
-  auto px = reinterpret_cast<const bf16*>(x.data_ptr());
-  auto pw = reinterpret_cast<const uint8_t*>(w.data_ptr());
-  auto ps = scale.data_ptr<float>();
-  auto pb = bias.numel() ? reinterpret_cast<const bf16*>(bias.data_ptr()) : nullptr;
-  auto py = reinterpret_cast<bf16*>(y.data_ptr());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  if (M == 1) launch<1>(px, pw, ps, pb, py, M, K, N, (int)unroll, stream);
-  else launch<4>(px, pw, ps, pb, py, M, K, N, (int)unroll, stream);
+  if (dt == at::kHalf) run<__half>(x, w, scale, bias, y, (int)M, (int)K, (int)N, (int)unroll);
+  else run<bf16>(x, w, scale, bias, y, (int)M, (int)K, (int)N, (int)unroll);
   return y;
 }
 """
@@ -209,7 +243,7 @@ class Fp8Linear(nn.Module):
         self.register_buffer("weight_scale", scale)
         self.register_parameter("bias", reference.bias)
         self.quant_error = fp8_error(reference.weight, q, scale)  # for NOTES.md
-        none = torch.empty(0, dtype=torch.bfloat16, device=q.device)
+        none = torch.empty(0, dtype=reference.weight.dtype, device=q.device)
         bias = reference.bias if reference.bias is not None else none
         # plain attributes: the forward is one pybind call without nn.Module lookups
         self._args = (q, scale, bias, int(unroll), MAX_ROWS)
@@ -222,9 +256,9 @@ class Fp8Linear(nn.Module):
 def build(reference: nn.Module, unroll: int = 4) -> nn.Module:
     ok = (
         isinstance(reference, nn.Linear)
-        and reference.weight.dtype == torch.bfloat16
+        and reference.weight.dtype in DTYPES
         and reference.weight.is_cuda
         and reference.in_features % 16 == 0  # 16 weights per 128-bit load
-        and (reference.bias is None or reference.bias.dtype == torch.bfloat16)
+        and (reference.bias is None or reference.bias.dtype == reference.weight.dtype)
     )
     return Fp8Linear(reference, unroll) if ok else reference

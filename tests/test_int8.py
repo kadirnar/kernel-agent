@@ -418,15 +418,13 @@ def test_backend_policy_has_an_int8_gemm_class():
 
 
 def test_examples_and_selftest_tables():
-    # IMMA m16n8k32 from sm_80; the weight-only GEMV has no tensor cores and runs on Turing
-    # too (compiled for sm_75, run on its compute_75 code path: #256)
-    for table, archs in (
-        (selftest.INT8_W8A8_EXAMPLES, "sm_80+"),
-        (selftest.INT8_WEIGHT_EXAMPLES, "sm_75+"),
-    ):
+    # Triton's int8 tl.dot (m16n8k32) needs sm_80; the CUDA ones run on Turing too: the
+    # weight-only GEMV has no tensor cores (#256), the skinny GEMM runs four m8n8k16 (#258)
+    for table in (selftest.INT8_W8A8_EXAMPLES, selftest.INT8_WEIGHT_EXAMPLES):
         for name in table:
             path = prompts.EXAMPLES_DIR / name
             source = path.read_text()
+            archs = "sm_80+" if name.startswith("triton_") else "sm_75+"
             assert gpu_arch.example_requirement(path)[0] == archs, name
             for needle in ("def build(", "quantize_int8", "int8_error", "ARCHS_WHY"):
                 assert needle in source, (name, needle)
@@ -540,7 +538,8 @@ def test_int_mm_matches_the_exact_cpu_path():
         *((n, "int8_weights") for n in sorted(selftest.INT8_WEIGHT_EXAMPLES)),
     ],
 )
-def test_int8_examples_pass_the_reduced_tier_and_fail_exact(name, precision, tmp_path):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])  # an fp16 model too (#258)
+def test_int8_examples_pass_the_reduced_tier_and_fail_exact(name, precision, dtype, tmp_path):
     from kernel_agent import toolchain
 
     tc = toolchain.setup()
@@ -552,9 +551,9 @@ def test_int8_examples_pass_the_reduced_tier_and_fail_exact(name, precision, tmp
     }
     k, n, calls = tables[precision][name]
     near = selftest.make_linear_capture(
-        tmp_path / "near.pt", k, n, calls, tier="near-lossless", precision=precision
+        tmp_path / "near.pt", k, n, calls, tier="near-lossless", precision=precision, dtype=dtype
     )
-    exact = selftest.make_linear_capture(tmp_path / "exact.pt", k, n, calls)
+    exact = selftest.make_linear_capture(tmp_path / "exact.pt", k, n, calls, dtype=dtype)
     example = prompts.EXAMPLES_DIR / name
     result = run_evaluation(near, example)
     assert result["status"] == "ok" and result["correct"], result
@@ -565,20 +564,24 @@ def test_int8_examples_pass_the_reduced_tier_and_fail_exact(name, precision, tmp
 
 
 @pytest.mark.gpu
-def test_the_examples_equal_the_reference_bit_for_bit():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_the_examples_equal_the_reference_bit_for_bit(dtype):
     from kernel_agent import toolchain
     from kernel_agent.kernels.evaluate import load_candidate_module
 
     if not selftest.int8_supported(toolchain.setup()):
         pytest.skip("needs the triton and cuda backends on sm_80+")
     torch.manual_seed(0)
-    lin = nn.Linear(1024, 2560, bias=True).cuda().to(torch.bfloat16)
+    lin = nn.Linear(1024, 2560, bias=True).cuda().to(dtype)
     for name, rows in (("triton_int8_w8a8_gemm.py", 300), ("cuda_int8_skinny_gemm.py", 40)):
         module = load_candidate_module(prompts.EXAMPLES_DIR / name).build(lin)
-        x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
-        with torch.inference_mode():
-            ref = quant.int8_w8a8_linear(x, module.weight_int8, module.weight_scale, lin.bias)
-            assert torch.equal(module(x), ref), name
+        assert module is not lin, name  # fp16 models too (#258)
+        for draw in range(3):  # a contracted (FMA) bias add misrounds ~1e-5 of the outputs
+            x = torch.randn(rows, 1024, device="cuda", dtype=dtype)
+            with torch.inference_mode():
+                ref = quant.int8_w8a8_linear(x, module.weight_int8, module.weight_scale, lin.bias)
+                got = module(x)
+                assert got.dtype == dtype and torch.equal(got, ref), (name, draw)
 
 
 @pytest.mark.gpu

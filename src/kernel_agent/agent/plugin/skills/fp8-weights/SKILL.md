@@ -15,9 +15,10 @@ Read the `precision-tiers` skill first (when it is allowed, the tolerance tier, 
   symmetric, `scale = amax(|row|) / 448`, codes `round(w / scale)` in e4m3
   (round to nearest even, clamped to ±448). The scale is constant along k, so it
   is applied once per output: `y[m, n] = scale[n] * sum_k x[m, k] q[n, k] + bias[n]`.
-* **Activations stay bf16.** Never quantise activations in an `fp8_weights`
-  target (that is W8A8, the `fp8_w8a8` class of the `fp8-w8a8` skill, for compute-bound GEMMs).
-* **Accumulate in fp32**; apply scale and bias in fp32 and round to bf16 once.
+* **Activations stay in the model's dtype** (bf16 or fp16; the examples are templates on
+  it). Never quantise activations in an `fp8_weights` target (that is W8A8, the
+  `fp8_w8a8` class of the `fp8-w8a8` skill, for compute-bound GEMMs).
+* **Accumulate in fp32**; apply scale and bias in fp32 and round to that dtype once.
 * **Report the numerical error** in `NOTES.md`: the weight report of
   `fp8_error(weight, q, scale)` (`rel_l2`, `worst_channel_rel_l2`, `underflow`,
   `crest`) and the evaluator's per-case `min_cosine` / `max_rel_l2` (reported in
@@ -33,18 +34,21 @@ Read the `precision-tiers` skill first (when it is allowed, the tolerance tier, 
 * 128-bit loads = 16 e4m3 codes; stream them past L1 (`ld.global.nc.L1::no_allocate`).
 * `__nv_cvt_fp8x2_to_halfraw2(v, __NV_E4M3)` (`cuda_fp8.h`) converts two codes to
   `f16x2` exactly (the low byte is `.x`); `__half22float2` -> fp32 for FMA
-  (GEMV), `__float22bfloat162_rn` -> bf16x2 (exact: every e4m3 value is a bf16
-  value) for a bf16 MMA. Convert each weight once, then reuse it for every
-  activation row.
+  (GEMV), the `f16x2` as it is for an fp16 MMA, `__float22bfloat162_rn` -> bf16x2
+  (exact: every e4m3 value is a bf16 value) for a bf16 MMA. Convert each weight once,
+  then reuse it for every activation row.
 * GEMV (M = 1): warp per output row, fp32 FMA, warp-shuffle reduction, scale in
   the epilogue. At M = 2..4 the per-row FMA work makes it ALU bound when the
   weight is L2-resident: the tensor-core kernel is better from M = 2.
-* Skinny GEMM (M <= 32): `mma.sync.m16n8k16.bf16` with the weight as the A
-  operand (16 output channels x k16) and the tokens as B, both loaded straight
-  from global memory with the same k permutation (thread t of a quad loads 16
-  consecutive k; mma j uses k 16t + 4j .. 16t + 4j + 3 of A and B). Several channel
-  tiles per block divide the activation traffic from L2; split k across warps
-  and reduce through shared memory.
+* Skinny GEMM (M <= 32): `mma.sync.m16n8k16` in the activations' type (bf16 / f16)
+  with the weight as the A operand (16 output channels x k16) and the tokens as B, both
+  loaded straight from global memory with the same k permutation (thread t of a quad
+  loads 16 consecutive k; mma j uses k 16t + 4j .. 16t + 4j + 3 of A and B). Several
+  channel tiles per block divide the activation traffic from L2; split k across warps
+  and reduce through shared memory. Turing (sm_75) has no bf16 MMA and only the k8 fp16
+  form: two `m16n8k8.f16` per k16 step on the same fragments (registers a0, a1 / b0, then
+  a2, a3 / b1); bf16 there takes the dequantised fallback (`cuda_fp8_skinny_gemm.py`, its
+  outputs verified through compute_75 PTX on an sm_120 GPU; not timed on a T4 yet).
 * Triton (sm_89+: Triton has no e4m3 type below; there, load `uint8` codes and build
   the bf16 bits with integer ops): load the codes from a `torch.float8_e4m3fn` tensor
   (`tl.float8e4nv`) and `w.to(tl.bfloat16)` before `tl.dot(x, w, acc)` (verified on sm_120;

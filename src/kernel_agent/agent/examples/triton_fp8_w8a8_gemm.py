@@ -15,7 +15,8 @@ The recipe is the one the systems agent of the VoxCPM2 throughput run found
   calibrated offline). In a model, fuse this into the producer of ``x`` (the RMSNorm or
   ``silu(gate) * up`` before the GEMM): the run let Inductor fuse it there.
 * ``_gemm_kernel``: e4m3 x e4m3 with fp32 accumulation, both scales (and the bias)
-  applied once per output in the epilogue, one rounding to bf16. A plain tile loop,
+  applied once per output in the epilogue, one rounding to the activations' dtype (bf16 or
+  fp16: :data:`DTYPES`, taken from the input). A plain tile loop,
   grouped along M for L2 reuse of the weight tiles. On sm_120 / sm_121 the product is
   ``tl.dot_scaled`` with constant unit ue8m0 scales (127 = 2^0, one per 32 along K): it
   lowers to the block-scaled MMA (PTX ``mma.sync ... kind::mxf8f6f4.block_scale``, SASS
@@ -37,8 +38,8 @@ The recipe is the one the systems agent of the VoxCPM2 throughput run found
   loaded unit scales 34.3 / 12.4 / 11.9 / 25.4 us. Other shapes: :data:`DEFAULT`; tune with
   ``sweep_candidate`` (``bm``, ``bn``, ``bk``, ``warps``, ``stages``; ``scaled=0`` for the
   ``tl.dot`` kernel).
-* Shapes the kernel does not tile (N or K not a multiple of the tile) and non-bf16 or CPU
-  inputs: ``kernel_agent.kernels.quant.fp8_w8a8_linear`` (``torch._scaled_mm`` where it
+* Shapes the kernel does not tile (N or K not a multiple of the tile) and other dtypes or
+  CPU inputs: ``kernel_agent.kernels.quant.fp8_w8a8_linear`` (``torch._scaled_mm`` where it
   applies), the same numerics.
 * The launcher is also a ``torch.library.custom_op`` with a fake implementation, so the
   GEMM stays one opaque op under ``torch.compile`` (``fullgraph=True``) and CUDA graphs
@@ -75,6 +76,8 @@ from kernel_agent.kernels.quant import fp8_error, fp8_w8a8_linear, quantize_fp8
 #: it elsewhere and says why).
 ARCHS = "sm_89+"
 ARCHS_WHY = "e4m3 tensor cores (tl.dot on e4m3; tl.dot_scaled on sm_12x)"
+#: Activation dtypes the kernels take (from the input; the output keeps it).
+DTYPES = (torch.bfloat16, torch.float16)
 
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)
@@ -172,7 +175,8 @@ def _gemm_kernel(
     acc = acc * tl.load(sa + rm, mask=rm < M, other=0.0)[:, None] * tl.load(sb + rn)[None, :]
     if HAS_BIAS:
         acc += tl.load(bias + rn).to(tl.float32)[None, :]
-    tl.store(c + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=row_ok)
+    # one rounding to the output's dtype (the activations': bf16 or fp16)
+    tl.store(c + rm[:, None] * N + rn[None, :], acc.to(c.dtype.element_ty), mask=row_ok)
 
 
 def _w8a8_linear(
@@ -182,8 +186,9 @@ def _w8a8_linear(
     bias: torch.Tensor | None,
     config: list[int],
 ) -> torch.Tensor:
-    """x [..., K] bf16, w_q [N, K] e4m3, w_s [N] fp32 -> [..., N] bf16 (W8A8, fp32 acc).
-    ``config``: BM, BN, BK, warps, stages, scaled (1: ``tl.dot_scaled``, 0: ``tl.dot``)."""
+    """x [..., K] bf16 / fp16, w_q [N, K] e4m3, w_s [N] fp32 -> [..., N] in x's dtype (W8A8,
+    fp32 acc). ``config``: BM, BN, BK, warps, stages, scaled (1: ``tl.dot_scaled``, 0:
+    ``tl.dot``)."""
     N, K = w_q.shape
     bm, bn, bk, warps, stages, scaled = config
     if N % bn or K % bk:
@@ -192,7 +197,7 @@ def _w8a8_linear(
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
     M = x2.shape[0]
-    out = torch.empty((*x.shape[:-1], N), device=x.device, dtype=torch.bfloat16)
+    out = torch.empty((*x.shape[:-1], N), device=x.device, dtype=x.dtype)
     if M == 0:
         return out
     x_q = torch.empty((M, K), device=x.device, dtype=torch.float8_e4m3fn)
@@ -223,19 +228,23 @@ def _w8a8_linear(
 
 
 def gemm_ptx(
-    capability: tuple[int, int], config: tuple[int, ...] = DEFAULT, scaled: bool | None = None
+    capability: tuple[int, int],
+    config: tuple[int, ...] = DEFAULT,
+    scaled: bool | None = None,
+    out: str = "bf16",
 ) -> str:
     """PTX of :func:`_gemm_kernel` compiled for a GPU of ``capability`` with tile ``config``
-    (BM, BN, BK, warps, stages) and ``scaled`` (None: :func:`block_scale_capable`). Compiles
-    only (Triton's own ptxas): no launch, no GPU needed."""
+    (BM, BN, BK, warps, stages), ``scaled`` (None: :func:`block_scale_capable`) and output
+    (and bias) type ``out`` (``bf16`` or ``fp16``). Compiles only (Triton's own ptxas): no
+    launch, no GPU needed."""
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
     bm, bn, bk, warps, stages = config[:5]
     scaled = block_scale_capable(capability) if scaled is None else scaled
-    ptr = {"a": "*fp8e4nv", "b": "*fp8e4nv", "sa": "*fp32", "sb": "*fp32", "bias": "*bf16"}
+    ptr = {"a": "*fp8e4nv", "b": "*fp8e4nv", "sa": "*fp32", "sb": "*fp32", "bias": f"*{out}"}
     consts = {"HAS_BIAS": False, "BM": bm, "BN": bn, "BK": bk, "GM": 8, "SCALED": scaled}
-    signature = {**ptr, "c": "*bf16", "M": "i32", "N": "i32", "K": "i32"}
+    signature = {**ptr, "c": f"*{out}", "M": "i32", "N": "i32", "K": "i32"}
     signature.update(dict.fromkeys(consts, "constexpr"))
     # specialised as the JIT specialises a launch: 16-byte aligned pointers, sizes divisible
     # by 16 (without it the tile loads are not vectorised and the K loop gets no cp.async)
@@ -255,7 +264,7 @@ w8a8_linear = torch.library.custom_op(f"{_NS}::w8a8_linear", _w8a8_linear, mutat
 
 @w8a8_linear.register_fake
 def _(x, w_q, w_s, bias, config):
-    return x.new_empty((*x.shape[:-1], w_q.shape[0]), dtype=torch.bfloat16)
+    return x.new_empty((*x.shape[:-1], w_q.shape[0]))
 
 
 class Fp8W8A8Linear(nn.Module):
@@ -274,7 +283,7 @@ class Fp8W8A8Linear(nn.Module):
         self._args = (q, scale, reference.bias, list(config))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != torch.bfloat16 or not x.is_cuda:
+        if x.dtype not in DTYPES or not x.is_cuda:
             return fp8_w8a8_linear(x, *self._args[:3])
         # compiled: one opaque op; eager: the launcher itself (no custom-op dispatch cost)
         launch = w8a8_linear if torch.compiler.is_compiling() else _w8a8_linear
@@ -296,10 +305,10 @@ def build(
     -1 by the GPU (:func:`block_scale_capable`)."""
     ok = (
         isinstance(reference, nn.Linear)
-        and reference.weight.dtype == torch.bfloat16
+        and reference.weight.dtype in DTYPES
         and reference.weight.is_cuda
         and torch.cuda.get_device_capability(reference.weight.device) >= (8, 9)  # e4m3 MMA
-        and (reference.bias is None or reference.bias.dtype == torch.bfloat16)
+        and (reference.bias is None or reference.bias.dtype == reference.weight.dtype)
     )
     if not ok:
         return reference

@@ -242,7 +242,8 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
             "int8_gemm",
             _INT8_LABEL,
             "cuBLASLt int8 (`torch._int_mm`: IMMA) with the per-token / per-channel scales in a "
-            "fused epilogue kernel, or CUDA C++ `mma.sync.m8n8k16.s32.s8.s8.s32` (sm_75's form)",
+            "fused epilogue kernel, or CUDA C++ `mma.sync.m8n8k16.s32.s8.s8.s32` (sm_75's form; "
+            "`cuda_int8_skinny_gemm.py` runs it up to 128 rows per call)",
             "Turing has IMMA (m8n8k16) but no bf16 tensor cores, and Triton's int8 `tl.dot` "
             "does not compile below sm_80 (Triton 3.8: `TritonGPUAccelerateMatmul` fails for "
             "sm_75; fp16 / bf16 dots run on FMA units there)",
@@ -258,11 +259,14 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
             _BY_ID["small_m_gemm"].label,
             "CUDA C++ (`load_inline`) GEMV / skinny GEMM: 16-byte weight loads, CUDA-core FMA "
             "for a few rows, fp16 `mma.sync.m16n8k8` (Turing's HMMA form) once M fills a tile; "
-            "weight-only INT8 / FP8 codes dequantised in registers",
+            "weight-only INT8 / FP8 codes dequantised in registers (`cuda_int8_gemv.py`, "
+            "`cuda_fp8_gemv.py`; `cuda_fp8_skinny_gemm.py` in fp16, `cuda_int8_skinny_gemm.py` "
+            "for W8A8)",
             "memory bound: the weight bytes set the floor and the host time per launch matters "
             "(RTX 5070 Ti: every kept small-M kernel of the studied runs was CUDA C++, up to "
             "10.5x); sm_75 has no bf16 tensor cores, no `cp.async` and no `m16n8k16` / "
-            "`m16n8k32` forms, and the bundled small-M examples are bf16 and sm_80+",
+            "`m16n8k32` forms (the bundled examples' Turing paths: verified through compute_75 "
+            "PTX, not timed on a T4 yet)",
             "Triton `tl.dot` on fp16 with BM = 16 inside CUDA graphs (FMA units below sm_80: "
             "enough while the weight stream dominates; int8 `tl.dot` does not compile here)",
             ("cuda", "triton"),

@@ -13,10 +13,13 @@ Every example declares the GPUs it runs on (its ``ARCHS``, ``kernel_agent/gpu_ar
 :func:`smoke_backends` runs those this GPU supports and lists the others with the reason
 (:func:`example_skip`), so ``doctor --smoke`` passes on any GPU. A backend the toolchain
 refuses on this GPU (``cute`` below sm_80: ``toolchain.ARCH_SUPPORT``) is listed the same
-way, never run."""
+way, never run. A low-precision example that declares fp16 activations (its ``DTYPES``,
+:func:`example_dtypes`) is also checked on an fp16 ``nn.Linear``."""
 
 from __future__ import annotations
 
+import ast
+import inspect
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -377,6 +380,24 @@ def examples_run(names: Iterable[str], tc: object, backend: str) -> bool:
     return all(example_skip(name, tc, backend) is None for name in names)
 
 
+def example_dtypes(name: str) -> tuple[str, ...]:
+    """The activation dtypes the bundled example ``name`` declares (``DTYPES =
+    (torch.bfloat16, torch.float16)``, read with ``ast``: not imported), as ``torch``
+    attribute names; ``("bfloat16",)`` without a declaration."""
+    try:
+        tree = ast.parse((EXAMPLES_DIR / name).read_text())
+    except (OSError, SyntaxError, ValueError):
+        return ("bfloat16",)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == [
+            "DTYPES"
+        ]:
+            elts = node.value.elts if isinstance(node.value, ast.Tuple) else []
+            found = tuple(e.attr for e in elts if isinstance(e, ast.Attribute))
+            return found or ("bfloat16",)
+    return ("bfloat16",)
+
+
 def pdl_supported(tc: object) -> bool:
     """Whether the PDL examples can run: the ``cuda`` backend on sm_90 or newer
     (``griddepcontrol``; their ``ARCHS``)."""
@@ -411,17 +432,18 @@ def make_linear_capture(
     *,
     tier: str | None = None,
     precision: str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> Path:
-    """A bf16 ``nn.Linear`` (Gaussian weights, std ``in_features ** -0.5``) and its calls,
-    captured in ``tier`` (``near-lossless`` for a reduced-precision target)."""
+    """A bf16 (or ``dtype``) ``nn.Linear`` (Gaussian weights, std ``in_features ** -0.5``)
+    and its calls, captured in ``tier`` (``near-lossless`` for a reduced-precision target)."""
     from kernel_agent.profiling.capture import capture_calls
 
     torch.manual_seed(0)
-    module = nn.Linear(in_features, out_features, bias=False).cuda().to(torch.bfloat16)
+    module = nn.Linear(in_features, out_features, bias=False).cuda().to(dtype)
     with torch.no_grad():
         module.weight.normal_(0.0, in_features**-0.5)
     cases: list[tuple[Any, ...]] = [
-        ((torch.randn(*shape, in_features, device="cuda", dtype=torch.bfloat16),), {}, count)
+        ((torch.randn(*shape, in_features, device="cuda", dtype=dtype),), {}, count)
         for shape, count in calls
     ]
     capture_calls(module, cases, path, tier=tier, precision=precision)
@@ -522,17 +544,26 @@ def smoke_fp8(
     :data:`W8A8_EXAMPLES`, :data:`MX_EXAMPLES`, :data:`INT8_W8A8_EXAMPLES`,
     :data:`INT8_WEIGHT_EXAMPLES`, or ``examples`` captured with ``capture``) passes the evaluator in
     the near-lossless tier, and the exact tier (a quick check) rejects it; an MXFP8 example
-    with the OCP floor scale rule fails the scale-rule guard."""
+    with the OCP floor scale rule fails the scale-rule guard. With a ``capture`` that takes a
+    ``dtype`` (:func:`make_linear_capture`), once per activation dtype the example declares
+    (:func:`example_dtypes`: an fp16 model too)."""
     from kernel_agent.kernels.evaluate import run_evaluation
 
     ok = True
     if examples is None:
         examples = _EXAMPLES.get(precision, FP8_EXAMPLES)
-    for name, (k, n, calls) in examples.items():
+    typed = "dtype" in inspect.signature(capture).parameters
+    for name, (k, n, calls), dtype in [
+        (example, spec, dt)
+        for example, spec in examples.items()
+        for dt in (example_dtypes(example) if typed else ("bfloat16",))
+    ]:
+        kw: dict[str, Any] = {} if dtype == "bfloat16" else {"dtype": getattr(torch, dtype)}
+        stem = name if dtype == "bfloat16" else f"{name}.{dtype}"
         near = capture(
-            tmp / f"{name}.near.pt", k, n, calls, tier="near-lossless", precision=precision
+            tmp / f"{stem}.near.pt", k, n, calls, tier="near-lossless", precision=precision, **kw
         )
-        exact = capture(tmp / f"{name}.exact.pt", k, n, calls)
+        exact = capture(tmp / f"{stem}.exact.pt", k, n, calls, **kw)
         result = run_evaluation(near, EXAMPLES_DIR / name)
         rejected = run_evaluation(exact, EXAMPLES_DIR / name, quick=True)
         passed = bool(result.get("correct")) and rejected.get("status") == "incorrect"
@@ -559,7 +590,8 @@ def smoke_fp8(
                 detail = f"the exact tier did not reject it: {rejected.get('status')}"
             else:
                 detail = f"the floor scale rule was not rejected: {floor.get('status')}"
-            print(f"  {name.removesuffix('.py'):22s} {'OK ' if passed else 'FAIL'} {detail}")
+            label = name.removesuffix(".py") + ("" if dtype == "bfloat16" else f" ({dtype})")
+            print(f"  {label:22s} {'OK ' if passed else 'FAIL'} {detail}")
     return ok
 
 
@@ -573,7 +605,8 @@ def smoke_fp4(
     """Every FP4 example of ``precision`` (:data:`FP4_EXAMPLES`; ``fp4_w4a4``:
     :data:`W4A4_EXAMPLES`, or ``examples``) passes the evaluator in its own tier
     (near-lossless-fp4, near-lossless-fp4a), and the 8-bit near-lossless tier (a quick check)
-    rejects it: FP4 needs its own tier."""
+    rejects it: FP4 needs its own tier. Once per activation dtype the example declares
+    (:func:`example_dtypes`)."""
     from kernel_agent.kernels.compare import tier_for
     from kernel_agent.kernels.evaluate import run_evaluation
 
@@ -581,12 +614,21 @@ def smoke_fp4(
     tier = tier_for("near-lossless", precision)
     if examples is None:
         examples = W4A4_EXAMPLES if precision == "fp4_w4a4" else FP4_EXAMPLES
-    for name, (k, n, calls) in examples.items():
+    for name, (k, n, calls), dtype in [
+        (example, spec, dt) for example, spec in examples.items() for dt in example_dtypes(example)
+    ]:
+        stem, dt = (name if dtype == "bfloat16" else f"{name}.{dtype}"), getattr(torch, dtype)
         fp4 = make_linear_capture(
-            tmp / f"{name}.fp4.pt", k, n, calls, tier=tier, precision=precision
+            tmp / f"{stem}.fp4.pt", k, n, calls, tier=tier, precision=precision, dtype=dt
         )
         fp8 = make_linear_capture(
-            tmp / f"{name}.fp8.pt", k, n, calls, tier="near-lossless", precision="fp8_weights"
+            tmp / f"{stem}.fp8.pt",
+            k,
+            n,
+            calls,
+            tier="near-lossless",
+            precision="fp8_weights",
+            dtype=dt,
         )
         result = run_evaluation(fp4, EXAMPLES_DIR / name)
         rejected = run_evaluation(fp8, EXAMPLES_DIR / name, quick=True)
@@ -603,7 +645,8 @@ def smoke_fp4(
                 detail = f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
             else:
                 detail = f"the FP8 tier did not reject it: {rejected.get('status')}"
-            print(f"  {name.removesuffix('.py'):22s} {'OK ' if passed else 'FAIL'} {detail}")
+            label = name.removesuffix(".py") + ("" if dtype == "bfloat16" else f" ({dtype})")
+            print(f"  {label:22s} {'OK ' if passed else 'FAIL'} {detail}")
     return ok
 
 

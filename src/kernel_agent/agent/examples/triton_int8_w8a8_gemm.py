@@ -18,7 +18,8 @@ rejects it.
 * ``_gemm_kernel``: ``tl.dot`` on int8 tiles with an int32 accumulator (``mma.sync
   m16n8k32.s32.s8.s8.s32``, SASS ``IMMA.16832.S8.S8``: exact integer sums), both scales and
   the bias applied once per output in the epilogue (``acc * x_scale[m] * w_scale[n] +
-  bias[n]`` in fp32, one rounding to bf16): the output equals ``quant.int8_w8a8_linear``
+  bias[n]`` in fp32, one rounding to the activations' dtype, bf16 or fp16: :data:`DTYPES`,
+  taken from the input): the output equals ``quant.int8_w8a8_linear``
   (``torch._int_mm``) bit for bit. A plain tile loop, grouped along M for L2 reuse of the
   weight tiles. On an RTX 5070 Ti (sm_120) the s8 ``mma.sync`` runs at 410 TOPS, twice the
   plain e4m3 ``QMMA.F32`` (206) of Triton's ``tl.dot`` on FP8 and as fast as the
@@ -26,7 +27,7 @@ rejects it.
 * One tile config per weight shape ``(N, K)`` (:data:`CONFIGS`, swept on the RTX 5070 Ti at
   M = 352 and 704, CUDA graph); other shapes :data:`DEFAULT`; tune with ``sweep_candidate``
   (``bm``, ``bn``, ``bk``, ``warps``, ``stages``).
-* Shapes the kernel does not tile (N or K not a multiple of the tile), non-bf16 or CPU
+* Shapes the kernel does not tile (N or K not a multiple of the tile), other dtypes or CPU
   inputs: ``kernel_agent.kernels.quant.int8_w8a8_linear`` (``torch._int_mm`` where it
   applies), the same numerics.
 * The launcher is also a ``torch.library.custom_op`` with a fake implementation, so the GEMM
@@ -59,7 +60,12 @@ from kernel_agent.kernels.quant import int8_error, int8_w8a8_linear, quantize_in
 #: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
 #: it elsewhere and says why).
 ARCHS = "sm_80+"
-ARCHS_WHY = "Triton's int8 tl.dot on the IMMA tensor cores (mma.sync m16n8k32 s8: sm_80+)"
+ARCHS_WHY = (
+    "Triton's int8 tl.dot on the IMMA tensor cores (mma.sync m16n8k32 s8: sm_80+; for sm_75 "
+    "Triton 3.8 fails to compile it: cuda_int8_skinny_gemm.py has Turing's m8n8k16)"
+)
+#: Activation dtypes the kernels take (from the input; the output keeps it).
+DTYPES = (torch.bfloat16, torch.float16)
 
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)
@@ -140,7 +146,8 @@ def _gemm_kernel(
     out = acc.to(tl.float32) * x_scale[:, None] * tl.load(sb + rn)[None, :]
     if HAS_BIAS:
         out += tl.load(bias + rn).to(tl.float32)[None, :]
-    tl.store(c + rm[:, None] * N + rn[None, :], out.to(tl.bfloat16), mask=row_ok)
+    # one rounding to the output's dtype (the activations': bf16 or fp16)
+    tl.store(c + rm[:, None] * N + rn[None, :], out.to(c.dtype.element_ty), mask=row_ok)
 
 
 def _w8a8_linear(
@@ -150,8 +157,8 @@ def _w8a8_linear(
     bias: torch.Tensor | None,
     config: list[int],
 ) -> torch.Tensor:
-    """x [..., K] bf16, w_q [N, K] int8, w_s [N] fp32 -> [..., N] bf16 (W8A8, int32 acc).
-    ``config``: BM, BN, BK, warps, stages."""
+    """x [..., K] bf16 / fp16, w_q [N, K] int8, w_s [N] fp32 -> [..., N] in x's dtype (W8A8,
+    int32 acc). ``config``: BM, BN, BK, warps, stages."""
     N, K = w_q.shape
     bm, bn, bk, warps, stages = config
     if N % bn or K % bk:
@@ -160,7 +167,7 @@ def _w8a8_linear(
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
     M = x2.shape[0]
-    out = torch.empty((*x.shape[:-1], N), device=x.device, dtype=torch.bfloat16)
+    out = torch.empty((*x.shape[:-1], N), device=x.device, dtype=x.dtype)
     if M == 0:
         return out
     x_q = torch.empty((M, K), device=x.device, dtype=torch.int8)
@@ -185,6 +192,9 @@ def _w8a8_linear(
         GM=8,
         num_warps=warps,
         num_stages=stages,
+        # no FMA contraction of `acc * x_scale * w_scale + bias`: the reference's roundings
+        # (contracted, a few outputs in a million differ; the products are exact integers)
+        enable_fp_fusion=False,
     )
     return out
 
@@ -196,7 +206,7 @@ w8a8_linear = torch.library.custom_op(f"{_NS}::int8_w8a8_linear", _w8a8_linear, 
 
 @w8a8_linear.register_fake
 def _(x, w_q, w_s, bias, config):
-    return x.new_empty((*x.shape[:-1], w_q.shape[0]), dtype=torch.bfloat16)
+    return x.new_empty((*x.shape[:-1], w_q.shape[0]))
 
 
 class Int8W8A8Linear(nn.Module):
@@ -215,7 +225,7 @@ class Int8W8A8Linear(nn.Module):
         self._args = (q, scale, reference.bias, list(config))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != torch.bfloat16 or not x.is_cuda:
+        if x.dtype not in DTYPES or not x.is_cuda:
             return int8_w8a8_linear(x, *self._args[:3])
         # compiled: one opaque op; eager: the launcher itself (no custom-op dispatch cost)
         launch = w8a8_linear if torch.compiler.is_compiling() else _w8a8_linear
@@ -235,10 +245,10 @@ def build(
     (else :data:`DEFAULT`)."""
     ok = (
         isinstance(reference, nn.Linear)
-        and reference.weight.dtype == torch.bfloat16
+        and reference.weight.dtype in DTYPES
         and reference.weight.is_cuda
         and torch.cuda.get_device_capability(reference.weight.device) >= (8, 0)  # int8 MMA
-        and (reference.bias is None or reference.bias.dtype == torch.bfloat16)
+        and (reference.bias is None or reference.bias.dtype == reference.weight.dtype)
     )
     if not ok:
         return reference

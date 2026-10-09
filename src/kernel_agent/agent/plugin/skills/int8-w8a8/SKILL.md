@@ -31,9 +31,11 @@ channels; FP8 where they do, or where the INT8 peak is the lower one (Blackwell 
   .row.col.s32.s8.s8.s32` (sm_80+; Turing: `m8n8k16`), cuBLASLt through `torch._int_mm(a [M,
   K], w.t())` (M > 16, K and N multiples of 8: `int8_matmul` pads M). The sums are exact (no
   fp32 rounding, no split-K order to match); the epilogue `acc * x_scale[m] * w_scale[n] (+
-  bias[n])` in fp32 without FMA contraction (`__fmul_rn`, `__fadd_rn`) and one rounding to
-  bf16 reproduce `int8_w8a8_linear` bit for bit (both examples do). Norms, softmax / attention
-  math and residual adds stay as in eager.
+  bias[n])` in fp32 without FMA contraction (`__fmul_rn`, `__fadd_rn`; a Triton launch with
+  `enable_fp_fusion=False`, else it contracts the bias add into an FMA and a few outputs in a
+  million differ) and one rounding to the model's dtype (bf16 or fp16) reproduce
+  `int8_w8a8_linear` bit for bit (both examples do, in both dtypes). Norms, softmax /
+  attention math and residual adds stay as in eager.
 * **Report** `int8_w8a8_error(weight, q, scale, x)` on captured activations: `activation_crest`
   (the largest amax / RMS of a token) and `activation_underflow` say whether the activations
   suit INT8; and the evaluator's per-case `min_cosine` / `max_rel_l2` in `NOTES.md`.
@@ -76,7 +78,7 @@ The toolchain block's measured peaks decide (`int8` in the GPU peaks: `torch._in
 
 | GPU | INT8 tensor-core path | rate |
 |---|---|---|
-| Turing sm_75 (T4, RTX 20xx) | `mma.sync` m8n8k16 s8, cuBLASLt (`torch._int_mm`); Triton's int8 `tl.dot` does not compile below sm_80 (Triton 3.8) | 2x fp16 |
+| Turing sm_75 (T4, RTX 20xx) | `mma.sync` m8n8k16 s8 (`cuda_int8_skinny_gemm.py`: four per m16n8k32 product, bit for bit through compute_75 PTX on an sm_120 GPU; not timed on a T4 yet), cuBLASLt (`torch._int_mm`); Triton's int8 `tl.dot` does not compile below sm_80 (Triton 3.8) | 2x fp16 |
 | Ampere sm_80 / sm_86 | `mma.sync` m16n8k32 s8 (IMMA), Triton `tl.dot` on int8, cuBLASLt | 2x bf16 (A100: 624 vs 312 TOPS); GeForce RTX 30xx 4x its fp32-accumulating bf16 (RTX 3090: 284 vs 71) |
 | Ada sm_89 | as Ampere; FP8 also | = FP8 with fp16 accumulation; GeForce RTX 40xx 2x FP8 with fp32 accumulation (RTX 4090: 661 vs 330) |
 | Hopper sm_90 | `wgmma` s8 (Triton `tl.dot`, CUTLASS sm_90); `mma.sync` stops below it | = FP8 (2x bf16) |
@@ -86,6 +88,6 @@ The toolchain block's measured peaks decide (`int8` in the GPU peaks: `torch._in
 
 ## Examples and sources
 
-* Examples: `triton_int8_w8a8_gemm.py` (one-pass per-token quantisation kernel + `tl.dot` on int8 tiles with an int32 accumulator, scales and bias in the epilogue, per-shape tiles, a `custom_op`), `cuda_int8_skinny_gemm.py` (IMMA skinny GEMM for decode). All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Examples: `triton_int8_w8a8_gemm.py` (one-pass per-token quantisation kernel + `tl.dot` on int8 tiles with an int32 accumulator, scales and bias in the epilogue, per-shape tiles, a `custom_op`), `cuda_int8_skinny_gemm.py` (IMMA skinny GEMM for decode, sm_75+); both take bf16 or fp16 activations. All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
 * Sources: the `documentation-sources` skill's `sources.md`, sections "Low precision (formats, scaling, accuracy)" (SmoothQuant, LLM.int8(), INT8 on Blackwell Ultra); "CUDA C++ and PTX"; "Triton". Per family: the `gpu-architectures` skill.
 * Code: `kernel_agent.kernels.quant` (`quantize_int8`, `quantize_int8_activations`, `int8_matmul`, `int8_w8a8_linear`, `int8_w8a8_error`, `smoothquant_factors`); research scripts and raw results: `docs/research-scripts/int8-178`.

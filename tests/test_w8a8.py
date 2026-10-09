@@ -314,17 +314,18 @@ def test_speed_of_light_counts_w8a8_gemms_at_the_fp8_peak():
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])  # an fp16 model too (#258)
 @pytest.mark.parametrize("name", sorted(selftest.W8A8_EXAMPLES))
-def test_w8a8_example_passes_the_reduced_tier_and_fails_exact(name, tmp_path):
+def test_w8a8_example_passes_the_reduced_tier_and_fails_exact(name, dtype, tmp_path):
     from kernel_agent import toolchain
 
     if not selftest.w8a8_supported(toolchain.setup()):
         pytest.skip("needs the triton backend on sm_89+")
     k, n, calls = selftest.W8A8_EXAMPLES[name]
     near = selftest.make_linear_capture(
-        tmp_path / "near.pt", k, n, calls, tier="near-lossless", precision="fp8_w8a8"
+        tmp_path / "near.pt", k, n, calls, tier="near-lossless", precision="fp8_w8a8", dtype=dtype
     )
-    exact = selftest.make_linear_capture(tmp_path / "exact.pt", k, n, calls)
+    exact = selftest.make_linear_capture(tmp_path / "exact.pt", k, n, calls, dtype=dtype)
     example = prompts.EXAMPLES_DIR / name
 
     result = run_evaluation(near, example)  # subprocess + the checks outside it

@@ -576,11 +576,11 @@ at a few rows per call, memory or launch bound) set `precision: "fp8_weights"`
 and a one-line `precision_why` with the number that justifies it (e.g. "M=1
 decode GEMVs, 40 % of the run, memory bound: FP8 halves the bytes"). Its
 kernels then store the weights in FP8 e4m3 with one scale per output channel
-(activations stay bf16), the target is checked in the run's reduced-precision
+(activations stay in the model's dtype), the target is checked in the run's reduced-precision
 tolerance tier (near-lossless or relaxed), and every end-to-end evaluation in the run's
 perceptual gate.""",
     "int8_weights": """`precision: "int8_weights"` (INT8 weight-only: int8 codes with one scale
-per output channel, bf16 activations; the bytes and the tier of `fp8_weights`) for the same
+per output channel, 16-bit activations; the bytes and the tier of `fp8_weights`) for the same
 memory-bound targets. Prefer it to `fp8_weights` on a GPU without hardware e4m3 conversion
 (before sm_89: e4m3 codes convert in software there, int8 in two cheap ops). Elsewhere it is
 the more accurate 8-bit weight format on rows without outliers (relative L2 ~0.01 per GEMM vs
@@ -1013,10 +1013,11 @@ def _precision_block(
 * quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
   quantize_fp8, fp8_error`): e4m3 codes, one fp32 scale per output channel; keep
   no bf16 copy of a quantised weight (half the bytes is the point);
-* activations stay bf16 (never quantise them), accumulate in fp32, apply the
-  scale (and bias) once per output in the epilogue, round to bf16 once;
-* verified examples: `cuda_fp8_gemv.py` (decode GEMV, M <= 4),
-  `cuda_fp8_skinny_gemm.py` (bf16 tensor cores, M <= 32); guide: skill
+* activations stay in the model's dtype (bf16 or fp16; never quantise them),
+  accumulate in fp32, apply the scale (and bias) once per output in the epilogue, round
+  to that dtype once;
+* verified examples (bf16 and fp16): `cuda_fp8_gemv.py` (decode GEMV, M <= 4),
+  `cuda_fp8_skinny_gemm.py` (16-bit tensor cores, M <= 32); guide: skill
   `kernel-agent:fp8-weights`;
 * report the numerical error in `NOTES.md`: `fp8_error(weight, q, scale)` of the
   weights and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
@@ -1027,9 +1028,10 @@ def _precision_block(
   one e4m3 scale per 16 consecutive weights of a row and one fp32 scale per
   tensor (`fmt="mxfp4"`: a power-of-two scale per 32, less accurate); keep no
   bf16 copy (a quarter of the bytes is the point);
-* activations stay bf16 (never quantise them: that is W4A4), accumulate in fp32:
-  scale each block's partial sum by its block scale (or dequantise in registers),
-  the tensor scale and bias once per output in the epilogue, round to bf16 once;
+* activations stay in the model's dtype (bf16 or fp16; never quantise them: that is
+  W4A4), accumulate in fp32: scale each block's partial sum by its block scale (or
+  dequantise in registers), the tensor scale and bias once per output in the epilogue,
+  round to that dtype once;
 * verified example: `cuda_fp4_gemv.py` (decode GEMV, M <= 4); guide: skill
   `kernel-agent:fp4-weights`;
 * report the numerical error in `NOTES.md`: `fp4_error(weight, codes, scales,
@@ -1044,8 +1046,8 @@ def _precision_block(
   448`, e4m3 codes), in the GEMM's prologue or fused into the op that produces
   them (RMSNorm, `silu(gate) * up`); never one static scale for all tokens;
 * e4m3 x e4m3 products on the tensor cores, accumulate in fp32, apply both scales
-  (and the bias) once per output in the epilogue, round to bf16 once; norms,
-  softmax / attention math and residual adds stay in bf16 / fp32 as in eager;
+  (and the bias) once per output in the epilogue, round to the model's dtype (bf16 or
+  fp16) once; norms, softmax / attention math and residual adds stay as in eager;
 * verified example: `triton_fp8_w8a8_gemm.py` (Triton e4m3 GEMM with per-shape
   tiles, M = 352); fallback and reference: `fp8_w8a8_linear` (`torch._scaled_mm`);
   guide: skill `kernel-agent:fp8-w8a8`; FP8 toolkit examples:
@@ -1116,10 +1118,10 @@ def _precision_block(
 * quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
   quantize_int8, int8_weights_linear, int8_error`): symmetric int8 codes in [-127, 127],
   one fp32 scale `amax / 127` per output channel; keep no bf16 copy of a quantised weight;
-* activations stay bf16 (never quantise them: that is `int8_w8a8`); convert the codes in
-  registers (exact: `prmt` into the fp32 `2^23 + code + 128`, minus `2^23 + 128`; or to
-  bf16 / fp16 for the tensor cores), accumulate in fp32, apply the scale (and bias) once
-  per output in the epilogue, round to bf16 once;
+* activations stay in the model's dtype (bf16 or fp16; never quantise them: that is
+  `int8_w8a8`); convert the codes in registers (exact: `prmt` into the fp32 `2^23 + code +
+  128`, minus `2^23 + 128`; or to bf16 / fp16 for the tensor cores), accumulate in fp32,
+  apply the scale (and bias) once per output in the epilogue, round to that dtype once;
 * verified example: `cuda_int8_gemv.py` (decode GEMV, M <= 4); reference:
   `int8_weights_linear`; guide: skill `kernel-agent:int8-weights`;
 * report the numerical error in `NOTES.md`: `int8_error(weight, q, scale)` of the weights
@@ -1137,17 +1139,17 @@ def _precision_block(
   up`); never one static or per-tensor scale;
 * s8 x s8 products on the tensor cores with an int32 accumulator (Triton `tl.dot(a, b, acc,
   out_dtype=tl.int32)`, `mma.sync ... m16n8k32.s32.s8.s8.s32`, `torch._int_mm`), then `acc *
-  x_scale[m] * w_scale[n] (+ bias[n])` in fp32 once per output, one rounding to bf16 (that
-  is `int8_w8a8_linear`, bit for bit); norms, softmax / attention math and residual adds
-  stay as in eager;
+  x_scale[m] * w_scale[n] (+ bias[n])` in fp32 once per output (no FMA contraction), one
+  rounding to the model's dtype, bf16 or fp16 (that is `int8_w8a8_linear`, bit for bit);
+  norms, softmax / attention math and residual adds stay as in eager;
 * activation outliers (`int8_w8a8_error(...)["activation_crest"]` above ~20): SmoothQuant
   (`smoothquant_factors(amax_per_input_channel, weight, alpha=0.4)` from many captured
   tokens; `smooth=` in the quantisers and `int8_w8a8_linear`; fold `1 / s` into the
   producer), or keep those GEMMs in bf16 / FP8 (where the run allows it);
-* verified examples: `triton_int8_w8a8_gemm.py` (compute-bound GEMMs, M ≳ 64),
-  `cuda_int8_skinny_gemm.py` (IMMA skinny GEMM, M <= 32 per weight read: decode); reference
-  and fallback: `int8_w8a8_linear` (`torch._int_mm`); guide: skill
-  `kernel-agent:int8-w8a8`;
+* verified examples (bf16 and fp16): `triton_int8_w8a8_gemm.py` (compute-bound GEMMs, M ≳
+  64; sm_80+), `cuda_int8_skinny_gemm.py` (IMMA skinny GEMM, M <= 32 per weight read:
+  decode; Turing's `m8n8k16` too); reference and fallback: `int8_w8a8_linear`
+  (`torch._int_mm`); guide: skill `kernel-agent:int8-w8a8`;
 * report the numerical error in `NOTES.md`: `int8_w8a8_error(weight, q, scale, x)` on
   captured activations and the evaluator's per-case `min_cosine` / `max_rel_l2`."""
     elif precision == "fp8_kv":

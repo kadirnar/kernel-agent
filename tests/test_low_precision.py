@@ -182,7 +182,7 @@ def test_engineer_prompt_explains_the_fp8_contract():
     for needle in (
         "quantize_fp8",
         "one fp32 scale per output channel",
-        "activations stay bf16",
+        "activations stay in the model's dtype (bf16 or fp16",
         "accumulate in fp32",
         "max_rel_l2",
         "cuda_fp8_gemv.py",
@@ -329,14 +329,21 @@ def _gpu_ready():
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])  # an fp16 model too (#258)
 @pytest.mark.parametrize("name", sorted(selftest.FP8_EXAMPLES))
-def test_fp8_example_passes_the_reduced_tier_and_fails_exact(name, tmp_path):
+def test_fp8_example_passes_the_reduced_tier_and_fails_exact(name, dtype, tmp_path):
     _gpu_ready()
     k, n, calls = selftest.FP8_EXAMPLES[name]
     near = selftest.make_linear_capture(
-        tmp_path / "near.pt", k, n, calls, tier="near-lossless", precision="fp8_weights"
+        tmp_path / "near.pt",
+        k,
+        n,
+        calls,
+        tier="near-lossless",
+        precision="fp8_weights",
+        dtype=dtype,
     )
-    exact = selftest.make_linear_capture(tmp_path / "exact.pt", k, n, calls)
+    exact = selftest.make_linear_capture(tmp_path / "exact.pt", k, n, calls, dtype=dtype)
     example = prompts.EXAMPLES_DIR / name
 
     result = run_evaluation(near, example)  # subprocess + the checks outside it

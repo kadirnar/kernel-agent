@@ -471,9 +471,17 @@ def test_mma_peaks_skip_the_emulated_fp8_mma_sync():
     ("arch", "runs", "skips"),
     [
         (
-            "sm_75",  # as compiled for it on the CPU (test_arch_matrix.py)
-            {"cuda_fp8_gemv.py", "cuda_int8_gemv.py", "cuda_fp4_gemv.py", "tilelang_rmsnorm.py"},
-            {"cuda_int8_skinny_gemm.py", "triton_int8_w8a8_gemm.py", "cute_rmsnorm.py"},
+            "sm_75",  # as compiled for it on the CPU (test_arch_matrix.py) and run (#258)
+            {
+                "cuda_fp8_gemv.py",
+                "cuda_int8_gemv.py",
+                "cuda_fp4_gemv.py",
+                "tilelang_rmsnorm.py",
+                "cuda_fp8_skinny_gemm.py",  # fp16: two m16n8k8; bf16: the dequant fallback
+                "cuda_int8_skinny_gemm.py",  # four m8n8k16
+                "triton_short_attention.py",  # tl.dot on FMA units
+            },
+            {"triton_int8_w8a8_gemm.py", "cute_rmsnorm.py", "triton_fp8_w8a8_gemm.py"},
         ),
         (
             "sm_80",
@@ -507,8 +515,8 @@ def test_examples_run_where_they_declare(arch, runs, skips):
         assert why and why.startswith("needs sm_") and f"this GPU is {arch}" in why, name
     assert selftest.w8a8_supported(tc) is (arch not in ("sm_75", "sm_80"))
     assert selftest.pdl_supported(tc) is (arch in ("sm_90", "sm_100", "sm_120"))
-    # weight-only FP8: every GPU here but Turing (the skinny GEMM's bf16 m16n8k16 MMA)
-    assert selftest.fp8_supported(tc) is (arch != "sm_75")
+    # weight-only FP8: every GPU here (Turing: the skinny GEMM's fp16 m16n8k8 form, #258)
+    assert selftest.fp8_supported(tc)
     assert selftest.cute_fp8_supported(tc) is (arch == "sm_120")
 
 

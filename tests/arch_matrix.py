@@ -124,7 +124,8 @@ _ATTN = (
     "sob soh sos smb smh smq smk: i32/16; scale: fp32"
 )
 _ATTN_CONSTS = {"sqd": 1, "skd": 1, "svd": 1, "MASK": 0, "S": 16, "BD": 128}
-_W8A8 = "sa sb bias: *fp32; c: *bf16; M N K: i32/16"
+#: The W8A8 GEMMs' scales and output (without a bias, its slot holds the fp32 scales).
+_W8A8 = "sa sb bias: *fp32; c: *{dt}; M N K: i32/16"
 #: GPUs that are not GeForce Blackwell (``supports`` has no negation).
 NOT_SM12X = "sm_7x, sm_8x, sm_9x, sm_10x, sm_11x"
 #: The FP8 producers' arguments besides the scales (``s``).
@@ -198,45 +199,57 @@ TRITON: dict[str, list[TritonSpec]] = {
             ),
         )
     ],
+    # the W8A8 GEMMs take the activations' dtype (bf16 or fp16) from the input (#258)
     "triton_int8_w8a8_gemm.py": [
-        TritonSpec(
-            "_quant_kernel",
-            "x_ptr: *bf16; q_ptr: *i8; s_ptr: *fp32; K stride_x: i32/16",
-            {"BLOCK": 1024},
-        ),
-        TritonSpec(
-            "_gemm_kernel",
-            "a b: *i8; " + _W8A8,
-            {"HAS_BIAS": False, "BM": 128, "BN": 128, "BK": 64, "GM": 8},
-            warps=8,
-            mma=(("sm_80+", "m16n8k32.row.col.satfinite.s32.s8.s8.s32"),),
-            pipelined=True,
-        ),
+        spec
+        for dt in HALF
+        for spec in (
+            TritonSpec(
+                "_quant_kernel",
+                f"x_ptr: *{dt}; q_ptr: *i8; s_ptr: *fp32; K stride_x: i32/16",
+                {"BLOCK": 1024},
+                label=dt,
+            ),
+            TritonSpec(
+                "_gemm_kernel",
+                "a b: *i8; " + _W8A8.format(dt=dt),
+                {"HAS_BIAS": False, "BM": 128, "BN": 128, "BK": 64, "GM": 8},
+                warps=8,
+                label=dt,
+                mma=(("sm_80+", "m16n8k32.row.col.satfinite.s32.s8.s8.s32"),),
+                pipelined=True,
+            ),
+        )
     ],
     "triton_fp8_w8a8_gemm.py": [
-        TritonSpec(
-            "_quant_kernel",
-            "x_ptr: *bf16; q_ptr: *fp8e4nv; s_ptr: *fp32; K stride_x: i32/16",
-            {"BLOCK": 1024},
-        ),
-        TritonSpec(
-            "_gemm_kernel",
-            "a b: *fp8e4nv; " + _W8A8,
-            {"HAS_BIAS": False, "BM": 64, "BN": 64, "BK": 128, "GM": 8, "SCALED": False},
-            label="tl.dot",
-            where=NOT_SM12X,
-            mma=(("sm_89", "m16n8k32.row.col.f32.e4m3.e4m3.f32"),),
-            pipelined=True,
-        ),
-        TritonSpec(
-            "_gemm_kernel",
-            "a b: *fp8e4nv; " + _W8A8,
-            {"HAS_BIAS": False, "BM": 64, "BN": 64, "BK": 128, "GM": 8, "SCALED": True},
-            label="tl.dot_scaled",
-            where="sm_12x",
-            mma=(("sm_12x", "kind::mxf8f6f4.block_scale"),),
-            pipelined=True,
-        ),
+        spec
+        for dt in HALF
+        for spec in (
+            TritonSpec(
+                "_quant_kernel",
+                f"x_ptr: *{dt}; q_ptr: *fp8e4nv; s_ptr: *fp32; K stride_x: i32/16",
+                {"BLOCK": 1024},
+                label=dt,
+            ),
+            TritonSpec(
+                "_gemm_kernel",
+                "a b: *fp8e4nv; " + _W8A8.format(dt=dt),
+                {"HAS_BIAS": False, "BM": 64, "BN": 64, "BK": 128, "GM": 8, "SCALED": False},
+                label=f"{dt},tl.dot",
+                where=NOT_SM12X,
+                mma=(("sm_89", "m16n8k32.row.col.f32.e4m3.e4m3.f32"),),
+                pipelined=True,
+            ),
+            TritonSpec(
+                "_gemm_kernel",
+                "a b: *fp8e4nv; " + _W8A8.format(dt=dt),
+                {"HAS_BIAS": False, "BM": 64, "BN": 64, "BK": 128, "GM": 8, "SCALED": True},
+                label=f"{dt},tl.dot_scaled",
+                where="sm_12x",
+                mma=(("sm_12x", "kind::mxf8f6f4.block_scale"),),
+                pipelined=True,
+            ),
+        )
     ],
     "triton_fp8_kv_decode.py": [
         TritonSpec(

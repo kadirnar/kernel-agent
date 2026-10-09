@@ -953,17 +953,20 @@ mode:
   capture (`kernels/compare.py`: `REDUCED_PRECISIONS`).
 * **Engineer.** The prompt of such a target states the contract: quantise once
   in `build()` (e4m3, one fp32 scale per output channel, no bf16 copy kept),
-  bf16 activations, fp32 accumulation, scale and bias in the epilogue, and
+  activations in the model's dtype (bf16 or fp16), fp32 accumulation, scale and bias
+  in the epilogue, and
   report the numerical error (`kernel_agent.kernels.quant.fp8_error` for the
   weights; the evaluator adds `max_rel_l2` per case in the near-lossless tier).
   It gets the skills `precision-tiers` and `fp8-weights` (formats, scales,
   dequantisation in registers, outliers, what sm_120 supports) and two
   verified examples: `examples/cuda_fp8_gemv.py` (decode GEMV, M <= 4) and
-  `examples/cuda_fp8_skinny_gemm.py` (M <= 32, bf16 `mma.sync` fed with
-  e4m3 codes upcast in registers). Both pass the evaluator in the
+  `examples/cuda_fp8_skinny_gemm.py` (M <= 32, bf16 / fp16 `mma.sync` fed with
+  e4m3 codes upcast in registers; on Turing fp16 as two `m16n8k8`, bf16 through the
+  dequantised fallback). Both pass the evaluator in the
   near-lossless tier and fail the exact tier (relative L2 ~0.026 > 0.02, ~20 %
-  of the elements outside the bf16 tolerance); `doctor --smoke` checks both
-  on sm_80+ GPUs (below sm_89 the e4m3 codes are converted in software).
+  of the elements outside the bf16 tolerance) on bf16 and fp16 captures; `doctor --smoke`
+  checks both on sm_75+ GPUs (below sm_89 the e4m3 codes are converted in software; the
+  sm_75 and sm_86 code paths verified through their PTX on an RTX 5070 Ti, #258).
 * **Speed of light.** For a `fp8_weights` target the 2-D weights count at one
   byte per element plus 4 bytes of scale per output channel, so `pct_of_sol`
   measures the FP8 kernel against the bytes it must stream. For a `fp8_w8a8`
@@ -1214,7 +1217,7 @@ Two INT8 classes fill that gap (issue #178), and are an option on every other GP
 allowed by default in near-lossless runs, in the near-lossless tier):
 
 * **`int8_weights`**: weight-only, symmetric int8 codes in [-127, 127] with one fp32 scale
-  `amax / 127` per output channel, bf16 activations, fp32 accumulation; the bytes and the
+  `amax / 127` per output channel, bf16 / fp16 activations, fp32 accumulation; the bytes and the
   floor of `fp8_weights` (the ceilings' *FP8 w* column), converted in registers with two
   ops per value (no e4m3 emulation). On Gaussian-like rows int8 per channel is ~2.5x more
   accurate than e4m3 (relative L2 ~0.009 vs 0.026 per GEMM).
@@ -1222,7 +1225,7 @@ allowed by default in near-lossless runs, in the near-lossless tier):
   call, s8 x s8 products summed exactly in int32 on the IMMA tensor cores (`mma.sync`
   m16n8k32 s8 from sm_80, m8n8k16 on Turing, `wgmma` s8 on Hopper, `tcgen05.mma kind::i8`
   on B200; cuBLASLt via `torch._int_mm`), `acc * x_scale * w_scale (+ bias)` in the
-  epilogue, one rounding to bf16. Needs INT8 tensor cores (sm_75+: refused on sm_70, with
+  epilogue, one rounding to the model's dtype. Needs INT8 tensor cores (sm_75+: refused on sm_70, with
   the reason); its *Ceilings* column is *INT8 W8A8* at the measured INT8 peak (`int8` in the
   GPU peaks, `torch._int_mm`, in TOPS; peaks cache version 5 also measures the s8 `mma.sync`
   rate, `s8 IMMA.S32`).
@@ -1242,14 +1245,16 @@ allowed by default in near-lossless runs, in the near-lossless tier):
   device and layout, recorded in `quant.INT_MM_FAILED`, the same integers; #254),
   `int8_w8a8_linear`, `int8_weights_linear`, `int8_error`, `int8_w8a8_error`
   (`activation_crest`, `activation_underflow`), `smoothquant_factors`.
-* **Examples** (verified on an RTX 5070 Ti; `ARCHS = "sm_80+"`, `doctor --smoke` runs them:
-  near-lossless pass, exact reject): `triton_int8_w8a8_gemm.py` (one-pass per-token
-  quantisation kernel + Triton `tl.dot` on int8 tiles with an int32 accumulator, scales and
-  bias in the epilogue, per-shape tiles, a `custom_op`; output equal to `int8_w8a8_linear`
-  bit for bit), `cuda_int8_skinny_gemm.py` (decode / M <= 32 per weight read: IMMA fragments
-  loaded straight from global memory, no conversion, exact int32 cross-warp reduction; bit
-  for bit too), `cuda_int8_gemv.py` (`int8_weights` decode GEMV, M <= 4; no tensor cores:
-  `ARCHS = "sm_75+"`).
+* **Examples** (verified on an RTX 5070 Ti on bf16 and fp16 captures; `doctor --smoke` runs
+  them: near-lossless pass, exact reject): `triton_int8_w8a8_gemm.py` (sm_80+: one-pass
+  per-token quantisation kernel + Triton `tl.dot` on int8 tiles with an int32 accumulator,
+  scales and bias in the epilogue without FMA contraction, per-shape tiles, a `custom_op`;
+  output equal to `int8_w8a8_linear` bit for bit), `cuda_int8_skinny_gemm.py` (sm_75+:
+  decode / M <= 32 per weight read: IMMA fragments loaded straight from global memory, no
+  conversion, exact int32 cross-warp reduction, four `m8n8k16` per product on Turing; bit
+  for bit too), `cuda_int8_gemv.py` (sm_75+: `int8_weights` decode GEMV, M <= 4). The
+  Turing and sm_86 paths were verified through their PTX on the RTX 5070 Ti (#258), not
+  timed on such GPUs yet.
 
 Measured on the RTX 5070 Ti (sm_120; `docs/research-scripts/int8-178`): s8 `mma.sync`
 (`IMMA.16832.S8.S8`) runs 411 TOPS, as fast as the block-scaled FP8 `QMMA.SF` (414) and
@@ -4412,7 +4417,10 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   GEMM, short-attention, decoder-layer and bf16-GEMM rows (fp16 `mma.sync` m16n8k8, WMMA,
   cuBLAS fp16; Triton's int8 `tl.dot` does not compile below sm_80), and no row or rule
   names a bundled example whose `ARCHS` excludes the GPU: such a mention is dropped
-  (`backends.runnable_text`, #254). The ceilings table's *FP8
+  (`backends.runnable_text`, #254). The low-precision examples take the model's dtype
+  (bf16 or fp16, `DTYPES`); the CUDA weight-only GEMVs and skinny GEMMs declare sm_75+
+  (Turing's fp16 `m16n8k8` and s8 `m8n8k16` forms, verified through compute_75 PTX, #258).
+  The ceilings table's *FP8
   MMA* column appears only where two FP8 `mma.sync` forms exist (sm_12x); the
   `mma.sync` e4m3 rates are not measured on sm_90 / sm_100, where they are emulated.
 * **Knowledge per GPU.** The `gpu-architectures` skill's `gpus.md` has one section per
@@ -4454,7 +4462,7 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   the CuTe DSL check names the family's peak MMA. The library scout's adapters declare
   their architectures the same way; `doctor` lists which run here (FlashAttention 3 needs
   sm_90, QuACK lists Hopper / Blackwell / RTX 50; see "Library scout"). Where a limit is
-  runtime-only (PDL, cuBLASLt's FP8, `tl.dot` on FMA units below sm_80), `ARCHS_COMPILES`
+  runtime-only (PDL, cuBLASLt's FP8, the block-scaled `F.scaled_mm` modes), `ARCHS_COMPILES`
   names the wider set its device code compiles for (`gpu_arch.example_compiles`).
 * **Compile matrix** (#256, CPU only). `tests/test_arch_matrix.py` compiles every bundled
   example and kernel-agent's own device code (graphloop, `mma_peaks`, the PDL probe, the

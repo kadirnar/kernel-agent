@@ -31,7 +31,8 @@ The contract:
   or into the GEMM's prologue; a separate pass reads and writes `x` once more
   (the run let Inductor fuse it into the producers).
 * **Math**: e4m3 x e4m3 products, fp32 accumulation, epilogue
-  `y[m, n] = sx[m] * sw[n] * acc[m, n] + bias[n]` in fp32, one rounding to bf16.
+  `y[m, n] = sx[m] * sw[n] * acc[m, n] + bias[n]` in fp32, one rounding to the model's
+  dtype (bf16 or fp16: the examples take it from the input).
   Norms, softmax / attention math, RoPE and residual adds stay as in eager.
 * **Report** `fp8_w8a8_error(weight, q, scale, x)` on captured activations
   (weight error, `activation_rel_l2`, `activation_crest`, the output's relative

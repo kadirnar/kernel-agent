@@ -49,10 +49,11 @@ down_proj GEMV 2.06 x RMS in its massive-activation channel).
 **The contract** (as FP8, with the block scales):
 
 * quantise once in `build()` with `quantize_fp4`, keep no bf16 copy;
-* activations stay bf16 (FP4 activations are W4A4: `fp4_w4a4`, skill `fp4-w4a4`);
+* activations stay in the model's dtype, bf16 or fp16 (FP4 activations are W4A4:
+  `fp4_w4a4`, skill `fp4-w4a4`);
 * fp32 accumulation: a partial sum per 16-weight block times its block scale
   (or the weights dequantised with their scale), the tensor scale and bias once
-  per output, one rounding to bf16;
+  per output, one rounding to that dtype;
 * report `fp4_error(weight, codes, scales, tensor_scale)` and the evaluator's
   per-case numbers in `NOTES.md`;
 * fallback: the dequantised weight (`dequantize_fp4`) through cuBLAS.
