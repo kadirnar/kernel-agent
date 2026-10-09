@@ -19,7 +19,10 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   ``M = peak FLOP/s / DRAM bandwidth`` (the peak of the GPU's 16-bit tensor-core dtype:
   bf16, fp16 on Volta / Turing, :func:`kernel_agent.gpu_arch.tensor_core_16bit`).
 * **floor** per precision: ``max(FLOPs / peak, (weight + io + KV bytes) / DRAM bandwidth,
-  calls × launch floor)``, peaks measured on this GPU (:mod:`kernel_agent.kernels.roofline`):
+  calls × launch floor)``, peaks measured on this GPU (:mod:`kernel_agent.kernels.roofline`).
+  The launch floor is the eager one: a row's calls are module calls the hooks saw, each
+  launched from Python (calls replayed inside a CUDA graph or a compiled region are no row's,
+  ``module_gaps``; a graph-timed evaluation's floor is the CUDA-graph one, #226):
 
   - ``exact``: as profiled, each dtype at its own peak;
   - ``fp8_weights``: one byte per weight (e4m3; per-channel scales neglected), math as profiled;
@@ -249,6 +252,7 @@ def floor(
         else row["weight_elems"] * precision.weight_bytes
     )
     memory = (weights + row["io_bytes"] + row.get("kv_bytes", 0)) / float(peaks["dram_gbps"]) / 1e6
+    # the eager floor: the hooks see a row's calls, so each was launched from Python
     launch = row["calls"] * float(peaks.get("launch_floor_us") or 0.0) / 1000
     ms = max(compute, memory, launch)
     bound = (

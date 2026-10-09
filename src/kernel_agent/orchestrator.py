@@ -1006,8 +1006,11 @@ class Orchestrator:
         for rec in ranked_for_target(self.run, target_id, self.truth):
             if not precisions.tier_allowed(rec.get("tolerance_tier"), allowed):
                 continue  # evaluated in the tier of a precision the run does not allow
-            if best is not None and rec["speedup"] <= best["speedup"]:
-                break  # ranked by the records' speedups, which a cap only lowers
+            # ranked by the records' speedups, which a cap only lowers; those without one in
+            # the target's timing context come last (#226), by their own
+            stale = rec.get("context_stale")
+            if best is not None and (stale or rec["speedup"] <= best["speedup"]):
+                break
             cap = self.speed_caps.get((target_id, Path(str(rec["snapshot"])).name))
             if cap is not None and cap < rec["speedup"]:
                 rec = {**rec, "speedup": cap, "evaluator_speedup": rec["speedup"]}
@@ -1473,7 +1476,12 @@ class Orchestrator:
             rec = self._kernel_record(target_id, snap.name)
             sha = (rec or {}).get("snapshot_sha256")
             hit = known.get((arg, sha)) if sha else None
-            result = dict(hit) if hit is not None else self._recheck_one(target_id, snap, rec)
+            # ... and in the target's current timing context (#226): after a change the
+            # record may be stale (evaluate.stale), and only a new re-check says so
+            key = timing_context.for_target(self.run, target_id).key
+            if hit is not None and tuple(hit.get("timing_context") or ("eager", "warm")) != key:
+                hit = None
+            result = dict(hit) if hit is not None else self._recheck_one(target_id, snap, rec, key)
             if memcheck.pending(result):  # passed, and no memcheck verdict yet
                 result = self._memcheck(target_id, snap, result)
             checked[arg] = result
@@ -1485,6 +1493,7 @@ class Orchestrator:
                     "snapshot": snap.name,
                     "sha256": sha,
                     "evaluator_schema": evaluate.EVALUATOR_SCHEMA,
+                    "timing_context": list(key),
                 }
             )
             warn = "WARNING " if result.get("status") == recheck.SPEED_DISAGREES else ""
@@ -1579,15 +1588,21 @@ class Orchestrator:
         return memcheck.refuse(result, check) if memcheck.failed(check) else result
 
     def _recheck_one(
-        self, target_id: str, snap: Path, rec: dict[str, Any] | None
+        self,
+        target_id: str,
+        snap: Path,
+        rec: dict[str, Any] | None,
+        context: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """:func:`kernels.recheck.run_recheck` of one kernel snapshot on its target's capture,
         against the verified evaluation record ``rec``. In a run with ``.truth/`` a missing or
         changed capture fails it; a run from before that layout without one skips it.
 
-        A record from an older evaluator (:func:`kernels.evaluate.stale`) is re-evaluated
-        first, and so is one whose speedup the re-check disagrees with when the kernel is
-        correct on the fresh inputs (:meth:`_reevaluate`): the current evaluator's result
+        A record from an older evaluator, or timed in another context than the target's
+        current one (``context``) without a speedup in it (:func:`kernels.evaluate.stale`,
+        #226), is re-evaluated first, and so is one whose speedup the re-check disagrees with
+        when the kernel is correct on the fresh inputs (:meth:`_reevaluate`): the current
+        evaluator's result
         is then the verdict (``reevaluated``: old and new speedup). A speedup that still
         disagrees is re-checked once more, in new processes, and the run that agrees
         better counts (``rechecks``: both). If it still disagrees, the kernel is kept with
@@ -1605,7 +1620,9 @@ class Orchestrator:
         if capture_sha256 is None and not capture.exists():
             return {"status": "skipped", "passed": True, "reason": f"no capture file {capture}"}
         fresh: dict[str, Any] | None = None
-        why = evaluate.stale(rec) if rec is not None else None
+        if context is None:
+            context = timing_context.for_target(self.run, target_id).key
+        why = evaluate.stale(rec, context) if rec is not None else None
         stale = bool(why)
         if rec is not None and why:
             fresh = self._reevaluate(target_id, snap, rec, capture_sha256, why)

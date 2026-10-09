@@ -518,10 +518,12 @@ def _speed_of_light(
     l2_flush: bool,
     precision: str | None = None,
     replay: Any = None,
+    context: str = "eager",
 ) -> str | None:
     """``pct_of_sol`` of every timed row (:func:`kernels.roofline.apply_sol`, the work
     counted once per case from its module state (``replay``), weights at the capture's
-    ``precision``); a note when it cannot be computed."""
+    ``precision``, the launch floor of the ``context`` the rows were timed in); a note when
+    it cannot be computed."""
     from kernel_agent.kernels.roofline import apply_sol, count_case, current_peaks
 
     peaks = current_peaks()
@@ -543,7 +545,7 @@ def _speed_of_light(
             )
         for row in rows:
             if row.get("correct") and row.get("cases"):
-                apply_sol(row, costs, peaks, hot_l2=not l2_flush)
+                apply_sol(row, costs, peaks, hot_l2=not l2_flush, context=context)
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"[:300]
     return None
@@ -1099,8 +1101,12 @@ def sweep(
         for case in out["cases"]:
             case["ref_ms"] = ref_ms[case["case"]]
         precision = capture_precision(capture)  # reduced-precision weights: their own bytes
+        # the launch floor of the context the configs were timed in (a graph: no host time)
+        timed_in = "graph" if timing.graph else "eager"
         if cuda and (
-            note := _speed_of_light(rows, reference, cases, timed, l2_flush, precision, replay)
+            note := _speed_of_light(
+                rows, reference, cases, timed, l2_flush, precision, replay, timed_in
+            )
         ):
             out["sol_note"] = note
         if points is not None:  # the finalists' speedups of the evaluator's rounds

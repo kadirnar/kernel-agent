@@ -60,7 +60,9 @@ A kernel arm's rows are its benchmark evaluations (``ledger.measured``: quick
 checks and duplicates count for nothing) of all its workers or islands (``workers.py``:
 its move-on rules count across them, the same rules in evaluation units). The
 integration's re-evaluations are not evaluations either, but replace a snapshot's
-earlier result in the arm's best, as in the ledger's keep bar (``ledger.standing``).
+earlier result in the arm's best, as in the ledger's keep bar (``ledger.standing``). The best
+is in the target's timing context (#226, ``ledger.in_context``): a result timed in another
+one counts at its speedup in this one, or not at all.
 
 UCB on the observed gain per evaluation (as in KernelBand): ``rate`` is the ms
 per run an arm's kept results saved, divided by its evaluations. Each arm's
@@ -142,6 +144,7 @@ from kernel_agent.budget import (
     improves,
     not_agents,
 )
+from kernel_agent.kernels import context as timing_context
 from kernel_agent.kernels import weights
 from kernel_agent.kernels.roofline import sol_signal
 from kernel_agent.native import engine as native_engine
@@ -862,8 +865,11 @@ def build_arms(
             max_sessions=max(int((islands or {}).get(target_id, 1)), 1),
         )
         plans = [int(r["exp"]) for r in research or [] if r["arm"] == target_id and r.get("plan")]
-        _kernel_history(arm, target_rows, max(plans, default=None), since)
+        key = timing_context.current(run, target_id).key  # its bests compare in it (#226)
+        compared = ledger.in_context(run, target_id, target_rows, key)
+        _kernel_history(arm, compared, max(plans, default=None), since)
         record = snapshot_record(run, target_id, arm.best_snapshot)
+        record = timing_context.in_context(record, key) if record is not None else None
         arm.sol = sol_fraction(record)
         if ceiling is not None and record is not None:  # its best kernel, if faster than now
             ceiling = dataclasses.replace(

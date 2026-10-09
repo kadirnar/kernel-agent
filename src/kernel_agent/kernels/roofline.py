@@ -4,8 +4,9 @@
   and from L2 (bytes read + bytes written), dense matmul TFLOP/s per dtype (best
   of a few large shapes; FP8 e4m3 via ``torch._scaled_mm`` and NVFP4 where torch
   has a kernel for the GPU, else ``tflops_unavailable`` says why) and the launch
-  floor (median time of a module call that
-  launches one tiny kernel, timed like a candidate), the INT8 GEMM peak (``int8``:
+  floors (:func:`launch_floors`: median time of a module call that launches one tiny kernel,
+  timed like a candidate in each timing context: eagerly, ``launch_floor_us``, and as one of
+  the calls captured in a CUDA graph, ``launch_floor_graph_us``), the INT8 GEMM peak (``int8``:
   ``torch._int_mm``, cuBLASLt's IMMA kernels, in TOPS), and the tensor-core
   instruction rates (``mma_tflops``, :mod:`.mma_peaks`: plain FP8 ``QMMA.F32``
   vs block-scaled ``QMMA.SF`` vs bf16 / fp16 (fp32 and fp16 accumulation) / TF32 ``HMMA``
@@ -28,7 +29,8 @@
   bandwidth)``.  The bandwidth is the L2 one when ``min_bytes`` fits in L2 and
   the timing runs with a warm L2 (the evaluator's default), else DRAM.  ``bound``
   is ``compute`` or ``memory``, or ``launch`` when ``sol_ms`` is below the launch
-  floor (one launch from Python costs more than the work itself).
+  floor of the result's timing context (:func:`launch_floor`): eagerly one launch from
+  Python costs more than the work itself, in a CUDA graph one kernel boundary does.
 
 :func:`annotate` adds per case ``flops``, ``min_bytes``, ``sol_ms``,
 ``pct_of_sol`` (100 × sol_ms / new_ms) and ``bound``, plus the weighted
@@ -108,10 +110,20 @@ INT8 = "int8"
 #: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks, 3 the MXFP8 one, 4 the
 #: tensor-core instruction rates (``mma_tflops``), 5 the INT8 peak and the s8 IMMA rate, 6
 #: the fp16 (fp32 and fp16 accumulation), TF32 and Turing-shape instruction rates (#257), 7
-#: the sustained 16-bit matmul peaks with the SM clock and power under that load (#253).
-#: :func:`ensure_peaks` measures an older cache again (once per process at most); until then
-#: it stays in use.
-PEAKS_VERSION = 7
+#: the sustained 16-bit matmul peaks with the SM clock and power under that load (#253), 8
+#: the CUDA-graph launch floor (#226). :func:`ensure_peaks` measures an older cache again
+#: (once per process at most); until then it stays in use.
+PEAKS_VERSION = 8
+#: Peaks key of the launch floor of each timing context (:mod:`kernel_agent.kernels.bench`):
+#: a module call that launches one tiny kernel, timed eagerly (its host launch time counts)
+#: or as one of the calls captured in a CUDA graph (a kernel boundary inside a graphed stage,
+#: where no per-call host time is paid).
+LAUNCH_FLOOR_KEYS = {"eager": "launch_floor_us", "graph": "launch_floor_graph_us"}
+#: The CUDA-graph launch floor of peaks that have none (measured before version 8, or its
+#: graph timing failed): a kernel boundary inside a CUDA graph (drain, launch, ramp-up of the
+#: next grid), ~0.9 us measured on an RTX 5070 Ti (docs/PARALLEL.md §4.6). A result that uses
+#: it says so (``launch_floor_note``).
+GRAPH_LAUNCH_FLOOR_US = 0.9
 #: Sustained 16-bit peaks (``tflops_sustained``, #253): seconds of back-to-back GEMMs per
 #: dtype, in batches of about :data:`SUSTAINED_BATCH_MS`. A power-capped board (the 150 W
 #: passively cooled A10, the 70 W T4 and L4) holds its boost clock for the ~60 ms bursts of
@@ -487,9 +499,8 @@ def measure_peaks() -> dict[str, Any]:
     """Measure the roofline peaks of the current GPU (takes ~15-35 s, the sustained peaks
     about 5 of them; hold the GPU lock)."""
     import torch
-    from torch import nn
 
-    from kernel_agent.kernels.bench import ensure_clocks, time_call, warm_gpu
+    from kernel_agent.kernels.bench import ensure_clocks, warm_gpu
 
     tc = toolchain.setup()
     if tc.gpu is None:
@@ -565,14 +576,9 @@ def measure_peaks() -> dict[str, Any]:
         peaks["sustained"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
     torch.cuda.empty_cache()
 
-    # Launch floor: a module call that launches one tiny kernel, timed like a candidate.
-    class _OneKernel(nn.Module):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return x + 1
-
-    x = torch.zeros(1, device="cuda")
-    floor = min(time_call(_OneKernel(), (x,), {}, target_ms=50.0)["median_ms"] for _ in range(3))
-    peaks["launch_floor_us"] = round(floor * 1000, 2)
+    # Launch floors: a module call that launches one tiny kernel, timed like a candidate in
+    # each timing context (eagerly and in a CUDA graph, #226).
+    peaks.update(launch_floors())
 
     # Tensor-core instruction rates (which instruction a kernel needs, mma_peaks.py): last,
     # so that a failure there cannot spoil the peaks above.
@@ -588,6 +594,51 @@ def measure_peaks() -> dict[str, Any]:
         if missing:
             peaks["mma_unavailable"] = missing
     return peaks
+
+
+def launch_floors(repeats: int = 3) -> dict[str, float]:
+    """The launch floor of each timing context (:data:`LAUNCH_FLOOR_KEYS`, us): the lowest
+    of ``repeats`` medians of a module call that launches one tiny kernel, timed like a
+    candidate (:func:`kernel_agent.kernels.bench.time_call`), eagerly and in a CUDA graph. A
+    graph floor that cannot be measured is left out (:func:`launch_floor` stands in for it)."""
+    import torch
+    from torch import nn
+
+    from kernel_agent.kernels.bench import CONTEXTS, EAGER, time_call
+
+    class _OneKernel(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+    x = torch.zeros(1, device="cuda")
+    floors: dict[str, float] = {}
+    for context in CONTEXTS:
+        try:
+            ms = min(
+                time_call(_OneKernel(), (x,), {}, target_ms=50.0, context=context)["median_ms"]
+                for _ in range(repeats)
+            )
+        except Exception:
+            if context == EAGER:  # no eager timing: nothing else works either
+                raise
+            continue
+        floors[LAUNCH_FLOOR_KEYS[context]] = round(ms * 1000, 2)
+    return floors
+
+
+def launch_floor(peaks: Mapping[str, Any], context: str = "eager") -> tuple[float, str | None]:
+    """The launch floor (us) of the timing ``context`` (``eager`` or ``graph``) in ``peaks``
+    and, when ``peaks`` has none for a CUDA graph, why another value stands in for it:
+    :data:`GRAPH_LAUNCH_FLOOR_US` (peaks measured before version 8). Without an eager one
+    the floor is 0: no case is launch bound."""
+    measured = float(peaks.get(LAUNCH_FLOOR_KEYS[context]) or 0.0)
+    if measured > 0 or context == "eager":
+        return measured, None
+    return GRAPH_LAUNCH_FLOOR_US, (
+        f"this GPU's peaks have no CUDA-graph launch floor (measured before peaks version 8): "
+        f"{GRAPH_LAUNCH_FLOOR_US} us assumed, a kernel boundary inside a CUDA graph measured "
+        "on an RTX 5070 Ti (`kernel-agent doctor --remeasure-peaks` measures this GPU's)"
+    )
 
 
 def _peaks_file() -> tuple[Any, Path] | None:
@@ -994,10 +1045,13 @@ def count_case(
 # ------------------------------------------------------------------ speed of light
 
 
-def sol_time(cost: CaseCost, peaks: dict[str, Any], *, hot_l2: bool = True) -> dict[str, Any]:
-    """Speed-of-light time (ms) and bound of one case. FP8 (or MXFP8) FLOPs without a
-    measured peak of their own count at the fastest peak, and ``peak_missing`` says so: the
-    estimate is then too slow, not a ceiling."""
+def sol_time(
+    cost: CaseCost, peaks: dict[str, Any], *, hot_l2: bool = True, context: str = "eager"
+) -> dict[str, Any]:
+    """Speed-of-light time (ms) and bound of one case timed in ``context`` (its launch
+    floor: :func:`launch_floor`). FP8 (or MXFP8) FLOPs without a measured peak of their own
+    count at the fastest peak, and ``peak_missing`` says so: the estimate is then too slow,
+    not a ceiling."""
     tflops = {k: float(v) for k, v in (peaks.get("tflops") or {}).items() if v}
     fastest = max(tflops.values(), default=0.0)
     missing = next((d for d in MATH_DTYPE.values() if cost.flops.get(d) and d not in tflops), None)
@@ -1012,10 +1066,10 @@ def sol_time(cost: CaseCost, peaks: dict[str, Any], *, hot_l2: bool = True) -> d
     gbps = float(peaks["l2_gbps"] if l2 else peaks["dram_gbps"])
     memory_ms = cost.min_bytes / gbps / 1e6
     sol_ms = max(compute_ms, memory_ms)
-    floor_ms = float(peaks.get("launch_floor_us") or 0.0) / 1000
+    floor_ms = launch_floor(peaks, context)[0] / 1000
     bound = "compute" if compute_ms > memory_ms else "memory"
     if sol_ms < floor_ms:
-        bound = "launch"  # one launch from Python costs more than the work
+        bound = "launch"  # one launch (eager: from Python; graph: a boundary) costs more
     found = {"sol_ms": sol_ms, "bound": bound, "l2_resident": l2}
     return found | ({"peak_missing": missing} if missing else {})
 
@@ -1036,13 +1090,16 @@ def apply_sol(
     peaks: dict[str, Any],
     *,
     hot_l2: bool = True,
+    context: str = "eager",
 ) -> None:
-    """Add per-case and weighted SOL fields to a timed evaluation result (in place)."""
+    """Add per-case and weighted SOL fields to a timed evaluation result (in place), timed
+    in ``context``: ``launch_floor_ms`` and the ``launch`` bound are that context's
+    (:func:`launch_floor`; ``launch_floor_note`` when the floor is not this GPU's own)."""
     sol_total = new_total = 0.0
     time_by_bound: dict[str, float] = collections.defaultdict(float)
     suspicious = unreliable = False
     for report, cost in zip(result["cases"], costs, strict=True):
-        sol = sol_time(cost, peaks, hot_l2=hot_l2)
+        sol = sol_time(cost, peaks, hot_l2=hot_l2, context=context)
         sol_ms = sol["sol_ms"]
         report.update(
             flops=cost.total_flops,
@@ -1079,7 +1136,10 @@ def apply_sol(
     result["sol_ms_weighted"] = _sig(sol_total)
     result["pct_of_sol"] = _pct(sol_total, new_total)
     result["bound"] = max(time_by_bound, key=lambda b: time_by_bound[b])
-    result["launch_floor_ms"] = round(float(peaks.get("launch_floor_us") or 0.0) / 1000, 5)
+    floor_us, floor_note = launch_floor(peaks, context)
+    result["launch_floor_ms"] = round(floor_us / 1000, 5)
+    if floor_note:
+        result["launch_floor_note"] = floor_note
     if suspicious:
         result["suspicious_faster_than_sol"] = True
     if unreliable:
@@ -1095,10 +1155,12 @@ def annotate(
     l2_flush: bool = False,
     precision: str | None = None,
     restore: Any = None,
+    context: str = "eager",
 ) -> None:
     """Add SOL fields to a timed evaluation result in place; never raises. ``precision``:
     the capture's reduced precision (weights counted at :data:`WEIGHT_BITS`); ``restore``:
-    sets a case's module state before its call (``restore(case)``, profiling/state.py)."""
+    sets a case's module state before its call (``restore(case)``, profiling/state.py);
+    ``context``: the timing context the result was measured in (:func:`apply_sol`)."""
     peaks = peaks or current_peaks()
     if not peaks:
         result["sol_note"] = "GPU peaks not measured yet (`kernel-agent doctor` measures them)"
@@ -1113,7 +1175,7 @@ def annotate(
                     module, c["args"], c["kwargs"], method=c.get("method"), precision=precision
                 )
             )
-        apply_sol(result, costs, peaks, hot_l2=not l2_flush)
+        apply_sol(result, costs, peaks, hot_l2=not l2_flush, context=context)
     except Exception as exc:
         result["sol_error"] = f"{type(exc).__name__}: {exc}"[:300]
 

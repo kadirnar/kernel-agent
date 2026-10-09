@@ -17,6 +17,11 @@ neither is a result that lacks what the call asks for (``profile`` tables are
 never stored; ``compile_check`` only when the earlier call asked for it).
 Every new record stores its ``source_key``; older records get theirs from their
 snapshot, if it is still the evaluated file.
+
+A timed result answers only in the target's current timing context (#226,
+:mod:`kernel_agent.kernels.context`): one timed in another context comes back as its view
+from this one when it was timed here too (a winner's ``speedup_by_context``), and is
+evaluated again when it was not.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+from kernel_agent.kernels import context as timing_context
 from kernel_agent.truth import TamperError, Truth
 from kernel_agent.workspace import RunDir
 
@@ -83,9 +89,12 @@ def find(
     *,
     mode: str = FULL,
     compile_check: bool = False,
+    context: tuple[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """The latest verified record of ``target_id`` with source ``key`` that a ``mode``
-    evaluation may return instead of evaluating again (None: evaluate it)."""
+    evaluation may return instead of evaluating again (None: evaluate it). ``context``: the
+    target's timing context (``TimingContext.key``); a timed record is returned as seen from
+    it (``timing_context.in_context``), and skipped when it has no speedup there."""
     history = run.history_dir(target_id)
     pools = [_records(keeper, run.results_file(target_id))]
     if mode == QUICK:
@@ -96,8 +105,11 @@ def find(
                 continue
             if compile_check and "compile_check" not in rec:
                 continue
-            if _key(rec, history, keeper) == key:
-                return rec
+            if _key(rec, history, keeper) != key:
+                continue
+            found = rec if context is None else timing_context.in_context(rec, context)
+            if found is not None:  # None: timed in another context, not in this one
+                return found
     return None
 
 

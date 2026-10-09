@@ -338,6 +338,9 @@ def test_graph_launched_runs_price_a_launch_at_a_graph_boundary():
     profile["kernel_view"] = {"timeline": timeline}
     table = fusion.build(profile, PEAKS, 1.0)
     assert table["launch_mode"] == "graph" and table["launch_us"] == fusion.GRAPH_BOUNDARY_US
+    # peaks with a measured CUDA-graph launch floor (version 8, #226): that one
+    measured = fusion.build(profile, {**PEAKS, "launch_floor_graph_us": 1.28}, 1.0)
+    assert measured["launch_us"] == 1.28 and "measured CUDA-graph" in measured["launch_basis"]
     no_peaks = fusion.build({"fusions": profile["fusions"]}, {}, 1.0)
     assert any("not measured" in n for n in no_peaks["notes"])
     # eager: the launch floor, at most what an op of the run takes on average

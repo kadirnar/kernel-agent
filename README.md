@@ -1447,7 +1447,25 @@ context too (2 rounds): `timing` per case and `speedup_by_context` hold both, or
 `graph: unavailable (<why>)` for a candidate that cannot be captured or whose graph
 replay computes something else, which would break a graphed stage. The candidate-free
 reference timing and the re-check of winners time in the result's context.
-Evaluator schema 3 (earlier records: eager, warm L2).
+Evaluator schema 3 (earlier records: eager, warm L2). The roofline's `launch` bound and
+`launch_floor_ms` are the context's too ("Speed of light").
+
+**Records across contexts.** A target's context can change between improve rounds: a
+re-profile after the systems agent graphed a stage flips it from eager to graph. Whatever
+compares an evaluation with older records of its target compares in one context
+(`kernels/context.py`: `comparable`, `in_context`): a record timed in another one counts at
+its `speedup_by_context` there (with the same L2), and without one it is not comparable
+(`context_stale` says why: an eager loser was never timed in a graph, an eager winner whose
+graph timing was `unavailable`, another L2). This holds for the ledger's keep bar (in the
+new evaluation's context; a row whose record is not written yet keeps its speedup), the
+early-discard bar and the budget's non-improving streak, an idea's `refuted` verdict (tries
+in another context are tries, not evidence: an FP8 idea refuted eagerly is untested in a
+graph), the duplicate cache (a winner's source comes back as its view from the target's
+context, `measured_in` and `context_note` say where it was timed; a loser's is evaluated
+again), the best-record ranking (`best_for_target`, the scheduler's arms: comparable
+records first, the rest after them by their own speedups) and the integration, which
+re-evaluates a record whose context changed before it takes it (`evaluate.stale`) and
+reuses an earlier re-check only in the same context.
 
 The kernel view of `analyze`'s profile (`torch.profiler`: kernel times,
 launches and the GPU busy share behind "launch/CPU bound" or "GPU bound" in
@@ -2481,8 +2499,10 @@ bandwidth + calls × launches saved × per-launch cost`: an intermediate no larg
 than the GPU's L2 stays there between its write and its read and saves no bytes
 (what made `fused_gate_up_silu` buy nothing on the 48 MB L2 of the RTX 5070 Ti);
 the per-launch cost is the measured launch floor of an eager run, at most the
-run's own time per recorded op, or ~0.9 µs per kernel boundary when the kernel
-view shows the run mostly CUDA-graph launched (docs/PARALLEL.md §4.6). The
+run's own time per recorded op, or the measured CUDA-graph launch floor per kernel
+boundary when the kernel view shows the run mostly CUDA-graph launched (1.28 µs
+measured on an NVIDIA A10, sm_86; ~0.9 µs on an RTX 5070 Ti, docs/PARALLEL.md §4.6,
+for peaks without one). The
 candidates go to `profile/fusions.md` + `fusions.json`, the top 10 to
 `summary.md` (*Fusion candidates (measured)*); a re-profile of an optimised model
 shows the run's own table. The planner takes a region from a row (`parent_class`,
@@ -2525,7 +2545,9 @@ precision or another algorithm moves.
   accumulation) and NVFP4 (`torch.nn.functional.scaled_mm`, one e4m3 scale per
   16 elements) where torch has a kernel for the GPU (otherwise
   `tflops_unavailable` says why; no ratio to bf16 is assumed), and the launch
-  floor (a module call that launches one tiny kernel, timed like a candidate).
+  floors (a module call that launches one tiny kernel, timed like a candidate in each
+  timing context: eagerly, `launch_floor_us`, and as one of the calls captured in a
+  CUDA graph, `launch_floor_graph_us`; peaks cache version 8, #226).
   Next to the GEMM peaks, the tensor-core *instruction* rates (`mma_tflops`,
   `kernel_agent/kernels/mma_peaks.py`): a register-only `mma.sync` loop per
   instruction compiled with NVRTC, bf16 `HMMA.F32`, plain e4m3 `QMMA.F32`, the
@@ -2544,11 +2566,14 @@ precision or another algorithm moves.
   412). `mma_peaks.measure((7, 5))` runs an older GPU's rate kernels through its
   `compute_75` PTX (driver JIT; the rates are this GPU's). `kernel-agent doctor`
   measures and prints them (`--remeasure-peaks` measures again); a cache from
-  before the FP8 / FP4 peaks or the instruction rates (or the 16-bit forms) is
-  measured again once.
+  before the FP8 / FP4 peaks or the instruction rates (or the 16-bit forms, or the
+  CUDA-graph launch floor) is measured again once.
   `toolchain.json` and the agents' prompts include them. On the RTX 5070 Ti:
   copy DRAM 767 GB/s, L2 2970 GB/s, matmul bf16/fp16/fp32 99 / 94 / 34
-  TFLOP/s, FP8 333 TFLOP/s, NVFP4 641 TFLOP/s, launch floor ~16 µs.
+  TFLOP/s, FP8 333 TFLOP/s, NVFP4 641 TFLOP/s, launch floor ~16 µs. Measured on an
+  NVIDIA A10, sm_86 (torch 2.10): launch floor 19.4 µs eagerly (22.3 µs in a full peak
+  measurement while other processes kept the CPU busy) and 1.28 µs in a CUDA graph (the
+  same in every run: no host time per launch there).
 * **Sustained peaks** (peaks cache version 7, #253). The burst peaks above are ~60 ms
   of GEMMs at the boost clock; a power-capped board (the 150 W passively cooled A10,
   the 70 W T4 and L4) cannot hold that clock under a model's load. After them,
@@ -2576,13 +2601,24 @@ precision or another algorithm moves.
   slot it writes plus the valid positions, not the whole cache.
 * Per case: `flops`, `min_bytes`, `sol_ms = max(Σ flops / peak, min_bytes /
   bandwidth)`, `pct_of_sol = 100 × sol_ms / new_ms` and `bound`. `bound` is
-  `compute`, `memory`, or `launch` when `sol_ms` is below the launch floor
-  (one launch from Python costs more than the work). Cases whose bytes fit in
+  `compute`, `memory`, or `launch` when `sol_ms` is below the launch floor of the
+  result's timing context (`context`, "What faster means"): eagerly one launch from
+  Python costs more than the work, graph-timed one kernel boundary in a CUDA graph
+  does. Cases whose bytes fit in
   L2 are compared with the L2 bandwidth (`l2_resident`) when the target is timed
   with a warm L2 (the benchmark reuses the same inputs); with a cold one ("Timing
   context") every case is compared with the DRAM bandwidth. The result also has
   the weighted `pct_of_sol` (cases weighted by calls per run), `sol_ms_weighted`,
-  the dominant `bound` and `launch_floor_ms`.
+  the dominant `bound` and `launch_floor_ms`, that context's floor. Peaks measured
+  before version 8 have no CUDA-graph floor: until they are measured again, 0.9 µs
+  stands in for it (a kernel boundary inside a CUDA graph on an RTX 5070 Ti,
+  docs/PARALLEL.md §4.6) and `launch_floor_note` says so. Measured on an NVIDIA A10,
+  sm_86: the RMSNorm example's prefill case (1 × 256 × 2048 bf16, `sol_ms` 1.34 µs) is
+  `launch` bound timed eagerly (52.2 µs, floor 22.3 µs) and `memory` bound
+  graph-timed (2.88 µs, 46.6 % of SOL, floor 1.28 µs). The ceilings table keeps the
+  eager floor: its rows are module calls the hooks saw, each launched from Python
+  (calls replayed inside a CUDA graph are no row's). The fusion table prices a launch
+  saved in a graph-launched run at the measured CUDA-graph floor.
 * A `fp8_weights` target (its capture's `precision`, see "Low-precision
   weights") counts its 2-D weights at one byte per element plus one fp32
   scale per output channel (`roofline.WEIGHT_BITS`), the bytes its kernels must
@@ -2600,7 +2636,8 @@ precision or another algorithm moves.
   Such a result is flagged, never rejected. Strided views count their whole
   span. Element-wise math counts as free. The launch floor is measured for a
   torch op, and backend launch paths add their own overhead on top of it
-  (CUDA C++ ~19 µs, Triton ~43 µs, see Backends).
+  (CUDA C++ ~19 µs, Triton ~43 µs, see Backends) when timed eagerly; graph-timed,
+  none of that host time is paid.
 
 ### Kernel feedback: compiler stats and Nsight Compute
 
