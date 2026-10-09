@@ -21,7 +21,12 @@ largest share of GPU time first, kernels that did not run in the profiled call l
 3. ``tensor_rate``: a kernel that is not memory or launch bound whose tensor-core opcodes
    for its operands are not this GPU's full-rate ones (:func:`full_rate`): ``mma.sync``
    where wgmma (sm_90) or tcgen05 (sm_100) runs faster, plain ``QMMA.F32`` where the
-   measured block-scaled ``QMMA.SF`` rate is higher (sm_12x).
+   measured block-scaled ``QMMA.SF`` rate is higher (sm_12x). Block-scaled is the census's
+   ``.SF`` (:func:`kernel_agent.kernels.sass.block_scaled`): sm_120's ``QMMA.SF`` /
+   ``OMMA.SF`` and sm_100's tcgen05 MMAs with a scale operand (``UTCQMMA.SF``). On sm_100
+   both FP8 forms are full rate (NVIDIA's B200 specification rates dense FP8 and MXFP8
+   alike), FP4's is ``UTCOMMA.SF`` (``kind::mxf4`` / ``mxf4nvf4``, twice the FP8 rate
+   there).
 4. ``no_tensor_cores``: a compute-bound evaluation whose kernel runs fp32 / fp16 math and
    no tensor-core instruction on a GPU with tensor cores.
 5. ``tensor_idle``: a kernel that issues tensor-core instructions while Nsight measures
@@ -43,7 +48,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from kernel_agent import gpu_arch
-from kernel_agent.kernels.sass import base, matches
+from kernel_agent.kernels.sass import base, block_scaled, matches
 
 MAX_DIRECTIVES = 5
 PER_RULE = 2  # directives of one rule at most
@@ -83,8 +88,9 @@ OPERANDS = {
 HOW = {
     "wgmma": "wgmma (HGMMA / QGMMA / IGMMA): Triton tl.dot with 4+ warps and 64+ row tiles on "
     "sm_90a, CUTLASS / CuTe sm90 GEMMs (warpgroup MMA from shared memory, TMA-fed)",
-    "tcgen05": "tcgen05.mma (UTCHMMA / UTCQMMA / UTCIMMA): Triton tl.dot on sm_100a, "
-    "CUTLASS / CuTe sm100 GEMMs (TMEM accumulators, TMA-fed)",
+    "tcgen05": "tcgen05.mma (UTCHMMA / UTCQMMA / UTCIMMA; block-scaled UTCQMMA.SF for MXFP8, "
+    "UTCOMMA.SF for NVFP4 / MXFP4): Triton tl.dot (tl.dot_scaled: UTCQMMA.SF) with 128-row "
+    "tiles on sm_100a, CUTLASS / CuTe sm100 GEMMs (TMEM accumulators, TMA-fed)",
     "block_scaled": "QMMA.SF (block-scaled mma.sync kind::mxf8f6f4.block_scale: Triton "
     "tl.dot_scaled with unit ue8m0 scales (127), CuTe MmaMXF8Op); bit-identical to unit-scale "
     "e4m3 products",
@@ -99,8 +105,13 @@ def full_rate(facts: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
     fam = gpu_arch.family(capability)
     if fam is None or fam.key == "newer":
         return {}
-    if "tcgen05" in fam.features:
-        return {"16-bit": ("UTCHMMA",), "fp8": ("UTCQMMA",), "int8": ("UTCIMMA",)}
+    if "tcgen05" in fam.features:  # FP8: UTCQMMA and UTCQMMA.SF alike; FP4 is block-scaled
+        return {
+            "16-bit": ("UTCHMMA",),
+            "fp8": ("UTCQMMA",),
+            "int8": ("UTCIMMA",),
+            "fp4": ("UTCOMMA.SF",),
+        }
     if "wgmma" in fam.features:
         return {"16-bit": ("HGMMA",), "fp8": ("QGMMA",), "int8": ("IGMMA",)}
     out: dict[str, tuple[str, ...]] = {"16-bit": ("HMMA",), "int8": ("IMMA",)}
@@ -255,7 +266,7 @@ def _census_rules(
                 continue
             if emulated and cls == "16-bit":  # those HMMA are the emulation: fp8_emulated
                 continue
-            if cls == "fp8" and want[0] == "QMMA.SF":
+            if cls == "fp8" and block_scaled(want[0]):  # sm_12x: block-scaled is faster
                 how, rates = HOW["block_scaled"], _rates(facts)
             elif fam is not None and "tcgen05" in fam.features:
                 how, rates = HOW["tcgen05"], ""

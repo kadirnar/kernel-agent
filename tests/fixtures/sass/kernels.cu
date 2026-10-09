@@ -203,8 +203,9 @@ extern "C" __global__ void ka_wgmma(unsigned long long da, unsigned long long db
 #endif
 
 #if defined(__CUDA_ARCH_FEAT_SM100_ALL)
-// Datacenter Blackwell tensor-memory MMA (tcgen05, sm_100a): allocate TMEM, one bf16 MMA
-// and one e4m3 MMA from shared-memory descriptors, commit, load the accumulator back.
+// Datacenter Blackwell tensor-memory MMA (tcgen05, sm_100a): allocate TMEM, one MMA of each
+// kind from shared-memory descriptors (the block-scaled ones with their scale factors in
+// TMEM), commit, load the accumulator back.
 extern "C" __global__ void ka_tcgen05(unsigned long long da, unsigned long long db,
                                       unsigned idesc, float* out) {
   __shared__ unsigned taddr_smem;
@@ -238,6 +239,22 @@ extern "C" __global__ void ka_tcgen05(unsigned long long da, unsigned long long 
         "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
         "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X [%0], %1, %2, %3, "
         "[%5], [%5], p;\n}" ::"r"(tmem), "l"(da), "l"(db), "r"(idesc), "r"(1), "r"(tmem + 16));
+    // The A operand in tensor memory (a second tmem[] operand, before the descriptor), plain
+    // and block-scaled with separate A / B scale addresses (one tmem[] scale operand), and
+    // MXFP4 (kind::mxf4): the census tells block-scaled MMAs by the operand after idesc[].
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
+        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%5], %2, %3, p;\n}" ::"r"(tmem),
+        "l"(da), "l"(db), "r"(idesc), "r"(1), "r"(tmem + 8));
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
+        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], [%5], %2, %3, [%6], [%7], "
+        "p;\n}" ::"r"(tmem), "l"(da), "l"(db), "r"(idesc), "r"(1), "r"(tmem + 8),
+        "r"(tmem + 16), "r"(tmem + 20));
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
+        "tcgen05.mma.cta_group::1.kind::mxf4.block_scale [%0], %1, %2, %3, [%5], [%6], p;\n}"
+        ::"r"(tmem), "l"(da), "l"(db), "r"(idesc), "r"(1), "r"(tmem + 16), "r"(tmem + 20));
     asm volatile(
         "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(b));
   }

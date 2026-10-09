@@ -33,13 +33,21 @@ Verified example: `examples/cuda_rmsnorm.py`.
 ## B. `nvrtc` — runtime compilation with `cuda.core`
 
 Verified example: `examples/nvrtc_rmsnorm.py`.
-* No nvcc / no build step: `arch, kind = nvrtc_target(torch.cuda.get_device_capability())`
-  (`from kernel_agent.toolchain import nvrtc_target`: `sm_XY` and `"cubin"`; under an
-  emulated older GPU, `KERNEL_AGENT_EMULATE_ARCH`, `compute_XY` and `"ptx"`, which the
-  driver JIT-compiles: a hard-coded `sm_XY` cubin does not load there), then
-  `Program(src, code_type="c++", options=ProgramOptions(arch=arch, std="c++17", include_path=cuda_include_dirs()))`
-  `.compile(kind).get_kernel("name")`; kernels must be `extern "C"` (or use
-  `name_expressions` for templates).
+* No nvcc / no build step: `kernel = nvrtc_kernel(src, "name", capability=torch.cuda.get_device_capability())`
+  (`from kernel_agent.toolchain import nvrtc_kernel`; `nvrtc_kernels(src, ["a", "b"])` for
+  several: a dict). It compiles for this GPU (`sm_XY` cubin; under an emulated older GPU,
+  `KERNEL_AGENT_EMULATE_ARCH`, `compute_XY` PTX, which the driver JIT-compiles: a
+  hard-coded `sm_XY` cubin does not load there), C++17 with CUDA's headers; other
+  `ProgramOptions` go as keywords (`arch="sm_120a"` for an arch-specific target,
+  `max_register_count=...`, extra `include_path`). It keeps the cubin, so the SASS census of
+  `profile=true` sees the kernel (cuda.core frees the `ObjectCode` after `get_kernel`), and
+  under `profile="ncu"` adds line info, so ncu's stall lines are source lines. Kernels must
+  be `extern "C"`, or a template instantiation by name (`"k<128>"`: passed to NVRTC as a
+  name expression).
+* Calling `Program(src, code_type="c++", options=ProgramOptions(arch=arch, ...)).compile(kind).get_kernel("name")`
+  directly (`arch, kind = nvrtc_target(...)`, `include_path=cuda_include_dirs()`) also
+  works: keep the `ObjectCode` in a module global for the census, `lineinfo=True` for
+  source lines.
 * Launch on torch's stream:
   `launch(dev.create_stream(torch.cuda.current_stream()), LaunchConfig(grid=..., block=..., shmem_size=...), kernel, t.data_ptr(), np.int32(n), np.float32(x))`.
   Scalars must be numpy scalars with the exact C type.

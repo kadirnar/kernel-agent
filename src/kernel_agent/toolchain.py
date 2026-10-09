@@ -24,7 +24,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -300,6 +300,120 @@ def nvrtc_target(capability: tuple[int, ...] | None = None) -> tuple[str, str]:
     return f"sm_{major}{minor}", "cubin"
 
 
+# ------------------------------------------------------------------ line info, NVRTC (#230)
+
+#: ``1`` in a process whose CUDA C++ builds carry line info (:func:`lineinfo_env`): the
+#: evaluator's ``--ncu-mode`` (:func:`kernel_agent.kernels.ncu.ncu_entry`), so Nsight
+#: Compute's source counters name CUDA C++ lines, not SASS instructions only.
+LINEINFO_ENV = "KERNEL_AGENT_LINEINFO"
+#: The directory of the line-info extension builds inside ``TORCH_EXTENSIONS_DIR``.
+LINEINFO_DIR = "lineinfo"
+
+
+def lineinfo() -> bool:
+    """Whether this process builds CUDA C++ with line info (:data:`LINEINFO_ENV`)."""
+    return os.environ.get(LINEINFO_ENV) == "1"
+
+
+def lineinfo_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The variables that make a process (of environment ``environ``, default this one's)
+    build its CUDA C++ with line info: :data:`LINEINFO_ENV` (NVRTC through
+    :func:`nvrtc_kernels`), ``-lineinfo`` in ``NVCC_APPEND_FLAGS`` (every nvcc:
+    ``load_inline``, native projects, whose build key includes the flags; TileLang passes
+    it itself) and torch's extension builds in a :data:`LINEINFO_DIR` directory of their
+    own. torch's build hash does not cover ``NVCC_APPEND_FLAGS``: in the shared directory
+    the cached build without line info would be loaded, and a rebuild in place would
+    replace the one the evaluations load (an nvcc build of 20-60 s each way). ``-lineinfo``
+    adds line tables only; the code is the same."""
+    environ = os.environ if environ is None else environ
+    flags = environ.get("NVCC_APPEND_FLAGS", "").split()
+    root = environ.get("TORCH_EXTENSIONS_DIR") or torch_extensions_default()
+    if os.path.basename(os.path.normpath(root)) != LINEINFO_DIR:
+        root = os.path.join(root, LINEINFO_DIR)
+    return {
+        LINEINFO_ENV: "1",
+        "NVCC_APPEND_FLAGS": " ".join(dict.fromkeys([*flags, "-lineinfo"])),
+        "TORCH_EXTENSIONS_DIR": root,
+    }
+
+
+def nvrtc_source_file(source: str) -> Path:
+    """A file holding ``source`` (``<cache>/nvrtc-src/<sha256>.cu``) to name an NVRTC
+    program by under :func:`lineinfo`: its line table points at the program's name, and
+    Nsight Compute reads a line's text from that file (an NVRTC program has none)."""
+    path = CACHE_DIR / "nvrtc-src" / f"{hashlib.sha256(source.encode()).hexdigest()[:24]}.cu"
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(source)
+        os.replace(tmp, path)  # whole or absent for a concurrent reader
+    return path
+
+
+def nvrtc_options(
+    source: str, capability: tuple[int, ...] | None = None, **options: Any
+) -> tuple[dict[str, Any], str]:
+    """``(ProgramOptions keyword arguments, code type)`` of :func:`nvrtc_kernels`: the
+    target of :func:`nvrtc_target` (an ``arch`` in ``options`` wins, e.g. ``sm_120a``; a
+    ``compute_XY`` one compiles to PTX), ``std="c++17"``, the :func:`cuda_include_dirs`
+    after any ``include_path`` given, the other ``options`` as given; under
+    :func:`lineinfo` also ``lineinfo=True`` and the program named by
+    :func:`nvrtc_source_file` (unless ``options`` say otherwise)."""
+    arch = options.pop("arch", None)
+    if arch is None:
+        arch, kind = nvrtc_target(capability)
+    else:
+        kind = "ptx" if str(arch).startswith("compute_") else "cubin"
+    given = options.pop("include_path", None)
+    paths = [given] if isinstance(given, str) else list(given or [])
+    out: dict[str, Any] = {"arch": arch, "std": "c++17"}
+    out["include_path"] = list(dict.fromkeys([*map(str, paths), *cuda_include_dirs()]))
+    out.update(options)
+    if lineinfo():
+        out.setdefault("lineinfo", True)
+        out.setdefault("name", str(nvrtc_source_file(source)))
+    return out, kind
+
+
+def nvrtc_kernels(
+    source: str,
+    names: Iterable[str],
+    *,
+    capability: tuple[int, ...] | None = None,
+    name_expressions: Iterable[str] = (),
+    **options: Any,
+) -> dict[str, Any]:
+    """``names``' ``cuda.core`` kernels, compiled from CUDA C++ ``source`` with NVRTC for this
+    GPU: ``Program(source, "c++", ProgramOptions(**opts)).compile(kind)`` with
+    :func:`nvrtc_options` (``capability``: another GPU's target), then ``get_kernel`` per
+    name (a template instantiation such as ``"k<128>"`` is added to ``name_expressions``).
+
+    The SASS census sees their cubin as long as a kernel lives
+    (:func:`kernel_agent.kernels.sass.keep`): ``cuda.core`` frees the ``ObjectCode`` once
+    ``get_kernel`` returns and a ``Kernel`` does not expose its cubin, so a candidate
+    compiling with ``Program`` directly must keep the ``ObjectCode`` itself (#230). In the
+    evaluator's ``--ncu-mode`` (:func:`lineinfo`) the program carries line info."""
+    from cuda.core import Program, ProgramOptions
+
+    from kernel_agent.kernels import sass
+
+    wanted = list(dict.fromkeys(names))
+    expressions = list(dict.fromkeys([*name_expressions, *(n for n in wanted if "<" in n)]))
+    kwargs, kind = nvrtc_options(source, capability, **options)
+    program = Program(source, code_type="c++", options=ProgramOptions(**kwargs))
+    code = program.compile(kind, name_expressions=expressions)
+    kernels = {name: code.get_kernel(name) for name in wanted}
+    if kind == "cubin" and isinstance(cubin := code.code, bytes | bytearray):
+        for name, kernel in kernels.items():
+            sass.keep(kernel, name, bytes(cubin))
+    return kernels
+
+
+def nvrtc_kernel(source: str, name: str, **kwargs: Any) -> Any:
+    """The ``cuda.core`` kernel ``name`` compiled from ``source`` (:func:`nvrtc_kernels`)."""
+    return nvrtc_kernels(source, [name], **kwargs)[name]
+
+
 # Newest GCC major officially accepted by nvcc, per CUDA major version.  Forcing
 # a newer host compiler is harmless when nvcc would have accepted it anyway.
 _MAX_GCC = {12: 14, 13: 15}
@@ -439,24 +553,14 @@ def setup(apply_env: bool = True) -> Toolchain:
     )
 
 
-def _emulated_env(
-    gpu: GPUInfo, env: dict[str, str], backends: dict[str, bool], unavailable: dict[str, str]
-) -> None:
-    """The builds of an emulated ``gpu`` (:mod:`kernel_agent.emulate`): extensions and
-    Inductor's cache in their own directories (nothing built for the real GPU is reused),
-    Inductor without its cubin-loading launcher, CuTe DSL compiling for it and the driver's
-    JIT cache large enough; CuTe DSL and TileLang cannot run (SASS)."""
-    import getpass
+def torch_extensions_default() -> str:
+    """torch's own ``TORCH_EXTENSIONS_DIR`` default (``cpp_extension._get_build_directory``:
+    per Python and CUDA version), without importing ``torch.utils.cpp_extension``: it reads
+    ``CUDA_HOME`` once, at its import, and :func:`setup`'s env may not have set it yet."""
     import sys
-    import tempfile
 
     import torch
 
-    from kernel_agent import emulate
-
-    # torch's own default (cpp_extension._get_build_directory: per Python and CUDA version),
-    # without importing torch.utils.cpp_extension: it reads CUDA_HOME once, at its import,
-    # and this env has not set it yet
     try:
         from torch._appdirs import user_cache_dir
 
@@ -465,9 +569,23 @@ def _emulated_env(
         root = str(Path.home() / ".cache" / "torch_extensions")
     cuda = f"cu{torch.version.cuda.replace('.', '')}" if torch.version.cuda else "cpu"
     python = f"py{sys.version_info.major}{sys.version_info.minor}{getattr(sys, 'abiflags', '')}"
-    default = os.path.join(root, f"{python}_{cuda}")
+    return os.path.join(root, f"{python}_{cuda}")
+
+
+def _emulated_env(
+    gpu: GPUInfo, env: dict[str, str], backends: dict[str, bool], unavailable: dict[str, str]
+) -> None:
+    """The builds of an emulated ``gpu`` (:mod:`kernel_agent.emulate`): extensions and
+    Inductor's cache in their own directories (nothing built for the real GPU is reused),
+    Inductor without its cubin-loading launcher, CuTe DSL compiling for it and the driver's
+    JIT cache large enough; CuTe DSL and TileLang cannot run (SASS)."""
+    import getpass
+    import tempfile
+
+    from kernel_agent import emulate
+
     current = os.environ.get("TORCH_EXTENSIONS_DIR")
-    env["TORCH_EXTENSIONS_DIR"] = emulate.arch_dir(gpu.arch, current, default)
+    env["TORCH_EXTENSIONS_DIR"] = emulate.arch_dir(gpu.arch, current, torch_extensions_default())
     # Inductor: its own cache (its key names the GPU, not the target) and no static launcher
     # (it loads the cubin, which is the emulated GPU's)
     try:

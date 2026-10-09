@@ -5,9 +5,9 @@ Everything compiles on the CPU (no GPU needed):
 * ``kernels.cu`` for every architecture of :data:`ARCHS` with the toolkit's ``nvcc -cubin``
   -> ``<arch>.sass``;
 * the FP8 W8A8 example's Triton GEMM (``agent/examples/triton_fp8_w8a8_gemm.py``) for
-  sm_120 with ``tl.dot`` and with ``tl.dot_scaled`` (Triton's own compiler, specialised
-  like the JIT specialises 16-byte aligned pointers and sizes divisible by 16) ->
-  ``triton_fp8_<dot|dot_scaled>_sm120a.sass``.
+  sm_120 and sm_100 (:data:`TRITON_TARGETS`) with ``tl.dot`` and with ``tl.dot_scaled``
+  (Triton's own compiler, specialised like the JIT specialises 16-byte aligned pointers
+  and sizes divisible by 16) -> ``triton_fp8_<dot|dot_scaled>_<arch>.sass``.
 
 Each file is the ``cuobjdump -sass`` text of the cubin (the format the census reads at run
 time) without the instruction encodings. Run it after a CUDA or Triton upgrade and check
@@ -43,8 +43,10 @@ ARCHS = (
     ("sm_100a", 100),
     ("sm_120a", 120),
 )
-#: The Triton GEMM's tile (BM, BN, BK, warps, stages): small, so the fixture stays small.
-TRITON_TILE = (32, 32, 64, 4, 2)
+#: The Triton GEMM's targets: (capability, fixture arch, tile (BM, BN, BK, warps, stages)),
+#: small tiles so the fixtures stay small. sm_100 lowers to tcgen05 from 128-row tiles
+#: (Triton 3.8: a 32-row tile issues mma.sync, which for e4m3 is unpacked to fp16 there).
+TRITON_TARGETS = ((120, "sm120a", (32, 32, 64, 4, 2)), (100, "sm100a", (128, 16, 32, 4, 1)))
 _ENCODING = re.compile(r"\s*/\* 0x[0-9a-f]+ \*/")
 _PADDING = re.compile(r"(/\*[0-9a-f]{4,}\*/)\s+")
 
@@ -77,9 +79,9 @@ def dump(cuobjdump: str, cubin: Path) -> str:
     return "\n".join(line for line in lines if line.strip())
 
 
-def triton_gemm(scaled: bool) -> bytes:
-    """The cubin of the FP8 example's ``_gemm_kernel`` for sm_120 (``scaled``: the
-    ``tl.dot_scaled`` product, else ``tl.dot``)."""
+def triton_gemm(scaled: bool, capability: int, tile: tuple[int, ...]) -> bytes:
+    """The cubin of the FP8 example's ``_gemm_kernel`` for a GPU of ``capability`` (120:
+    sm_120) with ``tile`` (``scaled``: the ``tl.dot_scaled`` product, else ``tl.dot``)."""
     import triton
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
@@ -88,7 +90,7 @@ def triton_gemm(scaled: bool) -> bytes:
     assert spec is not None and spec.loader is not None
     example: Any = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(example)
-    bm, bn, bk, warps, stages = TRITON_TILE
+    bm, bn, bk, warps, stages = tile
     ptr = {"a": "*fp8e4nv", "b": "*fp8e4nv", "sa": "*fp32", "sb": "*fp32", "bias": "*bf16"}
     consts = {"HAS_BIAS": False, "BM": bm, "BN": bn, "BK": bk, "GM": 8, "SCALED": scaled}
     signature = {**ptr, "c": "*bf16", "M": "i32", "N": "i32", "K": "i32"}
@@ -96,7 +98,7 @@ def triton_gemm(scaled: bool) -> bytes:
     aligned = {(i,): [["tt.divisibility", 16]] for i in range(len(ptr) + 4)}  # ptrs, M, N, K
     source = ASTSource(example._gemm_kernel, signature, constexprs=consts, attrs=aligned)
     options = {"num_warps": warps, "num_stages": stages}
-    compiled = triton.compile(source, target=GPUTarget("cuda", 120, 32), options=options)
+    compiled = triton.compile(source, target=GPUTarget("cuda", capability, 32), options=options)
     return bytes(compiled.asm["cubin"])
 
 
@@ -116,14 +118,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{arch}: {len(text.splitlines())} lines")
         import triton
 
-        for scaled, name in ((False, "dot"), (True, "dot_scaled")):
-            cubin = Path(tmp) / f"triton_{name}.cubin"
-            cubin.write_bytes(triton_gemm(scaled))
-            text = dump(cuobjdump, cubin)
-            head = f"// Triton {triton.__version__}, cuobjdump {version(cuobjdump)}"
-            out = ns.out / f"triton_fp8_{name}_sm120a.sass"
-            out.write_text(f"{head}: {EXAMPLE.name} tl.{name}, tile {TRITON_TILE}\n{text}\n")
-            print(f"{out.name}: {len(text.splitlines())} lines")
+        for capability, arch, tile in TRITON_TARGETS:
+            for scaled, name in ((False, "dot"), (True, "dot_scaled")):
+                cubin = Path(tmp) / f"triton_{name}_{arch}.cubin"
+                cubin.write_bytes(triton_gemm(scaled, capability, tile))
+                text = dump(cuobjdump, cubin)
+                head = f"// Triton {triton.__version__}, cuobjdump {version(cuobjdump)}"
+                out = ns.out / f"triton_fp8_{name}_{arch}.sass"
+                out.write_text(f"{head}: {EXAMPLE.name} tl.{name}, tile {tile}\n{text}\n")
+                print(f"{out.name}: {len(text.splitlines())} lines")
     return 0
 
 
