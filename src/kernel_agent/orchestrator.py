@@ -66,6 +66,7 @@ from kernel_agent.integrate import export as export_mod
 from kernel_agent.integrate import owners as owners_mod
 from kernel_agent.integrate import reuse as reuse_cache
 from kernel_agent.integrate.export import export_optimized
+from kernel_agent.kernels import context as timing_context
 from kernel_agent.kernels import evaluate, memcheck, recheck
 from kernel_agent.kernels.compare import allows_reduced
 from kernel_agent.native import engine as native_engine
@@ -1608,6 +1609,7 @@ class Orchestrator:
                     snap,
                     timeout=self.budget.eval_timeout_s,
                     capture_sha256=capture_sha256,
+                    **timing_context.for_target(self.run, target_id).kwargs(),  # #226
                 )
             except Exception as exc:
                 result = {"status": "error", "correct": False, "error": repr(exc)[:500]}
@@ -2531,6 +2533,9 @@ def _verdict(rec: dict[str, Any] | None) -> dict[str, Any] | None:
     verdict = {"correct": rec.get("correct"), "speedup": rec.get("speedup")}
     if (spread := recheck.spread(rec)) is not None:
         verdict["timing_spread"] = spread
+    for key in ("context", "l2"):  # the re-check times in the verdict's context (#226)
+        if rec.get(key):
+            verdict[key] = rec[key]
     return verdict
 
 

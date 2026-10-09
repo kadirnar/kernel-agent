@@ -464,7 +464,7 @@ def fakes(orch, measured: dict[str, tuple | list], fresh: dict[str, dict]):
         result.update(speedup=run[0], timing_spread=run[1])
         return recheck.judge(result, verdict)
 
-    def fake_reevaluate(capture, snap, *, timeout, capture_sha256):
+    def fake_reevaluate(capture, snap, *, timeout, capture_sha256, **timing):
         assert capture == orch.run.capture_file(Path(snap).parent.parent.name)
         assert capture_sha256 == truth.sha256_file(capture)
         seen["reevaluated"].append(stem(snap))

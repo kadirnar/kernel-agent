@@ -87,6 +87,11 @@ host-bound unless it is captured in a CUDA graph with static state buffers.
 `torch.cuda.graph` captures multi-stream work when the fork and the join happen inside the
 capture (`side.wait_stream(cur)` ... `cur.wait_stream(side)`).
 
+Before wrapping a stage that holds a target's kernel in a graph, read the kernel's result:
+`speedup_by_context` (eager and graph-timed speedups) and `graph: unavailable (<why>)` when
+it cannot be captured or replays wrong (fix it or keep that call outside the graph). Once
+the re-profile shows the stage graph-launched, the target's kernels are timed in a graph.
+
 ## Serving: continuous batching
 
 A batch of requests with natural lengths runs until its longest request stops; the finished

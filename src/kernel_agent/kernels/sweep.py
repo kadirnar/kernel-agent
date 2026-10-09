@@ -29,7 +29,9 @@ tries a list of configs while it holds one GPU of the pool:
    noise of the leader (more than 50 % slower after the first round, certainly slower
    after the second) drop out, at most half of those still timed per round (successive
    halving); their rows keep the speedups of the rounds they had and say why
-   (``raced``).
+   (``raced``). Timing runs in the target's context (``context``, #226): in a CUDA graph
+   when the reference and every passing config can be captured on every timed case
+   (:func:`kernels.bench.graph_probe`), else eagerly (``context_note`` says why).
 3. **Evaluate** the best config with the full evaluator (:func:`run_evaluation`
    in a fresh process: every stage and anti-gaming guard, the checks outside the
    candidate's process included), with its config bound into the file
@@ -67,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import itertools
 import json
 import keyword
@@ -814,6 +817,64 @@ class _TunedPoints:
             tuned.default().add_points(self.op, self.bucket, points, backend=self.backend)
 
 
+class _Context:
+    """The timer of a sweep's timing context (#226): a CUDA graph for a ``graph`` target while
+    the reference and every config timed so far can be captured on every timed case
+    (:func:`kernels.bench.graph_probe`), eager from the first that cannot (``context_note``
+    in ``out`` says which), so the configs timed together share one context."""
+
+    def __init__(
+        self,
+        context: str,
+        base: Callable[..., dict[str, Any]] | None,
+        reference: Any,
+        cases: list[dict[str, Any]],
+        timed: list[int],
+        replay: Any,
+        out: dict[str, Any],
+    ) -> None:
+        self.graph = context == "graph" and base is not None
+        self.base, self.reference, self.cases = base, reference, cases
+        self.timed, self.replay, self.out = timed, replay, out
+        self.probed: set[int] = set()  # configs (row indices) that capture
+        if context == "graph":
+            out["context"] = "graph" if self.graph else "eager"
+
+    def _unavailable(self, passing: list[tuple[dict[str, Any], tuple[Any, ...]]]) -> str | None:
+        from kernel_agent.kernels.bench import graph_probe
+
+        fns = [] if self.probed else [("the reference", None, (self.reference,))]
+        fns += [
+            (label(row["config"]), row["index"], holders)
+            for row, holders in passing
+            if row["index"] not in self.probed
+        ]
+        for who, index, holders in fns:
+            for ci in self.timed:
+                case = self.cases[ci]
+                fn = self.replay.call(case, *holders)
+                if (why := graph_probe(fn, case["args"], case["kwargs"])) is not None:
+                    return f"{who}, case {ci}: {why}"
+            self.probed.add(-1 if index is None else index)
+        return None
+
+    def timer(
+        self, passing: list[tuple[dict[str, Any], tuple[Any, ...]]]
+    ) -> Callable[..., dict[str, Any]]:
+        """The timer for ``passing`` (the configs about to be timed; only when the sweep
+        can time: ``base``)."""
+        assert self.base is not None
+        if self.graph and (why := self._unavailable(passing)) is not None:
+            self.graph = False
+            self.out["context"] = "eager"
+            self.out["context_note"] = f"graph timing unavailable ({why}): timed eagerly"
+        if self.graph:
+            from kernel_agent.kernels import bench
+
+            return functools.partial(bench.time_call, context=bench.GRAPH)
+        return self.base
+
+
 def sweep(
     capture_path: Path,
     candidate_path: Path,
@@ -828,6 +889,7 @@ def sweep(
     timer: Callable[..., dict[str, Any]] | None = None,
     race: bool = True,
     search: dict[str, Any] | None = None,
+    context: str = "eager",
 ) -> dict[str, Any]:
     """Steps 1 and 2 of the module docstring, in this process: the sorted ``table``.
 
@@ -838,7 +900,8 @@ def sweep(
     :func:`kernels.bench.time_call` (tests). ``race``: racing (``--early-stop``).
     ``search``: a search instead of ``configs`` (:func:`kernels.search.spec_from`, and
     ``history``: the rows of an earlier process of this sweep, ``start``: its first index,
-    ``arch``: GPU facts instead of this GPU's (tests), ``warm``: False for no warm starts)."""
+    ``arch``: GPU facts instead of this GPU's (tests), ``warm``: False for no warm starts).
+    ``context``: the target's timing context (``eager`` or ``graph``, :class:`_Context`)."""
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -928,6 +991,9 @@ def sweep(
             for i in timed
         ],
     }
+    # the target's timing context (#226): the configs' timer (a stand-in timer: as it is)
+    real = timer is None and cuda
+    timing = _Context(context if real else "eager", time_fn, reference, cases, timed, replay, out)
 
     # 1. every config through the quick tier (a search: batches, checked and timed)
     rows: list[dict[str, Any]] = []
@@ -974,7 +1040,7 @@ def sweep(
                     cases,
                     timed,
                     batch,
-                    timer=time_fn,
+                    timer=timing.timer(batch),
                     check_output=check_output,
                     l2_flush=l2_flush,
                     deadline=until,
@@ -1020,7 +1086,7 @@ def sweep(
                 cases,
                 timed,
                 passing,
-                timer=time_fn,
+                timer=timing.timer(passing),
                 check_output=check_output,
                 l2_flush=l2_flush,
                 deadline=deadline,
@@ -1058,6 +1124,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capture-sha256", help="refuse a capture without this digest")
     parser.add_argument("--nonce-stdin", action="store_true", help="tag result lines")
     parser.add_argument("--no-race", action="store_true", help="time every config every round")
+    parser.add_argument("--context", choices=("eager", "graph"), default="eager")
     ns = parser.parse_args(argv)
     tag = (sys.stdin.readline().strip() + "@@") if ns.nonce_stdin else ""
 
@@ -1079,6 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
             emit=emit,
             race=not ns.no_race,
             search=spec.get("search"),
+            context=ns.context,
         )
     except BrokenContext as exc:
         emit({"event": "broken_context", "index": exc.index, "error": exc.error})
@@ -1108,6 +1176,7 @@ def _spawn(
     capture_sha256: str | None,
     race: bool = True,
     search: dict[str, Any] | None = None,
+    context: str = "eager",
 ) -> dict[str, Any]:
     """One sweep subprocess: its checked ``rows``, final ``result`` (None if it did not
     finish) and the ``culprit``: the config that ran when it died (``culprit_config``)."""
@@ -1135,6 +1204,8 @@ def _spawn(
         cmd += ["--capture-sha256", capture_sha256]
     if not race:
         cmd.append("--no-race")
+    if context != "eager":
+        cmd += ["--context", context]
     timed_out, code = False, None
     try:
         proc = subprocess.run(
@@ -1194,6 +1265,7 @@ def _check_and_time(
     capture_sha256: str | None,
     race: bool = True,
     search: dict[str, Any] | None = None,
+    context: str = "eager",
 ) -> dict[str, Any]:
     """Steps 1 and 2 in subprocesses (another one without a config that crashed); every
     config gets a row. A ``search`` (:func:`kernels.search.spec_from`) instead of
@@ -1226,6 +1298,7 @@ def _check_and_time(
             capture_sha256=capture_sha256,
             race=race,
             search=resumed,
+            context=context,
         )
         checked = run["rows"]
         seen.update(checked)
@@ -1333,6 +1406,8 @@ def run_sweep(
     prepare: Callable[[Path], Path] | None = None,
     race: bool = True,
     search: dict[str, Any] | None = None,
+    context: str = "eager",
+    context_reason: str | None = None,
 ) -> dict[str, Any]:
     """Sweep ``configs`` of a candidate and fully evaluate the best one, all under one
     GPU-lock acquisition (see the module docstring); ``timeout``: the evaluation timeout.
@@ -1341,7 +1416,9 @@ def run_sweep(
     bound into the source, :func:`bind_config`) into the file that is evaluated and
     recorded (the tool: its snapshot).  ``race``: racing of the configs (``--early-stop``,
     :func:`kernels.early.race`).  ``search``: a search (:func:`kernels.search.spec_from`)
-    instead of ``configs`` (module docstring, **Search**).  Returns ``evaluation`` (the full
+    instead of ``configs`` (module docstring, **Search**). ``l2_flush``, ``context``,
+    ``context_reason``: the target's timing context (:func:`kernels.evaluate.evaluate`),
+    for the configs and the evaluation.  Returns ``evaluation`` (the full
     evaluator's result, or the first failure when no config passed), ``config``,
     ``evaluated`` (that file), ``sweep`` (counts, ``cases``, the sorted ``table``; a
     search's summary in ``search``) and ``gpu_index``."""
@@ -1368,6 +1445,7 @@ def run_sweep(
                 capture_sha256=capture_sha256,
                 race=race,
                 search=search,
+                context=context,
             )
             seconds = round(time.monotonic() - start, 1)
             top = data["table"][0] if data["table"] else _nothing_tried(data)
@@ -1383,6 +1461,8 @@ def run_sweep(
                     capture_sha256=capture_sha256,
                     l2_flush=l2_flush,
                     compile_check=compile_check,
+                    context=context,
+                    context_reason=context_reason,
                 )
             else:
                 evaluation = _stand_in(top)

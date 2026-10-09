@@ -40,6 +40,12 @@ Stages and their failure statuses:
    2 of its 3 rounds, and a candidate that cannot be a new best whatever the third rounds
    measure is timed no further (an early discard, ``early`` in the result:
    :mod:`kernels.early`, issue #190); every check before and after timing still runs.
+   Timing runs in the target's context (#226; ``context``, ``l2``, ``context_reason`` in
+   the result): eager calls, or calls captured in a CUDA graph (eager when a call of
+   either cannot be captured), with a warm or a cold L2. A winner (or ``profile``) is
+   timed in the other context too: ``timing`` per case and ``speedup_by_context`` hold
+   both, or ``graph: unavailable (<why>)`` for a candidate that would break a graphed
+   stage.
 4. ``incorrect_perturbed``: re-verification after timing (on CPU right after
    stage 2) at fresh addresses, with redrawn inputs and with the captured inputs
    scaled by 3, 0.01 and −1 (:mod:`kernels.verify`; ``redraws`` in the result: the
@@ -133,7 +139,15 @@ PEAK_MEMORY_WARN_MIB = 16.0
 #: Records without ``evaluator_version`` predate it and count as schema 0.
 #: 2: every timing round at full GPU clocks (#81; earlier records may be measured in an
 #: idle performance state, bandwidth-bound kernels up to 27x too slow).
-EVALUATOR_SCHEMA = 2
+#: 3: timed in the target's context (#226: ``context`` eager or CUDA graph, ``l2`` warm or
+#: cold; earlier records are eager with a warm L2, and an eager cold L2 no longer hides the
+#: call's host time behind the flush).
+EVALUATOR_SCHEMA = 3
+#: ``context_reason`` of an evaluation whose caller chose no context (eager, warm L2 unless
+#: ``l2_flush``); the tools choose one per target (:mod:`kernel_agent.kernels.context`).
+DEFAULT_CONTEXT_REASON = "no timing context chosen for the target: eager calls"
+#: Timing rounds per case in the other context (a winner's, or with ``profile``; #226).
+OTHER_ROUNDS = 2
 
 
 _run = subprocess.run  # bound at import: tests replace subprocess.run for the evaluator
@@ -404,6 +418,58 @@ def _ms(rounds: list[dict[str, Any]]) -> list[float]:
     return [float(r["median_ms"]) for r in rounds]
 
 
+def _in_context(ref_t: dict[str, Any], new_t: dict[str, Any]) -> dict[str, float]:
+    """A case's ``timing`` in one context: the median rounds of reference and candidate."""
+    ref_ms, new_ms = float(ref_t["median_ms"]), float(new_t["median_ms"])
+    return {
+        "ref_ms": round(ref_ms, 5),
+        "new_ms": round(new_ms, 5),
+        "speedup": round(ref_ms / max(new_ms, 1e-9), 3),
+    }
+
+
+def context_fields(
+    reports: list[dict[str, Any]], context: str, l2_flush: bool, reason: str
+) -> dict[str, Any]:
+    """A timed result's context fields (#226): ``context`` (the one ``speedup`` and
+    ``pct_of_sol`` are measured in), ``l2`` (``warm`` or ``cold``), ``context_reason`` and
+    ``speedup_by_context``: per context its speedup weighted by calls per run, when every
+    timed case was timed in it (``timing`` of the cases), or ``unavailable (<why>)``."""
+    from kernel_agent.kernels.bench import CONTEXTS
+
+    timed = [r for r in reports if r.get("timing")]
+    by_context: dict[str, Any] = {}
+    for name in CONTEXTS:
+        found = [r["timing"].get(name) for r in timed]
+        why = next((v for v in found if isinstance(v, str)), None)
+        if why is not None:
+            by_context[name] = why
+        elif found and all(isinstance(v, dict) for v in found):
+            n = [float(r.get("calls_per_run") or 0) for r in timed]
+            ref = sum(k * float(v["ref_ms"]) for k, v in zip(n, found, strict=True))
+            new = sum(k * float(v["new_ms"]) for k, v in zip(n, found, strict=True))
+            by_context[name] = round(ref / max(new, 1e-9), 3)
+    return {
+        "context": context,
+        "l2": "cold" if l2_flush else "warm",
+        "context_reason": reason,
+        "speedup_by_context": by_context,
+    }
+
+
+def _graph_unavailable(timed: list[tuple[int, tuple[Any, Any], dict[str, Any]]]) -> str | None:
+    """Why these timed cases (index, reference and candidate entrypoints, case) cannot all
+    be timed in a CUDA graph: the first call that cannot be captured
+    (:func:`kernels.bench.graph_probe`); None when every one can."""
+    from kernel_agent.kernels.bench import graph_probe
+
+    for i, fns, case in timed:
+        for who, fn in zip(("reference", "candidate"), fns, strict=True):
+            if (why := graph_probe(fn, case["args"], case["kwargs"])) is not None:
+                return f"{who}, case {i}: {why}"
+    return None
+
+
 @dataclasses.dataclass
 class _Rounds:
     """A timed case of :func:`evaluate`: its index, report and case, the reference's and the
@@ -415,6 +481,45 @@ class _Rounds:
     fns: tuple[Any, Any]
     ref: list[dict[str, Any]]
     new: list[dict[str, Any]]
+
+
+def _other_context(
+    timed: list[_Rounds], other: str, l2_flush: bool, graph_state: str | None
+) -> str | None:
+    """Time the timed cases in the ``other`` context too (:data:`OTHER_ROUNDS` rounds each,
+    into their ``timing``); returns why graph timing is unavailable: ``graph_state`` (known
+    already), a call that cannot be captured, or a graph replay whose output differs from
+    the reference's (correct eagerly, wrong inside a CUDA-graphed stage); None: it is not."""
+    from kernel_agent.kernels.bench import GRAPH, GraphUnavailable, median_round, timing_rounds
+
+    if other == GRAPH:
+        if graph_state is None:
+            graph_state = _graph_unavailable([(t.index, t.fns, t.case) for t in timed])
+        if graph_state is not None:
+            return graph_state
+    measured: dict[int, dict[str, float]] = {}
+    for t in timed:
+        try:
+            ref_r, new_r, checked = timing_rounds(
+                *t.fns,
+                t.case["args"],
+                t.case["kwargs"],
+                rounds=OTHER_ROUNDS,
+                l2_flush=l2_flush,
+                verify=other == GRAPH,
+                context=other,
+            )
+        except GraphUnavailable as exc:
+            return f"case {t.index}: {exc}"
+        if checked and checked.get("failures"):
+            return (
+                f"case {t.index}: the output of call #{checked['iteration']} of a graph replay "
+                f"differs from the reference ({_first_error(checked['failures'])})"
+            )
+        measured[t.index] = _in_context(median_round(ref_r), median_round(new_r))
+    for t in timed:
+        t.report["timing"][other] = measured[t.index]
+    return graph_state
 
 
 @functools.cache
@@ -498,6 +603,8 @@ def evaluate(
     config: dict[str, Any] | None = None,
     session: dict[str, Any] | None = None,
     early_best: float | None = None,
+    context: str = "eager",
+    context_reason: str | None = None,
 ) -> dict[str, Any]:
     """Build, check and time one candidate.  ``device`` defaults to CUDA when
     available; on CPU only correctness is checked (timing needs CUDA events).
@@ -513,6 +620,10 @@ def evaluate(
     ``early_best``: the speedup a new best must beat (the target's best kept one): a
     correct candidate that cannot reach it stops timing after the first rounds
     (``early`` in the result, :func:`kernels.early.discard`); None: every round.
+    ``context``: the target's timing context (``eager`` or ``graph``, :func:`kernels.bench.
+    time_call`; with ``l2_flush`` a cold L2), ``context_reason`` why it is the target's
+    (:mod:`kernels.context`); graph timing falls back to eager when a call cannot be
+    captured, and the result says why (:func:`context_fields`).
     Global state the candidate changed is restored on return."""
     guards: list[Any] = []
     try:
@@ -532,6 +643,8 @@ def evaluate(
                 config=config or {},
                 session=session if session is not None else {},
                 early_best=early_best,
+                context=context,
+                context_reason=context_reason,
             )
         )
     finally:
@@ -574,6 +687,8 @@ def _stages(
     config: dict[str, Any],
     session: dict[str, Any],
     early_best: float | None = None,
+    context: str = "eager",
+    context_reason: str | None = None,
 ) -> Generator[None, None, dict[str, Any]]:
     """The stages of :func:`evaluate`; the result is the generator's return value. It
     pauses once (a ``yield``) after timing, before the profiled activity pass, so a batch
@@ -591,7 +706,10 @@ def _stages(
     from kernel_agent.kernels import compare as comparator
     from kernel_agent.kernels import early, integrity, weights
     from kernel_agent.kernels.bench import (
+        EAGER,
+        GRAPH,
         ROUNDS,
+        GraphUnavailable,
         median_round,
         peak_memory,
         time_call,
@@ -819,60 +937,90 @@ def _stages(
     # with a bar to beat (early discard, kernels/early.py) every case first gets the rounds
     # after which the median of all of them is bounded, the rest only if it can still win
     first = early.min_rounds(ROUNDS) if early_best is not None else ROUNDS
-    timed: list[_Rounds] = []
-    for i, (report, case) in enumerate(zip(case_reports, cases, strict=True)):
-        if not case["count"]:  # correctness-only case (another workload setting): not timed
-            continue
+    # the target's timing context (#226): graph timing when every timed case of both can be
+    # captured in a CUDA graph, else eager, and the result says why
+    reason = context_reason or DEFAULT_CONTEXT_REASON
+    graph_state: str | None = None  # why graph timing is unavailable (None: not known to be)
+    if context == GRAPH:
+        probes = [
+            (i, (replay.call(c, reference), replay.call(c, *holders)), c)
+            for i, c in enumerate(cases)
+            if c["count"]
+        ]
         try:
-            # every call from the case's module state (restored outside the timed region)
-            fns = (replay.call(case, reference), replay.call(case, *holders))
-            ref_r, new_r, checked = timing_rounds(
-                *fns, case["args"], case["kwargs"], rounds=first, l2_flush=l2_flush
-            )
-            wall = wall_check(*fns, case["args"], case["kwargs"])
-            if _hidden_work(wall):  # confirm: other processes can delay one measurement
-                again = wall_check(*fns, case["args"], case["kwargs"])
-                wall = min(wall, again, key=lambda w: w["hidden_ms"])
+            graph_state = _graph_unavailable(probes)
         except Exception:
-            result.update(status="runtime_error", error=_short_tb(), failed_case=i)
+            result.update(status="runtime_error", error=_short_tb())
             return result
-        report["hidden_ms"] = round(wall["hidden_ms"], 4)
-        try:  # after timing; a warning, never a failure (peak_memory_summary)
-            peak = peak_memory(*fns, case["args"], case["kwargs"])
-        except Exception as exc:
-            report["peak_memory_error"] = f"{type(exc).__name__}: {exc}"[:200]
-        else:
-            report["ref_peak_mib"] = _mib(peak["ref_bytes"])
-            report["new_peak_mib"] = _mib(peak["new_bytes"])
-            report["peak_delta_mib"] = _mib(peak["new_bytes"] - peak["ref_bytes"])
-        if _hidden_work(wall):
-            _violation(
-                result,
-                "hidden_work",
-                f"case {i} ({case['signature']}): a call takes {wall['new_wall_ms']:.3f} ms "
-                f"between device-wide synchronisations but its timed stream sees only "
-                f"{wall['new_event_ms']:.3f} ms: {wall['hidden_ms']:.3f} ms of GPU work runs "
-                "on streams or threads the timed stream never waits for. Join side streams "
-                "back before returning (`with kernel_agent.concurrency.fork(name):` joins on "
-                "exit) and do not launch work from other threads.",
-                case=i,
-                **{k: round(v, 4) for k, v in wall.items()},
-            )
-            return result
-        checked = checked or {}  # the kept timed call (always in the first rounds)
-        if checked.get("failures"):
-            result.update(
-                status="incorrect_timed_output",
-                stage="timed_output",
-                failed_check={"case": i, "check": "timed_output", **checked},
-                error=f"case {i} ({case['signature']}): the output of timed call "
-                f"#{checked['iteration']} differs from the reference on the same inputs "
-                f"({_first_error(checked['failures'])}); correctness was checked on the first "
-                "call only, so the candidate must compute every call (no caching by "
-                "address, shape or call count, no skipped work)",
-            )
-            return result
-        timed.append(_Rounds(i, report, case, fns, ref_r, new_r))
+        if graph_state is not None:
+            context, reason = EAGER, f"{reason}; graph timing unavailable: timed eagerly"
+    timed: list[_Rounds] = []
+    restart = True
+    while restart:  # once more, eagerly, when a capture fails after the probe passed
+        restart, timed = False, []
+        for i, (report, case) in enumerate(zip(case_reports, cases, strict=True)):
+            if not case["count"]:  # correctness-only case (another workload setting): not timed
+                continue
+            try:
+                # every call from the case's module state (restored outside the timed region)
+                fns = (replay.call(case, reference), replay.call(case, *holders))
+                ref_r, new_r, checked = timing_rounds(
+                    *fns,
+                    case["args"],
+                    case["kwargs"],
+                    rounds=first,
+                    l2_flush=l2_flush,
+                    context=context,
+                )
+                wall = wall_check(*fns, case["args"], case["kwargs"])
+                if _hidden_work(wall):  # confirm: other processes can delay one measurement
+                    again = wall_check(*fns, case["args"], case["kwargs"])
+                    wall = min(wall, again, key=lambda w: w["hidden_ms"])
+            except GraphUnavailable as exc:
+                graph_state = f"case {i}: {exc}"
+                context, reason = EAGER, f"{reason}; graph timing unavailable: timed eagerly"
+                restart = True
+                break
+            except Exception:
+                result.update(status="runtime_error", error=_short_tb(), failed_case=i)
+                return result
+            report["hidden_ms"] = round(wall["hidden_ms"], 4)
+            try:  # after timing; a warning, never a failure (peak_memory_summary)
+                peak = peak_memory(*fns, case["args"], case["kwargs"])
+            except Exception as exc:
+                report["peak_memory_error"] = f"{type(exc).__name__}: {exc}"[:200]
+            else:
+                report["ref_peak_mib"] = _mib(peak["ref_bytes"])
+                report["new_peak_mib"] = _mib(peak["new_bytes"])
+                report["peak_delta_mib"] = _mib(peak["new_bytes"] - peak["ref_bytes"])
+            if _hidden_work(wall):
+                _violation(
+                    result,
+                    "hidden_work",
+                    f"case {i} ({case['signature']}): a call takes {wall['new_wall_ms']:.3f} ms "
+                    f"between device-wide synchronisations but its timed stream sees only "
+                    f"{wall['new_event_ms']:.3f} ms: {wall['hidden_ms']:.3f} ms of GPU work runs "
+                    "on streams or threads the timed stream never waits for. Join side streams "
+                    "back before returning (`with kernel_agent.concurrency.fork(name):` joins on "
+                    "exit) and do not launch work from other threads.",
+                    case=i,
+                    **{k: round(v, 4) for k, v in wall.items()},
+                )
+                return result
+            checked = checked or {}  # the kept timed call (always in the first rounds)
+            if checked.get("failures"):
+                result.update(
+                    status="incorrect_timed_output",
+                    stage="timed_output",
+                    failed_check={"case": i, "check": "timed_output", **checked},
+                    error=f"case {i} ({case['signature']}): the output of timed call "
+                    f"#{checked['iteration']} differs from the reference on the same inputs "
+                    f"({_first_error(checked['failures'])}); correctness was checked on the first "
+                    "call only, so the candidate must compute every call (no caching by "
+                    "address, shape or call count, no skipped work)",
+                )
+                return result
+            timed.append(_Rounds(i, report, case, fns, ref_r, new_r))
     stop = None
     if early_best is not None:  # stop timing a candidate that cannot be a new best
         sofar = [early.Timed(t.case["count"], _ms(t.ref), _ms(t.new)) for t in timed]
@@ -886,6 +1034,7 @@ def _stages(
                 rounds=ROUNDS - first,
                 l2_flush=l2_flush,
                 verify=False,
+                context=context,
             )
         except Exception:
             result.update(status="runtime_error", error=_short_tb(), failed_case=t.index)
@@ -928,6 +1077,20 @@ def _stages(
         report["target_calls"] = round(weight, 3)
         covered += weight
         saved += (ref_t["median_ms"] - new_t["median_ms"]) * weight
+        report["timing"] = {context: _in_context(ref_t, new_t)}
+        if graph_state is not None:
+            report["timing"][GRAPH] = f"unavailable ({graph_state})"
+    # the other context, for a winner (or with profile): what the verdict would be there,
+    # and whether the candidate can run inside a CUDA-graphed stage at all
+    if timed and stop is None and (profile or ref_total > new_total):
+        other = GRAPH if context == EAGER else EAGER
+        try:
+            graph_state = _other_context(timed, other, l2_flush, graph_state)
+        except Exception:
+            result.update(status="runtime_error", error=_short_tb())
+            return result
+        for t in timed if graph_state is not None else ():
+            t.report["timing"][GRAPH] = f"unavailable ({graph_state})"
     cpu_wait = telemetry.cpu_wait_share(sched)
     others = telemetry.others_share(cores)
     hygiene.phase("")
@@ -988,6 +1151,7 @@ def _stages(
         est_saved_calls=weights.summary(capture, covered),  # basis: instance groups / even split
         ref_ms_weighted=round(ref_total, 4),
         new_ms_weighted=round(new_total, 4),
+        **context_fields(case_reports, context, l2_flush, reason),
     )
     if cpu_wait is not None:  # a contended CPU delays launches (telemetry.dirty)
         result["cpu_wait_share"] = cpu_wait
@@ -1056,11 +1220,14 @@ def run_evaluation(
     compile_check: bool = False,
     quick: bool = False,
     early_best: float | None = None,
+    context: str = "eager",
+    context_reason: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate in a fresh subprocess under the GPU lock (``capture_sha256``, ``quick``,
-    ``early_best``: see :func:`evaluate`; the subprocess checks the bytes it loads), then
-    check its result outside the candidate's process (:func:`_check_reference_timing`,
-    :func:`_check_outputs`). The result says on which GPU of the pool it ran
+    ``early_best``, ``context``: see :func:`evaluate`; the subprocess checks the bytes it
+    loads), then check its result outside the candidate's process
+    (:func:`_check_reference_timing`, :func:`_check_outputs`). The result says on which GPU
+    of the pool it ran
     (``gpu_index``, :mod:`kernel_agent.gpulock`) and which evaluator measured it
     (``evaluator_version``, set here: the candidate's process cannot choose it).
 
@@ -1094,6 +1261,8 @@ def run_evaluation(
             quick=quick,
             watch=timed,
             early_best=early_best,
+            context=context,
+            context_reason=context_reason,
         )
         if why is None:
             break
@@ -1123,6 +1292,9 @@ def run_evaluations(
     capture_sha256: str | None = None,
     compile_check: bool = False,
     early_best: float | None = None,
+    l2_flush: bool = False,
+    context: str = "eager",
+    context_reason: str | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate several candidates of one capture (one agent's variants of one idea: the
     ``evaluate_candidates`` tool, issue #190) in one subprocess under one GPU-lock
@@ -1130,7 +1302,8 @@ def run_evaluations(
     through every stage of :func:`evaluate` with its own build, its own integrity snapshot
     and its own timing interleaved with the reference, then the checks outside its process
     (:func:`_check_reference_timing`, :func:`_check_outputs`); one result per candidate, in
-    order, each what :func:`run_evaluation` would return. ``timeout`` is per candidate.
+    order, each what :func:`run_evaluation` would return. ``timeout`` is per candidate;
+    ``l2_flush``, ``context``: their timing context (:func:`evaluate`).
 
     A candidate that kills the subprocess (or runs out of its time) gets ``crash`` (or
     ``timeout``) and the candidates after it go on in a new subprocess (at most
@@ -1149,6 +1322,9 @@ def run_evaluations(
                 capture_sha256=capture_sha256,
                 compile_check=compile_check,
                 early_best=early_best,
+                l2_flush=l2_flush,
+                context=context,
+                context_reason=context_reason,
             )
             for path in paths
         ]
@@ -1172,6 +1348,7 @@ def run_evaluations(
             compile_check=compile_check,
             watch=timed,
             early_best=early_best,
+            timing={"l2_flush": l2_flush, "context": context, "context_reason": context_reason},
         )
         todo = []
         for i, (data, why) in measured.items():
@@ -1203,15 +1380,21 @@ def _evaluate_batch(
     compile_check: bool,
     watch: bool,
     early_best: float | None,
+    timing: dict[str, Any] | None = None,
 ) -> dict[int, tuple[dict[str, Any], str | None]]:
     """The candidates ``paths[i]`` of ``indices`` in batch subprocesses under one hold of the
-    GPU (:func:`run_evaluations`): ``{i: (result, why its timing was dirty)}``."""
+    GPU (:func:`run_evaluations`): ``{i: (result, why its timing was dirty)}``; ``timing``:
+    ``l2_flush``, ``context`` and ``context_reason`` (:func:`evaluate`)."""
     version = {"evaluator_version": evaluator_version()}
     workdir = Path(tempfile.mkdtemp(prefix="ka-evals-"))
     out: dict[int, dict[str, Any]] = {}
     whys: dict[int, str | None] = {}
+    timing = timing or {}
     flags = _flags(
-        capture_sha256=capture_sha256, compile_check=compile_check, early_best=early_best
+        capture_sha256=capture_sha256,
+        compile_check=compile_check,
+        early_best=early_best,
+        **timing,
     )
     try:
         with gpu_lock() as gpu:
@@ -1231,7 +1414,11 @@ def _evaluate_batch(
                         data.update(gpu_index=gpu, **version)
                         data["outputs_file"] = str(outputs / f"{k}.pt")
                         _check_reference_timing(
-                            data, capture_path, capture_sha256, l2_flush=False, gpu=gpu
+                            data,
+                            capture_path,
+                            capture_sha256,
+                            l2_flush=bool(timing.get("l2_flush")),
+                            gpu=gpu,
                         )
                         out[left[k]] = data
                     if culprit is not None:  # it died (or ran out of time) in this one
@@ -1245,6 +1432,7 @@ def _evaluate_batch(
                         capture_sha256=capture_sha256,
                         compile_check=compile_check,
                         early_best=early_best,
+                        **timing,
                     )
                     whys[i] = None  # measured (and re-measured) by run_evaluation already
             for i, data in out.items():
@@ -1340,6 +1528,8 @@ def _flags(
     compile_check: bool = False,
     quick: bool = False,
     early_best: float | None = None,
+    context: str = "eager",
+    context_reason: str | None = None,
 ) -> list[str]:
     """The evaluator subprocess's flags for these options (:func:`main`)."""
     cmd = ["--profile"] if profile else []
@@ -1349,6 +1539,8 @@ def _flags(
     cmd += ["--compile-check"] if compile_check else []
     cmd += ["--quick"] if quick else []
     cmd += ["--early-best", repr(float(early_best))] if early_best is not None else []
+    cmd += ["--context", context] if context != "eager" else []
+    cmd += ["--context-reason", context_reason] if context_reason else []
     return cmd
 
 
@@ -1365,6 +1557,8 @@ def _evaluate_once(
     quick: bool,
     watch: bool,
     early_best: float | None = None,
+    context: str = "eager",
+    context_reason: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """One evaluation (:func:`run_evaluation`) and, with ``watch``, why its timing was dirty
     (None: clean, or not watched)."""
@@ -1392,6 +1586,8 @@ def _evaluate_once(
         compile_check=compile_check,
         quick=quick,
         early_best=early_best,
+        context=context,
+        context_reason=context_reason,
     )
     try:
         with gpu_lock() as gpu:  # reference and candidate run on this GPU, in one process
@@ -1447,7 +1643,7 @@ def _parse_result(stdout: str, nonce: str | None) -> dict[str, Any] | None:
 #: Captures (answer key only) and candidate-free reference timings already loaded
 #: by this process, keyed by path + digest (or mtime and size).
 _TRUTH: dict[tuple[str, str], dict[str, Any]] = {}
-_CLEAN_REF_MS: dict[tuple[str, str, bool, str], list[list[float]]] = {}
+_CLEAN_REF_MS: dict[tuple[str, str, bool, str, str], list[list[float]]] = {}
 
 
 def _capture_key(path: Path, sha256: str | None) -> tuple[str, str]:
@@ -1526,12 +1722,15 @@ def _check_reference_timing(
         return
     if not any(c.get("ref_ms") for c in result.get("cases") or []):
         return  # nothing timed
-    key = (*_capture_key(capture_path, capture_sha256), l2_flush, str(gpu))  # per GPU
+    context = str(result.get("context") or "eager")  # the one it was timed in (#226)
+    key = (*_capture_key(capture_path, capture_sha256), l2_flush, str(gpu), context)
     clean = _CLEAN_REF_MS.get(key)
     slow: list[str] = []
     for attempt in range(2):
         if clean is None or attempt:
-            clean = _clean_reference_timing(capture_path, capture_sha256, l2_flush=l2_flush)
+            clean = _clean_reference_timing(
+                capture_path, capture_sha256, l2_flush=l2_flush, context=context
+            )
             if clean is None:
                 result["reference_check"] = "skipped: the candidate-free timing failed"
                 return
@@ -1553,7 +1752,11 @@ def _check_reference_timing(
 
 
 def _clean_reference_timing(
-    capture_path: Path, capture_sha256: str | None, *, l2_flush: bool = False
+    capture_path: Path,
+    capture_sha256: str | None,
+    *,
+    l2_flush: bool = False,
+    context: str = "eager",
 ) -> list[list[float]] | None:
     """``[ref_ms, instability]`` per case from :func:`reference_timing` in a subprocess
     that never imports a candidate."""
@@ -1568,6 +1771,8 @@ def _clean_reference_timing(
     ]
     if l2_flush:
         cmd.append("--l2-flush")
+    if context != "eager":
+        cmd += ["--context", context]
     if capture_sha256:
         cmd += ["--capture-sha256", capture_sha256]
     try:
@@ -1582,11 +1787,15 @@ def _clean_reference_timing(
 
 
 def reference_timing(
-    capture_path: Path, *, l2_flush: bool = False, capture_sha256: str | None = None
+    capture_path: Path,
+    *,
+    l2_flush: bool = False,
+    capture_sha256: str | None = None,
+    context: str = "eager",
 ) -> dict[str, Any]:
-    """Time the reference of every case like :func:`evaluate` does, without any candidate
-    in the process: interleaved rounds of the reference against itself give two
-    medians per case; ``ref_ms`` is their mean and ``instability`` their relative
+    """Time the reference of every case like :func:`evaluate` does (in ``context``), without
+    any candidate in the process: interleaved rounds of the reference against itself give
+    two medians per case; ``ref_ms`` is their mean and ``instability`` their relative
     difference (a busy GPU)."""
     from kernel_agent import hygiene, toolchain
 
@@ -1607,7 +1816,13 @@ def reference_timing(
                 continue
             fn = replay.call(case, reference)
             one, two = compare_timing(
-                fn, fn, case["args"], case["kwargs"], l2_flush=l2_flush, verify=False
+                fn,
+                fn,
+                case["args"],
+                case["kwargs"],
+                l2_flush=l2_flush,
+                verify=False,
+                context=context,
             )
             a, b = one["median_ms"], two["median_ms"]
             ref_ms.append(round((a + b) / 2, 5))
@@ -1630,6 +1845,13 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         help="stop timing a correct candidate that cannot beat this speedup (kernels/early.py)",
     )
+    parser.add_argument(
+        "--context",
+        choices=("eager", "graph"),
+        default="eager",
+        help="timing context: eager calls, or calls captured in a CUDA graph (#226)",
+    )
+    parser.add_argument("--context-reason", help="why the context is the target's (recorded)")
     parser.add_argument("--json", default=None, help="write result JSON ('-' = stdout marker)")
     parser.add_argument("--outputs", type=Path, help="save the candidate's outputs here")
     parser.add_argument(
@@ -1667,7 +1889,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if ns.reference_timing:
             result = reference_timing(
-                ns.capture, l2_flush=ns.l2_flush, capture_sha256=ns.capture_sha256
+                ns.capture,
+                l2_flush=ns.l2_flush,
+                capture_sha256=ns.capture_sha256,
+                context=ns.context,
             )
         else:
             result = evaluate(
@@ -1681,6 +1906,8 @@ def main(argv: list[str] | None = None) -> int:
                 quick=ns.quick,
                 save_outputs=ns.outputs,
                 early_best=ns.early_best,
+                context=ns.context,
+                context_reason=ns.context_reason,
             )
     except Exception:
         result = {"status": "harness_error", "correct": False, "error": _short_tb()}
@@ -1737,6 +1964,8 @@ def _batch_main(ns: argparse.Namespace, tag: str) -> int:
             config={},
             session=session,
             early_best=ns.early_best,
+            context=ns.context,
+            context_reason=ns.context_reason,
         )
         result: dict[str, Any] | None = None
         try:

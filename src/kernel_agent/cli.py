@@ -422,6 +422,9 @@ def cmd_improve(ns: argparse.Namespace) -> int:
 def cmd_eval(ns: argparse.Namespace) -> int:
     from kernel_agent.kernels.evaluate import run_evaluation
 
+    # the timing context (#226): eager or CUDA graph, warm or cold L2
+    timing = {"context": ns.context, "l2_flush": ns.l2 == "cold"}
+
     if ns.sweep:  # many configs of build(reference, **config), the best fully evaluated
         from kernel_agent.kernels import search, sweep
 
@@ -446,6 +449,7 @@ def cmd_eval(ns: argparse.Namespace) -> int:
             timeout=ns.timeout,
             compile_check=ns.compile_check,
             search=found,
+            **timing,
         )
         data["sweep"]["notes"] = notes
         print(sweep.format_table(data), file=sys.stderr)
@@ -459,6 +463,7 @@ def cmd_eval(ns: argparse.Namespace) -> int:
         timeout=ns.timeout,
         compile_check=ns.compile_check,
         quick=ns.quick,
+        **timing,
     )
     if ns.profile and result.get("sass"):  # what to change, with its numbers (#230)
         from kernel_agent.kernels import directives
@@ -1031,6 +1036,18 @@ def main(argv: list[str] | None = None) -> int:
         "the best one is fully evaluated",
     )
     p.add_argument("--max-configs", type=int, default=None, help="--sweep: at most this many")
+    p.add_argument(
+        "--context",
+        choices=("eager", "graph"),
+        default="eager",
+        help="time eager calls, or calls captured in a CUDA graph (as in a graphed stage)",
+    )
+    p.add_argument(
+        "--l2",
+        choices=("warm", "cold"),
+        default="warm",
+        help="cold: evict the L2 before every timed call",
+    )
     p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser(

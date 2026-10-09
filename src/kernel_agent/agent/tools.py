@@ -20,6 +20,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from kernel_agent import board, critic, dashboard, dedup, gpuqueue, ledger, region, truth, workers
 from kernel_agent.budget import Budget
+from kernel_agent.kernels import context as timing_context
 from kernel_agent.kernels import search as search_mod
 from kernel_agent.kernels import sweep as sweep_mod
 from kernel_agent.kernels.evaluate import run_evaluation, run_evaluations
@@ -301,6 +302,11 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "sol_error",
             "peak_memory",  # the per-call peak vs the reference's (kernels/evaluate.py)
             "early",  # an early discard: timing stopped, it cannot be a new best (#190)
+            # the timing context speedup is measured in, and the other one's (#226)
+            "context",
+            "l2",
+            "context_reason",
+            "speedup_by_context",
         )
         if k in result
     }
@@ -329,6 +335,7 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
                 "suspicious_faster_than_sol",
                 "sol_unreliable",
                 "peak_delta_mib",
+                "timing",  # per timing context (#226)
             )
             if c.get(k) is not None
         }
@@ -834,6 +841,11 @@ def build_server(
         rows = [r for r in ledger.rows(run) if r["target"] == target_id]
         return {"early_best": ledger.best_kept(rows)}
 
+    def _context(target_id: str) -> dict[str, Any]:
+        """The target's timing context for the evaluator: eager or CUDA graph, warm or cold
+        L2, and why, from the run's newest profile (``kernels/context.py``, #226)."""
+        return timing_context.for_target(run, target_id).kwargs()
+
     def _refuted(target_id: str, idea: str) -> dict[str, Any] | None:
         """``ledger.ideas``' ``refuted`` of ``idea`` on ``target_id`` (None: not refuted)."""
         if not idea:
@@ -1067,7 +1079,7 @@ def build_server(
                         timeout=budget.eval_timeout_s,
                         capture_sha256=capture_sha256,
                         **({"compile_check": True} if args.get("compile_check") else {}),
-                        **({"quick": True} if quick else _bar(target_id)),
+                        **({"quick": True} if quick else _bar(target_id) | _context(target_id)),
                     ),
                 )
             if result is None:  # the critic withdrew it while it waited for the GPU
@@ -1385,6 +1397,7 @@ def build_server(
             prepare=prepare,
             race=budget.early_stop,  # racing of the configs (kernels/early.py, #190)
             search=search,
+            **_context(target_id),
         )
         snap, snap_sha256 = snaps[0]
         result = data["evaluation"]
@@ -1430,7 +1443,17 @@ def build_server(
         out["sweep"] = {
             k: info[k] for k in ("configs", "passed", "failed", "skipped", "seconds") if k in info
         }
-        for key in ("rounds", "raced", "cases", "timing", "note", "sol_note", "search", "helion"):
+        for key in (
+            "rounds",
+            "raced",
+            "cases",
+            "timing",
+            "note",
+            "sol_note",
+            "search",
+            "helion",
+            "context_note",
+        ):
             if info.get(key):
                 out["sweep"][key] = info[key]
         if notes:
@@ -1619,6 +1642,7 @@ def build_server(
                     capture_sha256=capture_sha256,
                     compile_check=bool(args.get("compile_check")),
                     **_bar(target_id),
+                    **_context(target_id),
                 )
                 for t, result in zip(batch, measured, strict=True):
                     t["result"] = result
