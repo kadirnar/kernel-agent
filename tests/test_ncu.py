@@ -278,3 +278,119 @@ def test_the_tool_accepts_profile_ncu():
     from kernel_agent.agent import tools
 
     assert "compiler_stats" in tools.compact({"status": "ok", "compiler_stats": {"triton": []}})
+
+
+# ------------------------------------------------------------------ rules and source lines (#230)
+
+
+def test_details_page_rules_rank_by_estimated_speedup():
+    rules = ncu.parse_details(fixture("details_rules.csv"))
+    assert len(rules) == 9  # rule rows only; metric rows and the ==PROF== log are skipped
+    assert {r["type"] for r in rules} == {"OPT", "WRN", "INF"}
+    top = ncu.top_rules(rules)
+    assert [(r["kernel"], r["rule"], r["speedup_pct"]) for r in top] == [
+        ("_quant_kernel", "LaunchConfiguration", 50.0),
+        ("_gemm_kernel", "CPIStall", 43.0),  # the larger of its two launches
+        ("_gemm_kernel", "TheoreticalOccupancy", 33.3),
+    ]
+    assert top[1]["description"].endswith("(local, global, surface, texture) operation.")
+    ranked = ncu.top_rules(rules, n=10)
+    assert [r["rule"] for r in ranked][-2:] == ["UncoalescedGlobalAccess", "IssueSlotUtilization"]
+    assert all(r["speedup_pct"] > 0 for r in ranked)  # no estimate: not ranked
+
+
+def test_source_lines_with_line_info_rank_by_stall_samples():
+    rows = ncu.parse_source(fixture("source_cuda_sass.csv"))
+    assert {r["kernel"] for r in rows} == {"_gemm_kernel", "_quant_kernel"}
+    assert sum(r["line"] is not None for r in rows) == 6  # the rest: SASS rows
+    top = ncu.top_lines(rows)
+    assert [(t["where"], t["samples"], t["share_pct"]) for t in top] == [
+        ("003_fp8_gemm.py:39", 5200, 58.5),
+        ("003_fp8_gemm.py:40", 3100, 34.9),
+        ("003_fp8_gemm.py:18", 900, 81.8),
+        ("003_fp8_gemm.py:47", 400, 4.5),
+        ("003_fp8_gemm.py:17", 200, 18.2),
+    ]
+    assert (top[0]["stall"], top[0]["stall_pct"]) == ("stall_long_sb", 78.8)
+    assert top[1]["stall"] == "stall_math" and "math pipe" in top[1]["why"]
+    assert top[0]["source"] == "a_t = tl.load(a_ptr, mask=row_ok, other=0.0)"
+    flagged = ncu.flagged_lines(rows)
+    assert [(f["where"], f["flags"]) for f in flagged] == [
+        ("003_fp8_gemm.py:47", ["uncoalesced global access (2048 of 4096 L2 sectors excessive)"]),
+        ("003_fp8_gemm.py:18", ["shared-memory bank conflicts (4-way)"]),
+    ]
+
+
+def test_source_without_line_info_ranks_sass_instructions():
+    rows = ncu.parse_source(fixture("source_sass.csv"))
+    assert all(r["line"] is None and r["address"].startswith("0x") for r in rows)
+    (top,) = ncu.top_lines(rows, n=1)
+    assert top["where"] == "SASS 0x7f3a20000020" and top["source"] == "HMUL2.BF16_V2 R8, R4, R4"
+    assert (top["share_pct"], top["stall"]) == (68.7, "stall_long_sb")
+    assert ncu.flagged_lines(rows) == []
+
+
+def test_the_details_command_exports_the_sections_of_one_call(tmp_path):
+    cmd = ncu.details_command(
+        "/opt/ncu", Path("cap.pt"), Path("cand.py"), tmp_path / "r.ncu-rep", tmp_path / "l"
+    )
+    sections = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--section"]
+    assert sections == list(ncu.SECTIONS) and "SourceCounters" in sections
+    assert cmd[cmd.index("--export") + 1] == str(tmp_path / "r.ncu-rep")
+    assert cmd[cmd.index("--launch-count") + 1] == str(ncu.DETAILS_LAUNCHES)
+    assert cmd[-2:] == ["--ncu-calls", "1"]
+    assert ncu.import_command("/opt/ncu", Path("r"), "source", "sass")[-4:] == [
+        "--page",
+        "source",
+        "--print-source",
+        "sass",
+    ]
+
+
+class FakeNcuDetails(FakeNcu):
+    """:class:`FakeNcu` for both runs: the metrics run's log, the details run's report
+    file, and the imported pages on stdout (``pages``: page or print-source -> text)."""
+
+    def __init__(self, raw: str, pages: dict[str, str], *, report: bool = True) -> None:
+        super().__init__(raw)
+        self.pages = pages
+        self.report = report
+
+    def __call__(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "--import" in cmd:
+            self.calls.append(cmd)
+            key = cmd[-1] if "--print-source" in cmd else cmd[cmd.index("--page") + 1]
+            return subprocess.CompletedProcess(cmd, 0, self.pages.get(key, ""), "")
+        if "--export" in cmd:
+            self.calls.append(cmd)
+            if self.report:
+                Path(cmd[cmd.index("--export") + 1]).write_bytes(b"report")
+            return subprocess.CompletedProcess(cmd, 0 if self.report else 9, "", "==ERROR== x")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_profile_ncu_adds_rules_and_stall_lines(usable):
+    pages = {
+        "details": fixture("details_rules.csv"),
+        "cuda,sass": "",  # no line info here: the SASS view is read instead
+        "sass": fixture("source_sass.csv"),
+    }
+    run = FakeNcuDetails(fixture("raw_base_units.csv"), pages)
+    out = ncu.profile_candidate(Path("c.pt"), Path("k.py"), run=run)
+    assert out["status"] == "ok" and len(out["kernels"]) == 3
+    assert [r["rule"] for r in out["rules"]] == [
+        "LaunchConfiguration",
+        "CPIStall",
+        "TheoreticalOccupancy",
+    ]
+    assert out["lines"][0]["source"] == "HMUL2.BF16_V2 R8, R4, R4" and out["flagged"] == []
+    views = [c[-1] for c in run.calls if "--print-source" in c]
+    assert views == ["cuda,sass", "sass"]
+
+
+def test_a_failed_details_run_keeps_the_metrics(usable):
+    run = FakeNcuDetails(fixture("raw_base_units.csv"), {}, report=False)
+    out = ncu.profile_candidate(Path("c.pt"), Path("k.py"), run=run)
+    assert out["status"] == "ok" and len(out["kernels"]) == 3
+    assert out["details"]["status"] == "error" and "==ERROR== x" in out["details"]["reason"]
+    assert "rules" not in out

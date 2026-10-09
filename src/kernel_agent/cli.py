@@ -75,9 +75,10 @@ def _doctor_probes(ns: argparse.Namespace, *, gpu: bool) -> None:
     probes (probes.py: ``tl.dot_scaled`` → block-scaled MMA, TMA, PDL, green contexts);
     informative, never a failure."""
     from kernel_agent import probes
-    from kernel_agent.kernels import ncu
+    from kernel_agent.kernels import ncu, sass
 
     print(ncu.describe(ncu.availability()))
+    print(sass.describe())  # the opcode census of profile=true (#230)
     if ns.no_probes:
         return
     print(probes.describe(probes.run(gpu)))
@@ -449,6 +450,10 @@ def cmd_eval(ns: argparse.Namespace) -> int:
         compile_check=ns.compile_check,
         quick=ns.quick,
     )
+    if ns.profile and result.get("sass"):  # what to change, with its numbers (#230)
+        from kernel_agent.kernels import directives
+
+        result["directives"] = directives.texts(directives.build(result, result))
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("correct") else 1
 

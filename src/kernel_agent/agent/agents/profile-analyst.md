@@ -21,7 +21,9 @@ Method (the `profiling-and-roofline` skill explains every number; the
 1. Find the numbers that answer the question; quote them with their file and row or case.
 2. Classify each hot spot: launch / CPU bound, memory bound or compute bound, with the
    evidence (busy share, `bound`, `pct_of_sol`, *M* against the ridge, idle-gap causes,
-   ncu throughputs, registers and spills).
+   ncu throughputs, rules and stall lines, registers and spills, the SASS census: the
+   tensor-core opcodes against this GPU's full-rate ones, local memory, load widths).
+   Check the file's `directives` against their evidence: confirm or overrule each.
 3. Compare with its floor: the ceilings table's floor per precision the run allows, or
    `sol_ms` of the recipe. The gap and the share decide what pays.
 4. Name what moves the bound, most promising first: fusion across calls or modules,

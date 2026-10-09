@@ -2360,15 +2360,59 @@ counters to admin users (`RmProfilingAdminOnly: 1`, ncu's `ERR_NVGPUCTRPERM`; se
 (`ncu.status: unavailable` with the fix) and the evaluation is unchanged.
 `kernel-agent doctor` says whether ncu can profile here. The ncu numbers are per
 launch with caches flushed and base clocks (ncu's defaults): compare kernels
-with each other, not with the evaluator's timings.
+with each other, not with the evaluator's timings. After the metrics, a second ncu
+run (#230, same lock) exports the `SpeedOfLight`, `ComputeWorkloadAnalysis`,
+`MemoryWorkloadAnalysis`, `SchedulerStats`, `WarpStateStats`, `Occupancy`,
+`LaunchStats` and `SourceCounters` sections of one candidate call to a report and reads
+it back: `--page details` gives Nsight's rules with their estimated speedup (`rules`:
+the 3 largest, global estimates first), `--page source --print-source cuda,sass` the
+warp-stall samples per source line (`lines`: the 5 lines with most samples, their share
+of the kernel's samples and dominant stall; `flagged`: lines with uncoalesced global
+accesses or shared-memory bank conflicts). Triton kernels carry line info; CUDA C++
+needs `-lineinfo` (`extra_cuda_cflags`, NVRTC `ProgramOptions(line_info=True)`), else
+the lines are SASS instructions. A failed details run leaves the metrics as they are
+(`ncu.details.status: error`).
+
+**SASS opcode census and directives** (#230). Every `profile` evaluation also reads
+what each candidate kernel was compiled to (`kernel_agent/kernels/sass.py`, no GPU work,
+no ncu, no admin counters): the cubins of the candidate process (Triton
+`CompiledKernel.asm["cubin"]` including Inductor's, an NVRTC `ObjectCode` the candidate
+keeps alive, the `.so` files built on this machine and mapped into the process:
+`load_inline`, native projects, TileLang; CuTe DSL's compiled functions) through
+`cuobjdump -sass` (the toolkit's or Triton's bundled one); kernels that ran without SASS
+there (library kernels, a freed NVRTC `ObjectCode`) are listed under `missing`. Per kernel
+it counts opcodes by category (tensor-core MMA with its full opcode, e.g.
+`QMMA.SF.16832.F32.E4M3.E4M3.E8`; global loads by width; `LDGSTS`; TMA; `LDL` / `STL`;
+tensor memory; barriers; shuffles; atomics; fp32 / fp16 math) and keeps the most frequent
+opcodes raw. The tables name only opcodes found in cubins compiled on the CPU for sm_80,
+sm_89, sm_90a, sm_100a and sm_120a (`tests/fixtures/sass/make_fixtures.py` refreshes them
+after a CUDA or Triton upgrade): `HMMA` / `IMMA` / `QMMA` / `OMMA` (`mma.sync`), `HGMMA` /
+`QGMMA` / `IGMMA` (wgmma), `UTCHMMA` / `UTCQMMA` / `UTCIMMA` / `UTCOMMA` (tcgen05), and
+e4m3 `mma.sync` on sm_90 / sm_100 shows as `F2FP.F16.E4M3.UNPACK_B` + `HMMA` (emulated).
+Without `cuobjdump` the census says so (`sass.status: unavailable`); `kernel-agent doctor`
+prints which one it uses. `kernel_agent/kernels/directives.py` turns census, compiler
+stats, ncu (bounds, rules, stall lines), per-kernel GPU time, the evaluation's roofline
+bound and the GPU's facts (capability, measured `mma.sync` rates) into at most 5
+directives by documented rules: local memory (spills), emulated FP8, a tensor-core
+instruction below this GPU's full-rate path for its operands (`mma.sync` where wgmma or
+tcgen05 runs faster; plain `QMMA.F32` where the measured `QMMA.SF` rate is higher, as
+on sm_12x), fp32 math in a compute-bound kernel without tensor cores, a tensor pipe under
+30 % active (ncu) in a kernel that issues MMAs, the line with most stall samples, uncoalesced or bank-conflicting lines, narrow global loads in a
+memory-bound kernel, Nsight's top rule, register-staged MMA operands without cp.async /
+TMA. Each carries its numbers ("_gemm_kernel: compute-bound at 21 % of SOL; issues
+QMMA.16832.F32.E4M3.E4M3 only (4 in its SASS); this GPU's full-rate fp8 path is QMMA.SF
+(... Triton tl.dot_scaled with unit ue8m0 scales ...): measured 413 vs 206 TFLOP/s"), so
+the engineer, the critic or the profile-analyst can check and overrule it.
 
 The tables do not stay in the session's context (#186): `evaluate_candidate` writes them
-(per-kernel times of candidate and reference, `compiler_stats`, the ncu report) to
+(per-kernel times of candidate and reference, `compiler_stats`, the SASS census, the ncu
+report with its rules and stall lines, the directives with their evidence) to
 `profiles/<snapshot>.json` in the session's working directory and returns `profile`: the
 top 3 kernels of each side with their share of GPU time, the spill warnings, the top ncu
-kernels' bounds and the file's path, a few hundred characters instead of up to 24 KB. The
-engineer reads the file for a detail or hands its path to the `profile-analyst` helper.
-The `kernel-agent eval --profile` CLI still prints everything.
+kernels' bounds, one census line per top kernel, the directives and the file's path, a
+few hundred characters to a few KB instead of up to 24 KB. The engineer reads the file
+for a detail or hands its path to the `profile-analyst` helper. The `kernel-agent eval
+--profile` CLI still prints everything, with the directives.
 
 ### Ceilings for the planner
 
