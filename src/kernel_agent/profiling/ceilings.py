@@ -62,6 +62,10 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   one (``saves_best``).
 * **end to end**, per precision: the run with every row at its floor, nested rows
   counted once (Amdahl over the non-overlapping set, :func:`projection.project`).
+* **library bar** (``ceilings.md`` once the library scout ran: ``libscout.write_ceilings``
+  renders the table again with it, issue #227): the module speedup of the best library
+  candidate on the targets that hold the row (``1.25x torch-sdpa``), ``—`` where none of
+  them was scouted. A floor the engineers start from, not a bound.
 
 Calls whose insides the hooks did not see (an optimised model in an improve round: a
 compiled module, a CUDA-graph replay, a replaced kernel) take the work of the same call
@@ -523,9 +527,24 @@ def _saves(row: Mapping[str, Any], precisions: Mapping[str, Any]) -> str:
     return f"{text} ({precisions[best['precision']]['label']} {_ms(best['ms'])})" if best else text
 
 
-def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01) -> str:
+def row_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    """A row's identity in the table (its ``target`` ``cls@group`` and its phase): the key of
+    :func:`markdown`'s ``bars``."""
+    return str(row.get("target")), str(row.get("phase"))
+
+
+def markdown(
+    table: Mapping[str, Any],
+    *,
+    top: int = 30,
+    min_share: float = 0.01,
+    bars: Mapping[tuple[str, str], str] | None = None,
+) -> str:
     """``## Ceilings`` section of ``profile/summary.md`` ("" without work in the profile):
-    the rows with at least ``min_share`` of the run, by what reaching the floor saves."""
+    the rows with at least ``min_share`` of the run, by what reaching the floor saves.
+    ``bars`` (the library scout's, ``libscout.write_ceilings``; None: no scout yet): the
+    *library bar* column, by :func:`row_key`, "—" for a row none of whose targets was
+    scouted."""
     if not table.get("rows"):  # a profile without work entries (made before #90)
         return ""
     peaks = table.get("peaks")
@@ -616,13 +635,15 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
         + "bound | "
         + " | ".join(precisions[c]["label"] for c in cols)
         + (" | FP8 MMA" if fp8_col else "")
-        + " | saves ms |",
+        + " | saves ms |"
+        + (" library bar |" if bars is not None else ""),
         "|---|---|---|---|---|---|---|---|---|"
         + ("---|" if kv else "")
         + "---|"
         + "---|" * len(cols)
         + ("---|" if fp8_col else "")
-        + "---|",
+        + "---|"
+        + ("---|" if bars is not None else ""),
     ]
     for r in shown:
         marks = {"†": r["estimated_calls"], "‡": r.get("reference_calls")}
@@ -641,6 +662,7 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             + "".join(f"{_ms(f.get(c))} | " for c in cols)
             + (f"{_fp8_cell(r.get('fp8_mma'))} | " if fp8_col else "")
             + f"{_saves(r, precisions)} |"
+            + (f" {bars.get(row_key(r)) or '—'} |" if bars is not None else "")
         )
     e2e = table.get("e2e") or {}
     if e2e:
@@ -692,6 +714,13 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             " †: partly estimated from the module's `nn.Linear` weights at its input's rows "
             "(its calls read none of them: a replaced kernel or `F.linear` on a child's weight)."
             if any(r["estimated_calls"] for r in shown)
+            else ""
+        )
+        + (
+            " *library bar*: the module speedup of the best library scout candidate on the "
+            "row's targets (library kernels with no agent: a floor to beat, never a ceiling); "
+            "— where none of them was scouted."
+            if bars is not None
             else ""
         ),
     ]

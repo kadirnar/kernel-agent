@@ -1342,6 +1342,61 @@ same codes on sm_120; torch 2.14 has no MXFP4 GEMM there), `fp4_w4a4_error`,
 probe: every `nn.Linear` of a target alone in W4A4 and FP8 W8A8 on its captured inputs,
 the most sensitive first, to keep those in FP8).
 
+**Scale-rule guard** (`kernels/scale_guard.py`, as for `fp8_mx`). A W4A4 candidate defines
+`quantize_activations(x) -> (codes, scales, outer)` with the quantiser its kernels use
+(codes packed two per byte `[rows, K / 2]`, not read by the guard; scales **unswizzled**
+`[rows, K / 16]` e4m3, MXFP4 `[rows, K / 32]` e8m0; outer fp32 per row or one per call;
+a quantiser that rotates first returns the rotated activations fourth; both examples
+define it). The evaluator runs it on the captured input and on a stress input
+of the same shape (`quant.fp4_stress_input`: every row's maximum 64, the other blocks' scale
+before rounding at 1.1125 x 2^e and in e4m3's subnormal range; MXFP4: block maxima at 1.9 x
+2^e) and rejects the candidate (`status: incorrect`, `stage: scale_rule`, the reason in
+`error`) when a block maximum exceeds 6 x scale x outer beyond the rounding of an e4m3 scale
+(`quant.fp4_scale_check`: 6.375 for a normal scale rounded to nearest, the reference's own
+subnormal rounding below 2^-6), when a non-zero block gets scale 0 where rounding to nearest
+gives a subnormal one, or when a scale is not finite. Caught on the CPU tests: block scales
+rounded down (truncated; up to 6.75 x step with a normal scale, more with a subnormal one;
+30 % of the blocks of rows spanning 1e-3 to 1e3, every stress block), an outer scale 0.8x
+too small (block scales clamp at 448), subnormal scales flushed to zero (on Gaussian rows
+only the stress input shows it) and MXFP4's OCP rule `2^(floor(log2 amax) - 2)` (up to 8 x
+scale; 43 % of those rows' blocks, every stress block); the reference (per token and per
+call), MXFP4's ceil rule and both examples' hooks pass. Swizzled scales are refused with
+the unswizzled form in the reason; a candidate without the hook is not rejected, its
+`scale_rule` report says the rule went unchecked.
+
+**Per-layer selection** (`kernel_agent/demotion.py`, `kernels/mix_probe.py`). When the
+worker captures a W4A4 target it runs the probe on the capture (`spec.json` → `capture` →
+`w4a4_probe`): the sensitivity ranking, with the layers that read the same activations (q /
+k / v, gate / up) as one group, and a ladder of the reference math on every captured case
+(its module state restored per case) with the top 0, 1, 2, ... groups in the GPU's 8-bit
+class (`fp8_w8a8`; `int8_w8a8` where FP8 is absent), each rung compared with the captured
+outputs in the target's tier. The target's mix (`spec.json` → `w4a4_mix`) starts at the
+fewest groups with which the reference math passes, and moves one group to 8 bits each time
+a gate fails: the evaluator (3 evaluations since the mix was set failing the tier with a
+cosine of 0.9 or more, none passing: precision, not a broken kernel; scale-rule rejections
+do not count) or the end-to-end gate (the integration's A/B of one of the target's kernels,
+evaluated under the current mix, alone against the unmodified model, rejected by the quality
+checks: perceptual gate, teacher forcing, held-out input; out-of-memory steps do not
+count). With every group at 8 bits a further failure proposes the target's pivot to its
+8-bit class (`<id>__fp8_w8a8`, source `w4a4-demotion`, once) and names the ideas left for
+W4A4 (per-token outer scales, a rotation, a norm-bias correction, bf16 for the top group);
+the W4A4 arm keeps its slices. The improve loop applies the policy before every slice of a
+W4A4 arm; the engineer prompt (the layers to keep at 8 bits, the probe's groups and why),
+the slice digest (`## Precision mix (W4A4)`: the mix, its last steps, the next group) and
+the round re-plan's target list show it; `w4a4_mix` events record each step. On a synthetic
+block (gate / up then six square layers, bf16, M = 256 and 66; `tests/test_w4a4_mix.py`) W4A4
+everywhere fails `near-lossless-fp4a` (cosine 0.939, relative L2 0.35) and the ladder
+passes from three groups at 8 bits (0.963 / 0.27; all seven: 0.995 / 0.096), the same on
+the CPU and on an NVIDIA A10 (sm_86, CUDA tensors; 0.4 s).
+
+**Backend policy.** The planner's table has a *Compute-bound W4A4 GEMM* row only on GPUs
+with block-scaled FP4 tensor cores and only in runs that allow `fp4_w4a4`: on sm_120 /
+sm_121 the CuTe `MmaMXF4NVF4Op` GEMM first (`cute_nvfp4_w4a4_gemm.py`, measured above), the
+Triton quantiser + `F.scaled_mm` inside CUDA graphs second; on sm_100 / sm_103 cuBLASLt
+NVFP4 through `F.scaled_mm` behind the Triton quantiser first, a `tcgen05` CuTe GEMM from
+`cute_sm100_gemm_tcgen05.py` for fused epilogues (no `mma.sync` there; not measured yet).
+Engineers of W4A4 MLPs and layers get the row and its "never" rules.
+
 Calibrated like the 8-bit and FP4 tiers (`docs/research-scripts/w4a4-233`, the reference
 math on real captures: captured inputs, 10 seeds of both per-channel redraws, x 3 / x 0.01 /
 x -1; failed draws near-lossless-fp4a · relaxed-fp4a):
@@ -1745,6 +1800,34 @@ why and naming the items the step overlaps;
 which items are not counted. `report.md` projects a file written before #121
 (or #114, whose kernel savings are per run) again from its savings and `history`.
 
+**Prediction error** (#226, `prediction.py`). `report.md` → *Prediction error* puts every
+accepted item next to what the integration measured when it added it, one row per item in
+the metric's ms (per second of audio for `metric=throughput`). *predicted* is the estimated
+gain of the step that added it as the projection counts it (`step.est_gain_ms`; of the
+first set, the baseline − its projection): a kernel's module-level estimate
+(`est_saved_ms_per_run` through `objective.from_run`), a transform's gain alone, nested
+kernels and overlapping items counted once, what the step removes subtracted. *measured*
+is the step's A/B, A − B medians, with the A/B's 95 % interval of its relative gain × A;
+*error* = measured − predicted, next to measured ÷ predicted. A step that added several
+items at once (the systems agent's combination) has one error, shared by its rows. A row
+whose step estimate is not its own estimate says why: it overlaps a counted item (counted
+once), it is a kernel nested in another, or it counts instead of items that counted before
+it. The first set is measured against its A/B's A when that was the unmodified model, else
+against the baseline of `analyze` (no interval). A kernel's row names its bound and timing
+context (`bound`, `context`, `l2` of its record). A region target's row (or a target
+naming a `fusion`) has its fusion candidate's prediction next to it (`profile/fusions.json`
+through `fusion.match`, as the improve scheduler expects it, #231), with its ratio when
+the step added only that item. A one-line summary gives the median ratio over the steps
+(each once) and the worst miss (the largest error in ms). On the accepted sets of
+`runs/openbmb--VoxCPM2/20261006-004718-retest2` (their numbers as
+`tests/test_not_projectable.py` keeps them, without the A/B records): median 0.44x over 3
+steps; the worst miss is the W8A8 DiT layer kernel, 19.47 ms per second of audio predicted
+for its step (its own estimate 37.57 ms, counted instead of the CFM solver's and the LocEnc's
+CUDA graphs) and 1.11 ms measured. The integration rows of `results.tsv` have the predicted
+saving next to the measured one (`pred_saved_ms`, see "Experiment ledger"), and the kernel
+library keeps the errors as a lesson (see "Kernel library and lessons").
+`python -m kernel_agent.prediction RUN_DIR [--json]` prints the section (or its records).
+
 A re-integration reuses an A/B (an item alone, a step, a swap) of the previous
 integration whose content is unchanged, whatever the snapshot names: every
 evaluation snapshots its files anew (`history/021_merge_..._cc6df165.py` and
@@ -2003,7 +2086,13 @@ sanitizer's first report goes to `integration.json` → `recheck` → `memcheck`
 per run, and the target's next engineer prompt (`## Refused by the
 integration`). A missing or failing sanitizer is recorded with its reason
 (`skipped`, `error`, `timeout`) and the kernel kept; a re-integration runs such a
-memcheck again, and reuses a decided one.
+memcheck again, and reuses a decided one. A checked process that made no CUDA call the
+sanitizer saw (a CPU-only run; CUDA work in a child process, which `--target-processes
+application-only` does not track) passes with `unchecked` saying nothing was checked:
+compute-sanitizer 2025.2 ends such a log with "Tracking kernels launched by child
+processes requires the --target-processes all option.", a notice, not a memory error
+(measured on an NVIDIA A10 with 2025.2.1: with CUDA in the process itself the log is a
+plain `ERROR SUMMARY`).
 
 A kernel that synchronises inside (every native project; a single file whose source has
 shared memory, `cp.async` / mbarrier pipelines, acquire / release counters or atomics:
@@ -2014,6 +2103,24 @@ threads never reach), after a clean memcheck. Their errors refuse it the same wa
 each tool's status, error count, report and seconds. Racecheck sees shared memory only;
 global-memory races are what the evaluator's determinism check of native candidates is for
 ([megakernel kit](#native-engines-when-module-kernels-plateau)).
+
+Whether each tool sees its hazard on this GPU is a `doctor` probe (`racecheck`,
+`synccheck`; `memcheck.selftest`): `kernels/sanitizer_probe.py` compiles four one-block
+kernels with NVRTC, a shared-memory exchange between two warps with and without its
+barrier, and a barrier every thread reaches next to a `__syncthreads()` half of a warp
+reaches. The tool must report the hazard as an error and not the clean kernel; the probe
+prints the first report line, says when it does not (a clean run of that tool is then no
+evidence here) and never fails `doctor`. Measured on an NVIDIA A10 (sm_86) with
+compute-sanitizer 2025.2.1 (CUDA 12.9, `doctor --fetch-sanitizer`): memcheck and racecheck
+report their hazards (`Error: Race reported between Write access at ka_race+0x80 in
+ka_sanitizer_probe.cu:13 and Read access ... [256 hazards]`); synccheck reports no barrier
+error at all, neither the divergent `__syncthreads()` (with the other half exiting, reading
+or at a second barrier) nor a `__syncwarp` mask that leaves out its caller (the tool docs'
+own example), so on that GPU a clean synccheck says nothing about `__syncthreads()`. It
+does check mbarrier protocols there: the megakernel kit's page pool failed it at 28
+layers until every consumer observed its previous empty phase (see the kit). The RTX
+5070 Ti's logs (compute-sanitizer 2026.3) report both hazards
+(`tests/fixtures/sanitizer/`).
 
 Issue #115's VAE decoder kernel (`vae_decoder__reduced` 004, Triton, accepted at
 7.88×) is clean on its captured cases alone (`[16, 64, 240]`, `[16, 64, 32]`,
@@ -2051,7 +2158,8 @@ installed, with a torch and Triton its requirements accept) compiles and runs th
 RMSNorm example (skipped with the reason otherwise), and a
 `kernel_agent.graphloop` loop runs through a CUDA-graph WHILE node with a chunk IF node
 (`graph_conditional`; skipped below a CUDA 12.4 driver or without `cuda.core`, where
-device loops use K-step unrolled graphs). A probe that fails says why and never fails `doctor`; the results go to
+device loops use K-step unrolled graphs), and racecheck and synccheck report their deliberate
+hazards (`racecheck`, `synccheck`, above; skipped without a usable sanitizer). A probe that fails says why and never fails `doctor`; the results go to
 `~/.cache/kernel-agent/probes-<gpu>-torch<version>.json`.
 `kernel-agent memcheck capture.pt candidate.py` runs one candidate.
 
@@ -2523,25 +2631,78 @@ intermediates written and read back, the module boundaries crossed and the
 lowest common ancestor call (its class is a region's `parent_class`, the ops its
 `region`). The same chain in every layer is one row (`calls`, `instances`).
 
-The estimate per run is `Σ round trips of intermediates larger than L2 / DRAM
-bandwidth + calls × launches saved × per-launch cost`: an intermediate no larger
-than the GPU's L2 stays there between its write and its read and saves no bytes
-(what made `fused_gate_up_silu` buy nothing on the 48 MB L2 of the RTX 5070 Ti);
-the per-launch cost is the measured launch floor of an eager run, at most the
-run's own time per recorded op, or ~0.9 µs per kernel boundary when the kernel
-view shows the run mostly CUDA-graph launched (docs/PARALLEL.md §4.6). The
-candidates go to `profile/fusions.md` + `fusions.json`, the top 10 to
-`summary.md` (*Fusion candidates (measured)*); a re-profile of an optimised model
-shows the run's own table. The planner takes a region from a row (`parent_class`,
-`region`, and `fusion` = its id); the improve scheduler expects that row's saving
-for the region arm (see "Scheduler"), and the native stage graph takes chains
-that span stages as evidence for a group. `python -m kernel_agent.profiling.fusion
-profile.json --window-ms <ms>` ranks a profile's chains again.
+The estimate per run is `Σ DRAM bytes of the intermediates' round trips / DRAM
+bandwidth + calls × launches saved × per-launch cost`. Which bytes go through DRAM
+follows an LRU-ish L2 rule: the GPU's L2 is taken to hold the newest bytes
+touched, and the ops between an intermediate's write and its last read inside the
+placement touch some distinct bytes, the *traffic* (what they read, weights
+included, and write, outside the intermediate's storage; per storage the most
+bytes one op touches in it). `min(its bytes, L2 − traffic)` of it is still in the
+L2 at that read; the rest counts, as that share of its round trip. So an
+intermediate that fits with its traffic saves no bytes (what made
+`fused_gate_up_silu` buy nothing on the 48 MB L2 of the RTX 5070 Ti); a small one
+that the traffic evicts counts (a norm's output that `up_proj` reads after
+`gate_proj` streamed its 6.3 MB weight, on a 6 MB L2); a large one read at once
+counts only the part beyond the L2; with the L2 unknown every one counts (an upper
+bound). Each intermediate records its bytes, traffic, DRAM bytes and why (`in` L2,
+evicted by `traffic`, larger than the L2: `size`, `unknown`), and `fusions.md`
+says it per row (*Intermediates and the L2*). An approximation from bytes, not the
+hardware's replacement policy: the reads in between are not taken to refresh it,
+and work the recorder does not see (another process, a graph replay) is not
+traffic. The per-launch cost is the measured launch floor of an eager run, at
+most the run's own time per recorded op, or ~0.9 µs per kernel boundary when the
+kernel view shows the run mostly CUDA-graph launched (docs/PARALLEL.md §4.6).
 
-Measured on the RTX 5070 Ti (eager, bf16; a loaded host, so the windows are long and
-a launch is priced at the run's time per op). Every intermediate was at most 4 MB, in
-the 48 MB L2: the savings are launches, the byte column is 0. Overlapping rows (they
-share a projection) do not add up.
+Rows can share an op: q / k / v take the input norm as a prologue while `q_proj`
+takes `q_norm` + RoPE as its epilogue; `gate_proj` / `up_proj` take the
+post-attention norm as a prologue while SiLU · mul is their epilogue. One GEMM
+cannot take in both, so such savings do not add up. The miner records per
+placement the rows whose placements take in the same op in some occurrence
+(`overlaps`), and the ranking is overlap-aware: the placements of every row are
+taken greedily by saving, each when its row has none yet and it shares no op with
+one taken. A row whose best placement is taken in elsewhere takes its next one
+(*fuse* says what it gave up, `blocked` in the json); a row with no placement
+left that saves something (a lone SiLU whose only saving is the epilogue of a
+GEMM another row takes in) is an alternative, listed under the row it overlaps
+(↳) and never added. The counted rows (`counted`) share no op: their savings add
+up, and the table states their total. Greedy and deterministic (ties: the
+innermost parent, the placement, the id), not the best combination in general.
+
+The candidates go to `profile/fusions.md` + `fusions.json`, the top 10 counted
+rows with their alternatives to `summary.md` (*Fusion candidates (measured)*); a
+re-profile of an optimised model shows the run's own table. The planner takes a
+region from a row (`parent_class`, `region`, and `fusion` = its id); the improve
+scheduler expects that row's saving for the region arm (by parent class: the
+counted rows first; see "Scheduler"), and the native stage graph takes chains that
+span stages as evidence for a group, adding up only those that share no op. A
+`fusions.json` from before (version 1: no traffic, no overlaps) stays readable,
+every row counted. `python -m kernel_agent.profiling.fusion profile.json
+--window-ms <ms>` ranks a profile's chains again.
+
+Measured on an NVIDIA A10 (sm_86, 6 MB L2; eager, bf16): Qwen3-0.6B, a 512-token
+prompt + 64 tokens, 103,822 ops, 70 host syncs, 24 chains, an 8.8 s pass (8.6 s
+with the size-only rule), a 1,398 ms window, a launch priced at 13.5 µs (the
+run's time per op). Both columns are priced at that window and the measured
+peaks (487 GB/s DRAM); *before* is the size-only rule ranked row by row, *after*
+the traffic rule ranked overlap-aware.
+
+| chain (phase) | before: fuse, saves ms | after: fuse, saves ms | L2 (after) |
+|---|---|---|---|
+| `k_proj` → `k_norm` → RoPE → KV `cat` (decode) | epilogue, 320.6 | epilogue, 320.6 | in L2 |
+| `q_proj` → `q_norm` → RoPE (decode) | epilogue, 297.7 | epilogue, 297.7 | in L2 |
+| residual add → `post_attention_layernorm` → gate / up (decode) | prologue, 237.5 | prologue, 237.5 | the norm's output evicted by `gate_proj`'s 6.3 MB weight before `up_proj` reads it: 10.8 MB DRAM, 0.02 ms |
+| residual add → `input_layernorm` (decode) | prologue into q / k / v, 251.9 | epilogue of `down_proj`, 206.1 (the q / k / v prologue shares `q_proj` / `k_proj` with the rows above) | in L2 |
+| gate, up → SiLU · mul (decode) | epilogue, 71.2 | chain, 23.8 (its epilogue shares gate / up with the prologue above, its prologue `down_proj` with the epilogue above) | SiLU's output evicted by `up_proj`: 21.7 MB DRAM |
+| `q_norm` + RoPE (prefill) | epilogue of `q_proj`, 4.7 (0 bytes) | prologue of SDPA, 5.9 (1.18 ms of bytes) | 4 intermediates evicted by ≤ 13.8 MB of traffic: 574 MB DRAM |
+| all 24 rows | Σ 1,298.5 ms, 77.8 MB DRAM (shared GEMMs counted twice) | Σ 1,203.3 ms counted (each row's best: 1,300.9), 1,100.6 MB DRAM | of the rows' intermediates: 19 evicted by traffic, 1 larger than the L2, 212 in L2 |
+
+On this eager, launch-bound run the bytes stay small next to the launches
+(2.26 ms of 1,203 ms); the traffic rule matters most where intermediates are large
+(prefill, batched runs) on a small L2. Measured earlier on the RTX 5070 Ti (eager,
+bf16; a loaded host, so the windows are long and a launch is priced at the run's
+time per op), ranked row by row with the size-only rule: every intermediate was at
+most 4 MB, in the 48 MB L2, so the savings are launches and the byte column is 0;
+the rows that share a projection (as on the A10 above) do not add up.
 
 | model, run | chain (phase) | calls | fuse | parent class | launches | saves ms |
 |---|---|---|---|---|---|---|
@@ -2680,19 +2841,41 @@ it back: `--page details` gives Nsight's rules with their estimated speedup (`ru
 the 3 largest, global estimates first), `--page source --print-source cuda,sass` the
 warp-stall samples per source line (`lines`: the 5 lines with most samples, their share
 of the kernel's samples and dominant stall; `flagged`: lines with uncoalesced global
-accesses or shared-memory bank conflicts). Triton kernels carry line info; CUDA C++
-needs `-lineinfo` (`extra_cuda_cflags`, NVRTC `ProgramOptions(line_info=True)`), else
-the lines are SASS instructions. A failed details run leaves the metrics as they are
+accesses or shared-memory bank conflicts). Source lines need line info in the binary,
+else the lines are SASS instructions: Triton and TileLang kernels always carry it, and
+the `--ncu-mode` process (only it) builds the candidate's CUDA C++ with it
+(`toolchain.lineinfo_env`): `-lineinfo` in `NVCC_APPEND_FLAGS` for every nvcc
+(`load_inline`, native projects, whose build key includes the flags), `load_inline` builds
+in a `lineinfo/` directory of `TORCH_EXTENSIONS_DIR` (torch's build hash does not cover
+the flag: in the shared directory the cached build without it would load, and a rebuild
+would evict the build the evaluations load), NVRTC through `toolchain.nvrtc_kernels`
+with `lineinfo` and the program named by a file holding its source
+(`~/.cache/kernel-agent/nvrtc-src/`, where ncu reads the line text); a `Program`
+compiled directly needs `ProgramOptions(lineinfo=True)`. Measured on an NVIDIA A10
+(sm_86): `cuda_rmsnorm.py`'s extension and `nvrtc_rmsnorm.py`'s cubin built that way
+carry `.debug_line` / `.nv_debug_line_sass`, the evaluations' builds none (ncu itself is
+not installed there). A failed details run leaves the metrics as they are
 (`ncu.details.status: error`).
 
 **SASS opcode census and directives** (#230). Every `profile` evaluation also reads
 what each candidate kernel was compiled to (`kernel_agent/kernels/sass.py`, no GPU work,
 no ncu, no admin counters): the cubins of the candidate process (Triton
-`CompiledKernel.asm["cubin"]` including Inductor's, an NVRTC `ObjectCode` the candidate
-keeps alive, the `.so` files built on this machine and mapped into the process:
-`load_inline`, native projects, TileLang; CuTe DSL's compiled functions) through
-`cuobjdump -sass` (the toolkit's or Triton's bundled one); kernels that ran without SASS
-there (library kernels, a freed NVRTC `ObjectCode`) are listed under `missing`. Per kernel
+`CompiledKernel.asm["cubin"]` including Inductor's; NVRTC kernels compiled through
+`kernel_agent.toolchain.nvrtc_kernel` / `nvrtc_kernels`, which keep each kernel's cubin
+for as long as the kernel lives (weak references: `cuda.core` frees the `ObjectCode`
+once `get_kernel` returns, and a `Kernel` does not expose its cubin), or an `ObjectCode`
+the candidate keeps alive; TileLang's `JITKernel`s: the cubin of the CUDA module their
+adapter's runtime module or loaded library imports, else the cubins TVM embeds raw in
+the `executable.so` it loads, which cuobjdump does not read; the `.so` files built on
+this machine and mapped into the process: `load_inline`, native projects; CuTe DSL's
+compiled functions) through `cuobjdump -sass` (one with `nvdisasm` beside it first: a
+partial toolkit may lack it, Triton bundles both); kernels that ran without SASS there
+(library kernels, an NVRTC kernel compiled without the helper whose `ObjectCode` was
+freed) are listed under `missing`. Measured on an NVIDIA A10 (sm_86): `nvrtc_rmsnorm.py`
+through the helper gives `rmsnorm_bf16 (sm_86): no tensor-core MMA; LDG 3x16b` (main's
+version, `Program` directly, listed it under `missing`), the `load_inline` FP8 skinny GEMM
+`fp8_skinny_kernel (sm_86): HMMA.16816.F32.BF16 x64, HMMA.16816.F32 x64; LDL/STL 120`
+over its 80 template variants. Per kernel
 it counts opcodes by category (tensor-core MMA with its full opcode, e.g.
 `QMMA.SF.16832.F32.E4M3.E4M3.E8`; global loads by width; `LDGSTS`; TMA; `LDL` / `STL`;
 tensor memory; barriers; shuffles; atomics; fp32 / fp16 math) and keeps the most frequent
@@ -2702,6 +2885,11 @@ refreshes them after a CUDA or Triton upgrade; Turing's forms are `HMMA.1688` an
 `IMMA.8816`): `HMMA` / `IMMA` / `QMMA` / `OMMA` (`mma.sync`), `HGMMA` /
 `QGMMA` / `IGMMA` (wgmma), `UTCHMMA` / `UTCQMMA` / `UTCIMMA` / `UTCOMMA` (tcgen05), and
 e4m3 `mma.sync` on sm_90 / sm_100 shows as `F2FP.F16.E4M3.UNPACK_B` + `HMMA` (emulated).
+A tcgen05 MMA carries its block scaling as an operand (a `tmem[]` scale operand after its
+instruction descriptor), not a modifier: the census marks it `.SF` like sm_120's own
+`QMMA.SF` / `OMMA.SF` (`UTCQMMA.SF`, `UTCOMMA.SF.4X`), so the FP8 example's GEMM compiled
+on the CPU for sm_100a (128-row tiles) shows `UTCQMMA` for `tl.dot` and `UTCQMMA.SF` for
+`tl.dot_scaled`, as `QMMA.16832.F32` and `QMMA.SF` on sm_120a.
 Without `cuobjdump` the census says so (`sass.status: unavailable`); `kernel-agent doctor`
 prints which one it uses. `kernel_agent/kernels/directives.py` turns census, compiler
 stats, ncu (bounds, rules, stall lines), per-kernel GPU time, the evaluation's roofline
@@ -2709,7 +2897,8 @@ bound and the GPU's facts (capability, measured `mma.sync` rates) into at most 5
 directives by documented rules: local memory (spills), emulated FP8, a tensor-core
 instruction below this GPU's full-rate path for its operands (`mma.sync` where wgmma or
 tcgen05 runs faster; plain `QMMA.F32` where the measured `QMMA.SF` rate is higher, as
-on sm_12x), fp32 math in a compute-bound kernel without tensor cores, a tensor pipe under
+on sm_12x; on sm_100 plain and block-scaled `UTCQMMA` are both FP8's full rate, FP4's is
+`UTCOMMA.SF`), fp32 math in a compute-bound kernel without tensor cores, a tensor pipe under
 30 % active (ncu) in a kernel that issues MMAs, the line with most stall samples, uncoalesced or bank-conflicting lines, narrow global loads in a
 memory-bound kernel, Nsight's top rule, register-staged MMA operands without cp.async /
 TMA. Each carries its numbers ("_gemm_kernel: compute-bound at 21 % of SOL; issues
@@ -2797,6 +2986,15 @@ re-profile makes a new one for its re-plan.
   when decode rows read a KV cache.
 * **End to end**, per precision: the run with every class at its floor, nested
   classes counted once (the non-overlapping set of `projection.py`).
+* **Library bar.** Once the library scout ran (see "Library scout" below),
+  `profile/ceilings.md` (the run's and the newest round's, rendered again from
+  `ceilings.json`) has a *library bar* column: the module speedup of the best library
+  candidate on the targets that time each row (their instance groups; a target without
+  a known group: its class's rows in its phase), `1.31x torch-sdpa`, `none correct`,
+  `no adapter` or `scout failed`; `—` where none of the row's targets was scouted (a
+  parent's row that holds a scouted child shows `—`: the bar is the child's). Several
+  targets on one row are named (`` `dit` 1.31x torch-sdpa; `dit2` no adapter ``). The
+  table's numbers stay the floors: the bar is a floor to beat, not a bound.
 * The planner ranks targets by ceiling × share (*saves ms*) and names each
   target's bound with its number. The improve scheduler takes each kernel arm's
   expected gain from the table of the newest (re-profiled) run, at the arm's
@@ -3454,7 +3652,8 @@ model and starts a new round (`kernel_agent/improve.py`,
 
   A region target takes its expected gain from the fusion table instead (see
   "Fusion candidates (measured)"): the row of its `fusion` id, else the largest
-  region row of its `parent_class`, converted to the metric's ms; `expected` is
+  region row of its `parent_class` (a counted row before an alternative that
+  shares a GEMM with one), converted to the metric's ms; `expected` is
   that predicted saving minus what its best kernel saved so far, and never less
   than 1 − 1/1.1 (≈ 9 %) of the prediction (`remaining_ms` as below).
 
@@ -3610,7 +3809,9 @@ model and starts a new round (`kernel_agent/improve.py`,
   `pivot_failed`; `improve.json` → `research[].pivot`; the improve section of
   `report.md`, the dashboard's target table and `kernel-agent status` show
   each arm's precision. The engineer of the new arm is pointed at the old
-  arm's kernels, notes and plan.
+  arm's kernels, notes and plan. A W4A4 target whose per-layer mix has every
+  group at 8 bits and still fails a gate proposes its pivot to the 8-bit class
+  itself (source `w4a4-demotion`, "W4A4 (`fp4_w4a4`)" above).
 * **Re-integration.** After every `--integrate-every 4` kept results, the
   integration of `optimize` measures the combination end to end
   (`--integrate-every 0`: only the final integration, and the one a new round
@@ -4099,7 +4300,24 @@ schedule for deadlocks and early starts over random SM speeds and predicts its t
 a trace. Template: `agent/examples/native_megakernel/` (RMSNorm → GEMV → residual layers,
 generic opcodes, and a graph + PDL and a grid-barrier baseline from the same math; 28
 layers of [1024, 1024] on an RTX 5070 Ti: 84–87 µs against 77.9 µs for graph + PDL and
-198 µs for the grid-barrier kernel, DRAM floor 70.5 µs); the
+198 µs for the grid-barrier kernel, DRAM floor 70.5 µs). Measured on an NVIDIA A10 (sm_86,
+`cp.async` page loads; PDL needs sm_90+, so the baseline is a plain graph there and its
+`label` says so), 28 layers:
+
+| | [1024, 1024] | [2048, 2048] | [4096, 4096] |
+|---|---|---|---|
+| megakernel (inflight 2; 16 rows, 8 at 4096) | 155.7 µs | 566.2 µs | 2481 µs |
+| plain graph, one kernel per layer | 204.4 µs | 532.4 µs | 1946 µs |
+| grid-barrier kernel | 431.8 µs | 848.5 µs | 2140 µs |
+| DRAM floor (487 GB/s) | 120.7 µs | 482.6 µs | 1930 µs |
+
+(`docs/research-scripts/megakernel-a10-225/bench_chain.py`, its output and per-layer trace
+next to it). The example's tiles fit the GPU's page pool by default (`rows=0`:
+`tile_rows`; 16 rows of a 4096-wide layer exceed a 99 KB pool, where the build used to
+fail), and each consumer thread observes its previous empty phase of a page before arriving
+again, without which synccheck refused the example from 6 layers on (151552 "Missing wait"
+errors at 28 layers on the A10; the protocol was correct, the check could not tell).
+The
 `native-engines` skill's `megakernel.md` is the milestone ladder, and a native digest
 points to it when a stage's best kernel synchronises its grid or launches more than 3
 kernels per call. Native candidates must give the same bits twice: the evaluator runs
@@ -4248,7 +4466,7 @@ InferenceBench a plain configuration search beat agents (docs/RESEARCH.md). Befo
 target's first engineer session (`optimize`'s kernels phase; `improve` before any
 slice, so targets captured in later rounds too) the **library scout**
 (`kernel_agent/libscout/`, issue #227) tries what libraries give on it, with no
-Claude session, once per target:
+Claude session, once per target and library install (see *Scouting again* below):
 
 1. **Op families** from what the reference calls on its dominant captured case (a
    `TorchFunctionMode` trace with the data flow between calls, never module names):
@@ -4293,7 +4511,12 @@ Claude session, once per target:
    (SDPA, softmax) is called again on its recorded inputs with the reference's op and
    the library's, checked in the capture's tolerance tier and timed interleaved, as
    kernel time (replayed from a CUDA graph) and per eager call (host launch cost
-   included). A config whose op bars all lose by more than 10 %, or fail, is not swept.
+   included). A pattern an adapter folds has its op bar too: each written-out RMSNorm
+   (`rms_norm (written out)(...)`) is replayed from its recorded calls (the cast, `pow`,
+   `mean`, `add`, `rsqrt`, the multiplies: the reference's own kernels) against what the
+   adapter's rewrite puts in its place (`patterns()` of the candidate: `F.rms_norm` with
+   `FUSE=0` / `FUSE=1`, a library's RMSNorm) on the same x and weight. A config whose op
+   bars all lose by more than 10 %, or fail, is not swept.
 5. **Sweeps**: every adapter that runs goes through `sweep_candidate`'s machinery
    (its configs checked and timed with racing, the best through the full evaluator),
    the probe and all sweeps under one GPU lock, and is recorded like an agent's sweep:
@@ -4304,10 +4527,33 @@ Claude session, once per target:
    engineer's first prompt and every improve digest get `## Library bar` (the best scout
    candidate with its speedup and % of SOL, every adapter's verdict, the op bars, what
    was not run and why), the planner's round context and `profile/ceilings.md` (also of
-   the newest round) `## Library bars`. It is a floor, never a stop signal: scout rows
-   extend no streak and use no agent's evaluation budget, and a best the scout set
-   retires no arm by the speed-of-light rule or the speedup goal (the scheduler's
-   expected gain stays the floor minus the bar).
+   the newest round, written again after each round's re-profile) `## Library bars` and
+   a *library bar* column in its table (see *Ceilings for the planner*), and `report.md`
+   a `## Library scout` section: per target the op families, the adapters tried and
+   their verdicts, the best library candidate (`library:<package>@<version>`, speedup,
+   % of SOL), the best agent kernel and whether it beat the bar, then the adapters not
+   run with why and the key each target was scouted under. It is a floor, never a stop
+   signal: scout rows extend no streak and use no agent's evaluation budget, and a best
+   the scout set retires no arm by the speed-of-light rule or the speedup goal (the
+   scheduler's expected gain stays the floor minus the bar).
+
+**Scouting again.** `run.json` → `libscout.scouted.<target>.key` remembers what a scout
+measured besides the capture: the GPU (`NVIDIA A10 (sm_86)`), the op families its
+reference calls and the installed version of every distribution the adapters of those
+families use on that GPU (each adapter's package and the runtime wheels its kernels
+come from: torch, the cuBLAS wheel under cuBLASLt and `_scaled_mm`, cuDNN under SDPA's
+cuDNN backend, flash-attn, flashinfer-python, quack-kernels and the CUTLASS DSL,
+liger-kernel and Triton; the CUDA toolkit's `nvcc` when one of them builds an
+extension), read from the package metadata without importing anything. Every pass of the
+scout step (each `optimize` target, every `improve` loop pass) compares it with what is
+installed now: a library of the target's families installed, upgraded or removed, or
+another GPU, scouts the target again and logs why (`libscout: <target>: scouting again:
+liger-kernel 0.6.1 → 0.6.2`); a library of other families (Liger for an attention-only
+target) or of an architecture this GPU lacks (FlashAttention 3 on sm_86) does not. A scout
+remembered before the key is scouted again once (`its remembered scout has no library
+key`). The new scout's rows join the ledger next to the old ones (each labelled with its
+own `library:<package>@<version>`), `libscout.json` and the bar are the new scout's, and
+`run.json` counts the scouts and keeps why the last one ran.
 
 The export writes `optimized/requirements.txt` with the exact version of every library
 an exported kernel declares (and `manifest.json` → `libraries` with its licence);
@@ -4349,6 +4595,26 @@ on copies of the runs' captures, on a machine shared with other jobs (load avera
   `fallback`, the scout's 3 candidates are 1 faster (1.26x), 1 correct and slower, 1
   `fallback`; Qwen3 `decoder_layer_decode`'s was 8.05x (a whole-layer CUDA kernel), the
   scout's 2 of 3 faster (1.35x, 1.31x): a floor, far below what the engineers reached.
+
+Measured on an NVIDIA A10 (sm_86, torch 2.10.0+cu128, 150 W power cap, a GPU shared with
+another tenant), the probe on toy captures (`tests/libscout_toy.py`):
+
+* The written-out RMSNorm (bf16 in, cast to fp32 and back, 8 recorded calls) against
+  `F.rms_norm`, kernel time (CUDA graph), two runs: [64, 1024] reference 15.2 us, `FUSE=1`
+  3.0 us (5.05x, 5.13x), `FUSE=0` 4.5 us (3.39x, 3.41x); [4096, 1024] 323 us, 37.5 us
+  (8.6x), 74.5 us (4.3x). Per eager call about 69 / 12.4 / 21.0 us at [64, 1024].
+* The SDPA core at 11 tokens (GQA, 16 heads over 2, batch 16, bf16): the reference's flash
+  18.7 us, **cuDNN 10.3 us (1.82x)**, math 39.5 us; mem-efficient has no kernel for this
+  call here (`No available kernel`): its op bar fails and the config is not swept.
+* Scouting the SDPA core through `scout_libraries` took 16.6 s (probe and the sweep of the
+  two configs the op bars kept: flash 0.38x, cuDNN 0.36x at module level, eager, where
+  Dynamo's guards cost more than the kernel saves; the full evaluation then stopped with
+  a `runtime_error` on this torch, whose `_KinetoEvent` has no `activity_type`, which
+  `kernels/integrity.py` calls); called again with nothing changed, 0.0 s (no scout);
+  after a faked torch upgrade (the metadata version patched to 2.10.1) it scouted again
+  (16.7 s) and logged `libscout: core: scouting again: torch 2.10.0+cu128 → 2.10.1+cu128`,
+  then held again. The remembered key: `{"gpu": "NVIDIA A10 (sm_86)", "families":
+  ["sdpa"], "libraries": {"nvidia-cudnn-cu12": "9.10.2.21", "torch": "2.10.0+cu128"}}`.
 
 ### KernelBench regression suite
 
@@ -4458,8 +4724,10 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   e4m3 `mma.sync` on Ada, `wgmma` on Hopper, `tcgen05.mma` on datacenter Blackwell,
   the block-scaled `QMMA.SF` on GeForce Blackwell with this GPU's measured
   `QMMA.F32` / `QMMA.SF` rates, the half-rate rule dropped where both measure the
-  same); a class whose precision the GPU cannot run is left out; each family adds what
-  it needs for the peak (`backends.ARCH_POLICY`, `ARCH_RULES`). The other rows keep
+  same); the opt-in compute-bound W4A4 GEMM row (`fp4_w4a4`, #233) appears on sm_100 /
+  sm_103 (`tcgen05.mma kind::mxf4nvf4`) and sm_120 / sm_121 (block-scaled FP4 `mma.sync`)
+  in runs that allow it; a class whose precision the GPU cannot run is left out; each
+  family adds what it needs for the peak (`backends.ARCH_POLICY`, `ARCH_RULES`). The other rows keep
   their evidence, labelled as measured on the RTX 5070 Ti. Turing has its own small-M
   GEMM, short-attention, decoder-layer and bf16-GEMM rows (fp16 `mma.sync` m16n8k8, WMMA,
   cuBLAS fp16; Triton's int8 `tl.dot` does not compile below sm_80), and no row or rule
@@ -4513,7 +4781,7 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   names the wider set its device code compiles for (`gpu_arch.example_compiles`).
 * **Compile matrix** (#256, CPU only). `tests/test_arch_matrix.py` compiles every bundled
   example and kernel-agent's own device code (graphloop, `mma_peaks`, the PDL probe, the
-  memcheck probe) for sm_75, sm_80, sm_86, sm_89 and sm_120 the way each backend builds it
+  memcheck and sanitizer probes) for sm_75, sm_80, sm_86, sm_89 and sm_120 the way each backend builds it
   (`load_inline`'s nvcc command, native projects, NVRTC, Triton with the JIT's
   specialisation, CuTe DSL with fake tensors, TileLang) and fails when an example compiles
   where its `ARCHS` / `ARCHS_COMPILES` exclude the arch (widen it, or declare it) or does
@@ -4568,8 +4836,12 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   toolchain, `doctor --smoke` and policy: `tests/test_turing.py`), the compile matrix
   above, and run on an RTX 5070 Ti; the CuTe DSL templates compile for sm_90a / sm_100a.
   The sm_75 / sm_80 / sm_86 / sm_89 code paths ran on the RTX 5070 Ti under emulation
-  (`doctor --smoke --emulate-arch ...` passes for each: correctness only). On other GPUs
-  nothing has run yet: `kernel-agent doctor --smoke` is the first check there.
+  (`doctor --smoke --emulate-arch ...` passes for each: correctness only). Run on an NVIDIA
+  A10 (sm_86, #225): the megakernel kit's GPU tests and its example
+  (correctness, the evaluator with its determinism stress, the trace, memcheck / racecheck /
+  synccheck at 2 and 28 layers, timings against both baselines: "Native engines") and
+  `doctor`'s probes, `cp.async` page path, 99 KB pools, 72 resident blocks and the watchdog
+  included. Elsewhere `kernel-agent doctor --smoke` is the first check.
 
 ### Dtype and memory by GPU
 
@@ -4784,7 +5056,9 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
 ~/.cache/kernel-agent/library/          ($KERNEL_AGENT_LIBRARY overrides it)
   <sm_arch>/<module_class>/<entry-id>/  kernel.py  spec.json  result.json  NOTES.md  entry.json
   <sm_arch>/backends.jsonl              per run and target: class, planned and tried backends, winner
+  <sm_arch>/predictions.jsonl           per run and accepted item: predicted vs measured gain
   lessons/<backend>.md  lessons/<module_family>.md
+  lessons/estimates.md                  measured ÷ predicted gain per kind of item (kernel-agent's)
 ```
 
 * **Store.** After every integration (`optimize` and each re-integration of
@@ -4844,6 +5118,19 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
   prompt cache") and answers with structured output only. kernel-agent writes the
   files itself: only names of this run's backends and module families, at most
   20 rules each. The librarian runs again only when the ledger has new rows.
+* **Prediction errors** (#226). After every integration, kernel-agent records each
+  accepted item's prediction error (see "Prediction error" under Integration) in
+  `<sm_arch>/predictions.jsonl`, replacing the run's earlier lines: its kind (kernel,
+  transform, region kernel), a kernel's module family, bound and timing context, its own
+  estimate, the estimated and measured gain of the step that added it, the error and
+  ratio, how many items that step added, and a region's fusion prediction and ratio. From
+  these records it writes `lessons/estimates.md` itself (the librarian never does), in
+  words that name no model: the median measured ÷ predicted gain per kind of item, a
+  kernel's by its bound and timing context, steps of several items in a row of their own,
+  e.g. `sm_120: kernel estimates (module-level), memory-bound, timed graph / cold L2: the
+  integration measured 0.50x of the predicted gain (median of 3 steps in 3 runs; 0.25x ..
+  1.50x)`. The planner's prompt gets the rules of its GPU architecture next to the
+  backend track record. Nothing is recorded under `--emulate-arch`.
 * **Safety.** Entries are code that will run. An entry is reused only when
   every file still has its recorded sha256. Otherwise a `LIBRARY: ... refused`
   line and a `library_rejected` event are emitted. Entries of another GPU
@@ -4968,7 +5255,8 @@ Triton toolkit (#148, the `triton-kernels` skill), for any model:
 with `--compile-check`).
 
 **Backend policy by target class.** The planner gets a table of target classes
-(compute-bound FP8 GEMM, small-M GEMV, attention over ≤ 16 tokens, conv, fused
+(compute-bound FP8 GEMM, compute-bound INT8 GEMM, compute-bound W4A4 GEMM where the run
+allows `fp4_w4a4`, small-M GEMV, attention over ≤ 16 tokens, conv, fused
 decoder layer, bf16 GEMM, norm / glue) with the first and second backend of
 each and the measured evidence (docs/RESEARCH-TRITON.md §5.1), and each engineer
 gets its target's row (`kernel_agent/backends.py`). Classes are read from the
@@ -5291,8 +5579,8 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  kind  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  review  early
-worker  session  idea  title  hypothesis
+est_saved_ms  pred_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags
+review  early  worker  session  idea  title  hypothesis
 ```
 
 Every row is one experiment, as in autoresearch's `results.tsv`:
@@ -5323,6 +5611,14 @@ Every row is one experiment, as in autoresearch's `results.tsv`:
   integration step's or probe's items. Every experiment can be reproduced from the run
   directory, also after later re-integrations replaced `integration.json`.
 
+`est_saved_ms` of a kernel row is the evaluator's estimate (ms per run of the workload),
+of an `e2e` row the measured saving: baseline − its median. An integration row (a step's
+B, a kernel probed alone) has the saving it was predicted to show next to it,
+`pred_saved_ms` (#226): baseline − (A as measured in the same A/B − the step's estimated
+gain, as the projection estimates an accepted step; see "Prediction error" under
+Integration), so `est_saved_ms − pred_saved_ms` is the step's measured − estimated gain. It
+is empty for a transform probed alone (its gain alone is its estimate), a step with an item
+that has no estimate, a measurement of A again and every other row.
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
 "Speed of light"). `eval_s` is the time an evaluation took and `queue_s` the
 time it waited for the GPU behind other jobs before that (see "GPUs and the GPU

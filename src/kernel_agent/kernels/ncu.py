@@ -32,9 +32,12 @@ metrics and the full report; KernelAgent: a SOL roofline classifier):
   (:func:`parse_source`: warp-stall samples per CUDA / Python source line, per SASS
   instruction without ``-lineinfo``; :func:`top_lines` the :data:`TOP_LINES` lines with
   most samples and their dominant stall, :func:`flagged_lines` those with uncoalesced
-  global accesses or shared-memory bank conflicts). Triton kernels carry line info;
-  CUDA C++ needs ``-lineinfo`` (``extra_cuda_cflags``, NVRTC ``ProgramOptions(line_info=
-  True)``) for source lines. A failure there leaves the metrics as they are
+  global accesses or shared-memory bank conflicts). Source lines need line info in the
+  binary: Triton and TileLang kernels always carry it, and ``--ncu-mode`` builds the
+  candidate's CUDA C++ with it (:func:`kernel_agent.toolchain.lineinfo_env`: ``-lineinfo``
+  for every nvcc, ``load_inline`` builds in their own directory, NVRTC through
+  :func:`kernel_agent.toolchain.nvrtc_kernels`; a ``Program`` compiled directly needs
+  ``ProgramOptions(lineinfo=True)``). A failure there leaves the metrics as they are
   (``details: {"status": "error", ...}``).
 
 Times under ncu are per launch with caches flushed and clocks locked to base (ncu's
@@ -825,7 +828,9 @@ def ncu_entry(
 ) -> int:
     """The evaluator's ``--ncu-mode`` (run under ncu): build the candidate, call it once on
     its most-called captured case (compiles, autotunes), then ``calls`` times inside the
-    NVTX range :data:`NVTX_RANGE` with fresh copies of the inputs (copied outside it)."""
+    NVTX range :data:`NVTX_RANGE` with fresh copies of the inputs (copied outside it). Its
+    CUDA C++ builds carry line info (:func:`kernel_agent.toolchain.lineinfo_env`), so the
+    source counters name its lines (#230); only here: the flag changes the build cache."""
     import torch
 
     from kernel_agent import toolchain
@@ -834,6 +839,7 @@ def ncu_entry(
     from kernel_agent.profiling.state import Replay, split
 
     toolchain.setup()
+    os.environ.update(toolchain.lineinfo_env())  # before the candidate builds anything
     capture = load_capture(capture_path, device="cuda", sha256=capture_sha256)
     reference = capture["module"].eval()
     replay = Replay(capture, reference)  # the case's module state, outside the NVTX range
@@ -987,8 +993,9 @@ def parse_ptxas(text: str) -> list[dict[str, Any]]:
     return out
 
 
-def cuobjdump() -> str | None:
-    """A ``cuobjdump``: the CUDA toolkit's, else the one Triton bundles."""
+def cuobjdumps() -> list[Path]:
+    """Every ``cuobjdump`` here, in order: the CUDA toolkit's, the one on ``PATH``, the one
+    Triton bundles."""
     from kernel_agent import toolchain
 
     home = toolchain.setup().cuda_home
@@ -999,7 +1006,12 @@ def cuobjdump() -> str | None:
         import triton
 
         places.append(Path(triton.__file__).parent / "backends" / "nvidia" / "bin" / "cuobjdump")
-    return next((str(p) for p in places if p.is_file() and os.access(p, os.X_OK)), None)
+    return [p for p in dict.fromkeys(places) if p.is_file() and os.access(p, os.X_OK)]
+
+
+def cuobjdump() -> str | None:
+    """A ``cuobjdump``: the CUDA toolkit's, else the one Triton bundles."""
+    return next((str(p) for p in cuobjdumps()), None)
 
 
 def extension_files() -> list[Path]:

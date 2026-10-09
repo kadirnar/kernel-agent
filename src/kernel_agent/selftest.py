@@ -605,7 +605,8 @@ def smoke_fp4(
     """Every FP4 example of ``precision`` (:data:`FP4_EXAMPLES`; ``fp4_w4a4``:
     :data:`W4A4_EXAMPLES`, or ``examples``) passes the evaluator in its own tier
     (near-lossless-fp4, near-lossless-fp4a), and the 8-bit near-lossless tier (a quick check)
-    rejects it: FP4 needs its own tier. Once per activation dtype the example declares
+    rejects it: FP4 needs its own tier; a W4A4 example's ``quantize_activations`` is checked
+    by the scale-rule guard (and passes it). Once per activation dtype the example declares
     (:func:`example_dtypes`)."""
     from kernel_agent.kernels.compare import tier_for
     from kernel_agent.kernels.evaluate import run_evaluation
@@ -633,6 +634,9 @@ def smoke_fp4(
         result = run_evaluation(fp4, EXAMPLES_DIR / name)
         rejected = run_evaluation(fp8, EXAMPLES_DIR / name, quick=True)
         passed = bool(result.get("correct")) and rejected.get("status") == "incorrect"
+        rule = result.get("scale_rule") or {}
+        unchecked = precision == "fp4_w4a4" and not rule.get("checked")  # its guard's hook
+        passed &= not unchecked
         ok &= passed
         if verbose:
             if passed:
@@ -643,6 +647,8 @@ def smoke_fp4(
                 )
             elif not result.get("correct"):
                 detail = f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+            elif unchecked:
+                detail = f"the scale-rule guard did not check it: {rule.get('note')}"
             else:
                 detail = f"the FP8 tier did not reject it: {rejected.get('status')}"
             label = name.removesuffix(".py") + ("" if dtype == "bfloat16" else f" ({dtype})")

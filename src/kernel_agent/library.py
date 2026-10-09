@@ -16,6 +16,8 @@ definition + solution + evaluation per kernel)::
                       shapes/dtypes of the captured cases), flags, precision (``exact``,
                       or e.g. ``fp8_weights``), and the sha256 of every file above
       lessons/<backend>.md  lessons/<module_family>.md   rules distilled by the librarian
+      <sm_arch>/predictions.jsonl  per run and accepted item: predicted vs measured gain
+      lessons/estimates.md         the rules kernel-agent draws from them
 
 * **Store** (:func:`store_run`, after every integration): the verified best kernel
   of every target that reached ``min_speedup`` (``module_winner``) and every kernel
@@ -36,6 +38,12 @@ definition + solution + evaluation per kernel)::
   cheap agent turns the run's ``NOTES.md`` files and ledger rows (and the insights and
   traps its sessions posted to the board, ``board.py``) into short validity rules and
   merges them into ``lessons/``, pruning duplicates and stale rules.
+* **Prediction errors** (:func:`store_predictions`, after every integration, issue #226):
+  every accepted item's predicted saving against the measured gain of the integration step
+  that added it (:mod:`kernel_agent.prediction`), with its kind, a kernel's bound and timing
+  context, into ``<sm_arch>/predictions.jsonl``; ``lessons/estimates.md`` and the planner's
+  prompt (:func:`prediction_note`) give the measured ÷ predicted ratio per kind of item,
+  in words that name no model (:func:`estimate_rules`).
 * **Claude Code memory** (:func:`cmd_import_memory`): agent sessions run without Claude
   Code's auto memory (``runner.SESSION_ENV``), so what they learn lands here, not in the
   user's ``~/.claude/projects/<project>/memory/``. ``kernel-agent library import-memory DIR``
@@ -56,6 +64,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -507,6 +516,200 @@ def store_run(
     return stored
 
 
+# ------------------------------------------------------------------ prediction errors (#226)
+
+PREDICTIONS = "predictions.jsonl"  # <library>/<sm_arch>/: per run and accepted item
+ESTIMATES = "estimates"  # lessons/estimates.md: the rules drawn from every architecture's
+
+
+def predictions_path(arch: str) -> Path:
+    return root() / _safe(arch) / PREDICTIONS
+
+
+def prediction_records(
+    run: RunDir,
+    *,
+    arch: str,
+    gpu: str | None = None,
+    found: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """One record per item the run's integration accepted (``found``: its
+    :func:`prediction.of_run <kernel_agent.prediction.of_run>`): what kind of item it is
+    (``kind``, a kernel's module ``family``, ``bound`` and timing ``context`` / ``l2``),
+    its own predicted saving, the estimated and measured gain of the step that added it,
+    the error and ratio, how many items that step added (``step_items``: more than one, the
+    error is the step's) and a region's fusion prediction; in the metric's ms."""
+    from kernel_agent import objective, prediction
+
+    found = prediction.of_run(run) if found is None else found
+    card = (run.load().get("card") or {}) if run.run_json.exists() else {}
+    metric = objective.of(read_json(run.baseline_json, {}) or {}).name
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    for row in found:
+        step, fusion = row["step"], row.get("fusion") or {}
+        cls = row.get("module_class")
+        out.append(
+            {
+                "run": str(run.root),
+                "repo_id": card.get("repo_id"),
+                "date": now,
+                "sm_arch": arch,
+                "gpu": gpu,
+                "metric": metric,
+                "set": row["set"],
+                "item": row["label"],
+                "kind": row["kind"],
+                "family": module_family(str(cls)) if cls else None,
+                "bound": row.get("bound"),
+                "context": row.get("context"),
+                "l2": row.get("l2"),
+                "predicted_ms": row["predicted_ms"],
+                "counted_ms": row["counted_ms"],
+                "step_predicted_ms": step["predicted_ms"],
+                "measured_ms": step["measured_ms"],
+                "error_ms": row["error_ms"],
+                "ratio": row["ratio"],
+                "step_items": len(step["items"]),
+                "overlaps": len(row["overlaps"]),
+                "paired": step["paired"],
+                "fusion_predicted_ms": fusion.get("predicted_ms"),
+                "fusion_ratio": fusion.get("ratio"),
+            }
+        )
+    return out
+
+
+def store_predictions(run: RunDir, arch: str, *, gpu: str | None = None) -> Path | None:
+    """Record the prediction errors of the run's integration in the library's record of
+    ``arch`` (this run's earlier lines replaced: a re-integration records the run again) and
+    write ``lessons/estimates.md`` from every architecture's record (:func:`estimate_rules`).
+    None when there is nothing to record; never under emulation (``emulate.py``): an emulated
+    GPU's timings are not that architecture's."""
+    from kernel_agent import emulate
+    from kernel_agent.backends import read_records
+
+    if emulate.active():
+        return None
+    records = prediction_records(run, arch=arch, gpu=gpu)
+    path = predictions_path(arch)
+    known = read_records(path)
+    kept = [r for r in known if r.get("run") != str(run.root)]
+    if not records and len(kept) == len(known):  # nothing to add, nothing of it to drop
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(r, default=str) + "\n" for r in [*kept, *records]))
+    tmp.replace(path)
+    write_estimates_lesson()
+    return path
+
+
+def _step_key(record: dict[str, Any]) -> tuple[str, Any]:
+    return (str(record.get("run")), record.get("set"))
+
+
+def _ratios(records: Iterable[dict[str, Any]], key: str = "ratio") -> tuple[list[float], int]:
+    """The ratios of ``records``, each step once, and the runs they come from."""
+    steps: dict[tuple[str, Any], float] = {}
+    for r in records:
+        if isinstance(r.get(key), int | float):
+            steps.setdefault(_step_key(r), float(r[key]))
+    return sorted(steps.values()), len({k[0] for k in steps})
+
+
+def _rule(what: str, ratios: list[float], runs: int) -> str:
+    """``<what>: the integration measured 0.41x of the predicted gain (median of 4 steps in
+    2 runs; 0.06x .. 0.90x)`` (``ratios`` sorted)."""
+    spread = f"; {ratios[0]:.2f}x .. {ratios[-1]:.2f}x" if len(ratios) > 1 else ""
+    n = len(ratios)
+    return (
+        f"{what}: the integration measured {statistics.median(ratios):.2f}x of the predicted "
+        f"gain (median of {n} step{'' if n == 1 else 's'} in {runs} "
+        f"run{'' if runs == 1 else 's'}{spread})"
+    )
+
+
+def estimate_rules(records: list[dict[str, Any]]) -> list[str]:
+    """Model-agnostic rules from prediction records (:func:`prediction_records`): measured ÷
+    predicted gain per kind of item, a kernel's by its bound and timing context; steps that
+    added several items at once in a rule of their own (their error is shared); a region's
+    fusion candidates by their own prediction. Most steps first."""
+    single = [r for r in records if int(r.get("step_items") or 1) == 1]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for r in single:
+        kind = str(r.get("kind") or "kernel")
+        if kind == "transform":
+            what = "transforms (their gain measured alone, added to the accepted set)"
+        else:
+            name = "region kernel" if kind == "region" else "kernel"
+            what = f"{name} estimates (module-level)"
+            bound = f"{r['bound']}-bound" if r.get("bound") else "bound not recorded"
+            context = r.get("context")
+            timed = f"timed {context}" + (f" / {r['l2']} L2" if r.get("l2") else "")
+            what += f", {bound}, " + (timed if context else "timing context not recorded")
+        groups.setdefault(what, []).append(r)
+    several = [r for r in records if int(r.get("step_items") or 1) > 1]
+    if several:
+        groups["steps that added several items at once (their summed estimate)"] = several
+    fusion = [r for r in records if isinstance(r.get("fusion_ratio"), int | float)]
+    if fusion:
+        groups["region fusion candidates (bytes and launches saved)"] = fusion
+    rules: list[tuple[int, str]] = []
+    for what, members in groups.items():
+        key = "fusion_ratio" if what.startswith("region fusion") else "ratio"
+        ratios, runs = _ratios(members, key)
+        if ratios:
+            rules.append((len(ratios), _rule(what, ratios, runs)))
+    return [text for _, text in sorted(rules, key=lambda r: (-r[0], r[1]))][:MAX_RULES]
+
+
+def write_estimates_lesson() -> Path | None:
+    """``lessons/estimates.md``: :func:`estimate_rules` of every architecture's record, each
+    rule prefixed with its architecture (None: no rule yet). kernel-agent writes it, never
+    the librarian (:func:`lesson_names` leaves it out)."""
+    from kernel_agent.backends import read_records
+
+    lines: list[str] = []
+    for path in sorted(root().glob(f"*/{PREDICTIONS}")):
+        lines += [f"{path.parent.name}: {rule}" for rule in estimate_rules(read_records(path))]
+    if not lines:
+        return None
+    out = lessons_dir() / f"{ESTIMATES}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(f"- {line}" for line in lines)
+    out.write_text(
+        f"# Lessons: {ESTIMATES}\n\n<!-- written by kernel-agent after every integration from "
+        f"<arch>/{PREDICTIONS} (library.py, issue #226); edits are overwritten -->\n\n{body}\n"
+    )
+    return out
+
+
+def prediction_note(arch: str | None) -> str:
+    """Planner-prompt section: how far the estimates were off in earlier runs on this GPU
+    architecture (:func:`estimate_rules` of its record; "" without one)."""
+    if not arch:
+        return ""
+    from kernel_agent.backends import read_records
+
+    records = read_records(predictions_path(arch))
+    rules = estimate_rules(records)
+    if not rules:
+        return ""
+    runs = len({r.get("run") for r in records})
+    return "\n".join(
+        [
+            f"**Estimated vs measured gains on {arch}** (kernel library: the integrations of "
+            f"{runs} earlier run{'' if runs == 1 else 's'}; measured ÷ predicted gain of the "
+            "step that added each accepted item):",
+            "",
+            *(f"* {rule}" for rule in rules),
+            "Weigh a module-level estimate with its row; the integration's A/B decides what "
+            "is kept.",
+        ]
+    )
+
+
 # ------------------------------------------------------------------ reuse
 
 
@@ -793,7 +996,8 @@ def lesson_names(run: RunDir) -> dict[str, str]:
             for backend in str(row["backend"] or "").split("+"):
                 if backend and backend != "torch":
                     names.setdefault(backend, "backend")
-    return {k: v for k, v in names.items() if _NAME.match(k)}
+    # lessons/estimates.md is kernel-agent's own (write_estimates_lesson), never the librarian's
+    return {k: v for k, v in names.items() if _NAME.match(k) and k != ESTIMATES}
 
 
 def _rows_table(rows: list[dict[str, Any]]) -> list[str]:

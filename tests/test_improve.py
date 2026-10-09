@@ -392,15 +392,22 @@ def test_dry_run_end_to_end(tmp_path, monkeypatch):
         assert "improve.png" in report
 
 
-def test_dry_run_uses_the_whole_budget_with_new_rounds(tmp_path):
+def test_dry_run_uses_the_whole_budget_with_new_rounds(tmp_path, monkeypatch):
     """Issue #166: every arm retires early in round 1; with budget left the loop starts new
     rounds (re-profile, re-plan, the arms that still matter) instead of ending, and the
     report shows the budget left unused (about none) and why; ``--rounds 1`` keeps the old
     behaviour."""
+    written: list[int] = []  # each re-profile's ceilings.md gets the library bar (#227)
+
+    def write_ceilings(run: RunDir) -> None:
+        written.append(max(int(p.parent.name) for p in run.root.glob("rounds/*/profile")))
+
+    monkeypatch.setattr(improve.libscout, "write_ceilings", write_ceilings)
     orch, world = make(tmp_path / "budget", max_hours=30.0)
     _, reason = loop(orch, world)
     state = read_json(orch.run.root / "improve.json")
     assert len(state["rounds"]) > 2 and reason.startswith("time left")  # the budget ended it
+    assert written == [r["n"] for r in state["rounds"][1:]]  # before each round's re-plan
     assert all(r["exp"] > 0 for r in state["rounds"][1:])
     assert {s["round"] for s in state["slices"]} == {r["n"] for r in state["rounds"]}
     used = state["finished"]["budget"]

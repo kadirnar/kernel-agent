@@ -297,7 +297,8 @@ def fusion_groups(
 ) -> tuple[Stage | None, list[Stage]]:
     """The loop ``body`` with the fusion chains inside its stages as evidence (issue #231),
     and a ``group`` (``fuse_<a>_<b>``) per other set of stages that chains span (their ops in
-    the modules of two or more stages: ``modules``, folded qualnames), by predicted saving."""
+    the modules of two or more stages: ``modules``, folded qualnames), by predicted saving
+    (of the chains whose savings add up: :func:`_additive`)."""
     spans: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
     for chain in fusions:
         modules = [str(m) for m in chain.get("modules") or [] if m]
@@ -314,7 +315,7 @@ def fusion_groups(
         if mine:
             body = dataclasses.replace(body, evidence=_evidence(mine))
     rest = [(ids, chains) for ids, chains in spans.items() if not set(ids) <= members]
-    rest.sort(key=lambda kv: (-sum(float(c.get("saving_ms") or 0.0) for c in kv[1]), kv[0]))
+    rest.sort(key=lambda kv: (-_saving(_additive(kv[1])), kv[0]))
     by_id = {s.id: s for s in stages}
     groups = []
     for ids, chains in rest:
@@ -337,19 +338,39 @@ def fusion_groups(
     return body, groups
 
 
+def _additive(chains: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The chains whose savings add up (``fusion.additive``: rows that share an op, a GEMM
+    in one's prologue and another's epilogue, count once)."""
+    from kernel_agent.profiling.fusion import additive
+
+    return additive(chains)
+
+
+def _saving(chains: Iterable[Mapping[str, Any]]) -> float:
+    return sum(float(c.get("saving_ms") or 0.0) for c in chains)
+
+
 def _evidence(chains: Sequence[Mapping[str, Any]], shown: int = 3) -> str:
     """``2 fusion chains across its stages' boundaries predict 0.5 ms (…): `f1a2b3c` 0.42 ms
-    (`add` → `mul`), …``."""
-    ranked = sorted(chains, key=lambda c: (-float(c.get("saving_ms") or 0.0), str(c.get("id"))))
-    total = sum(float(c.get("saving_ms") or 0.0) for c in ranked)
+    (`add` → `mul`), …``: the total of those that add up, alternatives (they share an op
+    with one of them) listed after them and not added."""
+    kept = {id(c) for c in _additive(chains)}
+    ranked = sorted(
+        chains,
+        key=lambda c: (id(c) not in kept, -float(c.get("saving_ms") or 0.0), str(c.get("id"))),
+    )
+    total = _saving(c for c in ranked if id(c) in kept)
     items = []
     for c in ranked[:shown]:
         ops = " → ".join(f"`{o.get('op')}`" for o in (c.get("ops") or [])[:6])
-        items.append(f"`{c.get('id')}` {float(c.get('saving_ms') or 0.0):,.3g} ms ({ops})")
+        alt = "" if id(c) in kept else ", an alternative"
+        items.append(f"`{c.get('id')}` {float(c.get('saving_ms') or 0.0):,.3g} ms ({ops}{alt})")
     more = f" and {len(ranked) - shown} more" if len(ranked) > shown else ""
+    others = len(ranked) - len(kept)
+    alternatives = f"; {others} of them share an op with one counted, not added" if others else ""
     return (
         f"{len(ranked)} fusion chains across its stages' boundaries predict {total:,.3g} ms "
-        "(`profile/fusions.md`): " + ", ".join(items) + more
+        f"(`profile/fusions.md`{alternatives}): " + ", ".join(items) + more
     )
 
 

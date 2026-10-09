@@ -1,0 +1,5 @@
+========= COMPUTE-SANITIZER
+========= Error: Race reported between Write access at ka_race+0x80 in ka_sanitizer_probe.cu:13
+=========     and Read access at ka_race+0xa0 in ka_sanitizer_probe.cu:14 [256 hazards]
+========= 
+========= RACECHECK SUMMARY: 1 hazard displayed (1 error, 0 warnings)

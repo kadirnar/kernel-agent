@@ -1,11 +1,13 @@
 """Fusion candidates (kernel_agent/profiling/fusion.py, issue #231): chains of memory-bound ops
 found from tensor storages on toy models (CPU), their bytes, launches, parent class and
-placements, the L2 rule, host syncs, the ranking, the summary section, the scheduler's
-expected gain of a region arm and the native stage graph's group evidence."""
+placements, the L2 rule (an intermediate's size and the traffic between its write and its
+read), host syncs, the overlap-aware ranking, the summary section, the scheduler's expected
+gain of a region arm and the native stage graph's group evidence."""
 
 from __future__ import annotations
 
 import json
+import random
 from typing import Any
 
 import pytest
@@ -91,6 +93,35 @@ class Stack(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+class Between(nn.Module):
+    """``y = x · 2``, an op on a buffer of ``rows`` × D floats that does not touch y (its read
+    and its write pass through the L2), then ``y + 1``."""
+
+    def __init__(self, rows: int) -> None:
+        super().__init__()
+        self.register_buffer("buf", torch.ones(rows, D))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        y = x * 2
+        other = self.buf * 3
+        return y + 1, other
+
+
+class NormProj(nn.Module):
+    """A norm, a projection that could take it as a prologue, then element-wise ops that it
+    could take as an epilogue (``mul`` + ``add``; ``silu``: one op, nothing saved alone)."""
+
+    def __init__(self, tail: str = "muladd") -> None:
+        super().__init__()
+        self.norm = RMSNorm()
+        self.q = nn.Linear(D, D, bias=False)
+        self.tail = tail
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.q(self.norm(x))
+        return F.silu(q) if self.tail == "silu" else q * 2 + 1
 
 
 class Synced(nn.Module):
@@ -200,17 +231,95 @@ def test_the_same_chain_in_every_layer_is_one_row():
     assert len(ids) == len(set(ids))
 
 
-def test_an_intermediate_that_fits_in_l2_saves_no_bytes():
-    wide = B * T * 2 * D * 4  # 2048 bytes, the largest intermediate of the gate
-    small = chain_with(mine(Gate(), inputs(B, T, D), l2=wide).chains(), "silu")
-    assert all(p["dram_bytes"] == 0 for p in small["placements"].values())
-    assert small["placements"]["epilogue"]["round_trip_bytes"] == 6 * wide  # still counted
-    big = chain_with(mine(Gate(), inputs(B, T, D), l2=wide - 1).chains(), "silu")
-    assert big["placements"]["epilogue"]["dram_bytes"] == 6 * wide
-    miner = mine(Gate(), inputs(B, T, D), l2=wide)
-    table = fusion.build({"fusions": miner.result()}, PEAKS, 1.0)
+def test_an_intermediate_that_fits_in_l2_with_its_traffic_saves_no_bytes():
+    wide = B * T * 2 * D * 4  # 2048 bytes: the gate's and up's outputs, SiLU's
+    # between SiLU's write and the mul that reads it, the up projection reads x (1024 bytes)
+    # and its weight (2048) and writes its output (2048)
+    up = FULL + wide + wide
+    fits = chain_with(mine(Gate(), inputs(B, T, D), l2=wide + up).chains(), "silu")
+    assert all(p["dram_bytes"] == 0 for p in fits["placements"].values())
+    assert fits["placements"]["epilogue"]["round_trip_bytes"] == 6 * wide  # still counted
+    found = fits["placements"]["epilogue"]["intermediates"]
+    assert [(names(fits["placements"]["epilogue"])[i["op"]], i["l2"]) for i in found] == [
+        ("linear", "in"),
+        ("silu", "in"),
+        ("linear", "in"),
+    ]
+    assert [i["traffic_bytes"] for i in found] == [0, up, 0]  # gate and up: read at once
+    table = fusion.build(
+        {"fusions": mine(Gate(), inputs(B, T, D), l2=wide + up).result()}, PEAKS, 1.0
+    )
     assert all(c["byte_ms"] == 0 for c in table["candidates"])
     assert any(c["launch_ms"] > 0 for c in table["candidates"])
+    # one byte less: the up projection evicts part of SiLU's output before the mul reads it
+    tight = chain_with(mine(Gate(), inputs(B, T, D), l2=wide + up - 1).chains(), "silu")
+    silu = tight["placements"]["epilogue"]["intermediates"][1]
+    assert silu["l2"] == "traffic" and silu["dram_bytes"] == 2  # ⌈4096 × 1 / 2048⌉
+    assert tight["placements"]["epilogue"]["dram_bytes"] == 2
+
+
+def test_an_intermediate_smaller_than_l2_evicted_by_the_traffic_before_its_read_counts():
+    rows = 128  # the buffer: 8 KB read and 8 KB written between y's write and its read
+    traffic = 2 * rows * D * 4
+    l2 = 4 * FULL  # y (1 KB) fits alone
+    miner = mine(Between(rows), inputs(B, T, D), l2=l2)
+    row = chain_with(miner.chains(), "mul")
+    chain = row["placements"]["chain"]
+    assert names(chain) == ["mul", "add"]
+    (y,) = chain["intermediates"]
+    assert y["bytes"] == FULL and y["round_trip_bytes"] == 2 * FULL
+    assert y["traffic_bytes"] == traffic and y["l2"] == "traffic"
+    assert y["dram_bytes"] == chain["dram_bytes"] == 2 * FULL  # all of it: evicted
+    assert y["calls"] == 1 and y["dram_calls"] == 1
+    # part of it: the newest L2 bytes hold half of y at its read
+    half = chain_with(mine(Between(rows), inputs(B, T, D), l2=traffic + FULL // 2).chains(), "mul")
+    assert half["placements"]["chain"]["dram_bytes"] == FULL
+    assert half["placements"]["chain"]["intermediates"][0]["l2"] == "traffic"
+    # the table says why
+    profile = {"fusions": miner.result()}
+    table = fusion.build(profile, {"dram_gbps": 1.0, "launch_floor_us": 10.0}, 1.0)
+    (c,) = table["candidates"]
+    assert c["placement"] == "chain" and c["dram_bytes"] == 2 * FULL
+    assert c["byte_ms"] == pytest.approx(2 * FULL / 1e9 * 1e3)  # at 1 GB/s
+    assert fusion.l2_text(c) == "0.00205 MB DRAM: 1 evicted by ≤ 0.0164 MB of traffic"
+    text = fusion.markdown(table, details=True)
+    assert "### Intermediates and the L2" in text
+    assert "`mul` (`m`) 0.00102 MB: evicted by ≤ 0.0164 MB of traffic" in text
+    assert "0.00205 MB DRAM in 1 of 1 calls" in text
+
+
+def test_an_intermediate_that_fits_with_little_traffic_stays_in_l2():
+    rows = 1  # 64 bytes read and 64 written in between
+    row = chain_with(mine(Between(rows), inputs(B, T, D), l2=4 * FULL).chains(), "mul")
+    (y,) = row["placements"]["chain"]["intermediates"]
+    assert y["traffic_bytes"] == 2 * rows * D * 4 and y["l2"] == "in"
+    assert y["dram_bytes"] == 0 and row["placements"]["chain"]["dram_bytes"] == 0
+    assert y["dram_calls"] == 0
+
+
+def test_with_the_l2_unknown_every_intermediate_counts():
+    for rows in (1, 128):
+        row = chain_with(mine(Between(rows), inputs(B, T, D), l2=None).chains(), "mul")
+        (y,) = row["placements"]["chain"]["intermediates"]
+        assert y["l2"] == "unknown" and y["dram_bytes"] == 2 * FULL  # the upper bound
+    table = fusion.build({"fusions": mine(Between(1), inputs(B, T, D)).result()}, PEAKS, 1.0)
+    assert fusion.l2_text(table["candidates"][0]) == "0.00205 MB DRAM: L2 unknown"
+
+
+def test_a_large_intermediate_read_at_once_is_partly_in_l2():
+    class Twice(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x * 2 + 1
+
+    # nothing between y's write and its read: the L2 still holds its newest quarter
+    row = chain_with(mine(Twice(), inputs(B, T, D), l2=FULL // 4).chains(), "mul")
+    (y,) = row["placements"]["chain"]["intermediates"]
+    assert y["l2"] == "size" and y["traffic_bytes"] == 0
+    assert y["dram_bytes"] == 3 * FULL // 2  # three quarters of its write and its read
+    assert fusion.l2_round_trip(FULL, 2 * FULL, 0, FULL // 4) == (3 * FULL // 2, "size")
+    assert fusion.l2_round_trip(FULL, 2 * FULL, 0, FULL) == (0, "in")
+    assert fusion.l2_round_trip(FULL, 2 * FULL, 5 * FULL, 4 * FULL) == (2 * FULL, "traffic")
+    assert fusion.l2_round_trip(FULL, 2 * FULL, 0, None) == (2 * FULL, "unknown")
 
 
 def test_no_chain_crosses_a_host_sync():
@@ -235,9 +344,133 @@ def test_the_ranking_is_deterministic():
     a = fusion.build({"fusions": first}, PEAKS, 1.0)
     b = fusion.build({"fusions": second}, PEAKS, 1.0)
     assert a == b
-    savings = [(-c["saving_ms"], c["id"]) for c in a["candidates"]]
-    assert savings == sorted(savings)  # by saving, ties by id
-    assert [c["rank"] for c in a["candidates"]] == list(range(1, len(savings) + 1))
+    order = [(not c["counted"], -c["saving_ms"], c["id"]) for c in a["candidates"]]
+    assert order == sorted(order)  # counted rows by saving, ties by id, then alternatives
+    assert [c["rank"] for c in a["candidates"]] == list(range(1, len(order) + 1))
+
+
+# ------------------------------------------------------------------ overlaps
+
+
+def _placement(saved: int, overlaps: dict[str, list[str]]) -> dict[str, Any]:
+    return {
+        "launches": saved + 1,
+        "launches_saved": saved,
+        "boundaries": 1,
+        "parent_class": "P",
+        "group": "m",
+        "intermediate_bytes": 0,
+        "round_trip_bytes": 0,
+        "dram_bytes": 0,
+        "largest_bytes": 0,
+        "tensors": 0,
+        "ops": [{"op": "add", "module": "m"}],
+        "intermediates": [],
+        "overlaps": overlaps,
+    }
+
+
+def _raw_chain(cid: str, placements: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {"id": cid, "phase": "", "method": "forward", "calls": 1, "placements": placements}
+
+
+def test_placements_sharing_a_gemm_are_ranked_without_double_counting():
+    miner = mine(NormProj(), inputs(B, T, D), l2=1 << 20)  # every intermediate in L2
+    chains = miner.chains()
+    norm = chain_with(chains, "rsqrt")
+    (tail,) = [c for c in chains if c is not norm]
+    assert names(tail["placements"]["chain"]) == ["mul", "add"]
+    # the norm's prologue and the tail's epilogue both take in the projection
+    assert norm["placements"]["prologue"]["overlaps"] == {tail["id"]: ["epilogue"]}
+    assert tail["placements"]["epilogue"]["overlaps"] == {norm["id"]: ["prologue"]}
+    assert norm["placements"]["chain"]["overlaps"] == tail["placements"]["chain"]["overlaps"] == {}
+    table = fusion.build({"fusions": miner.result()}, PEAKS, 1.0)
+    first, second = table["candidates"]
+    assert first["id"] == norm["id"] and first["placement"] == "prologue"  # 7 → 1: 0.06 ms
+    assert first["saving_ms"] == pytest.approx(0.06)
+    # the tail's epilogue (0.02 ms) would take the projection in again: it is one kernel
+    assert second["id"] == tail["id"] and second["placement"] == "chain"
+    assert second["saving_ms"] == pytest.approx(0.01)
+    assert second["blocked"] == {"epilogue": [norm["id"]]}
+    assert second["placements"] == {"chain": 0.01, "epilogue": 0.02}
+    assert first["counted"] and second["counted"] and first["overlaps"] == second["overlaps"] == []
+    # 9 launches become 2: 0.07 ms, not the 0.08 of each row's best
+    total = sum(c["saving_ms"] for c in fusion.additive(table["candidates"]))
+    assert total == pytest.approx(7 * 10.0 / 1000)
+    text = fusion.markdown(table)
+    assert f"| chain (epilogue 0.02 ms: overlaps `{norm['id']}`) |" in text
+    assert "The 2 counted rows share no op: together they save 0.07 ms" in text
+
+
+def test_a_row_whose_saving_needs_a_gemm_taken_elsewhere_is_an_alternative():
+    miner = mine(NormProj("silu"), inputs(B, T, D), l2=1 << 20)
+    table = fusion.build({"fusions": miner.result()}, PEAKS, 1.0)
+    first, alt = table["candidates"]
+    assert first["placement"] == "prologue" and first["counted"]
+    # SiLU alone saves nothing; its epilogue needs the projection the norm's prologue takes
+    assert names(alt) == ["linear", "silu"] and alt["placement"] == "epilogue"
+    assert not alt["counted"] and alt["placements"] == {"chain": 0.0, "epilogue": 0.01}
+    assert first["overlaps"] == [alt["id"]] and alt["overlaps"] == [first["id"]]
+    assert [c["rank"] for c in table["candidates"]] == [1, 2]
+    assert fusion.additive(table["candidates"]) == [first]
+    assert fusion.additive([alt]) == [alt]  # without the row it overlaps it adds up
+    text = fusion.markdown(table)
+    assert f"| ↳ `{alt['id']}` (alt. of `{first['id']}`) | 0.01 |" in text
+    assert "The counted row saves 0.06 ms" in text and "1 more is an alternative" in text
+    # beyond the top rows, "..." sums the counted rows only
+    assert "| ... |" not in fusion.markdown(table, top=1)
+    hit, how = fusion.match(table, {"fusion": alt["id"]}) or ({}, "")
+    assert hit is alt and f"an alternative to `{first['id']}`" in how
+    hit, how = fusion.match(table, {"fusion": first["id"]}) or ({}, "")
+    assert hit is first and f"alternatives `{alt['id']}` overlap it" in how
+
+
+def test_the_overlap_ranking_is_deterministic():
+    # two chains read one GEMM's output: both are its epilogue, saving the same; the id
+    # decides which, whatever order the chains come in
+    chains = [
+        _raw_chain(
+            cid,
+            {"chain": _placement(1, {}), "epilogue": _placement(2, {other: ["epilogue"]})},
+        )
+        for cid, other in (("fb", "fa"), ("fa", "fb"))
+    ]
+    tables = [
+        fusion.build({"fusions": {"chains": order}}, PEAKS, 1.0) for order in (chains, chains[::-1])
+    ]
+    assert tables[0] == tables[1]
+    fa, fb = tables[0]["candidates"]
+    assert [(c["id"], c["placement"]) for c in (fa, fb)] == [("fa", "epilogue"), ("fb", "chain")]
+    assert fb["blocked"] == {"epilogue": ["fa"]} and fa["counted"] and fb["counted"]
+    # a mined model: the same table from either run and any order of its chains
+    runs = [mine(Stack(3), inputs(B, T, D), l2=4 * FULL).result() for _ in range(2)]
+    shuffled = list(runs[1]["chains"])
+    random.Random(0).shuffle(shuffled)
+    a = fusion.build({"fusions": runs[0]}, PEAKS, 1.0)
+    b = fusion.build({"fusions": {**runs[1], "chains": shuffled}}, PEAKS, 1.0)
+    assert a == b
+    counted = {c["id"] for c in a["candidates"] if c["counted"]}
+    assert all(not counted & set(c["overlaps"]) for c in a["candidates"] if c["counted"])
+
+
+def test_a_table_from_before_the_traffic_and_the_overlaps_stays_readable():
+    raw = mine(NormProj("silu"), inputs(B, T, D), l2=1 << 20).result()
+    for chain in raw["chains"]:  # a version 1 profile: no intermediates, no overlaps
+        for placement in chain["placements"].values():
+            del placement["intermediates"], placement["overlaps"]
+    table = fusion.build({"fusions": raw}, PEAKS, 1.0)
+    assert all(c["counted"] and c["overlaps"] == [] for c in table["candidates"])
+    assert [c["placement"] for c in table["candidates"]] == ["prologue", "epilogue"]
+    old = [
+        {k: v for k, v in c.items() if k not in ("counted", "overlaps", "intermediates")}
+        for c in table["candidates"]
+    ]
+    text = fusion.markdown({**table, "candidates": old}, details=True)
+    assert "The 2 counted rows" in text and "in L2" in text and "↳" not in text
+    assert "### Intermediates" not in text
+    assert fusion.additive(old) == old
+    hit, how = fusion.match({"candidates": old}, {"fusion": old[1]["id"]}) or ({}, "")
+    assert hit is old[1] and how == f"fusion {old[1]['id']}"  # no overlaps to name
 
 
 def test_views_and_allocations_are_not_ops():
@@ -351,13 +584,15 @@ def test_graph_launched_runs_price_a_launch_at_a_graph_boundary():
 # ------------------------------------------------------------------ consumers
 
 
-def _region_run(tmp_path, spec: dict[str, Any]) -> RunDir:
+def _region_run(
+    tmp_path, spec: dict[str, Any], candidates: list[dict[str, Any]] | None = None
+) -> RunDir:
     root = tmp_path / "run"
     write_json(root / "run.json", {"config": {}})
     write_json(root / "baseline.json", {"median_ms": 100.0})
     classes = [{"cls": "Block", "root": "m", "inclusive_ms": 50.0, "instances": 2}]
     write_json(root / "profile" / "profile.json", {"classes": classes})
-    candidates = [
+    candidates = candidates or [  # a version 1 table: no counted, no overlaps
         {"id": "fsmall", "saving_ms": 0.5, "parent_class": "Block", "kind": "region"},
         {"id": "fbig", "saving_ms": 2.0, "parent_class": "Block", "kind": "region"},
         {"id": "fmod", "saving_ms": 9.0, "parent_class": "Block", "kind": "module"},
@@ -381,6 +616,26 @@ def test_a_region_arm_expects_the_saving_of_its_fusion(tmp_path):
     arm = build_arms(other, Policy(systems=False), [], rows=[])[0]
     assert arm.fusion is not None and arm.fusion.id == "fbig"
     assert arm.expected_ms == pytest.approx(4.0)
+
+
+def test_a_region_arm_expects_a_counted_row_before_an_alternative(tmp_path):
+    spec = {"kind": "region", "parent_class": "Block", "module_class": "Region_r"}
+    candidates = [
+        {"id": "fcount", "saving_ms": 0.5, "parent_class": "Block", "kind": "region",
+         "counted": True, "overlaps": ["falt"]},
+        {"id": "falt", "saving_ms": 2.0, "parent_class": "Block", "kind": "region",
+         "counted": False, "overlaps": ["fcount"]},
+    ]  # fmt: skip
+    arm = build_arms(_region_run(tmp_path, spec, candidates), Policy(systems=False), [], rows=[])[0]
+    assert arm.fusion is not None and arm.fusion.id == "fcount"
+    assert arm.expected_ms == pytest.approx(1.0)  # 0.5 ms of a 50 ms window, at 100 ms
+    assert "alternatives `falt` overlap it" in arm.why()
+    # the plan names the alternative: the arm expects its own saving, and says it overlaps
+    named = _region_run(tmp_path / "b", {**spec, "fusion": "falt"}, candidates)
+    arm = build_arms(named, Policy(systems=False), [], rows=[])[0]
+    assert arm.fusion is not None and arm.fusion.id == "falt"
+    assert arm.expected_ms == pytest.approx(4.0)
+    assert "an alternative to `fcount`" in arm.why()
 
 
 def test_a_fusion_already_saved_leaves_a_share_of_its_prediction(tmp_path):
@@ -431,6 +686,36 @@ def test_chains_that_span_stages_are_group_evidence():
     stages = engine.stage_graph(looped, fusions=chains)
     body = next(s for s in stages if s.id == "loop_body")
     assert "`f1`" in body.evidence and not any(s.id.startswith("fuse_") for s in stages)
+
+
+def test_group_evidence_adds_up_only_chains_that_share_no_op():
+    table = {
+        "columns": ["exact"],
+        "rows": [
+            _row("Encoder", "m.enc", 300),
+            _row("Linear", "m.enc.fc", 290),
+            _row("Decoder", "m.dec", 200),
+            _row("Conv", "m.dec.conv", 190),
+        ],
+    }
+    spans = ["m.enc.fc", "m.dec"]
+    chains = [
+        {"id": "f1", "saving_ms": 0.4, "counted": True, "overlaps": ["f3"], "modules": spans,
+         "ops": [{"op": "add"}]},
+        {"id": "f3", "saving_ms": 0.3, "counted": False, "overlaps": ["f1"], "modules": spans,
+         "ops": [{"op": "mul"}]},
+        {"id": "f4", "saving_ms": 0.2, "counted": True, "overlaps": [], "modules": spans,
+         "ops": [{"op": "cat"}]},
+    ]  # fmt: skip
+    group = engine.stage_graph(table, fusions=chains)[-1]
+    assert group.scope == "group" and group.members == ("dec", "enc")
+    # f1 + f4; f3 shares an op with f1 (one GEMM in f1's prologue and f3's epilogue)
+    assert "3 fusion chains across its stages' boundaries predict 0.6 ms" in group.evidence
+    assert "1 of them share an op with one counted, not added" in group.evidence
+    assert group.evidence.index("`f4`") < group.evidence.index("`f3` 0.3 ms (`mul`, an alt")
+    # without the chain it overlaps, an alternative adds up
+    alone = engine.stage_graph(table, fusions=[chains[1]])[-1]
+    assert "predict 0.3 ms" in alone.evidence and "not added" not in alone.evidence
 
 
 # ------------------------------------------------------------------ GPU

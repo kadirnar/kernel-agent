@@ -38,6 +38,15 @@ quantising activations saves nothing there (`fp4_weights`, `fp8_weights`).
 * scale layout for the MMA: cuBLASLt's 128 x 4 blocks (`swizzle_fp4_scales`, offsets
   `mx_scale_offset`), the same as CuTe's `tile_atom_to_shape_SF`.
 
+**The scale-rule guard**: define a module-level `quantize_activations(x) -> (codes, scales,
+outer)` with the quantiser your kernels use (both examples do): codes packed `[rows, K /
+2]`, scales **unswizzled** `[rows, K / 16]` e4m3 (MXFP4 `[rows, K / 32]` e8m0), outer
+`[rows]` or one per call. The evaluator rejects the candidate (`stage: scale_rule`) when, on
+the captured or a stress input, a block maximum exceeds 6 x scale x outer beyond e4m3's
+rounding (6.375: a block scale rounded down, an outer scale below amax / 2688, MXFP4's OCP
+floor rule) or a non-zero block gets scale 0 where rounding to nearest gives a subnormal
+one. Details (the stress input, a rotating quantiser): [calibration.md](calibration.md).
+
 **Accuracy**: W4A4 moves a GEMM's output about 1.4x as far as FP4 weights alone, and
 quantised activations can shrink it by up to ~1 % (e2m1's grid, not the scale rounding:
 unrounded block scales give the same; LocDiT gate_proj -0.9 %, q_proj 0.0 %). On the VoxCPM2 LocDiT layer at M = 352
@@ -52,9 +61,17 @@ within ±5 %, every element within 1.5 x RMS + 0.25 x |reference|; on redrawn in
 `nn.Linear` of the target alone on its captured inputs and ranks them (W4A4 output relative
 L2, norm change, FP8 W8A8's for comparison, FLOP share). On the VoxCPM2 LocDiT the MLP's
 gate / up rank first (0.088 vs FP8's 0.019, 49 % of the FLOPs); FP8 for them alone takes the
-hidden output from 0.036 / -3.4 % to 0.014 / -0.9 %. Start with W4A4 everywhere; when the
-evaluator or the perceptual gate rejects it, move the top layers to FP8 W8A8 inside the
-target (the same tier: FP8 is within it).
+hidden output from 0.036 / -3.4 % to 0.014 / -0.9 %. **kernel-agent picks the mix**: it
+probes every W4A4 target when it captures it (layers that read the same activations, q / k
+/ v or gate / up, form one group; the reference math is run on the captured cases with the
+top 0, 1, 2, ... groups in 8-bit until the tier passes) and your prompt names the layers to
+keep in the GPU's 8-bit class (FP8 W8A8; INT8 W8A8 without FP8 tensor cores), the others
+W4A4 (`spec.json` → `w4a4_mix`). Each failed gate moves the next group to 8 bits: 3
+evaluations failing the tier near its bounds (cosine >= 0.9) with none passing, or the
+end-to-end gate rejecting one of your kernels alone. Follow the mix in your prompt (the
+same tier: 8-bit layers are within it); with every group at 8 bits the target's pivot to
+its 8-bit class opens a new arm, and per-token outer scales, a rotation, a norm-bias
+correction or bf16 for the top group remain for W4A4.
 
 **MXFP4 and rotations**: MXFP4 W4A4 (`fmt="mxfp4"`, e8m0 per 32) fails near-lossless-fp4a on
 the LocDiT layer (norm 6.5 %) and is not in torch 2.14's `F.scaled_mm` on sm_120 (B200 /

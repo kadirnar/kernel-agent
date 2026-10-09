@@ -44,6 +44,12 @@ verdict on what it ran (``review``: ``accept:static``, ``reject:model:output_cac
 ``data_dependent`` when that speedup changes with the input (:mod:`kernel_agent.diversity`;
 a label, the classification is the benchmark input's).
 
+The ``est_saved_ms`` of an ``e2e`` row is measured: baseline − its median. An integration
+row (a step's B, or one item probed alone) has the predicted saving next to it
+(``pred_saved_ms``, issue #226, :func:`predicted_saving`): baseline − (A as measured in
+the same A/B − the estimated gain of B over A), so ``est_saved_ms − pred_saved_ms`` is the
+step's measured − estimated gain (:mod:`kernel_agent.prediction`).
+
 ``eval_s`` is the time an evaluation took, without the time it waited for the GPU behind
 other jobs (``queue_s``, :mod:`kernel_agent.gpuqueue`; empty when not known).
 
@@ -95,6 +101,7 @@ COLUMNS = (
     "ref_ms",
     "new_ms",
     "est_saved_ms",
+    "pred_saved_ms",
     "spread",
     "pct_of_sol",
     "eval_s",
@@ -145,6 +152,7 @@ _FLOATS = {
     "ref_ms",
     "new_ms",
     "est_saved_ms",
+    "pred_saved_ms",
     "spread",
     "pct_of_sol",
     "eval_s",
@@ -701,17 +709,22 @@ def record_e2e(
     review: str | None = None,
     title: str = "",
     files: list[str] | None = None,
+    est_gain_ms: float | None = None,
+    a_ms: float | None = None,
 ) -> dict[str, Any]:
     """Classify an end-to-end measurement (transform or integration step) and append it;
     ``session``: the agent session that ran it (its label; none for the integration's);
     ``review``: the critic's verdict (``critic.cell``); ``title``: its name
     (:func:`clean_title`); ``files``: the run-relative files it measured (:func:`item_files`),
     for its ``evaluation`` event. Its ``kind`` follows from ``backend`` and ``hypothesis``
-    (:func:`kind`)."""
+    (:func:`kind`). An integration step's ``est_gain_ms`` (the estimated gain of B over A)
+    gives its ``pred_saved_ms`` (:func:`predicted_saving`; ``a_ms``: A's median when the
+    result holds no A/B, a step measured in two processes)."""
     with _lock:
         best = best_kept([r for r in rows(run) if r["target"] == E2E])
         status = classify(result, best, e2e=True)
         base, new = _num(result.get("baseline_ms")), _num(result.get("median_ms"))
+        predicted = predicted_saving(base, result, est_gain_ms, a_ms)
         row = append(
             run,
             {
@@ -736,6 +749,7 @@ def record_e2e(
                 "est_saved_ms": round(base - new, 3)
                 if base is not None and new is not None
                 else None,
+                "pred_saved_ms": predicted,
                 "spread": e2e_spread(result),
                 "eval_s": eval_s,
                 "queue_s": queue_s,
@@ -753,6 +767,29 @@ def record_e2e(
     tag |= {"files": list(files)} if files else {}
     event(run, "evaluation", when=when, target=E2E, exp=row["exp"], status=row["status"], **tag)
     return row
+
+
+def predicted_saving(
+    baseline_ms: float | None,
+    result: dict[str, Any],
+    est_gain_ms: float | None,
+    a_ms: float | None = None,
+) -> float | None:
+    """``pred_saved_ms`` of an integration row (issue #226): the saving its step was predicted
+    to show, in the terms of its ``est_saved_ms`` (baseline − B as measured): baseline − (A as
+    measured − ``est_gain_ms``, the estimated gain of B over A), as the projection predicts an
+    accepted set (``projection.of_sets``). A is ``a_ms``, else the A of the result's A/B (its
+    median). None without an estimated gain (a transform probed alone: its gain alone is its
+    estimate) or without A."""
+    if est_gain_ms is None or baseline_ms is None:
+        return None
+    if a_ms is None:
+        ab = result.get("ab") or {}
+        a_ms = _num(ab.get("a_median_ms"))
+        times = [t for t in (_num(x) for x in ab.get("a_ms") or []) if t is not None]
+        if a_ms is None and times:
+            a_ms = statistics.median(times)
+    return None if a_ms is None else round(baseline_ms - a_ms + est_gain_ms, 3)
 
 
 def rows(run: RunDir) -> list[dict[str, Any]]:

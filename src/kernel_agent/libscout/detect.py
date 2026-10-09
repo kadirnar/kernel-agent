@@ -275,9 +275,25 @@ def _square_of(calls: list[Call], index: int) -> int | None:
     return None
 
 
-def _manual_rms(calls: list[Call], users: dict[int, list[int]]) -> list[dict[str, Any]]:
-    """Sites of the manual RMSNorm pattern: ``rsqrt(mean(x², -1) + eps)`` times ``x``."""
-    sites = []
+@dataclass
+class RmsMatch:
+    """One manual RMSNorm in a trace: ``square`` (the call that squares x), ``mean``,
+    ``scaled`` (x times the rsqrt), ``final`` (the call whose output is the norm's: the weight
+    multiply, or the cast back / ``scaled`` without a weight), ``weight`` (the parameter's
+    name), ``eps``."""
+
+    square: int
+    mean: int
+    scaled: int
+    final: int
+    weight: str | None
+    eps: float | None
+
+
+def _rms_matches(calls: list[Call], users: dict[int, list[int]]) -> list[RmsMatch]:
+    """The manual RMSNorm pattern: ``rsqrt(mean(x², -1) + eps)`` times ``x``, with its
+    weight multiply."""
+    found = []
     for c in calls:
         if c.name != "rsqrt" or not c.inputs:
             continue
@@ -308,18 +324,88 @@ def _manual_rms(calls: list[Call], users: dict[int, list[int]]) -> list[dict[str
                 break
         if final == scaled:  # no weight: the cast back, if any, is the output
             final = next((u for u in users.get(scaled, []) if calls[u].name == "to"), scaled)
-        shape = calls[mean].shapes[0] if calls[mean].shapes else []
+        found.append(RmsMatch(sq, mean, scaled, final, weight, eps))
+    return found
+
+
+def _manual_rms(calls: list[Call], users: dict[int, list[int]]) -> list[dict[str, Any]]:
+    """Sites of the manual RMSNorm pattern (:func:`_rms_matches`)."""
+    sites = []
+    for m in _rms_matches(calls, users):
+        shape = calls[m.mean].shapes[0] if calls[m.mean].shapes else []
         sites.append(
             {
                 "form": "manual",
                 "hidden": shape[-1] if shape else None,
-                "eps": eps,
-                "weight": weight,
-                "dtype": (calls[final].out_dtypes or ["?"])[0],
+                "eps": m.eps,
+                "weight": m.weight,
+                "dtype": (calls[m.final].out_dtypes or ["?"])[0],
                 "rows": _rows(shape),
             }
         )
     return sites
+
+
+@dataclass
+class RmsSpan:
+    """The calls of one written-out RMSNorm (:func:`rms_spans`), what the scout's op bars
+    replay against a library's fused kernel: ``calls`` (indices, in order), ``entry`` (the
+    first call: its first tensor argument is x, before any cast), ``weight`` (the
+    parameter's name or None), ``eps``, ``dtype`` (the norm's output dtype) and ``mid`` (the
+    dtype the normalised value has before the weight multiply, where the reference rounds:
+    ``fx_rewrites.fold_rms_norm``'s; None without a weight)."""
+
+    calls: list[int]
+    entry: int
+    weight: str | None
+    eps: float | None
+    dtype: str
+    mid: str | None
+
+
+def rms_spans(calls: list[Call]) -> list[RmsSpan]:
+    """Every manual RMSNorm of a :func:`trace` as the calls that compute it: the ancestors
+    of its output back to x (its casts included; x itself, a residual add before it, is not).
+    A pattern with an in-place call is left out (replaying it again would change its input)."""
+    users = _users(calls)
+    spans = []
+    for m in _rms_matches(calls, users):
+        entry = m.square
+        source = calls[m.square].inputs[0] if calls[m.square].inputs else -1
+        while source >= 0 and calls[source].name == "to":  # x.to(float32).pow(2): from x
+            entry = source
+            source = calls[source].inputs[0] if calls[source].inputs else -1
+        span: set[int] = set()
+        todo = [m.final]
+        while todo:
+            i = todo.pop()
+            if i <= source or i in span:
+                continue
+            span.add(i)
+            todo += [j for j in calls[i].inputs if j >= 0]
+        if any(_in_place(calls[i].qualname) for i in span):
+            continue
+        final = calls[m.final]
+        mid = None
+        if m.weight is not None:  # the dtype of what the weight multiplies
+            mid = next((d for d, p in zip(final.dtypes, final.params, strict=False) if not p), None)
+        spans.append(
+            RmsSpan(
+                sorted(span),
+                entry,
+                m.weight,
+                m.eps,
+                (final.out_dtypes or ["?"])[0],
+                mid,
+            )
+        )
+    return spans
+
+
+def _in_place(qualname: str) -> bool:
+    """``Tensor.mul_`` / ``Tensor.__iadd__``: a call that writes into its input."""
+    name = qualname.rpartition(".")[2]
+    return name.startswith("__i") or (name.endswith("_") and not name.endswith("__"))
 
 
 def _rows(shape: list[int]) -> int:

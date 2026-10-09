@@ -2,14 +2,16 @@
 
 No nvcc / no C++ extension build: the kernel source is compiled to a cubin in
 milliseconds and launched on torch's current stream with raw pointers.
+``kernel_agent.toolchain.nvrtc_kernel`` compiles it for this GPU (with CUDA's headers)
+and keeps its cubin for the SASS census of ``evaluate_candidate(profile=true)``.
 """
 
 import numpy as np
 import torch
-from cuda.core import Device, LaunchConfig, Program, ProgramOptions, launch
+from cuda.core import Device, LaunchConfig, launch
 from torch import nn
 
-from kernel_agent.toolchain import cuda_include_dirs, nvrtc_target
+from kernel_agent.toolchain import nvrtc_kernel
 
 SRC = r"""
 #include <cuda_bf16.h>
@@ -49,12 +51,10 @@ def _get_kernel():
     if _kernel is None:
         dev = Device(torch.cuda.current_device())
         dev.set_current()
-        # sm_XY and a cubin; an emulated older GPU (KERNEL_AGENT_EMULATE_ARCH): its PTX
-        arch, kind = nvrtc_target(torch.cuda.get_device_capability())
-        opts = ProgramOptions(arch=arch, std="c++17", include_path=cuda_include_dirs())
-        _kernel = (
-            Program(SRC, code_type="c++", options=opts).compile(kind).get_kernel("rmsnorm_bf16")
-        )
+        # an sm_XY cubin (an emulated older GPU, KERNEL_AGENT_EMULATE_ARCH: its PTX), C++17,
+        # CUDA's headers; the cubin stays readable for the SASS census while the kernel lives
+        capability = torch.cuda.get_device_capability()
+        _kernel = nvrtc_kernel(SRC, "rmsnorm_bf16", capability=capability)
     return _kernel
 
 

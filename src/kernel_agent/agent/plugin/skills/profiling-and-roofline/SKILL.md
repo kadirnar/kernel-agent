@@ -45,10 +45,15 @@ statistics", "Host synchronisation in the profile"). What to do about each regim
   memory-bound ops (element-wise, norms, reductions, casts) found from the tensor storages
   of every op of one run, with the GEMM / convolution / attention that could take them as
   an epilogue or prologue (*fuse*), across module boundaries (*crosses*), never across a
-  host sync; layers deduplicated (*calls*). *saves* = intermediates written and read back
-  that exceed the L2 / DRAM bandwidth (an L2-resident one saves 0 bytes) + launches saved
-  × the launch floor (eager) or ~0.9 us per CUDA-graph boundary. A row is a region target:
-  `parent_class` = its parent class, `region` = its ops, `fusion` = its id.
+  host sync; layers deduplicated (*calls*). *saves* = the DRAM part of the intermediates'
+  round trips / DRAM bandwidth + launches saved × the launch floor (eager) or ~0.9 us per
+  CUDA-graph boundary. LRU-ish L2: of an intermediate, what exceeds L2 − the bytes other
+  ops touch between its write and its last read counts (0 when it fits with that traffic;
+  `fusions.md` says per intermediate: in L2, evicted by N MB of traffic, larger than the
+  L2). The counted rows share no op and add up; a row marked ↳ is an alternative that
+  shares a GEMM with the row above it (a prologue and an epilogue of one projection):
+  plan one or the other. A row is a region target: `parent_class` = its parent class,
+  `region` = its ops, `fusion` = its id.
 * **Workload profile** of a target (`workload_profile.md`): every call of the target's
   instances during the capture run (signatures and shares, masks, strides, flags, integer
   ranges, KV-cache valid lengths): what may be specialised behind a run-time check.
@@ -99,7 +104,9 @@ so compare candidates in the context the result names.
 * The SASS census (`sass`, every `profile` evaluation, no GPU work): what each kernel was
   compiled to. `tensor`: its tensor-core opcodes whole (`HMMA` / `IMMA` / `QMMA` / `OMMA`:
   `mma.sync`; `QMMA.SF`: block-scaled; `HGMMA` / `QGMMA` / `IGMMA`: wgmma; `UTC*MMA`:
-  tcgen05); `categories`: global loads and stores, `cp_async` (`LDGSTS`), `tma`, `local`
+  tcgen05, `.SF` when block-scaled: the census's mark of the scale operand, e.g.
+  `UTCQMMA.SF` for `tl.dot_scaled` and `UTCQMMA` for `tl.dot` on sm_100); `categories`:
+  global loads and stores, `cp_async` (`LDGSTS`), `tma`, `local`
   (`LDL` / `STL`: spills or a run-time indexed array), shared memory, tensor memory,
   barriers, shuffles, atomics, fp32 / fp16 math; `global_load_bits`: load widths. Counts
   are static (instructions in the binary). `F2FP...E4M3.UNPACK` feeding `HMMA` is e4m3
@@ -107,8 +114,10 @@ so compare candidates in the context the result names.
   this GPU's full-rate path (the toolchain block's measured rates, `gpu-architectures`):
   on sm_120 `tl.dot` on e4m3 issues `QMMA.16832.F32` at half the rate of the
   `QMMA.SF` that `tl.dot_scaled` issues. `missing`: kernels that ran without SASS here
-  (library kernels; an NVRTC kernel whose `ObjectCode` was freed: keep the result of
-  `Program(...).compile("cubin")` in a module global to include it).
+  (library kernels; an NVRTC kernel compiled without `kernel_agent.toolchain.nvrtc_kernel`,
+  whose `ObjectCode` was freed: compile through the helper, or keep the result of
+  `Program(...).compile("cubin")` in a module global). TileLang kernels are read from
+  their `JITKernel`.
 * `profile="ncu"`: Nsight Compute on the most-called case, 24 curated metrics (SM and
   memory throughput, DRAM bytes, L1 / L2 hit rates, achieved and theoretical occupancy,
   tensor-pipe activity, registers, shared memory, grid, block, waves, top warp stalls);
@@ -116,8 +125,10 @@ so compare candidates in the context the result names.
   ncu runs per launch with flushed caches at base clocks: compare kernels with each other,
   not with the evaluator's timings. `ncu.status: unavailable` says why and how to fix it.
   Then `rules`: Nsight's 3 rules with the largest estimated speedup (global: share of the
-  kernel's time; local: a unit's efficiency), `lines`: the 5 source lines (SASS
-  instructions without `-lineinfo`) with most warp-stall samples, their share and
+  kernel's time; local: a unit's efficiency), `lines`: the 5 source lines with most
+  warp-stall samples (ncu's run builds `load_inline`, native projects and NVRTC through
+  `nvrtc_kernel` with `-lineinfo`; Triton and TileLang always have it; a `Program`
+  compiled directly needs `ProgramOptions(lineinfo=True)`, else SASS instructions), their share and
   dominant stall (`stall_long_sb`: waiting on global memory; `stall_math`: a pipe is
   saturated; `stall_barrier`; ...), `flagged`: uncoalesced or bank-conflicting lines.
 * `directives` (at most 5, in the summary): what the documented rules of

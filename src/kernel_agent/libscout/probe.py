@@ -18,7 +18,10 @@ same process:
   and with the library's, checked against the reference op's output in the capture's
   tolerance tier and timed interleaved (:data:`ROUNDS` rounds, the median of each) twice:
   as kernel time (the calls replayed from a CUDA graph) and per eager call (the host's
-  launch cost included). Adapters that build a CUDA extension (``compiles``) have none
+  launch cost included). A pattern an adapter folds (``patterns(reference, **config)``:
+  the written-out RMSNorm, :func:`pattern_bars`) has its op bar too: its recorded calls
+  replayed (the reference's own kernels, about six) against the library's fused kernel on
+  the same x and weight. Adapters that build a CUDA extension (``compiles``) have none
   (their sweep builds it). The op bar is the library's speed on the op alone, apart from
   what the module around it costs (cuDNN attention can be 2x faster on its call and slower
   in an eager, launch-bound layer): what an engineer can count on when calling the library
@@ -173,19 +176,56 @@ def time_functions(
     return out
 
 
+Timer = Callable[[Sequence[Callable[[], Any]]], Mapping[str, list[float] | None]]
+
+
+def _measure(
+    bar: dict[str, Any],
+    mine: Callable[[], Any],
+    theirs: Callable[[], Any],
+    *,
+    tier: str | None,
+    timer: Timer,
+) -> dict[str, Any]:
+    """One op bar: the library's output (``theirs``) checked against the reference's
+    (``mine``) in the capture's tolerance tier, both timed by ``timer``
+    (:func:`time_functions`): ``ok`` / ``error``, eager and kernel times, speedups."""
+    import torch
+
+    from kernel_agent.kernels.compare import compare_structures
+
+    try:
+        with torch.inference_mode():  # the recorded tensors are inference tensors
+            reports = compare_structures(mine(), theirs(), tier=tier)
+            failed = [r for r in reports if not r.get("ok")]
+            bar["ok"] = not failed
+            if failed:
+                bar["error"] = str(failed[0])[:300]
+            times = timer([mine, theirs])
+    except Exception as exc:  # a backend that cannot take this call
+        bar.update(ok=False, error=f"{type(exc).__name__}: {exc}"[:300])
+    else:
+        eager, graph = times["eager"] or [], times["graph"]
+        bar.update(ref_eager_us=eager[0], eager_us=eager[1])
+        bar["eager_speedup"] = round(eager[0] / eager[1], 3)
+        if graph is not None:  # the kernels' own time: what the bar is
+            bar.update(ref_us=graph[0], us=graph[1])
+            bar["speedup"] = round(graph[0] / graph[1], 3)
+    return bar
+
+
 def op_bars(
     reference: Any,
     invocations: Sequence[tuple[Any, Any, Any]],
     modules: Mapping[str, tuple[Any, list[dict[str, Any]]]],
     *,
     tier: str | None = None,
+    timer: Timer | None = None,
 ) -> list[dict[str, Any]]:
     """The op bars of the adapters in ``modules`` (``{adapter: (candidate module,
-    configs)}``) on the recorded ``invocations`` (see the module docstring)."""
-    import torch
-
-    from kernel_agent.kernels.compare import compare_structures
-
+    configs)}``) on the recorded ``invocations`` (see the module docstring); ``timer``:
+    :func:`time_functions` (a fake in the CPU tests)."""
+    timer = timer or time_functions
     bars: list[dict[str, Any]] = []
     for adapter, (module, configs) in modules.items():
         for config in configs:
@@ -215,24 +255,90 @@ def op_bars(
                 }
                 mine = functools.partial(func, *args, **kwargs)
                 theirs = functools.partial(table[func], *args, **kwargs)
-                try:
-                    with torch.inference_mode():  # the recorded tensors are inference tensors
-                        reports = compare_structures(mine(), theirs(), tier=tier)
-                        failed = [r for r in reports if not r.get("ok")]
-                        bar["ok"] = not failed
-                        if failed:
-                            bar["error"] = str(failed[0])[:300]
-                        times = time_functions([mine, theirs])
-                except Exception as exc:  # a backend that cannot take this call
-                    bar.update(ok=False, error=f"{type(exc).__name__}: {exc}"[:300])
-                else:
-                    eager, graph = times["eager"] or [], times["graph"]
-                    bar.update(ref_eager_us=eager[0], eager_us=eager[1])
-                    bar["eager_speedup"] = round(eager[0] / eager[1], 3)
-                    if graph is not None:  # the kernels' own time: what the bar is
-                        bar.update(ref_us=graph[0], us=graph[1])
-                        bar["speedup"] = round(graph[0] / graph[1], 3)
-                bars.append(bar)
+                bars.append(_measure(bar, mine, theirs, tier=tier, timer=timer))
+    return bars
+
+
+#: The op bar name of a written-out RMSNorm (:func:`pattern_bars`)
+RMS_PATTERN = "rms_norm (written out)"
+
+
+def pattern_bars(
+    reference: Any,
+    invocations: Sequence[tuple[Any, Any, Any]],
+    calls: Sequence[Any],
+    modules: Mapping[str, tuple[Any, list[dict[str, Any]]]],
+    *,
+    tier: str | None = None,
+    timer: Timer | None = None,
+) -> list[dict[str, Any]]:
+    """Op bars of the patterns the adapters in ``modules`` fold (``patterns(reference,
+    **config)`` of a candidate: ``{"rms_norm": fn(x, weight, eps, dtype, mid)}``, what its
+    rewrite puts in the pattern's place): every written-out RMSNorm of the trace
+    (``detect.rms_spans`` of ``calls``) replayed from its recorded calls (the reference's
+    own kernels, about six) against the adapter's function on the same x and weight,
+    checked and timed like :func:`op_bars` (one bar per distinct signature)."""
+    import torch
+
+    from kernel_agent.libscout.detect import _tensors, rms_spans
+
+    timer = timer or time_functions
+    spans = rms_spans(list(calls))
+    params = dict(reference.named_parameters()) if hasattr(reference, "named_parameters") else {}
+    sites: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for span in spans:
+        x = next(iter(_tensors(invocations[span.entry][1])), None)
+        weight = params.get(span.weight) if span.weight else None
+        dtype = getattr(torch, span.dtype, None)
+        mid = getattr(torch, span.mid, None) if span.mid else None
+        if x is None or span.eps is None or (span.weight and weight is None):
+            continue
+        if not isinstance(dtype, torch.dtype) or (span.mid and not isinstance(mid, torch.dtype)):
+            continue
+        args = (x,) if weight is None else (x, weight)
+        signature = _signature(RMS_PATTERN, args, {"eps": span.eps})
+        key = (signature, span.dtype, span.mid, len(span.calls))
+        if key in sites:
+            sites[key]["calls"] += 1
+        elif len(sites) < MAX_BAR_CALLS:
+            sites[key] = {
+                "span": span,
+                "args": (x, weight, span.eps, dtype, mid),  # the fused function's
+                "sig": signature,
+                "calls": 1,
+            }
+    bars: list[dict[str, Any]] = []
+    for adapter, (module, configs) in modules.items():
+        if not callable(getattr(module, "patterns", None)):
+            continue
+        for config in configs:
+            try:
+                fused = module.patterns(reference, **config).get("rms_norm")
+            except Exception as exc:
+                bars.append({"adapter": adapter, "config": config, "error": repr(exc)[:300]})
+                continue
+            if fused is None:
+                continue
+            for site in sites.values():
+                span = site["span"]
+                steps = [invocations[i] for i in span.calls]
+
+                def replay(steps: list[Any] = steps) -> Any:
+                    out = None
+                    for func, a, kw in steps:
+                        out = func(*a, **kw)
+                    return out
+
+                theirs = functools.partial(fused, *site["args"])
+                bar = {
+                    "adapter": adapter,
+                    "config": config,
+                    "op": RMS_PATTERN,
+                    "signature": site["sig"],
+                    "calls": site["calls"],
+                    "pattern_ops": len(span.calls),
+                }
+                bars.append(_measure(bar, replay, theirs, tier=tier, timer=timer))
     return bars
 
 
@@ -400,7 +506,10 @@ def probe(
         written[d.adapter.name] = str(path)
         if bars and device == "cuda" and not d.adapter.compiles:
             timed[d.adapter.name] = (module, d.configs)
-    measured = op_bars(reference, invocations, timed, tier=tier_of(capture)) if timed else []
+    measured = []
+    if timed:  # one op for one op, and the written-out patterns the adapters fold
+        measured = op_bars(reference, invocations, timed, tier=tier_of(capture))
+        measured += pattern_bars(reference, invocations, calls, timed, tier=tier_of(capture))
     for d, row in zip(decisions, rows, strict=True):  # the op bars spare the sweep its losers
         if not row.get("run") or d.adapter.name not in timed:
             continue

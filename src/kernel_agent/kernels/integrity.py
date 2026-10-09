@@ -232,7 +232,7 @@ class Snapshot:
             _watch("kernel_agent.kernels.verify.Rerounding", verify.Rerounding),
             _watch("kernel_agent.kernels.evaluate", evaluate, constants=True),
             _watch("kernel_agent.kernels.weights", weights, constants=True),
-            # the reference quantisers and the MXFP8 scale-rule guard (fp8_mx targets)
+            # the reference quantisers and the scale-rule guard (fp8_mx, fp4_w4a4 targets)
             _watch("kernel_agent.kernels.quant", quant, constants=True),
             _watch("kernel_agent.kernels.scale_guard", scale_guard, constants=True),
             _watch("kernel_agent.kernels.integrity", sys.modules[__name__], constants=True),

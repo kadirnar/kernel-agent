@@ -10,15 +10,19 @@ stack of decode layers (norm, projection, residual). Other row counts take the r
 
 * ``megakernel``: one launch of the interpreter (``ka_mk.cuh``) over a schedule built once
   here (:mod:`kernel_agent.native.megakernel.schedule`): one GEMV opcode per tile of ``rows``
-  output rows with the layer's RMSNorm fused into its prologue and the residual into its
+  output rows (default :func:`tile_rows`: 16, fewer where 16 rows of weights do not fit this
+  GPU's page pool) with the layer's RMSNorm fused into its prologue and the residual into its
   epilogue; a layer's tiles wait on one counter, the previous layer's (target: its tile
   count), not on a grid barrier, and every block's producer warp streams its next tiles'
   weights into the shared-memory page pool while its consumers wait and compute
   (``inflight``: pages in flight per block; 1 measured best on an RTX 5070 Ti, more pages
-  in flight queue the activations' critical loads behind weight copies);
+  in flight queue the activations' critical loads behind weight copies; on an A10, whose
+  ``cp.async`` path keeps one 8 KB page per SM in flight at 1, 2 measured 1-4 % faster);
 * ``graph_pdl``: one kernel per layer in a CUDA graph with programmatic dependent launch
   (weights into registers before ``ka_pdl_wait()``): the best launch-per-layer design of
-  docs/PARALLEL.md §4.6;
+  docs/PARALLEL.md §4.6. PDL needs sm_90+: on older GPUs (an A10, sm_86) the same graph has
+  plain edges, each kernel starts once the previous one completed and its ``ka_pdl_wait()``
+  is a no-op (correct, without the overlap); ``label`` says which one ran (:func:`graph_label`);
 * ``coop_barrier``: one cooperative persistent kernel with a hand-rolled grid barrier after
   every layer (§4.6's slow persistent variant).
 
@@ -48,6 +52,39 @@ ARCHS_WHY = "bf16 opcodes; page loads with cp.async (sm_80-sm_89) or bulk copies
 ARCHS_COMPILES = "sm_75+"
 
 MODES = ("megakernel", "graph_pdl", "coop_barrier")
+#: PDL (``griddepcontrol``, the programmatic stream serialization attribute) from sm_90 on.
+PDL_SINCE = (9, 0)
+#: What the other modes run (``Chain.label``).
+LABELS = {
+    "megakernel": "megakernel (counters, producer warp, page pool)",
+    "coop_barrier": "coop_barrier (one cooperative kernel, grid barrier per layer)",
+}
+
+
+def graph_label(capability: tuple[int, int]) -> str:
+    """What mode ``graph_pdl`` runs on a GPU of ``capability``: a graph with PDL edges, or
+    before sm_90 the plain graph (a timing of it is not a graph + PDL number)."""
+    if tuple(capability) >= PDL_SINCE:
+        return "graph_pdl (graph + PDL, one kernel per layer)"
+    arch = f"sm_{capability[0]}{capability[1]}"
+    return f"graph_pdl (plain graph, one kernel per layer: PDL needs sm_90+, this GPU is {arch})"
+
+
+#: Output rows per GEMV tile where they fit (the whole-row GEMV path takes up to 16).
+ROWS = 16
+
+
+def tile_rows(n: int, pool_bytes: int, want: int = ROWS) -> int:
+    """The most output rows per tile, at most ``want``, that divide ``n`` and whose bf16
+    weights (rows x n x 2 bytes) fit a page pool of ``pool_bytes`` (0: not one row fits).
+    16 rows of a 4096-wide layer are 128 KB: more than the pool of a GPU with 99 KB of shared
+    memory per block (A10 sm_86, RTX 5070 Ti sm_120: 11 pages of 8 KB), so 8 rows there; an
+    A100's 163 KB holds 16."""
+    rows = min(want, n)
+    while rows > 0 and (n % rows or rows * n * 2 > pool_bytes):
+        rows -= 1
+    return rows
+
 
 # opcodes of include/mk_ops.cuh
 NOP, RMSNORM, GEMV, GEMV_FP8, RESIDUAL, SPLITK_REDUCE, ARGMAX = range(7)
@@ -133,7 +170,7 @@ class Chain(nn.Module):
         self,
         reference: nn.Module,
         mode: str = "megakernel",
-        rows: int = 16,
+        rows: int = 0,
         trace: bool = False,
         pages: int = 0,
         inflight: int = 1,
@@ -154,6 +191,10 @@ class Chain(nn.Module):
         self.ext = extension()
         self.rt: runtime.Runtime | None = None
         self.inflight = inflight
+        # PDL edges where the GPU has them (an emulated older GPU reports its own capability)
+        capability = torch.cuda.get_device_capability(device)
+        self.pdl = mode == "graph_pdl" and tuple(capability) >= PDL_SINCE
+        self.label = graph_label(capability) if mode == "graph_pdl" else LABELS[mode]
         launch = getattr(self, f"_setup_{mode}")(rows, trace, pages)
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.device(device):
@@ -168,8 +209,12 @@ class Chain(nn.Module):
         fit, queues, page_bytes, max_slice = self.ext.mk_info()
         pages = min(pages, fit) if pages > 0 else fit
         n, layers = self.n, self.layers
-        if n % rows or n > max_slice:
-            raise ValueError(f"rows {rows} must divide n {n} (at most {max_slice} columns)")
+        self.rows = rows = rows or tile_rows(n, pages * page_bytes)
+        if rows < 1 or n % rows or n > max_slice:
+            raise ValueError(
+                f"rows {rows} must divide n {n} (at most {max_slice} columns) and fit the page "
+                f"pool ({pages} pages of {page_bytes} bytes)"
+            )
         act = 2 * layers  # tensor table: weights, gammas, the activation buffer
         tile_bytes = rows * n * 2
         # weights the L2 cannot keep stream once per call: evict them first, so the program,
@@ -210,7 +255,8 @@ class Chain(nn.Module):
         return lambda: self.ext.mk_run(*rt.args(), pages, queues, self.inflight)
 
     def _setup_graph_pdl(self, rows: int, trace: bool, pages: int):
-        return lambda: self.ext.chain_pdl(self._weights, self._gammas, self._act, self.eps, True)
+        w, g, act, eps, pdl = self._weights, self._gammas, self._act, self.eps, self.pdl
+        return lambda: self.ext.chain_pdl(w, g, act, eps, pdl)
 
     def _setup_coop_barrier(self, rows: int, trace: bool, pages: int):
         grid = min(self.ext.coop_blocks(self.n), self.n // 8)  # 8 rows per block at most
@@ -247,8 +293,8 @@ def _supported(reference: nn.Module, rows: int) -> bool:
     return (
         n % 256 == 0
         and 256 <= n <= 4096
-        and rows >= 1
-        and n % rows == 0
+        and rows >= 0
+        and n % max(rows, 1) == 0  # 0: tile_rows picks them
         and all(
             isinstance(layer, nn.Linear)
             and layer.bias is None
@@ -274,14 +320,15 @@ def _supported(reference: nn.Module, rows: int) -> bool:
 def build(
     reference: nn.Module,
     mode: str = "megakernel",
-    rows: int = 16,
+    rows: int = 0,
     trace: bool = False,
     pages: int = 0,
     inflight: int = 1,
 ) -> nn.Module:
-    """``rows``: output rows per GEMV tile; ``pages``: the page pool's size (0: what fits this
-    GPU's shared memory); ``inflight``: pages each producer warp keeps in flight (0: all);
-    ``trace``: per-instruction time stamps (``trace_summary()``)."""
+    """``rows``: output rows per GEMV tile (0: :func:`tile_rows`, 16 where they fit the page
+    pool); ``pages``: the page pool's size (0: what fits this GPU's shared memory);
+    ``inflight``: pages each producer warp keeps in flight (0: all); ``trace``:
+    per-instruction time stamps (``trace_summary()``)."""
     if not _supported(reference, rows):
         return reference
     return Chain(reference, mode, rows, trace, pages, inflight)

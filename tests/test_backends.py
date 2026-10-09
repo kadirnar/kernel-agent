@@ -81,7 +81,7 @@ def test_policy_text_and_planner_prompt():
     assert "never a plain `QMMA.F32` kernel" in text and "`tl.dot_scaled`" in text
     assert "one C++ launcher" in text and "warp_specialize" in text
     for c in backends.POLICY:
-        if c.id != "other":
+        if c.id not in ("other", "fp4_gemm"):  # W4A4: opt-in, in runs that allow it (#233)
             assert c.label in text
     # model-agnostic: classes, shapes, bounds and precisions, never a model's module names
     for name in ("VoxCPM", "LocDiT", "MiniCPM", "LocEnc"):

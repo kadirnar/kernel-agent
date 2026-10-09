@@ -96,6 +96,24 @@ def test_datacenter_blackwell_wants_tcgen05():
     assert "tcgen05.mma (UTCHMMA" in rate["text"]
 
 
+def test_plain_and_block_scaled_tcgen05_fp8_are_both_full_rate_on_sm100():
+    """sm_100's FP8 peak instruction is tcgen05's UTCQMMA, plain (tl.dot) or block-scaled
+    (tl.dot_scaled: UTCQMMA.SF, the scale operand); FP4's is the block-scaled UTCOMMA.SF.
+    On sm_120 the block-scaled form is the faster one (QMMA.SF)."""
+    for name in ("triton_fp8_dot_sm100a.sass", "triton_fp8_dot_scaled_sm100a.sass"):
+        found = directives.build(tables(SM100, rows(name)), COMPUTE)
+        assert "tensor_rate" not in [d["rule"] for d in found], (name, found)
+    tcgen05 = rows("sm_100a.sass", "ka_tcgen05")
+    assert "tensor_rate" not in [d["rule"] for d in directives.build(tables(SM100, tcgen05))]
+    wanted = directives.full_rate(SM100)
+    assert wanted["fp8"] == ("UTCQMMA",) and wanted["fp4"] == ("UTCOMMA.SF",)
+    assert all(sass.block_scaled(op) for op in wanted["fp4"])
+    assert sass.block_scaled(directives.full_rate(SM120)["fp8"][0])
+    bf16 = rows("sm_100a.sass", "ka_mma_bf16")
+    (found,) = directives.build(tables(SM100, bf16), COMPUTE)
+    assert "block-scaled UTCQMMA.SF for MXFP8" in found["text"]
+
+
 def test_mma_sync_is_the_full_rate_on_ada_and_ampere():
     assert directives.build(tables(SM89, rows("sm_89.sass", "ka_mma_e4m3")), COMPUTE) == []
     census = rows("sm_80.sass", "ka_mma_bf16", "ka_mma_s8")

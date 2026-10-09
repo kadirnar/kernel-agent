@@ -23,6 +23,12 @@ and says whether it works here and how:
   on the device and stops on its own flag, and a ``torch.compile`` step (no CUDA graphs of
   its own) runs in a WHILE body (skipped where they are unavailable: loops use the K-step
   unrolled graphs there; a compiled step that is not captured is reported, not failed).
+* ``racecheck`` / ``synccheck`` (#225): ``compute-sanitizer`` reports a deliberate
+  shared-memory race / a ``__syncthreads()`` half of a warp reaches, and not the same kernel
+  with its barrier (:func:`probe_sanitizer`, the first report line). Measured on an NVIDIA A10
+  (sm_86) with compute-sanitizer 2025.2.1 (CUDA 12.9): racecheck reports the race, synccheck
+  reports nothing (also not a ``__syncwarp`` mask that leaves out its caller, the tool docs'
+  own example), so a clean synccheck there is no evidence. Skipped without a sanitizer.
 
 :func:`run` records the results with :func:`versions` in
 ``<cache>/probes-<gpu>-torch<version>.json``. A probe that fails says why; none of them
@@ -284,6 +290,26 @@ def probe_graph_conditional() -> Probe:
     return Probe("graph_conditional", ok, detail)
 
 
+#: The longest a sanitizer self-test may take here (they take 2-3 s on an A10).
+SANITIZER_PROBE_S = 120.0
+
+
+def probe_sanitizer(name: str, selftest: Callable[..., dict[str, Any]] | None = None) -> Probe:
+    """Whether ``compute-sanitizer --tool name`` (racecheck, synccheck) reports its probe's
+    deliberate hazard on this GPU, and nothing else (:func:`kernel_agent.kernels.memcheck.
+    selftest`, issue #225): the integration refuses kernels on these tools' errors, so a tool
+    that does not see the hazard here makes its clean verdicts no evidence. Skipped without a
+    usable ``compute-sanitizer`` (``doctor --fetch-sanitizer`` installs NVIDIA's)."""
+    from kernel_agent.kernels import memcheck
+
+    tool = toolchain.sanitizer()
+    if not tool.path:
+        return Probe(name, None, str(tool.reason))
+    check = (selftest or memcheck.selftest)(tool, SANITIZER_PROBE_S, name)
+    took = f" ({check.get('seconds', '?')} s, compute-sanitizer {tool.version or '?'})"
+    return Probe(name, bool(check.get("ok")), f"{check.get('reason')}{took}")
+
+
 PROBES: dict[str, Callable[[], Probe]] = {
     "dot_scaled": probe_dot_scaled,
     "tma": probe_tma,
@@ -291,6 +317,8 @@ PROBES: dict[str, Callable[[], Probe]] = {
     "green_contexts": probe_green_contexts,
     "helion": probe_helion,
     "graph_conditional": probe_graph_conditional,
+    "racecheck": lambda: probe_sanitizer("racecheck"),
+    "synccheck": lambda: probe_sanitizer("synccheck"),
 }
 #: The package each probe needs (skipped without it; ``helion`` says why itself).
 NEEDS = {
@@ -299,6 +327,8 @@ NEEDS = {
     "pdl": "cuda.core",
     "green_contexts": "torch",
     "graph_conditional": "cuda.core",
+    "racecheck": "cuda.core",  # the probe program compiles with NVRTC
+    "synccheck": "cuda.core",
 }
 #: The GPUs each probe's feature exists on (``gpu_arch.supports``) and what it is: skipped
 #: elsewhere with the reason, never reported as a failure (#165).

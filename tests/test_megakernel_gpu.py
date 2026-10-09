@@ -322,6 +322,27 @@ def test_every_mode_of_the_example_matches_the_reference(mk, mode):
     torch.testing.assert_close(got, want, atol=0.1, rtol=0.05)
 
 
+def test_a_4096_wide_chain_builds_with_tiles_that_fit_this_gpus_page_pool(mk):
+    """16 rows of 4096 bf16 columns are 128 KB: more than the pool of a 99 KB GPU (an A10, an
+    RTX 5070 Ti), where the default build raised before; it takes the rows that fit."""
+    mod, ext = mk
+    pages, _, page_bytes, _ = ext.mk_info()
+    ref = _chain(hidden=4096, layers=2)
+    engine = mod.build(ref)
+    assert engine.rows == mod.tile_rows(4096, pages * page_bytes) > 0
+    x = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        torch.testing.assert_close(engine(x), ref(x), atol=0.1, rtol=0.05)
+
+
+def test_the_graph_baseline_says_whether_it_has_pdl_edges(mk):
+    mod, _ = mk
+    engine = mod.build(_chain(layers=2), mode="graph_pdl")
+    capability = torch.cuda.get_device_capability()
+    assert engine.pdl == (capability >= (9, 0))
+    assert engine.label == mod.graph_label(capability)
+
+
 def test_the_trace_shows_weight_loads_overlapping_counter_waits(mk):
     mod, _ = mk
     engine = mod.build(_chain(layers=16), mode="megakernel", trace=True)
@@ -562,14 +583,36 @@ def test_the_stress_catches_consumers_that_do_not_wait(mk):
     print(f"\n  broken schedule: {len(wrong)} of 500 calls wrong")
 
 
-def test_the_example_is_clean_under_memcheck_racecheck_and_synccheck(tmp_path):
+def test_the_sanitizer_self_tests_say_what_each_tool_sees_here():
+    """``doctor``'s self-tests (#225 follow-up 4): memcheck and racecheck report their probe's
+    hazard. synccheck is recorded as it is: measured on an A10 (sm_86) with compute-sanitizer
+    2025.2.1 it reports no barrier error at all, which the self-test must say."""
+    from kernel_agent.kernels import memcheck
+
+    tool = toolchain.sanitizer()
+    if not tool.path:
+        pytest.skip(tool.reason)
+    checks = memcheck.selftests(tool)
+    for name, check in checks.items():
+        print(f"\n  {name}: {'ok' if check['ok'] else 'NOT DETECTED'}: {check['reason']}")
+    assert checks["memcheck"]["ok"] and checks["racecheck"]["ok"], checks
+    assert "ka_race" in checks["racecheck"]["report"]
+    sync = checks["synccheck"]
+    assert sync["ok"] or sync["reason"].startswith("the deliberate divergent"), sync
+
+
+@pytest.mark.parametrize("hidden,layers", [(512, 2), (1024, 28)])
+def test_the_example_is_clean_under_memcheck_racecheck_and_synccheck(tmp_path, hidden, layers):
+    """At 28 layers every page of the pool is reused many times: before each consumer thread
+    observed its previous empty phase (ka_mk.cuh), synccheck reported 151552 "Missing wait"
+    errors there on an A10 and the integration refused the example."""
     from kernel_agent.kernels.memcheck import run_memcheck
     from kernel_agent.selftest import make_norm_chain_capture
 
     tool = toolchain.sanitizer()
     if not tool.path:
         pytest.skip(tool.reason)
-    capture = make_norm_chain_capture(tmp_path / "chain.pt", 512, 2, [((1,), 4)])
+    capture = make_norm_chain_capture(tmp_path / "chain.pt", hidden, layers, [((1,), 4)])
     result = run_memcheck(capture, EXAMPLE, tool=tool, timeout=1200)
     assert result["status"] == "ok", result
     assert [result["tools"][t]["status"] for t in ("memcheck", "racecheck", "synccheck")] == [
