@@ -121,6 +121,20 @@ def test_a_graph_replay_on_the_callers_stream_passes() -> None:
     assert trace.verdict()["passed"]
 
 
+def test_work_on_the_callers_stream_is_joined_whatever_its_timestamps() -> None:
+    """#268: the caller's stream runs the check's marker after everything run() put on it,
+    so a kernel of that stream reported as ending after the marker started is a profiler
+    timestamp artifact (seen once for a WHILE graph's last kernel), never hidden work; the
+    same timing on another stream still is."""
+    own = Trace()
+    own.launch(50, CALLER, 120, 5000, kernels=3, name="ka_loop_end")  # past the slack
+    assert own.verdict()["passed"], own.verdict()
+    side = Trace()
+    side.launch(50, RAW, 120, 5000, kernels=3, name="ka_loop_end")
+    verdict = side.verdict()
+    assert not verdict["passed"] and "ka_loop_end (stream 11)" in verdict["unjoined"][0]
+
+
 def test_ranges_without_the_checks_tag_are_not_trusted() -> None:
     trace = Trace()
     trace.range("ka::mark", 400, 450)  # the code under test names its own range like ours
