@@ -43,7 +43,12 @@ launches and host checks.
 
 The step's contract (as for any CUDA graph): it is a function of device state only, its
 buffers static and updated in place, its shapes fixed; no host syncs (``.item()``,
-``.cpu()``), no Python state that changes from step to step. Torch's RNG cannot be
+``.cpu()``), no Python state that changes from step to step. A ``torch.compile`` step in
+the default mode (Inductor's kernels, no CUDA graphs of its own) is captured into the WHILE
+body like eager ops: the warm-up run compiles it, the graph replays its kernels (the same
+tokens as the compiled step's host loop; measured on an NVIDIA A10, sm_86, torch 2.10, and
+probed by ``doctor``). ``mode="reduce-overhead"`` makes CUDA graphs of its own: not inside a
+device loop. Torch's RNG cannot be
 captured into the WHILE body (torch refuses an RNG op under a capture it did not start):
 such a step falls back to the unrolled graph, whose masked steps after the stop still draw
 numbers, so the generator's state after the loop differs from the host loop's; draw the
@@ -54,7 +59,21 @@ runs at every n-th step and at the stop: ``on_chunk()`` (captured, optional) and
 that writes the steps done to a host-mapped counter. :meth:`DeviceLoop.chunks` launches the
 loop and yields those counts as the host sees them, no device-wide synchronize; leaving
 the iteration early (the metric window) cancels the rest of the loop through a host-mapped
-flag the condition kernel reads and joins what was launched.
+flag the condition kernel reads and joins what was launched. The unrolled fallback has two
+block graphs, K steps and K steps then ``on_chunk()``, with K a divisor of n so that every
+chunk boundary ends a block: the second runs the blocks that end at a boundary, launched
+once the block before is seen active (after a stop it would run ``on_chunk`` again: the host
+waits once per chunk), and once more, its steps masked, for a stop in a plain block. So
+``on_chunk`` runs at the same steps as in the WHILE graph, once each.
+
+Counters: a run's steps stay on the device (``run()`` returns them as a tensor). With
+``workload=`` the loop is a stats source of that workload
+(:meth:`~kernel_agent.workloads.base.Workload.add_stats_source`): its graphs add each run's
+steps to a device total at no extra launch (the WHILE graph's end kernel, ``ka_loop_count``),
+which the workload reads before and after a timed run's clock, where the host waits
+anyway, and reports as the ``report`` counters (default ``steps``; a plain decode loop:
+``("steps", "tokens")``). No host sync is added to the timed run, and ``decode_stats`` of
+an evaluation or an A/B sees the steps.
 
 Integrity: the graph runs on the caller's current stream, so it is joined with that stream
 and the evaluator's timing sees all of it; :meth:`DeviceLoop.chunks` waits for it before
@@ -146,26 +165,31 @@ extern "C" __global__ void ka_chunk_signal(const long long* index, volatile long
 
 // After the WHILE node, outside it: the profiler does not list the kernels of a conditional
 // body one by one, this one ends when the loop has ended (the hidden-work check sees the
-// loop's span); it leaves the (index, active) status the unrolled blocks leave.
+// loop's span); it leaves the (index, active) status the unrolled blocks leave and adds the
+// run's steps to the loop's running total (read on the host outside the timed run).
 extern "C" __global__ void ka_loop_end(const long long* index, const bool* active,
-                                       long long* status) {
+                                       long long* status, long long* total) {
   status[0] = *index;
   status[1] = *active ? 1 : 0;
+  *total += *index;
 }
 """
 #: The same rule without a graph condition, for the unrolled and host modes (no conditional
 #: node API needed): a masked step (``active`` false) changes nothing; ``status`` is the
-#: (index, active) pair the host reads once per unrolled block.
+#: (index, active) pair the host reads once per unrolled block, ``total`` the steps of
+#: every run.
 COUNT_SRC = r"""
 extern "C" __global__ void ka_loop_count(const bool* flags, long long n_flags,
                                          long long* index, bool* active,
-                                         const long long* limits, long long* status) {
+                                         const long long* limits, long long* status,
+                                         long long* total) {
   if (*active) {
     const long long i = *index + 1;
     bool done = n_flags > 0 && i >= limits[0];
     for (long long f = 0; done && f < n_flags; ++f) done = flags[f];
     *index = i;
     *active = !(done || i >= limits[1]);
+    *total += 1;
   }
   status[0] = *index;
   status[1] = *active ? 1 : 0;
@@ -228,10 +252,23 @@ class _Cuda:
         return torch.cuda.graph_pool_handle()
 
     def capture_graph(self, fn: Callable[[], None], pool: Any) -> Any:
-        """``fn`` captured into a ``torch.cuda.CUDAGraph`` (its ``replay()`` runs it)."""
+        """``fn`` captured into a ``torch.cuda.CUDAGraph`` (its ``replay()`` runs it).
+
+        A capture that fails (a host sync in ``fn``) leaves torch 2.10's state behind: its
+        ``torch.cuda.graph`` exit raises before it restores the current stream (later work
+        would run on the capture stream) and the allocator still routes to ``pool``, so the
+        next ``MemPool`` destructor aborts the process (``captures_underway.empty()``;
+        measured on an A10 with torch 2.10). The outer stream context restores the stream,
+        and ending the allocation to the pool clears the allocator (an error where torch
+        already did it is ignored)."""
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=pool):
-            fn()
+        try:
+            with torch.cuda.stream(torch.cuda.current_stream()), torch.cuda.graph(graph, pool=pool):
+                fn()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                torch._C._cuda_endAllocateToPool(torch.cuda.current_device(), pool)
+            raise
         return graph
 
     def event(self) -> Any:
@@ -435,6 +472,13 @@ def choose_unroll(
     return best_k
 
 
+def aligned_unroll(k: int, every: int) -> int:
+    """The largest block size up to ``k`` that divides ``every``: with ``on_chunk`` every
+    chunk boundary (each ``every``-th step) must end an unrolled block, the block that ends
+    with ``on_chunk``."""
+    return max(d for d in range(1, max(1, min(k, every)) + 1) if every % d == 0)
+
+
 # ------------------------------------------------------------------ the loop
 
 
@@ -462,6 +506,8 @@ class DeviceLoop:
         warmup_runs: int = 1,
         strict: bool = False,
         device: torch.device | str | int | None = None,
+        workload: Any = None,
+        report: Sequence[str] = ("steps",),
     ) -> None:
         if mode not in ("auto", *MODES):
             raise ValueError(f"mode must be auto or one of {MODES}, got {mode!r}")
@@ -502,6 +548,8 @@ class DeviceLoop:
             # [min_steps, max_steps]: a run may lower the limit without a new graph
             self._limits = torch.tensor([self.min_steps, self.max_steps], device=self.device)
             self._status = torch.zeros(2, dtype=torch.int64, device=self.device)
+            # the steps of every run, counted on the device (read by stats_mark / since)
+            self._total = torch.zeros((), dtype=torch.int64, device=self.device)
         self._limit = self.max_steps
         #: The built mode (None until built) and why it is the one (the fallbacks' reasons).
         self.mode: str | None = None
@@ -513,6 +561,7 @@ class DeviceLoop:
             "host_checks": 0,
         }
         self._graph: Any = None  # the WHILE graph (cuda.core) or the unrolled block (torch)
+        self._chunk_graph: Any = None  # the unrolled block that ends with on_chunk
         self._pool: Any = None
         self._host: torch.Tensor | None = None  # host-mapped (progress, cancel)
         self._streams: dict[int, Any] = {}
@@ -520,6 +569,10 @@ class DeviceLoop:
         self._cancel = False
         self._keep: list[Any] = []  # what the graph references (streams, buffers)
         self._count: Any = False  # ka_loop_count (None: torch ops; False: not looked up)
+        #: The counters each run's steps are reported as (``workload``'s stats source).
+        self.report = tuple(report)
+        if workload is not None:
+            workload.add_stats_source(self)
 
     # -------------------------------------------------------------- the loop's own update
 
@@ -558,14 +611,17 @@ class DeviceLoop:
             core = _cuda.core()
             ptr, n = (flags.data_ptr(), flags.numel()) if flags is not None else (0, 0)
             args = (index.data_ptr(), active.data_ptr(), self._limits.data_ptr())
+            out = (self._status.data_ptr(), self._total.data_ptr())
             one = core.LaunchConfig(grid=1, block=1)
-            core.launch(self._core_stream(), one, kernel, ptr, n, *args, self._status.data_ptr())
+            core.launch(self._core_stream(), one, kernel, ptr, n, *args, *out)
             return
         following = index + 1
         stop = following >= self._limits[1]
         if flags is not None:
             stop = stop | (flags.all() & (following >= self._limits[0]))
-        index.add_(active.to(index.dtype))
+        counted = active.to(index.dtype)
+        index.add_(counted)
+        self._total.add_(counted)
         active.logical_and_(stop.logical_not())
 
     def _body(self) -> None:
@@ -610,7 +666,7 @@ class DeviceLoop:
             except Exception as exc:  # this mode cannot carry the loop here: say why
                 if self.strict:
                     raise
-                self._graph = self._pool = None
+                self._graph = self._chunk_graph = self._pool = None
                 reasons.append(f"{mode}: {type(exc).__name__}: {exc}"[:400])
                 continue
             self.mode = mode
@@ -676,8 +732,8 @@ class DeviceLoop:
                 core.launch(then, one, kernels["ka_chunk_signal"], index, host)
                 then.end_building()
             body.end_building()
-            status = self._status.data_ptr()
-            core.launch(builder, one, kernels["ka_loop_end"], index, active, status)
+            status, total = self._status.data_ptr(), self._total.data_ptr()
+            core.launch(builder, one, kernels["ka_loop_end"], index, active, status, total)
             builder.end_building()
             graph = builder.complete()
         except BaseException:
@@ -713,20 +769,29 @@ class DeviceLoop:
                 "`active` (graphloop.masked_copy_, masked_index_copy_)"
             )
 
+    def _chunk_block(self, k: int) -> Callable[[], None]:
+        """K steps, then ``on_chunk`` (the unrolled block that ends at a chunk boundary)."""
+        steps, on_chunk = self._block(k), self.on_chunk
+        assert on_chunk is not None
+
+        def block() -> None:
+            steps()
+            on_chunk()
+
+        return block
+
     def _build_unrolled(self) -> None:
         if not self.masked:
             raise Unsupported(
                 "the step is not declared masked (masked=True: it gates its writes with "
                 "`active`), so steps after the stop would write"
             )
-        if self.on_chunk is not None:
-            raise Unsupported("on_chunk runs at chunk boundaries only in an IF node or on the host")
         if not _cuda.graphs(self.device):
             raise Unsupported(f"the loop runs on {self.device}")
         self._counter()  # compiled before any capture
         self._check_masking()
         pool = _cuda.pool_handle()
-        k = self.unroll
+        k, one = self.unroll, None
         if k is None:
             self.active.fill_(False)  # masked replays: the state stays as it is
             one = _cuda.capture_graph(self._block(1), pool)
@@ -734,9 +799,15 @@ class DeviceLoop:
             self._reset()
             k = choose_unroll(step_s, launch_s, self.max_steps)
             self.stats |= {"step_us": round(step_s * 1e6, 2), "launch_us": round(launch_s * 1e6, 2)}
-            self._graph = one if k == 1 else None
+        if self.on_chunk is not None:
+            assert self.chunk_every is not None
+            k = aligned_unroll(k, self.chunk_every)  # every chunk boundary ends a block
+        self._graph = one if one is not None and k == 1 else None
         if self._graph is None:
             self._graph = _cuda.capture_graph(self._block(k), pool)
+        if self.on_chunk is not None:
+            # its own pool: the two block graphs replay in any order
+            self._chunk_graph = _cuda.capture_graph(self._chunk_block(k), _cuda.pool_handle())
         self._pool = pool
         self.stats["unroll"] = k
 
@@ -789,7 +860,7 @@ class DeviceLoop:
         if mode == "while":
             self._launch()
         else:
-            for _ in self._drive(mode):
+            for _ in self._drive(mode, streaming=False):
                 pass
         return self.index
 
@@ -807,7 +878,7 @@ class DeviceLoop:
         if self._host is not None:
             self._host.zero_()
         mode = self._call_mode(max_steps)
-        steps = self._poll_while() if mode == "while" else self._drive(mode)
+        steps = self._poll_while() if mode == "while" else self._drive(mode, streaming=True)
         try:
             yield from steps
         finally:
@@ -833,6 +904,28 @@ class DeviceLoop:
             self._event.synchronize()
             self._event = None
 
+    # -------------------------------------------------------------- counters
+
+    def steps_total(self) -> int:
+        """The steps of every run so far, counted on the device by the loop's own kernels
+        (the WHILE graph's end kernel, ``ka_loop_count``; no extra launch). Reading it
+        waits for the loop's work on the current stream: read it where the host waits
+        anyway (a workload reads it after a timed run's synchronize)."""
+        return int(self._total)
+
+    def stats_mark(self) -> tuple[int, int]:
+        """The runs and steps so far (:class:`~kernel_agent.workloads.base.StatsSource`:
+        called after the synchronize before a timed run's clock starts)."""
+        return self.stats["runs"], self.steps_total()
+
+    def stats_since(self, mark: tuple[int, int] | None) -> dict[str, float]:
+        """The steps of the runs since ``mark`` (None: since the loop was made) as each
+        counter of ``report``; ``{}`` when the loop did not run (an A/B's other state)."""
+        runs, steps = mark if mark is not None else (0, 0)
+        if self.stats["runs"] == runs or not self.report:
+            return {}
+        return dict.fromkeys(self.report, self.steps_total() - steps)
+
     def _launch(self) -> None:
         """The WHILE graph on the caller's stream, launched where the profiler sees it."""
         if not _cuda.runtime_launch(self._graph, _cuda.current_stream(self._dev)):
@@ -857,11 +950,12 @@ class DeviceLoop:
                 return
             time.sleep(POLL_S)
 
-    def _drive(self, mode: str) -> Generator[int]:
+    def _drive(self, mode: str, streaming: bool) -> Generator[int]:
         """The host-driven modes: the unrolled blocks or the plain loop. Yields the steps
-        done at each chunk boundary the host saw (every check without ``chunk_every``)."""
+        done at each chunk boundary the host saw (``streaming``: :meth:`chunks` reads
+        them)."""
         if mode == "unrolled":
-            yield from self._drive_unrolled()
+            yield from self._drive_unrolled(streaming)
         else:
             yield from self._drive_host()
 
@@ -890,37 +984,68 @@ class DeviceLoop:
         finally:
             self._record()
 
-    def _drive_unrolled(self) -> Generator[int]:
+    def _drive_unrolled(self, streaming: bool) -> Generator[int]:
+        """K-step blocks until the stop, each block's status read one block behind (the
+        GPU never waits for the host). With ``on_chunk``, a block that ends at a chunk
+        boundary is the second graph (its K steps, then ``on_chunk``), launched only after
+        the block before it was seen active: launched after a stop it would run
+        ``on_chunk`` once more (the host waits there once per chunk). A stop in a plain
+        block gets its ``on_chunk`` from one more replay of that graph, its steps masked.
+        ``streaming`` (:meth:`chunks`): a chunk's work is done when its count is yielded."""
         from kernel_agent.workloads.serving import AsyncFlags
 
-        k = int(self.stats["unroll"])
-        self._reset()
+        k, chunk, every = int(self.stats["unroll"]), self._chunk_graph, self.chunk_every or 0
         flags = AsyncFlags(depth=2)
-        pending: int | None = None
         done = 0
+
+        def launch(graph: Any) -> tuple[int, bool]:
+            graph.replay()
+            self.stats["launches"] += 1
+            return flags.send(self._status), graph is chunk
+
+        def read(ticket: int) -> tuple[int, bool]:
+            index, active = (int(v) for v in flags.read(ticket).tolist())
+            self.stats["host_checks"] += 1
+            return index, bool(active)
+
+        def settle(ticket: int, chunked: bool) -> Generator[int, None, bool]:
+            """A block's status on the host: yields the count at a chunk boundary or the
+            stop, returns whether the loop stopped in it."""
+            nonlocal done
+            index, active = read(ticket)
+            if not active and chunk is not None and not chunked:
+                ticket, _ = launch(chunk)  # the stop's on_chunk
+                if streaming:
+                    read(ticket)
+            if self._boundary(done, index, active):
+                yield index
+            done = index
+            return not active
+
+        self._reset()
+        pending: tuple[int, bool] | None = None  # the last block: its status, on_chunk ran
         try:
-            for _ in range(math.ceil(self._limit / k)):
+            for block in range(math.ceil(self._limit / k)):
                 if self._cancel:
                     break
-                self._graph.replay()
-                ticket = flags.send(self._status)
-                self.stats["launches"] += 1
+                chunked = chunk is not None and (block + 1) * k % every == 0
+                if chunked and pending is not None:  # never on_chunk after a stop
+                    stopped = yield from settle(*pending)
+                    pending = None
+                    if stopped:
+                        break
+                ticket = launch(chunk if chunked else self._graph)
                 if pending is not None:  # the previous block's status, one block behind
-                    index, active = (int(v) for v in flags.read(pending).tolist())
-                    self.stats["host_checks"] += 1
-                    if self._boundary(done, index, bool(active)):
-                        yield index
-                    done = index
-                    if not active:
+                    stopped = yield from settle(*pending)
+                    if stopped:
                         pending = None
                         break
                 pending = ticket
-            if pending is not None and self.chunk_every is not None and not self._cancel:
-                # the limit ended the loop in the last block: its count is the last chunk's
-                index, active = (int(v) for v in flags.read(pending).tolist())
-                self.stats["host_checks"] += 1
-                if self._boundary(done, index, bool(active)):
-                    yield index
+            else:  # the loop stopped in its last block (at the limit at the latest)
+                if pending is not None and chunk is not None and not pending[1]:
+                    pending = launch(chunk)  # the stop's on_chunk
+                if pending is not None and streaming:
+                    yield from settle(*pending)  # the last chunk's count
         finally:
             self._record()
 
@@ -936,10 +1061,13 @@ def device_loop(
     set from ``min_steps`` on, or ``max_steps`` steps (see the module docstring). Options:
     ``min_steps``, ``mode`` (``auto``: while → unrolled → host), ``masked`` (the step gates
     its writes with ``active``: needed by the unrolled fallback), ``unroll`` (K; default
-    measured), ``chunk_every`` / ``on_chunk`` (streaming), ``watch`` (callables that must be
-    called from Python: teacher forcing), ``check_state`` (tensors a masked step must not
-    change, checked once before the unrolled capture), ``warmup_runs``, ``strict`` (raise
-    instead of falling back), ``device``."""
+    measured; with ``on_chunk`` the largest divisor of ``chunk_every`` up to it),
+    ``chunk_every`` / ``on_chunk`` (streaming), ``watch`` (callables that must be called
+    from Python: teacher forcing), ``check_state`` (tensors a masked step must not change,
+    checked once before the unrolled capture), ``warmup_runs``, ``strict`` (raise instead
+    of falling back), ``device``, ``workload`` / ``report`` (the workload whose timed runs
+    count the loop's steps, read outside the clock, and the counters they are reported as;
+    default ``("steps",)``)."""
     return DeviceLoop(step, cond, max_steps, **options)
 
 
@@ -948,11 +1076,20 @@ def device_loop(
 
 def probe() -> tuple[bool | None, str]:
     """``doctor``: a loop of three steps on the device, run twice through a WHILE graph with
-    a chunk IF node (and once through :meth:`DeviceLoop.chunks`): ``(True, detail)`` when
-    every count is right, ``(None, why)`` where conditional nodes are unavailable (loops use
-    the unrolled graphs there), ``(False, why)`` when the graph is wrong."""
+    a chunk IF node (and once through :meth:`DeviceLoop.chunks`), then a ``torch.compile``
+    step in a WHILE body (:func:`_probe_compiled`): ``(True, detail)`` when every count is
+    right, ``(None, why)`` where conditional nodes are unavailable (loops use the unrolled
+    graphs there), ``(False, why)`` when a graph is wrong."""
     if (why := conditional_support()) is not None:
         return None, f"{why}; device_loop uses K-step unrolled CUDA graphs"
+    ok, detail = _probe_while()
+    if not ok:
+        return ok, detail
+    compiled, what = _probe_compiled()
+    return compiled is not False, f"{detail}; {what}"
+
+
+def _probe_while() -> tuple[bool, str]:
     device = torch.device("cuda", torch.cuda.current_device())
     with torch.inference_mode(False):
         count = torch.zeros(2, dtype=torch.int64, device=device)  # steps, chunk boundaries
@@ -987,4 +1124,53 @@ def probe() -> tuple[bool | None, str]:
     return True, (
         "a WHILE graph ran 3 steps three times with no host check; its chunk IF node ran at "
         f"steps 2 and 3 and signalled the host ({seconds * 1e3:.1f} ms incl. build)"
+    )
+
+
+def _probe_compiled() -> tuple[bool | None, str]:
+    """A ``torch.compile`` step (the default mode: Inductor's kernels, no CUDA graphs of its
+    own) captured into a WHILE body: compiled in the warm-up host run, then two WHILE runs
+    of three steps that read ``index`` on the device. ``(None, why)``: it does not compile
+    or is not captured here (``device_loop`` falls back for such a step), ``(False, why)``:
+    it ran wrong."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.inference_mode(False):
+        acc = torch.zeros(2, dtype=torch.int64, device=device)
+        scale = torch.tensor([1, 2], device=device)
+
+    def step(index: torch.Tensor, active: torch.Tensor) -> None:
+        acc.copy_(acc + (index + 1) * scale)  # 1, 2, 3 (and twice that) at steps 1, 2, 3
+
+    loop = DeviceLoop(
+        torch.compile(step),
+        lambda: acc[0] >= 6,  # stops after 3 steps
+        max_steps=8,
+        mode="while",
+        strict=True,
+        device=device,
+    )
+    start = time.perf_counter()
+    stage = "compiled"
+    try:
+        for _ in range(3):  # a host run (it compiles), then the WHILE graph twice
+            acc.zero_()
+            loop.run()
+            stage = "captured into a WHILE body"
+    except Exception as exc:
+        return None, (
+            f"a torch.compile step is not {stage} here ({type(exc).__name__}: {exc}"[:300]
+            + "): device_loop falls back for such a step"
+        )
+    torch.cuda.synchronize(device)
+    seconds = time.perf_counter() - start
+    got = (acc.tolist(), int(loop.index), loop.mode, loop.stats["launches"])
+    want = ([6, 12], 3, "while", 2)
+    if got != want:
+        return False, (
+            "a torch.compile step ran wrong in a WHILE body: (sums, index, mode, launches) = "
+            f"{got}, want {want}"
+        )
+    return True, (
+        "a torch.compile step (no CUDA graphs of its own) ran 3 steps twice in a WHILE body "
+        f"({seconds:.1f} s incl. compilation)"
     )

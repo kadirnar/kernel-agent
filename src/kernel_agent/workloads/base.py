@@ -36,10 +36,11 @@ import contextlib
 import itertools
 import statistics
 import time
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import torch
 from torch import nn
@@ -71,6 +72,19 @@ INPUTS_VERSION = 2
 #: ``verifies`` (verifications of a draft), ``drafted`` (draft tokens proposed),
 #: ``accepted`` (draft tokens accepted) and ``tokens`` (tokens emitted). Others are kept too.
 DECODE_COUNTERS = ("steps", "verifies", "drafted", "accepted", "tokens")
+
+
+class StatsSource(Protocol):
+    """Counters a run makes that the host reads only where it waits anyway
+    (:meth:`Workload.add_stats_source`; ``graphloop.DeviceLoop``: the steps its graphs
+    counted on the device). ``stats_mark()`` is called after the synchronize before a timed
+    run's clock starts, ``stats_since(mark)`` (``mark`` None: the source was added during
+    the run) after the synchronize that ends it; it returns the counters of the runs in
+    between (``{}``: it did not run)."""
+
+    def stats_mark(self) -> Any: ...
+
+    def stats_since(self, mark: Any) -> dict[str, float]: ...
 
 
 @dataclass
@@ -275,10 +289,23 @@ class Workload(ABC):
         ``metric_detail.decode_stats`` with the acceptance rate, tokens per verification and
         tokens per step (:func:`decode_stats`), and the reports show them. Steps per token
         that change with the input label a candidate data-dependent
-        (:mod:`kernel_agent.workloads.diverse`)."""
+        (:mod:`kernel_agent.workloads.diverse`). Counts the host knows only by reading the
+        device (a device loop's steps) come from a stats source instead
+        (:meth:`add_stats_source`): reading them here would add a host sync to the run."""
         stats = self.__dict__.setdefault("run_stats", {})
         for key, value in counters.items():
             stats[key] = stats.get(key, 0) + value
+
+    def add_stats_source(self, source: StatsSource) -> None:
+        """Count ``source``'s counters in every timed run as :meth:`report_stats` counts
+        them, read on the host only outside the run's clock (:class:`StatsSource`, called
+        by :func:`timed_run`): a generation loop whose step count lives on the device
+        (``graphloop.device_loop(..., workload=workload)``) reports it without a host sync
+        inside the timed run. Held weakly: the loop of an undone transform reports nothing
+        (it no longer runs), and nothing once it is gone."""
+        sources = self.__dict__.setdefault("stats_sources", [])
+        if not any(ref() is source for ref in sources):
+            sources.append(weakref.ref(source))
 
     def natural_length_run(self, reference: Any = None) -> dict[str, Any] | None:
         """Optional hook for autoregressive models that decide their own output length
@@ -524,8 +551,9 @@ def timed_run(
 ) -> tuple[Any, float, dict[str, Any]]:
     """One GPU-synchronised run of ``workload.run``: ``(output, value of the workload's
     metric in ms, its per-run details)`` (:meth:`Workload.metric_value`; with the counters
-    the run reported, :meth:`Workload.report_stats`, as ``decode_stats``). The clock starts
-    before ``workload.run`` is called, so whatever a transform does around it counts.
+    the run reported, :meth:`Workload.report_stats`, as ``decode_stats``; the stats sources'
+    counters, :meth:`Workload.add_stats_source`, are read outside the clock). The clock
+    starts before ``workload.run`` is called, so whatever a transform does around it counts.
     ``window``: inside :meth:`Workload.metric_window` (``ttfa``: the request up to its first
     chunk; the output is the window's, the full-run details are missing)."""
     workload.chunk_marks.clear()
@@ -533,15 +561,36 @@ def timed_run(
     with workload.metric_window() if window else contextlib.nullcontext():
         with torch.inference_mode():
             synchronize()
+            marks = _stats_marks(workload)  # device counters: read before the clock starts
             start = time.perf_counter()
             output = workload.run(inputs)
             synchronize()
             end = time.perf_counter()
+            _report_marked(workload, marks)  # ... and after the synchronize that ends it
         ms, detail = workload.metric_value(start, end)
         short = workload.in_window
     if workload.run_stats and not short:  # a request stopped at the window: partial counts
         detail = {**detail, "decode_stats": dict(workload.run_stats)}
     return output, ms, detail
+
+
+def _stats_sources(workload: Workload) -> list[StatsSource]:
+    """The live sources of :meth:`Workload.add_stats_source` (the dead ones dropped)."""
+    refs = workload.__dict__.get("stats_sources", [])
+    refs[:] = [ref for ref in refs if ref() is not None]
+    return [source for ref in refs if (source := ref()) is not None]
+
+
+def _stats_marks(workload: Workload) -> list[tuple[StatsSource, Any]]:
+    return [(source, source.stats_mark()) for source in _stats_sources(workload)]
+
+
+def _report_marked(workload: Workload, marks: list[tuple[StatsSource, Any]]) -> None:
+    """The counters of every stats source since its mark (None: added during the run)."""
+    marked = {id(source): mark for source, mark in marks}
+    for source in _stats_sources(workload):
+        if counters := source.stats_since(marked.get(id(source))):
+            workload.report_stats(**counters)
 
 
 def decode_stats(runs: list[dict[str, Any]]) -> dict[str, Any] | None:

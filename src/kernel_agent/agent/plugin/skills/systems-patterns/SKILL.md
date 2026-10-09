@@ -100,10 +100,11 @@ shapes, no `.item()`, no Python state that changes per step). The first run is a
 that warms the step up (compilations, cuBLAS handles); the graph is built at the next.
 Torch RNG cannot be captured into the WHILE body (it falls back to unrolled, whose masked
 steps still draw, so the generator's state after the loop differs: draw from your own
-generator or precompute the noise). `torch.compile(mode="reduce-overhead")` makes graphs
-of its own: compile without CUDA graphs inside a device loop. The graph runs on the
-caller's stream: the timing sees all of it and the hidden-work check its launch and whole
-span (a loop run on a side stream that is never joined fails as unjoined work).
+generator or precompute the noise). A `torch.compile` step in the default mode is captured
+into the WHILE body (the warm-up run compiles it; `doctor` probes it);
+`mode="reduce-overhead"` makes graphs of its own: not inside a device loop. The graph runs
+on the caller's stream: the timing sees all of it and the hidden-work check its launch and
+whole span (a loop run on a side stream that is never joined fails as unjoined work).
 
 * **Teacher forcing.** A chaotic workload's teacher-forced replay wraps a callable that
   must be called from Python every step (VoxCPM2: `model.feat_decoder.forward`). Name it:
@@ -116,7 +117,12 @@ span (a loop run on a side stream that is never joined fails as unjoined work).
   the stop that runs `on_chunk()` (captured) and writes the steps done to a host-mapped
   counter. `for steps in loop.chunks(): workload.mark_ready(...)` sees each chunk without a
   device-wide sync (`mark_chunk` would wait for the whole loop); leaving the iteration
-  early (the metric window) cancels the loop after its current step and joins it.
+  early (the metric window) cancels the loop after its current step and joins it. The
+  unrolled fallback runs `on_chunk` in a second block graph (K divides n), at the same
+  steps, once each.
+* **Counters.** Pass `workload=workload, report=("steps", "tokens")` (a plain decode loop)
+  and the steps reach `decode_stats` (the data-dependent label, the A/B) read outside the
+  timed run; `report_stats(steps=int(loop.run()))` would add a host sync per run.
 
 Measured on an RTX 5070 Ti (`examples/graph_while_decode.py`, toy decoders, ~193 tokens,
 the same tokens every way): against one graph per step with a `.item()` stop check the WHILE
@@ -126,6 +132,11 @@ one-kernel step (the overhead floor): 7.8 µs a step with the host check, 5.2 µ
 loop, 2.6 µs for graph replays with no stop check at all. So it pays where the loop checks
 a stop every step or the host is the bottleneck; a fixed-length loop whose host already
 runs ahead gains nothing (each WHILE iteration adds the flag and loop kernels, ~2.5 µs).
+Measured on an NVIDIA A10, sm_86: 0.377 → 0.369 ms per token (4 layers), 0.120 → 0.095
+(1 layer), a `torch.compile` step 0.270 → 0.258; a one-kernel step 13.1 µs with the host
+check, 8.6 µs in the WHILE loop, 6.2 µs unrolled with K = 16 (pass `unroll=` when the step
+is that short: the measured K was 2 there). Streaming with `on_chunk` (every 8 steps), the
+unrolled blocks took 0.120 ms per token where host steps took 0.711.
 
 ## A post-processing stage on a side stream
 

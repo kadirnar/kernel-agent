@@ -20,8 +20,9 @@ and says whether it works here and how:
   installed: skipped with that reason (the ``helion`` backend is then unavailable).
 * ``graph_conditional``: conditional graph nodes (CUDA 12.4+ driver, ``cuda.core``): a
   :func:`kernel_agent.graphloop.device_loop` WHILE graph with a chunk IF node runs its steps
-  on the device and stops on its own flag (skipped where they are unavailable: loops use
-  the K-step unrolled graphs there).
+  on the device and stops on its own flag, and a ``torch.compile`` step (no CUDA graphs of
+  its own) runs in a WHILE body (skipped where they are unavailable: loops use the K-step
+  unrolled graphs there; a compiled step that is not captured is reported, not failed).
 * ``racecheck`` / ``synccheck`` (#225): ``compute-sanitizer`` reports a deliberate
   shared-memory race / a ``__syncthreads()`` half of a warp reaches, and not the same kernel
   with its barrier (:func:`probe_sanitizer`, the first report line). Measured on an NVIDIA A10
