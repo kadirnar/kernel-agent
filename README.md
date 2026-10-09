@@ -1342,6 +1342,61 @@ same codes on sm_120; torch 2.14 has no MXFP4 GEMM there), `fp4_w4a4_error`,
 probe: every `nn.Linear` of a target alone in W4A4 and FP8 W8A8 on its captured inputs,
 the most sensitive first, to keep those in FP8).
 
+**Scale-rule guard** (`kernels/scale_guard.py`, as for `fp8_mx`). A W4A4 candidate defines
+`quantize_activations(x) -> (codes, scales, outer)` with the quantiser its kernels use
+(codes packed two per byte `[rows, K / 2]`, not read by the guard; scales **unswizzled**
+`[rows, K / 16]` e4m3, MXFP4 `[rows, K / 32]` e8m0; outer fp32 per row or one per call;
+a quantiser that rotates first returns the rotated activations fourth; both examples
+define it). The evaluator runs it on the captured input and on a stress input
+of the same shape (`quant.fp4_stress_input`: every row's maximum 64, the other blocks' scale
+before rounding at 1.1125 x 2^e and in e4m3's subnormal range; MXFP4: block maxima at 1.9 x
+2^e) and rejects the candidate (`status: incorrect`, `stage: scale_rule`, the reason in
+`error`) when a block maximum exceeds 6 x scale x outer beyond the rounding of an e4m3 scale
+(`quant.fp4_scale_check`: 6.375 for a normal scale rounded to nearest, the reference's own
+subnormal rounding below 2^-6), when a non-zero block gets scale 0 where rounding to nearest
+gives a subnormal one, or when a scale is not finite. Caught on the CPU tests: block scales
+rounded down (truncated; up to 6.75 x step with a normal scale, more with a subnormal one;
+30 % of the blocks of rows spanning 1e-3 to 1e3, every stress block), an outer scale 0.8x
+too small (block scales clamp at 448), subnormal scales flushed to zero (on Gaussian rows
+only the stress input shows it) and MXFP4's OCP rule `2^(floor(log2 amax) - 2)` (up to 8 x
+scale; 43 % of those rows' blocks, every stress block); the reference (per token and per
+call), MXFP4's ceil rule and both examples' hooks pass. Swizzled scales are refused with
+the unswizzled form in the reason; a candidate without the hook is not rejected, its
+`scale_rule` report says the rule went unchecked.
+
+**Per-layer selection** (`kernel_agent/demotion.py`, `kernels/mix_probe.py`). When the
+worker captures a W4A4 target it runs the probe on the capture (`spec.json` → `capture` →
+`w4a4_probe`): the sensitivity ranking, with the layers that read the same activations (q /
+k / v, gate / up) as one group, and a ladder of the reference math on every captured case
+(its module state restored per case) with the top 0, 1, 2, ... groups in the GPU's 8-bit
+class (`fp8_w8a8`; `int8_w8a8` where FP8 is absent), each rung compared with the captured
+outputs in the target's tier. The target's mix (`spec.json` → `w4a4_mix`) starts at the
+fewest groups with which the reference math passes, and moves one group to 8 bits each time
+a gate fails: the evaluator (3 evaluations since the mix was set failing the tier with a
+cosine of 0.9 or more, none passing: precision, not a broken kernel; scale-rule rejections
+do not count) or the end-to-end gate (the integration's A/B of one of the target's kernels,
+evaluated under the current mix, alone against the unmodified model, rejected by the quality
+checks: perceptual gate, teacher forcing, held-out input; out-of-memory steps do not
+count). With every group at 8 bits a further failure proposes the target's pivot to its
+8-bit class (`<id>__fp8_w8a8`, source `w4a4-demotion`, once) and names the ideas left for
+W4A4 (per-token outer scales, a rotation, a norm-bias correction, bf16 for the top group);
+the W4A4 arm keeps its slices. The improve loop applies the policy before every slice of a
+W4A4 arm; the engineer prompt (the layers to keep at 8 bits, the probe's groups and why),
+the slice digest (`## Precision mix (W4A4)`: the mix, its last steps, the next group) and
+the round re-plan's target list show it; `w4a4_mix` events record each step. On a synthetic
+block (gate / up then six square layers, bf16, M = 256 and 66; `tests/test_w4a4_mix.py`) W4A4
+everywhere fails `near-lossless-fp4a` (cosine 0.939, relative L2 0.35) and the ladder
+passes from three groups at 8 bits (0.963 / 0.27; all seven: 0.995 / 0.096), the same on
+the CPU and on an NVIDIA A10 (sm_86, CUDA tensors; 0.4 s).
+
+**Backend policy.** The planner's table has a *Compute-bound W4A4 GEMM* row only on GPUs
+with block-scaled FP4 tensor cores and only in runs that allow `fp4_w4a4`: on sm_120 /
+sm_121 the CuTe `MmaMXF4NVF4Op` GEMM first (`cute_nvfp4_w4a4_gemm.py`, measured above), the
+Triton quantiser + `F.scaled_mm` inside CUDA graphs second; on sm_100 / sm_103 cuBLASLt
+NVFP4 through `F.scaled_mm` behind the Triton quantiser first, a `tcgen05` CuTe GEMM from
+`cute_sm100_gemm_tcgen05.py` for fused epilogues (no `mma.sync` there; not measured yet).
+Engineers of W4A4 MLPs and layers get the row and its "never" rules.
+
 Calibrated like the 8-bit and FP4 tiers (`docs/research-scripts/w4a4-233`, the reference
 math on real captures: captured inputs, 10 seeds of both per-channel redraws, x 3 / x 0.01 /
 x -1; failed draws near-lossless-fp4a · relaxed-fp4a):
@@ -3660,7 +3715,9 @@ model and starts a new round (`kernel_agent/improve.py`,
   `pivot_failed`; `improve.json` → `research[].pivot`; the improve section of
   `report.md`, the dashboard's target table and `kernel-agent status` show
   each arm's precision. The engineer of the new arm is pointed at the old
-  arm's kernels, notes and plan.
+  arm's kernels, notes and plan. A W4A4 target whose per-layer mix has every
+  group at 8 bits and still fails a gate proposes its pivot to the 8-bit class
+  itself (source `w4a4-demotion`, "W4A4 (`fp4_w4a4`)" above).
 * **Re-integration.** After every `--integrate-every 4` kept results, the
   integration of `optimize` measures the combination end to end
   (`--integrate-every 0`: only the final integration, and the one a new round
@@ -4556,8 +4613,10 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   e4m3 `mma.sync` on Ada, `wgmma` on Hopper, `tcgen05.mma` on datacenter Blackwell,
   the block-scaled `QMMA.SF` on GeForce Blackwell with this GPU's measured
   `QMMA.F32` / `QMMA.SF` rates, the half-rate rule dropped where both measure the
-  same); a class whose precision the GPU cannot run is left out; each family adds what
-  it needs for the peak (`backends.ARCH_POLICY`, `ARCH_RULES`). The other rows keep
+  same); the opt-in compute-bound W4A4 GEMM row (`fp4_w4a4`, #233) appears on sm_100 /
+  sm_103 (`tcgen05.mma kind::mxf4nvf4`) and sm_120 / sm_121 (block-scaled FP4 `mma.sync`)
+  in runs that allow it; a class whose precision the GPU cannot run is left out; each
+  family adds what it needs for the peak (`backends.ARCH_POLICY`, `ARCH_RULES`). The other rows keep
   their evidence, labelled as measured on the RTX 5070 Ti. Turing has its own small-M
   GEMM, short-attention, decoder-layer and bf16-GEMM rows (fp16 `mma.sync` m16n8k8, WMMA,
   cuBLAS fp16; Triton's int8 `tl.dot` does not compile below sm_80), and no row or rule
@@ -5081,7 +5140,8 @@ Triton toolkit (#148, the `triton-kernels` skill), for any model:
 with `--compile-check`).
 
 **Backend policy by target class.** The planner gets a table of target classes
-(compute-bound FP8 GEMM, small-M GEMV, attention over ≤ 16 tokens, conv, fused
+(compute-bound FP8 GEMM, compute-bound INT8 GEMM, compute-bound W4A4 GEMM where the run
+allows `fp4_w4a4`, small-M GEMV, attention over ≤ 16 tokens, conv, fused
 decoder layer, bf16 GEMM, norm / glue) with the first and second backend of
 each and the measured evidence (docs/RESEARCH-TRITON.md §5.1), and each engineer
 gets its target's row (`kernel_agent/backends.py`). Classes are read from the

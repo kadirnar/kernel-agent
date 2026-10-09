@@ -35,7 +35,9 @@ def int4_per_tensor(w):
     return (torch.round(w.float() / scale).clamp(-8, 7) * scale).to(w.dtype)
 
 
-def quantize_activations(x):  # fp8_mx: the scale-rule guard's hook
+def quantize_activations(x):  # the scale-rule guard's hook (fp8_mx, fp4_w4a4)
+    if PRECISION == "fp4_w4a4":
+        return quant.quantize_fp4_activations(x)
     return quant.quantize_mxfp8(x, RULE)
 
 

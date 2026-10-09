@@ -20,10 +20,12 @@ habit:
   Both follow the GPU (issue #165, :class:`kernel_agent.gpu_arch.Facts`): the rows that
   differ by architecture (:data:`ARCH_POLICY`: compute-bound FP8 on Ada, Hopper and
   datacenter Blackwell; on GeForce Blackwell with this GPU's measured FP8 instruction
-  rates; compute-bound INT8 on Turing, Hopper and datacenter Blackwell; Turing's small-M
+  rates; compute-bound INT8 on Turing, Hopper and datacenter Blackwell; compute-bound W4A4
+  on datacenter Blackwell; Turing's small-M
   GEMMs, short attention, decoder layers and bf16 GEMMs) replace
   :data:`POLICY`'s, whose evidence was measured on an RTX 5070 Ti (sm_120);
-  a class whose precision the GPU cannot run is left out, and :data:`ARCH_RULES` adds what
+  a class whose precision the GPU cannot run is left out (the opt-in W4A4 class also when
+  the run does not allow it), and :data:`ARCH_RULES` adds what
   each family needs for the tensor-core peak. No row or rule names a bundled example whose
   ``ARCHS`` excludes the GPU (:func:`runnable_text`, #254).
 * :func:`outcomes` / :func:`by_backend` tabulate a run's kernel evaluations per target and
@@ -145,6 +147,27 @@ POLICY: tuple[TargetClass, ...] = (
         "those GEMMs in FP8 / bf16",
     ),
     TargetClass(
+        "fp4_gemm",
+        "Compute-bound W4A4 GEMM (NVFP4, M ≳ 128 rows; opt-in)",
+        "block-scaled FP4 `mma.sync` (`kind::mxf4nvf4.block_scale.scale_vec::4X` m16n8k64): "
+        "CuTe DSL `MmaMXF4NVF4Op` GEMM with the per-token outer scale, the weight's tensor "
+        "scale and the bias in its epilogue, after its per-token quantiser "
+        "(`examples/cute_nvfp4_w4a4_gemm.py`); then the quantiser fused into the producer of "
+        "the activations",
+        "the CuTe GEMM runs 650 TFLOP/s at 4096³ (cuBLASLt NVFP4 659, FP8 tensor-wise 333: "
+        "1.96x) and 1.28-2.10x FP8 at M = 352; its separate quantiser costs 2.5-5.5 us there, "
+        "so at N = 1024, K = 4096 quantiser + GEMM is 0.83x FP8 (24 output tiles on 70 SMs; "
+        "RTX 5070 Ti)",
+        "two-level `F.scaled_mm` NVFP4 (`[BlockWise1x16, TensorWise]`: one outer scale per "
+        "call, the bias in cuBLASLt's epilogue) behind a Triton quantiser "
+        "(`examples/triton_nvfp4_w4a4_gemm.py`), inside CUDA graphs: ~49 us of host dispatch "
+        "per call eager",
+        ("cute", "triton", "cuda"),
+        "never dequantise the e2m1 operands to FP8 / bf16 for a compute-bound W4A4 GEMM (the "
+        "FP4 rate is the point), never a static activation scale, and never MXFP4 through "
+        "`F.scaled_mm` on sm_120 (torch 2.14 has no kernel for it there)",
+    ),
+    TargetClass(
         "small_m_gemm",
         "Small-M GEMV / skinny GEMM (M < 128 rows, weights streamed)",
         "CUDA C++ (`load_inline`): the bundled FP8 GEMV / skinny GEMM examples (INT8: "
@@ -216,6 +239,10 @@ _SIG = re.compile(r"\[([0-9, ]*)\]")
 #: per-channel scales and MXFP8 (one ue8m0 scale per 32 K-elements, ``fp8_mx``).
 _FP8 = ("fp8_w8a8", "fp8_mx")
 _FP8_LABEL = "Compute-bound FP8 GEMM (W8A8, M ≳ 128 rows)"
+#: Precisions whose GEMMs run on the block-scaled FP4 tensor cores (W4A4, #233; opt-in): its
+#: class is in the planner's table only on GPUs with them (sm_100 / sm_103 / sm_110 /
+#: sm_120 / sm_121) and in runs that allow it (:func:`policy_text`).
+_FP4 = ("fp4_w4a4",)
 #: Precisions whose GEMMs run on the INT8 tensor cores (IMMA: s8 x s8 -> int32, #178).
 _INT8 = ("int8_w8a8",)
 _INT8_LABEL = "Compute-bound INT8 GEMM (INT8 W8A8, M ≳ 128 rows)"
@@ -443,6 +470,28 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
             "never a `mma.sync` kernel for a compute-bound GEMM on sm_100 (the sm_120 CuTe "
             "example's `MmaMXF8Op` and the CUDA FP8 examples use it)",
         ),
+        "fp4_gemm": TargetClass(
+            "fp4_gemm",
+            "Compute-bound W4A4 GEMM (NVFP4, M ≳ 128 rows; opt-in)",
+            "`tcgen05.mma kind::mxf4nvf4` (TMEM accumulators, TMA): two-level `F.scaled_mm` "
+            "NVFP4 (cuBLASLt `VEC16_UE4M3`) behind a Triton quantiser "
+            "(`examples/triton_nvfp4_w4a4_gemm.py`) as the baseline; a CuTe DSL Blackwell GEMM "
+            "with the FP4 operand and scale-factor types (from "
+            "`examples/cute_sm100_gemm_tcgen05.py`, the `cute-dsl` skill's `sm100-tcgen05.md`) "
+            "when its epilogue fuses the per-token outer scale, the bias or the next "
+            "quantisation",
+            "datacenter Blackwell runs NVFP4 at twice its FP8 rate through `tcgen05.mma` only "
+            "(NVIDIA's specifications; not measured by kernel-agent yet): the block-scaled "
+            "`mma.sync` of sm_120 (`MmaMXF4NVF4Op`) does not exist on sm_100 and `mma.sync` "
+            "saturates near a quarter of the B200 peak; torch 2.14's `F.scaled_mm` has NVFP4 "
+            "and MXFP4 (`BlockWise1x32`) here",
+            "CUTLASS sm_100 block-scaled (NVFP4) GEMMs from C++ when the epilogue fuses more; "
+            "FP8 W8A8 (`kind::f8f6f4`) for the layers the sensitivity probe keeps in 8-bit",
+            ("triton", "cute", "cuda"),
+            "never a `mma.sync` kernel for a compute-bound W4A4 GEMM on sm_100 (the sm_120 "
+            "CuTe W4A4 example uses it), never e2m1 operands dequantised to FP8 / bf16 for a "
+            "compute-bound GEMM, never a static activation scale",
+        ),
     },
 }
 #: What each family needs for the tensor-core peak, and its Triton notes (policy_text /
@@ -648,6 +697,11 @@ def _fp8_runs(facts: Facts | None) -> bool:
     return facts is None or facts.family is None or facts.has("fp8_tc")
 
 
+def _fp4_runs(facts: Facts | None) -> bool:
+    """Whether the GPU of ``facts`` has block-scaled FP4 tensor cores (unknown: assume so)."""
+    return facts is None or facts.family is None or facts.has("fp4_tc")
+
+
 def _int8_runs(facts: Facts | None) -> bool:
     """Whether the GPU of ``facts`` has INT8 tensor cores (IMMA, sm_75+; unknown: assume so)."""
     from kernel_agent.gpu_arch import precision_unsupported
@@ -692,6 +746,7 @@ def target_class(spec: dict[str, Any]) -> str:
     seq = shape[-2] if len(shape) >= 3 else None
     fp8 = precisions.of_spec(spec) in _FP8
     int8 = precisions.of_spec(spec) in _INT8
+    fp4 = precisions.of_spec(spec) in _FP4
     if family == "attention":
         return "short_attention" if seq is not None and seq <= 16 else "other"
     if family == "block" or spec.get("kind") == "region":
@@ -701,6 +756,8 @@ def target_class(spec: dict[str, Any]) -> str:
     if family in ("linear", "mlp"):
         if rows is not None and rows < 128:
             return "small_m_gemm"
+        if fp4:
+            return "fp4_gemm"
         return "fp8_gemm" if fp8 else "int8_gemm" if int8 else "bf16_gemm"
     if family in ("norm", "activation", "rope", "embedding"):
         return "elementwise"
@@ -717,10 +774,17 @@ def suggested_order(
     return ordered + [b for b in avail if b not in ordered]
 
 
-def policy_text(available: Iterable[str] | None = None, facts: Facts | None = None) -> str:
+def policy_text(
+    available: Iterable[str] | None = None,
+    facts: Facts | None = None,
+    precisions: Iterable[str] | None = None,
+) -> str:
     """The planner's backend policy for the GPU of ``facts`` (None: unknown, the sm_120
-    table): the class table and the rules that go with it."""
+    table): the class table and the rules that go with it. The W4A4 class (opt-in) only
+    when ``precisions`` (the run's allowed ones; None: none of the opt-in ones) has
+    ``fp4_w4a4`` and the GPU has block-scaled FP4 tensor cores."""
     avail = set(available) if available is not None else None
+    w4a4 = _fp4_runs(facts) and any(p in _FP4 for p in precisions or ())
     fam = facts.family if facts is not None else None
     where = (
         "measured on sm_120 / RTX 5070 Ti, docs/RESEARCH-TRITON.md §5.1"
@@ -741,10 +805,14 @@ def policy_text(available: Iterable[str] | None = None, facts: Facts | None = No
             continue
         if c.id == "int8_gemm" and not _int8_runs(facts):
             continue
+        if c.id == "fp4_gemm" and not w4a4:
+            continue
         if avail is not None and c.order and not set(c.order) & avail:
             continue
         lines.append(f"| {c.label} | {c.first} | {c.why} | {c.second} |")
     lines.append("")
+    if w4a4 and (never := policy("fp4_gemm", facts).never):
+        lines.append(f"* Compute-bound W4A4 GEMMs (`fp4_w4a4`, M ≳ 128): {never}.")
     if _fp8_runs(facts) and (never := policy("fp8_gemm", facts).never):
         block = facts is None or facts.has("block_scaled")
         lines.append(
@@ -782,7 +850,8 @@ def engineer_note(
     rows = rows_of(dominant_shape(target))
     fp8 = precisions.of_spec(target) in _FP8
     int8 = precisions.of_spec(target) in _INT8
-    for inside, wanted in (("fp8_gemm", fp8), ("int8_gemm", int8)):
+    fp4 = precisions.of_spec(target) in _FP4
+    for inside, wanted in (("fp8_gemm", fp8), ("int8_gemm", int8), ("fp4_gemm", fp4)):
         if cid != inside and wanted and (rows or 0) >= 128:
             gemm = policy(inside, facts)
             never = f" {gemm.never}." if gemm.never else ""

@@ -182,6 +182,7 @@ def _spec(cls, signature, precision=None):
 TARGETS = [
     _spec("Qwen3MLP", "a0[4, 176, 1024]:bfloat16", "fp8_w8a8"),
     _spec("Qwen3MLP", "a0[4, 176, 1024]:bfloat16", "int8_w8a8"),
+    _spec("Qwen3MLP", "a0[4, 176, 1024]:bfloat16", "fp4_w4a4"),  # W4A4 (opt-in, #233)
     _spec("Qwen3MLP", "a0[4, 176, 1024]:bfloat16"),
     _spec("Linear", "a0[80, 1024]:bfloat16", "fp8_w8a8"),
     _spec("LlamaMLP", "a0[16, 1, 2048]:bfloat16", "int8_weights"),
@@ -189,6 +190,7 @@ TARGETS = [
     _spec("Conv1d", "a0[16, 64, 240]:float32"),
     _spec("LlamaDecoderLayer", "a0[2, 176, 1024]:bfloat16", "fp8_w8a8"),
     _spec("LlamaDecoderLayer", "a0[2, 176, 1024]:bfloat16", "int8_w8a8"),
+    _spec("LlamaDecoderLayer", "a0[2, 176, 1024]:bfloat16", "fp4_w4a4"),
     _spec("Qwen3RMSNorm", "a0[1, 1, 1024]:bfloat16"),
     _spec("Mystery", "a0[3]:float32"),
 ]
