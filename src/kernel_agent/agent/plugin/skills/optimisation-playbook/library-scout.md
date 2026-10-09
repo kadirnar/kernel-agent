@@ -31,6 +31,13 @@ through `sweep_candidate`'s machinery and the full evaluator.
   Measured on the RTX 5070 Ti (sm_120): VoxCPM2's 11-token GQA attention, cuDNN 15.8 us vs
   the reference's flash 38.6 us as kernel time, but 33 to 122 us per eager call against
   the reference's 37 to 43 us (a busy CPU).
+* The same on an NVIDIA A10 (sm_86) with FlashInfer 0.6.17: a batch of 32 eleven-token GQA
+  prefills took 8.3 us in FlashInfer's batched prefill against 21.3 us for the reference's
+  flash kernel, but 56 vs 23 us per eager call (its host path). Its single-request decode
+  over 2048 to 8192 cached tokens was 1.1 to 1.3x the reference as kernel time; batched
+  decode at 16 x 1024 tokens, both at the DRAM bound, 1.04x; causal prefill of 512 to 1024
+  tokens 0.74 to 0.82x. Liger's Triton RMSNorm: 2.3 vs 15.3 us as kernel time, 93 vs 67 us
+  per eager call (the Triton launcher's host cost).
 * A written-out RMSNorm folded into `F.rms_norm` must keep the reference's roundings
   (normalised, rounded, then the weight: the scout's `FUSE=0`): with one rounding fewer a
   decoder layer whose residual stream cancels failed the tolerance (VoxCPM2 LocDiT layer).

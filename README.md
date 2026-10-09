@@ -4522,11 +4522,13 @@ Claude session, once per target and library install (see *Scouting again* below)
    | `torch-rms-norm` | torch | the written-out RMSNorm (about 6 kernels) as `F.rms_norm` (one fused kernel): `FUSE=0` keeps the reference's roundings (the weight multiplied after), `FUSE=1` puts the weight inside | any | run on a GPU |
    | `cublaslt` | torch + CUDA toolkit | `F.linear` through cuBLASLt: bias in the epilogue, residual add and tanh GELU too (`FUSE`), algorithm per shape: the heuristic's top 8 timed (`ALGO=-1`) or its i-th | fp16: sm_75+; bf16: sm_80+ | run on a GPU |
    | `torch-scaled-mm` | torch | `F.linear` as FP8 W8A8 `torch._scaled_mm` (row-wise or tensor-wise scales), `fp8_w8a8` targets only | sm_89+ | run on a GPU |
-   | `flash-attn`, `flash-attn-3` | flash-attn | SDPA without a mask | sm_80+; FA3 sm_90 | from the docs |
-   | `flashinfer-attention`, `flashinfer-norm` | flashinfer-python | single-request decode / prefill attention; RMSNorm | sm_75+ | from the docs |
-   | `quack-rmsnorm`, `quack-softmax` | quack-kernels | RMSNorm; softmax over the last dimension | sm_90, sm_10x, sm_12x | from the docs |
-   | `liger-rmsnorm`, `liger-swiglu` | liger-kernel | RMSNorm; `silu(gate) * up` | sm_80+ | from the docs |
-   | `flashinfer-sampling`, `liger-rope`, `gemlite` | | listed and probed, skipped: a random draw cannot be compared with the reference's; no template yet | | follow-ups |
+   | `flash-attn` | flash-attn | SDPA without a mask | sm_80+ | run on a GPU (A10, 2.8.1) |
+   | `flash-attn-3` | flash-attn-3 | SDPA without a mask | sm_90 | from the docs |
+   | `flashinfer-attention` | flashinfer-python | SDPA without a mask: one request through the single decode / prefill kernels, a batch through the paged wrappers (*FlashInfer's batched attention* below); decode on CUDA cores or tensor cores (`TENSOR_CORES`) | sm_75+ | run on a GPU (A10, 0.6.17) |
+   | `flashinfer-norm` | flashinfer-python | RMSNorm | sm_75+ | run on a GPU (A10, 0.6.17) |
+   | `quack-rmsnorm`, `quack-softmax` | quack-kernels | RMSNorm; softmax over the last dimension | sm_90, sm_10x, sm_12x | from the docs (an A10 skips them: sm_86) |
+   | `liger-rmsnorm`, `liger-swiglu` | liger-kernel | RMSNorm; `silu(gate) * up` | sm_80+ | run on a GPU (A10, 0.8.4) |
+   | `flashinfer-sampling`, `liger-rope`, `gemlite` | | listed and probed, skipped: a random draw cannot be compared with the reference's (*Sampling* below); no template yet | | follow-ups |
 
    An adapter is skipped with the reason when its library is missing or broken, the
    GPU is outside its architectures, no call site fits (dtype, head size, an explicit
@@ -4592,15 +4594,67 @@ key`). The new scout's rows join the ledger next to the old ones (each labelled 
 own `library:<package>@<version>`), `libscout.json` and the bar are the new scout's, and
 `run.json` counts the scouts and keeps why the last one ran.
 
+**FlashInfer's batched attention.** The path of an SDPA call follows from its shapes
+(`adapters.flashinfer_path`): batch 1 takes FlashInfer's single-request kernels
+(`single_decode_with_kv_cache` for one query, `single_prefill_with_kv_cache`), a batch its
+paged wrappers (`BatchDecodeWithPagedKVCacheWrapper` with one query per request,
+`BatchPrefillWithPagedKVCacheWrapper` otherwise). A dense SDPA call has one KV length for
+every request, so the page table has one page per request: page *i* is request *i*'s whole
+K / V (page size = its length; `indptr` 0..B, `last_page_len` the length), and K / V are
+passed in place: as `NHD` pages when they are `[B, S, H, D]` projections viewed as heads
+(the usual prefill), as `HND` when contiguous (a KV cache), as contiguous copies otherwise.
+Each wrapper's `plan()` (it reads the page table on the host) runs once per call shape,
+layout, dtype, mask, scale and decode form, on the shape's first call (the evaluator's
+untimed correctness pass): `build()` gets only the reference module, not the shapes it will
+be called with. A shape first met inside a CUDA graph capture runs torch's SDPA (`plan()`
+cannot run there). Decode sweeps `TENSOR_CORES` 0 and 1 (FlashInfer's CUDA-core decode, or
+its prefill kernels over each KV head's query heads). A padded batch (requests of different
+lengths) passes a mask, which the adapter does not take: its lengths are the mask's values
+(a host read per call), not its shapes.
+
+**Sampling.** `flashinfer-sampling` stays skipped: a library sampler draws the reference's
+distribution from another random stream, so its tokens never match the captured ones, and
+the evaluator compares outputs one to one. `kernels/distribution.py` is the comparison it
+needs, tested on the CPU with fake samplers (`tests/test_distribution.py`), not yet called
+by the evaluator: each sampler drawn `n` times (2000) on a case's inputs, the i-th draw of
+both after `torch.manual_seed(seed + i)` (the same verdict run to run); per output position
+(one request's token) a two-sample chi-square homogeneity test of the token counts, tokens
+with fewer than 10 draws of both samples pooled into one bin, the statistics and degrees of
+freedom summed over positions and held to the chi-square quantile at 1 - alpha
+(Wilson-Hilferty; alpha 1e-6: a correct sampler fails about one comparison in a million).
+On 4 requests over 50 tokens at 1000 draws a temperature of 1.0 or 0.9 against 0.8, a
+top-p of 0.8 or 0.95 against 0.9 and a top-k of 10 against 20 all exceed the bound more
+than twice (temperature 1.0: 517 against 122), while the right sampler on another random
+stream passes (at alpha 0.05 it failed 1 of 20 seeded comparisons: 5 %, as calibrated).
+The opt-in is for sampling targets only (`distribution.sampling_reason`: the reference's
+trace has the `sampling` family; a deterministic output keeps its exact comparison). Wired
+into the evaluator it replaces the comparison of a case's integer outputs (the drawn
+tokens; floating outputs such as logits compare as now), runs every call of the bitwise
+checks (determinism, stress) after one fixed seed so a sampler's own draws repeat, and
+compares the perturbed re-verification's draws the same way; then `flashinfer-sampling`'s
+template (`top_k_top_p_sampling_from_probs` for the `sort` / `cumsum` / `multinomial`
+chain) can be scouted.
+
 The export writes `optimized/requirements.txt` with the exact version of every library
 an exported kernel declares (and `manifest.json` → `libraries` with its licence);
 `kernel-agent doctor` lists the libraries, their versions and licences and which
 adapters can run on the GPU, each other one with the reason. `pip install
 'kernel-agent[libs]'` (flashinfer-python, liger-kernel, quack-kernels, gemlite) adds
 packages without replacing the installed torch (`uv lock` resolves it against the
-locked torch); flash-attn builds from source against it (`pip install flash-attn
---no-build-isolation`). `--no-library-scout` turns the scout off; a simulated run
-skips it.
+locked torch; in an environment whose torch and CUDA wheels must stay as they are,
+install each with `--no-deps` and its other requirements with the installed versions as
+constraints); flash-attn builds from source against it (`pip install flash-attn
+--no-build-isolation`) unless its GitHub release has a wheel for that torch, CUDA and
+Python (2.8.1: `flash_attn-2.8.1+cu12torch2.10cxx11abiTRUE-cp312-...`). FlashInfer
+compiles each kernel module on its first use with the CUDA toolkit's `nvcc` (7 to 15 s
+on the A10's host; cached in `~/.cache/flashinfer`) under the flags `toolchain.setup()`
+exports, as the probe and the evaluator do: with `CPATH` naming the CUDA 12.8 wheels'
+headers (for `load_inline` against a partial 12.9 toolkit) its CCCL refused nvcc 12.9
+with them ("CUDA compiler and CUDA toolkit headers are incompatible") until
+`-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`, which `setup()` adds whenever nvcc's CUDA
+differs from torch's; without `CPATH` it builds either way. `flashinfer-jit-cache`
+(flashinfer.ai/whl/cu128, 1.3 GB) has the kernels prebuilt. `--no-library-scout` turns
+the scout off; a simulated run skips it.
 
 `python -m kernel_agent.libscout CAPTURE [--precision P] [--no-sweep] [--json OUT]`
 scouts a capture outside a run (nothing recorded): families, decisions, op bars and
@@ -4652,6 +4706,55 @@ another tenant), the probe on toy captures (`tests/libscout_toy.py`):
   (16.7 s) and logged `libscout: core: scouting again: torch 2.10.0+cu128 → 2.10.1+cu128`,
   then held again. The remembered key: `{"gpu": "NVIDIA A10 (sm_86)", "families":
   ["sdpa"], "libraries": {"nvidia-cudnn-cu12": "9.10.2.21", "torch": "2.10.0+cu128"}}`.
+
+The library templates on the same A10 with their libraries installed (flash-attn 2.8.1,
+flashinfer-python 0.6.17, liger-kernel 0.8.4; the GPU shared with another tenant),
+`python -m kernel_agent.libscout` on toy captures of one bf16 call each (attention: 16
+query heads, head size 128; `[B, S, H, D]` projections viewed as heads where marked). Op
+bar: kernel time from a CUDA graph, the captured call's reference (torch's SDPA picks its
+flash kernel) against the library; module: the sweep's best config through the full
+evaluator, eager. Each toy is one launch-bound op, so TorchDynamo's guard check per call
+(tens of microseconds here) and the libraries' host paths decide the module numbers more
+than their kernels do:
+
+| capture | FlashInfer path | op bar (kernel time) | module (full evaluator) | achieved |
+|---|---|---|---|---|
+| decode, 1 request, 512 cached tokens (8 KV heads) | single decode | 10.5 → 9.2 us (1.14x, `TENSOR_CORES=1`; `=0` 13.1 us: not swept) | 0.42x | 228 GB/s |
+| decode, 2048 tokens | single decode | 26.2 → 20.4 us (1.29x) | 0.56x | 412 GB/s |
+| decode, 8192 tokens | single decode | 77.8 → 69.6 us (1.12x) | 0.76x | 482 GB/s |
+| decode, 16 requests x 1024 tokens | batch decode | 137.5 → 132.8 us (1.04x); projections: 140.0 → 133.6 (1.05x) | 1.03x; 1.04x | 505 GB/s |
+| prefill, 32 requests x 11 tokens (2 KV heads) | batch prefill | 21.3 → 13.4 us (1.60x: q copied to rows); projections: 21.3 → 8.3 (2.56x) | 0.33x; 0.42x | 391 GB/s |
+| causal prefill, 4 x 512 tokens, projections | batch prefill | 89.2 → 120.1 us (0.74x) | 0.73x | 36 TFLOP/s |
+| causal prefill, 1 x 1024 tokens | single prefill | 88.3 → 107.5 us (0.82x) | 0.71x | 40 TFLOP/s |
+
+* "Achieved": the library kernel's K / V bytes (decode) or all of q / k / v / o (the
+  11-token prefill) per op-bar time, or its FLOPs (causal prefill); the A10's measured peaks
+  are 487.5 GB/s DRAM (600 GB/s on its datasheet: the batched decode reads above the
+  measured figure) and 80.6 TFLOP/s bf16. The evaluator's `pct_of_sol` is missing on every
+  GQA capture: its roofline counts FLOPs with torch's `FlopCounterMode`, whose
+  `sdpa_flop_count` (torch 2.10) asserts that q and k have the same number of heads
+  (`sol_error`).
+* flash-attn: op bars 0.96 to 1.04x of the reference (torch's flash backend is
+  FlashAttention 2's kernel), module 0.33 to 1.01x; cuDNN's SDPA 1.02 to 1.14x on the
+  decodes. Every correct library candidate launches kernels the reference does not
+  (`custom_kernel_share` 1.0 for attention and RMSNorm, 0.04 to 0.09 for Liger's SwiGLU in
+  a gated MLP).
+* RMSNorm written out (the cast to fp32, `pow`, `mean`, `add`, `rsqrt`, the casts and
+  multiplies: 8 recorded calls) against the libraries' fused kernels on the same x and
+  weight: [64, 1024]: 15.2 us → FlashInfer 2.1 (7.19x), Liger 2.3 (6.64x), `F.rms_norm`
+  `FUSE=1` 3.0; per eager call 64.8 → 28.7, 92.9 (Liger: the Triton launcher's host cost),
+  11.8; module 1.26x, 0.62x (`FUSE=1` 1.83x). [4096, 1024]: 323 us → 35.6, 35.6 (9.07x:
+  97 % of the measured DRAM bandwidth), `FUSE=1` 37.3; module 4.23x (43.7 % of SOL), 2.51x
+  (25.8 %), `FUSE=1` 5.61x (57.8 %). Against `F.rms_norm` itself (one fused kernel already)
+  the libraries lose at module level: 0.34x and 0.17x at [64, 1024], 0.48x and 0.28x at
+  [4096, 1024].
+* SwiGLU (a gated MLP 1024 → 3072 → 1024): Liger's fused `silu(gate) * up` 0.95x at 512
+  tokens (56.6 % of SOL; cuBLASLt on its linears 1.11x), 0.46x at 16 (20.0 %).
+* QuACK is skipped on sm_86 with its reason (`needs sm_90,sm_10x,sm_12x (QuACK lists H100,
+  B200 / B300 and RTX 50); this GPU is sm_86`), FlashAttention 3 likewise (`needs sm_90`).
+* A probe took 3.7 to 5.5 s (98 s when it builds cuBLASLt's extension), a capture's scout
+  35 to 62 s (133 s). FlashInfer's first call of a kernel compiles its module (7 to 15 s
+  each here: single / batched decode and prefill, bf16, head size 128; then cached).
 
 ### KernelBench regression suite
 
