@@ -1,0 +1,56 @@
+GPU: NVIDIA A10 (sm_86), 72 SMs, L2 6 MB, smem 99 KB per block / 100 KB per SM
+torch 2.10.0+cu128 (CUDA 12.8), nvcc 12.9, driver CUDA 12.9
+date 2026-10-09 13:49; 28 layers, 15 trials of 100 graph replays per mode (per-call us: min / median)
+megakernel: 11 pages of 8192 B per block, 72 queues (resident interpreter blocks)
+DRAM: copy 486.7 GB/s (doctor's dram_gbps), read-only 517.0 GB/s
+
+H = 1024: 28 x [1024, 1024], 58.7 MB of weights, megakernel tiles of 16 rows
+  outputs against eager (cuBLAS; the GPU tests' tolerance atol 0.1, rtol 0.05):
+    megakernel    max |diff| 0.25, 0 of 1024 outside
+    graph         max |diff| 0, 0 of 1024 outside
+    coop_barrier  max |diff| 0, 0 of 1024 outside
+    megakernel bit-identical across its settings: True; graph == coop_barrier: True; megakernel == graph: False
+  DRAM floor (copy bandwidth)                                      120.7 us
+  (read-only stream)                                               113.6 us
+  megakernel (16 rows, inflight 1)                                 153.5 /   157.3 us  (77% of floor speed)
+  megakernel (16 rows, inflight 2)                                 152.7 /   155.7 us  (77% of floor speed)
+  megakernel (16 rows, inflight 4)                                 166.8 /   167.7 us  (72% of floor speed)
+  megakernel (16 rows, inflight all)                               169.8 /   170.6 us  (71% of floor speed)
+  graph_pdl (plain graph, one kernel per layer: PDL needs sm_90+, this GPU is sm_86)   203.6 /   204.4 us  (59% of floor speed)
+  coop_barrier (one cooperative kernel, grid barrier per layer)    430.4 /   431.8 us  (28% of floor speed)
+
+H = 2048: 28 x [2048, 2048], 234.9 MB of weights, megakernel tiles of 16 rows
+  outputs against eager (cuBLAS; the GPU tests' tolerance atol 0.1, rtol 0.05):
+    megakernel    max |diff| 0.25, 9 of 2048 outside
+    graph         max |diff| 0.25, 9 of 2048 outside
+    coop_barrier  max |diff| 0.25, 9 of 2048 outside
+    megakernel bit-identical across its settings: True; graph == coop_barrier: True; megakernel == graph: True
+  DRAM floor (copy bandwidth)                                      482.6 us
+  (read-only stream)                                               454.3 us
+  megakernel (16 rows, inflight 1)                                 568.6 /   571.4 us  (84% of floor speed)
+  megakernel (16 rows, inflight 2)                                 526.1 /   566.2 us  (85% of floor speed)
+  megakernel (16 rows, inflight 4)                                 538.2 /   578.9 us  (83% of floor speed)
+  megakernel (16 rows, inflight all)                               557.9 /   565.1 us  (85% of floor speed)
+  graph_pdl (plain graph, one kernel per layer: PDL needs sm_90+, this GPU is sm_86)   531.4 /   532.4 us  (91% of floor speed)
+  coop_barrier (one cooperative kernel, grid barrier per layer)    845.7 /   848.5 us  (57% of floor speed)
+
+H = 4096: 28 x [4096, 4096], 939.5 MB of weights, megakernel tiles of 8 rows
+  outputs against eager (cuBLAS; the GPU tests' tolerance atol 0.1, rtol 0.05):
+    megakernel    max |diff| 0.25, 32 of 4096 outside
+    graph         max |diff| 0.281, 33 of 4096 outside
+    coop_barrier  max |diff| 0.281, 33 of 4096 outside
+    megakernel bit-identical across its settings: True; graph == coop_barrier: True; megakernel == graph: False
+  DRAM floor (copy bandwidth)                                     1930.4 us
+  (read-only stream)                                              1817.1 us
+  megakernel (8 rows, inflight 1)                                 2548.4 /  2578.3 us  (75% of floor speed)
+  megakernel (8 rows, inflight 2)                                 2435.8 /  2480.6 us  (78% of floor speed)
+  megakernel (8 rows, inflight 4)                                 2426.8 /  2483.5 us  (78% of floor speed)
+  megakernel (8 rows, inflight all)                               2459.2 /  2487.2 us  (78% of floor speed)
+  graph_pdl (plain graph, one kernel per layer: PDL needs sm_90+, this GPU is sm_86)  1935.0 /  1945.8 us  (99% of floor speed)
+  coop_barrier (one cooperative kernel, grid barrier per layer)   2136.0 /  2139.9 us  (90% of floor speed)
+
+trace (H = 1024, 16 rows; the last of 20 calls, with time stamps), per layer after the first (mean over its tiles): wait = for the previous layer's counter, page = the last weight page after it, run = page landed to signal (h: x loaded and normalised, mark 0; dot: the products, mark 1; tail: the reduction, the store and the signal); overlap = share of tiles whose weight load was issued before their counter was met
+  inflight 1: span 150.5 us; wait 1.19, page 0.42, run 3.41 us (h 1.20, dot 0.69, tail 1.52); overlap min 1.000; layer0: page 4.98, run 3.49 us
+  inflight 2: span 150.5 us; wait 1.18, page 0.45, run 3.41 us (h 1.24, dot 0.68, tail 1.50); overlap min 1.000; layer0: page 5.17, run 3.54 us
+  inflight 4: span 151.6 us; wait 1.12, page 0.40, run 3.44 us (h 1.22, dot 0.65, tail 1.57); overlap min 1.000; layer0: page 5.10, run 6.90 us
+  inflight all: span 154.6 us; wait 1.23, page 0.28, run 3.54 us (h 1.25, dot 0.72, tail 1.57); overlap min 1.000; layer0: page 4.85, run 8.00 us

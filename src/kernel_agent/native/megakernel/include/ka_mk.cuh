@@ -610,6 +610,8 @@ __device__ __forceinline__ void interpret(const Params& p) {
   } else {
     // the consumers
     uint32_t phase = 0;  // per page: parity of the full phase to wait for next
+    uint32_t freed = 0;  // per page: parity of the empty phase this thread arrives on next
+    uint32_t owed = 0;   // per page: an arrival of this thread whose phase it has not observed
     int tail = 0;        // the ring page of the next instruction's first weights
     bool aborted = false;
     for (int i = begin; i < end; ++i) {
@@ -667,10 +669,21 @@ __device__ __forceinline__ void interpret(const Params& p) {
         }
         KA_MK_STAMP(p, i, 4, static_cast<long long>(now_ns()));
       }
-      // its pages are free: every consumer thread is done with them
+      // its pages are free: every consumer thread is done with them. Before a thread arrives
+      // on a page's empty barrier again it observes the phase its previous arrival there
+      // belonged to: long complete by then (the producer waited for it before the refill this
+      // instruction read), so the wait is one test. Without it compute-sanitizer synccheck
+      // reports "Missing wait" at these arrivals and stops the warp (measured on an A10,
+      // sm_86, compute-sanitizer 2025.2.1: the example from 6 layers on with its 11-page pool;
+      // 151552 errors at 28 layers), and the integration refuses a correct megakernel.
       if (detail::empty_arrives(t))
-        for (int k = 0; k < need; ++k)
-          detail::bar_arrive(empty + (tail + k < p.n_pages ? tail + k : tail + k - p.n_pages));
+        for (int k = 0; k < need; ++k) {
+          const int page = tail + k < p.n_pages ? tail + k : tail + k - p.n_pages;
+          if (owed & (1u << page)) detail::bar_wait(empty + page, ((freed >> page) & 1u) ^ 1u);
+          detail::bar_arrive(empty + page);
+          freed ^= 1u << page;
+          owed |= 1u << page;
+        }
       tail = (tail + need) % p.n_pages;
       if (!known) {
         aborted = true;
