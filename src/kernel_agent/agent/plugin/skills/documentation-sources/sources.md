@@ -87,6 +87,11 @@ those, use the local headers and the examples below. All URLs were checked (2026
 * https://arxiv.org/abs/2504.17577 — TileLang paper: scheduling annotations, GEMM / attention against Triton.
 * https://github.com/tile-ai/tilelang/pull/3099 — TileLang block-scaled `mxf8f6f4` MMA on sm_120 (FP8 at full rate with fp32 accumulation).
 
+## Helion
+* https://github.com/pytorch/helion — Helion: `@helion.kernel`, `hl.tile`, `helion.Config` fields, settings, examples (`examples/` in the repository).
+* https://pytorch.org/blog/helion/ — Helion's design and its B200 / H100 results against `torch.compile` and hand-written Triton.
+* https://pytorch.org/blog/accelerating-autotuning-in-helion/ — the LFBO pattern search (shorter tuning, faster configs).
+
 ## PyTorch (2.14)
 * https://docs.pytorch.org/docs/2.14/notes/cuda.html#cuda-graphs — CUDA graphs in PyTorch (capture rules, static inputs, pools).
 * https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/torch.compiler_cudagraph_trees.html — `mode="reduce-overhead"` CUDA graph trees.

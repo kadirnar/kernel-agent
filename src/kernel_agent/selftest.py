@@ -672,6 +672,35 @@ def smoke_fp8_toolkit(tmp: Path, verbose: bool = False, *, cuda: bool, triton: b
     return ok
 
 
+#: The Helion examples besides the RMSNorm (#229) and the bf16 ``nn.Linear`` they are checked
+#: on in the exact tier, as :data:`FP8_EXAMPLES`: in / out features and the captured calls
+#: (704 rows; 3 rows, correctness only: a tile's masked tail).
+HELION_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "helion_gemm_epilogue.py": (1024, 4096, [((64, 11), 20), ((3,), 0)]),
+}
+
+
+def smoke_helion(tmp: Path, verbose: bool = False) -> bool:
+    """Every Helion example of :data:`HELION_EXAMPLES` passes the evaluator (exact tier)."""
+    from kernel_agent.kernels.evaluate import run_evaluation
+
+    ok = True
+    for name, (k, n, calls) in HELION_EXAMPLES.items():
+        result = run_evaluation(
+            make_linear_capture(tmp / f"{name}.pt", k, n, calls), EXAMPLES_DIR / name
+        )
+        passed = bool(result.get("correct"))
+        ok &= passed
+        if verbose:
+            detail = (
+                f"speedup {result.get('speedup')}x"
+                if passed
+                else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
+            )
+            print(f"  {name.removesuffix('.py'):22s} {'OK ' if passed else 'FAIL'} {detail}")
+    return ok
+
+
 def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> bool:
     from kernel_agent import toolchain
     from kernel_agent.kernels.evaluate import run_evaluation
@@ -747,6 +776,8 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
         for name, spec in CUTE_ARCH_EXAMPLES.items():  # wgmma / tcgen05 templates (#228)
             if runs([name], "cute"):
                 ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_w8a8", examples={name: spec})
+        if runs(HELION_EXAMPLES, "helion"):
+            ok &= smoke_helion(Path(tmp), verbose)
         cuda = runs(CUBLASLT_EXAMPLES, "cuda")
         triton = runs([*PRODUCER_EXAMPLES, *FP8_KV_EXAMPLES], "triton")
         if cuda or triton:

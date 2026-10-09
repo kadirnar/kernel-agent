@@ -14,6 +14,10 @@ and says whether it works here and how:
 * ``green_contexts``: :func:`kernel_agent.concurrency.partition` splits the SMs into two
   disjoint green contexts (how many SMs it grants for 8 asked) whose streams run torch
   work.
+* ``helion`` (#229): Helion is installed with a torch and Triton it accepts (a mismatch is
+  refused: installing it must not change torch), and the bundled ``helion_rmsnorm.py``
+  example compiles with Helion's default config and computes the reference's RMSNorm. Not
+  installed: skipped with that reason (the ``helion`` backend is then unavailable).
 
 :func:`run` records the results with :func:`versions` in
 ``<cache>/probes-<gpu>-torch<version>.json``. A probe that fails says why; none of them
@@ -74,6 +78,7 @@ def versions() -> dict[str, str | None]:
         "cuda-bindings": _version("cuda-bindings") or _version("cuda_bindings"),
         "cutlass-dsl": _version("nvidia-cutlass-dsl"),
         "tilelang": _version("tilelang"),
+        "helion": _version("helion"),
     }
     from kernel_agent.kernels import ncu
 
@@ -228,13 +233,51 @@ def probe_green_contexts(sms: int = 8) -> Probe:
     )
 
 
+def probe_helion() -> Probe:
+    """Helion (#229): installed with a torch / Triton it accepts (:func:`kernels.helion_tune.
+    status`), and the bundled ``helion_rmsnorm.py`` example compiled with Helion's default
+    config (no autotuning) and run on a bf16 RMSNorm, equal to the reference within bf16
+    rounding. Helion lists A100 / H100 / B200; elsewhere this probe is the evidence."""
+    import torch
+
+    from kernel_agent.kernels import helion_tune
+
+    found = helion_tune.status()
+    if not found["ok"]:
+        return Probe("helion", None if found["version"] is None else False, str(found["why"]))
+    from kernel_agent.agent.prompts import EXAMPLES_DIR
+    from kernel_agent.kernels.evaluate import load_candidate_module
+    from kernel_agent.selftest import RMSNorm
+
+    torch.manual_seed(0)
+    reference = RMSNorm(2048, eps=1e-5).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        reference.weight.copy_(torch.randn(2048) * 0.1 + 1)
+    x = torch.randn(4, 64, 2048, device="cuda", dtype=torch.bfloat16)
+    module = load_candidate_module(EXAMPLES_DIR / "helion_rmsnorm.py")
+    began = time.monotonic()
+    with torch.no_grad():
+        got, want = module.build(reference)(x), reference(x)
+    torch.cuda.synchronize()
+    seconds = time.monotonic() - began
+    error = float((got.float() - want.float()).abs().max())
+    ok = error <= 0.0625  # bf16 rounding of values around 4
+    return Probe(
+        "helion",
+        ok,
+        f"helion {found['version']}: the RMSNorm example compiled and ran in {seconds:.1f} s, "
+        f"max abs error {error:.3g}" + ("" if ok else " (WRONG result)"),
+    )
+
+
 PROBES: dict[str, Callable[[], Probe]] = {
     "dot_scaled": probe_dot_scaled,
     "tma": probe_tma,
     "pdl": probe_pdl,
     "green_contexts": probe_green_contexts,
+    "helion": probe_helion,
 }
-#: The package each probe needs (skipped without it).
+#: The package each probe needs (skipped without it; ``helion`` says why itself).
 NEEDS = {"dot_scaled": "triton", "tma": "triton", "pdl": "cuda.core", "green_contexts": "torch"}
 #: The GPUs each probe's feature exists on (``gpu_arch.supports``) and what it is: skipped
 #: elsewhere with the reason, never reported as a failure (#165).

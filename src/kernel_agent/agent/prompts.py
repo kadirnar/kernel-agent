@@ -806,7 +806,8 @@ def _planner_skills(quality: str) -> str:
     return _role_skills(
         "planner",
         "the backend skills (`triton-kernels`, `cuda-kernels`, `cute-dsl`, "
-        "`tilelang-kernels`) to judge an approach, `gpu-architectures`, `systems-patterns`, "
+        "`tilelang-kernels`, `helion-kernels`) to judge an approach, `gpu-architectures`, "
+        "`systems-patterns`, "
         "`speculative-decoding`, `native-engines`",
         quality=quality,
     )
@@ -1305,7 +1306,7 @@ def build(reference: torch.nn.Module) -> torch.nn.Module:
 instances' configuration generically (read sizes from the module). Expose tuning
 parameters (block sizes, `num_warps`, `num_stages`, vector widths) as keyword
 arguments with defaults, `def build(reference, BLOCK=1024, num_warps=4)`, and
-tune them with `sweep_candidate`.
+tune them with `sweep_candidate` over a declared space (every value each may take).
 
 # Tools
 `<target>`: your target's id (`# Target`).
@@ -1332,17 +1333,25 @@ tune them with `sweep_candidate`.
   was evaluated before (comments and formatting aside) is not run again: the
   result says `duplicate` and returns the earlier one.
 * `sweep_candidate(target_id="<target>", candidate="candidates/<file>.py",
-  configs=[{{"BLOCK": 512, "num_warps": 4}}, {{"BLOCK": 1024, "num_warps": 8}}],
-  hypothesis="...", idea_id="<slug>")`: tunes the keyword arguments of
-  `build(reference, **config)` in one GPU session. Every config (at most
-  `max_configs`, default 32; a dict of lists sweeps every combination) is built
-  and checked like `mode="quick"`, failing configs are listed with their error,
-  the passing ones are timed interleaved against the reference, and the fastest
-  is fully evaluated and recorded like `evaluate_candidate` (its snapshot has the
-  config bound into `build()`). The result has the table sorted by weighted
-  speedup (`speedup_per_case`, `pct_of_sol`). A sweep counts as ONE evaluation:
-  tune block sizes, `num_warps`, `num_stages` and vector widths with one sweep per
-  idea, never with one evaluation per value.
+  space={{"BLOCK_M": {{"pow2": [16, 256]}}, "BLOCK_N": [32, 64, 128], "num_warps":
+  [2, 4, 8], "num_stages": "2..5"}}, constraints=["(BLOCK_M + BLOCK_N) * BLOCK_K * 2 *
+  num_stages <= smem_per_block"], hypothesis="...", idea_id="<slug>")`: tunes the
+  keyword arguments of `build(reference, **config)` in one GPU session. Declare
+  spaces, not lists: the search (`strategy` auto / grid / pattern / tpe) times
+  batches of configs chosen from what it measured until the sweep's time is up
+  (hundreds of configs, no count limit), prunes what this GPU cannot run (shared
+  memory per block in your constraints, TMA before sm_90, warp specialisation on
+  sm_120) and what ran out of resources or spilled, and starts from the best
+  points measured before on this GPU. `configs=[{{...}}, ...]` (at most 64) times a
+  list instead. Every config is built and checked like `mode="quick"`, failing
+  ones are listed with their error, the passing ones are timed interleaved against
+  the reference, and the fastest is fully evaluated and recorded like
+  `evaluate_candidate` (its snapshot has the config bound into `build()`). The
+  result has the table sorted by weighted speedup (`speedup_per_case`,
+  `pct_of_sol`). A sweep counts as ONE evaluation: tune block sizes, `num_warps`,
+  `num_stages` and vector widths with one sweep per idea, never with one evaluation
+  per value. A Helion candidate: `strategy="helion"` (no space) runs Helion's own
+  autotuner (skill `helion-kernels`).
 * `evaluate_candidates(target_id="<target>", candidates=[{{"candidate":
   "candidates/<a>.py", "hypothesis": "..."}}, ...], idea_id="<slug>")`: 2 to 8
   variants of one idea (different code; configs of one file are a sweep) in one

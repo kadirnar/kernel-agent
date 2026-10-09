@@ -1849,12 +1849,14 @@ kernel must be reported, an in-bounds kernel must not (2 s).
 
 `kernel-agent doctor` also records the versions that decide what compiles (torch,
 its CUDA, the driver, Triton, cuda.core / cuda.bindings, nvcc, CuTe DSL, TileLang,
-ncu) and probes the features kernels rely on (`kernel_agent/probes.py`,
+Helion, ncu) and probes the features kernels rely on (`kernel_agent/probes.py`,
 `--no-probes` skips them): Triton lowers `tl.dot_scaled` to the block-scaled MMA
 (`block_scale` in the PTX, `QMMA.SF` in the SASS), Triton host TMA descriptors
 compile and copy a tile, a programmatic dependent launch (PDL) orders a producer
-and a consumer, and `kernel_agent.concurrency.partition` splits the SMs into two
-disjoint green contexts (SMs granted) whose streams run torch work. A probe that fails says why and never fails `doctor`; the results go to
+and a consumer, `kernel_agent.concurrency.partition` splits the SMs into two
+disjoint green contexts (SMs granted) whose streams run torch work, and Helion (when
+installed, with a torch and Triton its requirements accept) compiles and runs the
+RMSNorm example (skipped with the reason otherwise). A probe that fails says why and never fails `doctor`; the results go to
 `~/.cache/kernel-agent/probes-<gpu>-torch<version>.json`.
 `kernel-agent memcheck capture.pt candidate.py` runs one candidate.
 
@@ -3817,14 +3819,81 @@ checked by then are `skipped`, timing stops after the last whole round that
 fits) and the full evaluation the usual `--eval-timeout`. A config that kills
 its process or breaks the CUDA context (an illegal memory access) is reported
 as `crash` and the subprocess starts again without it (at most 3 processes).
-At most 64 configs per sweep; a dict of lists (`{"BLOCK": [512, 1024],
+At most 64 configs per listed sweep; a dict of lists (`{"BLOCK": [512, 1024],
 "num_warps": [4, 8]}`) sweeps every combination. `kernel-agent eval capture.pt
 candidate.py --sweep configs.json` does the same interactively: the table on
-stderr, the JSON (with the full evaluation) on stdout.
+stderr, the JSON (with the full evaluation) on stdout. The timed-output check of
+the configs uses the target's tolerance tier (a near-lossless target's sweep had
+compared them with the exact bounds and rejected every config).
+
+**Search** (issue #229, `kernel_agent/kernels/search.py`). InferenceBench measured
+search ahead of every agent at an equal budget (SMAC3 11.53×, TPE 11.25×, the best
+agent 8.08×) because the agents timed few distinct configs. Instead of a list, a
+sweep takes a *space*, the values every parameter may take, and searches it:
+`sweep_candidate(target_id, candidate, space={"BLOCK_M": {"pow2": [16, 256]},
+"BLOCK_N": [32, 64, 128], "num_warps": [2, 4, 8], "num_stages": "2..5"},
+constraints=["(BLOCK_M + BLOCK_N) * BLOCK_K * 2 * num_stages <= smem_per_block"],
+strategy="auto", seed=0, hypothesis, idea_id)` (`--sweep` takes the same as JSON:
+`{"space": ..., "constraints": ..., "strategy": ...}`).
+
+* **Spaces**: per parameter a list, `{"pow2": [lo, hi]}`, `{"range": [lo, hi,
+  step]}`, `"pow2:16..256"`, `"2..5"`, `"0..64:16"` or one value; numbers are
+  ordered (a step goes to the next value), anything else is categorical.
+* **Constraints**: Python expressions over the parameters and the GPU's facts
+  (`smem_per_block` in bytes, `sm` (120 for sm_120), `sm_count`, `has_tma`,
+  `has_wgmma`, `has_tcgen05`), parsed with `ast`: numbers, arithmetic,
+  comparisons, `and` / `or` / `not`, `a if c else b` and `min`, `max`, `abs`,
+  `int`, `float`, `round`, `log2`, `cdiv`, nothing else.
+* **Pruning before compile** from the GPU at hand (`gpu_arch`): the constraints,
+  warp specialisation (a `warp_specialize`-like parameter) only on Hopper and
+  datacenter Blackwell (on sm_120 it measured slower and mostly failed to compile,
+  docs/RESEARCH-TRITON.md §1.2), TMA (a `tma` / `use_tma` flag or the indexing
+  `"tensor_descriptor"`) only on sm_90+. **From feedback**: a config that ran out of
+  resources (Triton's `OutOfResources`) prunes every config at least as large in
+  each numeric parameter; one that spilled registers (the compiler's stats, in
+  its row with its shared memory) prunes those with at least as large parameters
+  and at most as many warps.
+* **Strategies** (deterministic for a seed): `grid` (every valid config in a seeded
+  random order: cut short, a uniform sample), `pattern` (pattern search on the
+  lattice of values: an initial design of warm starts and random configs, then the
+  best configs' neighbours one step up and down per parameter, steps halved when
+  nothing is new, a pattern move along the last improvement, random restarts),
+  `tpe` (a tree-structured Parzen estimator in plain Python) and `auto` (`grid` up
+  to 64 valid configs, else `pattern`). On a 15,000-config synthetic objective with
+  a second optimum (`tests/test_search.py`), pattern search found the optimum
+  within 160 configs for each of 8 seeds, TPE within 320.
+* **Batches**: the subprocess asks for 16 configs at a time, checks them, times the
+  passing ones against the reference in 20 ms rounds with racing, and tells the
+  search their weighted speedups (comparable across batches: each is timed against
+  the reference in its own rounds), until the sweep's 3 × `--eval-timeout`, with no
+  limit on the number of configs; then the 4 best (`final`) are timed against each
+  other with the evaluator's rounds and the best of them is fully evaluated as
+  above. Builds of `load_inline` candidates happen off the lock for the first batch
+  (the seeded initial design); Triton compiles at the first launch, under it. A
+  crash restarts the subprocess from every point measured so far.
+* **Warm starts**: every measured point goes to the tuned-config cache
+  (`kernels/tuned.py`, table `points`: GPU, library versions, op `sweep:<module
+  class>:<parameters>`, the bucket of the timed cases' shapes); a later search
+  starts from the best points of the same GPU and versions at the same or a
+  neighbouring bucket (each dimension within a factor 2), measured again.
+* The tool's table shows the 24 best rows (the record keeps them all, beyond 64 as
+  config, status and speedup), `search` summarises the space, the valid configs,
+  what was pruned and why, and the ledger row says `[sweep: ...; pattern search,
+  1200 valid]`. A search is still **one** evaluation.
+* Measured on an RTX 5070 Ti (`--eval-timeout 100`): on the FP8 W8A8 GEMM example at
+  4096 rows (compute bound) the search timed 624 of 681 valid configs (960 in the
+  space; 279 pruned by the shared-memory constraint, 57 by spills; 463 raced out) in
+  180 s and found the tile a 64-config hand grid had (3.09× after the full evaluation
+  for both; the grid lost 4 configs to `OutOfResources`); at 704 rows (400 configs)
+  and on a looped RMSNorm (240 of 324), both host bound when timed eagerly, search and
+  grid matched within the noise.
+
+**Helion** candidates (`strategy="helion"`, no space): Helion's own autotuner on
+the candidate's kernels, see "Backends".
 
 The prompts and `program.md` tell kernel engineers to tune block sizes,
-`num_warps`, `num_stages` and vector widths with one sweep per idea instead of
-one evaluation per value.
+`num_warps`, `num_stages` and vector widths with one sweep per idea over a declared
+space instead of one evaluation per value ("declare spaces, not lists").
 
 ### KernelBench regression suite
 
@@ -4225,6 +4294,35 @@ kernel-agent library import-memory ~/.claude/projects/<project>/memory \
 | `nvrtc` | CUDA C++ compiled at runtime with NVRTC (`cuda.core`) | ~28 µs |
 | `tilelang` | TileLang (`tilelang.language`) | ~32 µs |
 | `triton` | Triton | ~43 µs |
+| `helion` | Helion (`helion.language`, compiled to Triton; optional, `pip install helion`) | ~48 µs (same session: `triton` ~55, `cuda` ~22) |
+
+**Helion** (issue #229, `kernel_agent/kernels/helion_tune.py`, skill `helion-kernels`)
+compiles "PyTorch with tiles" to Triton and searches a space it derives from each
+kernel (tile sizes, loop orders, L2 grouping, pointer / `block_ptr` / TMA indexing,
+persistent programs, reduction loops, warps, stages). A candidate writes the kernel
+body as a plain function and makes the kernel in `build` with
+`helion_tune.kernel(fn, helion_configs)`: Helion's default config in an evaluation (it
+never tunes there), the tuned one when `build` gets `helion_configs`
+(`examples/helion_rmsnorm.py`, `examples/helion_gemm_epilogue.py`).
+`sweep_candidate(..., strategy="helion")` checks the default config, runs Helion's
+autotuner on the case with the most work under the GPU lease (the sweep's remaining
+time as its budget, a seed, earlier tuned configs of this GPU as seeds, no warp
+specialisation where the arch rules refuse it), checks and times the tuned config
+next to the default and binds the faster into the snapshot (`_KA_SWEEP_CONFIG =
+{"helion_configs": {...}}`), so integration and export never tune again. Helion is
+optional: the `helion` backend is available when it imports, and `doctor`'s `helion`
+probe says whether it runs here (installed with a torch and Triton its requirements
+accept, a mismatch refused: installing it must not change torch; the RMSNorm example
+compiled with the default config and checked). Opt in to it in a run with
+`--backends ...,helion`. Measured on an RTX 5070 Ti (sm_120: not on Helion's list of
+tested GPUs; Helion 1.4.0 with torch 2.14.1 and Triton 3.8.0, issue #229): the probe passes
+(the RMSNorm bit-exact), `helion_rmsnorm.py` 1.51× on the 2048-wide RMSNorm capture
+(the decode call 48 µs: the host overhead row above; the Triton example 1.76×, the CUDA
+one 4.19× in the same session on a loaded machine), `helion_gemm_epilogue.py` correct
+in the exact tier on a `[704, 1024] × [1024, 4096]` bf16 Linear: Helion's default config
+0.21× of cuBLAS, after `strategy="helion"` (175 s of Helion's search; it chose a TMA store
+and no warp specialisation) 0.80×, bound into the snapshot and evaluated again without
+tuning at 0.79×. cuBLAS stays ahead on that bf16 GEMM, as the Triton sweeps found.
 
 There are verified example kernels for every backend in
 `src/kernel_agent/agent/examples/`, and a skill per backend plus an optimisation
@@ -4263,7 +4361,9 @@ Triton toolkit (#148, the `triton-kernels` skill), for any model:
   once and stores the fastest; a torch / CUDA / driver / library upgrade
   invalidates the entry; nothing is timed while a CUDA graph is captured
   (`KERNEL_AGENT_TUNE=0`: never). `python -m kernel_agent.kernels.tuned` lists
-  the entries (`--purge-stale`, `--clear`).
+  the entries (`--purge-stale`, `--clear`). Its `points` table holds every config a
+  searched sweep measured (`add_points` / `points`: the warm starts of the next search
+  at the same or a neighbouring shape bucket; "Parameter sweeps").
 
 `doctor --smoke` runs both examples through the evaluator (the attention one
 with `--compile-check`).
@@ -4366,7 +4466,7 @@ kernel-agent optimize <hf-url> [options]
                                        relaxed, near-lossless: all but the 4-bit fp4_weights
                                        and fp8_kv, which are opt-in; exact: exact; see
                                        "Allowed precisions")
-  --backends cuda,triton,cute,tilelang,nvrtc
+  --backends cuda,triton,cute,tilelang,nvrtc   (helion: opt in, when installed)
   --max-targets 4 --evaluations 12     targets and evaluation budget per target
   --parallel 2                         kernel agents at the same time
   --seeds-per-target 2|auto            isolated workers per target, budget split across them

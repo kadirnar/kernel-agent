@@ -23,6 +23,11 @@ the shape it tunes for.
 * **Configs** are JSON values (dicts of numbers / strings / lists); a tuple comes back as a
   list. Every candidate config must give a correct result: the evaluator checks whichever
   one the cache picks.
+* **Points** (issue #229): every config a search (``kernels/search.py``, ``sweep_candidate``
+  with a ``space``) measured, with its score, under the same key and versions
+  (:meth:`TunedConfigs.add_points`); a later search starts from the best ones at the same or
+  a neighbouring bucket (:meth:`TunedConfigs.points`, :func:`signature_bucket` of the
+  captured cases, :func:`bucket_distance`). They are starting points, measured again.
 
 API: :func:`best_config` (look up, or time the candidates with the caller's ``bench`` and
 store the fastest; never tunes while a CUDA graph is being captured), :func:`lookup`,
@@ -39,6 +44,7 @@ import importlib.metadata
 import json
 import math
 import os
+import re
 import sqlite3
 import statistics
 import sys
@@ -61,6 +67,7 @@ LIBRARIES: dict[str, tuple[tuple[str, ...], ...]] = {
     "cublaslt": (("nvidia-cublas", "nvidia-cublas-cu13", "nvidia-cublas-cu12"),),
     "cublas": (("nvidia-cublas", "nvidia-cublas-cu13", "nvidia-cublas-cu12"),),
     "tilelang": (("tilelang",),),
+    "helion": (("helion",), ("triton",)),  # Helion generates Triton
     "cuda": (("nvidia-cuda-nvcc", "nvidia-cuda-nvcc-cu13", "nvidia-cuda-nvcc-cu12"),),
 }
 _SCHEMA = """
@@ -76,6 +83,22 @@ CREATE TABLE IF NOT EXISTS configs (
     source TEXT,
     updated REAL,
     PRIMARY KEY (gpu, backend, op, bucket)
+)
+"""
+#: Every measured point of a search (kernels/search.py, issue #229): its score (a speedup,
+#: higher is better; NULL: the config failed), the latest measurement of each config.
+_POINTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS points (
+    gpu TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    op TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    config TEXT NOT NULL,
+    versions TEXT NOT NULL,
+    score REAL,
+    status TEXT,
+    updated REAL,
+    PRIMARY KEY (gpu, backend, op, bucket, config)
 )
 """
 
@@ -113,6 +136,40 @@ def shape_bucket(shape: Mapping[str, Any], *, exact: Iterable[str] = ()) -> str:
     return ",".join(parts)
 
 
+_DIMS = re.compile(r"\[([0-9, ]*)\]")
+_NUMBER = re.compile(r"\d+")
+
+
+def signature_bucket(signatures: Iterable[str]) -> str:
+    """The shape class of captured cases (their signatures, ``a0[1, 352, 1024]:bfloat16``):
+    every dimension inside brackets rounded up to a power of two (:func:`bucket`), the
+    distinct results sorted and joined by ``;``."""
+
+    def one(signature: str) -> str:
+        return _DIMS.sub(
+            lambda m: "[" + ", ".join(str(bucket(int(d))) for d in _NUMBER.findall(m[1])) + "]",
+            str(signature),
+        )
+
+    return ";".join(sorted({one(s) for s in signatures}))
+
+
+def bucket_distance(a: str, b: str) -> float | None:
+    """How far apart two buckets are: the largest ``|log2(x / y)|`` over their numbers in
+    the same places; None when they differ elsewhere (another op structure, dtype or
+    number of cases)."""
+    if _NUMBER.sub("#", a) != _NUMBER.sub("#", b):
+        return None
+    far = 0.0
+    for x, y in zip(_NUMBER.findall(a), _NUMBER.findall(b), strict=True):
+        x_, y_ = int(x), int(y)
+        if x_ != y_:
+            if min(x_, y_) == 0:
+                return None
+            far = max(far, abs(math.log2(x_ / y_)))
+    return far
+
+
 def _dist_version(names: Sequence[str]) -> str | None:
     for name in names:
         with contextlib.suppress(importlib.metadata.PackageNotFoundError):
@@ -147,8 +204,9 @@ def library_versions(backend: str) -> dict[str, str | None]:
         "cuda": torch.version.cuda,
         "driver": driver_version(),
     }
-    for group in LIBRARIES.get(backend, ()):
-        versions[group[0]] = _dist_version(group)
+    for part in backend.split("+"):  # a hybrid (``cuda+triton``): each backend's library
+        for group in LIBRARIES.get(part, ()):
+            versions[group[0]] = _dist_version(group)
     return versions
 
 
@@ -215,6 +273,7 @@ class TunedConfigs:
             with contextlib.suppress(sqlite3.DatabaseError):
                 conn.execute("PRAGMA journal_mode=WAL")  # readers never wait for a writer
             conn.execute(_SCHEMA)
+            conn.execute(_POINTS_SCHEMA)
             with conn:  # one transaction: committed on success
                 yield conn
         finally:
@@ -336,6 +395,79 @@ class TunedConfigs:
                 }
             )
         return out
+
+    # -- a search's points (kernels/search.py)
+
+    def add_points(
+        self,
+        op: str,
+        shape: Mapping[str, Any] | str,
+        points: Iterable[Mapping[str, Any]],
+        *,
+        backend: str = "triton",
+        exact: Iterable[str] = (),
+    ) -> int:
+        """Store measured points of ``op`` at ``shape``'s bucket under the current versions:
+        each ``{"config", "score" (higher is better; None: it failed), "status"}``, replacing
+        an earlier measurement of the same config. Returns how many."""
+        key = self._key(backend, op, _bucket_of(shape, exact))
+        versions = json.dumps(self.versions(backend), sort_keys=True)
+        now = time.time()
+        rows = []
+        for p in points:
+            score = p.get("score")
+            score = float(score) if score is not None and math.isfinite(float(score)) else None
+            config = json.dumps(p["config"], sort_keys=True)
+            rows.append((*key, config, versions, score, p.get("status"), now))
+        if not rows:
+            return 0
+        with self._db() as db:
+            db.executemany(
+                "INSERT OR REPLACE INTO points (gpu, backend, op, bucket, config, versions, "
+                "score, status, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        return len(rows)
+
+    def points(
+        self,
+        op: str,
+        shape: Mapping[str, Any] | str,
+        *,
+        backend: str = "triton",
+        exact: Iterable[str] = (),
+        near: float = 1.0,
+        limit: int | None = 32,
+    ) -> list[dict[str, Any]]:
+        """The points of ``op`` measured on this GPU under the current versions at ``shape``'s
+        bucket or a neighbouring one (:func:`bucket_distance` at most ``near``: a factor 2 per
+        dimension by default), the nearest bucket first, then the best score; failed points
+        (score None) after the measured ones. Each ``{"config", "score", "status", "bucket",
+        "distance"}``."""
+        want = _bucket_of(shape, exact)
+        current = self.versions(backend)
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT bucket, config, versions, score, status FROM points WHERE gpu=? AND "
+                "backend=? AND op=?",
+                (self.gpu, backend, op),
+            ).fetchall()
+        out = []
+        for bucket_, config, versions, score, status in rows:
+            far = bucket_distance(want, bucket_)
+            if far is None or far > near or json.loads(versions) != current:
+                continue
+            out.append(
+                {
+                    "config": json.loads(config),
+                    "score": score,
+                    "status": status,
+                    "bucket": bucket_,
+                    "distance": far,
+                }
+            )
+        out.sort(key=lambda p: (p["score"] is None, p["distance"], -(p["score"] or 0.0)))
+        return out if limit is None else out[:limit]
 
     def purge_stale(self) -> int:
         """Delete this GPU's entries tuned under other versions; returns how many."""

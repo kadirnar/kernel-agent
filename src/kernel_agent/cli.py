@@ -423,10 +423,19 @@ def cmd_eval(ns: argparse.Namespace) -> int:
     from kernel_agent.kernels.evaluate import run_evaluation
 
     if ns.sweep:  # many configs of build(reference, **config), the best fully evaluated
-        from kernel_agent.kernels import sweep
+        from kernel_agent.kernels import search, sweep
 
+        found: dict[str, Any] | None = None
+        configs: list[dict[str, Any]] = []
+        notes: list[str] = []
         try:
-            configs, notes = sweep.configs_from(Path(ns.sweep).read_text(), ns.max_configs)
+            text = Path(ns.sweep).read_text()
+            spec = json.loads(text) if text.lstrip().startswith("{") else None
+            if isinstance(spec, dict) and ("space" in spec or "strategy" in spec):  # a search
+                args = (spec.get(k) for k in ("space", "constraints", "strategy", "seed"))
+                found = search.spec_from(*args)
+            else:
+                configs, notes = sweep.configs_from(text, ns.max_configs)
         except (OSError, ValueError) as exc:
             print(f"--sweep {ns.sweep}: {exc}", file=sys.stderr)
             return 2
@@ -436,6 +445,7 @@ def cmd_eval(ns: argparse.Namespace) -> int:
             configs,
             timeout=ns.timeout,
             compile_check=ns.compile_check,
+            search=found,
         )
         data["sweep"]["notes"] = notes
         print(sweep.format_table(data), file=sys.stderr)
@@ -594,7 +604,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--backends",
         default=",".join(ALL_BACKENDS),
-        help=f"comma list from {','.join(ALL_BACKENDS)}",
+        help=f"comma list from {','.join(ALL_BACKENDS)} (and helion, opt in: when installed)",
     )
     p.add_argument("--max-targets", type=int, default=4)
     p.add_argument("--evaluations", type=int, default=12, help="evaluation budget per target")
@@ -1016,7 +1026,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--sweep",
         metavar="CONFIGS_JSON",
-        help="sweep build() keyword arguments: a JSON list of configs (or a dict of lists); "
+        help="sweep build() keyword arguments: a JSON list of configs (or a dict of lists), "
+        'or a search: {"space": {...}, "constraints": [...], "strategy": "auto", "seed": 0}; '
         "the best one is fully evaluated",
     )
     p.add_argument("--max-configs", type=int, default=None, help="--sweep: at most this many")

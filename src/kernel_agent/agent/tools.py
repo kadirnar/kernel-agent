@@ -20,6 +20,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from kernel_agent import board, critic, dashboard, dedup, gpuqueue, ledger, region, truth, workers
 from kernel_agent.budget import Budget
+from kernel_agent.kernels import search as search_mod
 from kernel_agent.kernels import sweep as sweep_mod
 from kernel_agent.kernels.evaluate import run_evaluation, run_evaluations
 from kernel_agent.kernels.roofline import sol_signal
@@ -1242,7 +1243,10 @@ def build_server(
         "built and checked on two cases (failing ones are listed with their error), the "
         "passing ones are timed interleaved against the reference, and the fastest is fully "
         "evaluated and recorded like evaluate_candidate (with its config bound into the "
-        "snapshot). Returns the table sorted by weighted speedup. Counts as ONE evaluation.",
+        "snapshot). Declare a `space` (every value each parameter may take) and the search "
+        "times as many configs as fit in the sweep's time, choosing each batch from what it "
+        "measured; or list `configs`. Returns the table sorted by weighted speedup. Counts "
+        "as ONE evaluation.",
         {
             "type": "object",
             "properties": {
@@ -1252,11 +1256,37 @@ def build_server(
                     "description": "path to the candidate .py (relative to your working dir) "
                     "whose build(reference, **config) takes the swept keyword arguments",
                 },
+                "space": {
+                    "type": ["object", "string"],
+                    "description": "the values every build() keyword argument may take: a "
+                    'list, {"pow2": [lo, hi]}, {"range": [lo, hi, step]}, "pow2:16..256", '
+                    '"2..5" or one fixed value, e.g. {"BLOCK_M": {"pow2": [16, 256]}, '
+                    '"BLOCK_N": [32, 64, 128], "num_warps": [2, 4, 8], "num_stages": "1..5"}',
+                },
+                "constraints": {
+                    "type": ["array", "string"],
+                    "description": "with space: Python expressions every config must "
+                    "satisfy, over the parameters and this GPU's smem_per_block (bytes), sm "
+                    "(120 for sm_120), sm_count, has_tma, has_wgmma, has_tcgen05, e.g. "
+                    '"(BLOCK_M + BLOCK_N) * BLOCK_K * 2 * num_stages <= smem_per_block"',
+                },
+                "strategy": {
+                    "type": "string",
+                    "enum": [*search_mod.STRATEGIES, search_mod.HELION],
+                    "description": "with space: auto (grid when at most "
+                    f"{search_mod.AUTO_GRID} valid configs, else pattern), grid, pattern "
+                    "(pattern search with random restarts) or tpe; helion (no space or "
+                    "configs): Helion's own autotuner on the candidate's @helion.kernel "
+                    "functions, the tuned configs bound as build(reference, helion_configs=...)",
+                    "default": "auto",
+                },
+                "seed": {"type": "integer", "description": "with space: the search's seed"},
                 "configs": {
                     "type": ["array", "object"],
-                    "description": 'build() keyword arguments per config, e.g. [{"BLOCK": '
-                    '512, "num_warps": 4}, {"BLOCK": 1024, "num_warps": 8}], or a dict of '
-                    'lists for every combination ({"BLOCK": [512, 1024], "num_warps": [4, 8]})',
+                    "description": "instead of space: build() keyword arguments per config, "
+                    'e.g. [{"BLOCK": 512, "num_warps": 4}, {"BLOCK": 1024, "num_warps": 8}], '
+                    'or a dict of lists for every combination ({"BLOCK": [512, 1024], '
+                    '"num_warps": [4, 8]})',
                 },
                 "max_configs": {
                     "type": "integer",
@@ -1279,7 +1309,7 @@ def build_server(
                 "parent": {"type": "string"},
                 "compile_check": {"type": "boolean", "default": False},
             },
-            "required": ["target_id", "candidate", "configs", "hypothesis"],
+            "required": ["target_id", "candidate", "hypothesis"],
         },
     )
     async def sweep_candidate(args: dict[str, Any]) -> dict[str, Any]:
@@ -1306,8 +1336,25 @@ def build_server(
         hypothesis = str(args.get("hypothesis") or "").strip()
         if not hypothesis:
             return _text({"status": "error", "error": "hypothesis is required"})
+        search: dict[str, Any] | None = None
+        configs: list[dict[str, Any]] = []
+        notes: list[str] = []
+        helion = str(args.get("strategy") or "").strip().lower() == search_mod.HELION
         try:
-            configs, notes = sweep_mod.configs_from(args.get("configs"), args.get("max_configs"))
+            if args.get("space") is not None and args.get("configs") is not None:
+                raise ValueError("pass a space to search or configs to list, not both")
+            if args.get("space") is not None or helion:  # a search (kernels/search.py, #229)
+                search = await asyncio.to_thread(
+                    search_mod.spec_from,
+                    args.get("space"),
+                    args.get("constraints"),
+                    args.get("strategy"),
+                    args.get("seed"),
+                )
+            elif args.get("configs") is None:
+                raise ValueError("space (the values of every parameter) or configs is required")
+            else:
+                configs, notes = sweep_mod.configs_from(args["configs"], args.get("max_configs"))
         except ValueError as exc:
             return _text({"status": "error", "error": str(exc)})
         idea = ledger.idea_slug(args.get("idea_id"))
@@ -1337,6 +1384,7 @@ def build_server(
             compile_check=bool(args.get("compile_check")),
             prepare=prepare,
             race=budget.early_stop,  # racing of the configs (kernels/early.py, #190)
+            search=search,
         )
         snap, snap_sha256 = snaps[0]
         result = data["evaluation"]
@@ -1351,8 +1399,11 @@ def build_server(
             }
         info = data["sweep"]
         config = data["config"]
-        result = {**result, "config": config, "sweep": {**info, "notes": notes}}
+        recorded = {**info, "table": sweep_mod.slim_table(info["table"]), "notes": notes}
+        result = {**result, "config": config, "sweep": recorded}
         tag = f"{sweep_mod.label(config)}; best of {info['passed']}/{info['configs']} configs"
+        if found := info.get("search"):  # e.g. "; pattern search, 1200 valid"
+            tag += f"; {found['strategy']} search, {found.get('valid') or '?'} valid"
         k = next((r.get("index") for r in info["table"] if r.get("config") == config), None)
         title = ledger.clean_title(args.get("title"), f" [cfg {k}]" if k is not None else "")
         _, row = record_candidate(
@@ -1379,12 +1430,19 @@ def build_server(
         out["sweep"] = {
             k: info[k] for k in ("configs", "passed", "failed", "skipped", "seconds") if k in info
         }
-        for key in ("rounds", "raced", "cases", "timing", "note", "sol_note"):
+        for key in ("rounds", "raced", "cases", "timing", "note", "sol_note", "search", "helion"):
             if info.get(key):
                 out["sweep"][key] = info[key]
         if notes:
             out["sweep"]["notes"] = notes
-        out["sweep"]["table"] = [sweep_mod.compact_row(r) for r in info["table"]]
+        table = info["table"]
+        if search is not None and len(table) > sweep_mod.TABLE_ROWS:  # the best, not hundreds
+            out["sweep"]["table_note"] = (
+                f"the best {sweep_mod.TABLE_ROWS} of {len(table)} rows (all of them are in the "
+                "run's results.jsonl record)"
+            )
+            table = table[: sweep_mod.TABLE_ROWS]
+        out["sweep"]["table"] = [sweep_mod.compact_row(r) for r in table]
         out["ledger"] = {"exp": row["exp"], "status": row["status"]}
         if idea or expected is not None:
             try:

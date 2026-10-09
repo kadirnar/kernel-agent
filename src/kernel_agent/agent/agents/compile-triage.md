@@ -24,7 +24,7 @@ Method:
    (registers, shared memory, a block size), a layout or alignment rule, a numerics check.
 3. Verify the API or rule you blame, when it is not plain from the code: `doc_search` /
    `doc_read` of the doc library (the installed versions' documentation), or the backend's
-   skill (`triton-kernels`, `cuda-kernels`, `cute-dsl`, `tilelang-kernels`,
+   skill (`triton-kernels`, `cuda-kernels`, `cute-dsl`, `tilelang-kernels`, `helion-kernels`,
    `native-engines`). Never guess a signature.
 4. Write the smallest change that fixes the cause; leave the design alone. When the error
    says the idea itself cannot work as written (an instruction this GPU does not have, a
