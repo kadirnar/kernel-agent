@@ -6,7 +6,9 @@ its library wheels, whether it imports, the architecture it compiles for
 (``CUTE_DSL_ARCH``, else the GPU's ``sm_XYa``), whether that architecture is one it knows
 and whether the block-scaled warp MMA (``MmaMXF8Op``: ``mma.sync kind::mxf8f6f4.block_scale``,
 SASS ``QMMA.SF``, 416 TFLOP/s on an RTX 5070 Ti vs 208 for plain e4m3) admits it, TVM-FFI
-(the low-overhead calling convention of the examples) and the compile cache.
+(the low-overhead calling convention of the examples) and the compile cache. The same
+target list decides whether ``toolchain.setup`` offers the ``cute`` backend on this GPU
+(:func:`unsupported`, cached per DSL version: 4.8 has no target below sm_80).
 
 **Compile cache** (:func:`compile_cached`). Every evaluation runs a candidate in a fresh
 process, so ``cute.compile`` (seconds per kernel: tracing, MLIR passes, ``ptxas``) is paid
@@ -215,6 +217,57 @@ def check(
     if not status.tvm_ffi:
         status.notes.append("apache-tvm-ffi missing: `--enable-tvm-ffi` (low host overhead) is off")
     return status
+
+
+#: The DSL's targets per installed version (:func:`_probe`'s ``arches``), kept across
+#: processes in the cache directory: ``toolchain.setup`` asks in every process (#254), and
+#: importing the DSL takes ~0.4 s.
+TARGETS = "cute-dsl-targets.json"
+
+
+def targets(probe: Callable[[], dict[str, Any]] | None = None) -> list[str]:
+    """The architectures the installed CuTe DSL compiles for (``[]``: it is not installed or
+    does not import), cached per DSL version (:data:`TARGETS`). ``probe`` replaces the
+    import (tests)."""
+    version = dsl_version()
+    path = CACHE_DIR / TARGETS
+    try:
+        cached = json.loads(path.read_text())
+    except (OSError, ValueError):
+        cached = {}
+    cached = cached if isinstance(cached, dict) else {}
+    if version != "unknown" and isinstance(cached.get(version), list):
+        return [str(a) for a in cached[version]]
+    try:
+        found = [str(a) for a in (probe or _probe)().get("arches") or []]
+    except Exception:  # not installed or broken: check() says why
+        return []
+    if version != "unknown" and found:
+        tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps({**cached, version: found}, indent=1))
+            tmp.replace(path)
+        except OSError:
+            pass
+    return found
+
+
+def unsupported(
+    capability: tuple[int, int] | None, probe: Callable[[], dict[str, Any]] | None = None
+) -> str | None:
+    """Why the installed CuTe DSL cannot compile for a GPU of ``capability`` (the
+    architecture :func:`arch_name` gives): None when it can, without a GPU, or when its
+    targets are unknown (not installed, or :func:`check` reports a broken install)."""
+    arch = arch_name(capability)
+    found = targets(probe) if arch is not None else []
+    if not found or arch in found:
+        return None
+    from kernel_agent.gpu_arch import arch_of, capability_of
+
+    caps = sorted({c for a in found if (c := capability_of(a)) is not None})
+    span = f"; its targets: {arch_of(caps[0])} to {arch_of(caps[-1])}" if caps else ""
+    return f"CuTe DSL {dsl_version()} has no {arch} target{span}"
 
 
 # ------------------------------------------------------------------ compile cache

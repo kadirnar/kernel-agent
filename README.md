@@ -1237,7 +1237,9 @@ allowed by default in near-lossless runs, in the near-lossless tier):
 * **Contract and reference** (`kernels/quant.py`): `quantize_int8`, `quantize_int8_activations`
   (scale `amax * (1 / 127)`, codes `round(x / scale)` to nearest even with an IEEE division:
   kernels reproduce the codes bit for bit), `int8_matmul` (exact int32 products:
-  `torch._int_mm` on the GPU, padded past its M > 16 minimum; chunked exact fp32 elsewhere),
+  `torch._int_mm` on the GPU, padded past its M > 16 minimum; chunked exact fp32 elsewhere
+  and where `_int_mm` raises, e.g. no cuBLASLt IMMA kernel for a Turing GPU: tried once per
+  device and layout, recorded in `quant.INT_MM_FAILED`, the same integers; #254),
   `int8_w8a8_linear`, `int8_weights_linear`, `int8_error`, `int8_w8a8_error`
   (`activation_crest`, `activation_underflow`), `smoothquant_factors`.
 * **Examples** (verified on an RTX 5070 Ti; `ARCHS = "sm_80+"`, `doctor --smoke` runs them:
@@ -4180,7 +4182,7 @@ Claude session, once per target:
    |---|---|---|---|---|
    | `torch-sdpa` | torch | SDPA pinned to one backend (`sdpa_kernel`): flash, mem-efficient, cuDNN, math | flash / cuDNN: sm_80+, half | run on a GPU |
    | `torch-rms-norm` | torch | the written-out RMSNorm (about 6 kernels) as `F.rms_norm` (one fused kernel): `FUSE=0` keeps the reference's roundings (the weight multiplied after), `FUSE=1` puts the weight inside | any | run on a GPU |
-   | `cublaslt` | torch + CUDA toolkit | `F.linear` through cuBLASLt: bias in the epilogue, residual add and tanh GELU too (`FUSE`), algorithm per shape: the heuristic's top 8 timed (`ALGO=-1`) or its i-th | sm_80+ | run on a GPU |
+   | `cublaslt` | torch + CUDA toolkit | `F.linear` through cuBLASLt: bias in the epilogue, residual add and tanh GELU too (`FUSE`), algorithm per shape: the heuristic's top 8 timed (`ALGO=-1`) or its i-th | fp16: sm_75+; bf16: sm_80+ | run on a GPU |
    | `torch-scaled-mm` | torch | `F.linear` as FP8 W8A8 `torch._scaled_mm` (row-wise or tensor-wise scales), `fp8_w8a8` targets only | sm_89+ | run on a GPU |
    | `flash-attn`, `flash-attn-3` | flash-attn | SDPA without a mask | sm_80+; FA3 sm_90 | from the docs |
    | `flashinfer-attention`, `flashinfer-norm` | flashinfer-python | single-request decode / prefill attention; RMSNorm | sm_75+ | from the docs |
@@ -4338,7 +4340,7 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
 
 | family | archs | what reaches the tensor-core peak | FP8 math | block-scaled (MXFP8) | INT8 math (`int8_w8a8`) | copies / launches |
 |---|---|---|---|---|---|---|
-| Turing / Volta | sm_75 (sm_70) | `mma.sync` fp16 (Triton `tl.dot` runs on FMA units) | no | no | sm_75: `mma.sync` m8n8k16, cuBLASLt (sm_70: no) | — |
+| Turing / Volta | sm_75 (sm_70) | `mma.sync` fp16 (Triton `tl.dot` runs on FMA units; int8 does not compile) | no | no | sm_75: `mma.sync` m8n8k16, cuBLASLt (sm_70: no) | — |
 | Ampere | sm_80, sm_86, sm_87 | `mma.sync` bf16 / fp16 | no (weight-only FP8 / FP4 in software) | no | yes: the 8-bit compute class (IMMA, 2x bf16) | `cp.async` |
 | Ada | sm_89 | `mma.sync`, e4m3 QMMA | yes | no | yes (IMMA) | `cp.async` |
 | Hopper | sm_90 | `wgmma` (e4m3 `mma.sync` is emulated) | yes | no | yes (`wgmma` s8) | TMA, clusters, PDL |
@@ -4371,7 +4373,11 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   `QMMA.F32` / `QMMA.SF` rates, the half-rate rule dropped where both measure the
   same); a class whose precision the GPU cannot run is left out; each family adds what
   it needs for the peak (`backends.ARCH_POLICY`, `ARCH_RULES`). The other rows keep
-  their evidence, labelled as measured on the RTX 5070 Ti. The ceilings table's *FP8
+  their evidence, labelled as measured on the RTX 5070 Ti. Turing has its own small-M
+  GEMM, short-attention, decoder-layer and bf16-GEMM rows (fp16 `mma.sync` m16n8k8, WMMA,
+  cuBLAS fp16; Triton's int8 `tl.dot` does not compile below sm_80), and no row or rule
+  names a bundled example whose `ARCHS` excludes the GPU: such a mention is dropped
+  (`backends.runnable_text`, #254). The ceilings table's *FP8
   MMA* column appears only where two FP8 `mma.sync` forms exist (sm_12x); the
   `mma.sync` e4m3 rates are not measured on sm_90 / sm_100, where they are emulated.
 * **Knowledge per GPU.** The `gpu-architectures` skill's `gpus.md` has one section per
@@ -4384,7 +4390,11 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
 * **Examples and doctor.** Every architecture-dependent example declares `ARCHS`
   (`"sm_89+"`, `"sm_12x"`, ...) and `ARCHS_WHY`; `doctor --smoke` runs those this GPU
   supports and lists the rest (`skipped here (...): triton_fp8_w8a8_gemm needs
-  sm_89+ (e4m3 tensor cores ...); this GPU is sm_86`). The doctor probes skip what the
+  sm_89+ (e4m3 tensor cores ...); this GPU is sm_86`). A backend whose compiler has no
+  target for the GPU is off: `backends unavailable: cute (CuTe DSL 4.8.0 has no sm_75
+  target; its targets: sm_80 to sm_121)` on a T4 (`toolchain.ARCH_SUPPORT`, the DSL's
+  targets cached per version), so neither a plan nor `doctor --smoke` uses it there
+  (#254). The doctor probes skip what the
   GPU lacks (the block-scaled `tl.dot_scaled` lowering outside sm_12x, TMA and PDL before sm_90) and
   the CuTe DSL check names the family's peak MMA. The library scout's adapters declare
   their architectures the same way; `doctor` lists which run here (FlashAttention 3 needs
@@ -4401,7 +4411,8 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   has `wgmma.mma_async` / `tcgen05.mma` + `tcgen05.alloc` + `tcgen05.ld` and TMA
   (`tests/test_cute_examples.py`); **not run on an H100 or B200 yet**.
 * **Tested** on the CPU with faked GPUs (sm_80, sm_86, sm_89, sm_90, sm_100, sm_120:
-  `tests/test_gpu_arch.py`) and run on an RTX 5070 Ti. The CUDA weight-only examples
+  `tests/test_gpu_arch.py`; a T4, sm_75, with its toolchain, `doctor --smoke` and policy:
+  `tests/test_turing.py`) and run on an RTX 5070 Ti. The CUDA weight-only examples
   were compiled for sm_80 / 86 / 89 / 90 / 100 / 120 on the CPU, the CuTe DSL templates
   above for sm_90a / sm_100a; on other GPUs nothing has run yet: `kernel-agent doctor
   --smoke` is the first check there.

@@ -9,7 +9,8 @@ run on a GPU by the tests:
   kernels) folded into ``F.rms_norm``, torch's fused RMSNorm kernel;
 * ``cublaslt``: ``F.linear`` through cuBLASLt with the bias, a residual add or a tanh GELU
   in the GEMM's epilogue and the algorithm chosen per shape (the heuristic's top 8 timed, or
-  its i-th), generalised from ``agent/examples/cuda_cublaslt_fp8.py`` to bf16 / fp16;
+  its i-th), generalised from ``agent/examples/cuda_cublaslt_fp8.py`` to bf16 / fp16 (fp16
+  call sites from sm_75, bf16 ones from sm_80: the tensor cores of each dtype);
 * ``torch-scaled-mm``: ``F.linear`` as an FP8 W8A8 GEMM (``torch._scaled_mm``; e4m3 weights
   quantised once, activations per call), only on targets planned at ``fp8_w8a8``.
 
@@ -925,8 +926,9 @@ ADAPTERS: tuple[Adapter, ...] = (
         module="torch",
         licence="BSD-3-Clause (torch); cuBLASLt: NVIDIA CUDA EULA",
         families=("linear",),
-        archs="sm_80+",
-        archs_why="bf16 tensor cores",
+        archs="sm_75+",
+        archs_why="fp16 tensor cores",
+        dtype_archs={"bfloat16": ("sm_80+", "bf16 tensor cores")},
         compiles=True,
         helpers=("fold_linear",),
     ),

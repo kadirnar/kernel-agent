@@ -20,10 +20,12 @@ habit:
   Both follow the GPU (issue #165, :class:`kernel_agent.gpu_arch.Facts`): the rows that
   differ by architecture (:data:`ARCH_POLICY`: compute-bound FP8 on Ada, Hopper and
   datacenter Blackwell; on GeForce Blackwell with this GPU's measured FP8 instruction
-  rates; compute-bound INT8 on Turing, Hopper and datacenter Blackwell) replace
+  rates; compute-bound INT8 on Turing, Hopper and datacenter Blackwell; Turing's small-M
+  GEMMs, short attention, decoder layers and bf16 GEMMs) replace
   :data:`POLICY`'s, whose evidence was measured on an RTX 5070 Ti (sm_120);
   a class whose precision the GPU cannot run is left out, and :data:`ARCH_RULES` adds what
-  each family needs for the tensor-core peak.
+  each family needs for the tensor-core peak. No row or rule names a bundled example whose
+  ``ARCHS`` excludes the GPU (:func:`runnable_text`, #254).
 * :func:`outcomes` / :func:`by_backend` tabulate a run's kernel evaluations per target and
   backend (library priors and library scout rows excluded, a re-evaluation replaces its
   snapshot's numbers);
@@ -37,17 +39,18 @@ habit:
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger
 from kernel_agent.budget import not_agents
-from kernel_agent.gpu_arch import Facts
+from kernel_agent.gpu_arch import Facts, example_requirement, supports
 from kernel_agent.workspace import RunDir, read_json
 
 #: What a candidate's source *runs*, per backend (first column of RESEARCH-TRITON §4.1).
@@ -234,12 +237,71 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
             _INT8_LABEL,
             "cuBLASLt int8 (`torch._int_mm`: IMMA) with the per-token / per-channel scales in a "
             "fused epilogue kernel, or CUDA C++ `mma.sync.m8n8k16.s32.s8.s8.s32` (sm_75's form)",
-            "Turing has IMMA (m8n8k16) but no bf16 tensor cores, and Triton's `tl.dot` runs on "
-            "CUDA cores below sm_80",
+            "Turing has IMMA (m8n8k16) but no bf16 tensor cores, and Triton's int8 `tl.dot` "
+            "does not compile below sm_80 (Triton 3.8: `TritonGPUAccelerateMatmul` fails for "
+            "sm_75; fp16 / bf16 dots run on FMA units there)",
             "CUTLASS sm_75 int8 GEMMs from C++",
             ("cuda", "triton"),
-            "never Triton `tl.dot` for the GEMM on sm_75 (no tensor cores there); never the "
+            "never Triton `tl.dot` on int8 tiles on sm_75 (it does not compile); never the "
             "`m16n8k32` s8 form (sm_80+)",
+        ),
+        # #254: the sm_120 rows name bf16 examples declared sm_80+ (and a CuTe DSL one,
+        # which has no sm_75 target); these are the paths Turing has
+        "small_m_gemm": TargetClass(
+            "small_m_gemm",
+            _BY_ID["small_m_gemm"].label,
+            "CUDA C++ (`load_inline`) GEMV / skinny GEMM: 16-byte weight loads, CUDA-core FMA "
+            "for a few rows, fp16 `mma.sync.m16n8k8` (Turing's HMMA form) once M fills a tile; "
+            "weight-only INT8 / FP8 codes dequantised in registers",
+            "memory bound: the weight bytes set the floor and the host time per launch matters "
+            "(RTX 5070 Ti: every kept small-M kernel of the studied runs was CUDA C++, up to "
+            "10.5x); sm_75 has no bf16 tensor cores, no `cp.async` and no `m16n8k16` / "
+            "`m16n8k32` forms, and the bundled small-M examples are bf16 and sm_80+",
+            "Triton `tl.dot` on fp16 with BM = 16 inside CUDA graphs (FMA units below sm_80: "
+            "enough while the weight stream dominates; int8 `tl.dot` does not compile here)",
+            ("cuda", "triton"),
+            "never `mma.sync` `m16n8k16` / `m16n8k32` or `cp.async` on sm_75 (ptxas: sm_80+)",
+        ),
+        "short_attention": TargetClass(
+            "short_attention",
+            _BY_ID["short_attention"].label,
+            "CUDA C++ single-tile kernel (one block per sequence × head, Q/K/V in shared "
+            "memory, WMMA fp16 `m16n16k16` or FMA for the ≤ 16 × 16 scores) as an SDPA "
+            "custom_op",
+            "latency bound (RTX 5070 Ti: a single-tile kernel 5.7 vs 15.9 us for cuDNN at 11 "
+            "tokens); on sm_75 SDPA has no flash or cuDNN backend (both sm_80+) and Triton's "
+            "`tl.dot` runs on FMA units",
+            "SDPA's memory-efficient backend in fp16 as the baseline; a Triton single-tile "
+            "kernel in fp16 (FMA `tl.dot`: measure it, the tile is ≤ 16 × 16)",
+            ("cuda", "triton"),
+        ),
+        "decoder_layer": TargetClass(
+            "decoder_layer",
+            _BY_ID["decoder_layer"].label,
+            "timed eagerly: CUDA C++ behind one launcher (cuBLAS fp16 GEMMs or fp16 "
+            "`mma.sync` m16n8k8, norm / RoPE / attention glue fused); inside CUDA graphs: "
+            "Inductor glue + cuBLAS",
+            "host time decides an eager-timed layer (RTX 5070 Ti: 2.21x with 5 Triton launches "
+            "vs 2.70x for the same math behind one C++ launcher); sm_75 has fp16 tensor cores "
+            "only, and CuTe DSL 4.8 has no sm_75 target",
+            "Triton for the memory-bound glue inside CUDA graphs (its `tl.dot` runs on FMA "
+            "units here: keep the GEMMs in cuBLAS)",
+            ("cuda", "triton"),
+        ),
+        "bf16_gemm": TargetClass(
+            "bf16_gemm",
+            _BY_ID["bf16_gemm"].label,
+            "keep cuBLAS(Lt) for the GEMM and fuse what is around it in CUDA C++ (one "
+            "launcher); the run's dtype decides the rate here: fp16 GEMMs get the tensor "
+            "cores (HMMA), bf16 ones run on CUDA cores",
+            "sm_75 has fp16 `mma.sync` (m16n8k8) but no bf16 tensor cores (datasheet T4: 65 "
+            "fp16 tensor TFLOP/s vs 8.1 fp32; the measured fp16 / bf16 peaks give this GPU's "
+            "ratio); the exact tier needs cuBLAS's summation order",
+            "where the tier allows another rounding: fp16 HMMA on operands converted from "
+            "bf16 in the kernel (fp16 overflows past 65504: check the operands' amax), or "
+            "CUTLASS sm_75 fp16 GEMMs with a fused epilogue",
+            ("cuda", "triton"),
+            "never Triton `tl.dot` for a compute-bound GEMM on sm_75 (FMA units)",
         ),
     },
     "ampere": {
@@ -366,9 +428,13 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
 #: engineer_note lines; GeForce Blackwell's were measured on an RTX 5070 Ti).
 ARCH_RULES: dict[str, tuple[str, ...]] = {
     "pre_ampere": (
-        "No bf16 tensor cores before sm_80 (fp16 is the tensor-core dtype) and Triton's "
-        "`tl.dot` runs on FMA units below sm_80: keep GEMMs in cuBLAS or CUDA C++ fp16 "
-        "`mma.sync`, use Triton for memory-bound glue.",
+        "No bf16 tensor cores before sm_80 (fp16 is the tensor-core dtype; Turing's form is "
+        "`mma.sync` m16n8k8, `m16n8k16` needs sm_80). Triton's `tl.dot` runs on FMA units "
+        "below sm_80 for fp16 / bf16 / tf32 and does not compile on int8 (Triton 3.8): keep "
+        "GEMMs in cuBLAS or CUDA C++ fp16 `mma.sync`, use Triton for memory-bound glue.",
+        "CuTe DSL 4.8 has no target below sm_80 (the toolchain block's `backends "
+        "unavailable` line says it for the installed version); CUTLASS C++ has sm_75 "
+        "tensor-core GEMMs.",
     ),
     "ampere": (
         "No FP8 tensor cores (sm_80 / sm_86): `fp8_weights`, `fp4_weights` and `fp8_kv` "
@@ -445,15 +511,94 @@ def _geforce_fp8(facts: Facts | None) -> TargetClass | None:
     )
 
 
+#: The bundled examples a row may name (``examples/<name>.py`` or ``<name>.py``).
+EXAMPLES_DIR = Path(__file__).parent / "agent" / "examples"
+_EXAMPLE = re.compile(r"\b[a-z0-9_]+\.py\b")
+_PARENS = re.compile(r"\s*\([^()]*\)")
+
+
+@functools.cache
+def _declared(name: str) -> tuple[bool, str | None]:
+    """Whether ``name`` is a bundled example file, and its ``ARCHS``."""
+    path = EXAMPLES_DIR / name
+    return (True, example_requirement(path)[0]) if path.is_file() else (False, None)
+
+
+def unrunnable(text: str, capability: tuple[int, ...] | None) -> list[str]:
+    """The bundled examples ``text`` names whose ``ARCHS`` exclude a GPU of ``capability``
+    (none without a capability)."""
+    if capability is None:
+        return []
+    out = []
+    for name in dict.fromkeys(_EXAMPLE.findall(text)):
+        bundled, spec = _declared(name)
+        if bundled and not supports(spec, capability):
+            out.append(name)
+    return out
+
+
+def _clauses(text: str) -> list[str]:
+    """``text`` split at its ``"; "`` outside parentheses."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        depth += (ch == "(") - (ch == ")")
+        if depth == 0 and text.startswith("; ", i):
+            parts.append(text[start:i])
+            start = i + 2
+    return [*parts, text[start:]]
+
+
+def runnable_text(text: str, capability: tuple[int, ...] | None) -> str:
+    """``text`` without what names a bundled example a GPU of ``capability`` cannot run
+    (:func:`unrunnable`): the parenthesis that names it, else its ``;`` clause ("" when
+    nothing is left). A row never recommends an example that does not run here (#254)."""
+    bad = unrunnable(text, capability)
+    if not bad:
+        return text
+    names = re.compile("|".join(re.escape(n) for n in bad))
+    kept = []
+    for clause in _clauses(text):
+        while names.search(clause):
+            group = next((g for g in _PARENS.finditer(clause) if names.search(g.group())), None)
+            if group is None:
+                break
+            clause = clause[: group.start()] + clause[group.end() :]
+        if not names.search(clause):
+            kept.append(clause)
+    return "; ".join(kept)
+
+
+def _runnable_row(row: TargetClass, capability: tuple[int, ...] | None) -> TargetClass:
+    """``row`` without the bundled examples a GPU of ``capability`` cannot run; a first or
+    second backend left empty becomes the ``other`` row's."""
+    first = runnable_text(row.first, capability) or _BY_ID["other"].first
+    second = runnable_text(row.second, capability) or _BY_ID["other"].second
+    why, never = runnable_text(row.why, capability), runnable_text(row.never, capability)
+    if (first, why, second, never) == (row.first, row.why, row.second, row.never):
+        return row
+    return replace(row, first=first, why=why, second=second, never=never)
+
+
+def arch_rules(facts: Facts | None) -> tuple[str, ...]:
+    """:data:`ARCH_RULES` of the GPU of ``facts`` (unknown: GeForce Blackwell's), without a
+    rule that names an example this GPU cannot run."""
+    fam = facts.family if facts is not None else None
+    cap = facts.capability if facts is not None else None
+    rules = ARCH_RULES.get(fam.key if fam else "blackwell_geforce", ())
+    return tuple(r for r in rules if not unrunnable(r, cap))
+
+
 def policy(class_id: str, facts: Facts | None = None) -> TargetClass:
-    """The policy row of ``class_id`` for the GPU of ``facts`` (None: :data:`POLICY`'s)."""
+    """The policy row of ``class_id`` for the GPU of ``facts`` (None: :data:`POLICY`'s),
+    naming only bundled examples whose ``ARCHS`` hold this GPU."""
     fam = facts.family if facts is not None else None
     row = None
     if fam is not None and class_id == "fp8_gemm" and fam.key == "blackwell_geforce":
         row = _geforce_fp8(facts)  # this GPU's measured FP8 instruction rates
     elif fam is not None:
         row = ARCH_POLICY.get(fam.key, {}).get(class_id)
-    return row or _BY_ID.get(class_id, _BY_ID["other"])
+    row = row or _BY_ID.get(class_id, _BY_ID["other"])
+    return _runnable_row(row, facts.capability if facts is not None else None)
 
 
 def _fp8_runs(facts: Facts | None) -> bool:
@@ -570,7 +715,7 @@ def policy_text(available: Iterable[str] | None = None, facts: Facts | None = No
         "* An eager-timed target with ≥ 3 kernel launches per call: one C++ launcher "
         "(host time, not GPU time, decides there)."
     )
-    lines += [f"* {rule}" for rule in ARCH_RULES.get(fam.key if fam else "blackwell_geforce", ())]
+    lines += [f"* {rule}" for rule in arch_rules(facts)]
     lines.append("* TileLang has no evidence either way on this GPU: list it, not first.")
     return "\n".join(lines)
 
@@ -600,7 +745,7 @@ def engineer_note(
             gemm = policy(inside, facts)
             never = f" {gemm.never}." if gemm.never else ""
             lines.append(f"* The GEMMs inside (M = {rows}): {gemm.first}.{never}")
-    rules = ARCH_RULES.get(fam.key if fam else "blackwell_geforce", ())
+    rules = arch_rules(facts)
     if fp8 and "triton" in planned:  # the family's Triton FP8 rule
         lines += [f"* {r}" for r in rules if r.startswith("Triton")]
     if fam is not None:  # what this family needs for the tensor-core peak

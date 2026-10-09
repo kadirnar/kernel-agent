@@ -283,8 +283,9 @@ def column_unsupported(column: str, capability: tuple[int, ...] | None) -> str |
 #: What INT8 W8A8 (``int8_w8a8``) needs per family for the INT8 tensor-core peak (#178).
 _INT8_PATH = {
     "pre_ampere": (
-        "Turing's IMMA is `mma.sync` m8n8k16 (`m16n8k32` needs sm_80) and Triton's `tl.dot` "
-        "runs on CUDA cores below sm_80: cuBLASLt (`torch._int_mm`) or CUDA C++ m8n8k16 here"
+        "Turing's IMMA is `mma.sync` m8n8k16 (`m16n8k32` needs sm_80) and Triton's int8 "
+        "`tl.dot` does not compile below sm_80 (Triton 3.8): cuBLASLt (`torch._int_mm`) or "
+        "CUDA C++ m8n8k16 here"
     ),
     "hopper": (
         "the INT8 peak needs `wgmma` s8 (Triton `tl.dot` on int8 emits it, CUTLASS sm_90); a "

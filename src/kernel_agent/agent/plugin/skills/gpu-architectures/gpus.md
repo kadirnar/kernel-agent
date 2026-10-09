@@ -11,15 +11,19 @@ block's measured peaks and instruction rates are the numbers to use.
 
 * Tensor cores: fp16 `mma.sync` only (int8 on sm_75); **no bf16, TF32 or FP8 tensor
   cores**. A bf16 model's matmuls do not get tensor-core rates here; fp16 does.
-* Triton's `tl.dot` falls back to FMA (CUDA cores) below sm_80: use Triton for
-  memory-bound glue, cuBLAS or CUDA C++ fp16 `mma.sync` for GEMMs.
+* Triton's `tl.dot` falls back to FMA (CUDA cores) below sm_80 for fp16 / bf16 / tf32
+  (no `mma` in the PTX), and an int8 `tl.dot` does not compile for sm_75 (Triton 3.8:
+  `PassManager::run failed` in `TritonGPUAccelerateMatmul`): use Triton for memory-bound
+  glue, cuBLAS or CUDA C++ fp16 `mma.sync` (m16n8k8; `m16n8k16` needs sm_80) for GEMMs.
+* CuTe DSL 4.8 has no sm_75 target (its targets start at sm_80): `doctor` lists `cute`
+  under `backends unavailable` with the reason; CUTLASS C++ has sm_75 tensor-core GEMMs.
 * No `cp.async`, TMA, clusters or PDL. Shared memory: 64 KB per block on sm_75, 96 KB on
   sm_70. CUDA 13 dropped sm_70 / sm_72 (Turing is its minimum).
 * Weight-only FP8 / FP4 and FP8 KV caches still run (software dequantisation, as on
   Ampere); W8A8 and MXFP8 do not.
 * INT8 tensor cores on sm_75 (IMMA, `mma.sync` m8n8k16 s8, 2x the fp16 rate): `int8_w8a8`
-  runs there through cuBLASLt (`torch._int_mm`) or CUDA C++ (Triton's `tl.dot` has no
-  tensor cores below sm_80; the `m16n8k32` form needs sm_80). sm_70 has no INT8 MMA:
+  runs there through cuBLASLt (`torch._int_mm`) or CUDA C++ (Triton's int8 `tl.dot` does
+  not compile below sm_80; the `m16n8k32` form needs sm_80). sm_70 has no INT8 MMA:
   `int8_w8a8` is refused there; `int8_weights` runs everywhere.
 
 ## [ampere] Ampere (sm_80: A100, A30; sm_86 / sm_87: A10, A40, RTX A6000, RTX 30xx, Orin)
@@ -163,7 +167,7 @@ instruction.
 * https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html , https://docs.nvidia.com/cuda/ada-tuning-guide/index.html , https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html , https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html — L2 sizes and per-architecture tuning.
 * https://docs.nvidia.com/cuda/cublas/index.html — "Scaling Mode Support Overview": tensor-wise FP8 8.9+, outer-vector / 128-block 9.0, MXFP8 / NVFP4 10.0+; TN layout on 8.9 / 9.0 / 12.x.
 * https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/ScaledBlas.cpp — `torch._scaled_mm` needs sm_89 or sm_90+; row-wise via CUTLASS on sm_89; blockwise sm_90 only.
-* https://github.com/triton-lang/triton/blob/main/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp — `tl.dot`: wgmma on sm_90, tcgen05 on sm_100-119, `mma.sync` on sm_120; FP8 `mma.sync` emulated on sm_90 / sm_100; native `tl.dot_scaled` on sm_100-119 and sm_12x; FMA below sm_80.
+* https://github.com/triton-lang/triton/blob/main/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp — `tl.dot`: wgmma on sm_90, tcgen05 on sm_100-119, `mma.sync` on sm_120; FP8 `mma.sync` emulated on sm_90 / sm_100; native `tl.dot_scaled` on sm_100-119 and sm_12x; FMA below sm_80 (fp16 / bf16 / tf32; an int8 dot fails this pass for sm_75 in Triton 3.8, checked 2026-10 on the CPU).
 * https://github.com/triton-lang/triton/blob/main/third_party/nvidia/backend/compiler.py — e4m3 (`fp8e4nv`) only from sm_89.
 * https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/blackwell_functionality.md — sm_100 vs sm_120 GEMMs; GeForce: no multicast, cluster 1x1x1.
 * https://pytorch.org/blog/flashattention-3/ — `mma.sync` reaches about 2/3 of the Hopper tensor-core peak.

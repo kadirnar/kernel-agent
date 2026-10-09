@@ -11,7 +11,9 @@ templates).
 
 Every example declares the GPUs it runs on (its ``ARCHS``, ``kernel_agent/gpu_arch.py``):
 :func:`smoke_backends` runs those this GPU supports and lists the others with the reason
-(:func:`example_skip`), so ``doctor --smoke`` passes on any GPU."""
+(:func:`example_skip`), so ``doctor --smoke`` passes on any GPU. A backend the toolchain
+refuses on this GPU (``cute`` below sm_80: ``toolchain.ARCH_SUPPORT``) is listed the same
+way, never run."""
 
 from __future__ import annotations
 
@@ -357,11 +359,12 @@ def smoke_megakernel(tmp: Path, verbose: bool = False) -> bool:
 
 def example_skip(name: str, tc: object, backend: str | None = None) -> str | None:
     """Why the bundled example ``name`` does not run with toolchain ``tc``: ``backend`` is
-    not available, or this GPU is not one of its ``ARCHS`` (:func:`gpu_arch.example_skip`);
-    None: it runs."""
+    not available (with the toolchain's reason: ``cute`` on sm_75), or this GPU is not one of
+    its ``ARCHS`` (:func:`gpu_arch.example_skip`); None: it runs."""
     gpu = getattr(tc, "gpu", None)
     if backend is not None and not (getattr(tc, "backends", {}) or {}).get(backend):
-        return f"the {backend} backend is not available"
+        why = (getattr(tc, "unavailable", {}) or {}).get(backend)
+        return f"the {backend} backend is not available" + (f" ({why})" if why else "")
     cap = tuple(gpu.capability) if gpu is not None else None
     return gpu_arch.example_skip(EXAMPLES_DIR / name, cap)
 
@@ -808,11 +811,17 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
 
     tc = toolchain.setup()
     ok = True
+    skipped: dict[str, str] = {}
+    # the available backends, and those installed but refused on this GPU (listed with why)
+    off = getattr(tc, "unavailable", {}) or {}
     with tempfile.TemporaryDirectory() as tmp:
         capture = make_rmsnorm_capture(Path(tmp) / "rmsnorm.pt")
-        for backend in backends or [b for b, avail in tc.backends.items() if avail]:
+        for backend in backends or [b for b, avail in tc.backends.items() if avail or b in off]:
             example = EXAMPLES_DIR / f"{backend}_rmsnorm.py"
             if not example.exists():
+                continue
+            if (why := example_skip(example.name, tc, backend)) is not None:
+                skipped[example.name] = why
                 continue
             result = run_evaluation(capture, example)
             passed = bool(result.get("correct"))
@@ -836,7 +845,6 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
                     else f"{result.get('status')}: {str(result.get('error', ''))[-300:]}"
                 )
                 print(f"  {'project':9s} {'OK ' if passed else 'FAIL'} {detail}")
-        skipped: dict[str, str] = {}
 
         def runs(names: Iterable[str], backend: str) -> bool:
             """Whether the examples ``names`` run here (``backend`` asked for, every one's

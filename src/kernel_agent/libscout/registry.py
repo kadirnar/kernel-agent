@@ -11,8 +11,10 @@ library's kernels:
   template needs). An adapter whose package is missing, broken or too old is skipped with
   the reason;
 * **architectures and dtypes** it declares (:attr:`Adapter.archs`, ``gpu_arch.supports``
-  syntax: ``sm_80+``, ``sm_90``, ``sm_12x``; :attr:`Adapter.dtypes`), checked against the GPU
-  at hand: FlashAttention 3 needs sm_90, QuACK lists Hopper / Blackwell / RTX 50;
+  syntax: ``sm_80+``, ``sm_90``, ``sm_12x``; :attr:`Adapter.dtypes`; per dtype
+  :attr:`Adapter.dtype_archs`), checked against the GPU at hand: FlashAttention 3 needs
+  sm_90, QuACK lists Hopper / Blackwell / RTX 50, cuBLASLt takes fp16 from sm_75 and bf16
+  from sm_80;
 * **candidate template** (:meth:`Adapter.code`: the op functions and the graph rewrite of a
   scout candidate, rendered by :mod:`kernel_agent.libscout.template`) and the configs the
   scout sweeps (:meth:`Adapter.configs`).
@@ -91,6 +93,9 @@ class Adapter:
     archs: str = ""  # gpu_arch.supports spec; "" = every GPU torch runs on
     archs_why: str = ""
     dtypes: tuple[str, ...] = ("bfloat16", "float16")
+    #: dtypes that need a newer GPU than :attr:`archs` (dtype → (spec, why)): a call site in
+    #: one is not taken below it (cuBLASLt: fp16 tensor cores from sm_75, bf16 from sm_80)
+    dtype_archs: Mapping[str, tuple[str, str]] = field(default_factory=dict)
     #: target precisions it serves: "exact" (the reference's own precision: every target,
     #: whatever its tier) or reduced ones (``fp8_w8a8``: only targets planned at one of them)
     precisions: tuple[str, ...] = ("exact",)
@@ -166,6 +171,21 @@ class Adapter:
         if dtype and dtype != "?" and dtype not in self.dtypes:
             return f"{family} in {dtype} (takes {', '.join(self.dtypes)})"
         return None
+
+    def site_reason(
+        self, family: str, site: Mapping[str, Any], capability: tuple[int, ...] | None
+    ) -> str | None:
+        """Why the template cannot take this call site on a GPU of ``capability``:
+        :meth:`sites_ok`, then :attr:`dtype_archs` (None: it can)."""
+        if (why := self.sites_ok(family, site)) is not None:
+            return why
+        need = self.dtype_archs.get(str(site.get("dtype")))
+        if need is None or capability is None or gpu_arch.supports(need[0], capability):
+            return None
+        return (
+            f"{family} in {site.get('dtype')} needs {need[0]} ({need[1]}); this GPU is "
+            f"{gpu_arch.arch_of(capability)}"
+        )
 
     def configs(self, found: Mapping[str, Site], gpu: Mapping[str, Any]) -> list[dict[str, Any]]:
         """The ``build`` keyword arguments the scout sweeps (``gpu``: ``capability``,
@@ -261,10 +281,18 @@ def applicable(
         if reason is not None:
             decisions.append(Decision(adapter, reason))
             continue
-        taken = sum(1 for s in mine for site in s.sites if adapter.sites_ok(s.family, site) is None)
+        taken = sum(
+            1
+            for s in mine
+            for site in s.sites
+            if adapter.site_reason(s.family, site, capability) is None
+        )
         if not taken:
             first = next(
-                why for s in mine for site in s.sites if (why := adapter.sites_ok(s.family, site))
+                why
+                for s in mine
+                for site in s.sites
+                if (why := adapter.site_reason(s.family, site, capability))
             )
             decisions.append(Decision(adapter, f"no call site it takes: {first}"))
             continue
