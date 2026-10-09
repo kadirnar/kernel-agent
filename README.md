@@ -2902,7 +2902,10 @@ teacher-forced and is rejected with a clear reason. Errors as small as one
 bf16 rounding step per layer cannot be told apart from correct rounding
 changes: an attention softmax scale off by 5 % reaches mean cosine 0.994 and
 passes; the module-level check has to catch errors of that size. The model
-runs in its checkpoint dtype (bf16), and `--dtype` is ignored.
+runs in the run's dtype: the checkpoint's bf16 by default (`--dtype auto`),
+float16 or float32 on a GPU without bf16 tensor cores (see "Dtype and memory by
+GPU"); `VoxCPMWorkload.set_dtype` hands it to VoxCPM's config, which is where
+`from_local` reads it. A run from before #255 keeps the checkpoint's dtype.
 
 Stop condition: the natural-length run (`natural_text`, seed 0) stops after
 31 patches on VoxCPM2 (stop at step 30 with a stop-minus-continue logit
@@ -4430,6 +4433,67 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   above for sm_90a / sm_100a; on other GPUs nothing has run yet: `kernel-agent doctor
   --smoke` is the first check there.
 
+### Dtype and memory by GPU
+
+The dtype a run's model runs in follows the GPU (#255, `workloads/dtypes.py`):
+
+* **`--dtype auto`** (the default of new runs) starts from the checkpoint's dtype
+  (`config.json` `torch_dtype` / `dtype`). A float16 checkpoint runs in float16
+  everywhere; a bfloat16 one in bfloat16 where the GPU has bf16 tensor cores (sm_80+:
+  Ampere incl. the A10, Ada, Hopper, Blackwell). A float32 checkpoint, or one that does
+  not state its dtype, runs in half precision as kernel-agent always ran it
+  (`--dtype float32` keeps float32).
+* **Turing (sm_75) has no bf16 tensor cores**: Triton's bf16 `tl.dot` compiles to FMA,
+  SDPA's flash and mem-efficient backends refuse bf16 there and attention runs the math
+  backend (T4 datasheet: 65 TFLOP/s fp16 tensor cores, 8.1 fp32), so every speedup would
+  be measured against a crippled baseline. The run's candidate is float16, which
+  overflows where bfloat16 does not, so `analyze` checks it first (`worker dtype_check`):
+  the workload runs once in float32 (bfloat16 when float32 does not fit) and once in
+  float16 on its inputs. float16 is kept when its outputs are finite where float32's are
+  and within the workload's relaxed bounds of them: its own comparison, teacher forcing
+  for chaotic workloads (VoxCPM) and, in near-lossless / relaxed runs, the perceptual
+  gate. Otherwise the run takes float32 when it fits, else the checkpoint's bfloat16. A
+  check that cannot run (no built-in workload) leaves the checkpoint's dtype and runs
+  again once the harness exists.
+* **Measured** (the check a T4 runs, run on the RTX 5070 Ti): Qwen3-0.6B (512-token
+  prompt, 64 new tokens) in float16 against float32 generates the same 64 tokens,
+  first-step logits cosine 0.999995, perceptual gate on its 14 prompts mean KL 9e-6, top-1
+  0.9989 (62 s with the gate). VoxCPM2 (60 patches) teacher forced: mean step cosine
+  0.99991, worst step 0.9965 (its exact thresholds, 0.99 / 0.7, pass too; the free run
+  diverges, as every rounding change does there), 81 s without the gate; float32 holds
+  9.5 GB of weights, float16 5.0 GB.
+* **An explicit `--dtype`** is kept as given; bfloat16 on a GPU without bf16 tensor cores
+  is logged and recorded with a warning.
+* **Recorded**: `run.json` → `dtype` (`requested`, `checkpoint`, `runtime`, `why`, the
+  check's verdict and metrics), and `workload.dtype` is what every worker loads
+  (`Workload.set_dtype`; VoxCPM passes it to its config). `report.md` names the dtype and
+  why; a dtype other than the checkpoint's gets a "Run dtype" section in
+  `profile/summary.md`, which the planner, systems and native prompts include. A run from
+  before #255 has no `dtype` and keeps the dtype it recorded.
+* **Memory preflight** (`memfit.py`), before analyze loads anything: the checkpoint's
+  size scaled to the run's dtype times a footprint factor learnt from the runs recorded
+  in `--runs-dir` (`baseline.json` `peak_mem_gb` over the weights, same model, metric and
+  batch size; VoxCPM2: 1.29 latency, 2.46 throughput at batch 16; without one those
+  defaults), against the GPU's memory minus 0.5 GB (`KERNEL_AGENT_EMULATE_MEM_GB` when
+  smaller). A model that does not fit is refused with the options (8-bit weight storage,
+  a smaller batch, half precision instead of float32, `--no-memory-check` to try
+  anyway). When two states of the model (one more weight-sized copy) do not fit, every
+  A/B of the integration starts in two processes. `run.json` → `memory_fit` records the
+  estimate, whether float32 fits and whether the in-process A/B does. Measured on the RTX
+  5070 Ti: VoxCPM2 latency in float16 estimated 5.48 GB (factor from its bf16 run),
+  peak 5.48 GB; Qwen3-0.6B estimated 1.28 GB from its recorded runs (factor 0.92), peak
+  1.28 GB, and 1.81 GB with the default factor. With `KERNEL_AGENT_EMULATE_MEM_GB=8`,
+  `analyze openbmb/VoxCPM2 -o metric=throughput -o batch_size=16` is refused before
+  loading (10.51 GB of 7.5 GB usable) and the latency run fits with its A/B in two
+  processes (9.7 GB).
+
+| GPU (memory) | VoxCPM2 latency (5.5 GB) | VoxCPM2 throughput, batch 16 (10.5 GB) | float32 (weights 8.5 GB) |
+|---|---|---|---|
+| A10, L4 (24 GB) | fits, A/B in one process | fits, A/B in one process | fits |
+| RTX 5070 Ti (16 GB) | fits, one process | fits, one process (14.8 of 15.0 GB) | latency only |
+| T4 (16 GB) | fits, one process | fits, A/B in two processes | latency only |
+| RTX 3070 (8 GB) | fits, A/B in two processes | refused | refused |
+
 ### GPUs and the GPU lock
 
 Every evaluation, worker command (`analyze`, `capture`, `e2e`) and peak
@@ -4834,7 +4898,12 @@ through `NVCC_APPEND_FLAGS` (`kernel_agent/toolchain.py`).
 ```bash
 kernel-agent optimize <hf-url> [options]
   --modality {llm,stt,tts,diffusion}   override auto-detection
-  --dtype bfloat16|float16|float32
+  --dtype auto|bfloat16|float16|float32
+                                       auto (default of new runs): the checkpoint's dtype; on a
+                                       GPU without bf16 tensor cores (Turing) float16, checked
+                                       against float32 by analyze (see "Dtype and memory by GPU")
+  --no-memory-check                    analyze: try a model whose estimated footprint does not
+                                       fit the GPU anyway
   -o KEY=VALUE                         workload options, e.g.
                                        LLM: prompt_len, new_tokens, batch_size, min_prefix
                                        STT: audio=/path.wav, audio_seconds, new_tokens
@@ -4986,7 +5055,9 @@ print(run.report.read_text())
 
 ```
 runs/<org>--<name>/<timestamp>/
-  run.json  toolchain.json
+  run.json  toolchain.json    run.json: card, workload, config, phases, ...; dtype (the run's
+                              dtype and why) and memory_fit (the memory preflight), see
+                              "Dtype and memory by GPU"
   baseline.json               eager baseline (+ compiled_ms / compiled_detail, see "Strong baseline")
   program.md                  agent instructions; edit it mid-run to steer the agents
   profile/summary.md          profile handed to the planner
@@ -5568,7 +5639,10 @@ compiled baseline), register its launcher as a custom op
 ## Harness contract (custom models)
 
 `harness.py` defines `create(spec) -> Workload`. Implement `load`, `roots`,
-`make_inputs`, `run` and `compare` (`kernel_agent/workloads/base.py`). If the
+`make_inputs`, `run` and `compare` (`kernel_agent/workloads/base.py`). `load` loads the
+model in `self.dtype` (`spec.torch_dtype`): the run's dtype for its GPU, which
+`Workload.set_dtype` sets before every load (override it when the model's library picks
+its own dtype, as `workloads/voxcpm.py` does; see "Dtype and memory by GPU"). If the
 inference loop calls module methods whose names the entrypoint pattern misses,
 list them in the class attribute `entrypoints = {"ClassName": ["method"]}`.
 

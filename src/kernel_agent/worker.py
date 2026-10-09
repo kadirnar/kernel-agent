@@ -2,6 +2,7 @@
 orchestrator never holds GPU memory and a crashing kernel cannot kill a run.
 
     python -m kernel_agent.worker analyze --run-dir R [--out-dir D --kernel ID=PATH ...]
+    python -m kernel_agent.worker dtype_check --run-dir R
     python -m kernel_agent.worker capture --run-dir R --target ID [--parent]
     python -m kernel_agent.worker e2e     --run-dir R [--kernel ID=PATH ...] [--transform PATH ...]
                                           [--baseline-ms MS] [--verify REL=SHA256 ...]
@@ -40,7 +41,9 @@ from kernel_agent.workspace import RunDir, read_json, write_json
 MARKER = "@@KA_WORKER@@"
 
 
-def _workload(run: RunDir) -> Any:
+def _workload(run: RunDir, dtype: str | None = None) -> Any:
+    """The run's workload, loaded in ``dtype`` (default: the dtype the run chose for its GPU,
+    ``run.json`` → ``dtype``, #255; a run from before has none and loads as it did)."""
     from kernel_agent import toolchain
     from kernel_agent.workloads import WorkloadSpec, create_workload
 
@@ -50,6 +53,8 @@ def _workload(run: RunDir) -> Any:
     if spec.harness is None and run.harness.exists():
         spec.harness = str(run.harness)
     workload = create_workload(spec)
+    if dtype := dtype or (cfg.get("dtype") or {}).get("runtime"):
+        workload.set_dtype(dtype)
     workload.load()
     return workload
 
@@ -75,7 +80,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     from kernel_agent.kernels.roofline import current_peaks
     from kernel_agent.profiling import ceilings
     from kernel_agent.profiling.profiler import profile_workload, summarize
-    from kernel_agent.workloads import diverse, holdout, perceptual, quality, stopping
+    from kernel_agent.workloads import diverse, dtypes, holdout, perceptual, quality, stopping
     from kernel_agent.workloads.base import measure
 
     if (ns.kernel or ns.transform) and not ns.out_dir:
@@ -162,6 +167,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             + _fusion_section(run, out, profile, window_ms, per)
             + objective.summary_section(baseline)
             + quality.summary_section(baseline)
+            + dtypes.summary_section(run.load().get("dtype"))  # not the checkpoint's (#255)
         )
         (out.profile_dir / "summary.md").write_text(
             summary + strong_baseline.summary_section(baseline)
@@ -181,6 +187,24 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             )
         baseline["profile"] = str(out.profile_dir / "summary.md")
     return baseline
+
+
+def cmd_dtype_check(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    """``analyze``'s check of a float16 candidate on a GPU without bf16 tensor cores (#255,
+    ``workloads/dtypes.py``): the workload in ``run.json`` → ``dtype.reference`` (float32
+    where it fits) and in its ``dtype.candidate`` on its inputs, judged within its
+    relaxed bounds (and by the perceptual gate in a near-lossless or relaxed run)."""
+    from kernel_agent.workloads import dtypes, perceptual
+
+    choice = run.load().get("dtype") or {}
+    if "reference" not in choice:
+        raise ValueError("run.json has no dtype.reference: no float16 candidate to check")
+    candidate = choice.get("candidate") or choice["runtime"]
+    gate = perceptual.gated(_quality(ns, run))
+    result = dtypes.check(
+        lambda dtype: _workload(run, dtype), candidate, choice["reference"], gate=gate
+    )
+    return {"status": "ok", **result}
 
 
 def _fusion_section(
@@ -992,6 +1016,7 @@ def _truth_bytes(
 
 COMMANDS = {
     "analyze": cmd_analyze,
+    "dtype_check": cmd_dtype_check,
     "capture": cmd_capture,
     "e2e": cmd_e2e,
     "e2e_ab": cmd_e2e_ab,

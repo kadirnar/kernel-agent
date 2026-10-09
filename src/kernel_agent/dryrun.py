@@ -762,7 +762,12 @@ def create_run(cfg: OptimizeConfig, seed: int = 0) -> RunDir:
                 "params": 596_049_920,
                 "size_gb": 1.4,
             },
-            "workload": {"repo_id": repo, "modality": "llm", "dtype": cfg.dtype, "options": {}},
+            "workload": {  # the simulated GPU (sm_120) runs the checkpoint's bf16 (#255)
+                "repo_id": repo,
+                "modality": "llm",
+                "dtype": "bfloat16" if cfg.dtype == "auto" else cfg.dtype,
+                "options": {},
+            },
             "config": cfg.to_dict(),
             "phases": {p: {"done": True} for p in ("analyze", "plan", "capture")},
             "created": ledger.stamp(t0),

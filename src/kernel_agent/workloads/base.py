@@ -46,6 +46,8 @@ from torch import nn
 
 from kernel_agent import objective
 from kernel_agent.hub import Modality
+from kernel_agent.workloads.dtypes import canonical as canonical_dtype
+from kernel_agent.workloads.dtypes import runtime_dtype as runtime_dtype
 
 if TYPE_CHECKING:
     from kernel_agent.workloads.serving import AsyncFlags, ServingOptions
@@ -164,6 +166,17 @@ class Workload(ABC):
     @property
     def dtype(self) -> torch.dtype:
         return self.spec.torch_dtype
+
+    def set_dtype(self, dtype: str) -> None:
+        """Load the model in ``dtype`` (``float16`` / ``bfloat16`` / ``float32``) from the
+        next :meth:`load` on: the dtype the run chose for its GPU (``run.json`` → ``dtype``,
+        :func:`~kernel_agent.workloads.dtypes.runtime_dtype`, #255). The default sets
+        ``spec.dtype``, which :attr:`dtype` returns; a workload whose model library picks
+        its own dtype passes it to that library as well."""
+        name = canonical_dtype(dtype)
+        if name is None:
+            raise ValueError(f"unknown dtype {dtype!r} (one of {', '.join(DTYPES)})")
+        self.spec.dtype = name
 
     @abstractmethod
     def load(self) -> None:
