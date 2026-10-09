@@ -45,10 +45,15 @@ statistics", "Host synchronisation in the profile"). What to do about each regim
   memory-bound ops (element-wise, norms, reductions, casts) found from the tensor storages
   of every op of one run, with the GEMM / convolution / attention that could take them as
   an epilogue or prologue (*fuse*), across module boundaries (*crosses*), never across a
-  host sync; layers deduplicated (*calls*). *saves* = intermediates written and read back
-  that exceed the L2 / DRAM bandwidth (an L2-resident one saves 0 bytes) + launches saved
-  × the launch floor (eager) or ~0.9 us per CUDA-graph boundary. A row is a region target:
-  `parent_class` = its parent class, `region` = its ops, `fusion` = its id.
+  host sync; layers deduplicated (*calls*). *saves* = the DRAM part of the intermediates'
+  round trips / DRAM bandwidth + launches saved × the launch floor (eager) or ~0.9 us per
+  CUDA-graph boundary. LRU-ish L2: of an intermediate, what exceeds L2 − the bytes other
+  ops touch between its write and its last read counts (0 when it fits with that traffic;
+  `fusions.md` says per intermediate: in L2, evicted by N MB of traffic, larger than the
+  L2). The counted rows share no op and add up; a row marked ↳ is an alternative that
+  shares a GEMM with the row above it (a prologue and an epilogue of one projection):
+  plan one or the other. A row is a region target: `parent_class` = its parent class,
+  `region` = its ops, `fusion` = its id.
 * **Workload profile** of a target (`workload_profile.md`): every call of the target's
   instances during the capture run (signatures and shares, masks, strides, flags, integer
   ranges, KV-cache valid lengths): what may be specialised behind a run-time check.

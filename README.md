@@ -2482,25 +2482,78 @@ intermediates written and read back, the module boundaries crossed and the
 lowest common ancestor call (its class is a region's `parent_class`, the ops its
 `region`). The same chain in every layer is one row (`calls`, `instances`).
 
-The estimate per run is `Σ round trips of intermediates larger than L2 / DRAM
-bandwidth + calls × launches saved × per-launch cost`: an intermediate no larger
-than the GPU's L2 stays there between its write and its read and saves no bytes
-(what made `fused_gate_up_silu` buy nothing on the 48 MB L2 of the RTX 5070 Ti);
-the per-launch cost is the measured launch floor of an eager run, at most the
-run's own time per recorded op, or ~0.9 µs per kernel boundary when the kernel
-view shows the run mostly CUDA-graph launched (docs/PARALLEL.md §4.6). The
-candidates go to `profile/fusions.md` + `fusions.json`, the top 10 to
-`summary.md` (*Fusion candidates (measured)*); a re-profile of an optimised model
-shows the run's own table. The planner takes a region from a row (`parent_class`,
-`region`, and `fusion` = its id); the improve scheduler expects that row's saving
-for the region arm (see "Scheduler"), and the native stage graph takes chains
-that span stages as evidence for a group. `python -m kernel_agent.profiling.fusion
-profile.json --window-ms <ms>` ranks a profile's chains again.
+The estimate per run is `Σ DRAM bytes of the intermediates' round trips / DRAM
+bandwidth + calls × launches saved × per-launch cost`. Which bytes go through DRAM
+follows an LRU-ish L2 rule: the GPU's L2 is taken to hold the newest bytes
+touched, and the ops between an intermediate's write and its last read inside the
+placement touch some distinct bytes, the *traffic* (what they read, weights
+included, and write, outside the intermediate's storage; per storage the most
+bytes one op touches in it). `min(its bytes, L2 − traffic)` of it is still in the
+L2 at that read; the rest counts, as that share of its round trip. So an
+intermediate that fits with its traffic saves no bytes (what made
+`fused_gate_up_silu` buy nothing on the 48 MB L2 of the RTX 5070 Ti); a small one
+that the traffic evicts counts (a norm's output that `up_proj` reads after
+`gate_proj` streamed its 6.3 MB weight, on a 6 MB L2); a large one read at once
+counts only the part beyond the L2; with the L2 unknown every one counts (an upper
+bound). Each intermediate records its bytes, traffic, DRAM bytes and why (`in` L2,
+evicted by `traffic`, larger than the L2: `size`, `unknown`), and `fusions.md`
+says it per row (*Intermediates and the L2*). An approximation from bytes, not the
+hardware's replacement policy: the reads in between are not taken to refresh it,
+and work the recorder does not see (another process, a graph replay) is not
+traffic. The per-launch cost is the measured launch floor of an eager run, at
+most the run's own time per recorded op, or ~0.9 µs per kernel boundary when the
+kernel view shows the run mostly CUDA-graph launched (docs/PARALLEL.md §4.6).
 
-Measured on the RTX 5070 Ti (eager, bf16; a loaded host, so the windows are long and
-a launch is priced at the run's time per op). Every intermediate was at most 4 MB, in
-the 48 MB L2: the savings are launches, the byte column is 0. Overlapping rows (they
-share a projection) do not add up.
+Rows can share an op: q / k / v take the input norm as a prologue while `q_proj`
+takes `q_norm` + RoPE as its epilogue; `gate_proj` / `up_proj` take the
+post-attention norm as a prologue while SiLU · mul is their epilogue. One GEMM
+cannot take in both, so such savings do not add up. The miner records per
+placement the rows whose placements take in the same op in some occurrence
+(`overlaps`), and the ranking is overlap-aware: the placements of every row are
+taken greedily by saving, each when its row has none yet and it shares no op with
+one taken. A row whose best placement is taken in elsewhere takes its next one
+(*fuse* says what it gave up, `blocked` in the json); a row with no placement
+left that saves something (a lone SiLU whose only saving is the epilogue of a
+GEMM another row takes in) is an alternative, listed under the row it overlaps
+(↳) and never added. The counted rows (`counted`) share no op: their savings add
+up, and the table states their total. Greedy and deterministic (ties: the
+innermost parent, the placement, the id), not the best combination in general.
+
+The candidates go to `profile/fusions.md` + `fusions.json`, the top 10 counted
+rows with their alternatives to `summary.md` (*Fusion candidates (measured)*); a
+re-profile of an optimised model shows the run's own table. The planner takes a
+region from a row (`parent_class`, `region`, and `fusion` = its id); the improve
+scheduler expects that row's saving for the region arm (by parent class: the
+counted rows first; see "Scheduler"), and the native stage graph takes chains that
+span stages as evidence for a group, adding up only those that share no op. A
+`fusions.json` from before (version 1: no traffic, no overlaps) stays readable,
+every row counted. `python -m kernel_agent.profiling.fusion profile.json
+--window-ms <ms>` ranks a profile's chains again.
+
+Measured on an NVIDIA A10 (sm_86, 6 MB L2; eager, bf16): Qwen3-0.6B, a 512-token
+prompt + 64 tokens, 103,822 ops, 70 host syncs, 24 chains, an 8.8 s pass (8.6 s
+with the size-only rule), a 1,398 ms window, a launch priced at 13.5 µs (the
+run's time per op). Both columns are priced at that window and the measured
+peaks (487 GB/s DRAM); *before* is the size-only rule ranked row by row, *after*
+the traffic rule ranked overlap-aware.
+
+| chain (phase) | before: fuse, saves ms | after: fuse, saves ms | L2 (after) |
+|---|---|---|---|
+| `k_proj` → `k_norm` → RoPE → KV `cat` (decode) | epilogue, 320.6 | epilogue, 320.6 | in L2 |
+| `q_proj` → `q_norm` → RoPE (decode) | epilogue, 297.7 | epilogue, 297.7 | in L2 |
+| residual add → `post_attention_layernorm` → gate / up (decode) | prologue, 237.5 | prologue, 237.5 | the norm's output evicted by `gate_proj`'s 6.3 MB weight before `up_proj` reads it: 10.8 MB DRAM, 0.02 ms |
+| residual add → `input_layernorm` (decode) | prologue into q / k / v, 251.9 | epilogue of `down_proj`, 206.1 (the q / k / v prologue shares `q_proj` / `k_proj` with the rows above) | in L2 |
+| gate, up → SiLU · mul (decode) | epilogue, 71.2 | chain, 23.8 (its epilogue shares gate / up with the prologue above, its prologue `down_proj` with the epilogue above) | SiLU's output evicted by `up_proj`: 21.7 MB DRAM |
+| `q_norm` + RoPE (prefill) | epilogue of `q_proj`, 4.7 (0 bytes) | prologue of SDPA, 5.9 (1.18 ms of bytes) | 4 intermediates evicted by ≤ 13.8 MB of traffic: 574 MB DRAM |
+| all 24 rows | Σ 1,298.5 ms, 77.8 MB DRAM (shared GEMMs counted twice) | Σ 1,203.3 ms counted (each row's best: 1,300.9), 1,100.6 MB DRAM | of the rows' intermediates: 19 evicted by traffic, 1 larger than the L2, 212 in L2 |
+
+On this eager, launch-bound run the bytes stay small next to the launches
+(2.26 ms of 1,203 ms); the traffic rule matters most where intermediates are large
+(prefill, batched runs) on a small L2. Measured earlier on the RTX 5070 Ti (eager,
+bf16; a loaded host, so the windows are long and a launch is priced at the run's
+time per op), ranked row by row with the size-only rule: every intermediate was at
+most 4 MB, in the 48 MB L2, so the savings are launches and the byte column is 0;
+the rows that share a projection (as on the A10 above) do not add up.
 
 | model, run | chain (phase) | calls | fuse | parent class | launches | saves ms |
 |---|---|---|---|---|---|---|
@@ -3413,7 +3466,8 @@ model and starts a new round (`kernel_agent/improve.py`,
 
   A region target takes its expected gain from the fusion table instead (see
   "Fusion candidates (measured)"): the row of its `fusion` id, else the largest
-  region row of its `parent_class`, converted to the metric's ms; `expected` is
+  region row of its `parent_class` (a counted row before an alternative that
+  shares a GEMM with one), converted to the metric's ms; `expected` is
   that predicted saving minus what its best kernel saved so far, and never less
   than 1 − 1/1.1 (≈ 9 %) of the prediction (`remaining_ms` as below).
 

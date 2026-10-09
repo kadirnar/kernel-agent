@@ -788,7 +788,9 @@ model. Specialist agents will then write custom kernels for each target you pick
    candidates (measured)* table lists such chains from the run's own ops, with
    the bytes and launches each would save (0 bytes where the intermediates stay
    in L2): take `parent_class` and `region` from its row and set `fusion` to
-   its id, so the scheduler expects that saving.
+   its id, so the scheduler expects that saving. A row marked ↳ shares a GEMM
+   with the row above it (one's prologue, the other's epilogue): their savings
+   do not add up, plan one of them.
    **Ceilings.** When the profile has a *Ceilings* table, rank targets by
    ceiling × share (its *saves ms*, and the floors of the precisions this run
    allows where precision may change), not by share alone, and name each
