@@ -766,13 +766,19 @@ class WorkReference:
         }
 
 
-def work_reference(workload: Workload, inputs: Any) -> WorkReference:
+def work_reference(workload: Workload, inputs: Any, *, miner: Any = None) -> WorkReference:
     """The work of every module call of ``workload`` as loaded (the unmodified model,
-    before an improve round's items are applied): one hooked run, untimed (#106)."""
+    before an improve round's items are applied): one hooked run, untimed (#106).
+    ``miner``: a :class:`~kernel_agent.profiling.fusion.Miner` that records every op of the
+    run with its module call (the fusion candidates, #231)."""
     start = time.perf_counter()
     roots = workload.roots()
     methods = discover_entrypoints(roots, workload_entrypoints(workload))
-    with torch.inference_mode(), ModuleTimer(roots, methods, cuda=False) as timer:
+    with (
+        torch.inference_mode(),
+        ModuleTimer(roots, methods, cuda=False) as timer,
+        miner.recording(timer) if miner is not None else contextlib.nullcontext(),
+    ):
         workload.run(inputs)
         synchronize()
     reference = timer.work_reference()
@@ -1110,11 +1116,14 @@ def profile_workload(
     reference_ms: float | None = None,
     *,
     work: WorkReference | None = None,
+    fusions: bool = False,
 ) -> dict[str, Any]:
     """Module view + kernel view (:func:`guarded_kernel_profile`; ``reference_ms``: the
     end-to-end time of the profiled window, measured without the profiler). Assumes the
     workload is warmed up. ``work``: the unmodified model's (:func:`work_reference`), for
-    the calls of an optimised model whose insides the hooks do not see."""
+    the calls of an optimised model whose insides the hooks do not see. ``fusions``: the
+    model is the unmodified one; one more hooked run records its fusion chains
+    (:func:`.fusion.scan`, ``fusions``)."""
     roots = workload.roots()
     methods = discover_entrypoints(roots, workload_entrypoints(workload))
     synchronize()
@@ -1126,6 +1135,11 @@ def profile_workload(
     classes = timer.class_stats()
     syncs = host_sync.scan(workload, inputs)  # one more run: host syncs by call site
     kernel_view = guarded_kernel_profile(workload, inputs, reference_ms)
+    mined: dict[str, Any] = {}
+    if fusions:  # after the kernel view: a run that fails under the miner cannot spoil it
+        from kernel_agent.profiling import fusion
+
+        mined["fusions"] = fusion.scan(workload, inputs)
     return {
         "hooked_wall_ms": round(hooked_ms, 2),
         "module_calls": len(timer.calls),
@@ -1135,6 +1149,7 @@ def profile_workload(
         "classes": [asdict(c) for c in classes],
         "kernel_view": kernel_view,
         "host_syncs": syncs,
+        **mined,
     }
 
 

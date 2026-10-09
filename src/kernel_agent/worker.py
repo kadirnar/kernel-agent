@@ -145,8 +145,11 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     if not ns.no_profile:
         window_ms, what, per = objective.profile_window(baseline)  # metric=throughput: a run
+        unmodified = not (ns.kernel or ns.transform)  # fusion chains: of the model as loaded
         with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
-            profile = profile_workload(workload, inputs, reference_ms=window_ms, work=work)
+            profile = profile_workload(
+                workload, inputs, reference_ms=window_ms, work=work, fusions=unmodified
+            )
         write_json(out.profile_dir / "profile.json", profile)
         # Floors per class at bf16 / FP8 / FP4 (profile/ceilings.json + .md; issue #90); the
         # markdown shows the precisions the run allows (precisions.py, issue #131).
@@ -156,6 +159,7 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         summary = (
             summarize(profile, window_ms, metric=what, per=per)
             + ceilings.markdown(table)
+            + _fusion_section(run, out, profile, window_ms, per)
             + objective.summary_section(baseline)
             + quality.summary_section(baseline)
         )
@@ -177,6 +181,27 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
             )
         baseline["profile"] = str(out.profile_dir / "summary.md")
     return baseline
+
+
+def _fusion_section(
+    run: RunDir, out: RunDir, profile: dict[str, Any], window_ms: float, per: str
+) -> str:
+    """``profile/fusions.json`` + ``.md`` of a profile that mined its chains (issue #231) and
+    their ``summary.md`` section; a re-profile of an optimised model (its kernels and
+    graphs hide the ops) shows the run's own table, from the unmodified model."""
+    from kernel_agent.kernels.roofline import current_peaks
+    from kernel_agent.profiling import fusion
+
+    if "fusions" in profile:
+        return fusion.markdown(
+            fusion.write(out.profile_dir, profile, current_peaks(), window_ms, per=per)
+        )
+    table = read_json(run.profile_dir / "fusions.json", None)
+    if out.root == run.root or not isinstance(table, dict):
+        return ""
+    text = fusion.markdown(table)
+    note = "\nFrom the analyze profile of the unmodified model (`profile/fusions.md` of the run).\n"
+    return text + note if text else ""
 
 
 def _work_reference(workload: Any) -> Any:

@@ -329,7 +329,9 @@ def kernel_digest(
         # the scheduler's ms are the metric's (#114): per second of audio for throughput
         f"* It costs about {arm.remaining_ms:.1f} ms {_per(run)} now; the scheduler expects "
         f"{arm.headroom:.0%} of that can still go"
-        + (f" ({arm.ceiling.describe()})." if arm.ceiling else "."),
+        + (f" ({arm.ceiling.describe()})." if arm.ceiling else "")
+        + (f" ({arm.fusion.describe()}, `profile/fusions.md`)." if arm.fusion else "")
+        + ("" if arm.ceiling or arm.fusion else "."),
         f"* {arm.streak} evaluations in a row without a new best; after {policy.patience} the "
         "target's time goes to the other arms for this round, so prefer a fundamentally "
         "different idea over small variations.",
