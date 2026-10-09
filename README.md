@@ -2003,7 +2003,13 @@ sanitizer's first report goes to `integration.json` → `recheck` → `memcheck`
 per run, and the target's next engineer prompt (`## Refused by the
 integration`). A missing or failing sanitizer is recorded with its reason
 (`skipped`, `error`, `timeout`) and the kernel kept; a re-integration runs such a
-memcheck again, and reuses a decided one.
+memcheck again, and reuses a decided one. A checked process that made no CUDA call the
+sanitizer saw (a CPU-only run; CUDA work in a child process, which `--target-processes
+application-only` does not track) passes with `unchecked` saying nothing was checked:
+compute-sanitizer 2025.2 ends such a log with "Tracking kernels launched by child
+processes requires the --target-processes all option.", a notice, not a memory error
+(measured on an NVIDIA A10 with 2025.2.1: with CUDA in the process itself the log is a
+plain `ERROR SUMMARY`).
 
 A kernel that synchronises inside (every native project; a single file whose source has
 shared memory, `cp.async` / mbarrier pipelines, acquire / release counters or atomics:

@@ -20,6 +20,10 @@ issue #115 overruns only on a partial tile, which the captured shapes never have
 the sanitizer's first report in ``report``), ``skipped`` (no usable ``compute-sanitizer``:
 :func:`kernel_agent.toolchain.find_sanitizer`; no CUDA device), ``error`` (the sanitizer or
 the process failed without a memory error) or ``timeout``; ``seconds`` is its wall time.
+``unchecked`` (:data:`UNCHECKED`, with ``ok``): the checked process made no CUDA call the
+sanitizer saw (a CPU-only run; CUDA work in a child process, which ``--target-processes
+application-only`` does not track), so nothing was checked: the log's notice about child
+processes is no error (:func:`unchecked`).
 
 **racecheck and synccheck** (issue #225). A candidate that synchronises inside a kernel
 (:func:`extra_tools`: every native project; a source with shared memory, ``cp.async`` or
@@ -117,6 +121,21 @@ _META = (
     "Target application returned an error",
     "Error: couldn't find exit code",
     "Error: Target application terminated before first instrumented API call",
+    # compute-sanitizer 2025.2 adds this notice after the line above: a hint, no error
+    "Tracking kernels launched by child processes requires",
+)
+#: What the log of a process that made no CUDA call under the sanitizer says (measured with
+#: compute-sanitizer 2025.2.1 on an NVIDIA A10: a CPU-only run, or CUDA work in a child
+#: process only; with CUDA in the process itself the log is a plain ERROR SUMMARY).
+_NO_CUDA_CALL = (
+    "terminated before first instrumented API call",
+    "Tracking kernels launched by child processes",
+)
+#: ``unchecked`` of such a run: it passes, and says so instead of claiming a clean kernel.
+UNCHECKED = (
+    "the checked process made no CUDA call the sanitizer saw, so nothing was checked: "
+    "kernels launched from a child process are not tracked (--target-processes "
+    "application-only), and a CPU-only run launches none"
 )
 REPORT_LINES = 25
 _dumps = json.dumps  # bound before any candidate is imported
@@ -277,6 +296,12 @@ def parse_log(text: str) -> tuple[int, str]:
     return errors, "\n".join(lines)
 
 
+def unchecked(text: str) -> bool:
+    """Whether a sanitizer log says its process made no CUDA call it saw (:data:`UNCHECKED`):
+    no error, and nothing checked either."""
+    return any(sign in text for sign in _NO_CUDA_CALL)
+
+
 def parse_race_log(text: str) -> tuple[int, int, str]:
     """``(errors, warnings, the first hazard report)`` of a racecheck log: its ``RACECHECK
     SUMMARY: N hazards displayed (E errors, W warnings)``, else one error per report."""
@@ -403,6 +428,8 @@ def run_memcheck(
             result["reason"] = child["reason"]
     else:
         result["reason"] = f"{child.get('status')}: {str(child.get('error') or '')[-1500:]}"
+    if not errors and unchecked(log):
+        result["unchecked"] = UNCHECKED
     tools, why = extra_tools(Path(candidate))
     if tools:
         result["tools"] = {"memcheck": _tool_record(result)}
@@ -422,9 +449,8 @@ def run_memcheck(
 
 
 def _tool_record(result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        k: result[k] for k in ("status", "errors", "report", "reason", "seconds") if k in result
-    }
+    keys = ("status", "errors", "report", "reason", "unchecked", "seconds")
+    return {k: result[k] for k in keys if k in result}
 
 
 def _run_tool(name: str, cmd: list[str], timeout: float, tool: Any) -> dict[str, Any]:
@@ -458,6 +484,8 @@ def _run_tool(name: str, cmd: list[str], timeout: float, tool: Any) -> dict[str,
     else:
         why = (log.strip().splitlines() or [""])[-1] if child is None else child.get("error")
         out["reason"] = f"the checked process gave no result: {str(why or tail)[-1500:]}"
+    if not errors and unchecked(log):
+        out["unchecked"] = UNCHECKED
     return out
 
 
@@ -465,8 +493,14 @@ def describe(result: dict[str, Any]) -> str:
     """One line on a memcheck result (and its racecheck and synccheck, when they ran)."""
     status, seconds = result.get("status"), result.get("seconds")
     took = f" ({seconds} s)" if seconds else ""
+
+    def verdict(rec: dict[str, Any]) -> str:
+        if rec.get("status") != "ok":
+            return str(rec.get("status"))
+        return "checked nothing" if rec.get("unchecked") else "clean"
+
     others = [
-        f"{name} {'clean' if rec.get('status') == 'ok' else rec.get('status')}"
+        f"{name} {verdict(rec)}"
         for name, rec in (result.get("tools") or {}).items()
         if name != "memcheck"
     ]
@@ -474,6 +508,8 @@ def describe(result: dict[str, Any]) -> str:
     if status == "ok":
         n = len(result.get("variants") or [])
         on = f"{result.get('cases')} case(s)" + (f" + {n} odd-size variant(s)" if n else "")
+        if result.get("unchecked"):
+            return f"memcheck checked nothing on {on}{also}{took}: {result['unchecked']}"
         return f"memcheck clean on {on}{also}{took}"
     if status in FAILED:
         return f"{status} FAILED{took}: {result.get('reason')}"
