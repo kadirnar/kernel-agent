@@ -4417,7 +4417,10 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   GEMM, short-attention, decoder-layer and bf16-GEMM rows (fp16 `mma.sync` m16n8k8, WMMA,
   cuBLAS fp16; Triton's int8 `tl.dot` does not compile below sm_80), and no row or rule
   names a bundled example whose `ARCHS` excludes the GPU: such a mention is dropped
-  (`backends.runnable_text`, #254). The ceilings table's *FP8
+  (`backends.runnable_text`, #254). The low-precision examples take the model's dtype
+  (bf16 or fp16, `DTYPES`); the CUDA weight-only GEMVs and skinny GEMMs declare sm_75+
+  (Turing's fp16 `m16n8k8` and s8 `m8n8k16` forms, verified through compute_75 PTX, #258).
+  The ceilings table's *FP8
   MMA* column appears only where two FP8 `mma.sync` forms exist (sm_12x); the
   `mma.sync` e4m3 rates are not measured on sm_90 / sm_100, where they are emulated.
 * **Knowledge per GPU.** The `gpu-architectures` skill's `gpus.md` has one section per
