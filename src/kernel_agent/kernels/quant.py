@@ -80,6 +80,10 @@ which ``nn.Linear`` to keep in FP8). :func:`fp4_scale_check`, :func:`fp4_scale_p
 quantiser's activation scales against the block maxima (the evaluator's scale-rule guard,
 :mod:`kernel_agent.kernels.scale_guard`); :func:`fp4_stress_input`: blocks whose maxima sit
 where a scale rounded down, flushed to zero or (MXFP4) the OCP floor rule saturates.
+:func:`fp4_bias_correction` (opt-in ``unbiased=True`` of :func:`quantize_fp4`,
+:func:`fp4_w4a4_linear`, :func:`fp4_w4a4_error`): per-token and per-output-channel factors of
+the epilogue that remove e2m1's in-phase shrink of a GEMM's output; codes and block scales are
+unchanged.
 """
 
 from __future__ import annotations
@@ -211,7 +215,7 @@ def _round_e2m1(v: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_fp4(
-    weight: torch.Tensor, fmt: str = "nvfp4"
+    weight: torch.Tensor, fmt: str = "nvfp4", unbiased: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(codes, scales, tensor_scale)`` of a 2-D weight ``[out, in]`` in block-scaled FP4
     (:data:`FP4_FORMATS`): ``codes`` uint8 ``[out, in / 2]`` (two e2m1 codes per byte, the
@@ -227,7 +231,11 @@ def quantize_fp4(
     ``2^(floor(log2 amax) - 2)``, saturates the largest elements of most blocks: on VoxCPM2
     that shrinks outputs by up to 13 %, where real activations meet the largest weights).
     Codes round to nearest even, saturated to ±6, computed in fp32. ``in`` must be a
-    multiple of the block size. Non-finite weights are refused."""
+    multiple of the block size. Non-finite weights are refused.
+
+    ``unbiased`` (opt-in, W4A4): ``tensor_scale`` becomes fp32 ``[out]``, the tensor scale
+    times each output channel's :func:`fp4_bias_correction` (``sum w^2 / sum w w^``): a
+    per-channel factor of the GEMM's epilogue; codes and block scales are the same."""
     if weight.dim() != 2:
         raise ValueError(f"expected a 2-D weight [out, in], got shape {tuple(weight.shape)}")
     if fmt not in FP4_FORMATS:
@@ -249,16 +257,19 @@ def quantize_fp4(
     else:
         mantissa, exponent = torch.frexp(bmax / FP4_MAX)  # m * 2^e, m in [0.5, 1)
         ceil_log2 = exponent - (mantissa == 0.5).to(exponent.dtype)
-        unbiased = torch.where(bmax > 0, ceil_log2, torch.full_like(exponent, -127))
-        scales = (unbiased.clamp(-127, 127) + 127).to(torch.uint8).view(scale_dtype)
+        e8m0 = torch.where(bmax > 0, ceil_log2, torch.full_like(exponent, -127))  # unbiased
+        scales = (e8m0.clamp(-127, 127) + 127).to(torch.uint8).view(scale_dtype)
         tensor_scale = torch.tensor(1.0)
         step = scales.float()
     values = torch.where(
         step[..., None] > 0, blocks / step.clamp_min(1e-38)[..., None], torch.zeros_like(blocks)
     )
     codes = _round_e2m1(values.clamp(-FP4_MAX, FP4_MAX)).reshape(rows, cols)
-    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
-    return packed.contiguous(), scales.contiguous(), tensor_scale.to(w.device)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous()
+    tensor_scale = tensor_scale.to(w.device)
+    if unbiased:  # one factor per output channel, in the tensor scale's place
+        tensor_scale = tensor_scale * fp4_bias_correction(w, packed, scales, tensor_scale)
+    return packed, scales.contiguous(), tensor_scale
 
 
 def dequantize_fp4(
@@ -268,14 +279,24 @@ def dequantize_fp4(
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """The weight of :func:`quantize_fp4`'s ``(codes, scales, tensor_scale)`` in ``dtype``
-    (``e2m1 * scale * tensor_scale`` in fp32, one rounding to ``dtype``)."""
+    (``e2m1 * scale * tensor_scale`` in fp32, one rounding to ``dtype``; ``tensor_scale``: one
+    value, or one per row with ``unbiased``)."""
     rows = codes.shape[0]
     lut = torch.tensor(E2M1_VALUES, device=codes.device)
     lut = torch.cat([lut, -lut])
     nibbles = torch.stack([codes & 0xF, codes >> 4], dim=-1).reshape(rows, -1).long()
     values = lut[nibbles].reshape(rows, scales.shape[1], -1)
-    weight = values * scales.float()[..., None] * float(tensor_scale)
+    if _one(tensor_scale):
+        ts: torch.Tensor | float = float(tensor_scale)
+    else:  # per output channel (quantize_fp4(..., unbiased=True))
+        ts = torch.as_tensor(tensor_scale).float().to(codes.device).reshape(rows, 1, 1)
+    weight = values * scales.float()[..., None] * ts
     return weight.reshape(rows, -1).to(dtype)
+
+
+def _one(scale: torch.Tensor | float) -> bool:
+    """Whether a tensor scale is one value (a float or a one-element tensor)."""
+    return not isinstance(scale, torch.Tensor) or scale.numel() == 1
 
 
 def _error_metrics(w: torch.Tensor, deq: torch.Tensor, x: torch.Tensor | None) -> dict[str, Any]:
@@ -323,13 +344,16 @@ def fp4_error(
     fmt = next((f for f, (_, dtype) in FP4_FORMATS.items() if dtype == scales.dtype), "fp4")
     block = w.shape[1] // max(scales.shape[1], 1)
     kind = "e4m3 scale per {} + fp32 tensor scale" if fmt == "nvfp4" else "e8m0 scale per {}"
+    tensor_scales = 1 if _one(tensor_scale) else torch.as_tensor(tensor_scale).numel()
+    if tensor_scales > 1:
+        kind += " x fp32 per channel (unbiased)"
     return {
         "format": fmt,
         "granularity": kind.format(block),
         **_error_metrics(w, deq, x),
         "bytes": {
             "before": weight.numel() * weight.element_size(),
-            "after": codes.numel() + scales.numel() * scales.element_size() + 4,
+            "after": codes.numel() + scales.numel() * scales.element_size() + 4 * tensor_scales,
         },
     }
 
@@ -1090,6 +1114,40 @@ def fp4_values(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return dequantize_fp4(codes, scales, 1.0, torch.float32)
 
 
+def fp4_bias_correction(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    outer: torch.Tensor | float | None = None,
+) -> torch.Tensor:
+    """The in-phase correction of FP4-quantised rows: per row of ``x [rows, K]`` (activations
+    per token, or a weight's output channels) quantised to ``(codes, scales, outer)`` (outer:
+    one per row, one value or None: 1), ``c = sum x^2 / sum x x^`` with ``x^ = e2m1 * scale *
+    outer``; 1 for a row whose ``sum x x^`` is not positive (zeros). fp32 ``[rows]`` (float64
+    sums).
+
+    e2m1's grid shrinks a block's in-phase component (``x^ ~ a x + e``, ``a < 1``: the zero
+    bin, and the bins at 2 and 4 that round more values down than up), so a W4A4 GEMM's
+    output loses ~1 % of its component along the exact output while the noise ``e`` adds to
+    its norm: the opt-in ``unbiased`` of :func:`fp4_w4a4_linear` / :func:`quantize_fp4`
+    multiplies the epilogue by ``c`` per token and per output channel (``1 / a``). Measured on
+    Qwen3-0.6B (every q / k / v / o / gate / up / down of its 28 layers, 334 tokens; NVFP4):
+    ``<y^, y> / |y|^2 - 1`` per GEMM from -0.86 % to -0.10 % on average (the activations' factor
+    alone -0.54 %), an MLP's (gate / up, SiLU, down) median from -2.45 % to -0.37 %; relative
+    L2 unchanged (0.1121 -> 0.1122); the output norm moves from -0.20 % to +0.57 % (the noise
+    is no longer hidden by the shrink). ``docs/research-scripts/w4a4-233/norm_bias.py``."""
+    a = x.detach().reshape(-1, x.shape[-1]).double()
+    rows = a.shape[0]
+    xh = fp4_values(codes, scales).to(a.device).double()
+    if outer is not None:
+        o = torch.as_tensor(outer).detach().double().to(a.device).reshape(-1)
+        xh = xh * (o if o.numel() == rows else o.expand(rows))[:, None]
+    num, den = (a * a).sum(dim=1), (a * xh).sum(dim=1)
+    c = num / den.clamp_min(1e-300)
+    ok = (den > 0) & torch.isfinite(c)
+    return torch.where(ok, c, torch.ones_like(c)).float()
+
+
 def hadamard(n: int, device: torch.device | str | None = None) -> torch.Tensor:
     """The orthonormal Sylvester-Hadamard matrix of order ``n`` (a power of two), fp32,
     symmetric: ``H @ H = I``."""
@@ -1150,6 +1208,7 @@ def fp4_w4a4_linear(
     fmt: str = "nvfp4",
     granularity: str = "token",
     rotate: int | None = None,
+    unbiased: bool = False,
 ) -> torch.Tensor:
     """``x @ Wᵀ + bias`` with W4A4 numerics (``fp4_w4a4``), in ``x``'s dtype and shape
     ``[..., out]``.
@@ -1161,10 +1220,16 @@ def fp4_w4a4_linear(
     tensor_scale) (+ bias[n])`` is computed once per output in fp32, one rounding to ``x``'s
     dtype: the epilogue of a block-scaled tensor-core kernel. NVFP4 runs through
     ``F.scaled_mm`` (``BlockWise1x16``, fp32 out: bit for bit the fp32 math on sm_120) where
-    it applies; otherwise the same math in fp32 (slow: a fallback and a reference)."""
-    xq, xs, outer = quantize_fp4_activations(
-        hadamard_rotate(x, rotate) if rotate else x, fmt, granularity
-    )
+    it applies; otherwise the same math in fp32 (slow: a fallback and a reference).
+
+    ``unbiased`` (opt-in): the epilogue's per-token factor is ``outer * c`` with ``c`` the
+    activations' :func:`fp4_bias_correction` (the quantised codes, block scales and ``outer``
+    are unchanged); pair it with ``quantize_fp4(W, unbiased=True)`` (``tensor_scale`` per
+    output channel)."""
+    xr = hadamard_rotate(x, rotate) if rotate else x
+    xq, xs, outer = quantize_fp4_activations(xr, fmt, granularity)
+    if unbiased:
+        outer = outer * fp4_bias_correction(xr, xq, xs, outer).to(outer.device)
     if _fp4_scaled_mm_ok(x, codes, fmt):
         import torch.nn.functional as F
 
@@ -1453,6 +1518,7 @@ def fp4_w4a4_error(
     fmt: str = "nvfp4",
     granularity: str = "token",
     rotate: int | None = None,
+    unbiased: bool = False,
 ) -> dict[str, Any]:
     """Numerical error of a W4A4 layer (``(codes, scales, tensor_scale)``: :func:`quantize_fp4`
     of ``weight``, rotated with ``rotate``): the weight report of :func:`fp4_error` (of the
@@ -1463,33 +1529,45 @@ def fp4_w4a4_error(
       ``activation_saturation``: :func:`fp4_saturation` (``share``, ``worst_ratio``);
     * ``output_rel_l2``, ``output_cosine`` and ``output_norm_ratio`` of the W4A4 output
       against ``x @ Wᵀ`` in fp32: the module-level error the ``near-lossless-fp4a`` tier
-      bounds (:data:`kernel_agent.kernels.compare.NEAR_LOSSLESS_BOUNDS`)."""
+      bounds (:data:`kernel_agent.kernels.compare.NEAR_LOSSLESS_BOUNDS`); ``output_gain``:
+      ``<y^, y> / |y|^2``, the output's in-phase component (its bias: about 0.99 with
+      NVFP4, while the noise lifts ``output_norm_ratio`` back towards 1).
+
+    ``unbiased``: the activations' :func:`fp4_bias_correction` in the epilogue (as
+    :func:`fp4_w4a4_linear`; the weight's per-channel one comes with ``tensor_scale`` from
+    ``quantize_fp4(..., unbiased=True)``)."""
     w = weight.detach().float()
     a = x.detach().float().reshape(-1, w.shape[1]).to(w.device)
     report = fp4_error(hadamard_rotate(w, rotate) if rotate else w, codes, scales, tensor_scale)
     a_rot = hadamard_rotate(a, rotate) if rotate else a
     xq, xs, outer = quantize_fp4_activations(a_rot, fmt, granularity)
+    saturation = fp4_saturation(a_rot, xs, outer, fmt)
+    if unbiased:
+        outer = outer * fp4_bias_correction(a_rot, xq, xs, outer)
     a_hat = fp4_values(xq, xs) * outer[:, None]
     rms = a.pow(2).mean(dim=1).sqrt()
     crest = a.abs().amax(dim=1) / rms.clamp_min(1e-30)
     ref = a @ w.T
     acc = fp4_values(xq, xs).double() @ fp4_values(codes, scales).to(a.device).double().T
-    new = (acc * (outer.double()[:, None] * float(tensor_scale))).float()
+    ts = torch.as_tensor(tensor_scale).double().to(a.device).reshape(-1)[None, :]
+    new = (acc * (outer.double()[:, None] * ts)).float()
     ref_norm, new_norm = float(ref.norm()), float(new.norm())
-    cos = float((ref.flatten() @ new.flatten()) / (ref_norm * new_norm)) if ref_norm else 1.0
+    dot = float(ref.flatten().double() @ new.flatten().double())
+    cos = dot / (ref_norm * new_norm) if ref_norm and new_norm else 1.0
     a_norm = float(a_rot.norm())
-    saturation = fp4_saturation(a_rot, xs, outer, fmt)
     block, kind = FP4_FORMATS[fmt][0], "e4m3" if fmt == "nvfp4" else "e8m0"
     report.update(
         activations=f"{fmt}: e2m1 + {kind} scale per {block}"
         + (f" x fp32 per {granularity}" if fmt == "nvfp4" else "")
-        + (f", Hadamard {rotate}" if rotate else ""),
+        + (f", Hadamard {rotate}" if rotate else "")
+        + (", unbiased" if unbiased else ""),
         activation_rel_l2=_sig(float((a_rot - a_hat).norm()) / a_norm if a_norm > 0 else 0.0),
         activation_crest=_sig(float(crest[rms > 0].max()) if bool((rms > 0).any()) else 0.0),
         activation_saturation={k: saturation[k] for k in ("share", "worst_ratio")},
         output_rel_l2=_sig(float((ref - new).norm()) / ref_norm if ref_norm else 0.0),
         output_cosine=round(cos, 6),
         output_norm_ratio=round(new_norm / ref_norm, 5) if ref_norm else 1.0,
+        output_gain=round(dot / ref_norm**2, 5) if ref_norm else 1.0,
     )
     return report
 

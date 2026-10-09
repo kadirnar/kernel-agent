@@ -1,0 +1,11 @@
+NVIDIA A10, torch 2.10.0+cu128, triton 3.6.0
+CUDA graphs, 20 calls per graph, median of 7 interleaved rounds, warm L2; us per call
+
+| producer, M x K | bf16 out | fused NVFP4 | + bias factor | bf16 + quantize_rows | bf16 + torch reference | fused vs bf16 + quantize_rows |
+|---|---|---|---|---|---|---|
+| RMSNorm 352 x 1024 | 2.71 | 5.89 | 6.91 | 7.63 | 151.1 | 1.30x |
+| RMSNorm 4096 x 1024 | 35.38 | 32.87 | 39.63 | 60.26 | 2692.9 | 1.83x |
+| RMSNorm 352 x 4096 | 5.32 | 17.72 | 18.64 | 23.09 | 938.1 | 1.30x |
+| SiLU-mul 352 x 3072 | 7.67 | 18.22 | 19.97 | 27.60 | 687.0 | 1.51x |
+| SiLU-mul 352 x 4096 | 16.54 | 17.97 | 20.94 | 32.20 | 944.6 | 1.79x |
+| SiLU-mul 4096 x 3072 | 156.01 | 128.05 | 173.36 | 255.23 | 8006.9 | 1.99x |

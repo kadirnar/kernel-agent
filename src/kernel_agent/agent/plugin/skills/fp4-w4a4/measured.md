@@ -40,8 +40,32 @@ FP8 W8A8 (`cute_fp8_blockscaled_gemm.py`) 267 us (1.13x). It passes `near-lossle
 through the evaluator (`locdit_gate.py`).
 
 A separate quantiser launch costs 2.5-8 us at M = 352: fuse it into the producer of the
-activations (RMSNorm, `silu(gate) * up`, the previous GEMM's epilogue), which then writes
-codes, swizzled block scales and the per-token outer scale.
+activations (RMSNorm, `silu(gate) * up`), which then writes codes, swizzled block scales and
+the per-token outer scale: `triton_fp4_producers.py`. A GEMM's epilogue tile lacks the
+row's amax for a per-token outer scale: emit MXFP4 there, or leave it to the next row-wise
+producer.
+
+**The producers** (`triton_fp4_producers.py`; measured on an NVIDIA A10, sm_86, CUDA graphs,
+interleaved rounds; memory bound, no FP4 tensor cores needed; the GEMMs not included):
+
+| producer, M x K | bf16 out | fused NVFP4 (swizzled) | + bias factor (`unbiased`) | bf16 + separate quantiser (`quantize_rows`) |
+|---|---|---|---|---|
+| RMSNorm 352 x 1024 | 2.7 us | 5.9 us | 6.9 us | 7.6 us (1.30x) |
+| RMSNorm 352 x 4096 | 5.3 us | 17.7 us | 18.6 us | 23.1 us (1.30x) |
+| RMSNorm 4096 x 1024 | 35.4 us | 32.9 us | 39.6 us | 60.3 us (1.83x) |
+| SiLU-mul 352 x 3072 | 7.7 us | 18.2 us | 20.0 us | 27.6 us (1.51x) |
+| SiLU-mul 352 x 4096 | 16.5 us | 18.0 us | 20.9 us | 32.2 us (1.79x) |
+| SiLU-mul 4096 x 3072 | 156 us | 128 us | 173 us | 255 us (1.99x) |
+
+At M = 352 the row programs are one wave, latency bound on the per-element IEEE division and
+e2m1 rounding (the reference's math). `g * (1 / step)` runs RMSNorm 352 x 4096 in 11.5 us
+instead of 17.4 but gives other codes; a reciprocal per block refined by two FMA residuals
+(Markstein; 12.5 us) matched `div_rn` bit for bit on 10^9 pairs on the A10 (steps below 2^126,
+quotients at the e2m1 midpoints +-3 ulps), but Triton's interpreter does not fuse FMAs, so the
+CPU tests could not check it: the example keeps `div_rn`.
+At 4096 rows the fused producer beats the bf16 one: it writes half a byte per element. The
+torch reference quantiser after a bf16 producer: 151 us at 352 x 1024 (a fallback only).
+Raw output: `docs/research-scripts/w4a4-233/results/bench_producers.out`.
 
 **Per-token outer scales cost nothing in a custom epilogue** (the CuTe example multiplies
 `acc * outer[m] * tensor_scale` before its one rounding), but `F.scaled_mm` takes only a

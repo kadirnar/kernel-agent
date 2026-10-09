@@ -1379,8 +1379,8 @@ evaluated under the current mix, alone against the unmodified model, rejected by
 checks: perceptual gate, teacher forcing, held-out input; out-of-memory steps do not
 count). With every group at 8 bits a further failure proposes the target's pivot to its
 8-bit class (`<id>__fp8_w8a8`, source `w4a4-demotion`, once) and names the ideas left for
-W4A4 (per-token outer scales, a rotation, a norm-bias correction, bf16 for the top group);
-the W4A4 arm keeps its slices. The improve loop applies the policy before every slice of a
+W4A4 (per-token outer scales, a rotation, the opt-in norm-bias correction below, bf16 for the
+top group); the W4A4 arm keeps its slices. The improve loop applies the policy before every slice of a
 W4A4 arm; the engineer prompt (the layers to keep at 8 bits, the probe's groups and why),
 the slice digest (`## Precision mix (W4A4)`: the mix, its last steps, the next group) and
 the round re-plan's target list show it; `w4a4_mix` events record each step. On a synthetic
@@ -1454,6 +1454,74 @@ NVFP4 peak ratio's ~1.9x holds for large GEMMs; at M = 352 a separate quantiser 
 N = 1024's 24 output tiles on 70 SMs eat part of it: fuse the quantiser into the producer of
 the activations and split K there. Eager, the Triton example is host bound (147-176 us at 704 x
 1024 -> 8192 against bf16's 126; the CuTe one 41-50; two runs on a loaded machine).
+
+**Quantising in the producer** (`examples/triton_fp4_producers.py`, the FP4 analogue of
+`triton_fp8_producers.py`). `rmsnorm_fp4` and `silu_mul_fp4` (and `quantize_rows`, the plain
+pass) compute their output as eager does and quantise it in their epilogue, bit for bit
+`quantize_fp4_activations` of that output: packed e2m1 codes, e4m3 block scales written straight
+into cuBLASLt's 128 x 4 swizzled layout (or row-major) with the padding zeroed, the per-token
+fp32 outer scale; `mx=True`: MXFP4. Triton has no e4m3 type before sm_89, so the scale bits
+come from integer arithmetic on the fp32 bits and the producers compile and run from sm_75
+(`ARCHS_COMPILES`); the example as a W4A4 candidate (`build()`: a gated MLP, gate|up merged,
+the SiLU-mul feeding `down_proj` in NVFP4, `F.scaled_mm` NVFP4 GEMMs) needs sm_100+ (`ARCHS`),
+elsewhere its GEMMs are emulated in fp32 from the producers' codes (a check, not a speed-up);
+`doctor --smoke` runs it on sm_100+ through the evaluator like the other W4A4 examples (a
+gated-MLP capture). Verified on an NVIDIA A10 (sm_86; `verify_producers.py`): bit for bit on every RMSNorm (56)
+and SiLU-mul (28) call of Qwen3-0.6B over 334 tokens and on rows from 1e-30 to 1e30 (bf16
+subnormals, zero blocks and rows; swizzled scales, MXFP4); the scale-rule guard passes its
+hook; the MLP module equals the reference chain bit for bit and passes `near-lossless-fp4a`
+through the evaluator. The CPU tests run the kernels themselves through Triton's interpreter
+(`tests/test_fp4_producers.py`). Fused against a separate pass (A10, CUDA graphs,
+`bench_producers.py`; the GEMMs not included):
+
+| producer, M x K | bf16 out | fused NVFP4 | + bias factor | bf16 + separate quantiser |
+|---|---|---|---|---|
+| RMSNorm 352 x 1024 | 2.7 us | 5.9 us | 6.9 us | 7.6 us (1.30x) |
+| RMSNorm 4096 x 1024 | 35.4 us | 32.9 us | 39.6 us | 60.3 us (1.83x) |
+| SiLU-mul 352 x 3072 | 7.7 us | 18.2 us | 20.0 us | 27.6 us (1.51x) |
+| SiLU-mul 4096 x 3072 | 156 us | 128 us | 173 us | 255 us (1.99x) |
+
+At M = 352 one wave of row programs is latency bound on the quantiser's per-element IEEE
+division and e2m1 rounding (the reference's math; a reciprocal multiply is faster and gives other
+codes); at 4096 rows the fused producer beats the bf16 one (half a byte written per element). A
+per-token outer scale needs the whole row, which a GEMM's epilogue tile does not have: emit MXFP4
+there, or let the next row-wise producer quantise. The online Hadamard rotation is not fused:
+`hadamard_rotate` is an fp32 matmul in the BLAS library's summation order, so a fused rotation
+could match it only to rounding, and it made NVFP4 worse on VoxCPM2's captures.
+
+**Norm bias** (opt-in `unbiased=True`). e2m1's grid shrinks a block's component along itself
+(the zero bin, and the bins at 2 and 4 that round more values down than up), so a W4A4 GEMM's
+output loses ~1 % along the exact output while its noise adds to the norm.
+`quant.fp4_bias_correction` gives the factor that takes it back, `sum x^2 / sum x x^` per row:
+`fp4_w4a4_linear(..., unbiased=True)` multiplies the epilogue's per-token scale by the
+activations' factor, `quantize_fp4(w, unbiased=True)` makes the tensor scale one per output
+channel, `fp4_w4a4_error(..., unbiased=True)` reports it (`output_gain`: `<y^, y> / |y|^2`, the
+in-phase component); codes, block scales and the outer scale the scale-rule guard checks are
+unchanged. Both factors are epilogue scales: free in a custom epilogue (the CuTe example's
+`acc * sx[m] * sw[n]`); `F.scaled_mm`'s two-level recipe takes only tensor-wise second-level
+scales (fp32 output and the epilogue in torch there). Measured on Qwen3-0.6B (every q / k / v /
+o / gate / up / down of its 28 layers on 334 tokens, the GEMMs emulated from the codes;
+`norm_bias.py`, `results/norm_bias.out`; means over the 196 GEMMs, the MLP's gate / up, SiLU,
+down median over the layers):
+
+| variant | gain - 1 | norm | rel L2 | cosine | MLP gain - 1 / norm |
+|---|---|---|---|---|---|
+| NVFP4 (block maximum to 6) | -0.86 % | -0.20 % | 0.1121 | 0.99337 | -2.45 % / -0.26 % |
+| adaptive block scales (maximum to 4 or 6, lower error), activations | -1.09 % | -0.46 % | 0.1094 | 0.99369 | -2.74 % / -0.70 % |
+| adaptive block scales, both operands | -1.00 % | -0.41 % | 0.1058 | 0.99410 | -2.41 % / -0.59 % |
+| per-token factor | -0.54 % | +0.13 % | 0.1119 | 0.99340 | -1.60 % / +0.57 % |
+| per-token and per-channel factors (`unbiased`) | -0.10 % | +0.57 % | 0.1122 | 0.99341 | -0.37 % / +1.86 % |
+| adaptive (both) and per-token factor | -0.24 % | +0.35 % | 0.1059 | 0.99412 | -0.37 % / +1.57 % |
+
+Adaptive block scales lower the error but deepen the shrink; the factors remove it at no error
+cost, and the output norm then shows the noise (+relative L2^2 / 2: Qwen3-0.6B's MLPs, relative
+L2 ~0.2, go from -0.26 % to +1.9 %). Use `unbiased` where a W4A4 target fails its gate on the
+norm with a small error (VoxCPM2's LocDiT layer: relative L2 0.036, norm -3.4 %; not measured
+with the correction here) or where the shrink compounds through many layers, not by default. On
+the A10 the producers' factor (`unbiased=True` of `rmsnorm_fp4` / `silu_mul_fp4`, a fourth
+output: the epilogue's per-token scale) is within 4e-7 of the reference on Qwen3-0.6B, and the
+MLP module with it moves the in-phase gain of layers 5 / 14 / 20 from 0.977 / 0.972 / 0.980 to
+0.995 / 0.995 / 0.998.
 
 ### What "faster" means
 

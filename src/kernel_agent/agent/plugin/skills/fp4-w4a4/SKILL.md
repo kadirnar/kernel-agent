@@ -28,9 +28,12 @@ quantising activations saves nothing there (`fp4_weights`, `fp8_weights`).
   NVFP4_OUTER_STEP` (`1 / 2688` in fp32), block scale `e4m3(min(bmax / (outer * 6), 448))`,
   codes `e2m1(x / (scale * outer))` to nearest even, saturated at ±6 (IEEE divisions, the
   hardware's `cvt.rn.satfinite.e2m1x2.f32`); a block whose scale is 0 gets codes 0. Per
-  token needs no grid-wide reduction, so a producer (RMSNorm, `silu(gate) * up`) can quantise
-  its own rows; `granularity="tensor"` (one outer scale per call) measured as accurate and
-  lets two-level `F.scaled_mm` (`[BlockWise1x16, TensorWise]`) write bf16 itself;
+  token needs no grid-wide reduction, so a producer (RMSNorm, `silu(gate) * up`) quantises
+  its own rows: `triton_fp4_producers.py` (bit for bit, swizzled scales, any GPU from sm_75:
+  e4m3 bits by integer math; 1.3-2.0x faster than a separate pass, measured on an A10:
+  [measured.md](measured.md)); `granularity="tensor"` (one outer scale per call) measured
+  as accurate and lets two-level `F.scaled_mm` (`[BlockWise1x16, TensorWise]`) write bf16
+  itself;
 * math: e2m1 x e2m1 with both block scales applied by the tensor core, fp32 accumulation,
   then `acc * outer[m] * tensor_scale (+ bias[n])` once per output, one rounding to bf16:
   `fp4_w4a4_linear` (the reference and fallback; `F.scaled_mm` `BlockWise1x16` with fp32 out
@@ -57,6 +60,15 @@ within ±5 %, every element within 1.5 x RMS + 0.25 x |reference|; on redrawn in
 % / 3.5). Per-layer numbers, MXFP4, rotations and the broken kernels the tiers reject:
 [calibration.md](calibration.md).
 
+**Norm bias** (opt-in `unbiased=True` of `quantize_fp4`, `fp4_w4a4_linear`,
+`fp4_w4a4_error` and the producers): a per-token factor in the epilogue and one per output
+channel in the weight's tensor scale (`fp4_bias_correction`, `sum x^2 / sum x x^`) take back
+e2m1's in-phase shrink at no error cost (measured on Qwen3-0.6B: per GEMM -0.86 % -> -0.10 %,
+an MLP -2.45 % -> -0.37 %); the output norm then shows the noise (+rel L2^2 / 2). Use it when a
+W4A4 target fails its gate on the norm with a small error, or the shrink compounds through
+many layers; not by default. Adaptive block scales (maximum to 4 or 6) lower the error 5.6 %
+but deepen the shrink. Numbers and when: [calibration.md](calibration.md).
+
 **Sensitive layers stay FP8**: `fp4_w4a4_sensitivity(module, run)` quantises every
 `nn.Linear` of the target alone on its captured inputs and ranks them (W4A4 output relative
 L2, norm change, FP8 W8A8's for comparison, FLOP share). On the VoxCPM2 LocDiT the MLP's
@@ -70,8 +82,8 @@ W4A4 (`spec.json` → `w4a4_mix`). Each failed gate moves the next group to 8 bi
 evaluations failing the tier near its bounds (cosine >= 0.9) with none passing, or the
 end-to-end gate rejecting one of your kernels alone. Follow the mix in your prompt (the
 same tier: 8-bit layers are within it); with every group at 8 bits the target's pivot to
-its 8-bit class opens a new arm, and per-token outer scales, a rotation, a norm-bias
-correction or bf16 for the top group remain for W4A4.
+its 8-bit class opens a new arm, and per-token outer scales, a rotation, the norm-bias
+correction (`unbiased=True`) or bf16 for the top group remain for W4A4.
 
 **MXFP4 and rotations**: MXFP4 W4A4 (`fmt="mxfp4"`, e8m0 per 32) fails near-lossless-fp4a on
 the LocDiT layer (norm 6.5 %) and is not in torch 2.14's `F.scaled_mm` on sm_120 (B200 /
@@ -82,8 +94,9 @@ gate_proj 0.088 -> 0.126) and helped MXFP4 only on some layers: measure before u
 
 **Examples**: `cute_nvfp4_w4a4_gemm.py` (CuTe DSL GEMM on `MmaMXF4NVF4Op`, sm_120a; the
 per-token scale and bias in the epilogue) and `triton_nvfp4_w4a4_gemm.py` (a Triton
-quantiser writing packed codes and swizzled scales, then `F.scaled_mm` NVFP4; sm_100+).
-Speeds and shapes: [measured.md](measured.md).
+quantiser writing packed codes and swizzled scales, then `F.scaled_mm` NVFP4; sm_100+);
+`triton_fp4_producers.py` (RMSNorm / SiLU-mul producers writing NVFP4 / MXFP4, a W4A4 MLP;
+the producers on any GPU, the GEMMs sm_100+). Speeds and shapes: [measured.md](measured.md).
 
 **Report** `fp4_w4a4_error(weight, codes, scales, tensor_scale, x)` on captured activations
 (its `activation_saturation` share is normal: NVFP4 rounds block scales to nearest) and the
@@ -91,6 +104,6 @@ evaluator's per-case numbers in `NOTES.md`.
 
 ## Examples and sources
 
-* Examples: `cute_nvfp4_w4a4_gemm.py`, `triton_nvfp4_w4a4_gemm.py`, `cute_fp8_blockscaled_gemm.py` (the FP8 kernel it is built from). All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
+* Examples: `cute_nvfp4_w4a4_gemm.py`, `triton_nvfp4_w4a4_gemm.py`, `triton_fp4_producers.py`, `cute_fp8_blockscaled_gemm.py` (the FP8 kernel it is built from). All in kernel-agent's examples directory (`kernel_agent/agent/examples/`; a session's prompt gives the directory): copy their structure; an example's `ARCHS` names the GPUs it runs on.
 * Sources: the `documentation-sources` skill's `sources.md`, sections "Low precision (formats, scaling, accuracy)"; "CUTLASS / CuTe".
-* Code: `kernel_agent.kernels.quant` (`quantize_fp4`, `quantize_fp4_activations`, `fp4_w4a4_linear`, `fp4_w4a4_error`, `fp4_w4a4_sensitivity`, `swizzle_fp4_scales`, `hadamard_rotate`); research scripts and raw results: `docs/research-scripts/w4a4-233`.
+* Code: `kernel_agent.kernels.quant` (`quantize_fp4`, `quantize_fp4_activations`, `fp4_w4a4_linear`, `fp4_w4a4_error`, `fp4_w4a4_sensitivity`, `swizzle_fp4_scales`, `hadamard_rotate`, `fp4_bias_correction`); research scripts and raw results: `docs/research-scripts/w4a4-233`.

@@ -33,3 +33,17 @@ captures of `runs/` (read only). Run GPU jobs under the GPU lock:
   quantiser alone) against the same baselines, cold and warm L2 (`results/bench_cute.out`).
 * `host_time.py`, `host_parts.py`: the examples' eager (host-bound) time and where the
   Triton one's goes (`results/host_time.out`).
+
+Follow-ups 1 and 8, run on an NVIDIA A10 (sm_86, torch 2.10.0+cu128, Triton 3.6.0) and its
+host's CPU, on Qwen3-0.6B from the Hugging Face cache (`HF_HOME`), no FP4 tensor cores needed:
+
+* `norm_bias.py` (CPU): W4A4's norm bias on Qwen3-0.6B's 196 projections and 28 MLPs with
+  the GEMMs emulated from the codes: the current rule, adaptive block scales (maximum to 4 or
+  6), per-token / per-channel bias factors and their combinations; the library's
+  `unbiased=True` against its prototype (`results/norm_bias.out`).
+* `verify_producers.py` (GPU): `examples/triton_fp4_producers.py` bit for bit against
+  `quantize_fp4_activations` on Qwen3-0.6B's RMSNorm and SiLU-mul calls and on rows from 1e-30
+  to 1e30, its bias factor, the scale-rule guard, the W4A4 MLP module (GEMMs emulated) against
+  the reference chain and through the evaluator (`results/verify_producers.out`).
+* `bench_producers.py` (GPU): the fused producers against bf16 output plus a separate
+  quantiser pass, interleaved CUDA-graph rounds (`results/bench_producers.out`).

@@ -1098,7 +1098,7 @@ def _precision_block(
   `outer = amax(|row|) * NVFP4_OUTER_STEP`, block scale `e4m3(min(bmax / (outer * 6), 448))`,
   codes `e2m1(x / (scale * outer))` to nearest even with IEEE divisions, saturated at ±6),
   in the GEMM's prologue or fused into the op that produces them (RMSNorm, `silu(gate) *
-  up`); never a static (calibrated) scale;
+  up`: `triton_fp4_producers.py`); never a static (calibrated) scale;
 * define a module-level `quantize_activations(x) -> (codes, scales, outer)` with the
   quantiser your kernels use (codes packed two per byte [rows, K / 2]; scales unswizzled,
   [rows, K / 16] e4m3, MXFP4 [rows, K / 32] e8m0; outer fp32 [rows] or one per call; a
@@ -1119,7 +1119,8 @@ def _precision_block(
   bits inside the target, and it moves the next group there when a gate rejects the
   mix. MXFP4 (`fmt="mxfp4"`) and a Hadamard rotation (`rotate=16`) measured no
   better than plain NVFP4 on VoxCPM2 (MXFP4 fails near-lossless-fp4a on its LocDiT layer):
-  measure before using them;
+  measure before using them. A gate failing on the norm with a small error: the opt-in
+  norm-bias correction (`unbiased=True`: a per-token and a per-channel epilogue factor, skill);
 * examples: `cute_nvfp4_w4a4_gemm.py` (CuTe DSL GEMM on `MmaMXF4NVF4Op`, sm_12x) and
   `triton_nvfp4_w4a4_gemm.py` (Triton quantiser + `F.scaled_mm` NVFP4, sm_100+); reference
   and fallback: `fp4_w4a4_linear`; guide: skill `kernel-agent:fp4-w4a4`;
