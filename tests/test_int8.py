@@ -418,11 +418,16 @@ def test_backend_policy_has_an_int8_gemm_class():
 
 
 def test_examples_and_selftest_tables():
-    for table in (selftest.INT8_W8A8_EXAMPLES, selftest.INT8_WEIGHT_EXAMPLES):
+    # IMMA m16n8k32 from sm_80; the weight-only GEMV has no tensor cores and runs on Turing
+    # too (compiled for sm_75, run on its compute_75 code path: #256)
+    for table, archs in (
+        (selftest.INT8_W8A8_EXAMPLES, "sm_80+"),
+        (selftest.INT8_WEIGHT_EXAMPLES, "sm_75+"),
+    ):
         for name in table:
             path = prompts.EXAMPLES_DIR / name
             source = path.read_text()
-            assert gpu_arch.example_requirement(path)[0] == "sm_80+", name
+            assert gpu_arch.example_requirement(path)[0] == archs, name
             for needle in ("def build(", "quantize_int8", "int8_error", "ARCHS_WHY"):
                 assert needle in source, (name, needle)
     triton = (prompts.EXAMPLES_DIR / "triton_int8_w8a8_gemm.py").read_text()

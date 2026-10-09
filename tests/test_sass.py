@@ -1,7 +1,7 @@
-"""SASS opcode census (#230): fixture dumps of tiny kernels compiled on the CPU for sm_80,
-sm_89, sm_90a, sm_100a and sm_120a (tests/fixtures/sass, make_fixtures.py) give the
-expected census; the opcode tables name only opcodes these cubins contain; the cubins of a
-process are collected and disassembled without a GPU."""
+"""SASS opcode census (#230): fixture dumps of tiny kernels compiled on the CPU for sm_75,
+sm_80, sm_86, sm_89, sm_90a, sm_100a and sm_120a (tests/fixtures/sass, make_fixtures.py)
+give the expected census; the opcode tables name only opcodes these cubins contain; the
+cubins of a process are collected and disassembled without a GPU."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import pytest
 from kernel_agent.kernels import sass
 
 FIXTURES = Path(__file__).parent / "fixtures" / "sass"
-ARCHS = ("sm_80", "sm_89", "sm_90a", "sm_100a", "sm_120a")
+ARCHS = ("sm_75", "sm_80", "sm_86", "sm_89", "sm_90a", "sm_100a", "sm_120a")
 
 
 def census_of(name: str) -> dict[str, dict[str, Any]]:
@@ -126,6 +126,11 @@ def test_memory_barriers_shuffles_and_local_memory_on_every_arch(arch):
     assert set(rows["ka_local"]["local"]) == {"LDL", "STL"}
     spill = rows["ka_spill"]["local"]  # 48 live values under __maxnreg__(32)
     assert spill["LDL"] > 40 and spill["STL"] > 40
+    if arch == "sm_75":  # Turing: m16n8k8 fp16 and m8n8k16 s8 only, no cp.async
+        turing = rows["ka_mma_turing"]
+        assert turing["tensor"] == {"HMMA.1688.F32": 1, "IMMA.8816.S8.S8": 1}
+        assert "ka_mma_bf16" not in rows and "ka_mma_s8" not in rows
+        return
     bf16 = rows["ka_mma_bf16"]
     assert bf16["tensor"] == {"HMMA.16816.F32.BF16": 1}
     assert bf16["categories"]["cp_async"] == 2  # LDGSTS + LDGDEPBAR
@@ -134,7 +139,8 @@ def test_memory_barriers_shuffles_and_local_memory_on_every_arch(arch):
 
 
 def test_fp8_mma_sync_per_arch():
-    assert "ka_mma_e4m3" not in census_of("sm_80.sass")  # no e4m3 mma.sync before sm_89
+    for arch in ("sm_75", "sm_80", "sm_86"):  # no e4m3 mma.sync before sm_89
+        assert "ka_mma_e4m3" not in census_of(f"{arch}.sass"), arch
     for arch in ("sm_89", "sm_120a"):
         row = census_of(f"{arch}.sass")["ka_mma_e4m3"]
         assert row["tensor"] == {"QMMA.16832.F32.E4M3.E4M3": 1}, arch

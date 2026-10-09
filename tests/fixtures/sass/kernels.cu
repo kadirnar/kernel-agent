@@ -54,6 +54,26 @@ extern "C" __global__ void ka_local(float* out, const int* idx) {
   out[threadIdx.x] = a[idx[threadIdx.x] & 63];
 }
 
+#if KA_SM < 80
+// Turing's tensor-core forms, the only mma.sync shapes below sm_80: fp16 m16n8k8 (HMMA) and
+// s8 m8n8k16 (IMMA); no bf16, no m16n8k16 / m16n8k32, no cp.async.
+extern "C" __global__ void ka_mma_turing(const unsigned* g, float* out, int* iout) {
+  unsigned a0 = g[threadIdx.x], a1 = a0 * 3u, b0 = a0 * 11u;
+  float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+  asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
+      "{%0,%1,%2,%3};"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(b0));
+  int i0 = 0, i1 = 0;
+  asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+               : "+r"(i0), "+r"(i1)
+               : "r"(a0), "r"(b0));
+  out[threadIdx.x] = d0 + d1 + d2 + d3;
+  iout[threadIdx.x] = i0 + i1;
+}
+#endif
+
 #if KA_SM >= 80
 // ldmatrix (LDSM) from shared memory filled by cp.async (LDGSTS); bf16 mma.sync (HMMA).
 extern "C" __global__ void ka_mma_bf16(const unsigned* g, float* out) {

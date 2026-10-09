@@ -36,8 +36,11 @@ from kernel_agent.kernels.quant import int8_error, int8_weights_linear, quantize
 
 #: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
 #: it elsewhere and says why).
-ARCHS = "sm_80+"
-ARCHS_WHY = "bf16 activations (cuda_bf16 conversions); int8 codes converted with prmt + FADD"
+ARCHS = "sm_75+"
+ARCHS_WHY = (
+    "bf16 activations (cuda_bf16 conversions, software bf16 math before sm_80); int8 codes "
+    "converted with prmt + FADD"
+)
 
 CUDA_SRC = r"""
 #include <torch/extension.h>

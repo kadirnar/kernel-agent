@@ -32,9 +32,17 @@ HERE = Path(__file__).parent
 EXAMPLE = (
     HERE.parents[2] / "src" / "kernel_agent" / "agent" / "examples" / "triton_fp8_w8a8_gemm.py"
 )
-#: (nvcc -arch, KA_SM): one GPU per family; the ``a`` targets carry wgmma, tcgen05 and the
-#: block-scaled mma.sync.
-ARCHS = (("sm_80", 80), ("sm_89", 89), ("sm_90a", 90), ("sm_100a", 100), ("sm_120a", 120))
+#: (nvcc -arch, KA_SM): one GPU per family, and sm_86 (A10, RTX 30xx) next to sm_80; the
+#: ``a`` targets carry wgmma, tcgen05 and the block-scaled mma.sync.
+ARCHS = (
+    ("sm_75", 75),
+    ("sm_80", 80),
+    ("sm_86", 86),
+    ("sm_89", 89),
+    ("sm_90a", 90),
+    ("sm_100a", 100),
+    ("sm_120a", 120),
+)
 #: The Triton GEMM's tile (BM, BN, BK, warps, stages): small, so the fixture stays small.
 TRITON_TILE = (32, 32, 64, 4, 2)
 _ENCODING = re.compile(r"\s*/\* 0x[0-9a-f]+ \*/")

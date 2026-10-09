@@ -15,6 +15,11 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.runtime import make_fake_stream
 from torch import nn
 
+#: GPUs this example runs on (``kernel_agent.gpu_arch.supports``: ``doctor --smoke`` skips
+#: it elsewhere and says why).
+ARCHS = "sm_80+"
+ARCHS_WHY = "CuTe DSL targets sm_80+ (nvidia-cutlass-dsl 4.8 has no sm_75 target)"
+
 THREADS = 256
 
 

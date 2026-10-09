@@ -54,6 +54,9 @@ from kernel_agent.kernels.quant import (
 #: it elsewhere and says why).
 ARCHS = "sm_100+"
 ARCHS_WHY = "block-scaled FP4 tensor cores (F.scaled_mm BlockWise1x16, cuBLASLt NVFP4)"
+#: GPUs its quantiser compiles for (e4m3 block scales in Triton: sm_89+; the GEMM is
+#: cuBLASLt's).
+ARCHS_COMPILES = "sm_89+"
 
 #: 16-element blocks per program of the quantiser, and its warps (RTX 5070 Ti, CUDA graph:
 #: 4096 x 4096 bf16 in 40 us with 32 / 2, 62 us with 8 / 1; 352 x 4096 in 4.4 us).

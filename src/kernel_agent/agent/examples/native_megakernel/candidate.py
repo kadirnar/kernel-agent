@@ -44,6 +44,8 @@ from kernel_agent.native.megakernel import schedule as mks
 #: GPUs this example runs on (``kernel_agent.gpu_arch.supports``).
 ARCHS = "sm_80+"
 ARCHS_WHY = "bf16 opcodes; page loads with cp.async (sm_80-sm_89) or bulk copies (sm_90+)"
+#: GPUs its device code compiles for (sm_75: compiles, never run there).
+ARCHS_COMPILES = "sm_75+"
 
 MODES = ("megakernel", "graph_pdl", "coop_barrier")
 

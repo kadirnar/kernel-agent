@@ -237,7 +237,10 @@ def gemm_ptx(
     consts = {"HAS_BIAS": False, "BM": bm, "BN": bn, "BK": bk, "GM": 8, "SCALED": scaled}
     signature = {**ptr, "c": "*bf16", "M": "i32", "N": "i32", "K": "i32"}
     signature.update(dict.fromkeys(consts, "constexpr"))
-    source = ASTSource(fn=_gemm_kernel, signature=signature, constexprs=consts)
+    # specialised as the JIT specialises a launch: 16-byte aligned pointers, sizes divisible
+    # by 16 (without it the tile loads are not vectorised and the K loop gets no cp.async)
+    aligned = {(i,): [["tt.divisibility", 16]] for i in range(len(ptr) + 4)}
+    source = ASTSource(fn=_gemm_kernel, signature=signature, constexprs=consts, attrs=aligned)
     target = GPUTarget("cuda", capability[0] * 10 + capability[1], 32)
     compiled = triton.compile(
         source, target=target, options={"num_warps": warps, "num_stages": stages}

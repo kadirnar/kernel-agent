@@ -1248,7 +1248,8 @@ allowed by default in near-lossless runs, in the near-lossless tier):
   bias in the epilogue, per-shape tiles, a `custom_op`; output equal to `int8_w8a8_linear`
   bit for bit), `cuda_int8_skinny_gemm.py` (decode / M <= 32 per weight read: IMMA fragments
   loaded straight from global memory, no conversion, exact int32 cross-warp reduction; bit
-  for bit too), `cuda_int8_gemv.py` (`int8_weights` decode GEMV, M <= 4).
+  for bit too), `cuda_int8_gemv.py` (`int8_weights` decode GEMV, M <= 4; no tensor cores:
+  `ARCHS = "sm_75+"`).
 
 Measured on the RTX 5070 Ti (sm_120; `docs/research-scripts/int8-178`): s8 `mma.sync`
 (`IMMA.16832.S8.S8`) runs 411 TOPS, as fast as the block-scaled FP8 `QMMA.SF` (414) and
@@ -2629,9 +2630,10 @@ there (library kernels, a freed NVRTC `ObjectCode`) are listed under `missing`. 
 it counts opcodes by category (tensor-core MMA with its full opcode, e.g.
 `QMMA.SF.16832.F32.E4M3.E4M3.E8`; global loads by width; `LDGSTS`; TMA; `LDL` / `STL`;
 tensor memory; barriers; shuffles; atomics; fp32 / fp16 math) and keeps the most frequent
-opcodes raw. The tables name only opcodes found in cubins compiled on the CPU for sm_80,
-sm_89, sm_90a, sm_100a and sm_120a (`tests/fixtures/sass/make_fixtures.py` refreshes them
-after a CUDA or Triton upgrade): `HMMA` / `IMMA` / `QMMA` / `OMMA` (`mma.sync`), `HGMMA` /
+opcodes raw. The tables name only opcodes found in cubins compiled on the CPU for sm_75,
+sm_80, sm_86, sm_89, sm_90a, sm_100a and sm_120a (`tests/fixtures/sass/make_fixtures.py`
+refreshes them after a CUDA or Triton upgrade; Turing's forms are `HMMA.1688` and
+`IMMA.8816`): `HMMA` / `IMMA` / `QMMA` / `OMMA` (`mma.sync`), `HGMMA` /
 `QGMMA` / `IGMMA` (wgmma), `UTCHMMA` / `UTCQMMA` / `UTCIMMA` / `UTCOMMA` (tcgen05), and
 e4m3 `mma.sync` on sm_90 / sm_100 shows as `F2FP.F16.E4M3.UNPACK_B` + `HMMA` (emulated).
 Without `cuobjdump` the census says so (`sass.status: unavailable`); `kernel-agent doctor`
@@ -4414,7 +4416,26 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   GPU lacks (the block-scaled `tl.dot_scaled` lowering outside sm_12x, TMA and PDL before sm_90) and
   the CuTe DSL check names the family's peak MMA. The library scout's adapters declare
   their architectures the same way; `doctor` lists which run here (FlashAttention 3 needs
-  sm_90, QuACK lists Hopper / Blackwell / RTX 50; see "Library scout").
+  sm_90, QuACK lists Hopper / Blackwell / RTX 50; see "Library scout"). Where a limit is
+  runtime-only (PDL, cuBLASLt's FP8, `tl.dot` on FMA units below sm_80), `ARCHS_COMPILES`
+  names the wider set its device code compiles for (`gpu_arch.example_compiles`).
+* **Compile matrix** (#256, CPU only). `tests/test_arch_matrix.py` compiles every bundled
+  example and kernel-agent's own device code (graphloop, `mma_peaks`, the PDL probe, the
+  memcheck probe) for sm_75, sm_80, sm_86, sm_89 and sm_120 the way each backend builds it
+  (`load_inline`'s nvcc command, native projects, NVRTC, Triton with the JIT's
+  specialisation, CuTe DSL with fake tensors, TileLang) and fails when an example compiles
+  where its `ARCHS` / `ARCHS_COMPILES` exclude the arch (widen it, or declare it) or does
+  not compile where they include it (with the compiler's error). It also checks Triton's
+  tensor-core forms per arch (no `mma` for 16-bit `tl.dot` on sm_75, s8 m16n8k32 from
+  sm_80, e4m3 m16n8k32 on sm_89), `cp.async` in the W8A8 GEMMs' K loops from sm_80 and
+  shared memory per block against each arch's limit. The Hopper / datacenter Blackwell
+  templates and the Helion examples are left out (with the reason). Verdicts are cached by
+  content in `~/.cache/kernel-agent/arch-matrix` (`KERNEL_AGENT_ARCH_MATRIX_CACHE`: a
+  directory, or `off`): the first run compiles 305 units (176 s on 12 cores at load 6 with
+  6 parallel compiles, 213 s at load 13; nvcc parsing the torch headers is 94 % of it),
+  later ones read them back in under a second and recompile only what changed (an `ARCHS`
+  edit in a CUDA example recompiles nothing). `uv run --no-sync python
+  tests/arch_matrix.py` prints the table.
 * **Builds.** `load_inline` compiles for the GPU's arch (`TORCH_CUDA_ARCH_LIST`, unless
   set); on Hopper and datacenter Blackwell for the arch-specific target (`9.0a`,
   `10.0a`), where `wgmma` / `tcgen05` and CUTLASS's sm_90 / sm_100 kernels live.
@@ -4426,12 +4447,12 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   policy rows name them. They compile for `sm_90a` / `sm_100a` on the CPU and their PTX
   has `wgmma.mma_async` / `tcgen05.mma` + `tcgen05.alloc` + `tcgen05.ld` and TMA
   (`tests/test_cute_examples.py`); **not run on an H100 or B200 yet**.
-* **Tested** on the CPU with faked GPUs (sm_80, sm_86, sm_89, sm_90, sm_100, sm_120:
-  `tests/test_gpu_arch.py`; a T4, sm_75, with its toolchain, `doctor --smoke` and policy:
-  `tests/test_turing.py`) and run on an RTX 5070 Ti. The CUDA weight-only examples
-  were compiled for sm_80 / 86 / 89 / 90 / 100 / 120 on the CPU, the CuTe DSL templates
-  above for sm_90a / sm_100a; on other GPUs nothing has run yet: `kernel-agent doctor
-  --smoke` is the first check there.
+* **Tested** on the CPU with faked GPUs (T4 sm_75, A100 sm_80, RTX 3090 and A10 sm_86,
+  L40S and L4 sm_89, sm_90, sm_100, sm_120: `tests/test_gpu_arch.py`; a T4 with its
+  toolchain, `doctor --smoke` and policy: `tests/test_turing.py`), the compile matrix
+  above, and run on an RTX 5070 Ti; the CuTe DSL templates compile for sm_90a / sm_100a.
+  On other GPUs nothing has run yet: `kernel-agent doctor --smoke` is the first check
+  there.
 
 ### Dtype and memory by GPU
 
@@ -5816,6 +5837,10 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pyt
 ```
 
 GPU tests are marked `gpu` and skipped when no CUDA device is present.
+`tests/test_arch_matrix.py` (in the CPU suite) compiles every example for sm_75 / sm_80 /
+sm_86 / sm_89 / sm_120 ("Any NVIDIA GPU"); its first run takes minutes, then its cached
+verdicts make it take a second (`KERNEL_AGENT_ARCH_MATRIX_JOBS` bounds its parallel
+compiles; `uv run --no-sync python tests/arch_matrix.py` prints the table).
 `uv run pytest --repeat 50 --load 8 <tests>` runs each test 50 times next to 8 busy
 processes: a test that uses threads, processes or time must pass every time (AGENTS.md,
 "Flaky tests").

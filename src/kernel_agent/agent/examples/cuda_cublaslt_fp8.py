@@ -79,6 +79,8 @@ from kernel_agent.kernels.quant import (
 #: it elsewhere and says why).
 ARCHS = "sm_89+"
 ARCHS_WHY = "cuBLASLt FP8 GEMMs (tensor-wise: sm_89+; the MXFP8 mode needs sm_100+)"
+#: GPUs its device code compiles for (the FP8 limit is cuBLASLt's, at run time).
+ARCHS_COMPILES = "sm_75+"
 
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)

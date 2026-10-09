@@ -55,6 +55,8 @@ from kernel_agent.kernels.quant import (
 #: it elsewhere and says why).
 ARCHS = "sm_100+"
 ARCHS_WHY = "block-scaled FP8 tensor cores (F.scaled_mm BlockWise1x32, cuBLASLt VEC32_UE8M0)"
+#: GPUs its quantiser compiles for (Triton's e4m3 type: sm_89+; the GEMM is cuBLASLt's).
+ARCHS_COMPILES = "sm_89+"
 
 #: The activation scale rule: ``ceil`` (2^ceil(log2(amax / 448))) or ``floor`` (the OCP rule,
 #: saturating: rejected by the evaluator's scale-rule guard).
