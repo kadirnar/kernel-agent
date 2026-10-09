@@ -3,7 +3,8 @@
 Regenerated together with the charts after every phase (:func:`refresh`) and, through the
 run's :class:`Refresher` (one thread, debounced), after evaluations, so it can be left open
 in a browser while a run is going; it reloads itself every 30 s until the report phase is
-done.
+done. Every rewrite first commits the new ledger rows to ``experiments.git``
+(:func:`kernel_agent.expgit.sync`), so no evaluation waits for git either.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import charts, ledger
+from kernel_agent import charts, expgit, ledger
 from kernel_agent.agent import auth
 from kernel_agent.workspace import RunDir
 
@@ -41,6 +42,7 @@ def refresh(run: RunDir, target_id: str | None = None) -> None:
 def _refresh(run: RunDir, targets: list[str] | None) -> None:
     """:func:`refresh` of the progress charts of ``targets`` (None: of every target)."""
     global _warned
+    expgit.sync(run)  # the experiments' git history (#224) first; it never raises
     try:
         with _lock:
             charts.write_charts(run, targets=targets)

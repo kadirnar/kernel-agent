@@ -612,7 +612,11 @@ def render_diff(run: RunDir, a_exp: int, b_exp: int | None) -> tuple[str, int]:
     for e in (a, b):
         if not e.files:
             return f"exp {e.exp}: its files are not recorded", 1
-    return diff(run, a, b).rstrip("\n") or f"exp {a.exp} and exp {b.exp}: the same code", 0
+    from kernel_agent import expgit  # it imports this module
+
+    text = expgit.diff(run, a.exp, b.exp)  # git diff exp/B exp/A once both are committed
+    text = diff(run, a, b) if text is None else text
+    return text.rstrip("\n") or f"exp {a.exp} and exp {b.exp}: the same code", 0
 
 
 # ------------------------------------------------------------------ the CLI
@@ -662,22 +666,28 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
     """``kernel-agent exp`` (``sub``: the CLI's subparsers)."""
     p: argparse.ArgumentParser = sub.add_parser(
         "exp",
-        help="the run's experiments: summary, list, show, diff",
+        help="the run's experiments: summary, list, show, diff, git",
         description="The run's experiments (results.tsv rows; read only, safe on a live run):\n"
         "  kernel-agent exp RUN                 headline, lineages, kept improvements by gain\n"
         "  kernel-agent exp list RUN [--lineage ID|model] [--status keep|discard|failed]\n"
         "                       [--kind K] [--session S] [--last N] [--tsv]\n"
         "  kernel-agent exp show RUN N          row, hypothesis, record, files, parent diff\n"
-        "  kernel-agent exp diff RUN A [B]      A's code against B (default: A's parent)",
+        "  kernel-agent exp diff RUN A [B]      A's code against B (default: A's parent)\n"
+        "  kernel-agent exp git RUN [--sync | --rebuild [--out DIR]] [-- GIT ARGS]\n"
+        "                                       the experiments.git history (expgit.py)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("command_or_run", metavar="RUN | list | show | diff")
+    p.add_argument("command_or_run", metavar="RUN | list | show | diff | git")
     p.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     return p
 
 
 def main(ns: argparse.Namespace) -> int:
     word, rest = ns.command_or_run, list(ns.args)
+    if word == "git":  # the git history of the experiments (#224)
+        from kernel_agent import expgit
+
+        return expgit.main(rest)
     if word not in COMMANDS:
         if rest:
             raise SystemExit(f"kernel-agent exp: unexpected {' '.join(rest)!r}")
