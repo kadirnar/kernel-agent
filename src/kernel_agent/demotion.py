@@ -62,7 +62,9 @@ PRECISION_COSINE = 0.9
 NEXT_IDEAS = (
     "per-token outer scales where one per call was used",
     "a Hadamard rotation of the remaining W4A4 layers (`quant.hadamard_rotate`, measure it)",
-    "a correction of e2m1's norm bias (quantised activations shrink a GEMM's output by up to ~1 %)",
+    "the opt-in correction of e2m1's norm bias (quantised activations shrink a GEMM's output by "
+    "~1 % along the exact one: `unbiased=True` of `quant.quantize_fp4` / `fp4_w4a4_linear`, the "
+    "producers' per-token factor in `triton_fp4_producers.py`)",
     "bf16 for the most sensitive group",
 )
 

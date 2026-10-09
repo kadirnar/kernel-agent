@@ -33,7 +33,9 @@ examples of each:
   2]`` (as :func:`~kernel_agent.kernels.quant.quantize_fp4_activations`; not read by the
   guard: the tiers judge them), scales unswizzled ``[rows, K / 16]`` e4m3 (NVFP4) or ``[rows,
   K / 32]`` e8m0 (MXFP4; uint8 bits or values too), ``outer`` fp32 ``[rows]`` or one value
-  per call (MXFP4: may be left out, ``(codes, scales)``); a quantiser that rotates its input
+  per call (MXFP4: may be left out, ``(codes, scales)``; with the opt-in norm-bias correction,
+  the quantiser's own outer scale, not the epilogue's ``outer x`` :func:`~kernel_agent.kernels.
+  quant.fp4_bias_correction`); a quantiser that rotates its input
   first (``quant.hadamard_rotate``) returns the rotated activations as a fourth element,
   which its scales are checked against. The swizzled 128 x 4 layout the
   GEMMs read (``swizzle_fp4_scales``) is refused with that reason: the hook returns the

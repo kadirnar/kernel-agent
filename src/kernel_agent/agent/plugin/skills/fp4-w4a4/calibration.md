@@ -72,6 +72,51 @@ An unwritten output channel stays within W4A4's noise (as with FP4 weights), and
 that ends in a normalisation hides a scale error: the perceptual gate judges those end to
 end. The tiers are calibrated for single layers and blocks; a deep stack accumulates more.
 
+## Norm bias and its correction (opt-in `unbiased=True`)
+
+Where the shrink comes from: e2m1's bins at 0 (everything below a quarter step), 2 and 4 round
+more values down than up, so a quantised block keeps less of its component along itself
+(`x^ ~ a x + e`, `a < 1`) while the noise `e` adds to its norm. A GEMM's output then has an
+in-phase gain `<y^, y> / |y|^2` below 1, partly hidden in its norm by the noise.
+`quant.fp4_bias_correction` returns `c = sum x^2 / sum x x^` per row (= `1 / a`): per token
+for the activations (a factor of the epilogue's per-token scale), per output channel for the
+weight (in its tensor scale, `quantize_fp4(w, unbiased=True)`). Codes, block scales and the
+outer scale the guard checks do not change.
+
+Measured on Qwen3-0.6B (every q / k / v / o / gate / up / down of its 28 layers on 334 tokens
+of six texts, the GEMMs emulated from the codes on the CPU; `norm_bias.py`,
+`results/norm_bias.out`); means over the 196 GEMMs, the MLP (gate / up, SiLU, down, every
+GEMM quantised) median over the layers:
+
+| variant | gain - 1 | norm | rel L2 | cosine | MLP gain - 1 / norm |
+|---|---|---|---|---|---|
+| NVFP4 (block maximum to 6) | -0.86 % | -0.20 % | 0.1121 | 0.99337 | -2.45 % / -0.26 % |
+| adaptive (maximum to 4 or 6, lower block error), activations | -1.09 % | -0.46 % | 0.1094 | 0.99369 | -2.74 % / -0.70 % |
+| adaptive, both operands | -1.00 % | -0.41 % | 0.1058 | 0.99410 | -2.41 % / -0.59 % |
+| per-token factor (least squares `sum x x^ / sum x^^2`) | -1.34 % | -0.69 % | 0.1118 | 0.99340 | -3.80 % / -1.74 % |
+| per-token factor (`|x| / |x^|`) | -0.94 % | -0.28 % | 0.1118 | 0.99340 | -2.71 % / -0.58 % |
+| per-token factor (`sum x^2 / sum x x^`) | -0.54 % | +0.13 % | 0.1119 | 0.99340 | -1.60 % / +0.57 % |
+| per-token and per-channel factors (`unbiased`) | -0.10 % | +0.57 % | 0.1122 | 0.99341 | -0.37 % / +1.86 % |
+| adaptive (both) and per-token factor | -0.24 % | +0.35 % | 0.1059 | 0.99412 | -0.37 % / +1.57 % |
+| adaptive (both) and both factors | +0.11 % | +0.70 % | 0.1061 | 0.99412 | +0.53 % / +2.57 % |
+
+The adaptive rule (with the outer scale `amax / (4 x 448)`, so that a block mapped to 4 never
+clamps at 448) lowers the error but deepens the shrink: it is not in the library. The factors
+remove the shrink at no error cost; the norm then shows the noise (+rel L2^2 / 2: Qwen3's MLPs
+at relative L2 ~0.2 go to +1.9 %). The last layer's MLP loses half its in-phase gain with
+every variant (cosine 0.89): the sensitivity probe's 8-bit layers are the answer there.
+
+When: a W4A4 target that fails its gate on the norm with a small error (the LocDiT layer:
+relative L2 0.036, norm -3.4 %: bias, not noise; the correction is expected to take most of it,
+not measured here), or a deep stack where the in-phase loss compounds. Not by default: where
+the noise dominates the norm already sits near 1 and the correction lifts it above. On an A10
+the producers' factor (`triton_fp4_producers.py`, `unbiased=True`) costs 5-35 % of the
+producer and is within 4e-7 of the reference; the MLP module with it moves Qwen3-0.6B layers
+5 / 14 / 20 from an in-phase gain of 0.977 / 0.972 / 0.980 to 0.995 / 0.995 / 0.998 (relative L2
+0.211 -> 0.214). Both factors are epilogue scales: free in a custom epilogue (CuTe's `acc *
+sx[m] * sw[n]`); `F.scaled_mm`'s two-level recipe takes tensor-wise second-level scales only
+(fp32 output and the epilogue in torch there, as `fp4_w4a4_linear`).
+
 ## The scale-rule guard (`kernels/scale_guard.py`)
 
 The hook `quantize_activations(x) -> (codes, scales, outer)`: codes packed two per byte

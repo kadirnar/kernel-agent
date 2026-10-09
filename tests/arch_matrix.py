@@ -135,6 +135,12 @@ _FP8_ROWS = {
     "_rmsnorm_fp8_kernel": "x w: *bf16; q: *fp8e4nv; M K ldx: i32/16; eps: fp32",
     "_silu_mul_fp8_kernel": "g u: *bf16; q: *fp8e4nv; M K ldg ldu: i32/16",
 }
+#: The FP4 producers' own arguments (codes, scales, outer and epilogue scales are shared).
+_FP4_ROWS = {
+    "_quant_rows_kernel": "x: *bf16; M K ldx: i32/16",
+    "_rmsnorm_fp4_kernel": "x w out: *bf16; M K ldx: i32/16; eps: fp32",
+    "_silu_mul_fp4_kernel": "g u out: *bf16; M K ldg ldu: i32/16",
+}
 
 #: The Triton kernels of each example (and of kernel-agent's own Triton probes), as their
 #: launches specialise them (recorded on the RTX 5070 Ti with tiny inputs; the FP8 GEMM's
@@ -276,6 +282,23 @@ TRITON: dict[str, list[TritonSpec]] = {
             label="mx" if mx else "per-token",
         )
         for kernel, args in _FP8_ROWS.items()
+        for mx in (False, True)
+    ],
+    # NVFP4 as the W4A4 MLP launches them (swizzled scales, the bias factor) and MXFP4 rows
+    "triton_fp4_producers.py": [
+        TritonSpec(
+            kernel,
+            args + "; q s: *u8; o e: *fp32; outer_step: fp32",
+            {
+                "MX": mx,
+                "SWIZZLE": not mx,
+                "UNBIASED": not mx,
+                **({} if kernel == "_quant_rows_kernel" else {"WRITE": False}),
+                "BLOCK": 1024,
+            },
+            label="mxfp4" if mx else "nvfp4",
+        )
+        for kernel, args in _FP4_ROWS.items()
         for mx in (False, True)
     ],
     "triton_mxfp8_gemm.py": [

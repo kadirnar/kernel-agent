@@ -1,0 +1,20 @@
+NVIDIA A10 2.10.0+cu128 triton 3.6.0
+Qwen3-0.6B, 334 tokens, 28 layers
+residual-stream token crest up to 32 (massive activations)
+  rmsnorm_fp4          bit for bit the reference in 56/56; bf16 output = eager's: 99.995 % of the elements at least (mean 100.000 %); codes of eager's output: 99.999 % equal at least; bias factor within 3.6e-07 of the reference (factors 0.9506 .. 1.0602)
+  silu_mul_fp4         bit for bit the reference in 28/28; bf16 output = eager's: 100.000 % of the elements at least (mean 100.000 %); codes of eager's output: 100.000 % equal at least; bias factor within 3.5e-07 of the reference (factors 0.9575 .. 1.0415)
+  silu_mul_fp4 merged  bit for bit the reference in 28/28
+  quantize_rows        bit for bit the reference in 28/28
+  synthetic 1 x 16 (1e-30 .. 1e30, CPU reference): True
+  synthetic 17 x 48 (1e-30 .. 1e30, CPU reference): True
+  synthetic 300 x 1024 (1e-30 .. 1e30, CPU reference): True
+  synthetic 129 x 4096 (1e-30 .. 1e30, CPU reference): True
+  synthetic 64 x 16384 (1e-30 .. 1e30, CPU reference): True
+  scale-rule guard: {'ok': True, 'checked': True, 'captured': {'format': 'nvfp4', 'blocks': 21376, 'saturated': 0, 'worst_ratio': 6.375, 'underflow': 0, 'coarser': 0}, 'stress': {'format': 'nvfp4', 'blocks': 21376, 'saturated': 0, 'worst_ratio': 6.0, 'underflow': 0, 'coarser': 0}}
+  W4A4 MLP (layer 5, GEMMs emulated, unbiased=False): equal to the reference chain in 100.000 % of the outputs (rel L2 0.00e+00); against bf16: rel L2 0.2111, in-phase gain 0.9768, norm 0.9991
+  W4A4 MLP (layer 5, GEMMs emulated, unbiased=True): equal to the reference chain in 99.998 % of the outputs (rel L2 9.32e-06); against bf16: rel L2 0.2139, in-phase gain 0.9951, norm 1.0178
+  W4A4 MLP (layer 14, GEMMs emulated, unbiased=False): equal to the reference chain in 100.000 % of the outputs (rel L2 0.00e+00); against bf16: rel L2 0.2173, in-phase gain 0.9724, norm 0.9960
+  W4A4 MLP (layer 14, GEMMs emulated, unbiased=True): equal to the reference chain in 99.995 % of the outputs (rel L2 4.74e-05); against bf16: rel L2 0.2200, in-phase gain 0.9953, norm 1.0193
+  W4A4 MLP (layer 20, GEMMs emulated, unbiased=False): equal to the reference chain in 100.000 % of the outputs (rel L2 0.00e+00); against bf16: rel L2 0.1954, in-phase gain 0.9804, norm 0.9995
+  W4A4 MLP (layer 20, GEMMs emulated, unbiased=True): equal to the reference chain in 99.999 % of the outputs (rel L2 8.05e-06); against bf16: rel L2 0.1978, in-phase gain 0.9977, norm 1.0171
+  evaluator (near-lossless-fp4a, GatedMLP 1024 -> 3072): correct True, status ok, max rel L2 0.2319, scale rule checked True ok True, speedup 0.152 (emulated GEMMs: not a speed claim)

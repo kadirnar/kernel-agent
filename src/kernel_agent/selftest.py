@@ -237,6 +237,11 @@ W4A4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
 CUTE_W4A4_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     "cute_nvfp4_w4a4_gemm.py": (1024, 8192, [((4, 176), 100), ((300,), 0), ((17,), 0)]),
 }
+#: The W4A4 producers' example (``triton_fp4_producers.py``: RMSNorm / SiLU-mul writing NVFP4,
+#: a gated MLP with W4A4 GEMMs), as :data:`PRODUCER_EXAMPLES` (a :class:`GatedMLP`).
+W4A4_PRODUCER_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
+    "triton_fp4_producers.py": (1024, 4096, [((64, 11), 540), ((3, 5), 0)]),
+}
 
 
 class GemvChain(nn.Module):
@@ -601,13 +606,15 @@ def smoke_fp4(
     *,
     precision: str = "fp4_weights",
     examples: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] | None = None,
+    capture: Any = None,
 ) -> bool:
     """Every FP4 example of ``precision`` (:data:`FP4_EXAMPLES`; ``fp4_w4a4``:
-    :data:`W4A4_EXAMPLES`, or ``examples``) passes the evaluator in its own tier
-    (near-lossless-fp4, near-lossless-fp4a), and the 8-bit near-lossless tier (a quick check)
-    rejects it: FP4 needs its own tier; a W4A4 example's ``quantize_activations`` is checked
-    by the scale-rule guard (and passes it). Once per activation dtype the example declares
-    (:func:`example_dtypes`)."""
+    :data:`W4A4_EXAMPLES`, or ``examples`` captured with ``capture``, default
+    :func:`make_linear_capture`) passes the evaluator in its own tier (near-lossless-fp4,
+    near-lossless-fp4a), and the 8-bit near-lossless tier (a quick check) rejects it: FP4
+    needs its own tier; a W4A4 example's ``quantize_activations`` is checked by the
+    scale-rule guard (and passes it). Once per activation dtype the example declares
+    (:func:`example_dtypes`; bf16 only with a ``capture`` that takes no ``dtype``)."""
     from kernel_agent.kernels.compare import tier_for
     from kernel_agent.kernels.evaluate import run_evaluation
 
@@ -615,21 +622,24 @@ def smoke_fp4(
     tier = tier_for("near-lossless", precision)
     if examples is None:
         examples = W4A4_EXAMPLES if precision == "fp4_w4a4" else FP4_EXAMPLES
+    capture = capture or make_linear_capture
+    typed = "dtype" in inspect.signature(capture).parameters
     for name, (k, n, calls), dtype in [
-        (example, spec, dt) for example, spec in examples.items() for dt in example_dtypes(example)
+        (example, spec, dt)
+        for example, spec in examples.items()
+        for dt in (example_dtypes(example) if typed else ("bfloat16",))
     ]:
-        stem, dt = (name if dtype == "bfloat16" else f"{name}.{dtype}"), getattr(torch, dtype)
-        fp4 = make_linear_capture(
-            tmp / f"{stem}.fp4.pt", k, n, calls, tier=tier, precision=precision, dtype=dt
-        )
-        fp8 = make_linear_capture(
+        stem = name if dtype == "bfloat16" else f"{name}.{dtype}"
+        kw: dict[str, Any] = {"dtype": getattr(torch, dtype)} if typed else {}
+        fp4 = capture(tmp / f"{stem}.fp4.pt", k, n, calls, tier=tier, precision=precision, **kw)
+        fp8 = capture(
             tmp / f"{stem}.fp8.pt",
             k,
             n,
             calls,
             tier="near-lossless",
             precision="fp8_weights",
-            dtype=dt,
+            **kw,
         )
         result = run_evaluation(fp4, EXAMPLES_DIR / name)
         rejected = run_evaluation(fp8, EXAMPLES_DIR / name, quick=True)
@@ -927,6 +937,14 @@ def smoke_backends(backends: list[str] | None = None, verbose: bool = False) -> 
             ok &= smoke_fp8(Path(tmp), verbose, precision="fp8_mx")
         if runs(W4A4_EXAMPLES, "triton") and hasattr(torch, "float4_e2m1fn_x2"):  # #233
             ok &= smoke_fp4(Path(tmp), verbose, precision="fp4_w4a4")
+        if runs(W4A4_PRODUCER_EXAMPLES, "triton") and hasattr(torch, "float4_e2m1fn_x2"):
+            ok &= smoke_fp4(
+                Path(tmp),
+                verbose,
+                precision="fp4_w4a4",
+                examples=W4A4_PRODUCER_EXAMPLES,
+                capture=make_mlp_capture,
+            )
         for precision, found in (
             ("int8_w8a8", INT8_W8A8_EXAMPLES),
             ("int8_weights", INT8_WEIGHT_EXAMPLES),
