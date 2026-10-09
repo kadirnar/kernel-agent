@@ -187,6 +187,63 @@ def activity_type(e: Any) -> str:
     return "cpu_op"
 
 
+#: Tiny kernels :func:`start_warm` launches between preparing and starting a trace.
+WARM_KERNELS = 128
+
+
+def warm_up(kernels: int = WARM_KERNELS) -> None:
+    """Launch ``kernels`` tiny kernels and wait for them (:func:`start_warm`)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    for _ in range(kernels):
+        torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+
+
+def start_warm(prof: Any, kernels: int = WARM_KERNELS) -> None:
+    """Start the trace of ``prof`` (a ``torch.profiler.profile`` not entered, or one with
+    ``prepare_trace`` / ``start_trace``) after ``kernels`` tiny kernels launched between
+    preparing it (CUPTI's activities enabled) and starting it. Once a process has been
+    through some earlier work, CUPTI loses the first kernel records of a new session: their
+    launches are recorded, the kernels are not (measured on an NVIDIA A10, torch 2.10: the
+    session's first 3 kernels after the evaluator's GPU tests, 10 after a few more test files,
+    the same count in every following session). In the activity check those were the
+    reference's kernels, so a candidate that relaunched them looked like a kernel of its own
+    (no ``fallback``) and its ``custom_kernel_share`` was wrong; a small profiled run lost all
+    of them. Kernels launched while the trace is prepared absorb that loss and are not in the
+    trace (``kernels`` 16 left 0 of 100 lost where 10 were before); stop it as usual
+    (``prof.stop()``). :func:`lost_launches` tells when they were not enough."""
+    prepare = getattr(prof, "prepare_trace", None) or prof._prepare_trace
+    start = getattr(prof, "start_trace", None) or prof._start_trace
+    prepare()
+    warm_up(kernels)
+    start()
+
+
+def lost_launches(events: Iterable[Any], spans: Iterable[tuple[int, int]]) -> int:
+    """Kernel launches inside one of ``spans`` (``(start, end)`` ns) whose kernel the
+    profiler did not record (``events``: :class:`Event` or anything with ``kind``, ``name``,
+    ``start`` and a ``corr`` / ``correlation``): what :func:`start_warm` should have absorbed.
+    0 when every launch there has its kernel."""
+    found = list(events)
+
+    def corr(e: Any) -> int:
+        return int(getattr(e, "corr", getattr(e, "correlation", -1)))
+
+    gpu = {corr(e) for e in found if e.kind in GPU_KINDS}
+    ranges = list(spans)
+    return sum(
+        1
+        for e in found
+        if e.kind in API_KINDS
+        and "LaunchKernel" in e.name
+        and corr(e) not in gpu
+        and any(a <= e.start <= b for a, b in ranges)
+    )
+
+
 def from_profiler(prof: Any) -> list[Event]:
     """The events of a finished ``torch.profiler.profile`` (its Kineto results, without
     exporting a chrome trace: an eager run of a large model has millions of events).

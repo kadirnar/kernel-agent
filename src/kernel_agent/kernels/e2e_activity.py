@@ -42,6 +42,7 @@ from typing import Any, Protocol
 import torch
 
 from kernel_agent.profiling.timeline import activity_type as _activity_type
+from kernel_agent.profiling.timeline import start_warm
 
 #: GPU work of a run may end this long after the caller's stream drained (ns).
 JOIN_SLACK_NS = 2_000
@@ -398,7 +399,7 @@ def profiled_run(
     _synchronize_all()
     prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
     try:
-        prof.start()
+        start_warm(prof)  # CUPTI may lose a session's first kernel records (timeline.py)
     except Exception as exc:
         raise ProfilerUnavailable(f"{type(exc).__name__}: {exc}") from exc
     try:

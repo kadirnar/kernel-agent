@@ -1992,7 +1992,16 @@ timer, the comparator or the reference, or hide work from the timer
   calls into the reference's entrypoint code (`sys.monitoring`). Joined side
   streams pass: those named through `kernel_agent.concurrency` are listed in
   the result (`streams`), other joined streams as `undeclared_streams` (a
-  note).
+  note). Every profiled pass (this one, the end-to-end hidden-work check, the
+  profile's kernel view and the fusion miner's kernel map) launches 128 tiny
+  kernels between preparing its trace and starting it (`timeline.start_warm`):
+  once a process has been through some earlier work, CUPTI loses the first kernel
+  records of a new session (measured on an NVIDIA A10, torch 2.10: 3, then 10 later
+  in the same process), and those were the reference's kernels, so a candidate that
+  relaunched them escaped `fallback`. Kernels launched while the trace is prepared
+  take that loss and are not in the trace. A pass that still lost a launch's kernel
+  inside the reference's or the candidate's calls says so (`lost_kernels`) and is
+  profiled again with a longer warm-up.
 * **Outside the candidate's process** (`run_evaluation`): the candidate's
   outputs from the correctness stage are saved, then compared with the capture
   by the parent process's own comparator. The reference time of each case must
@@ -4084,7 +4093,10 @@ model and starts a new round (`kernel_agent/improve.py`,
   events instead of failing, and lets compiled code whose guards the hooks
   break run eagerly rather than recompile. `profile/summary.md` lists these
   regions and the module calls that replay CUDA graphs (`module_gaps` in
-  `profile.json`); their kernels are in the kernel view.
+  `profile.json`); their kernels are in the kernel view. A replay is seen through
+  torch's replay hook (`register_graph_replay_start_hook`, torch 2.14), on a torch
+  without it (2.10) by wrapping `CUDAGraph.replay` for the profile: there a graph
+  replayed inside a module call went unseen (measured on an NVIDIA A10).
 * **Concurrent sessions** (`--agents N`, issue #183, [docs/MULTIAGENT.md](docs/MULTIAGENT.md)).
   `--agents 1` is the loop above: one session at a time. With `--agents N` (default
   3, since clean timing under load, #185) the one coordinator process keeps up to N

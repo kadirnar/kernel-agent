@@ -459,8 +459,10 @@ def test_events_of_different_kinds_are_left_untimed():
     start.record()
     end.record()
     torch.cuda.synchronize()
-    with pytest.raises(RuntimeError, match=r"torch\.Event"):
-        start.elapsed_time(end)  # what stopped the round-3 re-profile
+    # what stopped the round-3 re-profile (torch 2.14 names torch.Event; torch 2.10 says
+    # "Event device type CUDA does not match other's device type CPU.")
+    with pytest.raises(RuntimeError, match=r"torch\.Event|does not match other's device type"):
+        start.elapsed_time(end)
     assert ModuleTimer._elapsed_ms(_Call("m", "M", "()", -1, start, end)) is None
     same = torch.cuda.Event(enable_timing=True)
     same.record()
