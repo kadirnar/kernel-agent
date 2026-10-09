@@ -6,7 +6,8 @@ slow the reference, hide work on side streams or threads, or fall back to the
 reference.  The guards (all run by :mod:`kernels.evaluate`):
 
 * :class:`Snapshot`: identities of the timing / synchronisation primitives
-  (``torch.cuda.Event``, ``torch.cuda.synchronize``, ``time.perf_counter``), the
+  (``torch.cuda.Event``, ``torch.cuda.synchronize``, ``time.perf_counter``,
+  ``torch.cuda.CUDAGraph``), the
   evaluator's own functions and constants (``compare.TOLERANCES``, ...),
   ``torch``, ``torch.Tensor``, ``torch.nn.functional`` and the ``forward`` of
   every ``torch.nn`` module class, every method of the reference's module classes
@@ -221,6 +222,7 @@ class Snapshot:
             _watch("torch.cuda", torch.cuda),
             _watch("torch.cuda.Event", torch.cuda.Event),
             _watch("torch.cuda.Stream", torch.cuda.Stream),
+            _watch("torch.cuda.CUDAGraph", torch.cuda.CUDAGraph),  # graph timing (#226)
             _watch("kernel_agent.kernels.compare", compare, constants=True),
             _watch("kernel_agent.kernels.bench", bench, constants=True),
             _watch("kernel_agent.kernels.verify", verify, constants=True),

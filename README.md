@@ -953,9 +953,10 @@ call), an FP8 MLP composed from the examples (merged gate / up GEMV, `silu *
 up` in torch, down GEMV) streams the base LM decode MLP in 48.8 us instead of
 92.1 us (1.89x) and the LocDiT MLP (`[2, 11, 1024]`) in 22.8 us instead of
 33.7 us (1.48x); called eagerly, its extra launches make the LocDiT one slower
-(61 vs 37 us): a fused FP8 MLP is the agent's job. The module evaluator times
-eager calls with a warm L2: a weight that fits in L2 stays cached between its
-calls, so FP8 gains less there (the GEMV on [2048, 6144]: 1.3-1.7x, the skinny
+(61 vs 37 us): a fused FP8 MLP is the agent's job. Timed as eager calls with a warm L2
+(the module evaluator's context before #226, still a target's when the profile says
+so: "Timing context"), a weight that fits in L2 stays cached between its calls, so
+FP8 gains less there (the GEMV on [2048, 6144]: 1.3-1.7x, the skinny
 GEMM on `[2, 11, 1024]`: 1.4x; host overhead ~16-19 us per call included),
 while the merged gate + up weight (50 MB, more than L2; `doctor --smoke`'s
 GEMV case) measures 2.0x. A bf16 reference that only just fits in L2 can time
@@ -992,8 +993,9 @@ RTX 5070 Ti:
 | [1, 2048] x [2048, 2048] (LM q / o) | 11.9 us | 6.3 us | 3.9 us | 3.1x / 1.6x |
 | [4, 2048] x [2048, 6144] | 31.5 us | 17.9 us | 19.9 us (ALU bound) | 1.6x / 0.9x |
 
-With a warm L2, as the module evaluator times, FP4 and FP8 GEMVs take about
-the same time (host overhead and latency, not bandwidth): judge FP4 streamed
+With a warm L2, as the module evaluator timed every target before #226, FP4
+and FP8 GEMVs take about the same time (host overhead and latency, not
+bandwidth): judge FP4 streamed
 and end to end. On VoxCPM2, NVFP4 everywhere passes the perceptual gate but
 misses the teacher-forcing floor by 0.002; NVFP4 in both LMs with the LocDiT
 in FP8 passes every check ("Quality modes").
@@ -1269,6 +1271,36 @@ copies made before timing. A module's speedup is weighted by how
 often each captured shape runs per inference. The end-to-end speedup is
 wall-clock latency of the whole workload, unless the run optimises another
 metric.
+
+**Timing context** (#226, `kernel_agent/kernels/context.py`). A module is timed the
+way it runs in the model, read from the run's newest profile, never from names:
+
+* *eager* or *graph*: inside a CUDA-graphed stage (at least 50 % of the GPU events
+  of the timeline stage that holds the target's instance launched by graph replays)
+  the reference and the candidate are timed as 12 calls captured in one CUDA graph
+  (private memory pool; the case's module state and inputs with mutable state written
+  back by a restore graph before every replay, outside the events). Host time is not
+  paid there: an FP8 GEMM of two Triton launches at M = 352 (VoxCPM2's LocDiT QKV,
+  1024 → 2560, RTX 5070 Ti) measured 0.58x eagerly and 2.01x graph-timed with a cold
+  L2, the verdict that flipped VoxCPM2's slice 8 (9.74 → 9.03 ms per audio second once
+  kept). A call that cannot be captured (a host sync, a CPU tensor, a cache grown with
+  `torch.cat`) leaves the evaluation eager, and the result says why.
+* *warm* or *cold* L2: cold when the work the rest of the model touches between two
+  calls of one instance exceeds the GPU's L2 (`classes[].work` of a profile that sees
+  the whole model, `GPUInfo.l2_cache_mb`: Qwen3-0.6B's decoder layer has ~1.1 GB
+  between its decode calls). Cold reads a random buffer of twice the L2 before every
+  call: in a graph, a graph of the flushes alone is replayed next to it and subtracted
+  (a read, not a memset: a memset's dirty lines made the subtraction 10-13 µs short per
+  call); eagerly, the flush is waited for, so the call's host time still counts. The
+  speed of light uses DRAM bandwidth then.
+
+The result names the context (`context`, `l2`, `context_reason`); `speedup` and
+`pct_of_sol` are measured in it. A winner (or `profile=true`) is timed in the other
+context too (2 rounds): `timing` per case and `speedup_by_context` hold both, or
+`graph: unavailable (<why>)` for a candidate that cannot be captured or whose graph
+replay computes something else, which would break a graphed stage. The candidate-free
+reference timing and the re-check of winners time in the result's context.
+Evaluator schema 3 (earlier records: eager, warm L2).
 
 The kernel view of `analyze`'s profile (`torch.profiler`: kernel times,
 launches and the GPU busy share behind "launch/CPU bound" or "GPU bound" in
@@ -2366,8 +2398,9 @@ precision or another algorithm moves.
   bandwidth)`, `pct_of_sol = 100 × sol_ms / new_ms` and `bound`. `bound` is
   `compute`, `memory`, or `launch` when `sol_ms` is below the launch floor
   (one launch from Python costs more than the work). Cases whose bytes fit in
-  L2 are compared with the L2 bandwidth (`l2_resident`), because the benchmark
-  reuses the same inputs and runs them with a warm cache. The result also has
+  L2 are compared with the L2 bandwidth (`l2_resident`) when the target is timed
+  with a warm L2 (the benchmark reuses the same inputs); with a cold one ("Timing
+  context") every case is compared with the DRAM bandwidth. The result also has
   the weighted `pct_of_sol` (cases weighted by calls per run), `sol_ms_weighted`,
   the dominant `bound` and `launch_floor_ms`.
 * A `fp8_weights` target (its capture's `precision`, see "Low-precision
@@ -4698,6 +4731,7 @@ kernel-agent program init [path]       write the default program.md for editing
 kernel-agent eval capture.pt candidate.py [--profile] [--compile-baseline] [--compile-check]
                                        [--quick] [--timeout 300]
                                        [--sweep configs.json [--max-configs 32]]
+                                       [--context eager|graph] [--l2 warm|cold]
                                        (a full capture, e.g. <run_dir>/.truth/captures/<id>.pt)
 kernel-agent recheck capture.pt candidate.py [--seeds 3] [--seed S] [--speedup X] [--no-evaluate]
                                        fresh inputs, reference and candidate in separate

@@ -255,5 +255,7 @@ def test_evaluator_times_before_the_profiled_pass(tmp_path, monkeypatch):
     capture = make_rmsnorm_capture(tmp_path / "rms.pt", hidden=1024)
     result = evaluate(capture, EXAMPLES_DIR / "triton_rmsnorm.py")
     assert result["status"] == "ok", result
-    assert order == ["timing", "timing", "profiler"]
+    # two cases, and a winner's other timing context (#226), all before the profiler
+    timed_twice = isinstance(result["speedup_by_context"].get("graph"), float)
+    assert order == ["timing"] * (4 if timed_twice else 2) + ["profiler"], result
     assert all(case["clock"] >= bench.CLOCK_OK for case in result["cases"]), result["cases"]

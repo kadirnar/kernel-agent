@@ -19,7 +19,9 @@ from scratch, with nothing shared with the evaluation:
    disk; then a *candidate* subprocess builds the candidate, runs it on the same
    fresh inputs, saves its outputs and post-call state, and times it the same way
    (:func:`kernels.bench.time_call`, median of ``rounds`` rounds, after
-   :func:`kernels.bench.warm_gpu`) and runs the fresh inputs once more after timing
+   :func:`kernels.bench.warm_gpu`, in the timing context of the evaluator's verdict: eager or
+   CUDA graph, warm or cold L2, #226; a graph capture that fails leaves the re-check untimed)
+   and runs the fresh inputs once more after timing
    (a kernel that changes behaviour after its first calls), under the evaluator's
    integrity snapshot;
 3. the parent compares them with the strict comparator (:mod:`kernels.compare`:
@@ -152,10 +154,14 @@ def _time_cases(
     entries: list[dict[str, Any]],
     rounds: int,
     replay: Any,
+    timing: dict[str, Any] | None = None,
 ) -> list[Any]:
     """``[median ms, spread]`` per case (None: not timed) on the first seed's inputs, of the
-    module ``holders[0]`` (every call from the case's module state: ``replay``)."""
+    module ``holders[0]`` (every call from the case's module state: ``replay``), in the
+    timing context ``timing`` (``context``, ``l2_flush``: :func:`kernels.bench.time_call`)."""
     from kernel_agent.kernels.bench import median_round, time_call, warm_gpu
+
+    timing = timing or {}
 
     warm_gpu()
     first = {e["case"]: e for e in reversed(entries)}  # the first seed of every case
@@ -166,7 +172,9 @@ def _time_cases(
             continue
         args, kwargs = copy.deepcopy((first[i]["args"], first[i]["kwargs"]))
         fn = replay.call(case, *holders)
-        best = median_round([time_call(fn, args, kwargs, target_ms=60.0) for _ in range(rounds)])
+        best = median_round(
+            [time_call(fn, args, kwargs, target_ms=60.0, **timing) for _ in range(rounds)]
+        )
         out.append([best["median_ms"], best["spread"]])
     return out
 
@@ -180,8 +188,10 @@ def reference_main(
     capture_sha256: str | None,
     timing: bool,
     rounds: int,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Fresh inputs, the reference's outputs on them and its timing (no candidate here)."""
+    """Fresh inputs, the reference's outputs on them and its timing (no candidate here; in
+    the timing ``context``: ``context``, ``l2_flush``)."""
     import torch
 
     from kernel_agent.profiling.state import Replay
@@ -221,8 +231,27 @@ def reference_main(
         "tier": data.get("tier"),  # the capture's tolerance tier (kernels/compare.py)
     }
     if timing and device == "cuda":
-        result["ms"] = _time_cases((reference,), cases, entries, rounds, replay)
+        _timed(result, (reference,), cases, entries, rounds, replay, context)
     return result
+
+
+def _timed(
+    result: dict[str, Any],
+    holders: tuple[Any, ...],
+    cases: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+    rounds: int,
+    replay: Any,
+    context: dict[str, Any] | None,
+) -> None:
+    """``ms`` of a subprocess's result (:func:`_time_cases`), or ``timing_error`` when the
+    calls cannot be captured in the CUDA graph of a graph-timed verdict."""
+    from kernel_agent.kernels.bench import GraphUnavailable
+
+    try:
+        result["ms"] = _time_cases(holders, cases, entries, rounds, replay, context)
+    except GraphUnavailable as exc:
+        result["timing_error"] = f"graph timing unavailable: {exc}"
 
 
 def candidate_main(
@@ -233,9 +262,11 @@ def candidate_main(
     capture_sha256: str | None,
     timing: bool,
     rounds: int,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The candidate's outputs on the fresh inputs and its timing, under the evaluator's
-    integrity snapshot (taken before the candidate is imported)."""
+    """The candidate's outputs on the fresh inputs and its timing (in the timing
+    ``context``), under the evaluator's integrity snapshot (taken before the candidate is
+    imported)."""
     import torch
 
     import kernel_agent.kernels.bench  # noqa: F401  (binds the timer before the candidate)
@@ -308,7 +339,7 @@ def candidate_main(
             return bad
         result: dict[str, Any] = {"status": "ok", "device": device}
         if timing and device == "cuda":
-            result["ms"] = _time_cases((new, given), cases, entries, rounds, replay)
+            _timed(result, (new, given), cases, entries, rounds, replay, context)
             # the same inputs again: a kernel that changes behaviour after its first calls
             saved["after_timing"] = calls()
             if isinstance(saved["after_timing"], dict):
@@ -487,9 +518,10 @@ def run_recheck(
 ) -> dict[str, Any]:
     """Re-check ``candidate`` on ``capture`` (see the module docstring) under the GPU lock.
 
-    ``verdict``: the evaluator's result (or record) to compare with, ``seed``: the
-    first input seed (default: random), ``capture_sha256``: refuse a capture without
-    this digest (both subprocesses check the bytes they load)."""
+    ``verdict``: the evaluator's result (or record) to compare with (timed in its
+    ``context`` and ``l2``), ``seed``: the first input seed (default: random),
+    ``capture_sha256``: refuse a capture without this digest (both subprocesses check the
+    bytes they load)."""
     import torch
 
     capture, candidate = Path(capture).resolve(), Path(candidate).resolve()
@@ -507,6 +539,9 @@ def run_recheck(
     common = ["--workdir", str(workdir), "--rounds", str(rounds)]
     common += ["--capture-sha256", capture_sha256] if capture_sha256 else []
     common += [] if timing else ["--no-timing"]
+    context = str((verdict or {}).get("context") or "eager")  # the verdict's (#226)
+    common += ["--context", context] if context != "eager" else []
+    common += ["--l2-flush"] if (verdict or {}).get("l2") == "cold" else []
     module = [sys.executable, "-m", "kernel_agent.kernels.recheck"]
     try:
         with gpu_lock() as gpu:  # both processes on this GPU, one after the other
@@ -603,7 +638,9 @@ def _summarise(
     result["cases"] = reports
     result["correct"] = all(r["ok"] for r in reports)
     result["status"] = "ok" if result["correct"] else "incorrect"
-    if total_ref and total_new:
+    if why := ref.get("timing_error") or cand.get("timing_error"):
+        result["timing"] = f"skipped: {why}"  # no speedup to compare with the verdict's
+    elif total_ref and total_new:
         result["speedup"] = round(total_ref / total_new, 3)
         result["timing_spread"] = round(spread, 3)
     elif ref.get("device") != "cuda":
@@ -679,8 +716,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rounds", type=int, default=ROUNDS)
     parser.add_argument("--capture-sha256")
     parser.add_argument("--no-timing", action="store_true")
+    parser.add_argument("--context", choices=("eager", "graph"), default="eager")
+    parser.add_argument("--l2-flush", action="store_true")
     ns = parser.parse_args(argv)
     tag = sys.stdin.readline().strip()  # read before a candidate is imported
+    context = {"context": ns.context, "l2_flush": ns.l2_flush}
     try:
         if ns.role == "reference":
             result = reference_main(
@@ -691,6 +731,7 @@ def main(argv: list[str] | None = None) -> int:
                 capture_sha256=ns.capture_sha256,
                 timing=not ns.no_timing,
                 rounds=ns.rounds,
+                context=context,
             )
         else:
             if ns.candidate is None:
@@ -702,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
                 capture_sha256=ns.capture_sha256,
                 timing=not ns.no_timing,
                 rounds=ns.rounds,
+                context=context,
             )
     except Exception:
         result = {"status": "harness_error", "error": traceback.format_exc()[-3000:]}
