@@ -50,6 +50,9 @@ HF URL ─► resolve (modality, arch, family, size)
                      (workload_profile.md); a region target is first
                      refactored into its own submodule by a Claude
                      "refactor" agent, verified bitwise     [GPU worker]
+        ─► scout     library kernels on each target, no Claude: SDPA backends,
+                     cuBLASLt, installed libraries swept and evaluated; the
+                     bar the engineers start from ("Library scout") [GPU worker]
         ─► kernels   one Claude "kernel engineer" per target (or k isolated
                      workers, --seeds-per-target) writes candidates,
                      calls evaluate_candidate (correctness + interleaved
@@ -3895,6 +3898,116 @@ The prompts and `program.md` tell kernel engineers to tune block sizes,
 `num_warps`, `num_stages` and vector widths with one sweep per idea over a declared
 space instead of one evaluation per value ("declare spaces, not lists").
 
+### Library scout: library kernels as the bar to beat
+
+Our own runs found library choices by hand and late (cuDNN attention over flash at
+11 tokens, cuBLASLt's top algorithms timed instead of its first), and on
+InferenceBench a plain configuration search beat agents (docs/RESEARCH.md). Before a
+target's first engineer session (`optimize`'s kernels phase; `improve` before any
+slice, so targets captured in later rounds too) the **library scout**
+(`kernel_agent/libscout/`, issue #227) tries what libraries give on it, with no
+Claude session, once per target:
+
+1. **Op families** from what the reference calls on its dominant captured case (a
+   `TorchFunctionMode` trace with the data flow between calls, never module names):
+   `sdpa` (q / k / v shapes, GQA, mask, causal), `rms_norm` (`F.rms_norm`, or
+   `rsqrt(mean(x²) + eps)` times `x` written out, casts allowed), `layer_norm`,
+   `softmax`, `linear` (M, N, K, bias), `matmul`, `sampling` (a draw: `multinomial`, or
+   `sort` + `cumsum`; `topk` alone is not), `rotary` (rotate-half), `gated_mlp`.
+2. **Adapters** (`libscout/adapters.py`), each with its families, architectures
+   (`gpu_arch.supports` syntax), dtypes, target precisions, licence and an
+   availability probe (installed, version, import, the library's own check: an
+   incompatible wheel fails its import and is skipped with the error):
+
+   | adapter | library | replaces | GPUs | template |
+   |---|---|---|---|---|
+   | `torch-sdpa` | torch | SDPA pinned to one backend (`sdpa_kernel`): flash, mem-efficient, cuDNN, math | flash / cuDNN: sm_80+, half | run on a GPU |
+   | `torch-rms-norm` | torch | the written-out RMSNorm (about 6 kernels) as `F.rms_norm` (one fused kernel): `FUSE=0` keeps the reference's roundings (the weight multiplied after), `FUSE=1` puts the weight inside | any | run on a GPU |
+   | `cublaslt` | torch + CUDA toolkit | `F.linear` through cuBLASLt: bias in the epilogue, residual add and tanh GELU too (`FUSE`), algorithm per shape: the heuristic's top 8 timed (`ALGO=-1`) or its i-th | sm_80+ | run on a GPU |
+   | `torch-scaled-mm` | torch | `F.linear` as FP8 W8A8 `torch._scaled_mm` (row-wise or tensor-wise scales), `fp8_w8a8` targets only | sm_89+ | run on a GPU |
+   | `flash-attn`, `flash-attn-3` | flash-attn | SDPA without a mask | sm_80+; FA3 sm_90 | from the docs |
+   | `flashinfer-attention`, `flashinfer-norm` | flashinfer-python | single-request decode / prefill attention; RMSNorm | sm_75+ | from the docs |
+   | `quack-rmsnorm`, `quack-softmax` | quack-kernels | RMSNorm; softmax over the last dimension | sm_90, sm_10x, sm_12x | from the docs |
+   | `liger-rmsnorm`, `liger-swiglu` | liger-kernel | RMSNorm; `silu(gate) * up` | sm_80+ | from the docs |
+   | `flashinfer-sampling`, `liger-rope`, `gemlite` | | listed and probed, skipped: a random draw cannot be compared with the reference's; no template yet | | follow-ups |
+
+   An adapter is skipped with the reason when its library is missing or broken, the
+   GPU is outside its architectures, no call site fits (dtype, head size, an explicit
+   mask, `F.rms_norm` already), the target's precision is not one it serves (the
+   reference's own precision passes every tier: those adapters run on every target),
+   or it builds a CUDA extension without a CUDA toolkit.
+3. **Candidates** (`libscout/template.py`): one self-contained file per adapter,
+   `candidates/libscout_<adapter>.py`. TorchDynamo traces the reference's own captured
+   entrypoints into FX graphs; the adapter's `rewrite` (`libscout/fx_rewrites.py`) points
+   the matched nodes at the library; the graphs run eagerly (no Inductor), so every other
+   op launches the reference's own kernels. The reference's Python code is not what runs,
+   so the evaluator's fallback check judges the kernels: a candidate that launches only
+   the reference's kernels (the backend torch already picked) is a `fallback`, one with
+   library kernels has `custom_kernel_share` > 0. Each file declares
+   `KA_LIBRARY = "<package>@<version>"`, `KA_LICENCE` and `ARCHS`, and passes the
+   critic's static checks. The probe builds and calls each once on the dominant case: one
+   that fails there, or whose rewrite finds nothing in Dynamo's graphs, is not swept.
+4. **Op bars** (`libscout/probe.py`): each recorded call an adapter replaces one for one
+   (SDPA, softmax) is called again on its recorded inputs with the reference's op and
+   the library's, checked in the capture's tolerance tier and timed interleaved, as
+   kernel time (replayed from a CUDA graph) and per eager call (host launch cost
+   included). A config whose op bars all lose by more than 10 %, or fail, is not swept.
+5. **Sweeps**: every adapter that runs goes through `sweep_candidate`'s machinery
+   (its configs checked and timed with racing, the best through the full evaluator),
+   the probe and all sweeps under one GPU lock, and is recorded like an agent's sweep:
+   snapshot, `results.jsonl`, a ledger row with `backend` `library:<package>@<version>`,
+   `session` `libscout`, `idea` `library-<adapter>`, the title `library <adapter>:
+   <config>` and the hypothesis `library scout: <what> (<package> <version>) [sweep: ...]`.
+6. **The bar** (`targets/<id>/libscout.json`, `run.json` → `libscout.scouted`): the
+   engineer's first prompt and every improve digest get `## Library bar` (the best scout
+   candidate with its speedup and % of SOL, every adapter's verdict, the op bars, what
+   was not run and why), the planner's round context and `profile/ceilings.md` (also of
+   the newest round) `## Library bars`. It is a floor, never a stop signal: scout rows
+   extend no streak and use no agent's evaluation budget, and a best the scout set
+   retires no arm by the speed-of-light rule or the speedup goal (the scheduler's
+   expected gain stays the floor minus the bar).
+
+The export writes `optimized/requirements.txt` with the exact version of every library
+an exported kernel declares (and `manifest.json` → `libraries` with its licence);
+`kernel-agent doctor` lists the libraries, their versions and licences and which
+adapters can run on the GPU, each other one with the reason. `pip install
+'kernel-agent[libs]'` (flashinfer-python, liger-kernel, quack-kernels, gemlite) adds
+packages without replacing the installed torch (`uv lock` resolves it against the
+locked torch); flash-attn builds from source against it (`pip install flash-attn
+--no-build-isolation`). `--no-library-scout` turns the scout off; a simulated run
+skips it.
+
+`python -m kernel_agent.libscout CAPTURE [--precision P] [--no-sweep] [--json OUT]`
+scouts a capture outside a run (nothing recorded): families, decisions, op bars and
+every sweep's table.
+
+Measured on an RTX 5070 Ti (sm_120, torch 2.14.1), with `python -m kernel_agent.libscout`
+on copies of the runs' captures, on a machine shared with other jobs (load average about
+20: the same reference timed 0.54 to 0.87 ms between runs, so module speedups carry
+±20 %):
+
+| capture | the reference calls | op bar (kernel time, CUDA graph) | scout candidates (full evaluator, eager) | scout |
+|---|---|---|---|---|
+| VoxCPM2 batch 16, `dit_layer` (`MiniCPMDecoderLayer`, [32, 11, 1024]) | sdpa, rms_norm x2 (written out), linear x7, rotary x2, gated_mlp | SDPA, GQA at 11 tokens: the reference's flash 38.6 us, **cuDNN 15.8 us (2.30x)**, mem-efficient 51.0, math 45.6 | `torch-rms-norm` `FUSE=0` **1.26x** keep (`FUSE=1`, one rounding fewer, fails the tolerance); `torch-sdpa` cuDNN 0.98x; `cublaslt`: `ALGO=0` is torch's own kernel (`fallback`), the other algorithms fail the tolerance | 120 s |
+| Qwen3-0.6B, `decoder_layer_decode` (`Qwen3DecoderLayer`, batch 1, KV 513) | sdpa, rms_norm x4, linear x7, rotary x2, gated_mlp | SDPA decode: reference 8.6 us, cuDNN 5.5 us (1.45x) | `torch-rms-norm` 1.35x keep, `torch-sdpa` cuDNN 1.31x (its sweep: 1.01x), `cublaslt` 0.94x | 236 s |
+| Qwen3-0.6B, `attention_decode` | sdpa, rms_norm x2, linear x4, rotary x2 | as above: cuDNN 5.7 vs 9.1 us | `torch-rms-norm` 1.03x, `torch-sdpa` cuDNN 0.89x, `cublaslt` 0.89x | 327 s (5 cuBLASLt configs then, 3 now) |
+| Qwen3-0.6B, `mlp_decode` | linear x3, gated_mlp | | `cublaslt`: `fallback` (cuBLASLt's GEMV is torch's) | 119 s |
+
+* The op bar reproduces the cuDNN-over-flash choice at 11 tokens (16 vs 35 us by hand,
+  `NOTES.md` of the VoxCPM2 run) without an agent. Per eager call cuDNN's SDPA took 33
+  to 122 us in three runs (the reference's 37 to 43 us): its host cost eats the kernel's
+  gain in an eager, launch-bound layer, which is why the hand-found win was a CUDA-graph
+  transform. The bar shows both.
+* Every correct scout candidate launches library kernels the reference does not
+  (`custom_kernel_share` 0.016 to 0.067): no `fallback`; the ones that re-launch the
+  reference's kernels are.
+* Per target: a probe of 7-21 s and one sweep per adapter (26-106 s each: the sweep plus
+  the full evaluation), 2-5 minutes in all on this machine.
+* Against the first agent evaluation of the same targets: VoxCPM2 `dit_layer`'s was a
+  `fallback`, the scout's 3 candidates are 1 faster (1.26x), 1 correct and slower, 1
+  `fallback`; Qwen3 `decoder_layer_decode`'s was 8.05x (a whole-layer CUDA kernel), the
+  scout's 2 of 3 faster (1.35x, 1.31x): a floor, far below what the engineers reached.
+
 ### KernelBench regression suite
 
 `kernel-agent bench-suite` (`kernel_agent/suite.py`, `kernel_agent/kernelbench.py`)
@@ -4015,7 +4128,9 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   supports and lists the rest (`skipped here (...): triton_fp8_w8a8_gemm needs
   sm_89+ (e4m3 tensor cores ...); this GPU is sm_86`). The doctor probes skip what the
   GPU lacks (the block-scaled `tl.dot_scaled` lowering outside sm_12x, TMA and PDL before sm_90) and
-  the CuTe DSL check names the family's peak MMA.
+  the CuTe DSL check names the family's peak MMA. The library scout's adapters declare
+  their architectures the same way; `doctor` lists which run here (FlashAttention 3 needs
+  sm_90, QuACK lists Hopper / Blackwell / RTX 50; see "Library scout").
 * **Builds.** `load_inline` compiles for the GPU's arch (`TORCH_CUDA_ARCH_LIST`, unless
   set); on Hopper and datacenter Blackwell for the arch-specific target (`9.0a`,
   `10.0a`), where `wgmma` / `tcgen05` and CUTLASS's sm_90 / sm_100 kernels live.
@@ -4501,6 +4616,8 @@ kernel-agent optimize <hf-url> [options]
                                        sequential A/B stop (default on; never correctness)
   --no-recheck                         integration: no re-check of kernels on fresh inputs
   --no-library --no-librarian          cross-run kernel library / lessons agent off
+  --no-library-scout                   no library kernels swept before the agents (see
+                                       "Library scout")
   --librarian-model MODEL              (see "Kernel library and lessons")
 
 kernel-agent analyze <hf-url>          baseline + profile only (no Claude)
@@ -4560,6 +4677,7 @@ kernel-agent library import-memory DIR [--write]   Claude Code memory notes → 
 kernel-agent docs build [--offline] [--refresh] | status | search QUERY [--library L] | read ID | path
                                        the local doc library the agents search (see "Doc library")
 kernel-agent doctor [--smoke] [--remeasure-peaks] [--fetch-sanitizer] [--no-probes]
+python -m kernel_agent.libscout CAPTURE [--no-sweep]   the library scout on one capture
 kernel-agent install-claude-code <project-dir>
 ```
 
@@ -4606,7 +4724,10 @@ runs/<org>--<name>/<timestamp>/
   targets/<id>/capture_inputs.pt  module + real inputs (no outputs), for the agent
   targets/<id>/workload_profile.md  statistics of every call of the target (+ .json)
   targets/<id>/reference_source.py
-  targets/<id>/candidates/    files the agent writes
+  targets/<id>/candidates/    files the agent writes (+ libscout_<adapter>.py: the
+                              library scout's candidates)
+  targets/<id>/libscout.json  the library scout: families, adapters run and skipped,
+                              their results, the op bars (see "Library scout")
   targets/<id>/workers/<k>/   --seeds-per-target / --islands: a worker's (island's)
                               candidates/ + NOTES.md (+ NOTES.gen<g>.md of a culled
                               island's earlier generations) (+ links)
@@ -4652,7 +4773,8 @@ runs/<org>--<name>/<timestamp>/
                               (optimize, resume, integrate, improve): a second one is refused
   optimized/                  apply.py + manifest.json + kernels/ (+ rewrites/ of region targets)
                               + transforms/, the run files they load (manifest `needs`) and
-                              export_check.json (the self-test, see above)
+                              export_check.json (the self-test, see above); requirements.txt
+                              when a kernel calls a library (the library scout's)
 ```
 
 To use the result in your own code:
@@ -4761,8 +4883,11 @@ value for that column.
   `status`, the report, the live dashboard and the projection.
 * `backend` is read from the candidate's imports (`load_inline` → `cuda`,
   `cuda.core` → `nvrtc`, `cutlass` → `cute`, `tilelang`, `triton`; `torch` when
-  there is no custom kernel). The report's and `status`'s per-backend tables read
-  what the snapshot runs instead (see Backends).
+  there is no custom kernel); a candidate that declares the library it calls
+  (`KA_LIBRARY`, the library scout's) is `library:<package>@<version>`. The scout's rows
+  have the `session` `libscout` and a hypothesis starting `library scout: `: like the
+  library's prior winners they extend no streak (see "Library scout"). The report's and
+  `status`'s per-backend tables read what the snapshot runs instead (see Backends).
 * `results.jsonl` (in `.truth/`) still has the full records (cases, errors)
   plus `exp`, `ledger_status`, `title`, `hypothesis` and the snapshot's sha256. For
   runs that predate the ledger, the rows are rebuilt from the `results.jsonl`

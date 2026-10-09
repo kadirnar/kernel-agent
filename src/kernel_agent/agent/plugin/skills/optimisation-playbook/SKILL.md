@@ -9,6 +9,7 @@ The methodology for every target, any model, any GPU. More in this skill's direc
 
 * [model-families.md](model-families.md): where the time goes per model family (LLM and LLM-style TTS, diffusion, STT, diffusion-autoregressive TTS with the VoxCPM2 measurements, vocoders) and what wins there.
 * [model-transforms.md](model-transforms.md): algorithm-level changes (static caches, CUDA graphs, merged projections, precomputed tables, host syncs, speculative decoding).
+* [library-scout.md](library-scout.md): the library bar in your digest (library kernels kernel-agent swept on the target with no agent, op bars), how to read and beat it.
 
 Related skills: `profiling-and-roofline` (reading the profile and the evaluator's numbers), the backend skills (`triton-kernels`, `cuda-kernels`, `cute-dsl`, `tilelang-kernels`), `precision-tiers`, `systems-patterns`.
 
@@ -42,7 +43,9 @@ them with a warm cache.
 2. First candidate: simplest correct fused kernel. Evaluate. Give every evaluation a
    `title`, a commit subject of at most 72 characters saying what this version changes
    (`split-K=4, RED epilogue`): it names the experiment in the ledger, the charts and
-   `kernel-agent exp`; the `hypothesis` says why it should be faster.
+   `kernel-agent exp`; the `hypothesis` says why it should be faster. The `## Library
+   bar` of your prompt (when present) is what library kernels already reach on this
+   target with no agent, op by op: a floor to beat ([library-scout.md](library-scout.md)).
 3. Then optimise with evidence: run `evaluate_candidate` with `profile=true`
    to see which kernels remain and how long each takes, which instructions they
    issue (the SASS census) and the directives (each with its numbers: test the

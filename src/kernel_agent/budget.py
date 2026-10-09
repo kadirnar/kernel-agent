@@ -80,6 +80,15 @@ ROLE_USD = {
 #: Hypothesis of the library's prior winners (library.py), evaluated before a target's agent
 #: starts: they may set the best result, but are not the agent's attempts without a gain.
 PRIOR_HYPOTHESIS = "prior winner from "
+#: Hypothesis of the library scout's candidates (libscout/, issue #227): library kernels
+#: evaluated with no agent; like the priors they may set the best, never an agent's streak.
+LIBRARY_HYPOTHESIS = "library scout: "
+
+
+def not_agents(hypothesis: object) -> bool:
+    """Whether an evaluation with this hypothesis was none of the agents' attempts: a library
+    prior (:data:`PRIOR_HYPOTHESIS`) or a library scout candidate (:data:`LIBRARY_HYPOTHESIS`)."""
+    return str(hypothesis or "").startswith((PRIOR_HYPOTHESIS, LIBRARY_HYPOTHESIS))
 
 
 # ------------------------------------------------------------ advice signals
@@ -153,9 +162,9 @@ def non_improving_streak(
 
     ``start`` is the speedup to beat before any record (1.0 = the reference).
     Failed, incorrect and not-faster evaluations all extend the streak, except
-    the library's prior winners (``PRIOR_HYPOTHESIS``). The integration's
-    re-evaluations of earlier snapshots (``reevaluates``) are not the agent's: they
-    extend nothing, but replace the snapshot's earlier record in the best so far
+    the library's prior winners and the library scout's candidates (:func:`not_agents`).
+    The integration's re-evaluations of earlier snapshots (``reevaluates``) are not the
+    agent's: they extend nothing, but replace the snapshot's earlier record in the best so far
     (:class:`Standing`, like the ledger's keep bar).
     """
     stand, streak = Standing(start), 0
@@ -165,7 +174,7 @@ def non_improving_streak(
         elif improves(rec, stand.best, ok_key=ok_key):
             stand.keep(rec)
             streak = 0
-        elif not str(rec.get("hypothesis") or "").startswith(PRIOR_HYPOTHESIS):
+        elif not not_agents(rec.get("hypothesis")):
             streak += 1
     return streak
 

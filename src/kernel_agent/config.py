@@ -138,6 +138,9 @@ class OptimizeConfig:
     # Cross-run kernel library + lessons (kernel_agent/library.py).
     use_library: bool = True  # reuse prior winners and lessons, store this run's winners
     librarian: bool = True  # distil lessons after the report (a cheap agent: role_models)
+    #: The library scout (libscout/, #227): library kernels swept on every target before its
+    #: first agent session, with no agent (``--no-library-scout``: off)
+    library_scout: bool = True
 
     hf_token: str | None = None
     verbose: bool = False

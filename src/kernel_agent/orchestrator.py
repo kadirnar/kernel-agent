@@ -125,6 +125,9 @@ class Orchestrator:
         # The self-test of the exported optimized/ (integrate/export.py check_export); None =
         # the real one, which a simulated run (or a fake GPU worker) skips.
         self.export_checker: Callable[..., dict[str, Any]] | None = None
+        # The library scout of one target (libscout/scout.py scout_target); None = the real
+        # one, which a simulated run (or a fake GPU worker) skips.
+        self.scouter: Callable[..., dict[str, Any]] | None = None
         # (target, snapshot name) -> the conservative speedup of a kernel whose re-check
         # disagrees with its record (recheck.speed_warning): what ranks and projects it.
         self.speed_caps: dict[tuple[str, str], float] = {}
@@ -750,6 +753,7 @@ class Orchestrator:
                     self.budget.note("kernels", "budget_skipped", skip)
                     return
                 await self.seed_library([target_id])  # prior winners first, no LLM cost
+                await self.scout_libraries([target_id])  # library kernels: the bar, no LLM
                 if reason := self._prior_suffices(target_id):
                     log(f"kernels: {target_id}: no agent session needed: {reason}")
                     return
@@ -2363,6 +2367,45 @@ class Orchestrator:
                 )
             library.remember_seed(self.run, target_id, tried)
 
+    async def scout_libraries(self, target_ids: list[str]) -> None:
+        """The library scout (``libscout/``, issue #227) on the targets not scouted yet:
+        library kernels swept and fully evaluated with no agent, one GPU lease per target.
+        Their rows are the bar the engineers start from (a floor, never a stop); a failure
+        is logged and recorded, never fatal. Off with ``--no-library-scout``, in a simulated
+        run and with a fake GPU worker (unless a test sets :attr:`scouter`)."""
+        from kernel_agent.libscout import scout as libscout
+
+        real = not self.simulated and self.worker is None and self.tc.gpu is not None
+        if not self.cfg.library_scout or (self.scouter is None and not real):
+            return
+        done = False
+        for target_id in target_ids:
+            if libscout.scouted(self.run, target_id) is not None or self._refused(target_id):
+                continue
+            if not self.run.capture_file(target_id).exists():
+                continue
+            try:
+                with self._gpu_job("scout"):  # background work in the GPU queue
+                    found = await asyncio.to_thread(
+                        self.scouter or libscout.scout_target,
+                        self.run,
+                        target_id,
+                        keeper=self.truth,
+                        timeout=self.budget.eval_timeout_s,
+                        backends=dict(self.tc.backends),
+                        race=self.budget.early_stop,  # racing of the configs (#190)
+                    )
+            except Exception as exc:  # the bar is advice: never fails the run
+                log(f"libscout: {target_id} failed: {exc!r}")
+                found = {"error": repr(exc)[:300]}
+            entry = {"seconds": found.get("seconds"), "error": found.get("error")}
+            entry["adapters"] = [r.get("adapter") for r in found.get("adapters") or []]
+            libscout.remember(self.run, target_id, entry)
+            ledger.event(self.run, "library_scout", target=target_id, **entry)
+            done = True
+        if done:
+            libscout.write_ceilings(self.run)  # the planner's ceilings.md lists the bars
+
     def _prior_suffices(self, target_id: str) -> str | None:
         """Why a target needs no agent: a prior winner already reaches the speed-of-light stop."""
         from kernel_agent.kernels.roofline import sol_signal
@@ -2409,7 +2452,10 @@ class Orchestrator:
             stats.get(spec["module_class"]),
             precisions=self.allowed_precisions(),
         )
-        return target + self._library_note(spec["id"], spec)
+        from kernel_agent.libscout import scout as libscout
+
+        bar = libscout.prompt_note(self.run, spec["id"])  # the library scout's bar (#227)
+        return target + self._library_note(spec["id"], spec) + bar
 
     def _backend_record(self) -> str:
         """Planner-prompt section: which backend won which target class on this GPU in

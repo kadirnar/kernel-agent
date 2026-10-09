@@ -134,12 +134,13 @@ from typing import Any
 
 from kernel_agent import gpuqueue, ledger, precisions, projection, roles, truth
 from kernel_agent.budget import (
+    LIBRARY_HYPOTHESIS,
     PLATEAU,
-    PRIOR_HYPOTHESIS,
     SOL_STOP_PCT,
     WRAP_UP_SECONDS,
     Standing,
     improves,
+    not_agents,
 )
 from kernel_agent.kernels import weights
 from kernel_agent.kernels.roofline import sol_signal
@@ -281,6 +282,9 @@ class Arm:
     refused: str | None = None
     base: float = 1.0  # kernels: its best at the start of the round (the goal counts from it)
     fresh: bool = True  # kernels: its best was found in this round (the SOL rule applies)
+    # kernels: its best is the library scout's (libscout/, #227): a floor for the engineers,
+    # never a stop (the SOL rule and the speedup goal wait for an agent's best)
+    scouted: bool = False
     note: str | None = None  # native: its staged plan is done, and what it works on now
     max_sessions: int = 1  # sessions it may run at once (--agents N): its live islands
     # native, gate relaxed (build_arms(relax_native=True)): why it would wait; it takes a
@@ -660,7 +664,8 @@ def _improves(row: dict[str, Any], best: float) -> bool:
 
 
 def _prior(row: dict[str, Any]) -> bool:
-    return str(row["hypothesis"] or "").startswith(PRIOR_HYPOTHESIS)
+    """A library prior's or the library scout's row: not an agent's evaluation."""
+    return not_agents(row["hypothesis"])
 
 
 def _kernel_history(
@@ -694,6 +699,9 @@ def _kernel_history(
             arm.gain_ms += arm.ref_ms * (1.0 / arm.best - 1.0 / new)
             arm.best = new
     arm.best_snapshot = top["snapshot"] if (top := stand.top) else None
+    arm.scouted = top is not None and str(top.get("hypothesis") or "").startswith(
+        LIBRARY_HYPOTHESIS
+    )
     if not crossed:  # nothing in this round yet
         arm.base = arm.best
     arm.fresh = since is None or arm.best > arm.base
@@ -1005,13 +1013,15 @@ def stop_reason(arm: Arm, policy: Policy) -> str | None:
         return f"plateau: {arm.streak} evaluations in a row without a new best"
     if arm.idle >= IDLE_SLICES:
         return f"no evaluation in its last {arm.idle} slices"
-    if policy.sol_stop and arm.sol is not None and arm.sol >= policy.sol_stop and arm.fresh:
+    agents = not arm.scouted  # the library scout's best is a floor to beat, never a stop
+    sol = arm.sol is not None and policy.sol_stop and arm.sol >= policy.sol_stop
+    if sol and arm.fresh and agents:
         return f"at {arm.sol:.0%} of its recipe's roofline (move on at {policy.sol_stop:.0%})"
     cap = policy.native_hours if arm.kind == NATIVE else policy.target_hours
     if cap and arm.hours >= cap:
         return f"time cap: {arm.hours:.1f} h in its slices (cap {cap:g} h)"
     goal = policy.speedup_goal
-    if arm.kind == KERNEL and goal and arm.best >= goal * arm.base:
+    if arm.kind == KERNEL and goal and agents and arm.best >= goal * arm.base:
         since = f" ({arm.best / arm.base:.2f}x this round)" if arm.base > 1.0 else ""
         return f"speedup goal reached: {arm.best:.2f}x{since} (goal {goal:g}x)"
     return None

@@ -5,7 +5,9 @@
 (``manifest.json``), ``apply.py`` and ``phases.py``, and every run file they load
 (:mod:`kernel_agent.integrate.deps`: a history snapshot by name, a native project's bundle,
 a helper module), placed where the item's own lookup finds it; ``manifest.json`` lists them
-per item (``needs``).
+per item (``needs``). Kernels that call a library (the library scout's, ``KA_LIBRARY``) add
+``requirements.txt`` with its exact version and ``manifest.json`` → ``libraries`` with its
+licence.
 
 **Self-test** (:func:`check_export`, issue #171): a copy of the package, in a new temporary
 directory, is imported and applied to the workload in a fresh worker process
@@ -282,10 +284,23 @@ def export_optimized(
     manifest["roots"] = sorted({c["root"] for c in profile.get("classes", []) if c.get("root")})
     if conflicts:  # two items need different files at one place: the self-test fails
         manifest["conflicts"] = conflicts
+    _requirements(out, manifest)
     shutil.copy2(Path(phases.__file__), out / "phases.py")  # phase routing for apply.py
     write_json(out / "manifest.json", manifest)
     (out / "apply.py").write_text(APPLY_TEMPLATE.format(repo_id=card["repo_id"], root=out))
     return out
+
+
+def _requirements(out: Path, manifest: dict[str, list[Any]]) -> None:
+    """``requirements.txt`` with the exact versions (and the licences, in ``manifest.json``
+    → ``libraries``) of the libraries the exported files call: library scout kernels declare
+    theirs (``KA_LIBRARY``, ``KA_LICENCE``; libscout/, issue #227). None without any."""
+    from kernel_agent.libscout.scout import requirements, requirements_text
+
+    sources = {p.relative_to(out).as_posix(): p.read_text() for p in sorted(out.rglob("*.py"))}
+    if entries := requirements(sources):
+        (out / "requirements.txt").write_text(requirements_text(entries))
+        manifest["libraries"] = entries
 
 
 # ------------------------------------------------------------------ self-test (issue #171)
