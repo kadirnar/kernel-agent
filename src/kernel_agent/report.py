@@ -14,6 +14,7 @@ from kernel_agent import (
     library,
     objective,
     precisions,
+    prediction,
     projection,
     roles,
     sessions,
@@ -572,6 +573,7 @@ def write_report(run: RunDir) -> Path:
         if reference:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))
+        lines += prediction.report_lines(run, integration, baseline)  # #226
     lines += report_lines(run)  # `kernel-agent improve` slices, re-integrations, rounds
     lines += sessions.report_lines(run)  # agent time split and GPU use (issue #184)
     lines += backends.report_lines(run)  # evaluations per backend (by source) and target

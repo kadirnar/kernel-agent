@@ -1745,6 +1745,34 @@ why and naming the items the step overlaps;
 which items are not counted. `report.md` projects a file written before #121
 (or #114, whose kernel savings are per run) again from its savings and `history`.
 
+**Prediction error** (#226, `prediction.py`). `report.md` → *Prediction error* puts every
+accepted item next to what the integration measured when it added it, one row per item in
+the metric's ms (per second of audio for `metric=throughput`). *predicted* is the estimated
+gain of the step that added it as the projection counts it (`step.est_gain_ms`; of the
+first set, the baseline − its projection): a kernel's module-level estimate
+(`est_saved_ms_per_run` through `objective.from_run`), a transform's gain alone, nested
+kernels and overlapping items counted once, what the step removes subtracted. *measured*
+is the step's A/B, A − B medians, with the A/B's 95 % interval of its relative gain × A;
+*error* = measured − predicted, next to measured ÷ predicted. A step that added several
+items at once (the systems agent's combination) has one error, shared by its rows. A row
+whose step estimate is not its own estimate says why: it overlaps a counted item (counted
+once), it is a kernel nested in another, or it counts instead of items that counted before
+it. The first set is measured against its A/B's A when that was the unmodified model, else
+against the baseline of `analyze` (no interval). A kernel's row names its bound and timing
+context (`bound`, `context`, `l2` of its record). A region target's row (or a target
+naming a `fusion`) has its fusion candidate's prediction next to it (`profile/fusions.json`
+through `fusion.match`, as the improve scheduler expects it, #231), with its ratio when
+the step added only that item. A one-line summary gives the median ratio over the steps
+(each once) and the worst miss (the largest error in ms). On the accepted sets of
+`runs/openbmb--VoxCPM2/20261006-004718-retest2` (their numbers as
+`tests/test_not_projectable.py` keeps them, without the A/B records): median 0.44x over 3
+steps; the worst miss is the W8A8 DiT layer kernel, 19.47 ms per second of audio predicted
+for its step (its own estimate 37.57 ms, counted instead of the CFM solver's and the LocEnc's
+CUDA graphs) and 1.11 ms measured. The integration rows of `results.tsv` have the predicted
+saving next to the measured one (`pred_saved_ms`, see "Experiment ledger"), and the kernel
+library keeps the errors as a lesson (see "Kernel library and lessons").
+`python -m kernel_agent.prediction RUN_DIR [--json]` prints the section (or its records).
+
 A re-integration reuses an A/B (an item alone, a step, a swap) of the previous
 integration whose content is unchanged, whatever the snapshot names: every
 evaluation snapshots its files anew (`history/021_merge_..._cc6df165.py` and
@@ -4797,7 +4825,9 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
 ~/.cache/kernel-agent/library/          ($KERNEL_AGENT_LIBRARY overrides it)
   <sm_arch>/<module_class>/<entry-id>/  kernel.py  spec.json  result.json  NOTES.md  entry.json
   <sm_arch>/backends.jsonl              per run and target: class, planned and tried backends, winner
+  <sm_arch>/predictions.jsonl           per run and accepted item: predicted vs measured gain
   lessons/<backend>.md  lessons/<module_family>.md
+  lessons/estimates.md                  measured ÷ predicted gain per kind of item (kernel-agent's)
 ```
 
 * **Store.** After every integration (`optimize` and each re-integration of
@@ -4857,6 +4887,19 @@ and evaluation per kernel). The code is in `kernel_agent/library.py`.
   prompt cache") and answers with structured output only. kernel-agent writes the
   files itself: only names of this run's backends and module families, at most
   20 rules each. The librarian runs again only when the ledger has new rows.
+* **Prediction errors** (#226). After every integration, kernel-agent records each
+  accepted item's prediction error (see "Prediction error" under Integration) in
+  `<sm_arch>/predictions.jsonl`, replacing the run's earlier lines: its kind (kernel,
+  transform, region kernel), a kernel's module family, bound and timing context, its own
+  estimate, the estimated and measured gain of the step that added it, the error and
+  ratio, how many items that step added, and a region's fusion prediction and ratio. From
+  these records it writes `lessons/estimates.md` itself (the librarian never does), in
+  words that name no model: the median measured ÷ predicted gain per kind of item, a
+  kernel's by its bound and timing context, steps of several items in a row of their own,
+  e.g. `sm_120: kernel estimates (module-level), memory-bound, timed graph / cold L2: the
+  integration measured 0.50x of the predicted gain (median of 3 steps in 3 runs; 0.25x ..
+  1.50x)`. The planner's prompt gets the rules of its GPU architecture next to the
+  backend track record. Nothing is recorded under `--emulate-arch`.
 * **Safety.** Entries are code that will run. An entry is reused only when
   every file still has its recorded sha256. Otherwise a `LIBRARY: ... refused`
   line and a `library_rejected` event are emitted. Entries of another GPU
@@ -5304,8 +5347,8 @@ model-level transforms and integration steps (`target = e2e`).
 
 ```
 exp  time  target  backend  snapshot  parent  status  kind  correct  speedup  ref_ms  new_ms
-est_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags  review  early
-worker  session  idea  title  hypothesis
+est_saved_ms  pred_saved_ms  spread  pct_of_sol  eval_s  queue_s  diverse_speedup  flags
+review  early  worker  session  idea  title  hypothesis
 ```
 
 Every row is one experiment, as in autoresearch's `results.tsv`:
@@ -5336,6 +5379,14 @@ Every row is one experiment, as in autoresearch's `results.tsv`:
   integration step's or probe's items. Every experiment can be reproduced from the run
   directory, also after later re-integrations replaced `integration.json`.
 
+`est_saved_ms` of a kernel row is the evaluator's estimate (ms per run of the workload),
+of an `e2e` row the measured saving: baseline − its median. An integration row (a step's
+B, a kernel probed alone) has the saving it was predicted to show next to it,
+`pred_saved_ms` (#226): baseline − (A as measured in the same A/B − the step's estimated
+gain, as the projection estimates an accepted step; see "Prediction error" under
+Integration), so `est_saved_ms − pred_saved_ms` is the step's measured − estimated gain. It
+is empty for a transform probed alone (its gain alone is its estimate), a step with an item
+that has no estimate, a measurement of A again and every other row.
 `pct_of_sol` is the weighted share of the speed of light for kernel rows (see
 "Speed of light"). `eval_s` is the time an evaluation took and `queue_s` the
 time it waited for the GPU behind other jobs before that (see "GPUs and the GPU

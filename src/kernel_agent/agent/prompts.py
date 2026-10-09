@@ -722,7 +722,8 @@ def planner_prompt(
     backend_record: str = "",
 ) -> str:
     """``backend_record``: which backend won which target class in earlier runs on this GPU
-    (:func:`kernel_agent.backends.track_record_note`)."""
+    (:func:`kernel_agent.backends.track_record_note`) and how far their estimates were off
+    (:func:`kernel_agent.library.prediction_note`)."""
     from kernel_agent import backends as backend_policy
     from kernel_agent.gpu_arch import from_summary
 
