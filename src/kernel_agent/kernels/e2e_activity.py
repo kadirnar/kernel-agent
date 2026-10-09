@@ -232,7 +232,10 @@ def analyse(
             continue
         for w in work:
             seen[w.resource] += 1
-            if w.end > drained + slack_ns:
+            # Work on the caller's own stream precedes the marker by stream order, so it is
+            # joined whatever its timestamps say: CUPTI now and then reported a CUDA graph's
+            # last kernel (after a conditional WHILE node) as ending after that marker (#268).
+            if w.resource != caller and w.end > drained + slack_ns:
                 out["unjoined"].append(
                     f"{w.name[:80]} (stream {w.resource}) ran {(w.end - drained) / 1e3:.0f} us "
                     "past the caller's stream after run() returned"
