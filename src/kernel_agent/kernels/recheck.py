@@ -125,6 +125,38 @@ def _flat(**parts: Any) -> dict[str, dict[str, Any]]:
     return flat_outputs([parts])[0]
 
 
+def _rerounded(
+    fn: Any, entry: dict[str, Any], expected: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """The reference ``fn`` once more on an entry's fresh inputs with its rounding redrawn
+    (:func:`kernels.verify.rerounded_call`): its outputs and the arguments it computed
+    (flattened as ``expected``'s; an argument it left as the plain call did is not kept),
+    for :func:`compare_entries` to judge a failed check with the reference's own rounding
+    spread (#250). Empty when it cannot run so."""
+    import torch
+
+    from kernel_agent.kernels.verify import rerounded_call
+
+    alt = rerounded_call(fn, entry["args"], entry["kwargs"])
+    if alt is None:
+        return {}
+    flat = _flat(output=alt[0], args=alt[1], kwargs=alt[2])
+    for key in ("args", "kwargs"):
+        plain = expected.get(key) or {}
+        flat[key] = {
+            name: t
+            for name, t in (flat.get(key) or {}).items()
+            if not (
+                isinstance(t, torch.Tensor)
+                and isinstance(plain.get(name), torch.Tensor)
+                and t.shape == plain[name].shape
+                and t.dtype == plain[name].dtype
+                and torch.equal(t, plain[name])
+            )
+        }
+    return flat
+
+
 # ------------------------------------------------------------------ subprocesses
 
 
@@ -220,7 +252,10 @@ def reference_main(
         with torch.inference_mode():
             out = replay.call(case, reference)(*args, **kwargs)
         synchronize()
-        expected.append({"pre": pre, **_flat(output=out, args=args, kwargs=kwargs)})
+        done = {"pre": pre, **_flat(output=out, args=args, kwargs=kwargs)}
+        done["rerounded"] = _rerounded(replay.call(case, reference), entry, done)
+        synchronize()
+        expected.append(done)
     torch.save({"entries": expected}, workdir / EXPECTED)
     keys = ("method", "signature", "count")
     result: dict[str, Any] = {
@@ -394,7 +429,8 @@ def compare_entries(
 ) -> list[list[dict[str, Any]]]:
     """Failed checks per entry (``(case, seed)`` of ``entries``): the candidate's saved
     outputs and post-call state against the reference's (:mod:`kernels.compare`, in the
-    capture's tolerance ``tier``, with its bounds for redrawn inputs)."""
+    capture's tolerance ``tier``, with its bounds for redrawn inputs and the reference's own
+    rounding spread on them where the reference subprocess measured it: ``rerounded``)."""
     from kernel_agent.kernels.compare import compare_output, compare_side_effects_flat
 
     if not isinstance(saved, list) or len(saved) != len(expected):
@@ -406,18 +442,32 @@ def compare_entries(
         checks = []
         new_out = new.get("output") or {}
         pres = exp.get("pre") or {}
+        alt = exp.get("rerounded") or {}
         inputs = [*(pres.get("args") or {}).values(), *(pres.get("kwargs") or {}).values()]
         for name, ref in (exp.get("output") or {}).items():
             if name not in new_out:
                 checks.append({"name": name, "ok": False, "error": "missing in candidate output"})
             else:
                 checks.append(
-                    compare_output(name, ref, new_out[name], inputs, tier=tier, perturbed=True)
+                    compare_output(
+                        name,
+                        ref,
+                        new_out[name],
+                        inputs,
+                        tier=tier,
+                        perturbed=True,
+                        rerounded=(alt.get("output") or {}).get(name),
+                    )
                 )
         for key in ("args", "kwargs"):
             pre = (exp.get("pre") or {}).get(key) or {}
             checks += compare_side_effects_flat(
-                pre, exp.get(key) or {}, new.get(key) or {}, tier=tier, perturbed=True
+                pre,
+                exp.get(key) or {},
+                new.get(key) or {},
+                tier=tier,
+                perturbed=True,
+                rerounded_flat=alt.get(key) or {},
             )
         failures.append([c for c in checks if not c.get("ok")])
     return failures

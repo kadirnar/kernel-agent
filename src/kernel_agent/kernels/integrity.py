@@ -226,6 +226,8 @@ class Snapshot:
             _watch("kernel_agent.kernels.compare", compare, constants=True),
             _watch("kernel_agent.kernels.bench", bench, constants=True),
             _watch("kernel_agent.kernels.verify", verify, constants=True),
+            # redraws the reference's rounding: the spread that widens exact tolerances (#250)
+            _watch("kernel_agent.kernels.verify.Rerounding", verify.Rerounding),
             _watch("kernel_agent.kernels.evaluate", evaluate, constants=True),
             _watch("kernel_agent.kernels.weights", weights, constants=True),
             # the reference quantisers and the MXFP8 scale-rule guard (fp8_mx targets)

@@ -1,0 +1,4 @@
+layers=1 t=1 ctx=512: 200 draws in 3s before=0 after=0 cheats={'cached': 39, 'n': 39} spread/rel_l2=[(0.00653, 0.004105), (0.006854, 0.004164), (0.006924, 0.004031)]
+layers=1 t=64 ctx=64: 200 draws in 1s before=0 after=0 cheats={'cached': 39, 'n': 39} spread/rel_l2=[(0.007744, 0.005112), (0.007761, 0.005246), (0.007854, 0.005203)]
+layers=4 t=1 ctx=512: 200 draws in 9s before=200 after=0 cheats={'cached': 39, 'n': 39} spread/rel_l2=[(0.014292, 0.009278), (0.014931, 0.008553), (0.015507, 0.008293)]
+layers=4 t=64 ctx=64: 200 draws in 10s before=200 after=0 cheats={'cached': 39, 'n': 39} spread/rel_l2=[(0.016259, 0.01047), (0.016064, 0.01023), (0.016271, 0.01042)]

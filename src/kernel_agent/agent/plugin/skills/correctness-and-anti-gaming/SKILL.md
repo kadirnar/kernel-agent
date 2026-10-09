@@ -49,7 +49,11 @@ guards", "Independent re-check of winners", "Out-of-bounds accesses: memcheck").
   Laplace, log-normal) and × 3, × 0.01 and × −1 (`scaled_x3`, `scaled_x0.01`,
   `sign_flipped`), each against the live reference (`incorrect_perturbed`). Outputs cached
   by address, shape or call count, skipped work, reads of unused cache slots, absolute
-  epsilons and static activation scales fail here.
+  epsilons and static activation scales fail here. A redrawn check that fails is judged
+  again with the reference's own rounding spread on those inputs (the reference with every
+  op's rounding redrawn): an error whose RMS is at most 2x that spread (`error_over_spread`)
+  gets 4x the spread on each element's tolerance, so a deep chain that only rounds
+  differently from eager passes; "not rounding" in the error means the error is larger.
 * **Integrity** (`integrity_violation`): patching the timer, the comparator, torch
   functions, `nn` module forwards, the reference's methods or weights, or backend flags
   (TF32, SDPA backends, matmul precision, default dtype, current stream, dispatch modes);

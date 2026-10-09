@@ -23,9 +23,12 @@ relaxed`` (the default of new runs, :data:`DEFAULT_QUALITY`) has the same struct
 about twice the error budgets: the ``relaxed``, ``relaxed-fp4``, ``relaxed-fp4a`` and
 ``relaxed-kv`` tiers (:data:`QUALITY_TIERS`). On redrawn
 inputs (``perturbed``) these tiers use their own bounds (:data:`PERTURBED_BOUNDS`), with
-the element bound scaled per channel. On inputs scaled by a factor (``input_scale``: the
-evaluator's ×3 / ×0.01 / ×−1 checks, :mod:`kernel_agent.kernels.verify`) the absolute
-tolerance grows with a factor above 1 and the signal threshold shrinks with one below 1.
+the element bound scaled per channel, and the exact per-element tolerance of a check that
+failed grows with the reference's own rounding spread on those inputs when the error is
+noise-like (``rerounded``, :data:`ROUNDING_SPREAD_K`, #250). On inputs scaled by a factor
+(``input_scale``: the evaluator's ×3 / ×0.01 / ×−1 checks, :mod:`kernel_agent.kernels.
+verify`) the absolute tolerance grows with a factor above 1 and the signal threshold
+shrinks with one below 1.
 
 Caches are compared relative to the update. An argument a call updates in place is compared
 on the elements the reference or the candidate changed (:func:`compare_side_effects`). A
@@ -444,6 +447,43 @@ PERTURBED_BOUNDS: dict[str, tuple[float, float, float, tuple[float, float]]] = {
     NEAR_LOSSLESS_FP4A_TIER: (0.90, 0.50, 0.15, (3.0, 0.25)),
     RELAXED_FP4A_TIER: (0.85, 0.65, 0.18, (3.5, 0.25)),
 }
+#: The reference's own rounding spread (#250). Each layer of a deep bf16 chain rounds its
+#: output, and a candidate that rounds differently (a fused kernel keeping a value in fp32,
+#: another accumulation order) drifts from eager with depth: the elements of a residual
+#: stream near zero carry the rounding of summands many times their size, beyond
+#: ``atol + rtol * |ref|``. So a check on redrawn inputs that fails (the timed-output check,
+#: the perturbed-input checks, the integration's re-check) is judged again against the
+#: reference called once more on the same inputs with every operation's rounding redrawn
+#: (:func:`kernel_agent.kernels.verify.rerounded_call`: ``rerounded``, one more valid
+#: implementation of it). When the candidate's error is noise-like, its RMS at most
+#: ROUNDING_SPREAD_RMS times the spread (the RMS of ``rerounded - ref``), each element's
+#: exact tolerance grows by ROUNDING_SPREAD_K times the spread (the larger of the tensor's
+#: and the element's channel's, as the redrawn bounds take RMS), at most ROUNDING_SPREAD_CAP
+#: times the reference's RMS (the same way): a reference with discrete decisions (routing,
+#: argmax) can spread far. The mismatch fraction, the outlier rule, the whole-tensor checks
+#: and the captured-input checks are unchanged.
+#:
+#: Calibrated on an RTX 5070 Ti (sm_120): ``selftest.NormGemvChain`` (RMSNorm -> GEMV ->
+#: residual, hidden 1024, one row) and ``selftest.GemvChain`` at 2-28 layers (200 redrawn
+#: inputs each; docs/research-scripts/rounding-spread-250). The spread is 0.65-2.1 % of the
+#: output's RMS, about twice eager's own error against an fp32 recompute, and grows with
+#: depth. Honest candidates stay within 0.77 of it in RMS and every element within
+#: ``tol + 2.16 x`` it: the megakernel example and its graph + PDL and grid-barrier modes,
+#: the PDL example, and ``torch.compile`` of the reference (2.4x closer to fp32 than eager at
+#: 8 layers). A 4-layer attention + MLP stack with an in-place KV cache likewise: ``torch.
+#: compile`` 0.66. The plain tolerance rejects 1.6-1.8 % of the example's draws (its three
+#: modes) at 8 layers (3,000), 8.4-8.7 % at 16 and 16.8-17.1 % at 28 (1,000), and every
+#: ``torch.compile`` draw of the norm chain at 8 layers or more and of the 4-layer stack;
+#: after: none of them. What the check is for stays far above it: a previous call's output
+#: is 66-311 x the spread in RMS, the last layer skipped 8.9 x (28 layers) to 155 x (1
+#: layer), and a stale 16-element tile would need K >= 53 (the cap: 1.0 x the RMS). Newly
+#: accepted are only systematic errors within twice the spread: at 1 layer none (a 1 % bias
+#: of the RMS is 2.3 x it and passed before too), at 8 layers a bias up to ~2 % of the RMS,
+#: at 28 one up to ~4 % or a scale of 1.03 on a one-row output (eager's own error against
+#: fp32 there: 1.0 %).
+ROUNDING_SPREAD_K = 4.0
+ROUNDING_SPREAD_CAP = 0.125
+ROUNDING_SPREAD_RMS = 2.0
 #: An output of an input's shape is that input with rows written into it (:func:`written_box`,
 #: #206) when the elements the reference changed fill at least WRITTEN_MIN_DENSITY of their box
 #: (along each dimension, the indices where one changed) and the box is at most
@@ -565,6 +605,29 @@ def _channel_rms(
     return channel.clamp_min(rms).expand_as(ref)
 
 
+def _rounding_widening(
+    ref: torch.Tensor,
+    rerounded: torch.Tensor | None,
+    rms: float,
+    floor: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | float, float] | None:
+    """How far the exact tolerance of each element of ``ref`` (float, every element) grows
+    with the reference's own rounding spread (:data:`ROUNDING_SPREAD_K`): ``K`` times the RMS
+    of ``rerounded - ref`` (the larger of the tensor's and the element's channel's;
+    non-finite differences as 0), at most :data:`ROUNDING_SPREAD_CAP` times ``rms`` or the
+    element's channel's RMS of ``ref`` (``floor``: as :func:`_channel_rms`'s), and the
+    tensor's spread (that RMS). None without ``rerounded`` (:func:`_like` the reference)."""
+    if rerounded is None or rerounded.shape != ref.shape:
+        return None
+    alt = rerounded.detach().to(ref.device).float()
+    diff = torch.where(torch.isfinite(ref) & torch.isfinite(alt), alt - ref, 0.0)
+    spread = float(diff.pow(2).mean().sqrt()) if diff.numel() else 0.0
+    grow = torch.as_tensor(_channel_rms(diff, spread), device=ref.device) * ROUNDING_SPREAD_K
+    cap = torch.as_tensor(_channel_rms(ref, rms, floor), device=ref.device) * ROUNDING_SPREAD_CAP
+    widen = torch.minimum(grow, cap)
+    return (widen if widen.dim() else float(widen)), spread
+
+
 def compare_tensors(
     name: str,
     ref: torch.Tensor,
@@ -575,11 +638,14 @@ def compare_tensors(
     perturbed: bool = False,
     input_scale: float = 1.0,
     channel_rms: torch.Tensor | None = None,
+    rerounded: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """One tensor against its reference (module docstring); ``tier``: the tolerance tier
     (default :data:`TIER`); ``perturbed``: on redrawn inputs (:data:`PERTURBED_BOUNDS`;
     ``channel_rms``: a per-channel RMS, broadcastable to ``ref``, that the element bound's
     channel RMS is at least: a grown cache's for its appended rows, :func:`compare_grown`);
+    ``rerounded``: the reference recomputed on the same inputs with its rounding redrawn,
+    whose spread widens the exact per-element tolerance (:data:`ROUNDING_SPREAD_K`);
     ``input_scale``: the factor ``f`` the inputs were scaled by (the evaluator's ×3, ×0.01
     and ×−1 checks, :data:`kernel_agent.kernels.verify.SCALED`). A module's outputs, and
     their rounding errors, grow with ``|f| > 1``, so the absolute tolerance is
@@ -632,6 +698,20 @@ def compare_tensors(
     allowed = atol + rtol * a.abs()
     if perturbed and near is not None and not signal:  # the tier's element bound at RMS atol
         allowed = torch.maximum(allowed, near[3][0] * atol + near[3][1] * a.abs())
+    rms = ref_norm / math.sqrt(a.numel()) if a.numel() else 0.0
+    spread = _rounding_widening(full, _like(rerounded, ref), rms, channel_rms)
+    noise = float(diff.norm()) / math.sqrt(diff.numel()) if diff.numel() else 0.0
+    widened = False
+    if spread is not None:  # the reference's own rounding spread on these inputs (#250)
+        widen, total = spread
+        ratio = noise / total if total > 0 else (0.0 if noise == 0 else math.inf)
+        result.update(rounding_spread=round(total / rms, 6) if rms > 0 else 0.0)
+        result.update(error_over_spread=round(ratio, 3))
+        if ratio <= ROUNDING_SPREAD_RMS:  # noise-like: no larger than another rounding's
+            if masked and isinstance(widen, torch.Tensor):
+                widen = widen[finite]
+            allowed = allowed + widen
+            widened = True
     mismatch = (diff > allowed).float().mean().item() if a.numel() else 0.0
     outlier = float((diff / allowed.clamp_min(1e-30)).max()) if a.numel() else 0.0
     denom = ref_norm * new_norm
@@ -651,7 +731,6 @@ def compare_tensors(
     min_cos, max_rel = GLOBAL_TOLERANCES.get(ref.dtype, GLOBAL_TOLERANCES[torch.float32])
     if near is not None and signal:
         min_cos, max_rel, max_norm_change, (e_atol, e_rtol) = near
-        rms = ref_norm / math.sqrt(a.numel())
         scale: torch.Tensor | float = rms
         if perturbed:  # the larger of the tensor's and the element's channel's RMS
             scale = _channel_rms(full, rms, channel_rms)
@@ -679,13 +758,24 @@ def compare_tensors(
             )
         whole = True
     else:
+        tolerance = "tolerance"
+        if widened:
+            tolerance += (
+                f" (with {ROUNDING_SPREAD_K:g} x the reference's own rounding spread, "
+                f"{result['rounding_spread']:.3%} of its RMS)"
+            )
+        elif spread is not None:
+            tolerance += (
+                f" (the error's RMS is {result['error_over_spread']:.3g} x the reference's own "
+                f"rounding spread, more than {ROUNDING_SPREAD_RMS:g} x: not rounding)"
+            )
         if mismatch > MAX_MISMATCH:
             problems.append(
-                f"{mismatch:.4%} of elements outside tolerance (max {MAX_MISMATCH:.2%})"
+                f"{mismatch:.4%} of elements outside {tolerance} (max {MAX_MISMATCH:.2%})"
             )
         if outlier > MAX_OUTLIER:
             problems.append(
-                f"an element is {outlier:.3g}x its tolerance away (max {MAX_OUTLIER:g}x per "
+                f"an element is {outlier:.3g}x its {tolerance} away (max {MAX_OUTLIER:g}x per "
                 "element)"
             )
         whole = a.numel() > GLOBAL_MIN_NUMEL and signal
@@ -698,6 +788,19 @@ def compare_tensors(
         result["error"] = "; ".join(problems)
     result["ok"] = not problems
     return result
+
+
+def _like(rerounded: Any, ref: torch.Tensor) -> torch.Tensor | None:
+    """``rerounded`` (detached) when it is a plain tensor of ``ref``'s shape and dtype, else
+    None (no rounding spread)."""
+    if (
+        not isinstance(rerounded, torch.Tensor)
+        or type_error(rerounded) is not None
+        or rerounded.shape != ref.shape
+        or rerounded.dtype != ref.dtype
+    ):
+        return None
+    return rerounded.detach()
 
 
 def grown_dim(before: Any, after: Any) -> int | None:
@@ -737,6 +840,7 @@ def compare_grown(
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
+    rerounded: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """``new`` against ``ref``, both ``before`` grown by the call along ``dim``
     (:func:`grown_dim`; a KV cache ``torch.cat``-ed with the new token's K / V), relative to
@@ -756,7 +860,8 @@ def compare_grown(
     cache was 0.02 % of the elements (within :data:`MAX_MISMATCH`), and at ×0.01 the
     scaled old rows set the element bound (their RMS) of a new row computed from
     normalised activations, which is not scaled (#202). A candidate whose tensor does not
-    match ``ref``'s type, shape, dtype, layout or device is compared whole (the error)."""
+    match ``ref``'s type, shape, dtype, layout or device is compared whole (the error).
+    ``rerounded``: :func:`compare_tensors`'s, split the same way."""
     kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
     if (
         type_error(new) is not None
@@ -765,7 +870,8 @@ def compare_grown(
         or new.layout != ref.layout
         or new.device.type != ref.device.type
     ):
-        return compare_tensors(name, ref, new, **kw)
+        return compare_tensors(name, ref, new, rerounded=rerounded, **kw)
+    alt = _like(rerounded, ref)
     kept, total = before.shape[dim], ref.shape[dim]
     ref, before = ref.detach().to(new.device), before.detach().to(new.device)
     new = new.detach()
@@ -778,6 +884,7 @@ def compare_grown(
         ref.narrow(dim, kept, appended),
         new.narrow(dim, kept, appended),
         channel_rms=channels,
+        rerounded=None if alt is None else alt.narrow(dim, kept, appended),
         **kw,
     )
     result["grown"] = {"dim": dim, "kept": kept, "appended": appended}
@@ -796,7 +903,8 @@ def compare_grown(
     else:  # the reference changed the kept part too: compare the elements either side changed
         changed = ~unchanged | ~_same(new_old, before)
         count = int(changed.sum())
-        old = compare_tensors(name, ref_old[changed], new_old[changed], **kw)
+        old_alt = None if alt is None else alt.to(new.device).narrow(dim, 0, kept)[changed]
+        old = compare_tensors(name, ref_old[changed], new_old[changed], rerounded=old_alt, **kw)
         result["changed_elements"] = count
         if not old["ok"]:
             problems.append(f"the {count} changed elements of the {kept} kept rows: {old['error']}")
@@ -855,6 +963,7 @@ def compare_written(
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
+    rerounded: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """``new`` against ``ref``, both ``before`` with rows written into it (:func:`written_box`:
     ``box``, the indices per dimension of the elements the reference changed; a static KV
@@ -868,7 +977,8 @@ def compare_written(
 
     Compared whole, one wrong written row of a 4096-slot cache was 0.02 % of the elements,
     inside :data:`MAX_MISMATCH` (#206). A candidate whose tensor does not match ``ref``'s
-    type, shape, dtype, layout or device is compared whole (the error)."""
+    type, shape, dtype, layout or device is compared whole (the error). ``rerounded``:
+    :func:`compare_tensors`'s, its box taken the same way."""
     kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
     if (
         type_error(new) is not None
@@ -877,7 +987,8 @@ def compare_written(
         or new.layout != ref.layout
         or new.device.type != ref.device.type
     ):
-        return compare_tensors(name, ref, new, **kw)
+        return compare_tensors(name, ref, new, rerounded=rerounded, **kw)
+    alt = _like(rerounded, ref)
     ref, before = ref.detach().to(new.device), before.detach().to(new.device)
     new = new.detach()
     box = [index.to(new.device) for index in box]
@@ -891,7 +1002,14 @@ def compare_written(
     channels = _channels(ref.float()) if perturbed else None
     if channels is not None and box[-1].numel() < ref.shape[-1]:  # written along the channels
         channels = channels.index_select(-1, box[-1])
-    result = compare_tensors(name, part(ref), part(new), channel_rms=channels, **kw)
+    result = compare_tensors(
+        name,
+        part(ref),
+        part(new),
+        channel_rms=channels,
+        rerounded=None if alt is None else part(alt.to(new.device)),
+        **kw,
+    )
     sizes = [int(index.numel()) for index in box]
     result["written"] = {"box": sizes, "of": list(ref.shape)}
     written = f"written {sizes} of {list(ref.shape)}"
@@ -925,14 +1043,20 @@ def compare_output(
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
+    rerounded: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """One output tensor against its reference: :func:`compare_grown` when the reference is
     one of the call's input tensors ``inputs`` (pre-call) grown along one dimension (its
     leading part there equal to that input, NaN as NaN: a returned ``torch.cat`` of a cache
     and the new rows), :func:`compare_written` when it is one of them with rows written into
     it (:func:`written_box`: a returned functional ``index_copy`` into a static cache), else
-    :func:`compare_tensors`."""
-    kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
+    :func:`compare_tensors` (``rerounded``: theirs)."""
+    kw: dict[str, Any] = {
+        "tier": tier,
+        "perturbed": perturbed,
+        "input_scale": input_scale,
+        "rerounded": rerounded,
+    }
     for before in inputs:
         dim = grown_dim(before, ref)
         if dim is None:
@@ -956,13 +1080,17 @@ def compare_structures(
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
+    rerounded: Any = None,
 ) -> list[dict[str, Any]]:
     """The candidate's output ``new`` against the reference's ``ref``, tensor by tensor
     (:func:`compare_output`); ``inputs``: the call's inputs before the call (e.g.
     ``(args, kwargs)``), for outputs that grow one of them (:func:`compare_grown`) or write
-    rows into one (:func:`compare_written`)."""
+    rows into one (:func:`compare_written`); ``rerounded``: the reference's output recomputed
+    with its rounding redrawn (:func:`kernel_agent.kernels.verify.rerounded_call`; on
+    redrawn inputs)."""
     ref_flat = flatten(ref, prefix)
     new_flat = flatten(new, prefix)
+    alt_flat = flatten(rerounded, prefix)
     sources = list(flatten(inputs, "in").values())
     kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
     results = []
@@ -970,7 +1098,8 @@ def compare_structures(
         if name not in new_flat:
             results.append({"name": name, "ok": False, "error": "missing in candidate output"})
             continue
-        results.append(compare_output(name, tensor, new_flat[name], sources, **kw))
+        alt = alt_flat.get(name)
+        results.append(compare_output(name, tensor, new_flat[name], sources, rerounded=alt, **kw))
     return results
 
 
@@ -983,6 +1112,7 @@ def compare_side_effects(
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
+    rerounded: Any = None,
 ) -> list[dict[str, Any]]:
     """Compare the post-call state of a call's arguments (in-place side effects).
 
@@ -993,7 +1123,9 @@ def compare_side_effects(
     forgetting to, would vanish inside the allowance.  Caches that the call grows
     along one dimension (concatenation, :func:`grown_dim`) likewise: the appended
     rows on their own, the kept part unchanged where the reference kept it
-    (:func:`compare_grown`).  Other tensors are compared whole."""
+    (:func:`compare_grown`).  Other tensors are compared whole. ``rerounded``: the
+    arguments after the reference's call with its rounding redrawn (as
+    :func:`compare_structures`')."""
     return compare_side_effects_flat(
         flatten(pre, prefix),
         flatten(ref_post, prefix),
@@ -1001,6 +1133,7 @@ def compare_side_effects(
         tier=tier,
         perturbed=perturbed,
         input_scale=input_scale,
+        rerounded_flat=flatten(rerounded, prefix),
     )
 
 
@@ -1012,6 +1145,7 @@ def compare_side_effects_flat(
     tier: str | None = None,
     perturbed: bool = False,
     input_scale: float = 1.0,
+    rerounded_flat: dict[str, torch.Tensor] | None = None,
 ) -> list[dict[str, Any]]:
     """:func:`compare_side_effects` on already flattened ``{name: tensor}`` states."""
     kw: dict[str, Any] = {"tier": tier, "perturbed": perturbed, "input_scale": input_scale}
@@ -1021,9 +1155,10 @@ def compare_side_effects_flat(
         if new is None:
             results.append({"name": name, "ok": False, "error": "missing in candidate arguments"})
             continue
+        alt = (rerounded_flat or {}).get(name)
         before = pre_flat.get(name)
         if before is not None and (dim := grown_dim(before, ref)) is not None:
-            results.append(compare_grown(name, before, ref, new, dim, **kw))
+            results.append(compare_grown(name, before, ref, new, dim, rerounded=alt, **kw))
             continue
         if (
             before is None
@@ -1031,7 +1166,7 @@ def compare_side_effects_flat(
             or not (before.shape == ref.shape == new.shape)
             or not (before.dtype == ref.dtype == new.dtype)
         ):
-            results.append(compare_tensors(name, ref, new, **kw))
+            results.append(compare_tensors(name, ref, new, rerounded=alt, **kw))
             continue
         before, ref = before.to(new.device), ref.to(new.device)
         changed = (ref != before) | (new != before)
@@ -1039,7 +1174,9 @@ def compare_side_effects_flat(
         if count == 0:
             results.append({"name": name, "ok": True, "changed_elements": 0, "max_abs_err": 0.0})
             continue
-        result = compare_tensors(name, ref[changed], new[changed], **kw)
+        alt = _like(alt, ref)
+        alt = None if alt is None else alt.to(new.device)[changed]
+        result = compare_tensors(name, ref[changed], new[changed], rerounded=alt, **kw)
         result["changed_elements"] = count
         results.append(result)
     return results

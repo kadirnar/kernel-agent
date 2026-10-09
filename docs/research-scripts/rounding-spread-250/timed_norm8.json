@@ -1,0 +1,30 @@
+{
+ "norm8": {
+  "draws": 3000,
+  "seconds": 60,
+  "candidates": {
+   "megakernel": {
+    "before": 53,
+    "after": 0
+   },
+   "graph_pdl": {
+    "before": 49,
+    "after": 0
+   },
+   "coop_barrier": {
+    "before": 49,
+    "after": 0
+   },
+   "compiled": {
+    "before": 3000,
+    "after": 0
+   }
+  },
+  "cheats_rejected": {
+   "cached": 299,
+   "stale_tile": 299,
+   "skip_last": 299,
+   "n": 299
+  }
+ }
+}

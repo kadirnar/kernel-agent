@@ -254,7 +254,11 @@ class GemvChain(nn.Module):
 #: (correctness only) takes the example's fallback.
 PDL_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     # 8 layers: an exact-tier chain of bf16 GEMVs drifts from cuBLAS's rounding with depth
-    # (28 layers: 14 of 40 draws had > 0.1 % of elements outside bf16's tolerance; 8: none)
+    # (28 layers: 14 of 40 draws had > 0.1 % of elements outside bf16's tolerance; 8: none).
+    # Since #250 the redrawn-input checks judge such a draw with the reference's own rounding
+    # spread (28 layers: 342 of 1,000 draws past the plain tolerance, none rejected), but the
+    # captured-input check keeps the plain tolerance, and a deeper capture whose own input is
+    # past it on some GPU's cuBLAS would fail there on every run.
     "cuda_pdl_gemv_chain.py": (1024, 8, [((1,), 64), ((4,), 0)]),
 }
 
@@ -298,8 +302,11 @@ class NormGemvChain(nn.Module):
 #: (leading shape, calls per run). 4 layers: the exact tier's bf16 tolerance against eager
 #: (cuBLAS) rounding is reached with depth (issue #248, RTX 5070 Ti, 3000 random inputs: at 8
 #: layers 1.3 % of the draws had > 0.1 % of elements outside it for the megakernel and 1.0 %
-#: for the graph + PDL and grid-barrier baselines, which use no counters; at 4 layers none),
-#: and the evaluator draws fresh inputs for its timed-output and perturbed checks.
+#: for the graph + PDL and grid-barrier baselines, which use no counters; at 4 layers none).
+#: The redrawn-input checks judge such draws with the reference's own rounding spread since
+#: #250 (8 layers: 0 of 100 evaluations refused, 4 before; ``tests/test_megakernel_gpu.py``);
+#: the captured-input check does not, so the capture stays where its own input is far from
+#: the plain tolerance on any GPU.
 MEGAKERNEL_EXAMPLES: dict[str, tuple[int, int, list[tuple[tuple[int, ...], int]]]] = {
     "native_megakernel": (1024, 4, [((1,), 64), ((4,), 0)]),
 }

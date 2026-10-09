@@ -1,0 +1,52 @@
+kernel_agent from git archive origin/main (12ddbc2) src: the evaluator before #250
+  0 incorrect_perturbed 4s dtypes, recomputed on every call (no output caching by address, shape or values; no reading of unused cache slots; no shortcuts for the captured value range or sign: scales such as FP8 activation scales follow the input)
+  1 ok 7s 15.486x
+  2 ok 4s 15.577x
+  3 ok 4s 15.807x
+  4 ok 4s 15.65x
+  5 ok 4s 15.639x
+  6 incorrect_perturbed 4s dtypes, recomputed on every call (no output caching by address, shape or values; no reading of unused cache slots; no shortcuts for the captured value range or sign: scales such as FP8 activation scales follow the input)
+  7 ok 4s 15.694x
+  8 ok 4s 15.587x
+  9 ok 4s 15.788x
+ 10 ok 4s 15.56x
+ 11 ok 4s 15.464x
+ 12 ok 4s 15.483x
+ 13 ok 4s 15.876x
+ 14 incorrect_timed_output 3s e inputs (output: 0.1953% of elements outside tolerance (max 0.10%)); correctness was checked on the first call only, so the candidate must compute every call (no caching by address, shape or call count, no skipped work)
+ 15 ok 4s 15.518x
+ 16 ok 4s 15.491x
+ 17 ok 4s 15.462x
+ 18 ok 4s 15.476x
+ 19 ok 4s 15.639x
+ 20 ok 4s 15.523x
+ 21 ok 4s 15.753x
+ 22 ok 4s 15.692x
+ 23 ok 4s 15.713x
+ 24 ok 4s 15.412x
+ 25 ok 4s 15.756x
+ 26 ok 4s 15.469x
+ 27 ok 4s 15.631x
+ 28 ok 4s 15.61x
+ 29 ok 4s 15.657x
+ 30 ok 4s 15.814x
+ 31 ok 4s 15.414x
+ 32 ok 4s 15.538x
+ 33 ok 4s 15.406x
+ 34 ok 4s 15.71x
+ 35 ok 4s 15.746x
+ 36 ok 4s 15.387x
+ 37 ok 4s 15.826x
+ 38 ok 4s 15.695x
+ 39 ok 4s 15.616x
+ 40 ok 4s 15.571x
+ 41 ok 4s 15.333x
+ 42 ok 4s 15.708x
+ 43 ok 4s 15.588x
+ 44 ok 4s 15.585x
+ 45 ok 4s 15.439x
+ 46 ok 4s 15.486x
+ 47 ok 4s 15.806x
+ 48 ok 4s 15.841x
+ 49 ok 4s 15.543x
+{'incorrect_perturbed': 2, 'ok': 47, 'incorrect_timed_output': 1}
