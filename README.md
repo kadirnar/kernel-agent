@@ -2011,7 +2011,9 @@ workload does not use fails the evaluation, as do unjoined `cc.launch`
 handles, a changed current stream and threads still running the evaluated
 transforms' or kernels' code. The result lists the declared streams
 (`streams`); the analysis of the profiler events is a pure function, tested on
-synthetic traces.
+synthetic traces. The streams are named by marker kernels launched once the
+device is idle (the caller's: `ka::caller`): a CUDA graph's conditional body
+can be recorded under the correlation id of the drain marker's launch.
 
 ### Independent re-check of winners
 
@@ -2490,11 +2492,16 @@ scalars: the steps done, whether the loop goes on) until every flag of `cond()` 
 
 Every fallback says why (`loop.mode`, `loop.reason`, `loop.stats`: launches, host checks,
 K). The graph runs on the caller's stream, so the evaluator's timing sees all of it. The
-profiler lists only the last iteration's body kernels and does not record cuda.core's
-driver-API launch, so the loop is launched with the `cudaGraphLaunch` of torch's CUDA
-runtime and begins and ends with a kernel outside the WHILE node: the end-to-end
-hidden-work check sees the launch and the loop's whole span (a loop on a side stream that
-is never joined fails it, GPU-tested). `watch=[(module, "forward")]` names callables
+profiler does not list the body's kernels under the launch (the last iteration's only or,
+once an earlier profiled run initialised CUPTI, every iteration's on a stream of their own
+under other calls' correlation ids) and does not record cuda.core's driver-API launch, so
+the loop is launched with the `cudaGraphLaunch` of torch's CUDA runtime and begins and ends
+with a kernel outside the WHILE node: the end-to-end hidden-work check sees the launch and
+the loop's whole span (a loop on a side stream that is never joined fails it, GPU-tested).
+Since a body kernel can carry the correlation id of the check's own marker launch, the
+check names the caller's stream by a second marker launched once the device is idle
+(`ka::caller`): a joined loop failed it now and then in a process with an earlier profiled
+run before (A10, torch 2.10). `watch=[(module, "forward")]` names callables
 teacher forcing wraps: while one is replaced, runs take host steps (the wrapper sees every
 call) and no graph is built; for a chaotic workload the teacher-forced call stays out of the
 device loop. For streaming (`metric=ttfa`), `chunk_every=n` adds an IF node that runs
@@ -2524,6 +2531,33 @@ A `torch.compile` step in the default mode (Inductor's kernels, no CUDA graphs o
 is captured into the WHILE body like eager ops. The warm-up run compiles it on the loop's
 own buffers; a compilation under a capture fails. `doctor`'s `graph_conditional` probe runs
 one; `examples/graph_while_decode.py --compile` adds the compiled ways.
+
+A step may draw random numbers from the device's default CUDA generator (`torch.randn`,
+`rand`, `multinomial`, dropout; not `generator=g`), and every mode gives the plain loop's
+numbers step for step. Torch's own graphs make RNG kernels read the seed and the Philox
+offset from two device scalars of a graph-safe generator state, plus the offset counted
+within the capture, and fill the scalars at each replay. The WHILE graph does that per
+iteration: the step is captured while a clone of the generator state is in capture mode
+(a torch graph capture held open on a side stream around it), each launch fills the
+clone's scalars from the generator, and `ka_loop_step` advances the offset scalar by the
+step's increment, so step i reads base + i × increment, the plain loop's offsets. Torch
+exposes neither scalar: they are the two blocks the clone's registration allocates in a
+private `MemPool` (`MemPool.snapshot`), told apart by what a capture prologue writes into
+them. The unrolled blocks are torch's own graphs. `rng=` says where a run leaves the
+generator: `"exact"` (default) where the plain loop does (a WHILE `run()` then waits for
+the loop at its end to read the steps; an unrolled run gives back its masked steps'
+draws), `"reserve"` at max_steps × increment in every mode, without the wait (after an
+early stop later draws differ from the plain loop's, they never repeat the loop's). The
+build's own draws (the masked check, the measuring replays) are put back. `on_chunk` must
+not draw (refused in the WHILE graph). On torch 2.10 a failed capture of a step that drew
+left the default generator in capture mode, and every later draw of the process raised;
+the loop's captures end it. `doctor` probes a drawing step; `--temperature` samples the
+example's tokens (`torch.multinomial`), the same tokens every way (GPU-tested on the A10).
+Measured on an NVIDIA A10, sm_86 (shared with another tenant; torch 2.10; temperature 0.8,
+~193 tokens, median of 5 interleaved rounds of 20 runs, ms per token): 4 x 512: host loop
+1.853, graph per step 0.455, WHILE 0.435, unrolled (K = 4) 0.492; 1 x 256: 0.874, 0.178,
+0.162, 0.178. `rng="reserve"` took the same (0.435, 0.162: the example reads each run's
+steps anyway) and held the host ~0.4 µs per token where `"exact"` holds it for the loop.
 
 `examples/graph_while_decode.py` runs a toy decoder with a static KV cache all four ways
 (the same tokens every way). RTX 5070 Ti (~193 tokens): against a graph per step with a

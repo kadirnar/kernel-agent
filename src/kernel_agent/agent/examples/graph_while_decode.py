@@ -1,4 +1,4 @@
-"""Example: a toy decoder's greedy generation loop run on the device with
+"""Example: a toy decoder's generation loop (greedy or sampled) run on the device with
 ``kernel_agent.graphloop.device_loop`` (#232).
 
 ``ToyDecoder`` is a stand-in for any decoder with a static KV cache (an LLM, the LM of a TTS
@@ -7,7 +7,9 @@ static cache with a position mask, a GELU MLP) and the tied output projection. I
 reads the token and its position from device tensors and writes the KV cache at that
 position, so a graph can replay it with nothing from the host.
 
-The same greedy tokens, four ways:
+The same tokens, four ways (greedy, or sampled with ``temperature`` > 0: the step draws
+from torch's CUDA generator, seeded by the prefill, and every way draws the host loop's
+numbers):
 
 * :func:`generate_host`: the plain loop, the stop read with ``.item()`` every step;
 * :func:`generate_graph_steps`: one CUDA graph per step replayed from Python, the stop read
@@ -119,15 +121,20 @@ class ToyDecoder(nn.Module):
 
 class Request:
     """One request's static state: the last token, where its position starts, the output
-    buffer; :meth:`prefill` writes the prompt into the cache."""
+    buffer; :meth:`prefill` writes the prompt into the cache. ``temperature`` > 0: the
+    tokens are sampled (``torch.multinomial``), the generator seeded with ``seed`` by
+    :meth:`prefill`."""
 
-    def __init__(self, model: ToyDecoder, max_new: int) -> None:
+    def __init__(
+        self, model: ToyDecoder, max_new: int, temperature: float = 0.0, seed: int = 0
+    ) -> None:
         dev = model.emb.device
         with torch.inference_mode(False):
             self.last = torch.zeros(1, dtype=torch.int64, device=dev)
             self.start = torch.zeros((), dtype=torch.int64, device=dev)
             self.out = torch.full((max_new,), -1, dtype=torch.int64, device=dev)
         self.model, self.max_new = model, max_new
+        self.temperature, self.seed = temperature, seed
 
     def prefill(self, prompt: list[int]) -> None:
         model, dev = self.model, self.last.device
@@ -139,11 +146,16 @@ class Request:
         self.last.copy_(tokens[-1:])
         self.start.fill_(len(prompt) - 1)
         self.out.fill_(-1)
+        if self.temperature > 0:
+            torch.manual_seed(self.seed)  # every generation draws the same numbers
 
     def step(self, index: torch.Tensor, active: torch.Tensor | None) -> None:
         """Decode step ``index``: the token after ``last`` into ``out[index]`` and ``last``."""
         logits = self.model.step(self.last, self.start + index, active)
-        token = logits.argmax(-1, keepdim=True)
+        if self.temperature > 0:
+            token = torch.multinomial(torch.softmax(logits.float() / self.temperature, -1), 1)
+        else:
+            token = logits.argmax(-1, keepdim=True)
         if active is None:
             self.out.index_copy_(0, index.view(1), token)
             self.last.copy_(token)
@@ -246,6 +258,7 @@ def compare(
     prompt_len: int = 16,
     runs: int = 10,
     compile: bool = False,
+    temperature: float = 0.0,
     **model_options: Any,
 ) -> dict[str, dict[str, Any]]:
     """Every way on one model and prompt: per way the tokens' agreement with the host loop,
@@ -253,11 +266,11 @@ def compare(
     graph: its launch) and the host checks per run; ``eos`` is the first token the host
     loop generates for the first time from 3/4 of ``max_new`` on, so the loop stops on the
     device's own decision there. ``compile``: the ``torch.compile`` ways too, judged
-    against the compiled host loop."""
+    against the compiled host loop. ``temperature`` > 0: sampled tokens."""
     model = ToyDecoder(**model_options)
     gen = torch.Generator().manual_seed(1)
     prompt = torch.randint(0, model.emb.shape[0], (prompt_len,), generator=gen).tolist()
-    req = Request(model, max_new)
+    req = Request(model, max_new, temperature)
     free, _ = generate_host(req, prompt, eos=-1)
     late = range(3 * max_new // 4, max_new)
     eos = next((free[i] for i in late if free[i] not in free[:i]), -1)  # -1: max_new
@@ -268,6 +281,10 @@ def compare(
         "device loop (while, masked step)": DeviceGenerator(req, eos, mode="while"),
         "device loop (unrolled)": DeviceGenerator(req, eos, mode="unrolled"),
     }
+    if temperature > 0:  # rng="exact" (the others) waits for the loop at the end of a run
+        loops["device loop (while, rng=reserve)"] = DeviceGenerator(
+            req, eos, mode="while", masked=False, rng="reserve"
+        )
     # per way: the call and the tokens it must give
     ways: dict[str, tuple[Any, list[int]]] = {
         "host loop": (lambda: generate_host(req, prompt, eos), reference),
@@ -360,7 +377,20 @@ def main() -> None:
     The torch.compile ways ran 256 tokens (Inductor's numerics never generate the eager
     stop token there) and match the compiled host loop (0.866 ms per token); on the 1-layer
     models they stop after 78 and 24 tokens, too few for a stable number. The WHILE loop
-    held the host 0.25-0.35 µs per token."""
+    held the host 0.25-0.35 µs per token.
+
+    ``--temperature 0.8`` (sampled tokens, ``torch.multinomial``; the same A10, median of 5
+    interleaved rounds of 20 runs, ~193 tokens; the same tokens every way):
+
+    ===================================  ==========  =========
+    way                                  4 x 512     1 x 256
+    ===================================  ==========  =========
+    host loop                            1.853       0.874
+    graph per step                       0.455       0.178
+    device loop (while)                  0.435       0.162
+    device loop (while, rng=reserve)     0.435       0.162
+    device loop (unrolled, K=4)          0.492       0.178
+    ===================================  ==========  ========="""
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--max-new", type=int, default=256)
     parser.add_argument("--layers", type=int, default=4)
@@ -368,12 +398,14 @@ def main() -> None:
     parser.add_argument("--vocab", type=int, default=2048)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--compile", action="store_true", help="the torch.compile ways too")
+    parser.add_argument("--temperature", type=float, default=0.0, help="> 0: sampled tokens")
     ns = parser.parse_args()
     with torch.inference_mode():
         rows = compare(
             ns.max_new,
             runs=ns.runs,
             compile=ns.compile,
+            temperature=ns.temperature,
             layers=ns.layers,
             dim=ns.dim,
             vocab=ns.vocab,

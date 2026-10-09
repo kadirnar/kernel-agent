@@ -504,11 +504,36 @@ def activity_check(
                 torch.cuda.synchronize()
             time.sleep(settle_s)  # late launches from other threads
             torch.cuda.synchronize()
+            # the device is idle: no graph body runs under this marker's correlation id, so
+            # its stream is the timed one (e2e_activity.caller_stream)
+            with record_function(CALLER):
+                torch.cuda._sleep(1)
             e2e_activity.mark_streams(record_function)  # declared streams' profiler ids
             torch.cuda.synchronize()
     out["reference_calls"] = {codes[c]: n for c, n in counts.items() if n}
+    return analyse_activity(_events(prof), len(inputs), out)
 
-    events = _events(prof)
+
+#: The marker :func:`activity_check` launches on the timed stream once the device is idle.
+CALLER = "ka::caller"
+
+
+def analyse_activity(
+    events: list[_Event], calls: int, known: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The findings of :func:`activity_check` from its profiler ``events`` (``calls``: the
+    candidate's calls; ``known``: what is known already). The timed stream is where the
+    ``ka::caller`` marker ran (:func:`kernel_agent.kernels.e2e_activity.caller_stream`), and
+    a call's end the start of its ``ka::mark{i}`` marker's own record on that stream: once
+    CUPTI is initialised before a CUDA graph with a conditional node is built, the profiler
+    files that graph's body kernels under other launches' correlation ids, the markers' among
+    them (#232), so the first record of a marker's id need not be the marker. Work on the
+    timed stream precedes the marker by stream order: it is joined whatever its timestamps
+    say (#268)."""
+    from kernel_agent.kernels import e2e_activity
+
+    out: dict[str, Any] = {"foreign_threads": [], "unjoined": [], "reference_calls": {}}
+    out.update(known or {})
     ranges = {e.name: e for e in events if e.kind == "user_annotation" and e.name[:4] == "ka::"}
     gpu: dict[int, list[_Event]] = collections.defaultdict(list)  # a graph launch: several
     for e in events:
@@ -520,25 +545,28 @@ def activity_check(
         span = ranges.get(name)
         return [] if span is None else [e for e in launches if span.start <= e.start <= span.end]
 
-    marks = [within(f"ka::mark{i}") for i in range(len(inputs))]
+    marks = [within(f"ka::mark{i}") for i in range(calls)]
     if not all(marks) or not gpu:
         out["note"] = "the profiler recorded no GPU activity; activity checks skipped"
         return out
     main_thread = marks[0][0].resource
+    idents = [e for e in within(CALLER) if e.resource == main_thread]
+    timed = e2e_activity.caller_stream(gpu[marks[0][0].corr], gpu[idents[0].corr] if idents else [])
     ref_kernels: collections.Counter[str] = collections.Counter(
         w.name for e in within("ka::reference") for w in gpu[e.corr] if w.kind == "kernel"
     )
     new_kernels: collections.Counter[str] = collections.Counter()
     seen: collections.Counter[int] = collections.Counter()  # GPU operations per stream
     own = total = 0
-    for i in range(len(inputs)):
-        mark = min((w.start for w in gpu[marks[i][0].corr]), default=None)
+    for i in range(calls):
+        mine = [w.start for w in gpu[marks[i][0].corr] if w.resource == timed]
+        mark = min(mine, default=None)
         for launch in within(f"ka::call{i}"):
             if launch.resource != main_thread:
                 continue
             for work in gpu[launch.corr]:
                 seen[work.resource] += 1
-                if mark is not None and work.end > mark + JOIN_SLACK_NS:
+                if work.resource != timed and mark is not None and work.end > mark + JOIN_SLACK_NS:
                     out["unjoined"].append(
                         f"{work.name[:80]} (stream {work.resource}) ran "
                         f"{(work.end - mark) / 1e3:.0f} us past the end of call {i}"
@@ -555,13 +583,12 @@ def activity_check(
         out["foreign_threads"].append(f"{label} launched from thread {launch.resource}")
     out["custom_kernel_share"] = round(own / total, 3) if total else None
     # joined streams other than the timed one and the declared ones (a note, not a failure)
-    timed = gpu[marks[0][0].corr][0].resource
     out["undeclared_streams"] = e2e_activity.undeclared(
         seen, timed, e2e_activity.stream_ids(events)
     )
     # kernel launches per call, by name (the candidate's averaged over its calls)
     out["reference_kernels"] = dict(ref_kernels)
-    out["candidate_kernels"] = {k: n / len(inputs) for k, n in new_kernels.items()}
+    out["candidate_kernels"] = {k: n / calls for k, n in new_kernels.items()}
     for key in ("unjoined", "foreign_threads"):
         out[key] = sorted(set(out[key]))[:5]
     return out

@@ -52,7 +52,7 @@ GPU_WORK = frozenset({"kernel", "gpu_memcpy", "gpu_memset"})
 API_CALLS = frozenset({"cuda_runtime", "cuda_driver"})
 #: Profiler ranges of the check; :func:`profiled_run` appends a random tag to each, so code
 #: under test cannot fake them with ``record_function`` ranges of the same name.
-RUN, MARK, STREAM = "ka::run", "ka::mark", "ka::stream:"
+RUN, MARK, CALLER, STREAM = "ka::run", "ka::mark", "ka::caller", "ka::stream:"
 _LIMIT = 5  # examples kept per finding
 
 
@@ -151,6 +151,27 @@ def stream_ids(evts: Sequence[_EventLike], tag: str = "") -> dict[str, int]:
     return found
 
 
+def caller_stream(mark: Sequence[_EventLike], ident: Sequence[_EventLike]) -> int:
+    """The profiler's id of the caller's stream: where the ``ka::mark`` marker kernel ran.
+    ``mark``: the GPU records of the marker's correlation id; ``ident``: those of the
+    ``ka::caller`` marker, launched on the same stream once the device is idle.
+
+    A correlation id does not always name one launch's work: once CUPTI is initialised before
+    a CUDA graph with a conditional node is instantiated (any earlier profiled run in the
+    process does it), the profiler records every iteration of the conditional body, on a
+    stream id of its own, under correlation ids that are not the graph launch's: 0, ids of no
+    recorded call and now and then the id of the API call the host was making when the body
+    kernel started, the ``ka::mark`` marker's launch among them (measured on an NVIDIA A10,
+    torch 2.10, CUDA 12.9: a WHILE loop's step kernel listed first under the marker's id, so
+    the check took its stream for the caller's and its start for the time the caller's stream
+    drained, and refused the joined loop's last kernel; #232). Nothing runs on the device
+    while the ``ka::caller`` marker is launched, so its stream is the caller's; where it is
+    missing, the first record of the marker's id (the earlier rule)."""
+    streams = [w.resource for w in mark]
+    found = next((w.resource for w in ident if w.resource in streams), None)
+    return streams[0] if found is None else found
+
+
 def undeclared(seen: collections.Counter[int], caller: int, declared: dict[str, int]) -> list[str]:
     """Streams in ``seen`` (stream id -> GPU operations) other than the caller's and the
     declared ones, as readable notes."""
@@ -207,12 +228,14 @@ def analyse(
         return _verdict(out)
     main = marks[0].resource  # the thread that called run()
     mark_work = gpu[marks[0].corr]
-    drained = min(w.start for w in mark_work)  # the caller's stream reached the marker
-    caller = mark_work[0].resource
+    idents = [e for e in _within(launches, ranges.get(CALLER + tag)) if e.resource == main]
+    caller = caller_stream(mark_work, gpu[idents[0].corr] if idents else [])
+    # the caller's stream reached the marker (its own record: the id may name others too)
+    drained = min(w.start for w in mark_work if w.resource == caller)
     own = {  # the check's own markers, enqueued after run() returned
         e.corr
         for name, span in ranges.items()
-        if name == MARK + tag or name.startswith(STREAM)
+        if name in (MARK + tag, CALLER + tag) or name.startswith(STREAM)
         for e in _within(launches, span)
         if span.start >= run.end
     }
@@ -235,8 +258,9 @@ def analyse(
         for w in work:
             seen[w.resource] += 1
             # Work on the caller's own stream precedes the marker by stream order, so it is
-            # joined whatever its timestamps say: CUPTI now and then reported a CUDA graph's
-            # last kernel (after a conditional WHILE node) as ending after that marker (#268).
+            # joined whatever its timestamps say (#268: a WHILE graph's last kernel looked
+            # unjoined because a body kernel under the marker's correlation id was taken for
+            # the marker; caller_stream).
             if w.resource != caller and w.end > drained + slack_ns:
                 out["unjoined"].append(
                     f"{w.name[:80]} (stream {w.resource}) ran {(w.end - drained) / 1e3:.0f} us "
@@ -355,9 +379,11 @@ def profiled_run(
     settle_s: float = SETTLE_S,
 ) -> tuple[list[Event], dict[str, Any]]:
     """One ``run(inputs)`` under the profiler: then a marker kernel on the caller's stream
-    (``ka::mark``: it starts once that stream drained), one on every declared stream, and
-    ``settle_s`` of waiting for late launches. Returns the events and what the run left
-    behind (``outstanding``, ``stream_changed``, ``tag``: the ranges' suffix). Raises
+    (``ka::mark``: it starts once that stream drained), ``settle_s`` of waiting for late
+    launches and, once the device is idle, the markers that name the streams: one more on
+    the caller's stream (``ka::caller``, :func:`caller_stream`) and one on every declared
+    stream (:func:`stream_ids`). Returns the events and what the run left behind
+    (``outstanding``, ``stream_changed``, ``tag``: the ranges' suffix). Raises
     :class:`ProfilerUnavailable` when the profiler does not start."""
     from torch.autograd.profiler import record_function
     from torch.profiler import ProfilerActivity, profile
@@ -383,8 +409,12 @@ def profiled_run(
             state["stream_changed"] = torch.cuda.current_stream(device) != caller
             with torch.cuda.stream(caller), record_function(MARK + tag):
                 torch.cuda._sleep(1)
-            mark_streams(record_function, tag)
             time.sleep(settle_s)  # late launches
+            _synchronize_all()
+            # the device is idle: no graph body can run under these markers' correlation ids
+            with torch.cuda.stream(caller), record_function(CALLER + tag):
+                torch.cuda._sleep(1)
+            mark_streams(record_function, tag)
             _synchronize_all()
     finally:
         torch.cuda.set_stream(caller)
