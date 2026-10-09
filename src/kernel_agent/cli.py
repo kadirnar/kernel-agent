@@ -72,8 +72,8 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
 
 def _doctor_probes(ns: argparse.Namespace, *, gpu: bool) -> None:
     """Nsight Compute for ``profile="ncu"`` (kernels/ncu.py), the versions and the feature
-    probes (probes.py: ``tl.dot_scaled`` → block-scaled MMA, TMA, PDL, green contexts);
-    informative, never a failure."""
+    probes (probes.py: ``tl.dot_scaled`` → block-scaled MMA, TMA, PDL, green contexts,
+    conditional graph nodes); informative, never a failure."""
     from kernel_agent import probes
     from kernel_agent.kernels import ncu, sass
 

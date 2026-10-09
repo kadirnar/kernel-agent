@@ -95,7 +95,7 @@ ROLE_SKILLS = {
 
 _LINK = re.compile(r"\]\(([\w./-]+\.md)(?:#[^)]*)?\)")  # markdown links to files of the tree
 _EXAMPLE = re.compile(
-    r"`(?:examples/)?((?:cuda|nvrtc|triton|cute|tilelang|helion)_[a-z0-9_]+\.py)`"
+    r"`(?:examples/)?((?:cuda|nvrtc|triton|cute|tilelang|helion|graph)_[a-z0-9_]+\.py)`"
 )
 #: Backticked names that look like examples and are not (Unsloth's / kernels/triton_launch.py).
 _NOT_EXAMPLES = {"triton_launch.py"}

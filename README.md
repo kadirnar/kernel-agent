@@ -1854,9 +1854,12 @@ Helion, ncu) and probes the features kernels rely on (`kernel_agent/probes.py`,
 (`block_scale` in the PTX, `QMMA.SF` in the SASS), Triton host TMA descriptors
 compile and copy a tile, a programmatic dependent launch (PDL) orders a producer
 and a consumer, `kernel_agent.concurrency.partition` splits the SMs into two
-disjoint green contexts (SMs granted) whose streams run torch work, and Helion (when
+disjoint green contexts (SMs granted) whose streams run torch work, Helion (when
 installed, with a torch and Triton its requirements accept) compiles and runs the
-RMSNorm example (skipped with the reason otherwise). A probe that fails says why and never fails `doctor`; the results go to
+RMSNorm example (skipped with the reason otherwise), and a
+`kernel_agent.graphloop` loop runs through a CUDA-graph WHILE node with a chunk IF node
+(`graph_conditional`; skipped below a CUDA 12.4 driver or without `cuda.core`, where
+device loops use K-step unrolled graphs). A probe that fails says why and never fails `doctor`; the results go to
 `~/.cache/kernel-agent/probes-<gpu>-torch<version>.json`.
 `kernel-agent memcheck capture.pt candidate.py` runs one candidate.
 
@@ -2134,6 +2137,50 @@ request its own noise): under continuous batching on two slots, every request
 is still VoxCPM's own batch-1 `generate` of its text and seed (CPU test);
 docs/PARALLEL.md §5 estimates up to 1.31× throughput at natural length for
 its default texts, nothing at fixed length.
+
+### Host-free generation loops: CUDA-graph WHILE nodes
+
+`kernel_agent/graphloop.py` (#232) runs a whole generation loop on the device, for any
+loop a transform owns (LLM decode, a TTS LM, an AR sampler):
+`graphloop.device_loop(step, cond, max_steps)` calls `step(index, active)` (device
+scalars: the steps done, whether the loop goes on) until every flag of `cond()` is set
+(from `min_steps` on) or `max_steps`, in the first mode that works here:
+
+* **while**: one graph built through `cuda.core` whose WHILE node (a conditional node,
+  CUDA 12.4+ driver) runs the step, captured on a torch `ExternalStream` of the body's
+  capture stream with its memory from a private `torch.cuda.MemPool`, and a one-thread
+  kernel that counts the step, checks the flags and the limits and calls
+  `cudaGraphSetConditional`. One launch per request, no host decision per step; the steps
+  done stay a device tensor until the caller reads them.
+* **unrolled** (older drivers, a failed capture): a `torch.cuda.CUDAGraph` of K steps
+  replayed until the stop, the status read once per block, one block ahead. Steps after the
+  stop run masked (the step gates its writes with `active`: `graphloop.masked_copy_`,
+  `masked_index_copy_`; `check_state=` checks it once), so nothing is written past the
+  stop. K minimises the expected time from the measured step and launch costs
+  (`measure_unroll`, `choose_unroll`).
+* **host**: the plain loop (the warm-up runs, the last resort).
+
+Every fallback says why (`loop.mode`, `loop.reason`, `loop.stats`: launches, host checks,
+K). The graph runs on the caller's stream, so the evaluator's timing sees all of it. The
+profiler lists only the last iteration's body kernels and does not record cuda.core's
+driver-API launch, so the loop is launched with the `cudaGraphLaunch` of torch's CUDA
+runtime and begins and ends with a kernel outside the WHILE node: the end-to-end
+hidden-work check sees the launch and the loop's whole span (a loop on a side stream that
+is never joined fails it, GPU-tested). `watch=[(module, "forward")]` names callables
+teacher forcing wraps: while one is replaced, runs take host steps (the wrapper sees every
+call) and no graph is built; for a chaotic workload the teacher-forced call stays out of the
+device loop. For streaming (`metric=ttfa`), `chunk_every=n` adds an IF node that runs
+`on_chunk()` at chunk boundaries and writes the steps done to a host-mapped counter;
+`loop.chunks()` yields them as they happen and, left early (the metric window), cancels
+the loop through a host-mapped flag and joins it. `examples/graph_while_decode.py` runs a toy
+decoder with a static KV cache all four ways (RTX 5070 Ti, ~193 tokens, the same tokens
+every way): against a graph per step with a `.item()` stop check the WHILE loop took
+0.269 → 0.253 ms per token (4 layers) and 0.067 → 0.062 ms (1 layer), with ~0.3 µs of host
+time per token and no host check (eager host loop: 1.87 and 0.58 ms). With a one-kernel
+step a step costs 7.8 µs with the host check, 5.2 µs in the WHILE loop and 2.6 µs as graph
+replays without any stop check: the loop pays where a stop is checked every step or the
+host is the bottleneck, not for a fixed-length loop whose host already runs ahead. The
+`systems-patterns` skill tells the agents how to use it.
 
 ### Calls behind a kernel's estimate
 
