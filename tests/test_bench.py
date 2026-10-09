@@ -309,3 +309,39 @@ def test_random_draws_work_after_a_failed_graph_capture():
         bench._capture(body, torch.cuda.Stream())
     assert torch.randn(8, device="cuda").shape == (8,)
     assert torch.rand(8, device="cuda").max() < 1
+
+
+@pytest.mark.gpu
+def test_a_failed_graph_capture_leaves_the_allocator_usable(tmp_path):
+    """After a capture that fails (in its own process: the bug aborts it), a ``MemPool``
+    is used and destroyed: torch 2.10 left the allocator routed to the failed capture's pool
+    and that destructor aborted the process (``captures_underway.empty()``, measured on an
+    NVIDIA A10)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = tmp_path / "pool.py"
+    script.write_text(
+        "import torch\n"
+        "from kernel_agent.kernels import bench\n"
+        "def body():\n"
+        "    float(torch.rand(16, device='cuda').sum())  # a host sync: not capturable\n"
+        "try:\n"
+        "    bench._capture(body, torch.cuda.Stream())\n"
+        "except bench.GraphUnavailable:\n"
+        "    pass\n"
+        "pool = torch.cuda.MemPool()\n"
+        "with torch.cuda.use_mem_pool(pool):\n"
+        "    y = torch.empty(1 << 20, device='cuda')\n"
+        "del y, pool\n"
+        "torch.cuda.synchronize()\n"
+        "print('ok')\n"
+    )
+    src = str(Path(bench.__file__).parents[2])
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([src, os.environ.get("PYTHONPATH", "")])}
+    done = subprocess.run(
+        [sys.executable, str(script)], env=env, capture_output=True, text=True, timeout=300
+    )
+    assert done.returncode == 0 and "ok" in done.stdout, done.stderr[-2000:]

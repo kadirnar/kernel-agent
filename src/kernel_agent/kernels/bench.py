@@ -44,6 +44,7 @@ _GraphBase: Any = getattr(torch._C, "_CUDAGraph", None)
 _CUDAGraph: Any = getattr(torch.cuda, "CUDAGraph", None)
 _replay: Callable[..., Any] | None = getattr(_GraphBase or _CUDAGraph, "replay", None)
 _graph_capture: Any = getattr(torch.cuda, "graph", None)
+_pool_handle: Any = getattr(torch.cuda, "graph_pool_handle", lambda: None)
 _Stream = torch.cuda.Stream
 _on_stream = torch.cuda.stream
 _set_stream = torch.cuda.set_stream
@@ -289,15 +290,32 @@ def _capture(body: Callable[[], Any], stream: Any) -> tuple[Any, Any]:
 
     graph = _CUDAGraph()
     current = _current_stream()
+    pool = _pool_handle()  # its private pool, named: a failed capture must leave it (below)
     try:
-        with _graph_capture(graph, stream=stream):
+        with _graph_capture(graph, pool=pool, stream=stream):
             out = guarded()
     except Exception as exc:
         # the capture's exit raised before it set the current stream back (torch 2.14)
         _set_stream(current)
+        _leave_pool(pool)
         _leave_rng_capture()
         raise GraphUnavailable(first_line(failed[0] if failed else exc)) from exc
     return graph, out
+
+
+def _leave_pool(pool: Any) -> None:
+    """Stop the caching allocator routing allocations to ``pool``, the private pool of a
+    capture that failed: torch 2.10 leaves it routed there, and the next ``MemPool``
+    destructor of the process aborted it (``captures_underway.empty()``: a device loop's
+    after a candidate that could not be graph-timed, measured on an NVIDIA A10; graphloop
+    does the same for its own captures, #232). The pool is named before the capture because
+    ``CUDAGraph.pool()`` refuses after a failed one. An error where torch already did it is
+    ignored."""
+    end = getattr(torch._C, "_cuda_endAllocateToPool", None)
+    if end is None:
+        return
+    with contextlib.suppress(Exception):
+        end(torch.cuda.current_device(), pool)
 
 
 def _leave_rng_capture() -> None:
