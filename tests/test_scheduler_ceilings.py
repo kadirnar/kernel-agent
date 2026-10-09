@@ -279,6 +279,29 @@ def test_target_precisions():
     assert ceilings.floor_ms([row], ceilings.PRECISIONS["exact"], peaks) == pytest.approx(200.0)
     assert ceilings.floor_ms([{**row, "work_known": False}], reduced, peaks) is None
     assert ceilings.floor_ms([row], reduced, None) is None
+    # #257: on a GPU without bf16 tensor cores (Turing) `reduced` runs at the fp16 peak
+    turing = {"arch": "sm_75", "tflops": {"float32": 8.0, "bfloat16": 8.0, "float16": 65.0}}
+    fp16 = ceilings.target_precision("reduced", turing | {"dram_gbps": 320.0})
+    assert fp16 is ceilings.REDUCED_FP16 and fp16.label == "fp16"
+    assert ceilings.floor_ms([row], fp16, turing | {"dram_gbps": 1e6}) == pytest.approx(4e3 / 65)
+    assert ceilings.target_precision("reduced", {"arch": "sm_86"}) is reduced
+    assert ceilings.target_precision("exact", turing).label == "exact"
+
+
+def test_a_reduced_arm_on_turing_takes_the_fp16_floor():
+    spec = {"module_class": "Block", "qualname": "model.layers.3", "precision": "reduced"}
+    row = _row("Block", "model.layers.*", "prefill", 80.0, flops={"float32": int(65e12)})
+    row |= {"weight_elems": 10**6, "weight_bytes": 4 * 10**6, "io_bytes": 0, "calls": 4}
+    table = {"baseline_ms": 2000.0, "per": "per run", "rows": [row]}
+    table["peaks"] = {"arch": "sm_75", "dram_gbps": 320.0}
+    table["peaks"]["tflops"] = {"float32": 8.0, "bfloat16": 8.0, "float16": 65.0}
+    groups = [scheduler.projection.Group("t", "model.layers.*", 1.0)]
+    profiles = [{"baseline_ms": 2000.0, "ceilings": table}]
+    ceiling = scheduler.arm_ceiling(spec, groups, profiles)
+    assert ceiling is not None and ceiling.precision == "fp16"
+    assert ceiling.floor == pytest.approx(1000.0)  # 65 TFLOP at 65 TFLOP/s, not at 8
+    table["peaks"]["arch"] = "sm_86"
+    assert scheduler.arm_ceiling(spec, groups, profiles).floor == pytest.approx(65e3 / 8)
 
 
 def test_one_instance_of_a_group_takes_its_share():

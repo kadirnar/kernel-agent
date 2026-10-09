@@ -8,7 +8,8 @@
   launches one tiny kernel, timed like a candidate), the INT8 GEMM peak (``int8``:
   ``torch._int_mm``, cuBLASLt's IMMA kernels, in TOPS), and the tensor-core
   instruction rates (``mma_tflops``, :mod:`.mma_peaks`: plain FP8 ``QMMA.F32``
-  vs block-scaled ``QMMA.SF`` vs bf16 vs s8 ``IMMA``).  :func:`ensure_peaks`
+  vs block-scaled ``QMMA.SF`` vs bf16 / fp16 (fp32 and fp16 accumulation) / TF32 ``HMMA``
+  vs s8 ``IMMA``, Turing's shapes too).  :func:`ensure_peaks`
   measures them once per GPU + torch version in a subprocess under the GPU lock
   and caches them in ``<cache>/peaks-<gpu>-torch<version>.json``; they are never
   measured inside a timed evaluation.
@@ -99,10 +100,11 @@ MXFP8 = "mxfp8"
 #: multiply-add = 2 ops, like a FLOP).
 INT8 = "int8"
 #: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks, 3 the MXFP8 one, 4 the
-#: tensor-core instruction rates (``mma_tflops``), 5 the INT8 peak and the s8 IMMA rate.
+#: tensor-core instruction rates (``mma_tflops``), 5 the INT8 peak and the s8 IMMA rate, 6
+#: the fp16 (fp32 and fp16 accumulation), TF32 and Turing-shape instruction rates (#257).
 #: :func:`ensure_peaks` measures an older cache again (once per process at most); until then
 #: it stays in use.
-PEAKS_VERSION = 5
+PEAKS_VERSION = 6
 #: The tensor-core math of a reduced-precision target: the FLOPs of every op that reads one
 #: of its narrowed weights count at this dtype's peak (W8A8: FP8), not at the reference's.
 MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8, "int8_w8a8": INT8, "fp4_w4a4": FP4}

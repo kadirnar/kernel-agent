@@ -514,7 +514,7 @@ def arm_ceiling(
     window = float(table.get("baseline_ms") or 0.0)
     if spec.get("kind") == "region" or not table.get("rows") or window <= 0:
         return None
-    precision = ceilings.target_precision(spec.get("precision"))
+    precision = ceilings.target_precision(spec.get("precision"), table.get("peaks"))
     cls, phase = spec.get("module_class"), spec.get("phase") or None
     parts: dict[Any, tuple[float, float, str]] = {}
     upper = False

@@ -19,7 +19,9 @@ RTX 5070 Ti, sm_120: its measurements stay in the skills as labelled evidence).
   why it does not run here (``doctor --smoke``).
 * :func:`summary_lines` (in :meth:`Toolchain.summary <kernel_agent.toolchain.Toolchain.summary>`,
   so in ``doctor`` and every prompt's toolchain block): the family, what runs at full rate,
-  the precisions this GPU cannot run and the bf16 ridge from the measured peaks;
+  the precisions this GPU cannot run, the 16-bit ridge from the measured peaks (at the
+  16-bit tensor-core dtype, :func:`tensor_core_16bit`: fp16 on Volta / Turing) and what fp32
+  accumulation costs (:func:`kernel_agent.kernels.mma_peaks.accumulation_line`);
   :func:`prompt_section`: those facts and this family's section of ``gpu-architectures/gpus.md``.
 * :func:`from_summary`: the GPU, its capability and its measured instruction rates read
   back from a toolchain summary (the prompts receive the summary text).
@@ -210,6 +212,19 @@ def has(capability: tuple[int, ...] | None, feature: str) -> bool:
     """Whether the family of ``capability`` has ``feature`` (:data:`FAMILIES`)."""
     fam = family(capability)
     return fam is not None and feature in fam.features
+
+
+#: Short names of the 16-bit ``peaks["tflops"]`` keys.
+SHORT_16BIT = {"bfloat16": "bf16", "float16": "fp16"}
+
+
+def tensor_core_16bit(capability: tuple[int, ...] | None) -> str:
+    """The 16-bit dtype (``peaks["tflops"]`` key) this GPU's tensor cores run: ``bfloat16``
+    from Ampere on, ``float16`` on Volta / Turing (no bf16 tensor cores: bf16 matmuls run on
+    CUDA cores there); ``bfloat16`` for an unknown GPU."""
+    if capability is None or has(capability, "bf16_tc"):
+        return "bfloat16"
+    return "float16"
 
 
 def arch_of(capability: tuple[int, ...] | None) -> str | None:
@@ -465,7 +480,8 @@ def from_summary(text: str | None) -> Facts:
 
     mma = {}
     for instruction in INSTRUCTIONS:
-        rate = re.search(re.escape(instruction.label) + r" (\d+(?:\.\d+)?)\b", text or "")
+        label = r"(?<![\w.])" + re.escape(instruction.label)  # not inside a longer label
+        rate = re.search(label + r" (\d+(?:\.\d+)?)\b", text or "")
         if rate:
             mma[instruction.key] = float(rate.group(1))
     return Facts(match.group("name"), capability_of(match.group("arch")), mma)
@@ -491,7 +507,9 @@ def _features(fam: Family) -> str:
 def summary_lines(gpu: Any, peaks: Mapping[str, Any] | None) -> list[str]:
     """``Toolchain.summary`` lines about the GPU's architecture (none without a GPU): its
     family and features, the instruction a compute-bound kernel needs, the precisions it
-    cannot run and the bf16 ridge of the measured peaks."""
+    cannot run, the 16-bit ridge of the measured peaks (labelled with the tensor-core
+    dtype: bf16, fp16 on Volta / Turing) and the measured fp32- vs fp16-accumulating HMMA
+    rates."""
     if gpu is None:
         return []
     capability = (int(gpu.capability[0]), int(gpu.capability[1]))
@@ -527,13 +545,26 @@ def summary_lines(gpu: Any, peaks: Mapping[str, Any] | None) -> list[str]:
     if caveat and (note := precision_note("int8_w8a8", capability)) is not None:
         lines.append(f"INT8 W8A8: {note}")
     tflops = (peaks or {}).get("tflops") or {}
-    if peaks and tflops.get("bfloat16") and peaks.get("dram_gbps"):
-        ridge = float(tflops["bfloat16"]) * 1000 / float(peaks["dram_gbps"])
-        lines.append(
-            f"bf16 ridge: a GEMM turns compute bound near M ≈ {ridge:.0f} rows per weight read "
-            f"(measured bf16 {float(tflops['bfloat16']):.0f} TFLOP/s / DRAM "
-            f"{float(peaks['dram_gbps']):.0f} GB/s)"
+    dtype = tensor_core_16bit(capability)
+    short = SHORT_16BIT[dtype]
+    if peaks and tflops.get(dtype) and peaks.get("dram_gbps"):
+        dram = float(peaks["dram_gbps"])
+        ridge = float(tflops[dtype]) * 1000 / dram
+        line = (
+            f"16-bit ridge ({short}, the 16-bit tensor-core dtype here): a GEMM turns compute "
+            f"bound near M ≈ {ridge:.0f} rows per weight read (measured {short} "
+            f"{float(tflops[dtype]):.0f} TFLOP/s / DRAM {dram:.0f} GB/s)"
         )
+        if dtype != "bfloat16" and tflops.get("bfloat16"):
+            line += (
+                f"; bf16 matmuls run without tensor cores here ({float(tflops['bfloat16']):.0f} "
+                f"TFLOP/s: M ≈ {float(tflops['bfloat16']) * 1000 / dram:.0f})"
+            )
+        lines.append(line)
+    from kernel_agent.kernels.mma_peaks import accumulation_line
+
+    if (accumulate := accumulation_line((peaks or {}).get("mma_tflops") or {})) is not None:
+        lines.append(accumulate)
     return lines
 
 
