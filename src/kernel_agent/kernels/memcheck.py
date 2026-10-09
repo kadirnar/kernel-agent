@@ -36,20 +36,25 @@ result has every tool's own record (status, errors, first report, seconds). Race
 shared memory only: ordering bugs of global memory are what the evaluator's determinism and
 perturbed checks are for.
 
-:func:`selftest` proves that the sanitizer works here (``kernel-agent doctor``): a deliberate
-one-block overrun of a Triton kernel (:mod:`kernel_agent.kernels.memcheck_probe`) must be
-reported, an in-bounds kernel must not.
+:func:`selftest` proves that each tool works here (``kernel-agent doctor``, :data:`SELFTESTS`):
+memcheck must report a deliberate one-block overrun of a Triton kernel
+(:mod:`kernel_agent.kernels.memcheck_probe`) and not an in-bounds kernel; racecheck a
+shared-memory read-after-write between two warps without the barrier, synccheck a
+``__syncthreads()`` half of a warp reaches (:mod:`kernel_agent.kernels.sanitizer_probe`,
+NVRTC), and neither the same kernels with their barrier in place.
 
 Subprocesses (under the sanitizer)::
 
     python -m kernel_agent.kernels.memcheck CAPTURE CANDIDATE [--capture-sha256 S]
     python -m kernel_agent.kernels.memcheck_probe
+    python -m kernel_agent.kernels.sanitizer_probe race|sync
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -555,37 +560,95 @@ def pending(result: dict[str, Any]) -> bool:
 # ------------------------------------------------------------------ the self-test
 
 
-def selftest(tool: Any = None, timeout: float = 300.0) -> dict[str, Any]:
-    """``ok`` when the sanitizer reports the deliberate overrun of
-    :mod:`kernel_agent.kernels.memcheck_probe` and nothing else (``kernel-agent doctor``)."""
+@dataclasses.dataclass(frozen=True)
+class SelfTest:
+    """One tool's self-test: ``program`` (a module and its arguments) runs ``clean`` (a
+    kernel the tool must not report) and then ``hazard`` (one it must report as an error)."""
+
+    program: tuple[str, ...]
+    hazard: str
+    clean: str
+    hazard_is: str  # what the hazard is, for the verdict's reason
+    clean_is: str
+
+
+#: The self-test of every tool (``kernel-agent doctor``): memcheck's deliberate overrun of a
+#: Triton kernel (:mod:`kernel_agent.kernels.memcheck_probe`); racecheck's shared-memory race
+#: and synccheck's divergent ``__syncthreads()`` (:mod:`kernel_agent.kernels.sanitizer_probe`,
+#: issue #225).
+SELFTESTS = {
+    "memcheck": SelfTest(
+        ("kernel_agent.kernels.memcheck_probe",),
+        "_ka_memcheck_overrun",
+        "_ka_memcheck_inbounds",
+        "the deliberate out-of-bounds read",
+        "an in-bounds kernel",
+    ),
+    "racecheck": SelfTest(
+        ("kernel_agent.kernels.sanitizer_probe", "race"),
+        "ka_race",
+        "ka_ordered",
+        "the deliberate shared-memory race",
+        "a kernel ordered by its barrier",
+    ),
+    "synccheck": SelfTest(
+        ("kernel_agent.kernels.sanitizer_probe", "sync"),
+        "ka_divergent",
+        "ka_uniform",
+        "the deliberate divergent __syncthreads()",
+        "a barrier every thread reaches",
+    ),
+}
+
+
+def selftest(tool: Any = None, timeout: float = 300.0, name: str = "memcheck") -> dict[str, Any]:
+    """``ok`` when ``--tool name`` reports the deliberate hazard of its probe as an error and
+    nothing else (:data:`SELFTESTS`; ``kernel-agent doctor``). ``reason``: the first report
+    (or why not); ``errors`` / ``warnings`` / ``report`` as the tool's log has them."""
     from kernel_agent import toolchain
 
     tool = tool or toolchain.sanitizer()
     if not tool.path:
         return {"ok": False, "reason": tool.reason}
+    test = SELFTESTS[name]
     start = time.perf_counter()
-    workdir = Path(tempfile.mkdtemp(prefix="ka-memcheck-"))
-    cmd = [sys.executable, "-m", "kernel_agent.kernels.memcheck_probe"]
+    workdir = Path(tempfile.mkdtemp(prefix=f"ka-{name}-"))
+    cmd = [sys.executable, "-m", *test.program]
     try:
         with gpu_lock():
-            child, log, tail = _sanitize(cmd, timeout, workdir, tool)
+            child, log, tail = _sanitize(cmd, timeout, workdir, tool, name)
     except subprocess.TimeoutExpired:
         return {"ok": False, "reason": f"exceeded {timeout:.0f}s"}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-    errors, report = parse_log(log)
-    out: dict[str, Any] = {"seconds": round(time.perf_counter() - start, 1), "errors": errors}
-    out["report"] = report
+    out: dict[str, Any] = {"seconds": round(time.perf_counter() - start, 1)}
+    if name == "racecheck":
+        errors, out["warnings"], report = parse_race_log(log)
+    else:
+        errors, report = parse_log(log)
+    out.update(errors=errors, report=report)
     if child is None or child.get("status") != "ok":
         detail = (child or {}).get("error") or log.strip()[-500:] or tail.strip()[-500:]
         out.update(ok=False, reason=f"the probe did not run: {detail}")
-    elif "_ka_memcheck_inbounds" in log:
-        out.update(ok=False, reason=f"an in-bounds kernel was reported: {_first_lines(report)}")
-    elif not errors or "_ka_memcheck_overrun" not in report:
-        out.update(ok=False, reason="the deliberate out-of-bounds read was not reported")
+    elif test.clean in log:
+        out.update(ok=False, reason=f"{test.clean_is} was reported: {_first_lines(report)}")
+    elif child.get("clean") is False:  # the sanitizer changed a correct kernel's result
+        out.update(ok=False, reason=f"{test.clean_is} ({test.clean}) computed a wrong result")
+    elif not errors or test.hazard not in report:
+        warned = " (as a warning only)" if out.get("warnings") and test.hazard in report else ""
+        out.update(
+            ok=False,
+            reason=f"{test.hazard_is} was not reported{warned}: a clean {name} run is no "
+            "evidence on this GPU",
+        )
     else:
         out.update(ok=True, reason=_first_lines(report))
     return out
+
+
+def selftests(tool: Any = None, timeout: float = 300.0) -> dict[str, dict[str, Any]]:
+    """:func:`selftest` of every tool the integration runs (memcheck, racecheck, synccheck)."""
+    return {name: selftest(tool, timeout, name) for name in SELFTESTS}
 
 
 # ------------------------------------------------------------------ entry point

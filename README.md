@@ -2104,6 +2104,24 @@ each tool's status, error count, report and seconds. Racecheck sees shared memor
 global-memory races are what the evaluator's determinism check of native candidates is for
 ([megakernel kit](#native-engines-when-module-kernels-plateau)).
 
+Whether each tool sees its hazard on this GPU is a `doctor` probe (`racecheck`,
+`synccheck`; `memcheck.selftest`): `kernels/sanitizer_probe.py` compiles four one-block
+kernels with NVRTC, a shared-memory exchange between two warps with and without its
+barrier, and a barrier every thread reaches next to a `__syncthreads()` half of a warp
+reaches. The tool must report the hazard as an error and not the clean kernel; the probe
+prints the first report line, says when it does not (a clean run of that tool is then no
+evidence here) and never fails `doctor`. Measured on an NVIDIA A10 (sm_86) with
+compute-sanitizer 2025.2.1 (CUDA 12.9, `doctor --fetch-sanitizer`): memcheck and racecheck
+report their hazards (`Error: Race reported between Write access at ka_race+0x80 in
+ka_sanitizer_probe.cu:13 and Read access ... [256 hazards]`); synccheck reports no barrier
+error at all, neither the divergent `__syncthreads()` (with the other half exiting, reading
+or at a second barrier) nor a `__syncwarp` mask that leaves out its caller (the tool docs'
+own example), so on that GPU a clean synccheck says nothing about `__syncthreads()`. It
+does check mbarrier protocols there: the megakernel kit's page pool failed it at 28
+layers until every consumer observed its previous empty phase (see the kit). The RTX
+5070 Ti's logs (compute-sanitizer 2026.3) report both hazards
+(`tests/fixtures/sanitizer/`).
+
 Issue #115's VAE decoder kernel (`vae_decoder__reduced` 004, Triton, accepted at
 7.88×) is clean on its captured cases alone (`[16, 64, 240]`, `[16, 64, 32]`,
 `[8, 64, 32]`: every row count a whole tile; 7 s) and fails on their variants
@@ -2140,7 +2158,8 @@ installed, with a torch and Triton its requirements accept) compiles and runs th
 RMSNorm example (skipped with the reason otherwise), and a
 `kernel_agent.graphloop` loop runs through a CUDA-graph WHILE node with a chunk IF node
 (`graph_conditional`; skipped below a CUDA 12.4 driver or without `cuda.core`, where
-device loops use K-step unrolled graphs). A probe that fails says why and never fails `doctor`; the results go to
+device loops use K-step unrolled graphs), and racecheck and synccheck report their deliberate
+hazards (`racecheck`, `synccheck`, above; skipped without a usable sanitizer). A probe that fails says why and never fails `doctor`; the results go to
 `~/.cache/kernel-agent/probes-<gpu>-torch<version>.json`.
 `kernel-agent memcheck capture.pt candidate.py` runs one candidate.
 
@@ -4234,7 +4253,24 @@ schedule for deadlocks and early starts over random SM speeds and predicts its t
 a trace. Template: `agent/examples/native_megakernel/` (RMSNorm → GEMV → residual layers,
 generic opcodes, and a graph + PDL and a grid-barrier baseline from the same math; 28
 layers of [1024, 1024] on an RTX 5070 Ti: 84–87 µs against 77.9 µs for graph + PDL and
-198 µs for the grid-barrier kernel, DRAM floor 70.5 µs); the
+198 µs for the grid-barrier kernel, DRAM floor 70.5 µs). Measured on an NVIDIA A10 (sm_86,
+`cp.async` page loads; PDL needs sm_90+, so the baseline is a plain graph there and its
+`label` says so), 28 layers:
+
+| | [1024, 1024] | [2048, 2048] | [4096, 4096] |
+|---|---|---|---|
+| megakernel (inflight 2; 16 rows, 8 at 4096) | 155.7 µs | 566.2 µs | 2481 µs |
+| plain graph, one kernel per layer | 204.4 µs | 532.4 µs | 1946 µs |
+| grid-barrier kernel | 431.8 µs | 848.5 µs | 2140 µs |
+| DRAM floor (487 GB/s) | 120.7 µs | 482.6 µs | 1930 µs |
+
+(`docs/research-scripts/megakernel-a10-225/bench_chain.py`, its output and per-layer trace
+next to it). The example's tiles fit the GPU's page pool by default (`rows=0`:
+`tile_rows`; 16 rows of a 4096-wide layer exceed a 99 KB pool, where the build used to
+fail), and each consumer thread observes its previous empty phase of a page before arriving
+again, without which synccheck refused the example from 6 layers on (151552 "Missing wait"
+errors at 28 layers on the A10; the protocol was correct, the check could not tell).
+The
 `native-engines` skill's `megakernel.md` is the milestone ladder, and a native digest
 points to it when a stage's best kernel synchronises its grid or launches more than 3
 kernels per call. Native candidates must give the same bits twice: the evaluator runs
@@ -4698,7 +4734,7 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   names the wider set its device code compiles for (`gpu_arch.example_compiles`).
 * **Compile matrix** (#256, CPU only). `tests/test_arch_matrix.py` compiles every bundled
   example and kernel-agent's own device code (graphloop, `mma_peaks`, the PDL probe, the
-  memcheck probe) for sm_75, sm_80, sm_86, sm_89 and sm_120 the way each backend builds it
+  memcheck and sanitizer probes) for sm_75, sm_80, sm_86, sm_89 and sm_120 the way each backend builds it
   (`load_inline`'s nvcc command, native projects, NVRTC, Triton with the JIT's
   specialisation, CuTe DSL with fake tensors, TileLang) and fails when an example compiles
   where its `ARCHS` / `ARCHS_COMPILES` exclude the arch (widen it, or declare it) or does
@@ -4753,8 +4789,12 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   toolchain, `doctor --smoke` and policy: `tests/test_turing.py`), the compile matrix
   above, and run on an RTX 5070 Ti; the CuTe DSL templates compile for sm_90a / sm_100a.
   The sm_75 / sm_80 / sm_86 / sm_89 code paths ran on the RTX 5070 Ti under emulation
-  (`doctor --smoke --emulate-arch ...` passes for each: correctness only). On other GPUs
-  nothing has run yet: `kernel-agent doctor --smoke` is the first check there.
+  (`doctor --smoke --emulate-arch ...` passes for each: correctness only). Run on an NVIDIA
+  A10 (sm_86, #225): the megakernel kit's GPU tests and its example
+  (correctness, the evaluator with its determinism stress, the trace, memcheck / racecheck /
+  synccheck at 2 and 28 layers, timings against both baselines: "Native engines") and
+  `doctor`'s probes, `cp.async` page path, 99 KB pools, 72 resident blocks and the watchdog
+  included. Elsewhere `kernel-agent doctor --smoke` is the first check.
 
 ### Dtype and memory by GPU
 

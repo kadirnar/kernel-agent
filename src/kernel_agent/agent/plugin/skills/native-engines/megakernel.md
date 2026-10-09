@@ -33,7 +33,11 @@ opcodes (RMSNorm, GEMV tiles with bf16 or e4m3 weights, fused norm prologue, res
 split-K-partial epilogue, residual add, split-K reduce, argmax) and two baselines from the
 same math in the same project (`mode="graph_pdl"`: one kernel per layer with PDL edges;
 `mode="coop_barrier"`: one cooperative kernel with a grid barrier per layer), so
-`sweep_candidate` compares all three on your GPU.
+`sweep_candidate` compares all three on your GPU. PDL needs sm_90+: before (sm_80–sm_89)
+`graph_pdl` is a plain graph, and the engine's `label` says so (`graph_label`): compare
+against it as a graph, not as graph + PDL. `rows=0` (the default) takes 16 rows per tile
+where they fit the page pool and fewer where not (`tile_rows`: 16 rows of a 4096-wide layer
+are 128 KB, a 99 KB GPU's pool holds 88 KB, so 8).
 
 ## Rules of the interpreter
 
@@ -45,7 +49,13 @@ same math in the same project (`mode="graph_pdl"`: one kernel per layer with PDL
   weights, the residual): one round trip on the critical path, not three. Then all the
   pool loads, then the arithmetic: back-to-back loads, independent FMA chains.
 * Keep few pages in flight per block (`inflight`, 1 on an RTX 5070 Ti): the consumers'
-  critical loads queue behind the block's own outstanding weight copies.
+  critical loads queue behind the block's own outstanding weight copies. Measure it: on an
+  A10 (`cp.async` path, 8 KB per page) 2 was 1–4 % faster than 1, 4 and all slower at 1024.
+* Every thread that arrives on a page's empty barrier observes its previous phase there
+  before arriving again (`ka_mk.cuh` does; keep it in an interpreter of your own): the
+  protocol is correct without it, but compute-sanitizer synccheck reports "Missing wait",
+  stops the warp and the integration refuses the kernel (an A10 from 6 layers of the
+  example on). Cost there: 1–4 % at 1024, none measurable at 2048.
 * Every edge the data needs is declared, including write-after-read reuse of a buffer
   (or give each layer its own activation row, as the example does).
 * `simulate.check(schedule)` before the first launch; a launch that hangs anyway stops after
@@ -56,6 +66,10 @@ same math in the same project (`mode="graph_pdl"`: one kernel per layer with PDL
   varying order on purpose (split-K reduced with `atomicAdd`); prefer a reduce instruction.
 * The integration runs every native candidate under memcheck, **racecheck** (shared-memory
   hazards: a page reused while still read) and **synccheck** (barriers some threads miss).
+  `kernel-agent doctor`'s `racecheck` / `synccheck` probes say whether each tool reports a
+  deliberate hazard on your GPU: on an A10 with compute-sanitizer 2025.2.1 synccheck reports
+  no divergent `__syncthreads()` (a clean run says nothing about those barriers there) but
+  does check mbarrier phases.
 
 ## Reuse across calls (the stress check)
 
@@ -101,12 +115,39 @@ with the reference's own rounding spread (#250): at 8 layers none of 3,000 draws
 | one cooperative kernel, grid barrier per layer | 198 µs | 451 µs |
 
 The megakernel is 2.3× faster than the grid-barrier kernel and 8–12 % slower than graph +
-PDL on this chain. Its trace says where the rest goes: per layer ~1.1 µs waiting for the
+PDL on this chain (measured before the consumers observed their previous empty phase,
+which cost 1–4 % at 1024 on an A10). Its trace says where the rest goes: per layer ~1.1 µs waiting for the
 previous layer's slowest tile and its signal, ~0.3 µs for the last weight page, ~1.4 µs of
 run (activation loads ~0.5, products ~0.3, reduction, signal). Every weight load was issued
 before its counter was met (trace `overlap` 1.0). These are the next rungs to climb, not a
 limit: a chain this short is the megakernel's worst case (one dependent tile per SM per
 layer); stages with independent ops per layer (Q, K, V, gate, up) overlap them.
+
+## Measured (NVIDIA A10, sm_86; the example, 28 layers)
+
+No PDL before sm_90, so the launch-per-layer baseline is a plain graph; page loads take
+the `cp.async` path; 72 SMs (72 queues), 99 KB of shared memory per block (11 pages of
+8 KB), 150 W power cap, a GPU shared with another tenant (medians of 15 x 100 replays;
+runs differ by up to ~5 %). `docs/research-scripts/megakernel-a10-225/bench_chain.py` in the
+repository measures it on any GPU.
+
+| | H = 1024 (58.7 MB) | H = 2048 (235 MB) | H = 4096 (940 MB) |
+|---|---|---|---|
+| DRAM floor (487 GB/s copy) | 120.7 µs | 482.6 µs | 1930 µs |
+| plain graph, one kernel per layer | 204.4 µs | **532.4 µs** | **1946 µs** |
+| **megakernel**, inflight 1 / 2 (16 rows; 8 at 4096) | **157.3 / 155.7 µs** | 571.4 / 566.2 µs | 2578 / 2481 µs |
+| one cooperative kernel, grid barrier per layer | 431.8 µs | 848.5 µs | 2140 µs |
+
+At 1024 the megakernel is 1.3x faster than the plain graph and 2.8x faster than the
+grid-barrier kernel (77 % of the floor's speed); at 2048 the graph leads by 6 %, at 4096 by
+27 %. Its trace at 1024, per layer: ~1.2 µs waiting for the previous layer, ~0.4 µs for
+the last weight page, ~3.4 µs of run (x loaded and normalised ~1.2, products ~0.7,
+reduction + store + signal ~1.5; an RTX 5070 Ti ran the whole tile in ~1.4); every weight
+load issued before its counter was met. Rungs worth measuring there: the tail (the release
+fence of the signal, the reduction), tiles per layer against the SM count (64 tiles leave 8
+of 72 SMs idle per layer, 128 or 512 tiles end each layer with a partial round) and, at
+4096, tiles the 11-page pool can double-buffer (an 8-page tile cannot) and the whole-row
+GEMV path, which covers K of 1024 and 2048 only.
 
 ## The milestone ladder
 

@@ -5,6 +5,7 @@ determinism check of native candidates and the ``hang`` status of a megakernel's
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -208,6 +209,115 @@ def test_a_plain_triton_candidate_runs_memcheck_only(tmp_path, stub):
     result = memcheck.run_memcheck(capture, candidate, tool=stub)
     assert result["status"] == "ok" and "tools" not in result
     assert [r["tool"] for r in _records(tmp_path)] == ["memcheck"]
+
+
+# ------------------------------------------------------------------ doctor's self-tests
+
+
+def test_the_racecheck_and_synccheck_self_tests_want_their_hazard_and_nothing_else(
+    tmp_path, stub, monkeypatch
+):
+    """``doctor``'s racecheck / synccheck probes (#225 follow-up 4) on the real logs: the
+    RTX 5070 Ti's (compute-sanitizer 2026.3) report both hazards; the A10's (2025.2.1) report
+    the race and no barrier error at all."""
+    monkeypatch.setenv("STUB_CHILD", json.dumps({"status": "ok", "clean": True}))
+    for log in ("racecheck_probe.log", "racecheck_probe_a10.log"):
+        monkeypatch.setenv("STUB_LOG_racecheck", (FIXTURES / log).read_text())
+        check = memcheck.selftest(stub, name="racecheck")
+        assert check["ok"] and check["warnings"] == 0, (log, check)
+        assert check["reason"].startswith("Error: Race reported between Write access at ka_race")
+    assert check["reason"].endswith("ka_sanitizer_probe.cu:14 [256 hazards]")
+    record = _records(tmp_path)[-1]
+    assert record["args"][:4] == ["--tool", "racecheck", "--racecheck-report", "analysis"]
+    assert record["args"][-3:] == ["-m", "kernel_agent.kernels.sanitizer_probe", "race"]
+
+    monkeypatch.setenv("STUB_LOG_synccheck", (FIXTURES / "synccheck_probe.log").read_text())
+    check = memcheck.selftest(stub, name="synccheck")
+    assert check["ok"] and check["errors"] == 16
+    assert check["reason"] == (
+        "Barrier error detected. Divergent thread(s) in warp. "
+        "at ka_divergent(int *)+0xb0 in probe.cu:20"
+    )
+    assert _records(tmp_path)[-1]["args"][-1] == "sync"
+    monkeypatch.setenv("STUB_LOG_synccheck", (FIXTURES / "synccheck_probe_a10.log").read_text())
+    check = memcheck.selftest(stub, name="synccheck")
+    assert not check["ok"] and check["errors"] == 0
+    assert check["reason"] == (
+        "the deliberate divergent __syncthreads() was not reported: a clean synccheck run is "
+        "no evidence on this GPU"
+    )
+
+    race = (FIXTURES / "racecheck_probe_a10.log").read_text()
+    monkeypatch.setenv("STUB_LOG_racecheck", race.replace("ka_race+0xa0", "ka_ordered+0xa0"))
+    check = memcheck.selftest(stub, name="racecheck")  # the clean kernel was reported
+    assert not check["ok"] and check["reason"].startswith("a kernel ordered by its barrier was")
+    warned = race.replace("Error: Race", "Warning: Race").replace(
+        "(1 error, 0 warnings)", "(0 errors, 1 warning)"
+    )
+    monkeypatch.setenv("STUB_LOG_racecheck", warned)
+    check = memcheck.selftest(stub, name="racecheck")  # the integration refuses errors only
+    assert not check["ok"] and "not reported (as a warning only)" in check["reason"]
+    monkeypatch.setenv("STUB_LOG_racecheck", race)
+    monkeypatch.setenv("STUB_CHILD", json.dumps({"status": "ok", "clean": False}))
+    check = memcheck.selftest(stub, name="racecheck")
+    assert not check["ok"] and check["reason"].endswith("(ka_ordered) computed a wrong result")
+    monkeypatch.setenv("STUB_CHILD", json.dumps({"status": "error", "error": "no NVRTC"}))
+    assert memcheck.selftest(stub, name="synccheck")["reason"] == "the probe did not run: no NVRTC"
+
+
+def test_the_sanitizer_probe_program_names_the_self_tests_kernels():
+    from kernel_agent.kernels import sanitizer_probe
+
+    for name, test in memcheck.SELFTESTS.items():
+        if name == "memcheck":
+            continue
+        mode = test.program[-1]
+        assert sanitizer_probe.KERNELS[mode][:2] == (test.clean, test.hazard)
+        for kernel in (test.clean, test.hazard):
+            assert f'extern "C" __global__ void {kernel}(' in sanitizer_probe.SRC
+        assert test.hazard not in test.clean and test.clean not in test.hazard  # substrings
+    out = subprocess.run(
+        [sys.executable, "-m", "kernel_agent.kernels.sanitizer_probe", "bogus"],
+        input="tag\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    line = out.stdout.strip().splitlines()[-1]
+    assert line.startswith(f"{memcheck.RESULT_MARKER}tag@@")
+    assert json.loads(line.split("@@", 3)[-1]) == {
+        "status": "error",
+        "error": "mode 'bogus': one of race, sync",
+    }
+
+
+def test_doctor_probes_racecheck_and_synccheck(monkeypatch):
+    from kernel_agent import probes
+
+    calls = []
+
+    def selftest(tool, timeout, name):
+        calls.append((tool.path, timeout, name))
+        if name == "racecheck":
+            return {"ok": True, "reason": "Error: Race reported ... [256 hazards]", "seconds": 2.3}
+        return {"ok": False, "reason": "the deliberate divergent ... not reported", "seconds": 2}
+
+    monkeypatch.setattr(toolchain, "sanitizer", lambda: toolchain.Sanitizer("/cs", "2025.2.1.0"))
+    race = probes.probe_sanitizer("racecheck", selftest)
+    sync = probes.probe_sanitizer("synccheck", selftest)
+    assert calls == [("/cs", probes.SANITIZER_PROBE_S, "racecheck"),
+                     ("/cs", probes.SANITIZER_PROBE_S, "synccheck")]  # fmt: skip
+    assert race == probes.Probe(
+        "racecheck", True, "Error: Race reported ... [256 hazards] (2.3 s, compute-sanitizer "
+        "2025.2.1.0)"
+    )  # fmt: skip
+    assert sync.ok is False and sync.line().startswith("  synccheck: FAILED: the deliberate")
+    missing = toolchain.Sanitizer(None, reason="not found (CUDA_HOME, PATH, pip wheels)")
+    monkeypatch.setattr(toolchain, "sanitizer", lambda: missing)
+    skipped = probes.probe_sanitizer("synccheck", selftest)
+    assert skipped == probes.Probe("synccheck", None, missing.reason) and len(calls) == 2
+    assert {"racecheck", "synccheck"} <= set(probes.PROBES)
+    assert probes.NEEDS["racecheck"] == probes.NEEDS["synccheck"] == "cuda.core"
 
 
 # ------------------------------------------------------------------ determinism

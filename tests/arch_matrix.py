@@ -16,7 +16,8 @@ CUDA examples' ``CUDA_SRC``         ``load_inline``'s preamble and flags, ``nvcc
 native projects' ``.cu`` sources    the same ``nvcc`` command, the project's include dirs and
                                     ``cuda_cflags``
 NVRTC sources                       ``cuda.core.Program``: ``nvrtc_*`` examples, ``graphloop``,
-                                    ``mma_peaks`` (each instruction), ``probes.PDL_SRC``
+                                    ``mma_peaks`` (each instruction), ``probes.PDL_SRC``,
+                                    ``kernels.sanitizer_probe.SRC``
 Triton kernels                      ``triton.compile(ASTSource, GPUTarget)`` with the JIT's
                                     specialisation, recorded from launches (:data:`TRITON`)
 CuTe DSL                            ``CUTE_DSL_ARCH`` and fake tensors (:data:`CUTE`)
@@ -501,7 +502,8 @@ def _triton_units(path: Path, specs: list[TritonSpec]) -> list[Unit]:
 
 
 def _library_groups() -> list[Group]:
-    """kernel-agent's own device code: graphloop, mma_peaks, the PDL probe, Triton probes."""
+    """kernel-agent's own device code: graphloop, mma_peaks, the PDL and sanitizer probes,
+    Triton probes."""
     from kernel_agent import graphloop, probes
     from kernel_agent.kernels import mma_peaks
 
@@ -535,6 +537,16 @@ def _library_groups() -> list[Group]:
             f"probes.ARCHS['pdl'] = {pdl!r}",
             _expected(pdl),
             [Unit("PDL_SRC", "nvrtc", {"source": probes.PDL_SRC, "includes": False})],
+        )
+    )
+    from kernel_agent.kernels import sanitizer_probe  # doctor's racecheck / synccheck probes
+
+    groups.append(
+        Group(
+            "kernels.sanitizer_probe.SRC",
+            "every GPU",
+            every,
+            [Unit("SRC", "nvrtc", {"source": sanitizer_probe.SRC, "includes": False})],
         )
     )
     for rel, specs in LIBRARY_TRITON.items():
