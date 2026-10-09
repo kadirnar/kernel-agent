@@ -68,6 +68,17 @@ All four must pass before a PR. Add CPU tests for new behaviour (a fake SDK stre
 Claude Code CLI or a local fake Messages API where a session is involved; never a real
 model call), GPU tests marked `@pytest.mark.gpu`.
 
+### Compile matrix (`ARCHS`)
+
+`tests/test_arch_matrix.py` compiles every bundled example and kernel-agent's own device
+code for sm_75 / sm_80 / sm_86 / sm_89 / sm_120 on the CPU and checks it against the
+example's `ARCHS` (the GPUs it runs on) or `ARCHS_COMPILES` (where it compiles, when a limit
+is runtime-only). A changed example recompiles only its own units (verdicts are cached by
+content); the first run on a machine takes minutes. When it fails, change the declaration
+or the code as its message says; a new Triton kernel, CuTe DSL or TileLang example needs
+its entry in `tests/arch_matrix.py` (`TRITON` with the launch's specialisation, `CUTE`,
+`TILELANG`). `uv run --no-sync python tests/arch_matrix.py` prints the matrix.
+
 ### Flaky tests
 
 Several agents often run the suite at once (load average 20+): a CPU test whose verdict

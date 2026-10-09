@@ -37,6 +37,8 @@ from kernel_agent import concurrency
 #: it elsewhere and says why).
 ARCHS = "sm_90+"
 ARCHS_WHY = "programmatic dependent launch (griddepcontrol)"
+#: GPUs its device code compiles for (ka_launch.cuh compiles griddepcontrol out below sm_90).
+ARCHS_COMPILES = "sm_75+"
 
 CUDA_SRC = r"""
 #include <torch/extension.h>

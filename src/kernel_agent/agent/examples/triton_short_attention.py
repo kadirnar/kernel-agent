@@ -64,6 +64,8 @@ from kernel_agent.kernels.triton_launch import CachedLaunch
 #: it elsewhere and says why).
 ARCHS = "sm_80+"
 ARCHS_WHY = "bf16 tl.dot (Triton has no MMA below sm_80)"
+#: GPUs it compiles for (sm_75: tl.dot on FMA units, correct but without tensor cores).
+ARCHS_COMPILES = "sm_75+"
 
 # One namespace per candidate file (the evaluator names the module after the file's hash).
 _NS = re.sub(r"\W", "_", __name__)

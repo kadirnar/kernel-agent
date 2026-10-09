@@ -118,7 +118,7 @@ def test_doctor_smoke_never_runs_a_refused_backend(fake_dsl, monkeypatch, tmp_pa
 
     monkeypatch.setattr(evaluate, "run_evaluation", run_evaluation)
     monkeypatch.setattr(selftest, "make_rmsnorm_capture", lambda path: path)
-    smoked: list[str] = []
+    smoked: list[tuple[str, str | None]] = []
     for name in (
         "smoke_fp8",
         "smoke_fp4",
@@ -129,12 +129,22 @@ def test_doctor_smoke_never_runs_a_refused_backend(fake_dsl, monkeypatch, tmp_pa
         "smoke_helion",
         "smoke_fp8_toolkit",
     ):
-        monkeypatch.setattr(selftest, name, lambda *a, _n=name, **k: smoked.append(_n) or True)
+        monkeypatch.setattr(
+            selftest, name, lambda *a, _n=name, **k: smoked.append((_n, k.get("precision"))) or True
+        )
     assert selftest.smoke_backends(verbose=True)
     assert "cute_rmsnorm.py" not in ran
     assert {"cuda_rmsnorm.py", "triton_rmsnorm.py", "nvrtc_rmsnorm.py"} <= set(ran)
-    # nothing sm_80+ (FP8 / FP4 / INT8 / megakernel examples), no CuTe example at all
-    assert set(smoked) <= {"smoke_triton_tools", "smoke_helion"}
+    # nothing sm_80+ (FP8 skinny GEMM, W8A8, INT8 W8A8, megakernel), no CuTe example at all;
+    # the weight-only GEMVs run on Turing (compiled and run for compute_75: #256)
+    assert {name for name, _ in smoked} <= {
+        "smoke_triton_tools",
+        "smoke_helion",
+        "smoke_fp4",
+        "smoke_fp8",
+    }
+    assert ("smoke_fp4", None) in smoked and ("smoke_fp8", "int8_weights") in smoked
+    assert [p for name, p in smoked if name == "smoke_fp8"] == ["int8_weights"]
     out = capsys.readouterr().out
     assert re.search(r"cute_rmsnorm\s+the cute backend is not available \(CuTe DSL 4\.8\.0", out)
     # asking for cute explicitly does not run it either
@@ -209,17 +219,19 @@ def test_the_filter_keeps_what_runs_and_drops_only_what_does_not():
     assert "triton_fp8_w8a8_gemm.py" in ada and "triton_int8_w8a8_gemm.py" in ada
     # a parenthesis that names it goes, the clause stays; a clause naming it goes
     t4 = (7, 5)
-    text = "CUDA C++ (INT8: `cuda_int8_gemv.py` weight-only); Triton (`cuda_rmsnorm.py`) too"
+    text = "CUDA C++ (INT8: `cuda_int8_skinny_gemm.py` IMMA); Triton (`cuda_rmsnorm.py`) too"
     assert backends.runnable_text(text, t4) == "CUDA C++; Triton (`cuda_rmsnorm.py`) too"
+    gemv = "CUDA C++ (INT8: `cuda_int8_gemv.py` weight-only)"  # sm_75+: no tensor cores
+    assert backends.runnable_text(gemv, t4) == gemv
     text = "CuTe DSL layer from `examples/cute_fp8_decoder_block.py` (one launch); cuBLAS"
     assert backends.runnable_text(text, (8, 6)) == "cuBLAS"
     assert backends.runnable_text(text, (8, 9)) == text
     assert backends.runnable_text("a (b; `cute_fp8_decoder_block.py`); c", t4) == "a; c"
     assert backends.runnable_text(text, None) == text  # unknown GPU: unchanged
     # a first / second backend left empty falls back to the "other" row's
-    row = backends.TargetClass("x", "X", "`cuda_int8_gemv.py`", "why", "`cute_rmsnorm.py`")
+    row = backends.TargetClass("x", "X", "`cuda_int8_skinny_gemm.py`", "why", "`cuda_rmsnorm.py`")
     got = backends._runnable_row(row, t4)
-    assert (got.first, got.second) == (backends.policy("other").first, "`cute_rmsnorm.py`")
+    assert (got.first, got.second) == (backends.policy("other").first, "`cuda_rmsnorm.py`")
 
 
 def test_turing_rows_use_what_sm75_has():

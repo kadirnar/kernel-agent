@@ -1,6 +1,6 @@
 """Any NVIDIA GPU (#165): architecture families, precisions the GPU cannot run, the backend
 policy, the prompts' GPU facts, the ceilings columns, the examples' ``ARCHS`` and the doctor
-probes, on faked GPUs (sm_80, sm_86, sm_89, sm_90, sm_100, sm_120). CPU only."""
+probes, on faked GPUs (sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_120). CPU only."""
 
 from __future__ import annotations
 
@@ -16,11 +16,15 @@ from kernel_agent.kernels import mma_peaks
 from kernel_agent.profiling import ceilings
 from kernel_agent.report import _quality_lines
 
-#: name, capability, memory GB, SMs, L2 MB, smem per block KB
+#: name, capability, memory GB, SMs, L2 MB, smem per block KB; a second GPU of an arch is
+#: keyed ``<arch>/<GPU>`` (:func:`arch_of`)
 GPUS = {
+    "sm_75": ("Tesla T4", (7, 5), 14.6, 40, 4.0, 64.0),
     "sm_80": ("NVIDIA A100-SXM4-80GB", (8, 0), 80.0, 108, 40.0, 163.0),
     "sm_86": ("NVIDIA GeForce RTX 3090", (8, 6), 24.0, 82, 6.0, 99.0),
+    "sm_86/A10": ("NVIDIA A10", (8, 6), 22.1, 72, 6.0, 99.0),
     "sm_89": ("NVIDIA L40S", (8, 9), 48.0, 142, 96.0, 99.0),
+    "sm_89/L4": ("NVIDIA L4", (8, 9), 22.1, 58, 48.0, 99.0),
     "sm_90": ("NVIDIA H100 80GB HBM3", (9, 0), 80.0, 132, 50.0, 227.0),
     "sm_100": ("NVIDIA B200", (10, 0), 180.0, 148, 126.0, 227.0),
     "sm_120": ("NVIDIA GeForce RTX 5070 Ti", (12, 0), 15.5, 70, 48.0, 99.0),
@@ -36,9 +40,18 @@ PEAKS_120 = {
 }
 
 
+def arch_of(key: str) -> str:
+    """The arch of a :data:`GPUS` key (``sm_86`` for ``sm_86/A10``)."""
+    return key.split("/")[0]
+
+
 def peaks_of(arch: str) -> dict:
+    arch = arch_of(arch)
     if arch == "sm_120":
         return dict(PEAKS_120)
+    if arch == "sm_75":  # T4 datasheet: fp16 tensor cores; bf16 at the fp32 rate
+        tflops = {"bfloat16": 8.1, "float16": 65.0, "float32": 8.1}
+        return {"version": 4, "arch": arch, "dram_gbps": 320.0, "tflops": tflops}
     tflops = {"bfloat16": 300.0, "float32": 60.0}
     if arch in ("sm_89", "sm_90", "sm_100"):
         tflops["float8_e4m3fn"] = 600.0
@@ -174,21 +187,23 @@ def test_report_names_the_precisions_the_gpu_cannot_run():
 # ------------------------------------------------------------------ toolchain summary
 
 
-@pytest.mark.parametrize("arch", ALL)
-def test_summary_carries_the_gpu_facts(arch):
-    tc = fake(arch)
+@pytest.mark.parametrize("key", ALL)
+def test_summary_carries_the_gpu_facts(key):
+    tc = fake(key)
     text = tc.summary()
-    fam = gpu_arch.family(GPUS[arch][1])
+    arch = arch_of(key)
+    fam = gpu_arch.family(GPUS[key][1])
     assert fam is not None
     assert f"arch: {fam.name} ({arch})" in text and "smem per block" in text
-    assert "16-bit ridge (bf16, the 16-bit tensor-core dtype here)" in text
+    short = "fp16" if arch == "sm_75" else "bf16"  # Turing's tensor cores have no bf16
+    assert f"16-bit ridge ({short}, the 16-bit tensor-core dtype here)" in text
     assert "full rate needs" in text
     assert ("precisions this GPU cannot run" in text) is (arch not in ("sm_100", "sm_120"))
-    assert ("software conversion" in text) is (arch in ("sm_80", "sm_86"))
+    assert ("software conversion" in text) is (arch in ("sm_75", "sm_80", "sm_86"))
     if arch != "sm_120":
         assert "5070" not in text and "QMMA.SF" not in text
     facts = gpu_arch.from_summary(text)
-    assert facts.capability == GPUS[arch][1] and facts.name == GPUS[arch][0]
+    assert facts.capability == GPUS[key][1] and facts.name == GPUS[key][0]
     assert facts == gpu_arch.from_toolchain(tc)  # the prompts read back what doctor shows
 
 
@@ -336,18 +351,19 @@ def _planner(arch: str, quality: str = "near-lossless") -> str:
     )
 
 
-@pytest.mark.parametrize("arch", ALL)
-def test_planner_prompt_gets_this_gpus_facts(arch):
-    text = _planner(arch)
-    fam = gpu_arch.family(GPUS[arch][1])
+@pytest.mark.parametrize("key", ALL)
+def test_planner_prompt_gets_this_gpus_facts(key):
+    text = _planner(key)
+    arch = arch_of(key)
+    fam = gpu_arch.family(GPUS[key][1])
     assert fam is not None
-    assert f"# This GPU: {GPUS[arch][0]} ({arch}, {fam.name})" in text
+    assert f"# This GPU: {GPUS[key][0]} ({arch}, {fam.name})" in text
     section = gpu_arch.knowledge_section(fam.key)
     assert section.splitlines()[0] in text  # the family's section of gpus.md
     others = [f for f in gpu_arch.FAMILIES if f.key != fam.key]
     for other in others:  # and only that one
         assert gpu_arch.knowledge_section(other.key).splitlines()[0] not in text
-    if arch in ("sm_80", "sm_86"):
+    if arch in ("sm_75", "sm_80", "sm_86"):
         assert "This GPU cannot run `fp8_w8a8`" in text and '"fp8_w8a8"' not in text
     if arch in ("sm_89", "sm_90"):
         assert "This GPU cannot run `fp8_mx`" in text and 'precision: "fp8_mx"' not in text
@@ -455,6 +471,11 @@ def test_mma_peaks_skip_the_emulated_fp8_mma_sync():
     ("arch", "runs", "skips"),
     [
         (
+            "sm_75",  # as compiled for it on the CPU (test_arch_matrix.py)
+            {"cuda_fp8_gemv.py", "cuda_int8_gemv.py", "cuda_fp4_gemv.py", "tilelang_rmsnorm.py"},
+            {"cuda_int8_skinny_gemm.py", "triton_int8_w8a8_gemm.py", "cute_rmsnorm.py"},
+        ),
+        (
             "sm_80",
             {"cuda_fp8_gemv.py", "cuda_fp4_gemv.py", "triton_short_attention.py"},
             {"triton_fp8_w8a8_gemm.py", "cuda_pdl_gemv_chain.py", "cuda_cublaslt_fp8.py"},
@@ -484,9 +505,10 @@ def test_examples_run_where_they_declare(arch, runs, skips):
     for name in skips:
         why = selftest.example_skip(name, tc)
         assert why and why.startswith("needs sm_") and f"this GPU is {arch}" in why, name
-    assert selftest.w8a8_supported(tc) is (arch != "sm_80")
+    assert selftest.w8a8_supported(tc) is (arch not in ("sm_75", "sm_80"))
     assert selftest.pdl_supported(tc) is (arch in ("sm_90", "sm_100", "sm_120"))
-    assert selftest.fp8_supported(tc)  # weight-only FP8: every GPU here
+    # weight-only FP8: every GPU here but Turing (the skinny GEMM's bf16 m16n8k16 MMA)
+    assert selftest.fp8_supported(tc) is (arch != "sm_75")
     assert selftest.cute_fp8_supported(tc) is (arch == "sm_120")
 
 

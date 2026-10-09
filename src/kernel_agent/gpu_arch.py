@@ -388,19 +388,19 @@ def supports(spec: str | None, capability: tuple[int, ...] | None) -> bool:
     return False
 
 
-def example_requirement(path: Path) -> tuple[str | None, str]:
-    """``(ARCHS, ARCHS_WHY)`` declared at the top level of a bundled example (a file, or a
-    project directory's ``build.py`` / first ``.py``); ``(None, "")`` without them. Read with
-    ``ast``: the example is not imported (it may need a backend this machine lacks)."""
+def _declarations(path: Path) -> dict[str, str]:
+    """The ``ARCHS*`` constants at the top level of a bundled example (a file, or a project
+    directory's ``build.py`` / first ``.py``), read with ``ast``: the example is not imported
+    (it may need a backend this machine lacks)."""
     if path.is_dir():
         files = [path / "build.py"] if (path / "build.py").is_file() else sorted(path.glob("*.py"))
         if not files:
-            return None, ""
+            return {}
         path = files[0]
     try:
         tree = ast.parse(path.read_text())
     except (OSError, SyntaxError, ValueError):
-        return None, ""
+        return {}
     found: dict[str, str] = {}
     for node in tree.body:
         value: ast.expr | None
@@ -410,9 +410,25 @@ def example_requirement(path: Path) -> tuple[str | None, str]:
             name, value = getattr(node.target, "id", None), node.value
         else:
             continue
-        if name in ("ARCHS", "ARCHS_WHY") and isinstance(value, ast.Constant):
+        if name in ("ARCHS", "ARCHS_WHY", "ARCHS_COMPILES") and isinstance(value, ast.Constant):
             found[str(name)] = str(value.value)
+    return found
+
+
+def example_requirement(path: Path) -> tuple[str | None, str]:
+    """``(ARCHS, ARCHS_WHY)`` declared by a bundled example (:func:`_declarations`);
+    ``(None, "")`` without them."""
+    found = _declarations(path)
     return found.get("ARCHS"), found.get("ARCHS_WHY", "")
+
+
+def example_compiles(path: Path) -> str | None:
+    """The GPUs a bundled example's device code compiles for: its ``ARCHS_COMPILES`` where a
+    limit is runtime-only (it compiles for more GPUs than it runs on: PDL, FP8 tensor cores,
+    a library call), else its ``ARCHS``. The CPU compile matrix
+    (``tests/test_arch_matrix.py``) checks it on sm_75 / sm_80 / sm_86 / sm_89 / sm_120."""
+    found = _declarations(path)
+    return found.get("ARCHS_COMPILES", found.get("ARCHS"))
 
 
 def example_skip(path: Path, capability: tuple[int, ...] | None) -> str | None:

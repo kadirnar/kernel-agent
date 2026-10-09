@@ -313,6 +313,7 @@ def test_w8a8_example_lowers_to_the_block_scaled_mma():
     assert w8a8.block_scale_mma(w8a8.gemm_ptx((12, 0), w8a8.CONFIGS[(8192, 1024)]))
     ada = w8a8.gemm_ptx((8, 9), w8a8.DEFAULT)
     assert not w8a8.block_scale_mma(ada) and "e4m3.e4m3.f32" in ada
+    assert "cp.async" in ada  # the K loop pipelined, as the JIT compiles it (#256)
     assert not w8a8.block_scale_mma(w8a8.gemm_ptx((12, 0), w8a8.DEFAULT, scaled=False))
 
 
