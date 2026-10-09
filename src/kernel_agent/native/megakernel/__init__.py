@@ -9,6 +9,11 @@ dependencies are global-memory counters instead of grid barriers.
   mbarrier on sm_80-sm_89, bulk copies on sm_90+), the watchdog and ``KA_MK_TRACE``;
 * :mod:`.schedule`: a stage's ops and tile-level edges as per-SM queues, counter targets
   and the serialised int32 program;
+* :mod:`.captured`: those ops and edges built from one recorded call of the stage (each aten
+  op mapped to a family of :mod:`.opcodes`, the generic opcodes' numbers and argument slots,
+  or reported unsupported with why; tiles, the tensor table, edges from the storages, costs
+  from the GPU's roofline): ``python -m kernel_agent.native.megakernel.schedule
+  --from-capture CAPTURE``;
 * :mod:`.simulate`: a discrete-event simulation of a schedule (deadlocks, ordering, the
   predicted time from per-op costs or a trace);
 * :mod:`.runtime`: the device buffers of one schedule (program, counters, tensor table,

@@ -335,6 +335,56 @@ def test_a_4096_wide_chain_builds_with_tiles_that_fit_this_gpus_page_pool(mk):
         torch.testing.assert_close(engine(x), ref(x), atol=0.1, rtol=0.05)
 
 
+def test_a_schedule_built_from_a_recorded_call_runs_like_the_hand_declared_one(mk):
+    """``schedule="captured"``: the chain's op DAG from one recorded call of the reference
+    (``native/megakernel/captured.py``) is the hand-declared program, byte for byte, and gives
+    the same bits."""
+    mod, _ = mk
+    ref = _chain(layers=8)
+    hand, auto = mod.build(ref), mod.build(ref, schedule="captured")
+    assert auto.plan.ok and auto.rows == hand.rows
+    assert auto.schedule.to_bytes() == hand.schedule.to_bytes()
+    x = torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        want, mine, theirs = ref(x), auto(x), hand(x)
+    assert torch.equal(mine, theirs)
+    torch.testing.assert_close(mine, want, atol=0.1, rtol=0.05)
+
+
+@pytest.mark.parametrize("split_k", [1, 2])
+def test_a_captured_gated_mlp_runs_through_the_kit(mk, split_k):
+    """norm → gate and up (the norm in both prologues) → silu(gate) · up (the GLU opcode, its
+    tiles on chunked counters) → down + residual: a plan from a recorded call, its tensor
+    table, one launch; with every GEMV split over K and reduced (``split_k=2``)."""
+    from kernel_agent.native.megakernel import captured
+    from kernel_agent.selftest import GatedMlpBlock
+
+    _, ext = mk
+    pages, queues, page_bytes, _ = ext.mk_info()
+    torch.manual_seed(0)
+    block = GatedMlpBlock(1024, 4096).cuda().to(torch.bfloat16).eval()
+    with torch.no_grad():
+        for name, w in block.named_parameters():
+            w.normal_(1.0, 0.1) if "norm" in name else w.normal_(0.0, w.shape[-1] ** -0.5)
+    x = torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16)
+    plan = captured.from_module(
+        block, (x,), pool_bytes=pages * page_bytes, queues=queues, split_k=split_k
+    )
+    assert plan.ok and "glu" in [i.family for i in plan.info], plan.describe()
+    assert ("splitk_reduce" in [i.family for i in plan.info]) == (split_k > 1)
+    sched = plan.schedule(queues)
+    assert simulate.check(sched, draws=200) == []
+    tensors = plan.tensors()
+    plan.bind(tensors, plan.inputs[0]).copy_(x)
+    rt = runtime.Runtime(sched, tensors, pool_bytes=pages * page_bytes)
+    ext.mk_run(*rt.args(), pages, queues, 1)
+    torch.cuda.synchronize()
+    rt.check()
+    with torch.no_grad():
+        want = block(x)
+    torch.testing.assert_close(plan.bind(tensors, plan.outputs[0]), want, atol=0.1, rtol=0.05)
+
+
 def test_the_graph_baseline_says_whether_it_has_pdl_edges(mk):
     mod, _ = mk
     engine = mod.build(_chain(layers=2), mode="graph_pdl")

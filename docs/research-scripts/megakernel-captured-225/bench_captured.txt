@@ -1,0 +1,61 @@
+GPU: NVIDIA A10 (sm_86), 72 SMs, L2 6 MB
+torch 2.10.0+cu128 (CUDA 12.8); date 2026-10-09 16:30; 15 trials of 100 graph replays per engine (per-call us: min / median)
+megakernel: 11 pages of 8192 B per block, 72 queues
+DRAM: copy 487.0 GB/s (doctor's dram_gbps), read-only 517.0 GB/s
+
+H = 1024: 28 x [1024, 1024], 58.7 MB of weights; captured plan: 28 ops (gemv x 64 tiles, M=1, N=1024, K=1024, 16 rows per tile; RMSNorm prologue, residual epilogue), 27 edges, 0 unsupported ops
+  costs: roofline per tile on a 1/72 share of max(bytes / 487.5 GB/s, FLOPs / 15.2 TFLOP/s fp32 FMA), µs: `kernel-agent doctor`'s peaks of NVIDIA A10, measured 2026-10-09 15:25:41
+  programs byte-identical: True; simulator over 1000 SM-speed draws: no deadlock; predicted 152.7 us (roofline costs, every queue a 1/72 share of the DRAM bandwidth)
+  outputs bit-identical across the engines: True; max |diff| from eager 0.25
+  DRAM floor (copy bandwidth)                                  120.6 us
+  megakernel, hand schedule (inflight 2)                       153.1 /   160.7 us  (75% of floor speed)
+  megakernel, captured schedule (inflight 2)                   152.1 /   160.0 us  (75% of floor speed)
+  megakernel, hand schedule (inflight 1)                       155.1 /   161.9 us  (74% of floor speed)
+  megakernel, captured schedule (inflight 1)                   155.7 /   161.8 us  (75% of floor speed)
+
+H = 2048: 28 x [2048, 2048], 234.9 MB of weights; captured plan: 28 ops (gemv x 128 tiles, M=1, N=2048, K=2048, 16 rows per tile; RMSNorm prologue, residual epilogue), 27 edges, 0 unsupported ops
+  costs: roofline per tile on a 1/72 share of max(bytes / 487.5 GB/s, FLOPs / 15.2 TFLOP/s fp32 FMA), µs: `kernel-agent doctor`'s peaks of NVIDIA A10, measured 2026-10-09 15:25:41
+  programs byte-identical: True; simulator over 1000 SM-speed draws: no deadlock; predicted 610.3 us (roofline costs, every queue a 1/72 share of the DRAM bandwidth)
+  outputs bit-identical across the engines: True; max |diff| from eager 0.25
+  DRAM floor (copy bandwidth)                                  482.3 us
+  megakernel, hand schedule (inflight 2)                       527.8 /   554.3 us  (87% of floor speed)
+  megakernel, captured schedule (inflight 2)                   555.7 /   567.0 us  (85% of floor speed)
+  megakernel, hand schedule (inflight 1)                       606.4 /   616.4 us  (78% of floor speed)
+  megakernel, captured schedule (inflight 1)                   598.7 /   602.3 us  (80% of floor speed)
+
+gated MLP [1024 -> 3072 -> 1024], one row, 18.9 MB of weights
+  split_k=1: gemv0 gemv x192, gemv1 gemv x192, glu0 glu x2, gemv2 gemv x128; 5 counters; simulator: no deadlock, predicted 49.9 us; max |diff| from eager 0
+  split_k=auto: gemv0 gemv x192, gemv1 gemv x192, glu0 glu x2, gemv2 gemv x128; 5 counters; simulator: no deadlock, predicted 49.9 us; max |diff| from eager 0
+  split_k=2: gemv0 gemv x384, reduce0 splitk_reduce x192, gemv1 gemv x384, reduce1 splitk_reduce x192, glu0 glu x2, gemv2 gemv x128, reduce2 splitk_reduce x64; 454 counters; simulator: no deadlock, predicted 50.7 us; max |diff| from eager 0
+  DRAM floor (copy bandwidth)                                   38.8 us
+  megakernel from the recorded call, split_k=1                  54.2 /    54.5 us  (71% of floor speed)
+  megakernel from the recorded call, split_k=auto               54.4 /    54.8 us  (71% of floor speed)
+  megakernel from the recorded call, split_k=2                  74.1 /    74.8 us  (52% of floor speed)
+  PyTorch ops in a CUDA graph                                   66.0 /    66.2 us  (59% of floor speed)
+
+gated MLP [2048 -> 8192 -> 2048], one row, 100.7 MB of weights
+  split_k=1: gemv0 gemv x512, gemv1 gemv x512, glu0 glu x4, gemv2 gemv x512, reduce0 splitk_reduce x256; 266 counters; simulator: no deadlock, predicted 241.5 us; max |diff| from eager 0.0156
+  split_k=auto: gemv0 gemv x512, gemv1 gemv x512, glu0 glu x4, gemv2 gemv x512, reduce0 splitk_reduce x256; 266 counters; simulator: no deadlock, predicted 241.5 us; max |diff| from eager 0.0156
+  split_k=2: gemv0 gemv x1024, reduce0 splitk_reduce x512, gemv1 gemv x1024, reduce1 splitk_reduce x512, glu0 glu x4, gemv2 gemv x512, reduce2 splitk_reduce x256; 1290 counters; simulator: no deadlock, predicted 262.9 us; max |diff| from eager 0.0156
+  DRAM floor (copy bandwidth)                                  206.7 us
+  megakernel from the recorded call, split_k=1                 229.9 /   245.8 us  (84% of floor speed)
+  megakernel from the recorded call, split_k=auto              242.2 /   252.6 us  (82% of floor speed)
+  megakernel from the recorded call, split_k=2                 300.7 /   302.3 us  (68% of floor speed)
+  PyTorch ops in a CUDA graph                                  250.6 /   250.8 us  (82% of floor speed)
+
+$ bench_captured.py --hidden 2048 --no-mlp --captured-first   (the timing order swapped)
+
+GPU: NVIDIA A10 (sm_86), 72 SMs, L2 6 MB
+torch 2.10.0+cu128 (CUDA 12.8); date 2026-10-09 16:41; 15 trials of 100 graph replays per engine (per-call us: min / median)
+megakernel: 11 pages of 8192 B per block, 72 queues
+DRAM: copy 486.8 GB/s (doctor's dram_gbps), read-only 517.3 GB/s
+
+H = 2048: 28 x [2048, 2048], 234.9 MB of weights; captured plan: 28 ops (gemv x 128 tiles, M=1, N=2048, K=2048, 16 rows per tile; RMSNorm prologue, residual epilogue), 27 edges, 0 unsupported ops
+  costs: roofline per tile on a 1/72 share of max(bytes / 487.5 GB/s, FLOPs / 15.2 TFLOP/s fp32 FMA), µs: `kernel-agent doctor`'s peaks of NVIDIA A10, measured 2026-10-09 15:25:41
+  programs byte-identical: True; simulator over 1000 SM-speed draws: no deadlock; predicted 610.3 us (roofline costs, every queue a 1/72 share of the DRAM bandwidth)
+  outputs bit-identical across the engines: True; max |diff| from eager 0.25
+  DRAM floor (copy bandwidth)                                  482.5 us
+  megakernel, captured schedule (inflight 2)                   526.6 /   553.4 us  (87% of floor speed)
+  megakernel, hand schedule (inflight 2)                       527.1 /   563.4 us  (86% of floor speed)
+  megakernel, captured schedule (inflight 1)                   578.1 /   614.3 us  (79% of floor speed)
+  megakernel, hand schedule (inflight 1)                       599.1 /   604.5 us  (80% of floor speed)

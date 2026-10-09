@@ -16,6 +16,8 @@ per barrier, a graph kernel boundary ~0.9 µs; measured on an RTX 5070 Ti, docs/
 | `ka_mk.cuh` (on every project's include path, with `ka_launch.cuh`) | the interpreter `ka_mk::kernel<Ops>`: consumer threads run the instructions, a **producer warp** streams their weights into the shared-memory **page pool** (full / empty mbarrier per page; `cp.async.bulk` on sm_90+ incl. sm_120, `cp.async` + mbarrier on sm_80–sm_89; an L2 evict-first / evict-last hint; `inflight` caps the pages in flight); `ka_mk::wait` (an acquire read, relaxed polls and an acquire fence, nanosleep back-off) and `ka_mk::signal` (`red.release.gpu`); `ka_mk::sync<kThreads>()` (the consumers' barrier); the **watchdog**; `KA_MK_TRACE` (+ two `ctx.mark(k)` stamps an opcode sets) |
 | `schedule.py` | `Op` (opcode, tiles, cost per tile, `Prefetch` per tile, opcode arguments) and `Edge` (`ALL`, `SAME`, `span(k)`, `shard(k)` or any tile map) → per-SM queues (static wave order + longest-first, earliest-finish placement), every counter's target (its producers' tile count; chunked per output tile where consumers need only part of a producer), the int32 program (`Schedule.tensor()`, built once in `build()` / `apply()`) |
 | `simulate.py` | `check(schedule, draws=1000)`: deadlocks (the stuck counter and instruction first) and instructions started before their producers, over random SM speeds; `simulate(..., durations=costs_from_trace(...))` predicts the time; `report()` and `trace_summary()` say where it goes (wait, land, run per op; how often a weight load overlapped a counter wait) |
+| `captured.py` | the schedule's input built from one recorded call of the stage instead of by hand: `python -m kernel_agent.native.megakernel.schedule --from-capture <capture>` (a target's `capture.pt` / `capture_inputs.pt`) or `captured.from_module(reference, args)` in `build()` → a `Plan`: ops mapped to opcode families, unsupported ops with why, tiles, the tensor table (`plan.tensors()`, `plan.bind()`), tile-level edges from the storages, roofline costs; `plan.schedule(queues)` (next section) |
+| `opcodes.py` | the generic opcodes' numbers and argument slots (`gemv_args`, `rmsnorm_args`, ...; the example's `include/mk_ops.cuh` is their device code), `tile_rows`, `l2_hint` |
 | `runtime.py` | `Runtime(schedule, tensors, trace=..., pool_bytes=...)`: program, counters (self-zeroing: the last block of a launch resets them), tensor table, pinned status words; `check()` raises `MegakernelHang` before a launch after a hang |
 
 An `Ops` struct holds the project's opcodes (`kThreads` consumer threads, `kPageBytes`,
@@ -30,7 +32,9 @@ resident, so a waiting block never waits for one that has not started).
 
 Start from `examples/native_megakernel`: an RMSNorm → GEMV → residual chain with generic
 opcodes (RMSNorm, GEMV tiles with bf16 or e4m3 weights, fused norm prologue, residual or
-split-K-partial epilogue, residual add, split-K reduce, argmax) and two baselines from the
+split-K-partial epilogue, residual add, split-K reduce, argmax, gated activation `GLU`),
+its op DAG declared by hand (`chain_dag`) or built from a recorded call of the reference
+(`schedule="captured"`, next section), and two baselines from the
 same math in the same project (`mode="graph_pdl"`: one kernel per layer with PDL edges;
 `mode="coop_barrier"`: one cooperative kernel with a grid barrier per layer), so
 `sweep_candidate` compares all three on your GPU. PDL needs sm_90+: before (sm_80–sm_89)
@@ -38,6 +42,52 @@ same math in the same project (`mode="graph_pdl"`: one kernel per layer with PDL
 against it as a graph, not as graph + PDL. `rows=0` (the default) takes 16 rows per tile
 where they fit the page pool and fewer where not (`tile_rows`: 16 rows of a 4096-wide layer
 are 128 KB, a 99 KB GPU's pool holds 88 KB, so 8).
+
+## Schedules from the stage's captured ops
+
+Do not declare a stage's ops and edges by hand when its capture can say them:
+
+```bash
+python -m kernel_agent.native.megakernel.schedule \
+    --from-capture targets/native_<id>/capture_inputs.pt [--case K] [--queues N] \
+    [--pool-bytes B] [--split-k auto|N] [--no-fuse] [--ceilings profile/ceilings.json] [--json]
+```
+
+It records one call of the stage (the case with the most calls per run; `--device cuda` for
+modules that only run there) under the fusion miner's op recorder and maps each aten op, by
+its structure, never its module name: **RMSNorm** (rsqrt(mean(x²) + eps) · x, the casts and
+the weight in either order, or `rms_norm` as one op), **GEMV / skinny GEMM tiles** (`linear` /
+`mm` / `matmul` of ≤ 8 activation rows by a bf16 weight the stage only reads, no bias),
+**residual add**, **gated activation** (`silu` / `gelu` of one activation times another:
+the `GLU` opcode), **argmax**, and **split-K reduce** (a GEMV split over K: always when K
+exceeds the 4096-column slice, `--split-k N` / `auto` to fill the SMs). Every other op is
+listed as **unsupported, with why** (attention, softmax, LayerNorm, a biased linear, a cast,
+a cache write...), and `plan.schedule()` refuses the plan until it is mapped: write its
+opcode in your project's `Ops` and schedule it with the rest (`schedule.Op` / `Edge`).
+Then it fuses as the example does (a norm read only by GEMVs into their prologue, a
+residual into the GEMV's epilogue or its reduce), tiles every op (`tile_rows` for this
+GPU's page pool), lays out the tensor table (the GEMV weights, the norms' weights, one arena
+per dtype, every value its own slice: no write-after-read edges), derives the edges at tile
+granularity from the byte ranges each tile reads and writes (`ALL`, `SAME` or a per-tile
+map: chunked counters for free), costs each tile from the roofline of the GPU at hand
+(`kernel-agent doctor`'s peaks or a ceilings table's: max(bytes / bandwidth, FLOPs / fp32
+peak) on a 1/queues share, labelled), builds the schedule and runs `simulate.check`. It
+prints the DAG, the unsupported ops, the schedule and the simulator's report (exit 0: a
+clean schedule, 1: unsupported ops or a problem). In a project: `plan =
+captured.from_module(reference, (x,), pool_bytes=pages * page_bytes, queues=queues)`,
+`plan.schedule(queues)`, `tensors = plan.tensors()`, `Runtime(schedule, tensors, ...)`,
+`plan.bind(tensors, plan.inputs[0])` / `plan.outputs[0]` for the call's tensors (the
+example's `_setup_captured`).
+
+Measured on an NVIDIA A10 (sm_86, `docs/research-scripts/megakernel-captured-225/`): the
+example's chain from its capture is the hand-declared program byte for byte (28 layers at
+1024 and 2048; the same bits out, the same time within the bench's ±2 % order effect;
+predicted 152.7 µs at 1024, measured 152–162 µs best to median); a decode gated MLP
+[1024 → 3072 → 1024] from its recorded call runs in 54.5 µs as one launch against 66.2 µs
+for its PyTorch ops in a CUDA graph (71 % of the DRAM floor's speed, bit-identical to
+eager), [2048 → 8192 → 2048] in 245.8 µs against 250.8 µs (its down projection split over
+K, 8192 > 4096). Splitting every GEMV in two was slower there (74.8 and 302.3 µs): measure
+`--split-k`, do not assume it.
 
 ## Rules of the interpreter
 
@@ -155,6 +205,8 @@ Climb it one rung at a time; each rung is evaluated (`evaluate_candidate`, the s
 before the next. A rung that does not pay is a measurement, not a reason to stop: the next
 rungs attack other costs.
 
+0. **The DAG from the capture.** `--from-capture` on the stage's capture: what maps,
+   what does not (the opcodes to write first), the predicted time per op.
 1. **One correct opcode.** The interpreter with one opcode (the stage's dominant GEMV
    tile), every tile independent; correct against the stage, deterministic.
 2. **Counters replace barriers.** The real edges (`Edge(producer, consumer, ALL)` per layer);

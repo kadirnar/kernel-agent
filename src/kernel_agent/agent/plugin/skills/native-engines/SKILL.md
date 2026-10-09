@@ -13,7 +13,9 @@ C++ / CuTe code, keeps the weights streaming, fuses across module boundaries and
 part in one persistent kernel or a few launches.
 
 Project layout, building and timing: [projects.md](projects.md). A stage as one launch with
-counter dependencies instead of grid barriers (the megakernel kit, its milestone ladder):
+counter dependencies instead of grid barriers (the megakernel kit, its milestone ladder, its
+schedule built from the stage's captured ops: `python -m
+kernel_agent.native.megakernel.schedule --from-capture <capture>`):
 [megakernel.md](megakernel.md).
 
 ## Scopes (what you may replace)
