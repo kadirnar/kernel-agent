@@ -293,3 +293,19 @@ def test_a_compiled_candidate_is_not_recompiled_inside_the_graph_capture():
     result = bench.time_call(fn, (x,), {}, target_ms=5.0, keep=True, context=bench.GRAPH)
     assert "kept" in result and result["median_ms"] > 0
     assert counters["stats"]["unique_graphs"] == compiled, dict(counters["stats"])
+
+
+@pytest.mark.gpu
+def test_random_draws_work_after_a_failed_graph_capture():
+    """A capture that fails (a body that draws, then syncs) leaves the process able to draw
+    random numbers: on torch 2.10 the default generator stayed in capture mode and every
+    later draw raised (measured on an NVIDIA A10)."""
+
+    def body() -> None:
+        x = torch.rand(16, device="cuda")
+        float(x.sum())  # a host sync: not capturable
+
+    with torch.inference_mode(), pytest.raises(bench.GraphUnavailable):
+        bench._capture(body, torch.cuda.Stream())
+    assert torch.randn(8, device="cuda").shape == (8,)
+    assert torch.rand(8, device="cuda").max() < 1

@@ -295,8 +295,27 @@ def _capture(body: Callable[[], Any], stream: Any) -> tuple[Any, Any]:
     except Exception as exc:
         # the capture's exit raised before it set the current stream back (torch 2.14)
         _set_stream(current)
+        _leave_rng_capture()
         raise GraphUnavailable(first_line(failed[0] if failed else exc)) from exc
     return graph, out
+
+
+def _leave_rng_capture() -> None:
+    """End the capture mode a failed capture left the default CUDA generator in: torch's
+    capture end runs the generator's capture epilogue only when the capture ended cleanly, so
+    after a failed one every later random draw of the process raised "Offset increment outside
+    graph capture encountered unexpectedly" (torch 2.10 on an NVIDIA A10: a candidate that
+    cannot be graph-timed broke the evaluator's redrawn-input checks after it). The clean
+    capture of an empty-but-one-kernel graph on a fresh stream runs that epilogue. Never
+    raises: a process that cannot do it keeps the error it had."""
+    try:
+        graph = _CUDAGraph()
+        with _on_stream(_Stream()):
+            graph.capture_begin(capture_error_mode="relaxed")
+            _gpu_sleep(1)  # not an empty graph
+            graph.capture_end()
+    except Exception:  # the CUDA context itself is broken: nothing to reset here
+        return
 
 
 def _warm_up(
