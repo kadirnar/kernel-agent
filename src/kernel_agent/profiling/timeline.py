@@ -154,6 +154,39 @@ def _call(obj: Any, name: str, default: Any = None) -> Any:
         return default
 
 
+def activity_type(e: Any) -> str:
+    """The Kineto activity type of a ``_KinetoEvent`` (``kernel``, ``gpu_memcpy``,
+    ``cuda_runtime``, ``user_annotation``, ...; the ``cat`` of its chrome-trace event).
+
+    ``_KinetoEvent.activity_type()`` is new in recent torch (2.14 has it, 2.10 does not):
+    without it the type is read from what every version has, as the chrome trace of torch
+    2.10 labels the events (measured on an NVIDIA A10): a user annotation (a
+    ``record_function`` range) is ``user_annotation`` on the CPU and
+    ``gpu_user_annotation`` on the GPU; GPU work is ``gpu_memcpy`` (``Memcpy ...``),
+    ``gpu_memset`` (``Memset ...``) or else ``kernel``; a CPU event named ``cuda*`` is a
+    runtime call (``cudaLaunchKernel``, ``cudaGraphLaunch``), ``cu`` + a capital a driver
+    call (``cuLaunchKernelEx``, the launch of Triton and cuda.core), anything else
+    ``cpu_op``."""
+    method = getattr(e, "activity_type", None)
+    if method is not None:
+        return str(method())
+    name = str(_call(e, "name", ""))
+    on_gpu = str(_call(e, "device_type", "")).rsplit(".", 1)[-1] == "CUDA"
+    if _call(e, "is_user_annotation", False):
+        return "gpu_user_annotation" if on_gpu else ANNOTATION
+    if on_gpu and name.startswith("Memcpy"):
+        return "gpu_memcpy"
+    if on_gpu and name.startswith("Memset"):
+        return "gpu_memset"
+    if on_gpu:
+        return "kernel"
+    if name.startswith("cuda"):
+        return "cuda_runtime"
+    if len(name) > 2 and name.startswith("cu") and name[2].isupper():
+        return "cuda_driver"
+    return "cpu_op"
+
+
 def from_profiler(prof: Any) -> list[Event]:
     """The events of a finished ``torch.profiler.profile`` (its Kineto results, without
     exporting a chrome trace: an eager run of a large model has millions of events).
@@ -161,7 +194,7 @@ def from_profiler(prof: Any) -> list[Event]:
     keep = GPU_KINDS | API_KINDS | {ANNOTATION}
     out = []
     for e in prof.profiler.kineto_results.events():
-        kind = str(_call(e, "activity_type", ""))
+        kind = activity_type(e)
         if kind not in keep:
             continue
         name = str(_call(e, "name", ""))

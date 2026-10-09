@@ -41,6 +41,8 @@ from typing import Any, Protocol
 
 import torch
 
+from kernel_agent.profiling.timeline import activity_type as _activity_type
+
 #: GPU work of a run may end this long after the caller's stream drained (ns).
 JOIN_SLACK_NS = 2_000
 #: Wall time after ``run()`` returned in which late launches are looked for (s).
@@ -94,7 +96,7 @@ def events(prof: Any) -> list[Event]:
     out = []
     for e in prof.profiler.kineto_results.events():
         start = int(e.start_ns())
-        kind = str(e.activity_type())
+        kind = _activity_type(e)
         device = -1
         if kind in GPU_WORK:
             with contextlib.suppress(Exception):
