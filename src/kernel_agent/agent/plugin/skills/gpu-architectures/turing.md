@@ -36,12 +36,14 @@ on the GPU itself.
   fp16 / bf16 `tl.dot` is FMA on sm_75. Not CuTe DSL: 4.8 has no sm_75 target.
 * **Triton for memory-bound kernels** (norms, elementwise ops, reductions): they need no
   tensor cores, and they ran correctly with the sm_75 code path (below).
-* **INT8 W8A8 (`int8_w8a8`):** IMMA `mma.sync m8n8k16` s8 in CUDA C++, or cuBLASLt
-  (`torch._int_mm`). Triton's int8 `tl.dot` does not compile for sm_75.
+* **INT8 W8A8 (`int8_w8a8`):** IMMA `mma.sync m8n8k16` s8 in CUDA C++
+  (`cuda_int8_skinny_gemm.py`: four per m16n8k32 product, up to 128 rows per call), or
+  cuBLASLt (`torch._int_mm`). Triton's int8 `tl.dot` does not compile for sm_75.
 * **Weight-only formats** (`int8_weights`, `fp8_weights`, `fp4_weights`) dequantise in
-  registers. The bundled CUDA GEMVs compile for sm_75 and ran correctly through compute_75
-  PTX (below), although their `ARCHS` say sm_80+ (bf16 activations). Below sm_89 the e4m3
-  codes convert in software, and that conversion equals torch's on all 256 codes.
+  registers. The bundled CUDA GEMVs (`ARCHS = "sm_75+"`, bf16 or fp16 activations) and
+  `cuda_fp8_skinny_gemm.py` (fp16: two `m16n8k8` per k16 step; bf16 there: the dequantised
+  fallback) ran correctly through compute_75 PTX (below). Below sm_89 the e4m3 codes
+  convert in software, and that conversion equals torch's on all 256 codes.
 * **No `cp.async`** (sm_80+). TileLang's sm_75 GEMM fills shared memory with plain 16-byte
   loads. In CUDA C++, load the next tile into registers while the MMAs read the current one
   from shared memory.
@@ -151,6 +153,9 @@ ratio. After `kernel-agent doctor --remeasure-peaks` the toolchain block states 
 |---|---|
 | `cuda_int8_gemv.py` (int8 weights), M = 1 / 4 | 0.0045 / 0.0046 |
 | `cuda_fp8_gemv.py` (e4m3 weights, software conversion), M = 1 / 4 | 0.0259 / 0.0256 |
+| `cuda_fp8_skinny_gemm.py` fp16 (`m16n8k8`) vs fp32 math on its stored weight, M = 5..64 | 7e-6 to 1.4e-5 |
+| `cuda_int8_skinny_gemm.py` (`m8n8k16`) vs `int8_w8a8_linear`, bf16 and fp16, M = 3..40 | 0 (bit for bit) |
+| the weight-only and skinny examples on bf16 and fp16 captures (evaluator, #258) | near-lossless passes, exact tier rejects |
 | e4m3 -> fp16 conversion (`__nv_cvt_fp8_to_halfraw`, compute_75) | equal to torch on all 256 codes |
 | Triton fp16 / bf16 `tl.dot` GEMM (FMA) | 4.1e-7 / 1.8e-7 |
 | `triton_rmsnorm.py` fp16 / bf16 | < 5e-5 / < 5e-5 |
