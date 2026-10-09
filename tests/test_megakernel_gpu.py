@@ -5,6 +5,7 @@ example through the evaluator and under memcheck, racecheck and synccheck."""
 from __future__ import annotations
 
 import dataclasses
+import random
 
 import pytest
 import torch
@@ -337,6 +338,88 @@ def test_the_example_passes_the_evaluator(tmp_path):
     from kernel_agent.selftest import smoke_megakernel
 
     assert smoke_megakernel(tmp_path, verbose=True)
+
+
+def test_the_evaluator_stresses_the_example_back_to_back(tmp_path):
+    """Issue #248: the example uses counters, so the evaluator's determinism stage runs its
+    main case STRESS_CALLS times back to back, every call bit-identical to an isolated one."""
+    from kernel_agent.kernels import evaluate as ev
+    from kernel_agent.selftest import MEGAKERNEL_EXAMPLES, make_norm_chain_capture
+
+    hidden, layers, calls = MEGAKERNEL_EXAMPLES["native_megakernel"]
+    capture = make_norm_chain_capture(tmp_path / "chain.pt", hidden, layers, calls)
+    result = ev.run_evaluation(capture, EXAMPLE)
+    assert result["correct"], result
+    stress = result["determinism"]["stress"]
+    assert (stress["calls"], stress["wrong"]) == (ev.STRESS_CALLS, 0), stress
+
+
+def _stress(launch, xs, golden, out, calls, seed=0):
+    """``calls`` launches back to back on the inputs ``xs`` in turn (a GPU-side gap of up to
+    ~0.1 ms before a quarter of them), each output compared on the GPU with ``golden``: the
+    indices of the calls that differ in a bit."""
+    rng = random.Random(seed)
+    flags = []
+    for i in range(calls):
+        k = i % len(xs)
+        if rng.random() < 0.25:
+            torch.cuda._sleep(rng.randrange(1_000, 300_000))
+        launch(xs[k])
+        flags.append((out() != golden[k]).any())
+    torch.cuda.synchronize()
+    return [i for i, f in enumerate(flags) if bool(f)]
+
+
+@pytest.mark.parametrize("inflight", [1, 0])
+def test_two_thousand_back_to_back_calls_equal_isolated_ones(mk, inflight):
+    """Counters reset by the last block, pages and activation rows reused by every launch:
+    2,000 calls on 8 inputs, back to back and with gaps, each bit for bit the isolated call's."""
+    mod, _ = mk
+    engine = mod.build(_chain(layers=28), mode="megakernel", inflight=inflight)
+    xs = [torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16) for _ in range(8)]
+    with torch.inference_mode():
+        golden = []
+        for x in xs:
+            torch.cuda.synchronize()
+            golden.append(engine(x))
+            torch.cuda.synchronize()
+        held = {}
+
+        def launch(x):
+            held["out"] = engine(x)
+
+        wrong = _stress(launch, xs, golden, lambda: held["out"], 2000)
+    assert wrong == [], f"{len(wrong)} of 2000 calls differ, the first: {wrong[:5]}"
+    engine.rt.check()
+
+
+def test_the_stress_catches_consumers_that_do_not_wait(mk):
+    """The same stress on a broken schedule whose tiles do not wait for the previous layer:
+    they read rows before the previous layer wrote them, i.e. what the previous call left, and
+    the stress sees it. (A target of 1 of 64 was not enough here: each SM runs its own tile
+    of layer l right before its tile of layer l + 1, by when the other tiles of layer l are
+    done as well.)"""
+    mod, ext = mk
+    engine = mod.build(_chain(layers=8), mode="megakernel")
+    sched = engine.schedule
+    early = tuple(dataclasses.replace(i, waits=()) for i in sched.instrs)
+    broken = dataclasses.replace(sched, instrs=early)
+    assert simulate.check(broken, draws=50)  # early starts the simulator reports too
+    pages, queues, page_bytes, _ = ext.mk_info()
+    rt = runtime.Runtime(
+        broken, [*engine._weights, *engine._gammas, engine._act], pool_bytes=pages * page_bytes
+    )
+    xs = [torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16) for _ in range(8)]
+    with torch.inference_mode():
+        golden = [engine(x) for x in xs]  # the correct schedule's outputs
+
+        def launch(x):
+            engine._act[0].copy_(x.reshape(-1))
+            ext.mk_run(*rt.args(), pages, queues, 1)
+
+        wrong = _stress(launch, xs, golden, lambda: engine._act[-1].view(1, -1).clone(), 500)
+    assert len(wrong) > 0, "the stress saw no stale row"
+    print(f"\n  broken schedule: {len(wrong)} of 500 calls wrong")
 
 
 def test_the_example_is_clean_under_memcheck_racecheck_and_synccheck(tmp_path):

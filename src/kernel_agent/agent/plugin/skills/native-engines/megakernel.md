@@ -57,6 +57,38 @@ same math in the same project (`mode="graph_pdl"`: one kernel per layer with PDL
 * The integration runs every native candidate under memcheck, **racecheck** (shared-memory
   hazards: a page reused while still read) and **synccheck** (barriers some threads miss).
 
+## Reuse across calls (the stress check)
+
+Every launch reuses what the previous one left: the counters (zeroed by the launch's last
+block, after every block finished its queue), the activation rows, the pages, the program.
+The rule that keeps that safe:
+
+* **One launch of a runtime at a time, in stream order.** The next launch may only start
+  once the previous one completed: launch every call on the same stream (or join streams),
+  never two calls of one `Runtime` concurrently, and no PDL edge into a launch that reuses
+  the previous launch's counters before its blocks exit.
+* **Nothing is reused within a launch before its last reader is done.** A page is refilled
+  only after every consumer thread arrived on its empty barrier; a buffer row is rewritten
+  only behind an edge from every instruction that reads it (or never: one row per layer);
+  words the interpreter needs after an instruction's last barrier (its signal) are read
+  before it (warp 0 may already refill the row ring for a later chunk).
+* **Counters start at zero and end at zero.** Every signal a launch sends is waited for in
+  that launch, so the last block's reset never races a late `red`; a counter nobody waits on
+  is not signalled (`schedule.py` gives such tiles no counter).
+
+The evaluator checks this for every native candidate whose sources use counters or atomics:
+after the two-run check it runs the main case 256 times back to back
+(`$KERNEL_AGENT_STRESS_CALLS`), on four inputs in turn and with GPU-side gaps before some, and
+every call must equal an isolated call on the same input bit for bit (`determinism.stress`).
+On the example: 0 of 2,000 calls differ (28 layers, 1 or all pages in flight); the same
+schedule with its counter waits removed: 500 of 500 calls differ.
+
+Not every rare failure is a race: the example's exact-tier check against eager (cuBLAS
+rounding) fails on 1.3 % of random inputs at 8 layers and on none at 4 (3,000 draws, issue
+#248), and the graph + PDL and grid-barrier baselines, which use no counters, fail at 1.0 %.
+Tell them apart with the stress check: a race differs from an isolated call on the same
+input, a rounding drift does not.
+
 ## Measured (RTX 5070 Ti, sm_120; the example, 28 layers)
 
 | | H = 1024 (58.7 MB) | H = 2048 (235 MB) |

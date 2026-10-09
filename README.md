@@ -3972,9 +3972,12 @@ layers of [1024, 1024] on an RTX 5070 Ti: 84–87 µs against 77.9 µs for graph
 points to it when a stage's best kernel synchronises its grid or launches more than 3
 kernels per call. Native candidates must give the same bits twice: the evaluator runs
 every case twice from the same inputs and state (`incorrect` at stage `determinism`,
-unless the entry declares `ORDER_DEPENDENT_ATOMICS = "<why>"`), and a megakernel stopped
-by its watchdog is recorded as status `hang` with the instruction, counter, value and
-target.
+unless the entry declares `ORDER_DEPENDENT_ATOMICS = "<why>"`); those whose sources use
+counters or atomics then run their main case 256 times back to back
+(`$KERNEL_AGENT_STRESS_CALLS`), on four inputs in turn and with GPU-side gaps, every call
+bit for bit an isolated call's (`determinism.stress`, issue #248: state one launch leaves
+for the next must not be reused early). A megakernel stopped by its watchdog is recorded
+as status `hang` with the instruction, counter, value and target.
 
 ### Parameter sweeps
 
