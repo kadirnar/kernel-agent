@@ -24,6 +24,7 @@ from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
 from kernel_agent.kernels import recheck, weights
+from kernel_agent.libscout import scout as libscout
 from kernel_agent.workloads import dtypes
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
@@ -576,6 +577,7 @@ def write_report(run: RunDir) -> Path:
     lines += sessions.report_lines(run)  # agent time split and GPU use (issue #184)
     lines += backends.report_lines(run)  # evaluations per backend (by source) and target
     lines += library.report_lines(run)  # prior winners reused, entries stored, lessons
+    lines += libscout.report_lines(run)  # library kernels with no agent: the bar (#227)
     lines += web.report_lines(run.root)  # pages the agents fetched (issue #125)
     if costs:
         total = sum(c.get("usd", 0) for c in costs.values())

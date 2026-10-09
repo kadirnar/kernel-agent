@@ -13,13 +13,18 @@ each ``improve`` loop pass before slices, like the library priors):
    hypothesis ``library scout: <what> (<package> <version>) [sweep: ...]``, the session
    ``libscout`` and the backend ``library:<package>@<version>``;
 3. ``targets/<id>/libscout.json`` keeps what it found (:func:`summary`) and ``run.json`` →
-   ``libscout.scouted`` that it ran.
+   ``libscout.scouted`` that it ran, under which :func:`key` (the GPU, the op families and
+   the installed versions of the libraries their adapters use): the run scouts a target
+   again when the key changes (:func:`stale`: a library installed, upgraded or removed,
+   another GPU), never otherwise.
 
 The probe and the sweeps hold one GPU lock from start to end. The results are the **library
 bar** (:func:`bar_lines`): the kernel engineer's digest and first prompt, and the planner's
-round context, show it as the floor to beat. It is never a stop signal: scout rows extend no
-streak (``budget.LIBRARY_HYPOTHESIS``), and a best the scout set does not retire an arm by
-the speed-of-light or speedup-goal rules (``scheduler``).
+round context, show it as the floor to beat; ``ceilings.md`` as a column of its table and a
+section (:func:`write_ceilings`), ``report.md`` as its ``## Library scout`` section
+(:func:`report_lines`). It is never a stop signal: scout rows extend no streak
+(``budget.LIBRARY_HYPOTHESIS``), and a best the scout set does not retire an arm by the
+speed-of-light or speedup-goal rules (``scheduler``).
 
 ``python -m kernel_agent.libscout CAPTURE`` runs the same on a capture outside a run (nothing
 recorded; the table on stdout).
@@ -37,7 +42,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from kernel_agent.budget import LIBRARY_HYPOTHESIS
+from kernel_agent.budget import LIBRARY_HYPOTHESIS, not_agents
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 SESSION = "libscout"  # the ledger's session column of scout rows
@@ -61,12 +66,121 @@ def scouted(run: RunDir, target_id: str) -> dict[str, Any] | None:
 
 
 def remember(run: RunDir, target_id: str, entry: Mapping[str, Any]) -> None:
-    """``run.json`` → ``libscout.scouted[target_id]`` (the scout runs once per target)."""
+    """``run.json`` → ``libscout.scouted[target_id]``: the scout ran, under its :func:`key`
+    (it runs again only when :func:`stale` says the key changed)."""
 
     def put(data: dict[str, Any]) -> None:
         data.setdefault("libscout", {}).setdefault("scouted", {})[target_id] = dict(entry)
 
     run.update(put)
+
+
+# ------------------------------------------------------------------ the scout's key
+
+#: Why a remembered scout without a :func:`key` is scouted again (once: the new one has one)
+NO_KEY = (
+    "its remembered scout has no library key (made before scouts were keyed by the installed "
+    "library versions)"
+)
+
+
+def gpu_label(gpu: Any) -> str | None:
+    """``NVIDIA A10 (sm_86)`` of a :class:`~kernel_agent.toolchain.GPUInfo` (an emulated
+    one: ``NVIDIA A10 emulating sm_80 (sm_80)``); None without a GPU."""
+    return None if gpu is None else f"{gpu.name} ({gpu.arch})"
+
+
+def _keyed(families: Iterable[str] | None, gpu: Any) -> list[Any]:
+    """The adapters a target's scout depends on: those of its op ``families`` (None: a scout
+    that failed before it detected them, every adapter; []: none) that have a template and
+    run on ``gpu``."""
+    from kernel_agent.libscout.adapters import ADAPTERS
+
+    capability = tuple(gpu.capability) if gpu is not None else None
+    names = None if families is None else set(families)
+    return [
+        a
+        for a in ADAPTERS
+        if not a.no_template
+        and (names is None or names & set(a.families))
+        and a.arch_reason(capability) is None
+    ]
+
+
+def installed() -> dict[str, str]:
+    """:func:`registry.versions` of every adapter: one metadata pass for all of a run's
+    targets (:func:`key`'s ``versions``)."""
+    from kernel_agent.libscout.adapters import ADAPTERS
+    from kernel_agent.libscout.registry import versions
+
+    return versions(ADAPTERS)
+
+
+def key(
+    families: Iterable[str] | None,
+    gpu: Any,
+    *,
+    nvcc: str | None = None,
+    versions: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """What a target's scout measured besides its capture: ``{gpu, families, libraries}``,
+    the GPU (:func:`gpu_label`), the op families its reference calls and the installed
+    version of every distribution the adapters of those families use on this GPU
+    (:attr:`~kernel_agent.libscout.registry.Adapter.distributions`: torch, the cuBLAS and
+    cuDNN wheels torch loads, flash-attn, flashinfer, QuACK, Liger, Triton, ...; read from
+    the metadata, nothing imported) and, when one of them builds a CUDA extension (cuBLASLt),
+    the CUDA toolkit's ``nvcc``. ``versions``: :func:`installed`, read once for many targets.
+    A target whose key changes is scouted again (:func:`stale`); the others keep their bar."""
+    from kernel_agent.libscout.registry import versions as read
+
+    adapters = _keyed(families, gpu)
+    found = read(adapters) if versions is None else versions
+    wanted = {d for a in adapters for d in a.distributions}
+    libraries = {d: found[d] for d in sorted(wanted) if d in found}
+    if nvcc and any(a.compiles for a in adapters):
+        libraries["nvcc (CUDA toolkit)"] = str(nvcc)
+    return {
+        "gpu": gpu_label(gpu),
+        "families": None if families is None else sorted(set(families)),
+        "libraries": libraries,
+    }
+
+
+def changes(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
+    """What differs between two :func:`key` s: ``flashinfer-python 0.2.5 → 0.2.6``,
+    ``liger-kernel 0.6.1 installed``, ``flash-attn 2.8.3 removed``, ``GPU A → B``."""
+    out = []
+    if old.get("gpu") != new.get("gpu"):
+        out.append(f"GPU {old.get('gpu') or 'none'} → {new.get('gpu') or 'none'}")
+    was, now = old.get("libraries") or {}, new.get("libraries") or {}
+    for dist in sorted(set(was) | set(now)):
+        before, after = was.get(dist), now.get(dist)
+        if before == after:
+            continue
+        if before is None:
+            out.append(f"{dist} {after} installed")
+        elif after is None:
+            out.append(f"{dist} {before} removed")
+        else:
+            out.append(f"{dist} {before} → {after}")
+    return out
+
+
+def stale(
+    entry: Mapping[str, Any],
+    gpu: Any,
+    *,
+    nvcc: str | None = None,
+    versions: Mapping[str, str] | None = None,
+) -> str | None:
+    """Why a remembered scout (:func:`scouted`) no longer holds on this GPU with what is
+    installed now (None: it does): its key is missing (:data:`NO_KEY`) or a library of its
+    families, or the GPU, changed (:func:`changes`)."""
+    old = entry.get("key")
+    if not isinstance(old, Mapping):
+        return NO_KEY
+    now = key(old.get("families"), gpu, nvcc=nvcc, versions=versions)
+    return "; ".join(changes(old, now)) or None
 
 
 def summary(run: RunDir, target_id: str) -> dict[str, Any] | None:
@@ -450,10 +564,69 @@ def planner_lines(run: RunDir, target_ids: Iterable[str]) -> list[str]:
 CEILINGS_HEAD = "## Library bars (libscout)"
 
 
+def bar_cell(found: Mapping[str, Any]) -> str:
+    """A target's library bar in a table cell: ``1.25x torch-sdpa`` (the best correct
+    candidate, :func:`best`), ``none correct``, ``no adapter`` or ``scout failed``."""
+    if found.get("error"):
+        return "scout failed"
+    top = best(found)
+    if top is not None:
+        return f"{float(top['speedup']):.2f}x {top.get('adapter')}"
+    return "none correct" if found.get("adapters") else "no adapter"
+
+
+def ceiling_bars(
+    run: RunDir, table: Mapping[str, Any], target_ids: Iterable[str] | None = None
+) -> dict[tuple[str, str], str] | None:
+    """The *library bar* column of a ceilings ``table`` (``ceilings.markdown``'s ``bars``):
+    the :func:`bar_cell` of every scouted target on the rows that time its instance groups
+    (``projection.tree``; ``ceilings.holding``'s own rows: a target hidden inside a parent's
+    row, or a region target, has none; a target without a known group: its class's rows in
+    its phase); where several share a row, each cell prefixed with its target's id. None: no
+    target scouted (no column)."""
+    from kernel_agent import projection
+    from kernel_agent.profiling import ceilings
+
+    ids = run.target_ids() if target_ids is None else list(target_ids)
+    found = {t: s for t in ids if (s := summary(run, t)) is not None}
+    if not found:
+        return None
+    specs = {t: read_json(run.target(t) / "spec.json", {}) or {} for t in found}
+    cells: dict[tuple[str, str], dict[str, str]] = {}
+    for group in projection.tree(run, list(found)).groups:
+        spec = specs.get(group.target) or {}
+        if spec.get("kind") == "region":
+            continue
+        cls = spec.get("module_class")
+        if group.pattern:
+            rows, inside = ceilings.holding(table, group.pattern, cls, group.phase)
+            if inside:
+                continue
+        else:
+            rows = [
+                r
+                for r in table.get("rows") or []
+                if r.get("cls") == cls and group.phase in (None, r.get("phase"))
+            ]
+        for row in rows:
+            cells.setdefault(ceilings.row_key(row), {})[group.target] = bar_cell(
+                found[group.target]
+            )
+    return {
+        row: next(iter(by.values()))
+        if len(by) == 1
+        else "; ".join(f"`{t}` {cell}" for t, cell in by.items())
+        for row, by in cells.items()
+    }
+
+
 def write_ceilings(run: RunDir, profile_dir: Path | None = None) -> None:
-    """Replace (or append) the library bars section of ``<profile_dir>/ceilings.md``; by
-    default of the run's profile and of the newest improve round's (what the next planner
-    reads)."""
+    """``<profile_dir>/ceilings.md`` with the library bar: its table rendered again from
+    ``ceilings.json`` with the *library bar* column (:func:`ceiling_bars`), and the library
+    bars section (:func:`planner_lines`) replaced or appended; by default of the run's
+    profile and of the newest improve round's (what the next planner reads)."""
+    from kernel_agent.profiling import ceilings
+
     dirs = [profile_dir] if profile_dir is not None else [run.profile_dir]
     if profile_dir is None:
         rounds = [p for p in (run.root / "rounds").glob("*/profile") if p.parent.name.isdigit()]
@@ -464,15 +637,129 @@ def write_ceilings(run: RunDir, profile_dir: Path | None = None) -> None:
         path = directory / "ceilings.md"
         if not directory.is_dir():
             continue
-        text = path.read_text() if path.is_file() else ""
-        text = text.split("\n" + CEILINGS_HEAD)[0].split(CEILINGS_HEAD)[0].rstrip("\n")
+        old = path.read_text() if path.is_file() else ""
+        text = old.split("\n" + CEILINGS_HEAD)[0].split(CEILINGS_HEAD)[0].rstrip("\n")
+        table = read_json(directory / "ceilings.json", None)
+        bars = ceiling_bars(run, table) if isinstance(table, dict) else None
+        if bars is not None and (again := ceilings.markdown(table, bars=bars).strip("\n")):
+            text = again  # what ceilings.write wrote, with the column (#227)
         if lines:
             text += (
                 f"\n\n{CEILINGS_HEAD}\n\nWhat library kernels reach on each target with no "
                 "agent (module speedup of the best scout candidate; op bars: the library's op "
                 "alone vs the reference's). A floor to beat, not a ceiling.\n\n" + "\n".join(lines)
             )
-        path.write_text(text.lstrip("\n") + "\n")
+        new = text.lstrip("\n") + "\n"
+        if new != old and (old or text.strip()):  # nothing to say: no empty file
+            path.write_text(new)
+
+
+# ------------------------------------------------------------------ report.md
+
+
+def agent_best(run: RunDir, target_id: str) -> dict[str, Any] | None:
+    """The fastest correct record of a target that an agent made (``ranked_for_target``
+    without the library priors' and the scout's rows, ``budget.not_agents``); None: none."""
+    from kernel_agent.agent.tools import ranked_for_target
+
+    return next(
+        (r for r in ranked_for_target(run, target_id) if not not_agents(r.get("hypothesis"))),
+        None,
+    )
+
+
+def _cell(text: Any) -> str:
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def _beaten(top: Mapping[str, Any] | None, agent: Mapping[str, Any] | None) -> str:
+    """Whether an agent's kernel beat the bar: ``yes (1.28x the bar)`` / ``no (...)``."""
+    if top is None:
+        return "— (no bar)"
+    if agent is None:
+        return "no agent kernel"
+    bar, mine = float(top["speedup"]), float(agent["speedup"])
+    if mine > bar:
+        return f"yes ({mine / bar:.2f}x the bar)"
+    return f"no ({mine:.2f}x ≤ {bar:.2f}x)"
+
+
+def _key_text(key: Mapping[str, Any] | None) -> str:
+    """``NVIDIA A10 (sm_86); torch 2.10.0+cu128, triton 3.6.0`` of a :func:`key`."""
+    if not isinstance(key, Mapping):
+        return "no key (scouted before the key)"
+    libs = ", ".join(f"{d} {v}" for d, v in (key.get("libraries") or {}).items())
+    return f"{key.get('gpu') or 'no GPU'}; {libs or 'no library of its families installed'}"
+
+
+def report_lines(run: RunDir) -> list[str]:
+    """``## Library scout`` of report.md ([] when no target was scouted), from the run's
+    files (``libscout.json``, ``run.json`` → ``libscout.scouted``, ``results.jsonl``): per
+    target the op families, the adapters tried and their verdicts, the best library
+    candidate (its ``library:<package>@<version>`` backend, speedup, % of SOL), the best
+    agent kernel and whether it beat the bar; then the adapters not run with why, and the
+    key each target was scouted under (and why it was scouted again)."""
+    found = {t: s for t in run.target_ids() if (s := summary(run, t)) is not None}
+    if not found:
+        return []
+    lines = [
+        "",
+        "## Library scout",
+        "",
+        "Library kernels on each target with no agent (`libscout/`, #227): every adapter of "
+        "the op families the reference calls, swept and fully evaluated at module level. The "
+        "best is the bar the engineers start from: a floor to beat, never a ceiling.",
+        "",
+        "| target | op families | adapters tried | best library candidate | best agent kernel "
+        "| bar beaten |",
+        "|---|---|---|---|---|---|",
+    ]
+    skipped: list[str] = []
+    keys: list[str] = []
+    for target_id, mine in found.items():
+        if mine.get("error"):
+            lines.append(
+                f"| `{target_id}` | scout failed: {_cell(_last_line(mine['error']))} "
+                "| — | — | — | — |"
+            )
+        else:
+            top = best(mine)
+            agent = agent_best(run, target_id)
+            tried = "; ".join(_short(r) for r in mine.get("adapters") or []) or "none applies"
+            bar = "none correct"
+            if top is not None:
+                config = _config(top.get("config"))
+                bar = (
+                    f"`{top.get('backend')}` {top.get('adapter')}"
+                    + (f" ({config})" if config else "")
+                    + f": {float(top['speedup']):.2f}x{_sol(top)}"
+                )
+            theirs = "—" if agent is None else f"{float(agent['speedup']):.2f}x"
+            if agent is not None and agent.get("snapshot"):
+                theirs += f" `{Path(str(agent['snapshot'])).name}`"
+            lines.append(
+                f"| `{target_id}` | {_cell(mine.get('described') or 'none')} | {_cell(tried)} "
+                f"| {_cell(bar)} | {theirs} | {_beaten(top, agent)} |"
+            )
+        skipped += [
+            f"* `{target_id}`: {s.get('adapter')}: {_cell(s.get('reason'))}"
+            for s in mine.get("skipped") or []
+        ]
+        entry = scouted(run, target_id) or {}
+        again = ""
+        if entry.get("rescouted"):
+            again = f"; scouted {entry.get('scouts')} times, last after: {entry['rescouted']}"
+        keys.append(f"* `{target_id}`: {_key_text(entry.get('key'))}{again}")
+    if skipped:
+        lines += ["", "Not run (and why):", "", *skipped]
+    lines += [
+        "",
+        "Scouted with (a target is scouted again when a library of its families or the GPU "
+        "changes):",
+        "",
+        *keys,
+    ]
+    return lines
 
 
 # ------------------------------------------------------------------ export and doctor

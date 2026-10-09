@@ -21,7 +21,9 @@ from typing import Any
 import pytest
 import torch
 from libscout_toy import Block, Core, Feed, Head, Mixer, Plain, Promoted, Residual, Scale
-from test_recheck import make, simulated  # noqa: F401 (fixture)
+from test_ceilings import PEAKS
+from test_ceilings import _profile as ceilings_profile
+from test_recheck import kernel, make, simulated  # noqa: F401 (fixture)
 from test_truth import sealed_run
 
 from kernel_agent import budget, critic, gpulock, ledger, scheduler, toolchain, truth
@@ -29,6 +31,8 @@ from kernel_agent.integrate.export import export_optimized
 from kernel_agent.kernels import sweep
 from kernel_agent.libscout import adapters, detect, fx_rewrites, probe, registry, template
 from kernel_agent.libscout import scout as libscout
+from kernel_agent.profiling import ceilings
+from kernel_agent.report import write_report
 from kernel_agent.workspace import RunDir, read_json, read_jsonl, write_json
 
 TESTS = Path(__file__).parent
@@ -448,6 +452,92 @@ def test_op_bars_spare_the_sweep_its_losers():
     assert keep == [{"BACKEND": "efficient"}] and len(pruned) == 1
 
 
+class InPlace(Scale):
+    """The written-out RMSNorm with ``+=`` (``add_``): no pattern to replay for an op bar
+    (a replayed in-place call would change its recorded input)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.pow(2).mean(-1, keepdim=True)
+        variance += self.eps
+        return self.weight * (x * torch.rsqrt(variance))
+
+
+def test_written_out_rms_norms_get_op_bars_against_the_fused_kernel(tmp_path):
+    """The pattern's recorded calls replayed (the reference's kernels) against what the
+    adapter's rewrite puts in its place, on the same x and weight; the GPU timer faked."""
+    torch.manual_seed(0)
+    block = Block().to(torch.bfloat16).eval()  # two RMSNorms: q's in Mixer, the block's
+    with torch.no_grad():
+        for p in block.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+    cos, sin = (t.bfloat16() for t in rope())
+    invocations: list[Any] = []
+    x = torch.randn(2, 5, 32).bfloat16()
+    calls = detect.trace(block, (x, cos, sin), module=block, invocations=invocations)
+    spans = detect.rms_spans(calls)
+    assert [[calls[i].name for i in s.calls] for s in spans] == [
+        ["to", "pow", "mean", "add", "rsqrt", "mul", "to", "mul"]
+    ] * 2
+    assert [(s.weight, s.eps, s.dtype, s.mid) for s in spans] == [
+        ("mix.n.weight", 1e-6, "bfloat16", "bfloat16"),
+        ("norm.weight", 1e-6, "bfloat16", "bfloat16"),
+    ]
+    assert calls[spans[1].entry].name == "to" and calls[spans[1].calls[0] - 1].name == "add"
+    in_place = InPlace(8)
+    traced = detect.trace(in_place, (torch.randn(3, 8),), module=in_place)
+    assert "rms_norm" not in detect.families(traced) and detect.rms_spans(traced) == []
+    assert detect._in_place("TensorBase.add_") and detect._in_place("Tensor.__imul__")
+    assert not detect._in_place("Tensor.__add__") and not detect._in_place("TensorBase.pow")
+
+    configs = [{"FUSE": 0}, {"FUSE": 1}]
+    path = tmp_path / "libscout_torch_rms_norm.py"
+    path.write_text(_render("torch-rms-norm", configs))
+    module = probe._import(path)
+    timed: list[int] = []
+
+    def timer(fns: Any) -> dict[str, list[float] | None]:
+        timed.append(len(fns))
+        return {"eager": [12.0, 4.0], "graph": [6.0, 2.5]}
+
+    wrong = types.SimpleNamespace(  # drops the weight: fails the tolerance
+        patterns=lambda reference, **config: {"rms_norm": lambda x, w, eps, dtype, mid: x}
+    )
+    modules = {"torch-rms-norm": (module, configs), "wrong": (wrong, [{}])}
+    bars = probe.pattern_bars(block, invocations, calls, modules, timer=timer)
+    assert [(b["adapter"], b["config"]) for b in bars] == [
+        ("torch-rms-norm", {"FUSE": 0}),
+        ("torch-rms-norm", {"FUSE": 0}),
+        ("torch-rms-norm", {"FUSE": 1}),
+        ("torch-rms-norm", {"FUSE": 1}),
+        ("wrong", {}),
+        ("wrong", {}),
+    ]
+    assert [b["signature"] for b in bars[:2]] == [
+        "rms_norm (written out)([2, 5, 4, 8] [8] bfloat16; eps=1e-06)",
+        "rms_norm (written out)([2, 5, 32] [32] bfloat16; eps=1e-06)",
+    ]
+    assert all(b["ok"] for b in bars[:4]), [b.get("error") for b in bars[:4]]
+    assert bars[0] == {
+        "adapter": "torch-rms-norm",
+        "config": {"FUSE": 0},
+        "op": probe.RMS_PATTERN,
+        "signature": "rms_norm (written out)([2, 5, 4, 8] [8] bfloat16; eps=1e-06)",
+        "calls": 1,
+        "pattern_ops": 8,
+        "ok": True,
+        "ref_eager_us": 12.0,
+        "eager_us": 4.0,
+        "eager_speedup": 3.0,
+        "ref_us": 6.0,
+        "us": 2.5,
+        "speedup": 2.4,
+    }
+    assert not bars[4]["ok"] and bars[4]["error"] and timed == [2] * 6
+    keep, pruned = probe.prune([*configs, {}], bars)
+    assert keep == configs and pruned[0]["why"].startswith("op bar fails")
+    assert libscout.bar_groups(bars)[1]["libraries"][0]["speedup"] == 2.4
+
+
 def test_the_probe_sweeps_no_candidate_that_changes_nothing_or_fails(tmp_path):
     """The dry run of a candidate on the dominant case: a rewrite that finds nothing in
     Dynamo's graphs (here: no RMSNorm at all) is not swept, nor one that fails there."""
@@ -689,11 +779,9 @@ def test_orchestrator_scouts_each_target_once(tmp_path, simulated):  # noqa: F81
     asyncio.run(orch.scout_libraries(["mix"]))
     assert [c[0] for c in calls] == ["mix"]
     assert set(calls[0][1]) == {"keeper", "timeout", "backends", "race"}
-    assert libscout.scouted(run, "mix") == {
-        "seconds": 2.0,
-        "error": None,
-        "adapters": ["torch-sdpa"],
-    }
+    entry = libscout.scouted(run, "mix")
+    assert entry is not None and entry.pop("key")["families"] is None  # it found no families
+    assert entry == {"seconds": 2.0, "error": None, "adapters": ["torch-sdpa"]}
     assert [e["target"] for e in ledger.events(run) if e["event"] == "library_scout"] == ["mix"]
     off = make(tmp_path / "off", library_scout=False)
     write_json(off.run.target("mix") / "spec.json", {"id": "mix", "module_class": "Mixer"})
@@ -701,6 +789,285 @@ def test_orchestrator_scouts_each_target_once(tmp_path, simulated):  # noqa: F81
     off.scouter = scouter
     asyncio.run(off.scout_libraries(["mix"]))
     assert len(calls) == 1
+
+
+# ------------------------------------------------------------------ the scout's key
+
+
+def _versions(monkeypatch, installed: dict[str, str]) -> dict[str, str]:
+    """Distribution metadata as ``installed`` says (a test upgrades or removes in place);
+    no library module of the registry but torch importable."""
+    _fake_libraries(monkeypatch, {})
+    monkeypatch.setattr(registry, "package_version", lambda p: installed.get(p))
+    return installed
+
+
+H100 = toolchain.GPUInfo("Fake H100", (9, 0), 80.0, 132, 50.0)
+
+
+def test_versions_are_read_from_the_metadata_without_an_import(monkeypatch):
+    installed = _versions(
+        monkeypatch,
+        {
+            "torch": "2.10.0+cu128",
+            "nvidia-cublas-cu12": "12.8.4.1",
+            "liger-kernel": "0.6.1",
+            "triton": "3.6.0",
+        },
+    )
+
+    def no_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"imported {name}")
+
+    monkeypatch.setattr(registry.importlib, "import_module", no_import)
+    assert registry.versions(adapters.ADAPTERS) == {
+        "liger-kernel": "0.6.1",
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "torch": "2.10.0+cu128",
+        "triton": "3.6.0",
+    }
+    del installed["torch"]  # a source tree on PYTHONPATH: it imports, no metadata
+    assert registry.versions([adapters.BY_NAME["torch-sdpa"]]) == {"torch": registry.NO_METADATA}
+
+
+def test_a_scout_is_keyed_by_the_libraries_of_its_families_on_this_gpu(monkeypatch):
+    installed = _versions(
+        monkeypatch,
+        {
+            "torch": "2.10.0+cu128",
+            "nvidia-cudnn-cu12": "9.10.2.21",
+            "nvidia-cublas-cu12": "12.8.4.1",
+            "flash-attn": "2.8.3",
+            "flash-attn-3": "3.0.0b1",
+            "liger-kernel": "0.6.1",
+            "triton": "3.6.0",
+        },
+    )
+    a10 = GPUS["sm_86"]
+    sdpa = libscout.key(["sdpa"], a10)
+    assert sdpa == {  # FlashAttention 3 needs sm_90: not this GPU's; FlashInfer: not here
+        "gpu": "Fake A10 (sm_86)",
+        "families": ["sdpa"],
+        "libraries": {
+            "flash-attn": "2.8.3",
+            "nvidia-cudnn-cu12": "9.10.2.21",
+            "torch": "2.10.0+cu128",
+        },
+    }
+    assert libscout.key(["sdpa"], H100)["libraries"]["flash-attn-3"] == "3.0.0b1"
+    assert libscout.key(["linear"], a10, nvcc="12.9")["libraries"] == {  # cuBLASLt compiles
+        "nvidia-cublas-cu12": "12.8.4.1",
+        "torch": "2.10.0+cu128",
+        "nvcc (CUDA toolkit)": "12.9",
+    }
+    assert "nvcc (CUDA toolkit)" not in libscout.key(["sdpa"], a10, nvcc="12.9")["libraries"]
+    assert libscout.key([], a10)["libraries"] == {}  # no family: no library matters
+    assert set(libscout.key(None, a10)["libraries"]) == set(installed) - {"flash-attn-3"}
+    norm = {"key": libscout.key(["rms_norm"], a10)}
+    attention = {"key": sdpa}
+
+    assert libscout.stale(attention, a10) is None and libscout.stale(norm, a10) is None
+    installed.update({"liger-kernel": "0.6.2", "triton": "3.7.0", "flash-attn-3": "3.0.0"})
+    assert libscout.stale(attention, a10) is None  # Liger and FA3 change no SDPA bar here
+    assert libscout.stale(norm, a10) == "liger-kernel 0.6.1 → 0.6.2; triton 3.6.0 → 3.7.0"
+    installed.update({"flash-attn": "2.8.4", "flashinfer-python": "0.2.6"})
+    del installed["nvidia-cudnn-cu12"]
+    assert libscout.stale(attention, a10) == (
+        "flash-attn 2.8.3 → 2.8.4; flashinfer-python 0.2.6 installed; "
+        "nvidia-cudnn-cu12 9.10.2.21 removed"
+    )
+    blackwell = libscout.stale({"key": libscout.key(["sdpa"], a10)}, GPUS["sm_120"])
+    assert blackwell == "GPU Fake A10 (sm_86) → Fake RTX 5070 Ti (sm_120)"
+    assert libscout.stale({"seconds": 2.0, "adapters": []}, a10) == libscout.NO_KEY
+
+
+def test_orchestrator_scouts_again_when_a_library_changes(
+    tmp_path,
+    simulated,  # noqa: F811
+    monkeypatch,
+    capsys,
+):
+    installed = _versions(monkeypatch, {"torch": "2.10.0+cu128", "liger-kernel": "0.6.1"})
+    installed["triton"] = "3.6.0"
+    orch = make(tmp_path)
+    monkeypatch.setattr(orch.tc, "gpu", GPUS["sm_86"], raising=False)
+    run = orch.run
+    families = {"core": {"sdpa": {"count": 1}}, "norm": {"rms_norm": {"count": 2}}}
+    for target_id in families:
+        write_json(run.target(target_id) / "spec.json", {"id": target_id})
+        truth.replace(run.capture_file(target_id)).write_bytes(b"capture")
+    calls: list[str] = []
+
+    def scouter(run_: RunDir, target_id: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(target_id)
+        found = {"seconds": 1.0, "families": families[target_id], "adapters": []}
+        write_json(run_.target(target_id) / libscout.FILE, {"target": target_id, **found})
+        return found
+
+    orch.scouter = scouter
+    asyncio.run(orch.scout_libraries(["core", "norm"]))
+    asyncio.run(orch.scout_libraries(["core", "norm"]))  # nothing changed: no scout
+    assert calls == ["core", "norm"]
+    assert libscout.scouted(run, "norm")["key"] == {
+        "gpu": "Fake A10 (sm_86)",
+        "families": ["rms_norm"],
+        "libraries": {"liger-kernel": "0.6.1", "torch": "2.10.0+cu128", "triton": "3.6.0"},
+    }
+    installed["liger-kernel"] = "0.6.2"  # Liger has RMSNorm, not attention: only `norm`
+    asyncio.run(orch.scout_libraries(["core", "norm"]))
+    assert calls == ["core", "norm", "norm"]
+    assert "libscout: norm: scouting again: liger-kernel 0.6.1 → 0.6.2" in capsys.readouterr().out
+    entry = libscout.scouted(run, "norm")
+    assert entry["scouts"] == 2 and entry["rescouted"] == "liger-kernel 0.6.1 → 0.6.2"
+    assert entry["key"]["libraries"]["liger-kernel"] == "0.6.2"
+    # a scout remembered before the key: stale once, said why; then keyed like the rest
+    libscout.remember(run, "core", {"seconds": 1.0, "error": None, "adapters": []})
+    asyncio.run(orch.scout_libraries(["core", "norm"]))
+    asyncio.run(orch.scout_libraries(["core", "norm"]))
+    assert calls == ["core", "norm", "norm", "core"]
+    assert f"libscout: core: scouting again: {libscout.NO_KEY}" in capsys.readouterr().out
+    events = [e for e in ledger.events(run) if e["event"] == "library_scout"]
+    assert [(e["target"], e.get("rescouted")) for e in events] == [
+        ("core", None),
+        ("norm", None),
+        ("norm", "liger-kernel 0.6.1 → 0.6.2"),
+        ("core", libscout.NO_KEY),
+    ]
+    text = write_report(run).read_text()  # report.md's section, from these files
+    assert "## Library scout" in text
+    assert "* `norm`: Fake A10 (sm_86); liger-kernel 0.6.2, torch 2.10.0+cu128, triton " in text
+
+
+def test_the_report_shows_each_targets_scout_and_whether_an_agent_beat_it(tmp_path, monkeypatch):
+    monkeypatch.setenv(gpulock.ENV, "1")
+    run, keeper = _scouted_run(tmp_path)
+    assert libscout.report_lines(run) == []  # nothing scouted: no section
+    libscout.scout_target(
+        run, "mix", keeper=keeper, prober=_prober, sweeper=_sweeper, say=lambda m: None
+    )
+    key = {
+        "gpu": "Fake A10 (sm_86)",
+        "families": ["rms_norm", "sdpa"],
+        "libraries": {"nvidia-cudnn-cu12": "9.10.2.21", "torch": "2.14.1"},
+    }
+    libscout.remember(run, "mix", {"key": key, "scouts": 2, "rescouted": "torch 2.14.0 → 2.14.1"})
+    write_json(run.target("lin") / "spec.json", {"id": "lin"})
+    write_json(run.target("lin") / libscout.FILE, {"target": "lin", "error": "probe exited"})
+    snapshot = libscout.summary(run, "mix")["adapters"][0]["snapshot"]
+    head = [
+        "",
+        "## Library scout",
+        "",
+        "Library kernels on each target with no agent (`libscout/`, #227): every adapter of "
+        "the op families the reference calls, swept and fully evaluated at module level. The "
+        "best is the bar the engineers start from: a floor to beat, never a ceiling.",
+        "",
+        "| target | op families | adapters tried | best library candidate | best agent kernel "
+        "| bar beaten |",
+        "|---|---|---|---|---|---|",
+        "| `lin` | scout failed: probe exited | — | — | — | — |",
+    ]
+    mix = (
+        "| `mix` | sdpa x1, rms_norm x2 (manual) | torch-sdpa 1.25x; torch-rms-norm fallback "
+        "| `library:torch@2.14.1` torch-sdpa (BACKEND='cudnn'): 1.25x, 40 % of SOL | {agent} "
+        "| {beaten} |"
+    )
+    tail = [
+        "",
+        "Not run (and why):",
+        "",
+        "* `mix`: flash-attn: flash-attn is not installed (pip install 'kernel-agent[libs]')",
+        "",
+        "Scouted with (a target is scouted again when a library of its families or the GPU "
+        "changes):",
+        "",
+        "* `lin`: no key (scouted before the key)",
+        "* `mix`: Fake A10 (sm_86); nvidia-cudnn-cu12 9.10.2.21, torch 2.14.1; scouted 2 "
+        "times, last after: torch 2.14.0 → 2.14.1",
+    ]
+    assert libscout.report_lines(run) == [
+        *head,
+        mix.format(agent="—", beaten="no agent kernel"),
+        *tail,
+    ]
+    assert snapshot.startswith("history/")
+    kernel(run, "mix", 1.1, name="slower")  # an agent's kernel below the bar
+    assert libscout.report_lines(run)[8] == mix.format(
+        agent="1.10x `" + Path(libscout.agent_best(run, "mix")["snapshot"]).name + "`",
+        beaten="no (1.10x ≤ 1.25x)",
+    )
+    kernel(run, "mix", 1.6, name="fused")
+    best = Path(libscout.agent_best(run, "mix")["snapshot"]).name
+    assert libscout.report_lines(run)[8] == mix.format(
+        agent=f"1.60x `{best}`", beaten="yes (1.28x the bar)"
+    )
+
+
+def test_the_ceilings_table_gets_the_library_bar_as_a_column(tmp_path):
+    run = sealed_run(tmp_path)
+    profile = ceilings_profile()
+    run.profile_dir.mkdir(parents=True, exist_ok=True)
+    write_json(run.profile_dir / "profile.json", profile)
+    ceilings.write(run.profile_dir, profile, PEAKS, 5000.0)
+    before = (run.profile_dir / "ceilings.md").read_text()
+    specs = {
+        "dit": {"module_class": "VoxCPMLocDiT", "qualname": "model.feat_decoder.estimator"},
+        "mlp": {"module_class": "MiniCPMMLP", "qualname": "model.base_lm.layers.3.mlp"},
+        "proj": {"module_class": "Linear"},  # no instance group known: its class's rows
+        "norm": {"module_class": "RMSNorm"},  # not scouted (and under 1 % of the run: no row)
+    }
+    for target_id, spec in specs.items():
+        write_json(run.target(target_id) / "spec.json", {"id": target_id, **spec})
+    correct = {"adapter": "torch-sdpa", "correct": True, "speedup": 1.31, "status": "keep"}
+    wrong = {"adapter": "liger-swiglu", "correct": False, "status": "fail"}
+    found = {
+        "dit": {"described": "sdpa x2", "adapters": [correct]},
+        "mlp": {"described": "gated_mlp x1", "adapters": [wrong]},
+        "proj": {"error": "probe exited with 1"},
+    }
+    for target_id, data in found.items():
+        write_json(run.target(target_id) / libscout.FILE, {"target": target_id, **data})
+    table = read_json(run.profile_dir / "ceilings.json")
+    assert ceilings.markdown(table).lstrip("\n") == before  # the json renders it again
+    libscout.write_ceilings(run)
+    libscout.write_ceilings(run)  # rendered again, not a second column
+    text = (run.profile_dir / "ceilings.md").read_text()
+    lines = text.splitlines()
+    header = next(line for line in lines if line.startswith("| target |"))
+    assert header.endswith("| saves ms | library bar |")
+
+    def row(prefix: str) -> str:
+        return next(line for line in lines if line.startswith(prefix))
+
+    dit = row("| `VoxCPMLocDiT` `model.feat_decoder.estimator` |")
+    assert dit.endswith(" | 1.31x torch-sdpa |")
+    assert row("| `MiniCPMMLP` ").endswith(" | none correct |")
+    assert row("| `Linear` ").endswith(" | scout failed |")
+    assert row("| `UnifiedCFM` ").endswith(" | — |")  # holds the scouted LocDiT: not its bar
+    assert "*library bar*: the module speedup of the best library scout candidate" in text
+    assert text.count(libscout.CEILINGS_HEAD) == 1
+    assert "* `dit` (sdpa x2): torch-sdpa 1.31x" in text
+    # several targets on one row: each named
+    write_json(run.target("dit2") / "spec.json", {"id": "dit2", **specs["dit"]})
+    write_json(run.target("dit2") / libscout.FILE, {"target": "dit2", "adapters": []})
+    bars = libscout.ceiling_bars(run, table)
+    assert bars is not None
+    assert bars[("VoxCPMLocDiT@model.feat_decoder.estimator", "prefill")] == (
+        "`dit` 1.31x torch-sdpa; `dit2` no adapter"
+    )
+    assert libscout.ceiling_bars(sealed_run(tmp_path / "none"), table) is None
+    # the newest round's profile too (what its re-planner reads), never an empty file
+    newest = run.root / "rounds" / "2" / "profile"
+    newest.mkdir(parents=True)
+    ceilings.write(newest, profile, PEAKS, 5000.0)
+    (run.root / "rounds" / "1" / "profile").mkdir(parents=True)
+    libscout.write_ceilings(run)
+    assert "| saves ms | library bar |" in (newest / "ceilings.md").read_text()
+    assert not (run.root / "rounds" / "1" / "profile" / "ceilings.md").exists()
+    bare = sealed_run(tmp_path / "bare")
+    bare.profile_dir.mkdir(parents=True, exist_ok=True)
+    libscout.write_ceilings(bare)  # nothing scouted, no table: nothing written
+    assert not (bare.profile_dir / "ceilings.md").exists()
 
 
 def test_the_export_lists_the_libraries_its_kernels_call(tmp_path):
@@ -790,3 +1157,25 @@ def test_probe_measures_sdpa_backends_and_the_scout_evaluates_them(tmp_path, mon
         assert evaluation["correct"], evaluation.get("error")
         assert evaluation["custom_kernel_share"] > 0
     assert decision["configs"]
+
+
+@pytest.mark.gpu
+def test_probe_measures_the_written_out_rms_norm_against_the_fused_kernel(tmp_path, monkeypatch):
+    """A written-out RMSNorm (bf16, the cast to fp32 and back): its recorded calls replayed
+    against ``F.rms_norm`` with the reference's roundings and with the weight inside."""
+    from kernel_agent.profiling.capture import capture_calls
+
+    monkeypatch.setenv(gpulock.ENV, "1")  # conftest holds this process's GPU lock
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join([str(TESTS), os.environ.get("PYTHONPATH", "")])
+    )
+    torch.manual_seed(0)
+    norm = Scale(1024).cuda().bfloat16().eval()
+    rows = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    capture_calls(norm, [((rows,), {}, 100)], tmp_path / "norm.pt")
+    info = probe.run_probe(tmp_path / "norm.pt", out_dir=tmp_path / "out", target="norm")
+    assert "error" not in info, info.get("error")
+    bars = [b for b in info["op_bars"] if b.get("op") == probe.RMS_PATTERN]
+    assert sorted(b["config"]["FUSE"] for b in bars) == [0, 1]
+    assert all(b["ok"] and b["ref_us"] > 0 and b["us"] > 0 for b in bars), bars
+    assert all(b["pattern_ops"] == 8 for b in bars)

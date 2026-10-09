@@ -2750,6 +2750,15 @@ re-profile makes a new one for its re-plan.
   when decode rows read a KV cache.
 * **End to end**, per precision: the run with every class at its floor, nested
   classes counted once (the non-overlapping set of `projection.py`).
+* **Library bar.** Once the library scout ran (see "Library scout" below),
+  `profile/ceilings.md` (the run's and the newest round's, rendered again from
+  `ceilings.json`) has a *library bar* column: the module speedup of the best library
+  candidate on the targets that time each row (their instance groups; a target without
+  a known group: its class's rows in its phase), `1.31x torch-sdpa`, `none correct`,
+  `no adapter` or `scout failed`; `—` where none of the row's targets was scouted (a
+  parent's row that holds a scouted child shows `—`: the bar is the child's). Several
+  targets on one row are named (`` `dit` 1.31x torch-sdpa; `dit2` no adapter ``). The
+  table's numbers stay the floors: the bar is a floor to beat, not a bound.
 * The planner ranks targets by ceiling × share (*saves ms*) and names each
   target's bound with its number. The improve scheduler takes each kernel arm's
   expected gain from the table of the newest (re-profiled) run, at the arm's
@@ -4201,7 +4210,7 @@ InferenceBench a plain configuration search beat agents (docs/RESEARCH.md). Befo
 target's first engineer session (`optimize`'s kernels phase; `improve` before any
 slice, so targets captured in later rounds too) the **library scout**
 (`kernel_agent/libscout/`, issue #227) tries what libraries give on it, with no
-Claude session, once per target:
+Claude session, once per target and library install (see *Scouting again* below):
 
 1. **Op families** from what the reference calls on its dominant captured case (a
    `TorchFunctionMode` trace with the data flow between calls, never module names):
@@ -4246,7 +4255,12 @@ Claude session, once per target:
    (SDPA, softmax) is called again on its recorded inputs with the reference's op and
    the library's, checked in the capture's tolerance tier and timed interleaved, as
    kernel time (replayed from a CUDA graph) and per eager call (host launch cost
-   included). A config whose op bars all lose by more than 10 %, or fail, is not swept.
+   included). A pattern an adapter folds has its op bar too: each written-out RMSNorm
+   (`rms_norm (written out)(...)`) is replayed from its recorded calls (the cast, `pow`,
+   `mean`, `add`, `rsqrt`, the multiplies: the reference's own kernels) against what the
+   adapter's rewrite puts in its place (`patterns()` of the candidate: `F.rms_norm` with
+   `FUSE=0` / `FUSE=1`, a library's RMSNorm) on the same x and weight. A config whose op
+   bars all lose by more than 10 %, or fail, is not swept.
 5. **Sweeps**: every adapter that runs goes through `sweep_candidate`'s machinery
    (its configs checked and timed with racing, the best through the full evaluator),
    the probe and all sweeps under one GPU lock, and is recorded like an agent's sweep:
@@ -4257,10 +4271,33 @@ Claude session, once per target:
    engineer's first prompt and every improve digest get `## Library bar` (the best scout
    candidate with its speedup and % of SOL, every adapter's verdict, the op bars, what
    was not run and why), the planner's round context and `profile/ceilings.md` (also of
-   the newest round) `## Library bars`. It is a floor, never a stop signal: scout rows
-   extend no streak and use no agent's evaluation budget, and a best the scout set
-   retires no arm by the speed-of-light rule or the speedup goal (the scheduler's
-   expected gain stays the floor minus the bar).
+   the newest round, written again after each round's re-profile) `## Library bars` and
+   a *library bar* column in its table (see *Ceilings for the planner*), and `report.md`
+   a `## Library scout` section: per target the op families, the adapters tried and
+   their verdicts, the best library candidate (`library:<package>@<version>`, speedup,
+   % of SOL), the best agent kernel and whether it beat the bar, then the adapters not
+   run with why and the key each target was scouted under. It is a floor, never a stop
+   signal: scout rows extend no streak and use no agent's evaluation budget, and a best
+   the scout set retires no arm by the speed-of-light rule or the speedup goal (the
+   scheduler's expected gain stays the floor minus the bar).
+
+**Scouting again.** `run.json` → `libscout.scouted.<target>.key` remembers what a scout
+measured besides the capture: the GPU (`NVIDIA A10 (sm_86)`), the op families its
+reference calls and the installed version of every distribution the adapters of those
+families use on that GPU (each adapter's package and the runtime wheels its kernels
+come from: torch, the cuBLAS wheel under cuBLASLt and `_scaled_mm`, cuDNN under SDPA's
+cuDNN backend, flash-attn, flashinfer-python, quack-kernels and the CUTLASS DSL,
+liger-kernel and Triton; the CUDA toolkit's `nvcc` when one of them builds an
+extension), read from the package metadata without importing anything. Every pass of the
+scout step (each `optimize` target, every `improve` loop pass) compares it with what is
+installed now: a library of the target's families installed, upgraded or removed, or
+another GPU, scouts the target again and logs why (`libscout: <target>: scouting again:
+liger-kernel 0.6.1 → 0.6.2`); a library of other families (Liger for an attention-only
+target) or of an architecture this GPU lacks (FlashAttention 3 on sm_86) does not. A scout
+remembered before the key is scouted again once (`its remembered scout has no library
+key`). The new scout's rows join the ledger next to the old ones (each labelled with its
+own `library:<package>@<version>`), `libscout.json` and the bar are the new scout's, and
+`run.json` counts the scouts and keeps why the last one ran.
 
 The export writes `optimized/requirements.txt` with the exact version of every library
 an exported kernel declares (and `manifest.json` → `libraries` with its licence);
@@ -4302,6 +4339,26 @@ on copies of the runs' captures, on a machine shared with other jobs (load avera
   `fallback`, the scout's 3 candidates are 1 faster (1.26x), 1 correct and slower, 1
   `fallback`; Qwen3 `decoder_layer_decode`'s was 8.05x (a whole-layer CUDA kernel), the
   scout's 2 of 3 faster (1.35x, 1.31x): a floor, far below what the engineers reached.
+
+Measured on an NVIDIA A10 (sm_86, torch 2.10.0+cu128, 150 W power cap, a GPU shared with
+another tenant), the probe on toy captures (`tests/libscout_toy.py`):
+
+* The written-out RMSNorm (bf16 in, cast to fp32 and back, 8 recorded calls) against
+  `F.rms_norm`, kernel time (CUDA graph), two runs: [64, 1024] reference 15.2 us, `FUSE=1`
+  3.0 us (5.05x, 5.13x), `FUSE=0` 4.5 us (3.39x, 3.41x); [4096, 1024] 323 us, 37.5 us
+  (8.6x), 74.5 us (4.3x). Per eager call about 69 / 12.4 / 21.0 us at [64, 1024].
+* The SDPA core at 11 tokens (GQA, 16 heads over 2, batch 16, bf16): the reference's flash
+  18.7 us, **cuDNN 10.3 us (1.82x)**, math 39.5 us; mem-efficient has no kernel for this
+  call here (`No available kernel`): its op bar fails and the config is not swept.
+* Scouting the SDPA core through `scout_libraries` took 16.6 s (probe and the sweep of the
+  two configs the op bars kept: flash 0.38x, cuDNN 0.36x at module level, eager, where
+  Dynamo's guards cost more than the kernel saves; the full evaluation then stopped with
+  a `runtime_error` on this torch, whose `_KinetoEvent` has no `activity_type`, which
+  `kernels/integrity.py` calls); called again with nothing changed, 0.0 s (no scout);
+  after a faked torch upgrade (the metadata version patched to 2.10.1) it scouted again
+  (16.7 s) and logged `libscout: core: scouting again: torch 2.10.0+cu128 → 2.10.1+cu128`,
+  then held again. The remembered key: `{"gpu": "NVIDIA A10 (sm_86)", "families":
+  ["sdpa"], "libraries": {"nvidia-cudnn-cu12": "9.10.2.21", "torch": "2.10.0+cu128"}}`.
 
 ### KernelBench regression suite
 
