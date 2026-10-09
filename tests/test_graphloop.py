@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import math
+import subprocess
+import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -844,6 +846,36 @@ def test_a_step_that_syncs_or_draws_falls_back_and_leaves_no_capture_open():
     torch.cuda.synchronize()
     assert loop.mode == "unrolled" and "RNG op during graph capture" in loop.reason
     assert len({tuple(row.tolist()) for row in x.cpu()}) == 4  # every step drew its own
+
+
+FAILED_CAPTURE_EXIT = """
+import torch
+from kernel_agent import graphloop
+
+x = torch.zeros(4, 8, device="cuda")
+
+def syncs(index, active):
+    x[0] += float(x[0, 0].item())
+
+loop = graphloop.device_loop(syncs, None, 4, masked=True, warmup_runs=0)
+loop.run()
+torch.cuda.synchronize()
+print("mode", loop.mode)
+"""
+
+
+@pytest.mark.gpu
+@gpu
+def test_a_process_with_a_failed_capture_exits_cleanly():
+    """#246: the abandoned builders of a failed capture are never destroyed, not even at
+    interpreter shutdown (where destroying them crashed the process)."""
+    if graphloop.conditional_support() is not None:
+        pytest.skip(graphloop.conditional_support())
+    done = subprocess.run(
+        [sys.executable, "-c", FAILED_CAPTURE_EXIT], capture_output=True, text=True, timeout=300
+    )
+    assert done.returncode == 0, (done.returncode, done.stderr[-2000:])
+    assert "mode host" in done.stdout
 
 
 @pytest.mark.gpu

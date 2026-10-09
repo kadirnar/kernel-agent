@@ -281,13 +281,17 @@ _ABANDONED: list[Any] = []
 
 def _abandon(builders: list[Any]) -> None:
     """End the captures of a failed build, innermost first (through the driver where
-    cuda.core no longer counts an invalidated capture as building), and keep the builders."""
+    cuda.core no longer counts an invalidated capture as building), and keep the builders
+    for good: each gets one reference nothing releases, because a list alone is cleared at
+    interpreter shutdown and destroying them then crashed the process on exit (#246)."""
     for builder in reversed(builders):
         with contextlib.suppress(Exception):
             if builder.is_building:
                 builder.end_building()
         with contextlib.suppress(Exception):
             _cuda.end_capture(int(builder.stream.handle))
+    for builder in builders:
+        ctypes.pythonapi.Py_IncRef(ctypes.py_object(builder))
     _ABANDONED.append(builders)
 
 
