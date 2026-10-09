@@ -331,6 +331,7 @@ class Coordinator:
             started = 0
             if stop is None:
                 await self.orch.seed_library(imp.targets())  # library priors before slices
+                await self.orch.scout_libraries(imp.targets())  # the library bar (#227)
                 started = self._fill()
                 self._integrate_when_due()
             elif self.jobs and self.draining != stop:

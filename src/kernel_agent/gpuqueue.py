@@ -100,6 +100,7 @@ KINDS: dict[str, tuple[str, float]] = {
     "recheck": (BACKGROUND, 60.0),
     "memcheck": (BACKGROUND, 60.0),
     "seed": (BACKGROUND, 9.0),
+    "scout": (BACKGROUND, 90.0),  # the library scout of one target (libscout/, #227)
     "capture": (BACKGROUND, 60.0),
     "reprofile": (BACKGROUND, 300.0),
     DEFAULT: (DEFAULT, 60.0),

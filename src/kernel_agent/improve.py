@@ -76,6 +76,7 @@ from kernel_agent.budget import improves
 from kernel_agent.config import OptimizeConfig
 from kernel_agent.dashboard import refresh
 from kernel_agent.integrate.owners import context_line
+from kernel_agent.libscout import scout as libscout
 from kernel_agent.native import engine as native_engine
 from kernel_agent.profiling import ceilings
 from kernel_agent.research import rows_table
@@ -306,6 +307,7 @@ def kernel_digest(
         ]
     else:
         lines += ["", "## Best so far", "* no correct candidate faster than the reference yet"]
+    lines += libscout.bar_lines(run, arm.id)  # library kernels with no agent: a floor (#227)
     lines += refusals(run, arm.id)
     rows = arm.rows[-LAST_ROWS:]
     if rows:
@@ -588,6 +590,9 @@ def rounds_context(
                 f"* `{arm.id}` (`{arm.module_class}`){tier}: best {arm.best:.2f}x after "
                 f"{arm.evals} evaluations; {arm.stop or 'still open'}"
             )
+    kernels = [a.id for a in arms if a.kind == KERNEL]
+    if bars := libscout.planner_lines(run, kernels):  # what libraries reach there (#227)
+        lines += ["", "## Library bars (the library scout, no agent: floors to beat)", *bars]
     lines += [
         "",
         "Propose only NEW targets: module classes that are hot in this profile and not listed "
@@ -945,6 +950,7 @@ class Improver:
             if self.icfg.max_slices is not None and done >= self.icfg.max_slices:
                 return f"--max-slices {self.icfg.max_slices} reached"
             await self.orch.seed_library(self.targets())  # library priors before any slice
+            await self.orch.scout_libraries(self.targets())  # the library bar (#227)
             arms = self._pickable()
             arm = pick(arms)
             if arm is None:

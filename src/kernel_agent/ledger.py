@@ -177,8 +177,15 @@ clock: Callable[[], float] = time.time
 # ------------------------------------------------------------------ classification
 
 
+#: A library scout candidate's ``KA_LIBRARY = "<package>@<version>"`` (libscout/, #227)
+_LIBRARY = re.compile(r"""^KA_LIBRARY\s*=\s*['"]([^'"\n]+)['"]""", re.M)
+
+
 def detect_backend(source: str) -> str:
-    """Kernel backend(s) a candidate uses, from its imports (``torch`` if none)."""
+    """Kernel backend(s) a candidate uses, from its imports (``torch`` if none); a candidate
+    that declares the library it calls (``KA_LIBRARY``): ``library:<package>@<version>``."""
+    if match := _LIBRARY.search(source):
+        return f"library:{match.group(1)}"
     return "+".join(name for name, pattern in _BACKENDS if pattern.search(source)) or "torch"
 
 

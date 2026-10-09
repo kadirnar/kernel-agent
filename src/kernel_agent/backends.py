@@ -25,7 +25,8 @@ habit:
   a class whose precision the GPU cannot run is left out, and :data:`ARCH_RULES` adds what
   each family needs for the tensor-core peak.
 * :func:`outcomes` / :func:`by_backend` tabulate a run's kernel evaluations per target and
-  backend (library priors excluded, a re-evaluation replaces its snapshot's numbers);
+  backend (library priors and library scout rows excluded, a re-evaluation replaces its
+  snapshot's numbers);
   :func:`report_lines` and :func:`status_lines` show them in ``report.md`` and ``status``.
 * :func:`record_run` appends the run's outcomes to the kernel library
   (``<library>/<sm_arch>/backends.jsonl``, one line per run and target: class, planned
@@ -45,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel_agent import ledger
-from kernel_agent.budget import PRIOR_HYPOTHESIS
+from kernel_agent.budget import not_agents
 from kernel_agent.gpu_arch import Facts
 from kernel_agent.workspace import RunDir, read_json
 
@@ -79,6 +80,8 @@ def classify(source: str) -> str:
     """Backend(s) a candidate's source runs (``cuda+triton`` for a hybrid), from kernel
     decorators and compile calls; without any, from its imports
     (:func:`kernel_agent.ledger.detect_backend`; ``torch`` when there is no custom kernel)."""
+    if (library := ledger.detect_backend(source)).startswith("library:"):
+        return library  # a library scout candidate (libscout/): the library is its backend
     found = [name for name, pattern in _USES if pattern.search(source)]
     return "+".join(found) if found else ledger.detect_backend(source)
 
@@ -660,7 +663,7 @@ def outcomes(run: RunDir, rows: list[dict[str, Any]] | None = None) -> list[Outc
         status = r["status"]
         if status in (ledger.REEVALUATED, ledger.DUPLICATE):
             continue
-        if str(r.get("hypothesis") or "").startswith(PRIOR_HYPOTHESIS):
+        if not_agents(r.get("hypothesis")):  # library priors and scout rows
             continue
         key = (r["target"], str(r["snapshot"] or ""))
         if key not in cache:

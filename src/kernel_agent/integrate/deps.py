@@ -42,7 +42,9 @@ from kernel_agent.integrate.reuse import SOURCES
 #: A history snapshot's file name without ``.py`` (``028_decode_step_megakernel_2c930eef``).
 SNAPSHOT_NAME = re.compile(r"\d{3,}_\w+")
 #: Files at the top of ``optimized/`` that a needed file never replaces.
-RESERVED = frozenset({"apply.py", "manifest.json", "phases.py", "export_check.json"})
+RESERVED = frozenset(
+    {"apply.py", "manifest.json", "phases.py", "export_check.json", "requirements.txt"}
+)
 #: Needed files per item at most (a literal naming a large directory tree is not followed).
 MAX_FILES = 500
 

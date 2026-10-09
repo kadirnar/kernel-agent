@@ -59,6 +59,7 @@ def cmd_doctor(ns: argparse.Namespace) -> int:
 
     print(describe())  # the GPU lock pool (nvidia-smi, CUDA_VISIBLE_DEVICES, KERNEL_AGENT_GPUS)
     _doctor_probes(ns, gpu=tc.gpu is not None)
+    _doctor_libraries(tc)
     _doctor_docs()
     if not _doctor_sanitizer(ns, gpu=tc.gpu is not None):
         return 1
@@ -82,6 +83,18 @@ def _doctor_probes(ns: argparse.Namespace, *, gpu: bool) -> None:
     if ns.no_probes:
         return
     print(probes.describe(probes.run(gpu)))
+
+
+def _doctor_libraries(tc: Any) -> None:
+    """The library scout's libraries (libscout/, #227): installed versions, licences and the
+    adapters that can run on this GPU, each skipped one with the reason; never a failure."""
+    from kernel_agent.libscout import scout as libscout
+
+    capability = tuple(tc.gpu.capability) if tc.gpu is not None else None
+    try:
+        print("\n".join(libscout.doctor_lines(capability, tc.backends)))
+    except Exception as exc:
+        print(f"library scout: probe failed: {exc!r}")
 
 
 def _doctor_docs() -> None:
@@ -287,6 +300,7 @@ def _config(ns: argparse.Namespace) -> OptimizeConfig:
         precisions=ns.precisions,
         use_library=not ns.no_library,
         librarian=not ns.no_librarian,
+        library_scout=not ns.no_library_scout,
         role_models=_role_settings(ns, "role_models"),
         role_efforts=_role_settings(ns, "role_efforts"),
         hf_token=os.environ.get("HF_TOKEN"),
@@ -695,6 +709,12 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
         help="do not reuse or store kernels and lessons of the cross-run library",
     )
     p.add_argument("--no-librarian", action="store_true", help="skip the lessons agent")
+    p.add_argument(
+        "--no-library-scout",
+        action="store_true",
+        help="do not sweep library kernels (SDPA backends, cuBLASLt, installed libraries) on "
+        "each target before its first agent session",
+    )
     p.add_argument(
         "--ab-rounds", type=int, default=8, help="integration: timed rounds per paired A/B"
     )

@@ -29,6 +29,10 @@ viz = ["matplotlib>=3.8"]
 # --no-deps (see README): its own requirements pin datasets/gradio/funasr and pull a
 # torchaudio build that may not match the installed torch.
 voxcpm = ["einops", "librosa", "pydantic", "soundfile"]
+# Libraries the library scout (libscout/, #227) probes and uses when installed: never a
+# reason to replace the installed torch (an incompatible wheel is reported by `doctor` and
+# skipped). flash-attn builds from source against the installed torch: see the README.
+libs = ["flashinfer-python", "liger-kernel", "quack-kernels", "gemlite"]
 all = ["kernel-agent[models,cuda,cute,tilelang,viz]"]
 
 [project.scripts]
