@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,8 @@ class Toolchain:
     notes: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     peaks: dict[str, Any] | None = None  # measured roofline peaks (kernels/roofline.py)
+    #: installed backends that cannot compile for this GPU, and why (:data:`ARCH_SUPPORT`)
+    unavailable: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -81,7 +84,9 @@ class Toolchain:
         disabled = [name for name, ok in self.backends.items() if not ok]
         lines.append(f"backends available: {', '.join(enabled) or 'none'}")
         if disabled:
-            lines.append(f"backends unavailable: {', '.join(disabled)}")
+            why = self.unavailable
+            off = [f"{name} ({why[name]})" if name in why else name for name in disabled]
+            lines.append(f"backends unavailable: {', '.join(off)}")
         if self.peaks:
             lines.append(f"measured peaks: {format_peaks(self.peaks)}")
         elif self.gpu:
@@ -246,6 +251,39 @@ def _module_available(name: str) -> bool:
         return False
 
 
+def _cute_targets(capability: tuple[int, int]) -> str | None:
+    from kernel_agent import cute_dsl
+
+    return cute_dsl.unsupported(capability)
+
+
+#: Backends whose compiler targets only some architectures: why each cannot compile for a
+#: GPU of a capability (None: it can). An installed backend refused here is off, with the
+#: reason (``Toolchain.unavailable``), so neither a plan nor ``doctor --smoke`` uses it:
+#: CuTe DSL 4.8's targets start at sm_80, and on a T4 every ``cute`` kernel fails to
+#: compile (``KeyError: 'sm_75'``, #254). Triton, nvcc (CUDA C++, TileLang) and NVRTC
+#: compile for sm_75 and newer; Helion compiles to Triton (``doctor``'s helion probe runs
+#: its example on the GPU).
+ARCH_SUPPORT: dict[str, Callable[[tuple[int, int]], str | None]] = {"cute": _cute_targets}
+
+
+def arch_unsupported(backends: dict[str, bool], capability: tuple[int, int]) -> dict[str, str]:
+    """Why each available backend of ``backends`` cannot compile for a GPU of
+    ``capability`` (:data:`ARCH_SUPPORT`). A check that fails itself refuses nothing: the
+    backend's own compile errors say more than a broken probe."""
+    out: dict[str, str] = {}
+    for name, why_not in ARCH_SUPPORT.items():
+        if not backends.get(name):
+            continue
+        try:
+            why = why_not(capability)
+        except Exception:
+            continue
+        if why:
+            out[name] = why
+    return out
+
+
 @functools.cache
 def setup(apply_env: bool = True) -> Toolchain:
     """Discover the toolchain and (optionally) export the env vars backends need.
@@ -309,6 +347,8 @@ def setup(apply_env: bool = True) -> Toolchain:
         # Helion compiles to Triton (#229); `doctor`'s helion probe says whether it runs here
         "helion": _module_available("helion") and _module_available("triton") and gpu is not None,
     }
+    unavailable = arch_unsupported(backends, gpu.capability) if gpu is not None else {}
+    backends.update(dict.fromkeys(unavailable, False))
     if nvcc_ver is not None and not has_ninja:
         notes.append("ninja missing: torch load_inline (cuda backend) disabled")
 
@@ -325,6 +365,7 @@ def setup(apply_env: bool = True) -> Toolchain:
         notes=notes,
         env=env,
         peaks=load_peaks(peaks_path(gpu.name, torch.__version__)) if gpu else None,
+        unavailable=unavailable,
     )
 
 

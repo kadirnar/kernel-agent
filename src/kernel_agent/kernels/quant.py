@@ -818,6 +818,12 @@ def _int_mm_ok(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a.is_cuda and b.is_cuda and a.shape[1] % 8 == 0 and b.shape[0] % 8 == 0
 
 
+#: ``(device, layout of bᵀ)`` → the error ``torch._int_mm`` raised there: :func:`int8_matmul`
+#: tried it once and takes the exact fp32 path there since (#254: cuBLASLt's IMMA with
+#: regular layouts on Turing is unverified; an error must not fail every INT8 W8A8 reference).
+INT_MM_FAILED: dict[tuple[str, str], str] = {}
+
+
 def int8_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """``a @ bᵀ`` of int8 ``a [M, K]`` and ``b [N, K]`` (an ``nn.Linear`` weight's layout) as
     exact int32 ``[M, N]``: what the IMMA tensor cores accumulate.
@@ -825,7 +831,8 @@ def int8_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     Through ``torch._int_mm`` (cuBLASLt's int8 kernels; rows padded with zeros past its
     M > 16 minimum) on the GPU where K and N are multiples of 8; otherwise in fp32 over
     chunks of :data:`_INT8_EXACT_K` along K (every partial sum an exact integer) summed in
-    int32: the same integers on any device."""
+    int32: the same integers on any device. Where ``torch._int_mm`` raises (once per device
+    and layout, recorded in :data:`INT_MM_FAILED`), the fp32 path gives the same integers."""
     if a.dtype != torch.int8 or b.dtype != torch.int8 or a.dim() != 2 or b.dim() != 2:
         raise ValueError("int8_matmul takes 2-D int8 a [M, K] and b [N, K]")
     if a.shape[1] != b.shape[1]:
@@ -834,11 +841,16 @@ def int8_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     b = b.to(a.device)
     if m == 0:
         return torch.zeros(0, b.shape[0], dtype=torch.int32, device=a.device)
-    if _int_mm_ok(a, b):
+    bt = b.t()
+    where = (str(a.device), "row-major" if bt.is_contiguous() else "column-major")
+    if _int_mm_ok(a, b) and where not in INT_MM_FAILED:
         rows = max(m, 17)
         rows += -rows % 8
         padded = a if rows == m else torch.cat([a, a.new_zeros(rows - m, k)])
-        return torch._int_mm(padded.contiguous(), b.t())[:m]
+        try:
+            return torch._int_mm(padded.contiguous(), bt)[:m]
+        except RuntimeError as exc:  # no cuBLASLt IMMA kernel for this GPU / layout
+            INT_MM_FAILED[where] = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
     acc = torch.zeros(m, b.shape[0], dtype=torch.int32, device=a.device)
     for k0 in range(0, k, _INT8_EXACT_K):
         part = a[:, k0 : k0 + _INT8_EXACT_K].float() @ b[:, k0 : k0 + _INT8_EXACT_K].float().T

@@ -263,7 +263,10 @@ def test_adapters_follow_the_gpu_architecture(monkeypatch):
         "cudnn",
         "math",
     ]
-    assert turing["cublaslt"].reason == "needs sm_80+ (bf16 tensor cores); this GPU is sm_75"
+    assert turing["cublaslt"].reason == (  # fp16 sites run there (#254); these are bf16
+        "no call site it takes: linear in bfloat16 needs sm_80+ (bf16 tensor cores); this GPU "
+        "is sm_75"
+    )
     assert turing["flash-attn"].reason == (
         "needs sm_80+ (FlashAttention 2: Ampere and newer); this GPU is sm_75"
     )

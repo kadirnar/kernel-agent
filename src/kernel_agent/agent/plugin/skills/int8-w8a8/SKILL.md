@@ -38,7 +38,8 @@ channels; FP8 where they do, or where the INT8 peak is the lower one (Blackwell 
   (the largest amax / RMS of a token) and `activation_underflow` say whether the activations
   suit INT8; and the evaluator's per-case `min_cosine` / `max_rel_l2` in `NOTES.md`.
 * **Reference / fallback**: `int8_w8a8_linear(x, q, scale, bias, smooth=None)` (`torch._int_mm`
-  on the GPU, exact chunked fp32 elsewhere).
+  on the GPU, exact chunked fp32 elsewhere and where `_int_mm` raises, e.g. no cuBLASLt IMMA
+  kernel for the GPU: the same integers; `quant.INT_MM_FAILED` records it).
 
 ## Fragments without conversion (`mma.sync` m16n8k32, 8-bit operands)
 
@@ -75,7 +76,7 @@ The toolchain block's measured peaks decide (`int8` in the GPU peaks: `torch._in
 
 | GPU | INT8 tensor-core path | rate |
 |---|---|---|
-| Turing sm_75 (T4, RTX 20xx) | `mma.sync` m8n8k16 s8, cuBLASLt (`torch._int_mm`); Triton `tl.dot` has no tensor cores below sm_80 | 2x fp16 |
+| Turing sm_75 (T4, RTX 20xx) | `mma.sync` m8n8k16 s8, cuBLASLt (`torch._int_mm`); Triton's int8 `tl.dot` does not compile below sm_80 (Triton 3.8) | 2x fp16 |
 | Ampere sm_80 / sm_86 | `mma.sync` m16n8k32 s8 (IMMA), Triton `tl.dot` on int8, cuBLASLt | 2x bf16 (A100: 624 vs 312 TOPS); GeForce RTX 30xx 4x its fp32-accumulating bf16 (RTX 3090: 284 vs 71) |
 | Ada sm_89 | as Ampere; FP8 also | = FP8 with fp16 accumulation; GeForce RTX 40xx 2x FP8 with fp32 accumulation (RTX 4090: 661 vs 330) |
 | Hopper sm_90 | `wgmma` s8 (Triton `tl.dot`, CUTLASS sm_90); `mma.sync` stops below it | = FP8 (2x bf16) |
