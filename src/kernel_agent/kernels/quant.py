@@ -67,11 +67,22 @@ per token of the activations, codes ``round(x / scale)`` to nearest even.
   :func:`int8_w8a8_error`, and SmoothQuant-style migration of activation outliers into the
   weights (:func:`smoothquant_factors`: per input channel ``s``, activations ``x / s``,
   weight columns ``W * s``; the same product in exact arithmetic).
+
+``"precision": "fp4_w4a4"`` (W4A4, issue #233; opt-in: block-scaled FP4 weights and
+activations on the FP4 tensor cores of sm_100 / sm_120, fp32 accumulation; the
+``near-lossless-fp4a`` tier): weights from :func:`quantize_fp4`, activations per call
+:func:`quantize_fp4_activations` (NVFP4: an e4m3 scale per 16 and an fp32 outer scale per
+token; MXFP4: e8m0 per 32), :func:`fp4_w4a4_linear` (``F.scaled_mm`` NVFP4 where it applies:
+the reference and fallback), :func:`swizzle_fp4_scales`, :func:`fp4_values`,
+:func:`fp4_saturation`, :func:`fp4_w4a4_error`, an optional block Hadamard rotation
+(:func:`hadamard_rotate`) and the per-layer sensitivity probe (:func:`fp4_w4a4_sensitivity`:
+which ``nn.Linear`` to keep in FP8).
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -187,9 +198,11 @@ def _round_e2m1(v: torch.Tensor) -> torch.Tensor:
     """e2m1 codes (uint8 0..15, one per element) of fp32 values within ±6, rounded to
     nearest even."""
     mag = v.abs()
-    idx = torch.bucketize(mag, torch.tensor(_E2M1_MIDPOINTS, device=v.device))
-    for tie in _TIE_UP:
-        idx += mag == tie
+    # comparisons with the midpoints, not a bucketize table: no host-to-device copy, so the
+    # reference runs inside a CUDA graph (a W4A4 fallback path quantises on every call)
+    idx = torch.zeros(mag.shape, dtype=torch.int64, device=mag.device)
+    for mid in _E2M1_MIDPOINTS:
+        idx += (mag >= mid) if mid in _TIE_UP else (mag > mid)
     negative = (v < 0) & (idx > 0)  # no negative zero
     return (idx + 8 * negative).to(torch.uint8)
 
@@ -970,3 +983,343 @@ def smoothquant_factors(
     ok = (a > 0) & (w > 0) & torch.isfinite(a)
     s = a.clamp_min(1e-30).pow(alpha) / w.clamp_min(1e-30).pow(1.0 - alpha)
     return torch.where(ok, s.clamp(1e-5, 1e5), torch.ones_like(s)).contiguous()
+
+
+# ------------------------------------------------------------------ W4A4 (fp4_w4a4)
+
+#: ``1 / (6 * 448)`` in fp32: the outer (second-level) scale of an NVFP4 row is ``amax *
+#: NVFP4_OUTER_STEP``, so the row's largest block scale lands at e4m3's 448 (a product with
+#: an fp32 constant: the same on every device and in a kernel, where a division by a Python
+#: scalar is a multiplication by its reciprocal on the GPU only).
+NVFP4_OUTER_STEP = float(torch.tensor(1.0 / (FP4_MAX * 448.0), dtype=torch.float32))
+#: Where the outer NVFP4 scale of the activations comes from (:func:`quantize_fp4_activations`):
+#: ``token`` (default) one per row of ``x.reshape(-1, K)``, from that row alone (a producer
+#: quantises a row without a grid-wide reduction; the epilogue multiplies by it); ``tensor``
+#: one per call (two-level ``F.scaled_mm`` applies it as its tensor-wise scale and writes
+#: bf16 itself, but every row's amax is needed first).
+FP4_GRANULARITIES = ("token", "tensor")
+_FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _fp4_codes(blocks: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+    """e2m1 codes (two per byte, the even element in the low nibble) of fp32 ``blocks [rows,
+    nb, block]`` with one fp32 ``step`` per block: ``e2m1(x / step)`` (an IEEE division) to
+    nearest even, saturated to ±6; a block whose step is 0 gets codes 0."""
+    rows = blocks.shape[0]
+    safe = torch.where(step > 0, step, torch.ones_like(step))  # any positive step, exactly
+    values = torch.where(step[..., None] > 0, blocks / safe[..., None], torch.zeros_like(blocks))
+    codes = _round_e2m1(values.clamp(-FP4_MAX, FP4_MAX)).reshape(
+        rows, blocks.shape[1] * blocks.shape[2]
+    )
+    return (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous()
+
+
+def quantize_fp4_activations(
+    x: torch.Tensor, fmt: str = "nvfp4", granularity: str = "token"
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(codes, scales, outer)`` of activations ``x [..., K]`` in block-scaled FP4 (W4A4,
+    ``fp4_w4a4``): ``codes`` uint8 ``[rows, K / 2]`` (two e2m1 codes per byte, the even element
+    in the low nibble, as :func:`quantize_fp4`), ``scales`` ``[rows, K / block]`` in the
+    format's scale dtype and ``outer`` fp32 ``[rows]``, with ``x[r, k] ≈ e2m1(code[r, k]) *
+    scales[r, k // block] * outer[r]``.
+
+    ``nvfp4`` (an e4m3 scale per 16), in fp32, per row ``r`` of ``x.reshape(-1, K)``
+    (``granularity="tensor"``: the amax of the whole call for every row):
+
+    * ``outer = amax(|x_r|) * NVFP4_OUTER_STEP`` (1 for a row of zeros);
+    * block scale ``e4m3(min(bmax / (outer * 6), 448))`` (``outer * 6`` rounded to fp32, an
+      IEEE division, e4m3 to nearest even): the row's largest block lands at 448;
+    * ``step = scale * outer`` (fp32), codes ``e2m1(x / step)`` (an IEEE division) to nearest
+      even, saturated to ±6: a block scale that rounds down clamps the block's largest
+      elements (by up to e4m3's half step, 6.25 %), as cuBLASLt's and TensorRT's NVFP4
+      quantisers do; a block whose scale is 0 (below e4m3's range) gets codes 0.
+
+    ``mxfp4`` (an e8m0 scale per 32): the scale ``2^ceil(log2(bmax / 6))`` of
+    :func:`quantize_fp4` (exact, from the exponent bits of ``bmax``; never saturates),
+    ``outer`` 1. Dynamic (every call), never a calibrated scale. ``K`` must be a multiple of
+    the block."""
+    if fmt not in FP4_FORMATS:
+        raise ValueError(f"unknown FP4 format {fmt!r} (one of {', '.join(FP4_FORMATS)})")
+    if granularity not in FP4_GRANULARITIES:
+        raise ValueError(f"unknown granularity {granularity!r} ({', '.join(FP4_GRANULARITIES)})")
+    block, scale_dtype = FP4_FORMATS[fmt]
+    k = x.shape[-1]
+    if k % block:
+        raise ValueError(f"the last dimension {k} is not a multiple of the {fmt} block ({block})")
+    a = x.detach().reshape(-1, k).float()
+    rows = a.shape[0]
+    blocks = a.reshape(rows, k // block, block)
+    bmax = blocks.abs().amax(dim=-1)
+    if fmt == "mxfp4":
+        # bmax = m * 2^e, m in [0.5, 1): 6 * 2^(e - 3) = 0.75 * 2^e covers it when m <= 0.75
+        mantissa, exponent = torch.frexp(bmax)
+        e = exponent - 3 + (mantissa > 0.75).to(exponent.dtype)
+        e = torch.where(bmax > 0, e, torch.full_like(e, -127)).clamp(-127, 127)
+        scales = (e + 127).to(torch.uint8).view(scale_dtype)
+        outer = torch.ones(rows, device=a.device)
+        step = scales.float()
+    else:
+        amax = a.abs().amax(dim=1) if k else torch.zeros(rows, device=a.device)
+        if granularity == "tensor" and rows:
+            amax = amax.amax().expand(rows)
+        outer = torch.where(amax > 0, amax * NVFP4_OUTER_STEP, torch.ones_like(amax))
+        scales = (bmax / (outer * FP4_MAX)[:, None]).clamp(max=448.0).to(scale_dtype)
+        step = scales.float() * outer[:, None]
+    return _fp4_codes(blocks, step), scales.contiguous(), outer.contiguous()
+
+
+def fp4_values(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """fp32 ``e2m1(code) * block scale`` ``[rows, K]`` of FP4 ``codes [rows, K / 2]`` and
+    ``scales [rows, K / block]`` (no outer or tensor scale): exact in fp32 (an e2m1 value has
+    2 significant bits, an e4m3 scale 4), what the block-scaled tensor cores multiply."""
+    return dequantize_fp4(codes, scales, 1.0, torch.float32)
+
+
+def hadamard(n: int, device: torch.device | str | None = None) -> torch.Tensor:
+    """The orthonormal Sylvester-Hadamard matrix of order ``n`` (a power of two), fp32,
+    symmetric: ``H @ H = I``."""
+    if n < 1 or n & (n - 1):
+        raise ValueError(f"the Hadamard order must be a power of two, got {n}")
+    h = torch.ones(1, 1, device=device)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return h / math.sqrt(n)
+
+
+def hadamard_rotate(x: torch.Tensor, block: int) -> torch.Tensor:
+    """``x [..., K]`` with every ``block`` consecutive elements along K multiplied by
+    :func:`hadamard` (``block``), in fp32: a block-diagonal rotation (QuaRot / QuTLASS style)
+    that spreads an outlier over its block before FP4 quantisation. Applied to the
+    activations and to the weight's rows alike it leaves ``x @ Wᵀ`` unchanged in exact
+    arithmetic: ``(x H)(W H)ᵀ = x Wᵀ``. ``K`` must be a multiple of ``block``."""
+    k = x.shape[-1]
+    if k % block:
+        raise ValueError(f"the last dimension {k} is not a multiple of the rotation ({block})")
+    h = hadamard(block, x.device)
+    v = x.detach().float().reshape(-1, k // block, block) @ h
+    return v.reshape(*x.shape[:-1], k)
+
+
+def swizzle_fp4_scales(scales: torch.Tensor) -> torch.Tensor:
+    """FP4 block scales ``[rows, K / block]`` (NVFP4 e4m3 or MXFP4 e8m0) → cuBLASLt's flat 128
+    x 4 blocked layout (:func:`swizzle_mx_scales`: rows padded to 128, columns to 4, padding
+    code 0), in their dtype: ``F.scaled_mm``'s ``SWIZZLE_32_4_4``, CuTe's
+    ``tile_atom_to_shape_SF``."""
+    swizzled = swizzle_mx_scales(scales.view(torch.uint8))
+    return swizzled.view(torch.uint8).view(scales.dtype)
+
+
+def _fp4_scaled_mm_ok(x: torch.Tensor, codes: torch.Tensor, fmt: str) -> bool:
+    """Whether ``F.scaled_mm`` runs these operands as NVFP4 (``BlockWise1x16`` e4m3 scales):
+    CUDA bf16 activations, K a multiple of 16 and N of 8, block-scaled FP4 tensor cores
+    (sm_100+; measured on sm_120) and a torch with ``F.scaled_mm`` and an FP4 dtype. torch
+    2.14 refuses MXFP4 (``BlockWise1x32`` on e2m1) outside B200 / B300: the fallback."""
+    import torch.nn.functional as F
+
+    if fmt != "nvfp4" or _FP4_DTYPE is None or not hasattr(F, "scaled_mm"):
+        return False
+    if not (x.is_cuda and codes.is_cuda and x.dtype == torch.bfloat16):
+        return False
+    if (2 * codes.shape[1]) % 16 or codes.shape[0] % 8:
+        return False
+    return torch.cuda.get_device_capability(x.device) >= (10, 0)
+
+
+def fp4_w4a4_linear(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    tensor_scale: torch.Tensor | float,
+    bias: torch.Tensor | None = None,
+    *,
+    fmt: str = "nvfp4",
+    granularity: str = "token",
+    rotate: int | None = None,
+) -> torch.Tensor:
+    """``x @ Wᵀ + bias`` with W4A4 numerics (``fp4_w4a4``), in ``x``'s dtype and shape
+    ``[..., out]``.
+
+    ``(codes, scales, tensor_scale)``: the weight from :func:`quantize_fp4` in ``fmt`` (of
+    ``hadamard_rotate(W, rotate)`` with ``rotate``). ``x`` is rotated (``rotate``) and
+    quantised on every call (:func:`quantize_fp4_activations`), the block-scaled products
+    ``Σ_k (e2m1 · s_x)(e2m1 · s_w)`` accumulate in fp32, and ``acc * (outer[m] *
+    tensor_scale) (+ bias[n])`` is computed once per output in fp32, one rounding to ``x``'s
+    dtype: the epilogue of a block-scaled tensor-core kernel. NVFP4 runs through
+    ``F.scaled_mm`` (``BlockWise1x16``, fp32 out: bit for bit the fp32 math on sm_120) where
+    it applies; otherwise the same math in fp32 (slow: a fallback and a reference)."""
+    xq, xs, outer = quantize_fp4_activations(
+        hadamard_rotate(x, rotate) if rotate else x, fmt, granularity
+    )
+    if _fp4_scaled_mm_ok(x, codes, fmt):
+        import torch.nn.functional as F
+
+        blockwise, swizzle = F.ScalingType.BlockWise1x16, F.SwizzleType.SWIZZLE_32_4_4
+        acc = F.scaled_mm(
+            xq.view(torch.float4_e2m1fn_x2),
+            codes.view(torch.float4_e2m1fn_x2).t(),  # column-major [K / 2, N]: cuBLASLt's B layout
+            scale_a=swizzle_fp4_scales(xs),
+            scale_recipe_a=blockwise,
+            scale_b=swizzle_fp4_scales(scales),
+            scale_recipe_b=blockwise,
+            swizzle_a=swizzle,
+            swizzle_b=swizzle,
+            output_dtype=torch.float32,
+        )
+    else:
+        acc = fp4_values(xq, xs) @ fp4_values(codes, scales).to(xq.device).T
+    if isinstance(tensor_scale, torch.Tensor):  # a 0-d tensor: no host sync (CUDA graphs)
+        ts: torch.Tensor | float = tensor_scale.float().to(acc.device)
+    else:
+        ts = float(tensor_scale)
+    y = acc * (outer[:, None] * ts)
+    if bias is not None:
+        y = y + bias.float().to(y.device)
+    return y.to(x.dtype).reshape(*x.shape[:-1], codes.shape[0])
+
+
+def fp4_saturation(
+    x: torch.Tensor, scales: torch.Tensor, outer: torch.Tensor, fmt: str = "nvfp4"
+) -> dict[str, Any]:
+    """How FP4 activation scales fit the block maxima of ``x [..., K]`` (``scales [rows, K /
+    block]`` and ``outer [rows]`` of :func:`quantize_fp4_activations`): ``blocks``,
+    ``saturated`` (blocks whose maximum exceeds ``6 x step``: their largest elements are
+    clamped; NVFP4 rounds its block scales to nearest, so some blocks saturate a little),
+    ``share`` and ``worst_ratio`` (the largest ``bmax / step``: up to 6.375 for NVFP4 with a
+    normal e4m3 block scale, more with a subnormal one, below 2^-6)."""
+    block = FP4_FORMATS[fmt][0]
+    k = x.shape[-1]
+    a = x.detach().reshape(-1, k).float()
+    rows = a.shape[0]
+    bmax = a.reshape(rows, k // block, block).abs().amax(dim=-1)
+    step = scales.float().to(a.device) * outer.float().to(a.device)[:, None]
+    ratio = torch.where(step > 0, bmax / step.clamp_min(1e-38), torch.zeros_like(bmax))
+    saturated = int((ratio > FP4_MAX * (1 + 2.0**-20)).sum())
+    blocks = rows * (k // block)
+    return {
+        "blocks": blocks,
+        "saturated": saturated,
+        "share": _sig(saturated / blocks) if blocks else 0.0,
+        "worst_ratio": _sig(float(ratio.max())) if blocks else 0.0,
+    }
+
+
+def fp4_w4a4_error(
+    weight: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    tensor_scale: torch.Tensor | float,
+    x: torch.Tensor,
+    *,
+    fmt: str = "nvfp4",
+    granularity: str = "token",
+    rotate: int | None = None,
+) -> dict[str, Any]:
+    """Numerical error of a W4A4 layer (``(codes, scales, tensor_scale)``: :func:`quantize_fp4`
+    of ``weight``, rotated with ``rotate``): the weight report of :func:`fp4_error` (of the
+    rotated weight), plus
+
+    * ``activation_rel_l2``: ``‖x − x̂‖ / ‖x‖`` of the quantised (rotated) activations;
+      ``activation_crest``: the largest ``amax / RMS`` of a token (before the rotation);
+      ``activation_saturation``: :func:`fp4_saturation` (``share``, ``worst_ratio``);
+    * ``output_rel_l2``, ``output_cosine`` and ``output_norm_ratio`` of the W4A4 output
+      against ``x @ Wᵀ`` in fp32: the module-level error the ``near-lossless-fp4a`` tier
+      bounds (:data:`kernel_agent.kernels.compare.NEAR_LOSSLESS_BOUNDS`)."""
+    w = weight.detach().float()
+    a = x.detach().float().reshape(-1, w.shape[1]).to(w.device)
+    report = fp4_error(hadamard_rotate(w, rotate) if rotate else w, codes, scales, tensor_scale)
+    a_rot = hadamard_rotate(a, rotate) if rotate else a
+    xq, xs, outer = quantize_fp4_activations(a_rot, fmt, granularity)
+    a_hat = fp4_values(xq, xs) * outer[:, None]
+    rms = a.pow(2).mean(dim=1).sqrt()
+    crest = a.abs().amax(dim=1) / rms.clamp_min(1e-30)
+    ref = a @ w.T
+    acc = fp4_values(xq, xs).double() @ fp4_values(codes, scales).to(a.device).double().T
+    new = (acc * (outer.double()[:, None] * float(tensor_scale))).float()
+    ref_norm, new_norm = float(ref.norm()), float(new.norm())
+    cos = float((ref.flatten() @ new.flatten()) / (ref_norm * new_norm)) if ref_norm else 1.0
+    a_norm = float(a_rot.norm())
+    saturation = fp4_saturation(a_rot, xs, outer, fmt)
+    block, kind = FP4_FORMATS[fmt][0], "e4m3" if fmt == "nvfp4" else "e8m0"
+    report.update(
+        activations=f"{fmt}: e2m1 + {kind} scale per {block}"
+        + (f" x fp32 per {granularity}" if fmt == "nvfp4" else "")
+        + (f", Hadamard {rotate}" if rotate else ""),
+        activation_rel_l2=_sig(float((a_rot - a_hat).norm()) / a_norm if a_norm > 0 else 0.0),
+        activation_crest=_sig(float(crest[rms > 0].max()) if bool((rms > 0).any()) else 0.0),
+        activation_saturation={k: saturation[k] for k in ("share", "worst_ratio")},
+        output_rel_l2=_sig(float((ref - new).norm()) / ref_norm if ref_norm else 0.0),
+        output_cosine=round(cos, 6),
+        output_norm_ratio=round(new_norm / ref_norm, 5) if ref_norm else 1.0,
+    )
+    return report
+
+
+def fp4_w4a4_sensitivity(
+    module: torch.nn.Module,
+    run: Callable[[], Any],
+    *,
+    fmt: str = "nvfp4",
+    granularity: str = "token",
+    rotate: int | None = None,
+    calls: int = 4,
+) -> list[dict[str, Any]]:
+    """The sensitivity probe of a W4A4 target: which of ``module``'s ``nn.Linear`` layers to
+    keep in FP8 W8A8. ``run()`` calls the module (e.g. on its captured inputs); the first
+    ``calls`` inputs of every ``nn.Linear`` are kept (their rows together), and each layer is
+    quantised alone to W4A4 (:func:`fp4_w4a4_error` in ``fmt`` / ``granularity`` / ``rotate``)
+    and to FP8 W8A8 (:func:`fp8_w8a8_error`) on them.
+
+    One row per layer, the most sensitive first (largest W4A4 output relative L2 error):
+    ``name``, ``rows``, ``in_features``, ``out_features``, ``flop_share`` (of the layers'
+    GEMM FLOPs over those calls), ``activation_crest``, ``w4a4_rel_l2``,
+    ``w4a4_norm_change`` (``‖new‖ / ‖ref‖ - 1``: quantised activations can shrink a GEMM's
+    output by up to ~1 %, compounding through an MLP), ``fp8_rel_l2``. On the VoxCPM2 LocDiT
+    layer (M = 352) gate / up rank first (0.088 vs FP8's 0.019; 49 % of the FLOPs) and FP8 for
+    them alone moves the layer's hidden output from relative L2 0.036 / norm -3.4 % to 0.014 /
+    -0.9 %. Move layers to FP8 from the top until the evaluator and the perceptual gate pass;
+    a layer the module calls with other inputs later is judged on these only."""
+    seen: dict[str, list[torch.Tensor]] = {}
+    layers = {n: m for n, m in module.named_modules() if isinstance(m, torch.nn.Linear)}
+
+    def keep(name: str) -> Callable[..., None]:
+        def hook(_: torch.nn.Module, args: tuple[Any, ...]) -> None:
+            if len(seen.setdefault(name, [])) < calls and isinstance(args[0], torch.Tensor):
+                seen[name].append(args[0].detach().reshape(-1, args[0].shape[-1]))
+
+        return hook
+
+    hooks = [m.register_forward_pre_hook(keep(n)) for n, m in layers.items()]
+    try:
+        with torch.no_grad():
+            run()
+    finally:
+        for h in hooks:
+            h.remove()
+    found = []
+    for name, inputs in seen.items():
+        w = layers[name].weight.detach()
+        x = torch.cat(inputs).to(w.device)
+        if w.shape[1] % (rotate or FP4_FORMATS[fmt][0]) or not x.numel():
+            continue  # K not a multiple of the block (or the rotation): W4A4 does not apply
+        wq = hadamard_rotate(w, rotate) if rotate else w
+        e4 = fp4_w4a4_error(
+            w, *quantize_fp4(wq, fmt), x, fmt=fmt, granularity=granularity, rotate=rotate
+        )
+        e8 = fp8_w8a8_error(w, *quantize_fp8(w), x)
+        found.append(
+            {
+                "name": name,
+                "rows": int(x.shape[0]),
+                "in_features": int(w.shape[1]),
+                "out_features": int(w.shape[0]),
+                "flops": 2 * int(x.shape[0]) * int(w.shape[1]) * int(w.shape[0]),
+                "activation_crest": e4["activation_crest"],
+                "w4a4_rel_l2": e4["output_rel_l2"],
+                "w4a4_norm_change": _sig(e4["output_norm_ratio"] - 1.0),
+                "fp8_rel_l2": e8["output_rel_l2"],
+            }
+        )
+    total = sum(r["flops"] for r in found) or 1
+    for row in found:
+        row["flop_share"] = _sig(row.pop("flops") / total)
+    return sorted(found, key=lambda r: -r["w4a4_rel_l2"])

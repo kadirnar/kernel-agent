@@ -24,8 +24,9 @@ and ``report.md``) and the ceilings table (only the allowed floors are shown and
 expected gains).
 
 The GPU decides too (issue #165): a precision whose math needs tensor cores the GPU lacks
-(:data:`kernel_agent.gpu_arch.PRECISION_NEEDS`: ``fp8_w8a8`` sm_89+, ``fp8_mx`` sm_100+,
-``int8_w8a8`` sm_75+) is not allowed on it (:func:`allowed` and :func:`refusal` with the GPU's
+(:data:`kernel_agent.gpu_arch.PRECISION_NEEDS`: ``fp8_w8a8`` sm_89+, ``fp8_mx`` and
+``fp4_w4a4`` sm_100+, ``int8_w8a8`` sm_75+) is not allowed on it (:func:`allowed` and
+:func:`refusal` with the GPU's
 ``capability``; :func:`unsupported` says why); a run records the list its GPU allows in
 ``run.json``.
 """
@@ -35,8 +36,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-#: The 4-bit precisions: allowed only when ``--precisions`` names them.
-FOUR_BIT = ("fp4_weights",)
+#: The 4-bit precisions: allowed only when ``--precisions`` names them (in no quality mode by
+#: default): FP4 weights and W4A4 (``fp4_w4a4``, #233: FP4 weights and activations).
+FOUR_BIT = ("fp4_weights", "fp4_w4a4")
 #: Every precision allowed only when ``--precisions`` names it: the 4-bit ones and ``fp8_kv``
 #: (an FP8 KV cache: it pays only where the cache is a large share of a decode step's bytes,
 #: long contexts; on short caches it is slower, docs/FP8.md §5).
@@ -177,7 +179,8 @@ def refusal(
 def tier_allowed(tier: str | None, allowed: Iterable[str]) -> bool:
     """Whether an evaluation in the tolerance ``tier`` (its ``tolerance_tier``; None: not
     recorded) is of a precision ``allowed`` holds: the exact tier, or the near-lossless or
-    relaxed tier of one of them (``near-lossless-fp4``, ``relaxed-fp4``: ``fp4_weights``)."""
+    relaxed tier of one of them (``near-lossless-fp4``, ``relaxed-fp4``: ``fp4_weights``;
+    ``near-lossless-fp4a``, ``relaxed-fp4a``: ``fp4_w4a4``)."""
     from kernel_agent.kernels.compare import EXACT_TIER, REDUCED_QUALITIES, TIERS, tier_for
 
     if tier is None or tier not in TIERS:

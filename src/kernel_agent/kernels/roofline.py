@@ -41,6 +41,8 @@ weights count at one byte plus one scale byte per 32, its GEMMs at the measured 
 (:data:`MXFP8`: the block-scaled tensor cores through ``F.scaled_mm`` ``BlockWise1x32``).
 INT8 (#178): an ``int8_weights`` or ``int8_w8a8`` target's weights count at one byte, and the
 GEMMs on the weights of an ``int8_w8a8`` target at the measured INT8 peak (:data:`INT8`).
+W4A4 (#233): an ``fp4_w4a4`` target's weights count as NVFP4 (4 bits plus a scale byte per
+16), its GEMMs at the measured NVFP4 peak (:data:`FP4`).
 
 Limitations: bytes are what the reference touches.  Reads through gather ops
 (embedding, index, index_select, gather) count the gathered rows, and SDPA counts
@@ -82,11 +84,12 @@ WEIGHT_BITS = {
     "fp8_mx": 8,
     "int8_weights": 8,
     "int8_w8a8": 8,
+    "fp4_w4a4": 4,
 }
 #: ... or, for block-scaled formats, plus one 1-byte scale per this many elements and one
-#: fp32 scale per tensor (``fp4_weights``: NVFP4, an e4m3 scale per 16; ``fp8_mx``: MXFP8,
-#: an e8m0 scale per 32).
-WEIGHT_SCALE_BLOCK = {"fp4_weights": 16, "fp8_mx": 32}
+#: fp32 scale per tensor (``fp4_weights`` and ``fp4_w4a4``: NVFP4, an e4m3 scale per 16;
+#: ``fp8_mx``: MXFP8, an e8m0 scale per 32).
+WEIGHT_SCALE_BLOCK = {"fp4_weights": 16, "fp8_mx": 32, "fp4_w4a4": 16}
 #: ``peaks["tflops"]`` keys of the low-precision tensor-core peaks: FP8 e4m3 and NVFP4.
 FP8, FP4 = "float8_e4m3fn", "float4_e2m1fn_x2"
 #: ... and MXFP8 (e4m3 with an e8m0 scale per 32 along K on both operands: the block-scaled
@@ -102,7 +105,7 @@ INT8 = "int8"
 PEAKS_VERSION = 5
 #: The tensor-core math of a reduced-precision target: the FLOPs of every op that reads one
 #: of its narrowed weights count at this dtype's peak (W8A8: FP8), not at the reference's.
-MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8, "int8_w8a8": INT8}
+MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8, "int8_w8a8": INT8, "fp4_w4a4": FP4}
 _MiB = 1024**2
 
 # Ops that look at a tensor argument's metadata only (no data read).

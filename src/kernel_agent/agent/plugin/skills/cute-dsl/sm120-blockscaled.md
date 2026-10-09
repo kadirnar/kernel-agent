@@ -21,7 +21,8 @@ Part of the `cute-dsl` skill.
 
   **Never use `MmaFP8Op` (or any `QMMA.F32` path) for a compute-bound FP8 GEMM**: it is
   capped at 208 TFLOP/s, below cuBLASLt (325 TFLOP/s at 4096³). Its 4-bit siblings
-  (`MmaMXF4Op`, `MmaMXF4NVF4Op`) only when the run allows 4-bit precisions.
+  (`MmaMXF4Op`, `MmaMXF4NVF4Op`) only when the run allows 4-bit precisions (`fp4_w4a4`:
+  `examples/cute_nvfp4_w4a4_gemm.py`, 650 TFLOP/s with `MmaMXF4NVF4Op` at 4096³).
 * **Unit scales**: a W8A8 layer's per-token / per-channel scales are not 32-element blocks,
   so feed `MmaMXF8Op` scale bytes of 127 (ue8m0 2^0: the product equals the plain
   fp32-accumulated e4m3 GEMM bit for bit) and apply the real scales in the epilogue. Real

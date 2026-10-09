@@ -1,0 +1,32 @@
+
+### W4A4 except FP8 in none
+  case 0 out[0]               ok=True cos 0.99994 rel 0.0357 norm -3.40 % el 0.19
+  case 0 out[1][0]            ok=True cos 0.99885 rel 0.0482 norm -0.56 % el 0.13
+  case 0 out[1][1]            ok=True cos 0.99686 rel 0.0792 norm +0.00 % el 0.26
+  case 1 out[0]               ok=True cos 0.99993 rel 0.0336 norm -3.16 % el 0.17
+  case 1 out[1][0]            ok=True cos 0.99885 rel 0.0481 norm -0.57 % el 0.12
+  case 1 out[1][1]            ok=True cos 0.99684 rel 0.0795 norm +0.12 % el 0.23
+
+### W4A4 except FP8 in ('down_proj',)
+  case 0 out[0]               ok=True cos 0.99998 rel 0.0261 norm -2.51 % el 0.17
+  case 0 out[1][0]            ok=True cos 0.99885 rel 0.0482 norm -0.56 % el 0.13
+  case 0 out[1][1]            ok=True cos 0.99686 rel 0.0792 norm +0.00 % el 0.26
+  case 1 out[0]               ok=True cos 0.99996 rel 0.0250 norm -2.35 % el 0.17
+  case 1 out[1][0]            ok=True cos 0.99885 rel 0.0481 norm -0.57 % el 0.12
+  case 1 out[1][1]            ok=True cos 0.99684 rel 0.0795 norm +0.12 % el 0.23
+
+### W4A4 except FP8 in ('o_proj', 'down_proj')
+  case 0 out[0]               ok=True cos 0.99998 rel 0.0244 norm -2.36 % el 0.17
+  case 0 out[1][0]            ok=True cos 0.99885 rel 0.0482 norm -0.56 % el 0.13
+  case 0 out[1][1]            ok=True cos 0.99686 rel 0.0792 norm +0.00 % el 0.26
+  case 1 out[0]               ok=True cos 0.99997 rel 0.0240 norm -2.29 % el 0.17
+  case 1 out[1][0]            ok=True cos 0.99885 rel 0.0481 norm -0.57 % el 0.12
+  case 1 out[1][1]            ok=True cos 0.99684 rel 0.0795 norm +0.12 % el 0.23
+
+### W4A4 except FP8 in ('gate_proj', 'up_proj')
+  case 0 out[0]               ok=True cos 0.99995 rel 0.0141 norm -0.96 % el 0.09
+  case 0 out[1][0]            ok=True cos 0.99885 rel 0.0482 norm -0.56 % el 0.13
+  case 0 out[1][1]            ok=True cos 0.99686 rel 0.0792 norm +0.00 % el 0.26
+  case 1 out[0]               ok=True cos 0.99994 rel 0.0135 norm -0.81 % el 0.10
+  case 1 out[1][0]            ok=True cos 0.99885 rel 0.0481 norm -0.57 % el 0.12
+  case 1 out[1][1]            ok=True cos 0.99684 rel 0.0795 norm +0.12 % el 0.23

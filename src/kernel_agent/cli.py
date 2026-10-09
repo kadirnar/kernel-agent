@@ -805,10 +805,10 @@ def _add_precisions_arg(p: argparse.ArgumentParser) -> None:
         metavar="P,P,...",
         help="target precisions the run allows, recorded in run.json (exact is always "
         "allowed): exact, fp8_weights, fp8_w8a8, fp8_mx, int8_weights, int8_w8a8, reduced, "
-        "fp4_weights, fp8_kv (needs --quality relaxed or near-lossless). Default: relaxed and "
-        "near-lossless allow all but the 4-bit fp4_weights and fp8_kv, which are opt-in; exact "
-        "allows exact. Given to a run that exists (improve, resume, integrate), it replaces "
-        "the run's list",
+        "fp4_weights, fp4_w4a4, fp8_kv (needs --quality relaxed or near-lossless). Default: "
+        "relaxed and near-lossless allow all but the 4-bit fp4_weights and fp4_w4a4 and "
+        "fp8_kv, which are opt-in; exact allows exact. Given to a run that exists (improve, "
+        "resume, integrate), it replaces the run's list",
     )
 
 

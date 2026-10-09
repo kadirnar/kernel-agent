@@ -10,8 +10,8 @@ RTX 5070 Ti, sm_120: its measurements stay in the skills as labelled evidence).
   instructions, the one a compute-bound kernel needs for the full rate, async copies,
   clusters / PDL, the typical shared memory per block.
 * :func:`precision_unsupported`: why a target precision cannot run on a capability
-  (:data:`PRECISION_NEEDS`: FP8 tensor-core math needs sm_89+, block-scaled MXFP8 sm_100+,
-  INT8 tensor-core math (IMMA) sm_75+). Weight-only and KV-cache formats dequantise in
+  (:data:`PRECISION_NEEDS`: FP8 tensor-core math needs sm_89+, block-scaled MXFP8 and W4A4
+  sm_100+, INT8 tensor-core math (IMMA) sm_75+). Weight-only and KV-cache formats dequantise in
   registers and run everywhere; before sm_89 without a hardware e4m3 conversion, and INT8
   W8A8's fast path differs per family (:func:`precision_note`).
 * :func:`supports` / :func:`example_requirement` / :func:`example_skip`: the ``ARCHS``
@@ -236,12 +236,17 @@ PRECISION_NEEDS: dict[str, tuple[tuple[int, int], str]] = {
         "block-scaled FP8 tensor cores (MXFP8): sm_100+ (Blackwell; cuBLASLt VEC32_UE8M0)",
     ),
     "int8_w8a8": ((7, 5), "INT8 tensor cores (IMMA, `mma.sync` s8): sm_75+ (Turing and newer)"),
+    "fp4_w4a4": (
+        (10, 0),
+        "block-scaled FP4 tensor cores (NVFP4 / MXFP4: `tcgen05.mma kind::mxf4nvf4` on sm_100 / "
+        "sm_103, `mma.sync kind::mxf4nvf4.block_scale` on sm_120 / sm_121): sm_100+ (Blackwell)",
+    ),
 }
 #: Ceilings columns (``profiling/ceilings.py``) whose floor needs such tensor cores.
 COLUMN_NEEDS: dict[str, tuple[tuple[int, int], str]] = {
     "w8a8": PRECISION_NEEDS["fp8_w8a8"],
     "mxfp8": PRECISION_NEEDS["fp8_mx"],
-    "w4a4": ((10, 0), "FP4 tensor cores: sm_100+ (Blackwell)"),
+    "w4a4": PRECISION_NEEDS["fp4_w4a4"],
     "int8_w8a8": PRECISION_NEEDS["int8_w8a8"],
 }
 #: Weight-only / KV-cache formats: dequantised in registers, so any GPU runs them; below
@@ -301,10 +306,30 @@ _INT8_CUT = (
 )
 
 
+#: What W4A4 (``fp4_w4a4``, #233) needs per family for the FP4 tensor-core peak.
+_W4A4_PATH = {
+    "blackwell_geforce": (
+        "the FP4 peak needs the block-scaled `mma.sync.aligned.kind::mxf4nvf4.block_scale."
+        "scale_vec::4X.m16n8k64` (e2m1 x e2m1, a ue4m3 scale per 16; CuTe DSL `MmaMXF4NVF4Op`, "
+        "sm_120a / sm_121a only) or cuBLASLt through `F.scaled_mm` (`BlockWise1x16`); torch "
+        "2.14 has no MXFP4 GEMM here (CuTe `MmaMXF4Op` or Triton `tl.dot_scaled` on e2m1)"
+    ),
+    "blackwell": (
+        "the FP4 peak needs `tcgen05.mma kind::mxf4nvf4` (TMEM accumulators fed by TMA: "
+        "CUTLASS / CuTe DSL sm_100 block-scaled GEMMs, cuBLASLt through `F.scaled_mm`); the "
+        "block-scaled `mma.sync` of sm_120 does not exist here"
+    ),
+}
+
+
 def precision_note(precision: str | None, capability: tuple[int, ...] | None) -> str | None:
     """What an engineer of a ``precision`` target must know about this GPU (None: nothing)."""
     if capability is None:
         return None
+    if precision == "fp4_w4a4":
+        fam = family(capability)
+        why = _W4A4_PATH.get(fam.key) if fam is not None else None
+        return why + "." if why else None
     if precision == "int8_w8a8":
         if tuple(int(c) for c in capability[:2]) == (10, 3):
             return _INT8_CUT + "."

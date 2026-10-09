@@ -396,7 +396,10 @@ to every `e2e` and `capture` by the orchestrator) accepts such changes when the
   FP8's error) is captured with the `near-lossless-fp4` tier instead: the
   same checks with cosine >= 0.96, relative L2 error <= 0.28, the norm within
   ±4 % and every element within 1.25 × RMS + 0.25 × |reference| (calibration
-  below). Other targets keep the exact tier.
+  below). `"precision": "fp4_w4a4"` (W4A4: FP4 weights and activations, #233) has
+  `near-lossless-fp4a`: cosine >= 0.96, relative L2 error <= 0.28, the norm within
+  ±5 % and every element within 1.5 × RMS + 0.25 × |reference| ("W4A4" below).
+  Other targets keep the exact tier.
 * **Redrawn inputs.** The evaluator's perturbed-input and timed-output checks
   and the integration's re-check compare a candidate with the reference on
   redrawn inputs: each channel (a position of the last dimension) from its own
@@ -426,7 +429,7 @@ rounding differs from eager (bf16 intermediates, fast `exp2` / `rsqrt`,
 FP8 activations written by the previous kernel's epilogue). The planner and
 systems prompts say so (`prompts.RELAXED_POLICY`). A target's tier follows its
 precision as in near-lossless (`compare.QUALITY_TIERS`: `relaxed`,
-`relaxed-fp4`, `relaxed-kv`); a target without a reduced precision keeps the
+`relaxed-fp4`, `relaxed-fp4a`, `relaxed-kv`); a target without a reduced precision keeps the
 exact tier. The numbers (`kernels/compare.py`, `perceptual.RELAXED_GATE`, the
 workloads' `relaxed_options`; `-o` options the user set still win):
 
@@ -436,6 +439,8 @@ workloads' `relaxed_options`; `-o` options the user set still win):
 | ... redrawn and scaled inputs | 0.996, 0.08, ±3 %, 0.75 (0.125) | 0.99, 0.16, ±6 %, 1.5 (0.125) |
 | FP4 tier (`fp4_weights`, opt-in), captured | 0.96, 0.28, ±4 %, 1.25 (0.25) | 0.94, 0.36, ±6 %, 1.75 (0.25) |
 | ... redrawn and scaled | 0.94, 0.40, ±12 %, 2.5 (0.25) | 0.90, 0.55, ±18 %, 3.0 (0.25) |
+| W4A4 tier (`fp4_w4a4`, opt-in), captured | 0.96, 0.28, ±5 %, 1.5 (0.25) | 0.94, 0.36, ±8 %, 2.0 (0.25) |
+| ... redrawn and scaled | 0.90, 0.50, ±15 %, 3.0 (0.25) | 0.85, 0.65, ±18 %, 3.5 (0.25) |
 | KV tier (`fp8_kv`, opt-in), captured | as the 8-bit tier | as the 8-bit tier |
 | ... redrawn and scaled | 0.985, 0.16, ±3 %, 1.5 (0.125) | 0.97, 0.25, ±6 %, 2.5 (0.125) |
 | TTS gate: error-rate increase, speaker similarity (mean / worst sample), MOS drop | +0.05, 0.93 / 0.85, 0.3 | +0.10, 0.90 / 0.80, 0.45 |
@@ -620,7 +625,7 @@ its channel's in the whole cache, as one token has too few rows for a channel RM
 Qwen3's `k_norm` makes key channel 50 about ten times the row's RMS) and the kept rows
 must stay bit for bit where the reference kept them (`compare.grown_dim`,
 `compare_grown`). Every such wrong row is rejected in every tier, except where a tier's
-own budget allows that error (x 0.9 on the FP4 tiers' redrawn bounds, a bias of 5x the
+own budget allows that error (x 0.9 on the FP4 and W4A4 tiers' redrawn bounds, a bias of 5x the
 exact tolerance on the FP4 tiers and relaxed-kv's redrawn ones). On the
 Qwen3 decoder layer at decode (failed draws, near-lossless · relaxed, before → after):
 
@@ -706,8 +711,9 @@ near-lossless's x 0.01 check, which failed them before.
 the target precisions it allows; `exact` is always one of them. `--quality exact`
 allows `exact` only. `--quality near-lossless` and `--quality relaxed` allow `fp8_weights`,
 `fp8_w8a8`, `fp8_mx` (MXFP8, 8-bit), `int8_weights`, `int8_w8a8` (INT8, 8-bit: "INT8"
-below) and `reduced` by default, but **not** the 4-bit `fp4_weights`: 4-bit is opt-in
-(`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights`). So is `fp8_kv`
+below) and `reduced` by default, but **not** the 4-bit `fp4_weights` and `fp4_w4a4`
+(W4A4, "W4A4" below): 4-bit is opt-in in every quality mode
+(`--precisions exact,fp8_weights,fp8_w8a8,reduced,fp4_weights,fp4_w4a4`). So is `fp8_kv`
 (an FP8 KV cache, "FP8 toolkit" below): it pays only on long caches. The list is
 recorded in `run.json` → `config.precisions`; a run whose `run.json` has none
 (made before the option) gets the default, so its FP4 targets stay out.
@@ -734,10 +740,12 @@ wherever a precision is chosen or used:
   `report.md` (also next to the target in *Kernel targets*, out of the
   projection; the report's header names the allowed precisions);
 * **ceilings**: `profile/summary.md` shows (and ranks rows by) only the floors of
-  the allowed precisions (`ceilings.json` keeps every floor), and the systems
+  the allowed precisions (the *W4A4* column only with `fp4_w4a4`, *FP4 w* only with
+  `fp4_weights`; `ceilings.json` keeps every floor), and the systems
   agent's end-to-end estimate takes only them;
 * **prompts**: engineer, research and systems sessions are told that 4-bit
-  weights and activations are not allowed.
+  weights and activations are not allowed (or only 4-bit activations, when
+  `fp4_weights` is allowed and `fp4_w4a4` is not).
 
 `kernel-agent integrate <run_dir> [--precisions ...]` integrates a run again
 (A/B measurements of unchanged content reused, no agent session) and rewrites its
@@ -1252,6 +1260,90 @@ the captured LocDiT inputs at 0.041, fails the x 0.01 check). The CPU calibratio
 (`tests/test_perturbed_calibration.py`) runs both classes' reference math and these
 broken variants on the synthetic massive-activation MLP in both modes, and #175's blatant
 bugs (int4 per tensor, scales x 1.2, an unwritten row, gate / up swapped) for both classes.
+
+#### W4A4 (`fp4_w4a4`): FP4 tensor-core math, opt-in
+
+`"precision": "fp4_w4a4"` (#233) quantises weights and activations to NVFP4 and runs the
+GEMMs on the block-scaled FP4 tensor cores: e2m1 x e2m1 with an e4m3 scale per 16 along K on
+both operands applied by the tensor core, fp32 accumulation, then the activations'
+per-token fp32 outer scale, the weight's tensor scale and the bias once per output. It is
+**opt-in in every quality mode** (only a run whose `--precisions` names it allows it) and
+needs block-scaled FP4 tensor cores, sm_100+ (`tcgen05.mma kind::mxf4nvf4` on sm_100 /
+sm_103, `mma.sync ... kind::mxf4nvf4.block_scale` on sm_120 / sm_121); on Ada, Hopper and
+older `gpu_arch.PRECISION_NEEDS` refuses it with the reason and the ceilings table hides its
+*W4A4* column, which is shown only when `fp4_w4a4` is allowed (before #233 it came with
+`fp4_weights`). Its targets get the `fp4-w4a4` skill, the W4A4 engineer contract and the
+`near-lossless-fp4a` / `relaxed-fp4a` tiers; the roofline counts their weights as NVFP4 and
+their GEMMs at the measured NVFP4 peak.
+
+Reference math (`kernels/quant.py`): `quantize_fp4` (weights), `quantize_fp4_activations`
+(per token: `outer = amax * NVFP4_OUTER_STEP`, block scale `e4m3(min(bmax / (outer * 6),
+448))`, codes `e2m1(x / (scale * outer))` to nearest even with IEEE divisions; a CPU test
+checks it bit for bit against a pure-Python e2m1 / e4m3 / fp32 reference, scale saturation
+included; `granularity="tensor"`: one outer scale per call; `fmt="mxfp4"`: e8m0 per 32),
+`fp4_w4a4_linear` (`F.scaled_mm` NVFP4 where it applies: bit for bit the fp32 math of the
+same codes on sm_120; torch 2.14 has no MXFP4 GEMM there), `fp4_w4a4_error`,
+`hadamard_rotate` (an optional block rotation) and `fp4_w4a4_sensitivity` (the per-layer
+probe: every `nn.Linear` of a target alone in W4A4 and FP8 W8A8 on its captured inputs,
+the most sensitive first, to keep those in FP8).
+
+Calibrated like the 8-bit and FP4 tiers (`docs/research-scripts/w4a4-233`, the reference
+math on real captures: captured inputs, 10 seeds of both per-channel redraws, x 3 / x 0.01 /
+x -1; failed draws near-lossless-fp4a · relaxed-fp4a):
+
+| capture | numerics | captured: cosine / rel L2 / norm | fails (captured, redrawn, scaled) |
+|---|---|---|---|
+| VoxCPM2 LocDiT layer (M = 352, 176) | NVFP4 W4A4 | 0.9968 / 0.080 / 3.4 % | 0, 0, 0 · 0, 0, 0 |
+| VoxCPM2 LocDiT layer | MXFP4 W4A4 | 0.9935 / 0.116 / 6.5 % | **2/2**, 0, 0 · 0, 0, 0 |
+| VoxCPM2 LocEnc, 12 layers (M = 80) | NVFP4 W4A4 | 0.9929 / 0.119 / 0.2 % | 0, 0, 0 · 0, 0, 0 |
+| VoxCPM2 base-LM decode layer (M = 1) | NVFP4 W4A4 | 0.9988 / 0.050 / 1.8 % | 0, 0, 0 · 0, 0, 0 |
+| Qwen3-0.6B decode layer (M = 1) | NVFP4 W4A4 | 0.9839 / 0.179 / 2.3 % | 0, **4/80**, 0 · 0, 0, 0 |
+
+The LocDiT layer, a compute-bound block W4A4 is for, passes the near-lossless gate with
+NVFP4 (MXFP4 is rejected there on the norm, as MXFP4 weights are). Quantised activations
+shrink a GEMM's output by up to ~1 % (e2m1's grid; unrounded block scales give the same),
+which the LocDiT MLP compounds to -3.4 % of the hidden state's norm; keeping its gate / up
+in FP8 (the sensitivity probe's top two, 49 % of the FLOPs) gives -0.9 %. A Hadamard
+rotation of 16 made NVFP4 worse on these captures. Broken W4A4 kernels fail on the
+single-layer captures: weight scale x 1.05 / x 1.2, swapped nibbles, activation block scales
+shifted by a block, the first token's outer scale for every token, truncated activation
+codes, activation scales cached from the first call, int4 per tensor, a dropped KV head; an
+unwritten output row and swapped q heads stay within W4A4's noise on the LocDiT layer (as
+with FP4 weights), and a module ending in a normalisation (the LocEnc) hides scale bugs:
+the perceptual gate judges those. The CPU calibration test runs the W4A4 reference math and
+the blatant bugs on the synthetic massive-activation MLP in both modes.
+
+Through the evaluator (`locdit_gate.py`): the LocDiT layer with every GEMM replaced by the
+CuTe W4A4 example, captured again in `near-lossless-fp4a` and `relaxed-fp4a`, passes both
+(captured, redrawn, scaled and timed-output checks; min cosine 0.9969, max relative L2
+0.079), with gate / up in FP8 as well. Its GPU time per call at M = 352 in a CUDA graph:
+bf16 301 us, W4A4 201 us (1.50x), W4A4 with gate / up in FP8 210 us (1.43x), every GEMM
+FP8 W8A8 (the CuTe FP8 example) 267 us (1.13x). Timed eagerly, as the evaluator does,
+the layer is host bound (0.70-0.97x).
+
+Examples (both verified on an RTX 5070 Ti; `doctor --smoke` runs them through the evaluator
+in `near-lossless-fp4a` and checks that the 8-bit tier rejects them):
+`cute_nvfp4_w4a4_gemm.py` (CuTe DSL, `MmaMXF4NVF4Op`, persistent and warp-specialised,
+the per-token scale and bias in its epilogue, a CuTe per-token quantiser; sm_12x) and
+`triton_nvfp4_w4a4_gemm.py` (a Triton quantiser writing packed codes and swizzled scales,
+then two-level `F.scaled_mm` NVFP4 with one outer scale per call; sm_100+). Both quantisers
+match `quantize_fp4_activations` bit for bit and both GEMMs `fp4_w4a4_linear` (bias-free; the
+CuTe one rounds `fma(acc, s, bias)` once). CUDA graphs, against cuBLASLt FP8 tensor-wise
+(the GEMM alone):
+
+| M x K -> N | bf16 | FP8 tensor-wise | NVFP4 `F.scaled_mm` | CuTe GEMM | CuTe quantiser + GEMM |
+|---|---|---|---|---|---|
+| 4096 x 4096 -> 4096 | 1397 us | 413 us (333 TFLOP/s) | 209 us (659, 1.98x) | 212 us (650, 1.96x) | 262 us (1.58x) |
+| 352 x 1024 -> 8192 | 68 us | 29.6 us | 14.7 us (2.01x) | 14.1 us (2.10x) | 16.8 us (1.76x) |
+| 352 x 1024 -> 4096 | 38 us | 18.4 us | 10.2 us (1.80x) | 9.5 us (1.93x) | 11.7 us (1.57x) |
+| 352 x 2048 -> 1024 | 22.6 us | 13.2 us | 8.8 us (1.51x) | 8.2 us (1.61x) | 12.8 us (1.03x) |
+| 352 x 4096 -> 1024 | 39 us | 18.4 us | 14.8 us (1.25x) | 14.5 us (1.28x) | 22.2 us (0.83x) |
+
+(4096³ warm L2; M = 352 rows with the weights streamed from DRAM, `bench_cute.py`.) The
+NVFP4 peak ratio's ~1.9x holds for large GEMMs; at M = 352 a separate quantiser launch and
+N = 1024's 24 output tiles on 70 SMs eat part of it: fuse the quantiser into the producer of
+the activations and split K there. Eager, the Triton example is host bound (147-176 us at 704 x
+1024 -> 8192 against bf16's 126; the CuTe one 41-50; two runs on a loaded machine).
 
 ### What "faster" means
 
@@ -2549,11 +2641,13 @@ re-profile makes a new one for its re-plan.
   *FP8 w* (one byte per weight, bf16 math), *W8A8* (FP8 tensor-core peak),
   *MXFP8* (one byte + an e8m0 scale per 32 per weight, the measured MXFP8 peak
   of the block-scaled tensor cores: target precision `fp8_mx`),
-  *FP4 w* (NVFP4, 4.5 bits per weight, bf16 math) and *W4A4* (NVFP4 peak). A
+  *FP4 w* (NVFP4, 4.5 bits per weight, bf16 math) and *W4A4* (NVFP4 peak: target
+  precision `fp4_w4a4`). A
   precision whose peak was not measured is `?`. `ceilings.json` keeps every
   floor; `summary.md` (what the planner reads) shows only the columns of the
   precisions the run allows ("Allowed precisions": exact; near-lossless also
-  FP8 w, W8A8 and MXFP8, FP4 w and W4A4 only with `fp4_weights` asked for), names the
+  FP8 w, W8A8 and MXFP8; FP4 w only with `fp4_weights` asked for, W4A4 only with
+  `fp4_w4a4`), names the
   others as not shown, and ranks rows below their exact floor by those columns only.
 * **FP8 instruction.** With the instruction rates measured and W8A8 allowed, the
   *FP8 MMA* column says what a W8A8 kernel needs to reach its floor: *SF* (the
@@ -4176,7 +4270,8 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   (`GPU ... smem per block`, `arch: ...`, `tensor cores: ...`, `precisions this GPU
   cannot run: ...`, `bf16 ridge: ...`).
 * **Precisions by GPU.** `fp8_w8a8` needs FP8 tensor cores (sm_89+), `fp8_mx`
-  block-scaled ones (sm_100+) and `int8_w8a8` INT8 ones (IMMA, sm_75+: on Turing and
+  block-scaled ones (sm_100+), `fp4_w4a4` block-scaled FP4 ones (sm_100+: "W4A4" above)
+  and `int8_w8a8` INT8 ones (IMMA, sm_75+: on Turing and
   Ampere the 8-bit compute class, "INT8" above); weight-only `fp8_weights` /
   `int8_weights` / `fp4_weights` and the `fp8_kv` cache run everywhere (dequantised in registers; below sm_89 the e4m3
   conversion is CUDA's software routine and Triton has no e4m3 type, as vLLM runs FP8

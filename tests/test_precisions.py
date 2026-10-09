@@ -54,7 +54,7 @@ DEFAULT = (  # near-lossless, no 4-bit
     "int8_weights",
     "int8_w8a8",
 )
-EVERY = tuple(compare.PRECISIONS)  # ... and with fp4_weights asked for
+EVERY = tuple(compare.PRECISIONS)  # ... and with fp4_weights and fp4_w4a4 asked for
 WHY = "M=1 decode GEMVs stream 2 x 6 MB of bf16 weights: memory bound at 91 % of SOL"
 
 
@@ -133,7 +133,7 @@ def test_default_parse_check_and_refusal():
     assert precisions.tier_allowed("near-lossless-fp4", EVERY)
     assert not precisions.tier_allowed("near-lossless", ("exact",))
     assert precisions.tier_allowed("exact", ("exact",)) and precisions.tier_allowed(None, ())
-    assert precisions.describe(DEFAULT).endswith("(4-bit not allowed: fp4_weights)")
+    assert precisions.describe(DEFAULT).endswith("(4-bit not allowed: fp4_weights, fp4_w4a4)")
     assert precisions.describe(("exact",)) == "exact"
 
 
@@ -231,7 +231,10 @@ def test_planner_offers_only_the_allowed_precisions(tmp_path):
         system = seen[0]["system"]
         if allowed is None:
             assert enum == list(DEFAULT) and pivots == list(DEFAULT[1:])
-            assert "`fp4_weights` is not allowed" in system and "No 4-bit weights" in system
+            assert (
+                "`fp4_weights`, `fp4_w4a4` are not allowed" in system
+                and "No 4-bit weights" in system
+            )
             assert '`precision: "fp4_weights"`' not in system
         else:
             assert enum == list(EVERY) and "fp4_weights" in pivots
@@ -251,7 +254,8 @@ def test_prompts_name_no_4bit_unless_allowed():
     only = prompts.precision_policy(NEAR, ("exact", "fp8_weights"))
     assert (
         '`precision: "fp8_w8a8"`' not in only
-        and "`fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8`, `reduced`, `fp4_weights` are"
+        and "`fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8`, `reduced`, `fp4_weights`, "
+        "`fp4_w4a4` are"
         in only
     )
     card = {"repo_id": "org/m", "modality": "tts"}
@@ -260,7 +264,7 @@ def test_prompts_name_no_4bit_unless_allowed():
 
     target = {"id": "lm", "precision": "fp8_weights", "pivot_of": None}
     block = prompts._pivot_block(target, Path("/r/pivot.json"))
-    assert "4-bit precisions (`fp4_weights`) are not allowed" in block  # named as refused
+    assert "4-bit precisions (`fp4_weights`, `fp4_w4a4`) are not allowed" in block  # refused
     assert "never propose them" in block
     assert "<one of `reduced`, `fp8_w8a8`, `fp8_mx`, `int8_weights`, `int8_w8a8`>" in block
     assert "streaming weights (`int8_weights`)" in block  # no fp4_weights
@@ -269,7 +273,7 @@ def test_prompts_name_no_4bit_unless_allowed():
     assert "streaming weights (`int8_weights`, `fp4_weights`)" in allowed
     assert (
         "<one of `reduced`, `fp4_weights`, `fp8_w8a8`, `fp8_mx`, `fp8_kv`, `int8_weights`, "
-        "`int8_w8a8`>" in allowed
+        "`int8_w8a8`, `fp4_w4a4`>" in allowed
     )
     assert prompts._pivot_block(target, Path("/r/p.json"), ("exact", "fp8_weights")) == ""
 
@@ -500,7 +504,8 @@ def test_scheduler_stops_a_disallowed_arm_and_uses_the_allowed_floors(tmp_path):
     for config, speedup, label in (
         ({"quality": "exact"}, 1.25, "exact"),
         ({"quality": NEAR}, 2.0, "W8A8"),  # an old run.json: no FP4
-        ({"quality": NEAR, "precisions": list(EVERY)}, 100 / 30, "FP4 w"),
+        ({"quality": NEAR, "precisions": list(EVERY)}, 100 / 20, "W4A4"),
+        ({"quality": NEAR, "precisions": ["fp8_weights", "fp4_weights"]}, 100 / 30, "FP4 w"),
         ({"quality": NEAR, "precisions": ["fp8_weights"]}, 100 / 60, "FP8 w"),
     ):
         write_json(run.run_json, {**run.load(), "config": config})
@@ -543,7 +548,12 @@ def test_ceilings_show_and_rank_by_the_allowed_floors_only():
     assert (
         "not shown: FP8 w, W8A8, INT8 W8A8, MXFP8, FP4 w, W4A4," in exact and "W8A8 ≥" not in exact
     )
-    assert ceilings.columns(("exact", "fp4_weights")) == ["exact", "fp4_weights", "w4a4"]
+    # #233: the W4A4 column with its own (opt-in) precision, not with 4-bit weights
+    assert ceilings.columns(("exact", "fp4_weights")) == ["exact", "fp4_weights"]
+    assert ceilings.columns(("exact", "fp4_w4a4")) == ["exact", "w4a4"]
+    weights_only = ceilings.build(profile, peaks, 5000.0, allowed=("exact", "fp4_weights"))
+    assert weights_only["columns"] == ["exact", "fp4_weights"]  # no W4A4 floor ranks a row
+    assert "not shown: FP8 w, W8A8, INT8 W8A8, MXFP8, W4A4," in ceilings.markdown(weights_only)
     assert ceilings.target_columns(DEFAULT) == [
         "exact",
         "fp8_weights",

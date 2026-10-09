@@ -42,6 +42,7 @@ PRECISION_QUERIES = {
     "fp4_weights": "fp4 e2m1 block scaled",
     "int8_weights": "int8 dot",
     "int8_w8a8": "int8 dot",
+    "fp4_w4a4": "nvfp4 e2m1 block scaled mma",
 }
 #: A word of a target's module class, approach or why (a regular expression, matched case
 #: insensitively) → what to look it up by.

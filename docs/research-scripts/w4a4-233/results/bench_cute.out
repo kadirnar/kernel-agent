@@ -1,0 +1,160 @@
+NVIDIA GeForce RTX 5070 Ti, sm_120, torch 2.14.1+cu130
+## quantiser: bit for bit against quant.quantize_fp4_activations
+M     1 K  1024 normal  : codes True, scales True, outer True, swizzled path True
+M     1 K  1024 outliers: codes True, scales True, outer True, swizzled path True
+M    17 K  2048 normal  : codes True, scales True, outer True, swizzled path True
+M    17 K  2048 outliers: codes True, scales True, outer True, swizzled path True
+M   352 K  1024 normal  : codes True, scales True, outer True, swizzled path True
+M   352 K  1024 outliers: codes True, scales True, outer True, swizzled path True
+M   352 K  4096 normal  : codes True, scales True, outer True, swizzled path True
+M   352 K  4096 outliers: codes True, scales True, outer True, swizzled path True
+M  4096 K  4096 normal  : codes True, scales True, outer True, swizzled path True
+M  4096 K  4096 outliers: codes True, scales True, outer True, swizzled path True
+
+## GEMM: module output against quant.fp4_w4a4_linear (same codes, fp32 math)
+M     1 N  2048 K  1024 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 1.73), 0 of 2048 outputs differ; bit for bit to the fma epilogue: True
+M     1 N  2048 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.45), 0 of 2048 outputs differ; bit for bit to the fma epilogue: True
+M     1 N   256 K  1024 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.12), 0 of 256 outputs differ; bit for bit to the fma epilogue: True
+M     1 N   256 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 1.75), 0 of 256 outputs differ; bit for bit to the fma epilogue: True
+M     1 N  4096 K  1024 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.17), 0 of 4096 outputs differ; bit for bit to the fma epilogue: True
+M     1 N  4096 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 1.92), 0 of 4096 outputs differ; bit for bit to the fma epilogue: True
+M     1 N  1024 K  4096 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.02), 0 of 1024 outputs differ; bit for bit to the fma epilogue: True
+M     1 N  1024 K  4096 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.08), 0 of 1024 outputs differ; bit for bit to the fma epilogue: True
+M     1 N  1024 K  2048 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 1.93), 0 of 1024 outputs differ; bit for bit to the fma epilogue: True
+M     1 N  1024 K  2048 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.27), 0 of 1024 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  2048 K  1024 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.44), 0 of 34816 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  2048 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.31), 0 of 34816 outputs differ; bit for bit to the fma epilogue: True
+M    17 N   256 K  1024 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.14), 0 of 4352 outputs differ; bit for bit to the fma epilogue: True
+M    17 N   256 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.45), 0 of 4352 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  4096 K  1024 bias True : rel L2 7.99e-07, max |d| 1.221e-04 (max |ref| 2.58), 1 of 69632 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  4096 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.5), 0 of 69632 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  1024 K  4096 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.52), 0 of 17408 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  1024 K  4096 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.25), 0 of 17408 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  1024 K  2048 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.14), 0 of 17408 outputs differ; bit for bit to the fma epilogue: True
+M    17 N  1024 K  2048 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.38), 0 of 17408 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  2048 K  1024 bias True : rel L2 3.97e-06, max |d| 1.953e-03 (max |ref| 2.84), 3 of 720896 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  2048 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.95), 0 of 720896 outputs differ; bit for bit to the fma epilogue: True
+M   352 N   256 K  1024 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.56), 0 of 90112 outputs differ; bit for bit to the fma epilogue: True
+M   352 N   256 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.83), 0 of 90112 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  4096 K  1024 bias True : rel L2 3.62e-07, max |d| 2.441e-04 (max |ref| 2.91), 3 of 1441792 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  4096 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.84), 0 of 1441792 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  1024 K  4096 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.75), 0 of 360448 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  1024 K  4096 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.69), 0 of 360448 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  1024 K  2048 bias True : rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.95), 0 of 360448 outputs differ; bit for bit to the fma epilogue: True
+M   352 N  1024 K  2048 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.94), 0 of 360448 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  2048 K  1024 bias True : rel L2 2.09e-06, max |d| 1.953e-03 (max |ref| 3), 78 of 8388608 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  2048 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 3.17), 0 of 8388608 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N   256 K  1024 bias True : rel L2 4.68e-06, max |d| 1.953e-03 (max |ref| 2.88), 7 of 1048576 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N   256 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 3.23), 0 of 1048576 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  4096 K  1024 bias True : rel L2 4.33e-06, max |d| 7.812e-03 (max |ref| 3.33), 151 of 16777216 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  4096 K  1024 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 3.2), 0 of 16777216 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  1024 K  4096 bias True : rel L2 6.78e-07, max |d| 4.883e-04 (max |ref| 2.92), 27 of 4194304 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  1024 K  4096 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 3.33), 0 of 4194304 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  1024 K  2048 bias True : rel L2 4.57e-07, max |d| 4.883e-04 (max |ref| 3.03), 5 of 4194304 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  1024 K  2048 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 2.92), 0 of 4194304 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  4096 K  4096 bias True : rel L2 2.44e-06, max |d| 3.906e-03 (max |ref| 3.34), 114 of 16777216 outputs differ; bit for bit to the fma epilogue: True
+M  4096 N  4096 K  4096 bias False: rel L2 0.00e+00, max |d| 0.000e+00 (max |ref| 3.12), 0 of 16777216 outputs differ; bit for bit to the fma epilogue: True
+worst rel L2 4.68e-06
+persistent=False: rel L2 6.40e-06
+selftest {'bias': 6.422407750505954e-06, 'no_bias': 0.0}
+
+## timing (CUDA graphs, best of 7 replays)
+
+M 4096 N 4096 K 4096 (warm L2, 1 operand set(s))
+  bf16 torch.mm                             1397.42 us     98.4 TFLOP/s
+  FP8 tensor-wise _scaled_mm                 415.60 us    330.7 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                210.20 us    653.8 TFLOP/s, 1.98x FP8
+  NVFP4 F.scaled_mm, fp32 out                220.83 us    622.4 TFLOP/s, 1.88x FP8
+  NVFP4 CuTe GEMM (A quantised)              211.55 us    649.7 TFLOP/s, 1.96x FP8
+  NVFP4 CuTe quantiser + GEMM (module)       262.49 us    523.6 TFLOP/s, 1.58x FP8
+  quant.fp4_w4a4_linear (eager reference)   5037.71 us
+
+M 352 N 4096 K 1024 (warm L2, 1 operand set(s))
+  bf16 torch.mm                               37.74 us     78.2 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  18.54 us    159.2 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                 10.28 us    287.2 TFLOP/s, 1.80x FP8
+  NVFP4 F.scaled_mm, fp32 out                 11.83 us    249.6 TFLOP/s, 1.57x FP8
+  NVFP4 CuTe GEMM (A quantised)                9.72 us    303.8 TFLOP/s, 1.91x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        11.80 us    250.2 TFLOP/s, 1.57x FP8
+  quant.fp4_w4a4_linear (eager reference)    573.84 us
+
+M 352 N 4096 K 1024 (cold L2, 13 operand set(s))
+  bf16 torch.mm                               37.76 us     78.2 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  18.35 us    160.9 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                 10.20 us    289.4 TFLOP/s, 1.80x FP8
+  NVFP4 F.scaled_mm, fp32 out                 11.80 us    250.2 TFLOP/s, 1.56x FP8
+  NVFP4 CuTe GEMM (A quantised)                9.50 us    310.7 TFLOP/s, 1.93x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        11.71 us    252.1 TFLOP/s, 1.57x FP8
+
+M 352 N 1024 K 4096 (warm L2, 1 operand set(s))
+  bf16 torch.mm                               39.06 us     75.6 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  17.44 us    169.3 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                 14.69 us    201.0 TFLOP/s, 1.19x FP8
+  NVFP4 F.scaled_mm, fp32 out                 15.48 us    190.7 TFLOP/s, 1.13x FP8
+  NVFP4 CuTe GEMM (A quantised)               14.38 us    205.4 TFLOP/s, 1.21x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        19.72 us    149.7 TFLOP/s, 0.88x FP8
+  quant.fp4_w4a4_linear (eager reference)    582.98 us
+
+M 352 N 1024 K 4096 (cold L2, 13 operand set(s))
+  bf16 torch.mm                               39.01 us     75.7 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  18.44 us    160.1 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                 14.79 us    199.7 TFLOP/s, 1.25x FP8
+  NVFP4 F.scaled_mm, fp32 out                 15.48 us    190.8 TFLOP/s, 1.19x FP8
+  NVFP4 CuTe GEMM (A quantised)               14.46 us    204.2 TFLOP/s, 1.28x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        22.18 us    133.1 TFLOP/s, 0.83x FP8
+
+M 352 N 2048 K 1024 (warm L2, 1 operand set(s))
+  bf16 torch.mm                               19.91 us     74.2 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  11.32 us    130.5 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                  6.18 us    238.9 TFLOP/s, 1.83x FP8
+  NVFP4 F.scaled_mm, fp32 out                  6.81 us    216.8 TFLOP/s, 1.66x FP8
+  NVFP4 CuTe GEMM (A quantised)                5.64 us    261.6 TFLOP/s, 2.01x FP8
+  NVFP4 CuTe quantiser + GEMM (module)         7.94 us    186.0 TFLOP/s, 1.43x FP8
+  quant.fp4_w4a4_linear (eager reference)    574.38 us
+
+M 352 N 2048 K 1024 (cold L2, 24 operand set(s))
+  bf16 torch.mm                               20.18 us     73.2 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  11.44 us    129.1 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                  5.95 us    248.2 TFLOP/s, 1.92x FP8
+  NVFP4 F.scaled_mm, fp32 out                  6.61 us    223.5 TFLOP/s, 1.73x FP8
+  NVFP4 CuTe GEMM (A quantised)                5.39 us    273.7 TFLOP/s, 2.12x FP8
+  NVFP4 CuTe quantiser + GEMM (module)         7.82 us    188.9 TFLOP/s, 1.46x FP8
+
+M 352 N 1024 K 2048 (warm L2, 1 operand set(s))
+  bf16 torch.mm                               22.64 us     65.2 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  13.13 us    112.4 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                  8.85 us    166.8 TFLOP/s, 1.48x FP8
+  NVFP4 F.scaled_mm, fp32 out                  9.50 us    155.4 TFLOP/s, 1.38x FP8
+  NVFP4 CuTe GEMM (A quantised)                8.25 us    178.9 TFLOP/s, 1.59x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        11.45 us    129.0 TFLOP/s, 1.15x FP8
+  quant.fp4_w4a4_linear (eager reference)    574.59 us
+
+M 352 N 1024 K 2048 (cold L2, 24 operand set(s))
+  bf16 torch.mm                               22.57 us     65.4 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  13.21 us    111.8 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                  8.76 us    168.6 TFLOP/s, 1.51x FP8
+  NVFP4 F.scaled_mm, fp32 out                  9.45 us    156.3 TFLOP/s, 1.40x FP8
+  NVFP4 CuTe GEMM (A quantised)                8.19 us    180.2 TFLOP/s, 1.61x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        12.84 us    115.0 TFLOP/s, 1.03x FP8
+
+M 352 N 8192 K 1024 (warm L2, 1 operand set(s))
+  bf16 torch.mm                               68.04 us     86.8 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  29.04 us    203.4 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                 14.51 us    407.1 TFLOP/s, 2.00x FP8
+  NVFP4 F.scaled_mm, fp32 out                 17.07 us    345.9 TFLOP/s, 1.70x FP8
+  NVFP4 CuTe GEMM (A quantised)               13.90 us    424.8 TFLOP/s, 2.09x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        15.74 us    375.3 TFLOP/s, 1.85x FP8
+  quant.fp4_w4a4_linear (eager reference)    576.61 us
+
+M 352 N 8192 K 1024 (cold L2, 7 operand set(s))
+  bf16 torch.mm                               68.52 us     86.2 TFLOP/s
+  FP8 tensor-wise _scaled_mm                  29.61 us    199.4 TFLOP/s, 1.00x FP8
+  NVFP4 F.scaled_mm, bf16 out                 14.72 us    401.1 TFLOP/s, 2.01x FP8
+  NVFP4 F.scaled_mm, fp32 out                 17.56 us    336.4 TFLOP/s, 1.69x FP8
+  NVFP4 CuTe GEMM (A quantised)               14.13 us    417.8 TFLOP/s, 2.10x FP8
+  NVFP4 CuTe quantiser + GEMM (module)        16.84 us    350.8 TFLOP/s, 1.76x FP8
+
+## the CuTe quantiser alone (bf16 [M, K] -> codes, swizzled scales, outer)
+  M   352 K  1024:    2.48 us ( 372.0 GB/s); torch reference (eager)   360.48 us
+  M   352 K  4096:    5.48 us ( 674.2 GB/s); torch reference (eager)   360.92 us
+  M  4096 K  4096:   41.00 us (1048.5 GB/s); torch reference (eager)  4483.71 us
