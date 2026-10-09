@@ -104,6 +104,10 @@ h3 { margin: 0; font-size: 14px; }
 .caption { margin: 2px 0 8px; color: var(--ink-2); font-size: 12.5px; }
 .note { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 .empty { padding: 26px 8px; color: var(--muted); text-align: center; font-size: 13px; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden;
+  font-size: 12px; }
+.seg button { border: 0; background: none; padding: 2px 10px; color: var(--ink-2); cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--code); color: var(--ink); font-weight: 600; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 6px; color: var(--ink-2);
   font-size: 12px; }
 .legend .key { display: inline-flex; align-items: center; gap: 6px; }
@@ -274,9 +278,14 @@ td.nowrap { white-space: nowrap; }
 <main>
 <section aria-labelledby="h-e2e">
   <div class="card">
-    <div class="head"><h2 id="h-e2e">End-to-end latency</h2><span class="note" id="e2e-note"></span></div>
+    <div class="head"><h2 id="h-e2e">End-to-end latency</h2>
+      <div class="seg" id="e2e-axis" role="group" aria-label="x axis of the end-to-end chart"><button
+        type="button" data-axis="exp" aria-pressed="true">experiment #</button><button
+        type="button" data-axis="time" aria-pressed="false">time</button></div>
+      <span class="note" id="e2e-note"></span></div>
     <p class="caption">Projected from the best kernels (baseline − Σ est. saved ms) and measured
-      end-to-end runs (transforms, integration) over wall-clock time. Lower is better.</p>
+      end-to-end runs (transforms, integration steps; its probes of one item alone left out) over
+      experiment number (results.tsv exp) or wall-clock time. Lower is better.</p>
     <div class="chart" id="chart-e2e"></div>
     <div class="legend" id="legend-e2e"></div>
   </div>
@@ -377,7 +386,7 @@ td.nowrap { white-space: nowrap; }
   const MAX_EVENTS = 600, MAX_LOGS = 400;
   const S = { summary: null, rows: [], events: [], logs: [], lanes: null };
   const ui = { target: "", status: "", query: "", limit: 100, files: null, file: null, filter: "",
-               conn: "connecting", filesStale: false };
+               conn: "connecting", filesStale: false, axis: "exp" };  // axis: the e2e chart's x
   let clockOffset = 0;
   const $ = (id) => document.getElementById(id);
 
@@ -737,51 +746,95 @@ td.nowrap { white-space: nowrap; }
   }
 
   // ------------------------------------------------------------ end-to-end chart
+  // The phases over experiment numbers (charts.exp_bands): a row belongs to the phase started
+  // last before it; consecutive rows of one phase make one band (a resumed phase too).
+  function expBands() {
+    const starts = S.summary.phases.map((p) => [Math.floor(p.start), p.phase]).sort((a, b) => a[0] - b[0]);
+    const bands = [];
+    for (const r of S.rows) {
+      let phase = null;
+      for (const [a, p] of starts) if (r.ts != null && a <= r.ts) phase = p;
+      if (phase == null) continue;
+      const last = bands[bands.length - 1];
+      if (last && last.phase === phase) last.b = r.exp + 0.5;
+      else bands.push({ phase, a: r.exp - 0.5, b: r.exp + 0.5 });
+    }
+    return bands;
+  }
+  // The phases over wall-clock time: a phase without an end lasts until the next one starts;
+  // consecutive starts of one phase (a resumed run) make one band, not labels printed over
+  // each other.
+  function timeBands(tEnd) {
+    const phases = S.summary.phases, bands = [];
+    phases.forEach((p, i) => {
+      const next = phases[i + 1];
+      const b = p.end != null ? minutesOf(p.end) : next ? minutesOf(next.start) : tEnd;
+      const last = bands[bands.length - 1];
+      if (last && last.phase === p.phase) last.b = Math.max(last.b, b);
+      else bands.push({ phase: p.phase, a: minutesOf(p.start), b });
+    });
+    return bands;
+  }
   function drawE2E() {
     const host = $("chart-e2e"), sm = S.summary, base = sm.baseline.eager_ms, mt = metricOf(sm);
+    const byExp = ui.axis === "exp";  // x: the experiment number (results.tsv exp) or the time
     $("h-e2e").textContent = mt.title;
     $("legend-e2e").replaceChildren();
-    if (base == null || sm.run.start_ts == null) {
+    $("e2e-axis").querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.axis === ui.axis)));
+    if (base == null || (!byExp && sm.run.start_ts == null)) {
       return empty(host, "Starts once the baseline is measured (analyze phase).");
     }
-    const tEnd = timeExtent(), tMax = tEnd * 1.03;
-    const proj = [{ t: 0, ms: base, row: null }], measured = [], failed = [];
+    const lastExp = Math.max(1, ...S.rows.map((r) => r.exp || 0));
+    const tEnd = byExp ? lastExp : timeExtent(), tMin = byExp ? -Math.max(0.6, 0.012 * lastExp) : 0;
+    const tMax = byExp ? tEnd - tMin : tEnd * 1.03;
+    const xOf = byExp ? (r) => r.exp : (r) => minutesOf(r.ts);
+    const proj = [{ t: 0, ms: base, row: null }], measured = [], kept = [], failed = [];
+    let probes = 0;
     // the projection after each kept (or re-evaluated) kernel, nested targets counted once
     // (projection.py); null where the savings exceed the baseline: not projectable (#128)
     const steps = (sm.projection && sm.projection.steps) || {};
     for (const r of S.rows) {
-      const t = minutesOf(r.ts);
+      const t = xOf(r);
       if (t == null) continue;
+      const ok = (r.status === "keep" || r.status === "discard") && r.new_ms;
       if (r.target !== "e2e") {
         if (r.exp in steps) proj.push({ t, ms: steps[r.exp], row: r });
-      } else if ((r.status === "keep" || r.status === "discard") && r.new_ms) measured.push({ t, row: r });
+        continue;
+      }
+      if (ok && r.status === "keep") kept.push({ t, row: r });  // the best so far: every keep
+      // one item alone next to the combinations (an integration probe): left out, counted
+      if (r.kind === "probe") probes += 1;
+      else if (ok) measured.push({ t, row: r });
       else if (FAILURES.includes(r.status)) failed.push({ t, row: r });
     }
     const shown = proj.filter((p) => p.ms != null);
     const comp = sm.baseline.compiled_ms;
-    const values = [base, ...shown.map((p) => p.ms), ...measured.map((m) => m.row.new_ms)];
+    const values = [base, ...shown.map((p) => p.ms), ...[...measured, ...kept].map((m) => m.row.new_ms)];
     if (comp) values.push(comp);
     let lo = Math.min(...values), hi = Math.max(...values);
     const span = Math.max(hi - lo, 0.05 * hi);
     lo = Math.max(lo - 0.15 * span, 0);
     hi += 0.1 * span;
     const narrow = host.clientWidth < 560;
-    const f = frame(host, "e2e", `${mt.title} over wall-clock time; arrow keys walk the points`,
+    const over = byExp ? "experiment number" : "wall-clock time";
+    const f = frame(host, "e2e", `${mt.title} over ${over}; arrow keys walk the points`,
       { height: narrow ? 270 : 330, left: 54, top: 24, bottom: 34, right: 18 });
-    const xs = linear(0, tMax, f.x0, f.x1), ys = linear(lo, hi, f.y0, f.y1);
+    const xs = linear(tMin, tMax, f.x0, f.x1), ys = linear(lo, hi, f.y0, f.y1);
 
     // phase bands (every other one shaded), labelled when the label fits
     let shaded = false;
     const bands = svg("g", { "aria-hidden": "true" });
-    for (const p of sm.phases) {
-      const a = xs(minutesOf(p.start)), b = xs(p.end == null ? tEnd : minutesOf(p.end));
+    const spans = byExp ? expBands() : timeBands(tEnd);
+    for (const p of spans) {
+      const a = xs(p.a), b = xs(p.b);
       if (b - a < textWidth(p.phase) + 6) continue;
       if (shaded) bands.append(svg("rect", { class: "band", x: a, y: f.y1, width: b - a, height: f.y0 - f.y1 }));
       shaded = !shaded;
       bands.append(label((a + b) / 2, f.y1 - 7, p.phase, "middle", "phase-label"));
     }
     f.root.append(bands);
-    const ta = timeAxis(tMax, narrow ? 4 : 8);
+    const ta = byExp ? { ticks: ticks(0, tEnd, narrow ? 4 : 8).filter(Number.isInteger),
+      fmt: (v) => `${v}`, label: "experiment # (results.tsv exp)" } : timeAxis(tMax, narrow ? 4 : 8);
     axes(f, xs, ys, ta.ticks, ticks(lo, hi, 5), ta.fmt, (v) => num(v, 0), ta.label);
 
     const g = svg("g", {});
@@ -791,13 +844,13 @@ td.nowrap { white-space: nowrap; }
       g.append(svg("line", { class: "compile", x1: f.x0, x2: f.x1, y1: ys(comp), y2: ys(comp) }),
         label(f.x0 + 4, ys(comp) - 5, `torch.compile ${fmt.ms(comp)}`));
     }
-    if (sm.run.running) {
+    if (sm.run.running && !byExp) {
       const x = xs(minutesOf(nowTs()));
       const left = x - f.x0 > 30;
       g.append(svg("line", { class: "now", x1: x, x2: x, y1: f.y1, y2: f.y0 }),
         label(left ? x - 3 : x + 3, f.y0 - 5, "now", left ? "end" : "start", "tick"));
     }
-    const lineEnd = sm.run.running ? minutesOf(nowTs()) : tEnd;
+    const lineEnd = sm.run.running && !byExp ? minutesOf(nowTs()) : tEnd;
     // a step line that stops where a step is not projectable (and starts again after it)
     let d = `M${xs(0)},${ys(base)}`, y = base;
     for (const p of proj.slice(1)) {
@@ -811,19 +864,24 @@ td.nowrap { white-space: nowrap; }
     if (proj.length > 1) {  // at the end of the line: its last projectable value
       const end = shown[shown.length - 1], stop = proj[proj.indexOf(end) + 1];
       const text = `projected ${fmt.ms(end.ms)}` + (last.ms == null ? ", then not projectable" : "");
-      g.append(label(xs(stop ? stop.t : Math.max(lineEnd, last.t)), ys(end.ms) - 6, text, "end", "strong"));
+      const x = xs(stop ? stop.t : Math.max(lineEnd, last.t));
+      const fits = x - textWidth(text, 12) >= f.x0;  // else it starts where the line stops
+      g.append(label(fits ? x : x + 4, ys(end.ms) - 6, text, fits ? "end" : "start", "strong"));
     }
-    if (measured.length) {  // every measured run: a thin, light line; the best so far: a step line
+    if (measured.length) {  // every measured run: a thin, light line
       g.append(svg("path", { class: "each-line", d: through(measured.map((m) => ({ x: xs(m.t), y: ys(m.row.new_ms) }))) }));
-      let bd = `M${xs(measured[0].t)},${ys(base)}`;
-      for (const m of measured) if (m.row.status === "keep") bd += `H${xs(m.t)}V${ys(m.row.new_ms)}`;
-      g.append(svg("path", { class: "best-line", d: `${bd}H${xs(Math.max(lineEnd, measured[measured.length - 1].t))}` }));
+    }
+    const runs = [...measured, ...kept];
+    if (runs.length) {  // the best so far: a step line from the baseline (at exp 0) through every keep
+      let bd = `M${xs(byExp ? 0 : Math.min(...runs.map((m) => m.t)))},${ys(base)}`;
+      for (const m of kept) bd += `H${xs(m.t)}V${ys(m.row.new_ms)}`;
+      g.append(svg("path", { class: "best-line", d: `${bd}H${xs(Math.max(lineEnd, ...runs.map((m) => m.t)))}` }));
     }
     failed.forEach((m) => g.append(failTick(xs(m.t), f.y1, f.y1 + 9)));  // ticks at the top
     f.root.append(g);
 
     // label the integrated result (else the running best measurement)
-    const best = sm.measured && [...measured].reverse().find((m) => m.row.new_ms === sm.measured.ms);
+    const best = sm.measured && [...runs].reverse().find((m) => m.row.new_ms === sm.measured.ms);
     if (best) {
       const text = `${fmt.ms(best.row.new_ms)} (${fmt.x(base / best.row.new_ms)})`;
       const x = xs(best.t), y = ys(best.row.new_ms);
@@ -839,7 +897,7 @@ td.nowrap { white-space: nowrap; }
         `${fmt.x(base / p.ms)} vs eager · after #${r.exp} ${r.status === "keep" ? "kept" : r.status}`,
         [`${r.target} ${fmt.x(r.speedup)} · ${r.backend} · ${fmt.ms(savedOf(r))} saved`, r.time], r.hypothesis) });
     }
-    for (const m of [...measured, ...failed]) {
+    for (const m of [...measured, ...kept.filter((k) => k.row.kind === "probe"), ...failed]) {
       const r = m.row, ok = r.status === "keep" || r.status === "discard";
       points.push({ x: xs(m.t), y: ok ? ys(r.new_ms) : f.y1 + 6, r: 9, open: openFor(r), tip: () => tipContent(
         ok ? `${fmt.ms(r.new_ms)} · ${fmt.x(r.speedup)}` : r.status.replaceAll("_", " "),
@@ -847,7 +905,8 @@ td.nowrap { white-space: nowrap; }
         [r.snapshot, r.time], r.hypothesis) });
     }
     hover(f, points);
-    $("e2e-note").textContent = `${S.rows.length - sm.counts.e2e} kernel evaluations · ${sm.counts.e2e} end-to-end runs`;
+    $("e2e-note").textContent = `${S.rows.length - sm.counts.e2e} kernel evaluations · ${sm.counts.e2e} end-to-end runs`
+      + (probes ? ` (${probes} integration probe${probes > 1 ? "s" : ""} not drawn)` : "");
     const keys = [key("projected", "projected (kernels)"), key("best", "measured, best so far"),
       key("each", "each measured run"), key("failtick", "failed"), key("ref", "baseline")];
     if (comp) keys.push(key("compile", "torch.compile"));
@@ -1223,6 +1282,13 @@ td.nowrap { white-space: nowrap; }
   $("f-target").addEventListener("change", (e) => { ui.target = e.target.value; renderLedger(); });
   $("f-status").addEventListener("change", (e) => { ui.status = e.target.value; renderLedger(); });
   $("f-query").addEventListener("input", (e) => { ui.query = e.target.value; renderLedger(); });
+  $("e2e-axis").addEventListener("click", (e) => {  // experiment # | time, from the same rows
+    const button = e.target.closest("button[data-axis]");
+    if (!button || button.dataset.axis === ui.axis || !S.summary) return;
+    ui.axis = button.dataset.axis;
+    tip.hidden = true;
+    drawE2E();
+  });
 
   // ------------------------------------------------------------ files
   const openFor = (r) => (r && r.file ? () => openFile(r.file, true) : null);

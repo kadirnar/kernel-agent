@@ -1360,7 +1360,7 @@ A kernel's estimated saving (`est_saved_ms_per_run`: its gain per call × the
 calls of the target's instances its cases stand for, see "Calls behind a kernel's
 estimate") is in ms per run of the workload, not in the metric. Wherever it
 meets the metric (the projections of `integration.json`, `status`, `watch`, the
-dashboard, `progress.png`, `amdahl.png`, `report.md`, and the improve
+dashboard, `timeline.png`, `amdahl.png`, `report.md`, and the improve
 scheduler's region arms) it is converted first by one helper,
 `objective.from_run` (`projection.Units` per run):
 
@@ -3194,7 +3194,8 @@ model and starts a new round (`kernel_agent/improve.py`,
   the steps that hold it. A target's better kernel version is swapped into the
   accepted set even when the systems agent combined an older one (version
   swaps, see the integration waterfall below). Every measurement is a ledger row, so the progress chart shows
-  the measured latency going down. `optimized/` is re-exported each time.
+  the measured latency going down (a dashed line where each re-integration ended).
+  `optimized/` is re-exported each time.
 * **Rounds** (issue #166: never leave budget unused). Once every arm of a round
   has retired, the optimised model (the accepted integration applied) is
   profiled again into `rounds/<n>/` (`worker analyze --out-dir D --kernel ...
@@ -4417,7 +4418,8 @@ runs/<org>--<name>/<timestamp>/
                               on the GPU, ...) and, at its end, its time split (sessions.py)
   critic.jsonl                improve: the critic's verdicts, withdrawals and the outcome
                               of every reviewed evaluation (its precision and recall)
-  progress.png  amdahl.png  integration.png  dashboard.html
+  progress.png  timeline.png  amdahl.png  integration.png  dashboard.html   (see "Charts":
+                              experiments over exp number, latency over wall-clock time, ...)
   integration.json  report.md  logs/  (incl. logs/program-<sha12>.md, artifacts.jsonl:
                               kernel_agent.artifacts lookups, export_checks.jsonl)
   improve.json  improve.png   improve loop: slices, research sessions, re-integrations, rounds;
@@ -4623,7 +4625,39 @@ lines, never as scattered points: a prominent line for the best so far, a thin g
 line through every individual result, and the failures as short red ticks on the
 axis (the legends show the same samples).
 
-`progress.png`: end-to-end latency over wall-clock time. The blue step line
+`progress.png`: the run's experiments over experiment number (the `exp` of
+`results.tsv`, 0 = the baseline; see `kernel-agent exp`), measured values only, as
+autoresearch and AutoKernel draw theirs (#223). The title reads `<model>: N experiments,
+K kept improvements` (N: the measured rows without the integration's probes; K: the new
+bests). The subtitle gives the measured result (baseline → the integrated result), the
+GPU, the experiments by kind with the probes beside them, then by status (each failure
+kind counted), the hours and the cost. Two panels share the x axis:
+
+* The model's metric, lower is better. The green step line is the running best through
+  every kept end-to-end result, and each kept step is labelled with its number, value,
+  ratio to the baseline and title. The thin grey line goes through every correct
+  end-to-end and integration experiment. The integration's probes of one item alone are
+  left out: drawn next to the combinations, they only zigzag. Failures are ticks at the
+  top. A dashed line marks the baseline and a dotted one the `torch.compile` baseline,
+  each labelled. The axis turns logarithmic once the baseline is 3× the best. Below that
+  it runs from the best − 15 % of the gain to the baseline + 15 %, and slower results are
+  cut off at the frame.
+* The kernels. Each target's running best module speedup is a step line in its colour
+  (from the seventh target on, in grey), named with its best at the right end. The line
+  is the target's standing best, so a re-evaluation that finds the best slower steps
+  down. Kernel failures are ticks on this panel's axis.
+
+The shaded bands are the phases and later `improve` rounds over the experiments they
+ran; a phase started again (a resumed run) is one band. Dashed vertical lines mark where
+each re-integration of `improve` ended. No two labels overlap: where two would collide,
+the bigger step keeps the full label and the other gets the short one, or none. The
+projection from the kernels is not drawn here; `timeline.png`, `amdahl.png`, `status`,
+the report and the `watch` tiles show it.
+
+![run progress](docs/images/example-progress.png)
+
+`timeline.png`: end-to-end latency over wall-clock time, where the hours went (the
+`progress.png` of runs before #223). The blue step line
 is the projection from the best kernels (baseline − Σ est. saved ms of each
 target's best kept candidate, in the metric's ms: see "What faster means"). The green
 step line is the best measured end-to-end run so far, and the thin grey line goes through
@@ -4661,25 +4695,27 @@ The savings are module-level estimates against the eager model, so they can add
 up to more than the run: an estimate from before #119, or kernels whose modules
 the integration's transforms already sped up. A projection at or below 0 ms (or
 above the baseline) is *not projectable* (#128), never a ratio:
-`report.md`, `kernel-agent status`, the dashboard, `watch` and `progress.png`
+`report.md`, `kernel-agent status`, the dashboard, `watch` and `timeline.png`
 say `not projectable` and why, naming the largest items and their savings, as
 the integration does for an accepted set (`not_additive`). On
 `20261006-004718-retest2` the best kernels counted 42.6 ms per second of audio
 against a 37.7 ms baseline (`dit_layer__fp8_w8a8` 37.6 ms, `vae_decoder__reduced`
 3.0 ms, `loc_enc_decode` 2.1 ms); the report printed `0.0 ms (37659015247.39x vs
-eager)`. The step line of `progress.png` and `watch` stops where the projection
+eager)`. The step line of `timeline.png` and `watch` stops where the projection
 stops being projectable (`projected 1.2 ms, then not projectable`). Where the
 run has an integration, the projection shown first (the `status` header, the
-dashboard and `watch` tiles, the `progress.png` subtitle, `report.md` above the
+dashboard and `watch` tiles, the `timeline.png` subtitle, `report.md` above the
 kernels' own) is that of its last accepted set (see "Integration: paired A/B with
 undo handles": 5.3 ms against 6.0 ms measured on that run), with the best kernels'
 alone next to it.
 
-![run progress](docs/images/example-progress.png)
+![run timeline](docs/images/example-timeline.png)
 
 `targets/<id>/progress.png`: module speedup per evaluation. The green step line
-is the running best, and each kept candidate is labelled with its hypothesis where
-the line steps up. The thin grey line goes through every evaluation's speedup (one
+is the running best, and each kept candidate is labelled with its experiment number and
+title (`#32 2.07×  fold the o_proj epilogue…`, the number `kernel-agent exp show` takes)
+where the line steps up; the subtitle names the target's experiments (`exp 1–34`). The
+thin grey line goes through every evaluation's speedup (one
 dash pattern per worker with `--seeds-per-target`), failures are red ticks on the
 x axis, and the dashed line is the reference module.
 
@@ -4777,7 +4813,9 @@ measured and projected end-to-end latency, elapsed time, USD spent, the
 pipeline phases and the agents that are running. Below that: a
 speedup-per-evaluation chart per target (the running best as a step line, a thin
 line through every evaluation, failures as ticks; hypothesis on hover), projected and
-measured end-to-end latency over wall-clock time (lines, no points), the agents'
+measured end-to-end latency (lines, no points; the integration's probes of one item alone
+left out) with an axis toggle, `experiment #` (the default, as `progress.png`) or `time`
+(as `timeline.png`), drawn from the same rows, the agents'
 swimlanes (one row per session running at the same time, coloured by its state:
 model, GPU held, waiting for the GPU, evaluation off the GPU, own runs, idle; and a
 GPU row with who held it), cumulative agent cost, the integration waterfall, the latest
