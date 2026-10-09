@@ -2543,6 +2543,20 @@ precision or another algorithm moves.
   `toolchain.json` and the agents' prompts include them. On the RTX 5070 Ti:
   copy DRAM 767 GB/s, L2 2970 GB/s, matmul bf16/fp16/fp32 99 / 94 / 34
   TFLOP/s, FP8 333 TFLOP/s, NVFP4 641 TFLOP/s, launch floor ~16 µs.
+* **Sustained peaks** (peaks cache version 7, #253). The burst peaks above are ~60 ms
+  of GEMMs at the boost clock; a power-capped board (the 150 W passively cooled A10,
+  the 70 W T4 and L4) cannot hold that clock under a model's load. After them,
+  `measure_peaks` runs ~2 s of back-to-back 8192³ GEMMs per 16-bit dtype (the next
+  batch queued before the previous one is waited for, so the GPU never idles) and
+  records the median rate of the settled second half (`tflops_sustained`), with the
+  SM clock, power, enforced power limit and clock-event reasons sampled meanwhile
+  through NVML or `nvidia-smi` (`sustained`). `doctor` and the toolchain block print
+  both and, where the sustained rate is at least 10 % below the burst one, a `sustained
+  load slows this GPU down` line. The ceilings' floors then use the sustained rate; the
+  evaluator's `pct_of_sol` keeps the burst one (a module timing is a burst). On the RTX
+  5070 Ti: `sustained bf16/fp16 94 / 92 TFLOP/s (2 s; SM 2670 MHz, burst 2782; 300 W of a
+  300 W limit; sw_power_cap)`, 6 % below its burst peaks (100 / 97), so its floors keep
+  the burst ones; the whole peak measurement took 14 s.
 * **Work** is counted on the reference call. FLOPs come from
   `torch.utils.flop_counter.FlopCounterMode`, split by the dtype of each op's
   inputs. Attention (SDPA) FLOPs count only the query/key pairs that the mask
@@ -2717,6 +2731,9 @@ re-profile makes a new one for its re-plan.
   FP8 w, W8A8 and MXFP8; FP4 w only with `fp4_weights` asked for, W4A4 only with
   `fp4_w4a4`), names the
   others as not shown, and ranks rows below their exact floor by those columns only.
+* **Power-capped boards** (#253). A sustained bf16 / fp16 peak at least 10 % below the
+  burst one ("Speed of light": an A10, T4 or L4 at its power limit) replaces it in the
+  compute floors, since a model's run is sustained load; the table says so (*Sustained*).
 * **FP8 instruction.** With the instruction rates measured and W8A8 allowed, the
   *FP8 MMA* column says what a W8A8 kernel needs to reach its floor: *SF* (the
   block-scaled `QMMA.SF`: Triton `tl.dot_scaled`, MXFP8) when the row is compute
@@ -4403,6 +4420,17 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   papers); every prompt gets its GPU's section under "# This GPU", with the note that
   numbers measured on another GPU are evidence from that GPU. The RTX 5070 Ti
   measurements in the other guides stay, labelled with the GPU.
+* **Boards of one architecture: the NVIDIA A10** (#253). Nothing keys on GPU names: an
+  A10, an A40 and a GeForce RTX 3090 are all sm_86 Ampere. What tells them apart is
+  measured: the fp32-accumulating HMMA line above (100 % on a datacenter board, 50 % on
+  GeForce); the INT8 GEMM policy row gives this GPU's measured `s8 IMMA` / `bf16 HMMA` ratio (2x on an A10 or
+  A100, 4x on a GeForce RTX 30xx, whose datasheet ratios stay as labelled evidence); and a
+  power-capped board gets its sustained peaks ("Speed of light"). On sm_80 / sm_86 the
+  fused decoder layer's second backend is a CUDA C++ layer with IMMA / bf16 GEMMs
+  (`cuda_int8_skinny_gemm.py`), not the sm_89+ CuTe DSL layer. The `gpu-architectures`
+  skill's `skus.md` has the SKU classes (A100; A10 / A40 / RTX A6000; RTX 30xx) and the
+  power-capped A10 / T4 / L4, datasheet numbers labelled. `tests/test_gpu_skus.py` fakes
+  the A10, RTX 3090, A100, T4 and L4 with datasheet peaks (labelled, never in prompts).
 * **Examples and doctor.** Every architecture-dependent example declares `ARCHS`
   (`"sm_89+"`, `"sm_12x"`, ...) and `ARCHS_WHY`; `doctor --smoke` runs those this GPU
   supports and lists the rest (`skipped here (...): triton_fp8_w8a8_gemm needs

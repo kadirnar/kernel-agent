@@ -11,9 +11,12 @@ warning, when the GPU actually slowed down during it:
 
 The clock-event reasons of every sample are recorded (``reasons``); ``sw_power_cap``
 alone is informational, since consumer GPUs report it routinely while they run at
-full boost. The board's maximum SM clock (``clocks.max.sm``, ``sm_max_mhz``) is
-recorded too but is not the reference: boards often never reach it under load (an
-RTX 5070 Ti boosts to ~2.9 of its 3.1 GHz). The paired A/B design keeps throttling
+full boost. What a power-capped board (A10, T4, L4) sustains is measured once with the
+peaks instead (``roofline.sustained_peaks``: the sustained 16-bit matmul rate, the SM
+clock and :meth:`Monitor.power_limit_w`). The board's maximum SM clock
+(``clocks.max.sm``, ``sm_max_mhz``) is recorded too but is not the reference: boards
+often never reach it under load (an RTX 5070 Ti boosts to ~2.9 of its 3.1 GHz). The
+paired A/B design keeps throttling
 out of the comparison, but the absolute latencies of a throttled measurement are
 pessimistic and separate-process numbers noisy.
 
@@ -165,6 +168,32 @@ class Monitor:
         }
         self.samples.append(sample)
         return sample
+
+    def power_limit_w(self) -> float | None:
+        """The board's enforced power limit in W (None: no backend, or it does not say):
+        150 W on an A10, 70 W on a T4, the cap a sustained load runs into (#253)."""
+        if self.backend is None:
+            return None
+        try:
+            if self.backend == "nvml":
+                milliwatts = self._nvml.nvmlDeviceGetEnforcedPowerLimit(self._handle)
+                return round(milliwatts / 1000.0, 1)
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "-i",
+                    str(self._bus),
+                    "--query-gpu=enforced.power.limit",
+                    f"--format={_FORMAT}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            ).stdout
+            return round(float(out.strip().splitlines()[0]), 1)
+        except Exception:  # [N/A], no such query on an old driver, ...
+            return None
 
     def processes(self) -> list[dict[str, Any]]:
         """The other processes on this GPU, most memory first: ``pid``, ``used_mib`` and

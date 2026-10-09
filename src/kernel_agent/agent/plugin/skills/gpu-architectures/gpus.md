@@ -46,6 +46,10 @@ block's measured peaks and instruction rates are the numbers to use.
   cut launch gaps.
 * Shared memory: 163 KB per block on sm_80 (and sm_87), 99 KB on sm_86. L2: 40 MB on A100
   (with L2 residency control); the toolchain block has this GPU's.
+* sm_86 boards differ (datacenter A10 / A40: full-rate fp32 accumulation, INT8 2x bf16,
+  150-300 W caps; GeForce RTX 30xx: fp32 accumulation at half rate, INT8 4x bf16): the
+  toolchain block's measured lines say which this GPU is; `skus.md` next to this file has
+  the SKU classes and the NVIDIA A10.
 
 ## [ada] Ada Lovelace (sm_89: RTX 40xx, RTX 6000 Ada, L4, L40S)
 

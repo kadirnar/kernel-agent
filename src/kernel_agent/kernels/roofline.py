@@ -9,7 +9,11 @@
   ``torch._int_mm``, cuBLASLt's IMMA kernels, in TOPS), and the tensor-core
   instruction rates (``mma_tflops``, :mod:`.mma_peaks`: plain FP8 ``QMMA.F32``
   vs block-scaled ``QMMA.SF`` vs bf16 / fp16 (fp32 and fp16 accumulation) / TF32 ``HMMA``
-  vs s8 ``IMMA``, Turing's shapes too).  :func:`ensure_peaks`
+  vs s8 ``IMMA``, Turing's shapes too). The bf16 / fp16 peaks are also measured
+  under sustained load (``tflops_sustained``: :data:`SUSTAINED_S` of back-to-back
+  GEMMs, :func:`sustain`), with the SM clock, power and clock-event reasons sampled
+  meanwhile (``sustained``): a power-capped board slows down there, and the
+  ceilings' floors use that rate (:func:`floor_tflops`, #253).  :func:`ensure_peaks`
   measures them once per GPU + torch version in a subprocess under the GPU lock
   and caches them in ``<cache>/peaks-<gpu>-torch<version>.json``; they are never
   measured inside a timed evaluation.
@@ -63,9 +67,11 @@ import copy
 import json
 import math
 import os
+import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -101,10 +107,20 @@ MXFP8 = "mxfp8"
 INT8 = "int8"
 #: Schema of the cached peaks; 2 adds the FP8 / FP4 peaks, 3 the MXFP8 one, 4 the
 #: tensor-core instruction rates (``mma_tflops``), 5 the INT8 peak and the s8 IMMA rate, 6
-#: the fp16 (fp32 and fp16 accumulation), TF32 and Turing-shape instruction rates (#257).
+#: the fp16 (fp32 and fp16 accumulation), TF32 and Turing-shape instruction rates (#257), 7
+#: the sustained 16-bit matmul peaks with the SM clock and power under that load (#253).
 #: :func:`ensure_peaks` measures an older cache again (once per process at most); until then
 #: it stays in use.
-PEAKS_VERSION = 6
+PEAKS_VERSION = 7
+#: Sustained 16-bit peaks (``tflops_sustained``, #253): seconds of back-to-back GEMMs per
+#: dtype, in batches of about :data:`SUSTAINED_BATCH_MS`. A power-capped board (the 150 W
+#: passively cooled A10, the 70 W T4 and L4) holds its boost clock for the ~60 ms bursts of
+#: the other peaks but not under a model's sustained load.
+SUSTAINED_S = 2.0
+SUSTAINED_BATCH_MS = 100.0
+#: A sustained peak at or below this share of the burst one replaces it in the floors of
+#: the ceilings table (:func:`floor_tflops`): the board slows down under sustained load.
+SUSTAINED_BELOW = 0.9
 #: The tensor-core math of a reduced-precision target: the FLOPs of every op that reads one
 #: of its narrowed weights count at this dtype's peak (W8A8: FP8), not at the reference's.
 MATH_DTYPE = {"fp8_w8a8": FP8, "fp8_mx": MXFP8, "int8_w8a8": INT8, "fp4_w4a4": FP4}
@@ -336,8 +352,140 @@ def _int8_tops(shapes: list[tuple[int, int, int]], free: int) -> float | None:
     return None if best is None else round(best, 1)
 
 
+# ------------------------------------------------------------------ sustained peaks (#253)
+
+
+def sustain(
+    launch: Callable[[], Any],
+    wait: Callable[[Any], float],
+    seconds: float,
+    monitor: Any = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[float, list[dict[str, Any]]]:
+    """``(TFLOP/s, samples)`` of back-to-back batches of one GEMM for ``seconds``:
+    ``launch()`` queues a batch and returns its handle, ``wait(handle)`` waits for it and
+    returns its TFLOP/s. The next batch is queued before the monitor samples
+    (:class:`kernel_agent.telemetry.Monitor`) and the previous one is waited for, so the GPU
+    never idles between batches (an idle gap would let a power-capped clock recover). The
+    rate is the median of the second half of the batches (the clock has settled there),
+    the samples are those taken meanwhile."""
+    begin = clock()
+    pending = launch()
+    rates: list[float] = []
+    samples: list[dict[str, Any] | None] = []
+    while True:
+        queued = launch() if clock() - begin < seconds else None
+        samples.append(monitor.sample("sustained") if monitor is not None else None)
+        rates.append(float(wait(pending)))
+        if queued is None:
+            break
+        pending = queued
+    half = len(rates) // 2
+    return round(statistics.median(rates[half:]), 1), [s for s in samples[half:] if s]
+
+
+def _sustained_tflops(
+    dtype: Any, free: int, monitor: Any, seconds: float = SUSTAINED_S
+) -> tuple[float, list[dict[str, Any]]] | None:
+    """:func:`sustain` on 8192³ ``torch.mm`` of ``dtype`` (4096³ when memory is short;
+    None: not even that fits)."""
+    import torch
+
+    width = torch.empty((), dtype=dtype).element_size()
+    size = next((s for s in (8192, 4096) if 3 * s * s * width <= free // 2), None)
+    if size is None:
+        return None
+    a = torch.randn(size, size, device="cuda", dtype=dtype)
+    b = torch.randn(size, size, device="cuda", dtype=dtype)
+    c = torch.empty(size, size, device="cuda", dtype=dtype)
+
+    def gemm() -> None:
+        torch.mm(a, b, out=c)
+
+    gemm()
+    per = max(1, int(SUSTAINED_BATCH_MS / _best_ms(gemm, iters=2, trials=1)))
+
+    def launch() -> tuple[Any, Any]:
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(per):
+            gemm()
+        end.record()
+        return start, end
+
+    def wait(events: tuple[Any, Any]) -> float:
+        start, end = events
+        end.synchronize()
+        return 2 * size**3 * per / start.elapsed_time(end) / 1e9
+
+    return sustain(launch, wait, seconds, monitor)  # a, b, c are freed with the closures
+
+
+def sustained_peaks(
+    peaks: dict[str, Any],
+    monitor: Any,
+    measure: Callable[[str, Any], tuple[float, list[dict[str, Any]]] | None],
+) -> dict[str, Any]:
+    """Add the sustained 16-bit peaks to ``peaks`` (``measure(dtype name, monitor)``:
+    :func:`_sustained_tflops`): ``tflops_sustained`` per dtype and ``sustained``, the load
+    they ran under: the median SM clock and power of the samples of the settled halves, the
+    clock-event reasons seen there, the highest SM clock of every sample of ``monitor``
+    (the burst peaks' samples too), the board's maximum clock and its enforced power limit.
+    Returns ``peaks``."""
+    rates: dict[str, float] = {}
+    settled: list[dict[str, Any]] = []
+    for name in ("bfloat16", "float16"):
+        if not (peaks.get("tflops") or {}).get(name):
+            continue
+        found = measure(name, monitor)
+        if found is not None:
+            rates[name], samples = found
+            settled += samples
+    if not rates:
+        return peaks
+    peaks["tflops_sustained"] = rates
+    info: dict[str, Any] = {"seconds": SUSTAINED_S}
+    seen = list(getattr(monitor, "samples", None) or [])
+    if settled:
+        info["sm_mhz"] = round(statistics.median(s["sm_mhz"] for s in settled))
+        info["power_w"] = round(statistics.median(s["power_w"] for s in settled), 1)
+        info["reasons"] = sorted({r for s in settled for r in s.get("reasons") or []})
+    if seen:
+        info["burst_sm_mhz"] = max(s["sm_mhz"] for s in seen)
+        if board := [s["sm_max_mhz"] for s in seen if s.get("sm_max_mhz")]:
+            info["sm_max_mhz"] = max(board)
+    limit = getattr(monitor, "power_limit_w", None)
+    if callable(limit) and (watts := limit()) is not None:
+        info["power_limit_w"] = watts
+    peaks["sustained"] = info
+    return peaks
+
+
+def sustained_drops(peaks: Mapping[str, Any] | None) -> dict[str, tuple[float, float]]:
+    """dtype → ``(burst, sustained)`` TFLOP/s of the matmul peaks whose sustained rate is at
+    most :data:`SUSTAINED_BELOW` of the burst one (a power-capped board; {}: none)."""
+    tflops = (peaks or {}).get("tflops") or {}
+    out = {}
+    for dtype, rate in ((peaks or {}).get("tflops_sustained") or {}).items():
+        burst = tflops.get(dtype)
+        if burst and rate and float(rate) <= SUSTAINED_BELOW * float(burst):
+            out[dtype] = (float(burst), float(rate))
+    return out
+
+
+def floor_tflops(peaks: Mapping[str, Any] | None) -> dict[str, float]:
+    """The matmul peaks a floor of the ceilings table runs at: ``tflops``, each sustained
+    peak in place of its burst one where :func:`sustained_drops` says the board slows down
+    (a model's end-to-end run is sustained load; a peak without a sustained measurement
+    stays as measured: no ratio is assumed)."""
+    tflops = {k: float(v) for k, v in ((peaks or {}).get("tflops") or {}).items() if v}
+    tflops.update({k: rate for k, (_, rate) in sustained_drops(peaks).items()})
+    return tflops
+
+
 def measure_peaks() -> dict[str, Any]:
-    """Measure the roofline peaks of the current GPU (takes ~10-30 s; hold the GPU lock)."""
+    """Measure the roofline peaks of the current GPU (takes ~15-35 s, the sustained peaks
+    about 5 of them; hold the GPU lock)."""
     import torch
     from torch import nn
 
@@ -370,17 +518,21 @@ def measure_peaks() -> dict[str, Any]:
     del src, dst
     torch.cuda.empty_cache()
 
-    # Dense matmul (tensor cores for 16-bit types; fp32 with TF32 off).
+    # Dense matmul (tensor cores for 16-bit types; fp32 with TF32 off). The clocks are
+    # sampled right after each burst (telemetry: NVML or nvidia-smi; none without them).
+    from kernel_agent.telemetry import Monitor
+
+    monitor = Monitor()
     big = [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 8192, 8192)]
-    peaks["tflops"] = {
-        name: tflops
-        for name, dtype, shapes in (
-            ("bfloat16", torch.bfloat16, big),
-            ("float16", torch.float16, big),
-            ("float32", torch.float32, big[:2]),
-        )
-        if (tflops := _matmul_tflops(dtype, shapes, free)) is not None
-    }
+    peaks["tflops"] = {}
+    for name, dtype, shapes in (
+        ("bfloat16", torch.bfloat16, big),
+        ("float16", torch.float16, big),
+        ("float32", torch.float32, big[:2]),
+    ):
+        if (tflops := _matmul_tflops(dtype, shapes, free)) is not None:
+            peaks["tflops"][name] = tflops
+        monitor.sample(f"burst {name}")
     torch.cuda.empty_cache()
     # Low-precision tensor cores: measured where torch has a kernel for this GPU, else the
     # reason is recorded (a ratio to bf16 is never assumed).
@@ -401,6 +553,17 @@ def measure_peaks() -> dict[str, Any]:
         torch.cuda.empty_cache()
     if unavailable:
         peaks["tflops_unavailable"] = unavailable
+
+    # Sustained 16-bit peaks (#253), after every burst so that the heat of their load cannot
+    # lower a burst peak; a failure here leaves the peaks above as they are.
+    def sustained(name: str, mon: Any) -> tuple[float, list[dict[str, Any]]] | None:
+        return _sustained_tflops(getattr(torch, name), free, mon)
+
+    try:
+        sustained_peaks(peaks, monitor, sustained)
+    except Exception as exc:  # out of memory, a lost device, ...
+        peaks["sustained"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+    torch.cuda.empty_cache()
 
     # Launch floor: a module call that launches one tiny kernel, timed like a candidate.
     class _OneKernel(nn.Module):

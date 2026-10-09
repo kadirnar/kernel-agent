@@ -566,7 +566,39 @@ def summary_lines(gpu: Any, peaks: Mapping[str, Any] | None) -> list[str]:
 
     if (accumulate := accumulation_line((peaks or {}).get("mma_tflops") or {})) is not None:
         lines.append(accumulate)
+    if (sustained := sustained_line(peaks)) is not None:  # a power-capped board (#253)
+        lines.append(sustained)
     return lines
+
+
+def sustained_line(peaks: Mapping[str, Any] | None) -> str | None:
+    """What the GPU sustains when its sustained 16-bit peaks are at least 10 % below the burst
+    ones (a power-capped board: A10, T4, L4; #253), from the measured peaks only
+    (:func:`kernel_agent.kernels.roofline.sustained_drops`), never from the GPU's name."""
+    from kernel_agent.kernels.roofline import sustained_drops
+
+    drops = sustained_drops(peaks)
+    if not drops or peaks is None:
+        return None
+    rates = ", ".join(
+        f"{SHORT_16BIT.get(k, k)} {rate:.0f} of the {burst:.0f} TFLOP/s burst"
+        for k, (burst, rate) in drops.items()
+    )
+    info = peaks.get("sustained") or {}
+    load = []
+    if info.get("sm_mhz") and info.get("burst_sm_mhz"):
+        load.append(f"SM clock {info['sm_mhz']} vs {info['burst_sm_mhz']} MHz")
+    if info.get("reasons"):
+        load.append(", ".join(info["reasons"]))
+    if info.get("power_limit_w"):
+        load.append(f"{float(info['power_limit_w']):.0f} W limit")
+    after = f" after {float(info['seconds']):.0f} s of GEMMs" if info.get("seconds") else ""
+    return (
+        f"sustained load slows this GPU down: matmul {rates}{after}"
+        + (f" ({'; '.join(load)})" if load else "")
+        + ": the ceilings' floors use the sustained rate (an end-to-end run is sustained "
+        "load), while a short module timing may see the burst one"
+    )
 
 
 # ------------------------------------------------------------------ knowledge per family
