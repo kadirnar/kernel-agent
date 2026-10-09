@@ -521,6 +521,14 @@ def test_the_native_digest_points_to_the_kit_for_grid_syncs_and_many_launches(tm
         "kernels per call." in text
     )
     assert "megakernel.md" in text and "examples/native_megakernel" in text
+    assert "--from-capture" in text and "captured.from_module" in text  # the DAG builder
+    assert "schedule --from-capture targets/" not in text  # no capture of the target here
+    (run.target(target) / "capture.pt").write_bytes(b"stand-in")
+    text = "\n".join(engine.megakernel_hint(run, rows))
+    assert (
+        f"kernels per call. Its op DAG from the captured ops: `python -m kernel_agent.native."
+        f"megakernel.schedule --from-capture targets/{target}/capture.pt`." in text
+    )
     (root / "csrc" / "layer.cu").write_text("// counters, one launch\n")
     calm = proj.write_bundle(root, history).rename(history / "004_stack_22222222.py")
     append_jsonl(run.results_file(target), {"snapshot": calm.name, "kernel_launches_candidate": 1})

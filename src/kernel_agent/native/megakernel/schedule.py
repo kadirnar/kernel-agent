@@ -538,3 +538,33 @@ def check_words(words: Sequence[int]) -> str | None:
         if not 0 <= counter < n_c or target < 1:
             return f"wait {k}: counter {counter}, target {target}"
     return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python -m kernel_agent.native.megakernel.schedule --from-capture CAPTURE``: the op
+    DAG of one captured call of a stage (:mod:`.captured`: each op mapped to a family of the
+    kit's opcodes, or reported unsupported with why), its schedule on ``--queues`` resident
+    blocks and the simulator's verdict over random SM speeds. Exit 0: a schedule without
+    deadlock; 1: unsupported ops or a problem; 2: the capture could not be recorded."""
+    import argparse
+    from pathlib import Path
+
+    from kernel_agent.native.megakernel import captured
+
+    parser = argparse.ArgumentParser(
+        description="A megakernel schedule built from a stage's captured ops (issue #225)."
+    )
+    parser.add_argument(
+        "--from-capture",
+        type=Path,
+        required=True,
+        metavar="CAPTURE",
+        help="a target's capture.pt or capture_inputs.pt (the module and its calls)",
+    )
+    captured.add_arguments(parser)
+    ns = parser.parse_args(argv)
+    return captured.run(ns.from_capture, ns)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

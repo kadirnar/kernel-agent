@@ -10,6 +10,8 @@
 //   RESIDUAL       y = a + b over a range
 //   SPLITK_REDUCE  y[r] = bf16(sum_s part[s][r]) (+ a residual)
 //   ARGMAX         out = argmax(x[0:n]) (first maximum; NaN counts as the largest, as torch)
+//   GLU            y = bf16(act(a)) * b over a range (act: silu, gelu tanh, gelu erf; a
+//                  gated MLP's activation)
 //
 // A whole-row GEMV tile (K of 1024 or 2048, up to 16 rows) splits K across the threads
 // (gemv_split); the other shapes (split-K slices, wider K, more rows) stage h in shared memory
@@ -29,9 +31,9 @@ namespace mk {
 
 typedef __nv_bfloat16 bf16;
 
-// Opcode numbers and argument slots: mirrored in candidate.py.
+// Opcode numbers and argument slots: mirrored in kernel_agent/native/megakernel/opcodes.py.
 enum Opcode : int { NOP = 0, RMSNORM = 1, GEMV = 2, GEMV_FP8 = 3, RESIDUAL = 4, SPLITK_REDUCE = 5,
-                    ARGMAX = 6 };
+                    ARGMAX = 6, GLU = 7 };
 
 enum GemvArg : int {
   G_X = 0, G_X_OFF, G_GAMMA, G_GAMMA_OFF, G_EPS, G_OUT, G_OUT_OFF, G_RES, G_RES_OFF, G_ROW0,
@@ -43,6 +45,8 @@ enum ReduceArg : int {
   S_PART = 0, S_PART_OFF, S_SPLITS, S_STRIDE, S_ROW0, S_ROWS, S_OUT, S_OUT_OFF, S_RES, S_RES_OFF
 };
 enum ArgmaxArg : int { A_X = 0, A_X_OFF, A_N, A_OUT, A_OUT_OFF };
+enum GluArg : int { U_A = 0, U_A_OFF, U_B, U_B_OFF, U_OUT, U_OUT_OFF, U_I0, U_N, U_ACT };
+enum GluAct : int { GLU_SILU = 0, GLU_GELU_TANH = 1, GLU_GELU = 2 };
 
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
@@ -462,6 +466,29 @@ __device__ __forceinline__ void residual(const Ctx& c) {
     y[i] = __float2bfloat16(__bfloat162float(__ldcg(a + i)) + __bfloat162float(__ldcg(b + i)));
 }
 
+// The activation of a GLU in fp32, as torch computes it for bf16 (opmath float)
+__device__ __forceinline__ float glu_act(float v, int act) {
+  if (act == GLU_SILU) return v / (1.f + expf(-v));
+  if (act == GLU_GELU_TANH) {
+    const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.f + tanhf(inner));
+  }
+  return 0.5f * v * (1.f + erff(v * 0.7071067811865476f));
+}
+
+// y = bf16(act(a)) * b: torch's two roundings (the activation's bf16 output, then the product)
+__device__ __forceinline__ void glu(const Ctx& c) {
+  const bf16* a = c.ptr<const bf16>(c.arg(U_A)) + c.arg(U_A_OFF);
+  const bf16* b = c.ptr<const bf16>(c.arg(U_B)) + c.arg(U_B_OFF);
+  bf16* y = c.ptr<bf16>(c.arg(U_OUT)) + c.arg(U_OUT_OFF);
+  const int i0 = c.arg(U_I0), n = c.arg(U_N), act = c.arg(U_ACT);
+  for (int i = i0 + threadIdx.x; i < i0 + n; i += kThreads) {
+    const float g = __bfloat162float(__float2bfloat16(glu_act(__bfloat162float(__ldcg(a + i)),
+                                                              act)));
+    y[i] = __float2bfloat16(g * __bfloat162float(__ldcg(b + i)));
+  }
+}
+
 __device__ __forceinline__ void splitk_reduce(const Ctx& c) {
   const float* part = c.ptr<const float>(c.arg(S_PART)) + c.arg(S_PART_OFF);
   const int splits = c.arg(S_SPLITS), stride = c.arg(S_STRIDE);
@@ -531,6 +558,7 @@ struct Ops {
       case RESIDUAL: residual(c); return true;
       case SPLITK_REDUCE: splitk_reduce(c); return true;
       case ARGMAX: argmax(c); return true;
+      case GLU: glu(c); return true;
       default: return false;
     }
   }

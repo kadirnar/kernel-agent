@@ -26,24 +26,49 @@ stack of decode layers (norm, projection, residual). Other row counts take the r
 * ``coop_barrier``: one cooperative persistent kernel with a hand-rolled grid barrier after
   every layer (§4.6's slow persistent variant).
 
+``schedule`` (a ``build()`` keyword): the megakernel's op DAG declared by hand
+(:func:`chain_dag`, ``hand``) or built from one recorded call of the reference
+(``captured``: ``kernel_agent.native.megakernel.captured`` maps its aten ops to the kit's
+opcode families, fuses the norm and the residual into each GEMV, tiles them and derives the
+edges from the storages: the same DAG here, from no knowledge of the module).
+
 Every mode is captured once into a CUDA graph here; a call copies x into the activation
-buffer (one row per layer, ``[layers + 1, n]``), replays the graph and returns a copy of the
-last row. ``trace=True`` records per-instruction time stamps of the megakernel
-(``KA_MK_TRACE``, set in ``kernel_project.toml``): ``module.trace_summary()``.
+buffer (one row per layer, ``[layers + 1, n]``; a captured plan's input slice), replays the
+graph and returns a copy of the last row. ``trace=True`` records per-instruction time
+stamps of the megakernel (``KA_MK_TRACE``, set in ``kernel_project.toml``):
+``module.trace_summary()``.
 
 Opcodes (``include/mk_ops.cuh``): RMSNorm, GEMV tiles with bf16 or e4m3 weights (fused norm,
-residual, split-K partials), residual add, split-K reduce, argmax; the argument builders
-below mirror their slots.
+residual, split-K partials), residual add, split-K reduce, argmax, gated activation (GLU);
+their numbers and argument slots are the kit's (``kernel_agent.native.megakernel.opcodes``).
 """
-
-import struct
 
 import torch
 from torch import nn
 
 from kernel_agent.native import project
+from kernel_agent.native.megakernel import opcodes as oc
 from kernel_agent.native.megakernel import runtime, simulate
 from kernel_agent.native.megakernel import schedule as mks
+
+# The opcodes of include/mk_ops.cuh: numbers and argument slots (the kit's generic ABI)
+from kernel_agent.native.megakernel.opcodes import (  # noqa: F401
+    ARGMAX,
+    GEMV,
+    GEMV_FP8,
+    GLU,
+    NOP,
+    RESIDUAL,
+    RMSNORM,
+    SPLITK_REDUCE,
+    argmax_args,
+    f32_bits,
+    gemv_args,
+    glu_args,
+    reduce_args,
+    residual_args,
+    rmsnorm_args,
+)
 
 #: GPUs this example runs on (``kernel_agent.gpu_arch.supports``).
 ARCHS = "sm_80+"
@@ -52,6 +77,9 @@ ARCHS_WHY = "bf16 opcodes; page loads with cp.async (sm_80-sm_89) or bulk copies
 ARCHS_COMPILES = "sm_75+"
 
 MODES = ("megakernel", "graph_pdl", "coop_barrier")
+#: Where the megakernel's op DAG comes from: declared by hand (:func:`chain_dag`) or built
+#: from a recorded call of the reference (``kernel_agent.native.megakernel.captured``).
+SCHEDULES = ("hand", "captured")
 #: PDL (``griddepcontrol``, the programmatic stream serialization attribute) from sm_90 on.
 PDL_SINCE = (9, 0)
 #: What the other modes run (``Chain.label``).
@@ -71,7 +99,7 @@ def graph_label(capability: tuple[int, int]) -> str:
 
 
 #: Output rows per GEMV tile where they fit (the whole-row GEMV path takes up to 16).
-ROWS = 16
+ROWS = oc.ROWS
 
 
 def tile_rows(n: int, pool_bytes: int, want: int = ROWS) -> int:
@@ -80,82 +108,41 @@ def tile_rows(n: int, pool_bytes: int, want: int = ROWS) -> int:
     16 rows of a 4096-wide layer are 128 KB: more than the pool of a GPU with 99 KB of shared
     memory per block (A10 sm_86, RTX 5070 Ti sm_120: 11 pages of 8 KB), so 8 rows there; an
     A100's 163 KB holds 16."""
-    rows = min(want, n)
-    while rows > 0 and (n % rows or rows * n * 2 > pool_bytes):
-        rows -= 1
-    return rows
+    return oc.tile_rows(n, n * 2, pool_bytes, want)
 
 
-# opcodes of include/mk_ops.cuh
-NOP, RMSNORM, GEMV, GEMV_FP8, RESIDUAL, SPLITK_REDUCE, ARGMAX = range(7)
+def chain_dag(
+    n: int, layers: int, rows: int, eps: float, l2_hint: int = mks.EVICT_NORMAL
+) -> tuple[list[mks.Op], list[mks.Edge]]:
+    """The chain's ops and edges, declared by hand: per layer one GEMV opcode per tile of
+    ``rows`` output rows with the layer's RMSNorm fused into its prologue and the residual
+    into its epilogue, waiting on the previous layer (one counter, target its tile count).
+    Tensor table: the layers' weights, the norms' weights, the activation buffer
+    ``[layers + 1, n]`` (row l: layer l's input). ``schedule="captured"`` builds the same
+    DAG from a recording of the reference instead (``kernel_agent.native.megakernel.
+    captured``)."""
+    act, tile_bytes = 2 * layers, rows * n * 2
 
+    def tile(layer: int, t: int) -> list[int]:  # layer's RMSNorm fused, its residual added
+        return gemv_args(
+            x=act, x_off=layer * n, gamma=layers + layer, eps=eps, out=act,
+            out_off=(layer + 1) * n, res=act, res_off=layer * n, row0=t * rows, rows=rows,
+            k=n,
+        )  # fmt: skip
 
-def f32_bits(value: float) -> int:
-    """A float argument as the int32 word the device reads with ``ctx.arg_f``."""
-    return struct.unpack("<i", struct.pack("<f", value))[0]
-
-
-def gemv_args(
-    *,
-    x: int,
-    x_off: int,
-    out: int,
-    out_off: int,
-    row0: int,
-    rows: int,
-    k: int,
-    gamma: int = -1,
-    gamma_off: int = 0,
-    eps: float = 0.0,
-    res: int = -1,
-    res_off: int = 0,
-    k0: int = 0,
-    klen: int | None = None,
-    part: int = -1,
-    part_off: int = 0,
-    scale: int = -1,
-    scale_off: int = 0,
-) -> list[int]:
-    """Arguments of a GEMV / GEMV_FP8 tile (tensors by table index, offsets in elements):
-    rows [row0, row0 + rows) of ``W h`` over columns [k0, k0 + klen); ``gamma``: fuse the
-    RMSNorm of x (over all k columns); ``res``: add a residual; ``part``: write fp32
-    partials there instead (split-K); ``scale``: the e4m3 weights' per-row scales."""
-    return [
-        x, x_off, gamma, gamma_off, f32_bits(eps), out, out_off, res, res_off, row0, rows, k,
-        k0, k if klen is None else klen, part, part_off, scale, scale_off,
-    ]  # fmt: skip
-
-
-def rmsnorm_args(
-    *, x: int, x_off: int, gamma: int, gamma_off: int, eps: float, out: int, out_off: int, n: int
-) -> list[int]:
-    return [x, x_off, gamma, gamma_off, f32_bits(eps), out, out_off, n]
-
-
-def residual_args(
-    *, a: int, a_off: int, b: int, b_off: int, out: int, out_off: int, i0: int, n: int
-) -> list[int]:
-    return [a, a_off, b, b_off, out, out_off, i0, n]
-
-
-def reduce_args(
-    *,
-    part: int,
-    part_off: int,
-    splits: int,
-    stride: int,
-    row0: int,
-    rows: int,
-    out: int,
-    out_off: int,
-    res: int = -1,
-    res_off: int = 0,
-) -> list[int]:
-    return [part, part_off, splits, stride, row0, rows, out, out_off, res, res_off]
-
-
-def argmax_args(*, x: int, x_off: int, n: int, out: int, out_off: int) -> list[int]:
-    return [x, x_off, n, out, out_off]
+    ops = [
+        mks.Op(
+            f"layer{layer}",
+            GEMV,
+            n // rows,
+            cost=float(tile_bytes),
+            args=lambda t, layer=layer: tile(layer, t),
+            weights=lambda t, layer=layer: mks.Prefetch(layer, t * tile_bytes, tile_bytes, l2_hint),
+        )
+        for layer in range(layers)
+    ]
+    edges = [mks.Edge(f"layer{k - 1}", f"layer{k}", mks.ALL) for k in range(1, layers)]
+    return ops, edges
 
 
 def extension():
@@ -174,12 +161,15 @@ class Chain(nn.Module):
         trace: bool = False,
         pages: int = 0,
         inflight: int = 1,
+        schedule: str = "hand",
     ) -> None:
         super().__init__()
         if mode not in MODES:
             raise ValueError(f"mode {mode!r}: one of {', '.join(MODES)}")
+        if schedule not in SCHEDULES:
+            raise ValueError(f"schedule {schedule!r}: one of {', '.join(SCHEDULES)}")
         self.reference = reference  # other row counts (a fallback)
-        self.mode = mode
+        self.mode, self.source = mode, schedule
         weights = [layer.weight.detach() for layer in reference.layers]
         gammas = [norm.weight.detach() for norm in reference.norms]
         self.eps = float(getattr(reference.norms[0], "variance_epsilon", 1e-6))
@@ -188,6 +178,7 @@ class Chain(nn.Module):
         with torch.inference_mode(False):  # buffers updated in place, in and out of inference
             self._weights, self._gammas = weights, gammas  # the graph holds their addresses
             self._act = torch.zeros(self.layers + 1, self.n, device=device, dtype=torch.bfloat16)
+        self._in, self._out = self._act[0], self._act[self.layers]  # a captured plan: its own
         self.ext = extension()
         self.rt: runtime.Runtime | None = None
         self.inflight = inflight
@@ -209,47 +200,57 @@ class Chain(nn.Module):
         fit, queues, page_bytes, max_slice = self.ext.mk_info()
         pages = min(pages, fit) if pages > 0 else fit
         n, layers = self.n, self.layers
+        if self.source == "captured":
+            return self._setup_captured(rows, trace, pages, queues, page_bytes)
         self.rows = rows = rows or tile_rows(n, pages * page_bytes)
         if rows < 1 or n % rows or n > max_slice:
             raise ValueError(
                 f"rows {rows} must divide n {n} (at most {max_slice} columns) and fit the page "
                 f"pool ({pages} pages of {page_bytes} bytes)"
             )
-        act = 2 * layers  # tensor table: weights, gammas, the activation buffer
-        tile_bytes = rows * n * 2
         # weights the L2 cannot keep stream once per call: evict them first, so the program,
         # the activations and the norms' weights stay in L2 (the GPU's own L2 size decides)
         l2 = torch.cuda.get_device_properties(self._act.device).L2_cache_size
         total = sum(w.numel() * w.element_size() for w in self._weights)
-        self.l2_hint = mks.EVICT_FIRST if total > l2 // 2 else mks.EVICT_NORMAL
-
-        def tile(layer: int, t: int) -> list[int]:  # layer's RMSNorm fused, its residual added
-            return gemv_args(
-                x=act, x_off=layer * n, gamma=layers + layer, eps=self.eps, out=act,
-                out_off=(layer + 1) * n, res=act, res_off=layer * n, row0=t * rows, rows=rows,
-                k=n,
-            )  # fmt: skip
-
-        ops = [
-            mks.Op(
-                f"layer{layer}",
-                GEMV,
-                n // rows,
-                cost=float(tile_bytes),
-                args=lambda t, layer=layer: tile(layer, t),
-                weights=lambda t, layer=layer: mks.Prefetch(
-                    layer, t * tile_bytes, tile_bytes, self.l2_hint
-                ),
-            )
-            for layer in range(layers)
-        ]
-        edges = [mks.Edge(f"layer{k - 1}", f"layer{k}", mks.ALL) for k in range(1, layers)]
+        self.l2_hint = oc.l2_hint(total, l2)
+        ops, edges = chain_dag(n, layers, rows, self.eps, self.l2_hint)
         self.schedule = mks.build(ops, edges, queues, meta={"rows": rows, "pages": pages})
         self.rt = runtime.Runtime(
             self.schedule,
             [*self._weights, *self._gammas, self._act],
             trace=trace,
             pool_bytes=pages * page_bytes,
+        )
+        rt = self.rt
+        return lambda: self.ext.mk_run(*rt.args(), pages, queues, self.inflight)
+
+    def _setup_captured(self, rows: int, trace: bool, pages: int, queues: int, page_bytes: int):
+        """The schedule of a recorded one-row call of the reference: its ops mapped to the
+        kit's opcode families, fused, tiled, its edges from the storages, costs from this
+        GPU's roofline (``kernel_agent.native.megakernel.captured``)."""
+        from kernel_agent.native.megakernel import captured
+
+        device = self._act.device
+        probe = torch.zeros(1, self.n, device=device, dtype=torch.bfloat16)
+        peaks, source = captured.peaks_here()
+        self.plan = plan = captured.from_module(
+            self.reference,
+            (probe,),
+            pool_bytes=pages * page_bytes,
+            rows=rows,
+            queues=queues,
+            peaks=peaks,
+            peaks_source=source,
+            l2_bytes=torch.cuda.get_device_properties(device).L2_cache_size,
+        )
+        self.schedule = plan.schedule(queues, meta={"pages": pages})  # refuses unmapped ops
+        self.rows = self.schedule.instrs[0].args[10]  # G_ROWS of a GEMV tile
+        with torch.inference_mode(False):
+            tensors = plan.tensors(device=device)
+        self._in = plan.bind(tensors, plan.inputs[0]).view(-1)
+        self._out = plan.bind(tensors, plan.outputs[0])
+        self.rt = runtime.Runtime(
+            self.schedule, tensors, trace=trace, pool_bytes=pages * page_bytes
         )
         rt = self.rt
         return lambda: self.ext.mk_run(*rt.args(), pages, queues, self.inflight)
@@ -272,9 +273,9 @@ class Chain(nn.Module):
             return self.reference(x)
         if self.rt is not None:
             self.rt.check()  # a hung schedule is not launched again
-        self._act[0].copy_(x.reshape(-1))
+        self._in.copy_(x.reshape(-1))
         self._graph.replay()
-        return self._act[self.layers].clone().view(x.shape)  # the buffer is reused
+        return self._out.clone().view(x.shape)  # the buffer is reused
 
     def trace_summary(self) -> dict:
         """Per op: execution and wait times of the last call, the prefetch overlap."""
@@ -324,11 +325,14 @@ def build(
     trace: bool = False,
     pages: int = 0,
     inflight: int = 1,
+    schedule: str = "hand",
 ) -> nn.Module:
     """``rows``: output rows per GEMV tile (0: :func:`tile_rows`, 16 where they fit the page
     pool); ``pages``: the page pool's size (0: what fits this GPU's shared memory);
     ``inflight``: pages each producer warp keeps in flight (0: all); ``trace``:
-    per-instruction time stamps (``trace_summary()``)."""
+    per-instruction time stamps (``trace_summary()``); ``schedule``: the megakernel's op DAG
+    declared by hand (:func:`chain_dag`) or built from a recorded call of the reference
+    (``captured``)."""
     if not _supported(reference, rows):
         return reference
-    return Chain(reference, mode, rows, trace, pages, inflight)
+    return Chain(reference, mode, rows, trace, pages, inflight, schedule)

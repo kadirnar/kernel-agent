@@ -4560,14 +4560,38 @@ errors at 28 layers on the A10; the protocol was correct, the check could not te
 The
 `native-engines` skill's `megakernel.md` is the milestone ladder, and a native digest
 points to it when a stage's best kernel synchronises its grid or launches more than 3
-kernels per call. Native candidates must give the same bits twice: the evaluator runs
-every case twice from the same inputs and state (`incorrect` at stage `determinism`,
+kernels per call, with the command that builds the stage's schedule from its capture.
+Native candidates must give the same bits twice: the evaluator runs every case twice from the same inputs and state (`incorrect` at stage `determinism`,
 unless the entry declares `ORDER_DEPENDENT_ATOMICS = "<why>"`); those whose sources use
 counters or atomics then run their main case 256 times back to back
 (`$KERNEL_AGENT_STRESS_CALLS`), on four inputs in turn and with GPU-side gaps, every call
 bit for bit an isolated call's (`determinism.stress`, issue #248: state one launch leaves
 for the next must not be reused early). A megakernel stopped by its watchdog is recorded
 as status `hang` with the instruction, counter, value and target.
+
+**Schedules from a stage's captured ops** (`native/megakernel/captured.py`). The ops and
+tile-level edges need not be declared by hand: `python -m
+kernel_agent.native.megakernel.schedule --from-capture targets/<id>/capture.pt` (or
+`captured.from_module(reference, args)` in `build()`) records one call of the stage with the
+fusion miner's op recorder and maps every aten op, by its structure and never by module
+names, to a family of the kit's generic opcodes (`native/megakernel/opcodes.py`, the
+example's `mk_ops.cuh`): RMSNorm, GEMV / skinny GEMM tiles (≤ 8 activation rows, bf16
+weights the stage only reads), residual add, gated activation (`silu` / `gelu` times an
+activation: a new `GLU` opcode), split-K reduce (K beyond the 4096-column slice, or
+`--split-k N|auto`) and argmax; every other op is listed as unsupported with why, and the
+plan refuses to schedule until it is mapped. It fuses norms into the GEMVs' prologues and
+residuals into their epilogues, tiles each op for the GPU's page pool, lays out the tensor
+table (weights, constants, one arena per dtype with a slice per value), derives the edges
+at tile granularity from the byte ranges each tile reads and writes (chunked counters where
+a consumer reads part of a producer), costs each tile from the roofline of the GPU at hand
+(`doctor`'s peaks or a ceilings table's `peaks`, labelled), then builds the queues and
+counters and runs the simulator over 1,000 random SM-speed draws. The example takes it as
+`build(reference, schedule="captured")`. Measured on an NVIDIA A10: the 28-layer chain
+built from its recorded call is the hand-declared program byte for byte at 1024 and 2048
+(same bits, same time within the bench's ±2 % order effect; predicted 152.7 µs at 1024,
+measured 152–162 µs); a decode gated MLP [1024 → 3072 → 1024] runs as one launch in
+54.5 µs against 66.2 µs for its PyTorch ops in a CUDA graph, [2048 → 8192 → 2048] in
+245.8 against 250.8 µs (`docs/research-scripts/megakernel-captured-225/`).
 
 ### Parameter sweeps
 

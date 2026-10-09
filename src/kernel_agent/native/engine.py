@@ -847,7 +847,13 @@ def megakernel_hint(run: RunDir, rows: Iterable[Mapping[str, Any]]) -> list[str]
         if isinstance(launches, int | float) and launches > MEGAKERNEL_LAUNCHES:
             why.append(f"launches {launches:g} kernels per call")
         if why:
-            hints.append(f"* `{target}`: its best kernel `{snap.name}` {' and '.join(why)}.")
+            line = f"* `{target}`: its best kernel `{snap.name}` {' and '.join(why)}."
+            if (capture := stage_capture(run, target)) is not None:
+                line += (
+                    " Its op DAG from the captured ops: `python -m "
+                    f"kernel_agent.native.megakernel.schedule --from-capture {capture}`."
+                )
+            hints.append(line)
     if not hints:
         return []
     return [
@@ -860,4 +866,19 @@ def megakernel_hint(run: RunDir, rows: Iterable[Mapping[str, Any]]) -> list[str]
         "include path, the scheduler and its simulator) replaces them by counter dependencies "
         "and loads the next instructions' weights while a block waits: the `native-engines` "
         "skill's `megakernel.md` and `examples/native_megakernel`.",
+        "* The schedule need not be declared by hand: `--from-capture` (or "
+        "`captured.from_module(reference, args)` in `build()`) maps each recorded op of one "
+        "call to the kit's opcode families (RMSNorm, GEMV tiles, residual add, gated "
+        "activation, split-K reduce, argmax; every other op listed as unsupported, with why), "
+        "fuses norms and residuals into the GEMVs, derives tile-level edges from the storages "
+        "and costs from this GPU's roofline, and checks the schedule in the simulator.",
     ]
+
+
+def stage_capture(run: RunDir, target: str) -> str | None:
+    """The capture of a stage target the agent can read (the inputs-only copy of a sealed
+    run, else the capture), relative to the run directory; None without one."""
+    for path in (run.target(target) / "capture_inputs.pt", run.capture_file(target)):
+        if path.is_file() and run.truth_dir not in path.parents:
+            return str(path.relative_to(run.root))
+    return None

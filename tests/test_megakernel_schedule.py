@@ -17,6 +17,7 @@ from kernel_agent import toolchain
 from kernel_agent.agent.prompts import EXAMPLES_DIR
 from kernel_agent.native import megakernel
 from kernel_agent.native import project as proj
+from kernel_agent.native.megakernel import opcodes as oc
 from kernel_agent.native.megakernel import schedule as mks
 from kernel_agent.native.megakernel import simulate
 from kernel_agent.native.megakernel.schedule import ALL, SAME, Edge, Op, Prefetch, shard, span
@@ -347,12 +348,24 @@ def test_the_example_mirrors_the_header_abi():
     for i, name in enumerate(names):
         assert getattr(mks, name) == i, name
     ops = (EXAMPLE / "include" / "mk_ops.cuh").read_text()
-    codes = dict(re.findall(r"(\w+) = (\d+)", re.search(r"enum Opcode[^}]*\}", ops).group(0)))
-    entry = (EXAMPLE / "candidate.py").read_text()
-    mirror = re.search(r"^(NOP, .*) = range\((\d+)\)$", entry, re.M)
-    assert mirror is not None
-    assert [n.strip() for n in mirror.group(1).split(",")] == list(codes)
-    assert [int(v) for v in codes.values()] == list(range(int(mirror.group(2))))
-    gemv = re.search(r"enum GemvArg[^}]*\}", ops).group(0)
-    slots = re.findall(r"G_\w+", gemv)
-    assert len(slots) == 18 and len(slots) <= mks.ARGS
+    for enum in ("Opcode", "GluAct"):  # numbers: the kit's opcodes module
+        codes = re.findall(r"(\w+) = (\d+)", re.search(rf"enum {enum}[^}}]*\}}", ops).group(0))
+        assert [(name, getattr(oc, name)) for name, _ in codes] == [(n, int(v)) for n, v in codes]
+    assert [name for name, _ in codes] == ["GLU_SILU", "GLU_GELU_TANH", "GLU_GELU"]
+    builders = {  # argument slots: as many as each builder writes
+        "GemvArg": oc.gemv_args(x=0, x_off=0, out=0, out_off=0, row0=0, rows=1, k=8),
+        "NormArg": oc.rmsnorm_args(
+            x=0, x_off=0, gamma=0, gamma_off=0, eps=0.0, out=0, out_off=0, n=8
+        ),
+        "ResidualArg": oc.residual_args(a=0, a_off=0, b=0, b_off=0, out=0, out_off=0, i0=0, n=8),
+        "GluArg": oc.glu_args(a=0, a_off=0, b=0, b_off=0, out=0, out_off=0, i0=0, n=8, act=0),
+        "ReduceArg": oc.reduce_args(
+            part=0, part_off=0, splits=1, stride=8, row0=0, rows=8, out=0, out_off=0
+        ),
+        "ArgmaxArg": oc.argmax_args(x=0, x_off=0, n=8, out=0, out_off=0),
+    }
+    for enum, args in builders.items():
+        slots = re.findall(r"\b[A-Z]_\w+", re.search(rf"enum {enum}[^}}]*\}}", ops).group(0))
+        assert len(slots) == len(args) <= mks.ARGS, enum
+    entry = (EXAMPLE / "candidate.py").read_text()  # the example takes the kit's ABI
+    assert "from kernel_agent.native.megakernel.opcodes import" in entry
