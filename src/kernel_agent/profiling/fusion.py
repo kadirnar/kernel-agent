@@ -60,8 +60,9 @@ does not see (another process, a graph replay) is not traffic.
 
 The per-launch cost is the measured launch floor when the run launches eagerly, at most the
 run's own time per recorded op (window ÷ ops: the floor times a module call, whose Python a
-bare op does not pay), and :data:`GRAPH_BOUNDARY_US` per kernel boundary when the kernel
-view shows most GPU work launched by CUDA graphs.
+bare op does not pay), and the measured CUDA-graph launch floor (``launch_floor_graph_us``;
+:data:`GRAPH_BOUNDARY_US` for peaks without one) per kernel boundary when the kernel view
+shows most GPU work launched by CUDA graphs.
 
 Overlap-aware ranking (:func:`build`): rows can share an op, an anchor in one's prologue
 and another's epilogue (a norm before q / k / v and the q norm after q), and one GEMM
@@ -107,6 +108,7 @@ from typing import Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from kernel_agent.kernels.roofline import GRAPH_LAUNCH_FLOOR_US
 from kernel_agent.projection import fold
 
 VERSION = 2  # 2: the L2 traffic of each intermediate, overlaps and counted rows
@@ -114,8 +116,9 @@ VERSION = 2  # 2: the L2 traffic of each intermediate, overlaps and counted rows
 #: carries to its next step (a position counter) is not a fusion.
 MAX_GAP = 64
 #: A kernel boundary inside a CUDA graph (drain, launch, ramp-up of the next grid): ~0.9 us,
-#: measured on an RTX 5070 Ti (docs/PARALLEL.md §4.6), used where no launch floor applies.
-GRAPH_BOUNDARY_US = 0.9
+#: measured on an RTX 5070 Ti (docs/PARALLEL.md §4.6), used where the peaks have no measured
+#: CUDA-graph launch floor (the roofline's stand-in for it).
+GRAPH_BOUNDARY_US = GRAPH_LAUNCH_FLOOR_US
 #: Candidates shown in ``summary.md`` (``fusions.md`` shows :data:`SHOWN`).
 TOP = 10
 SHOWN = 40
@@ -915,13 +918,16 @@ def build(
     peaks = peaks or {}
     dram = float(peaks.get("dram_gbps") or 0.0)
     floor_us = float(peaks.get("launch_floor_us") or 0.0)
+    graph_us = float(peaks.get("launch_floor_graph_us") or 0.0)  # measured since peaks v8
     mode, mode_basis = launch_mode(profile)
     # an eager launch saves at most what an op of this run takes on average: the launch
     # floor (a module call with one kernel) includes Python a bare op does not pay
     ops = int(raw.get("ops") or 0)
     per_op_us = 1000.0 * window_ms / ops if ops and window_ms > 0 else None
     notes = []
-    if mode == "graph":
+    if mode == "graph" and graph_us:
+        boundary, basis = graph_us, f"the measured CUDA-graph launch floor; {mode_basis}"
+    elif mode == "graph":
         boundary, basis = GRAPH_BOUNDARY_US, f"a CUDA-graph kernel boundary; {mode_basis}"
     elif floor_us and (per_op_us is None or floor_us <= per_op_us):
         boundary, basis = floor_us, f"the measured launch floor of an eager run; {mode_basis}"

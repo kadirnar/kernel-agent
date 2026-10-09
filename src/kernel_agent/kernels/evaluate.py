@@ -229,12 +229,18 @@ def record_schema(record: dict[str, Any]) -> int:
         return 0
 
 
-def stale(record: dict[str, Any]) -> str | None:
-    """Why ``record`` was measured by an older evaluator than this one (None: it was not);
-    only the schema counts, not the commit."""
+def stale(record: dict[str, Any], context: tuple[str, str] | None = None) -> str | None:
+    """Why ``record`` was measured by an older evaluator than this one, or (``context``: its
+    target's timing context, ``TimingContext.key``) in another timing context without a
+    speedup in this one (#226, :func:`kernels.context.comparable`); None: neither. Only the
+    schema counts, not the commit."""
     schema = record_schema(record)
     if schema >= EVALUATOR_SCHEMA:
-        return None
+        if context is None:
+            return None
+        from kernel_agent.kernels.context import comparable
+
+        return comparable(record, context)[1]
     if schema == 0:
         return f"measured before evaluator_version was recorded (now schema {EVALUATOR_SCHEMA})"
     return f"measured by evaluator schema {schema} (now {EVALUATOR_SCHEMA})"
@@ -1440,6 +1446,7 @@ def _stages(
     if (memory := peak_memory_summary(case_reports)) is not None:
         result["peak_memory"] = memory
     # speed of light per case (after timing, never inside it): sol_ms, pct_of_sol, bound
+    # (the launch bound of the context it was timed in: a CUDA graph pays no host launch)
     annotate(
         result,
         reference,
@@ -1447,6 +1454,7 @@ def _stages(
         l2_flush=l2_flush,
         precision=capture_precision(capture),
         restore=(lambda c: replay.restore(c, reference)) if replay else None,
+        context=context,
     )
     if profile:
         try:

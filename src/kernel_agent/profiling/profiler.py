@@ -1368,7 +1368,8 @@ def _roofline_note() -> list[str]:
         "",
         f"{toolchain.format_peaks(peaks)}. A module call takes at least max(FLOPs / peak, "
         "bytes it must read and write / bandwidth), and at least the launch floor if it "
-        "launches anything. Weights are read once per call, so a class with P bf16 "
+        "launches anything (inside a CUDA-graph replay the graph one: no host time per "
+        "launch). Weights are read once per call, so a class with P bf16 "
         f"parameters needs ≥ 2·P bytes / {gbps:.0f} GB/s per call (≈ {2e3 / gbps:.1f} us per "
         "million parameters): when *inclusive ms / calls* is far above that, there is "
         "headroom. Kernel "

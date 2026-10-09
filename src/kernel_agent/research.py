@@ -29,6 +29,7 @@ from typing import Any
 from kernel_agent import board, ledger, truth
 from kernel_agent.agent.prompts import DOSSIER_FILE
 from kernel_agent.agent.tools import best_for_target, idea_rows
+from kernel_agent.kernels import context as timing_context
 from kernel_agent.truth import TamperError, Truth
 from kernel_agent.workers import all_notes
 from kernel_agent.workspace import RunDir
@@ -104,12 +105,13 @@ def ideas_table(stats: list[dict[str, Any]]) -> list[str]:
 
 def target_ideas(run: RunDir, target_id: str, keeper: Truth | None = None) -> list[dict[str, Any]]:
     """:func:`kernel_agent.ledger.ideas` of a target from its records (they carry the
-    expected speedups); from its ledger rows when the records cannot be verified."""
+    expected speedups), seen from its timing context (#226); from its ledger rows when the
+    records cannot be verified."""
     try:
         records = (keeper or truth.of(run)).records(run.results_file(target_id))
     except TamperError:
         return ledger.ideas(r for r in ledger.rows(run) if r["target"] == target_id)
-    return ledger.ideas(idea_rows(records))
+    return ledger.ideas(idea_rows(records, timing_context.current(run, target_id).key))
 
 
 def plan_section(run: RunDir, target_id: str) -> list[str]:

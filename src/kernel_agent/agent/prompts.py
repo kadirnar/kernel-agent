@@ -1440,7 +1440,8 @@ Every timed result reports the roofline of each case for the current
 recipe: `sol_ms` = max(FLOPs / peak FLOP/s, `min_bytes` / peak bandwidth) with peaks
 measured on this GPU, `pct_of_sol` = 100 × sol_ms / new_ms, and `bound`
 (`memory`, `compute`, or `launch` when even a perfect kernel is dominated by one
-launch: then compare `new_ms` with `launch_floor_ms` and fuse more work per
+launch in the result's `context`: then compare `new_ms` with `launch_floor_ms`, a
+launch from Python eagerly, a kernel boundary in a CUDA graph, and fuse more work per
 launch). The result-level `pct_of_sol` weights the cases by calls per run; at
 ≥ 90 % the advice is `stop`: this recipe is at its bound, and the next gain needs
 another one (fewer bytes: fusion with the neighbouring calls, a precision the run
@@ -1801,7 +1802,8 @@ Go through every item, say whether it applies and cite `exp` numbers:
    reduction order) or semantic (an output, side effect or entrypoint the
    candidate gets wrong)? Check the outputs against `reference_source.py`.
 4. **Wrong bottleneck**: compute work on a memory- or launch-bound kernel, or the
-   reverse (`bound`, `pct_of_sol`, `launch_floor_ms`). Without per-kernel times
+   reverse (`bound`, `pct_of_sol`, `launch_floor_ms`, all in the record's `context`:
+   a CUDA graph's floor has no host time). Without per-kernel times
    in the records, recommend one evaluation with `profile=true` first.
 5. **Missing fundamental**: a standard technique never tried (fusion across the
    module boundary, split-K / flash-decoding for one-position decode, 128-bit

@@ -146,7 +146,7 @@ def load_peaks(path: Path) -> dict[str, Any] | None:
 
 
 def format_peaks(peaks: dict[str, Any]) -> str:
-    """One line: copy bandwidths (read + write bytes), matmul TFLOP/s, launch floor."""
+    """One line: copy bandwidths (read + write bytes), matmul TFLOP/s, launch floors."""
     parts = [f"copy DRAM {peaks['dram_gbps']:.0f} GB/s"]
     if peaks.get("l2_gbps"):
         parts.append(f"L2 {peaks['l2_gbps']:.0f} GB/s")
@@ -169,7 +169,10 @@ def format_peaks(peaks: dict[str, Any]) -> str:
             "no " + "/".join(short.get(k, k) for k in peaks["tflops_unavailable"]) + " matmul"
         )
     if peaks.get("launch_floor_us"):
-        parts.append(f"launch floor {peaks['launch_floor_us']:.1f} us")
+        floor = f"launch floor {peaks['launch_floor_us']:.1f} us"
+        if peaks.get("launch_floor_graph_us"):  # a kernel boundary in a CUDA graph (#226)
+            floor += f" ({peaks['launch_floor_graph_us']:.1f} us in a CUDA graph)"
+        parts.append(floor)
     if peaks.get("mma_tflops"):  # tensor-core instruction rates (kernels/mma_peaks.py)
         from kernel_agent.kernels.mma_peaks import describe
 

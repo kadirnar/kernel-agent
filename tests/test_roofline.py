@@ -228,6 +228,50 @@ def test_apply_sol_weights_and_flags():
     assert sol_signal({"correct": False, "pct_of_sol": 99.0}) is None
 
 
+def test_the_launch_floor_follows_the_timing_context(monkeypatch):
+    """#226: a graph-timed result's launch bound and ``launch_floor_ms`` are the CUDA graph's
+    (no host time per launch; measured on an NVIDIA A10, sm_86: 19.4 us eager, 1.28 us in a
+    graph); peaks from before version 8 have none: a documented stand-in, said in the result."""
+    peaks = {**PEAKS, "launch_floor_graph_us": 0.5}
+    assert roofline.launch_floor(peaks, "eager") == (10.0, None)
+    assert roofline.launch_floor(peaks, "graph") == (0.5, None)
+    floor, note = roofline.launch_floor(PEAKS, "graph")  # an older cache
+    assert floor == roofline.GRAPH_LAUNCH_FLOOR_US and note and "before peaks version 8" in note
+    assert roofline.launch_floor({}, "eager") == (0.0, None)  # not measured: no launch bound
+
+    small = CaseCost(read_bytes=2_000_000, write_bytes=2_000_000)  # 4 MB from DRAM: 4 us
+    eager_sol = sol_time(small, peaks)
+    assert eager_sol["bound"] == "launch"  # below the 10 us eager floor
+    graph_sol = sol_time(small, peaks, context="graph")
+    assert graph_sol["bound"] == "memory" and graph_sol["sol_ms"] == eager_sol["sol_ms"]
+
+    eager, graph, old = (_result((1, 0.02, 0.012)) for _ in range(3))
+    apply_sol(eager, [small], peaks)
+    apply_sol(graph, [small], peaks, context="graph")
+    apply_sol(old, [small], PEAKS, context="graph")
+    assert eager["launch_floor_ms"] == 0.01 and eager["bound"] == "launch"
+    assert graph["launch_floor_ms"] == 0.0005 and graph["bound"] == "memory"
+    assert graph["cases"][0]["bound"] == "memory" and "launch_floor_note" not in graph
+    assert eager["pct_of_sol"] == graph["pct_of_sol"]  # the work is the same
+    assert old["launch_floor_ms"] == 0.0009 and "0.9 us assumed" in old["launch_floor_note"]
+    assert compact(old)["launch_floor_note"] == old["launch_floor_note"]
+
+    lin, cases = nn.Linear(64, 64), [{"args": (torch.ones(2, 64),), "kwargs": {}}]
+    annotated = _result((1, 0.5, 0.2))
+    annotate(annotated, lin, cases, peaks=peaks, context="graph")
+    assert annotated["launch_floor_ms"] == 0.0005 and annotated["bound"] == "launch"
+
+    # a sweep's rows: the floor of the context its configs were timed in
+    from kernel_agent.kernels import sweep
+
+    monkeypatch.setattr(roofline, "current_peaks", lambda: peaks)
+    rows = [_result((1, 0.5, 0.2)), _result((1, 0.5, 0.2))]
+    cases[0]["method"] = "forward"
+    assert sweep._speed_of_light(rows[:1], lin, cases, [0], False, context="graph") is None
+    assert sweep._speed_of_light(rows[1:], lin, cases, [0], False) is None
+    assert [r["launch_floor_ms"] for r in rows] == [0.0005, 0.01]
+
+
 def test_annotate_without_peaks_and_on_errors(monkeypatch):
     result = _result((1, 0.5, 0.2))
     monkeypatch.setattr(roofline, "current_peaks", lambda: None)
@@ -310,6 +354,8 @@ def test_toolchain_peaks_cache(tmp_path, monkeypatch):
     assert peaks is not None and peaks["dram_gbps"] == 812.5
     line = toolchain.format_peaks(peaks)
     assert line == "copy DRAM 812 GB/s, L2 2900 GB/s, matmul bf16 100 TFLOP/s, launch floor 9.5 us"
+    graphed = toolchain.format_peaks({**peaks, "launch_floor_graph_us": 1.28})  # version 8
+    assert graphed.endswith("launch floor 9.5 us (1.3 us in a CUDA graph)")
     tc = toolchain.Toolchain(
         gpu=None, torch_version="x", torch_cuda=None, cuda_home=None, nvcc_version=None, peaks=peaks
     )
@@ -360,6 +406,8 @@ def test_measured_peaks_and_rmsnorm_sol(tmp_path):
         assert low in peaks.get("tflops_unavailable", {}) or peaks["tflops"][low] > 1
     assert peaks["version"] == roofline.PEAKS_VERSION
     assert 0.5 < peaks["launch_floor_us"] < 500
+    # a kernel boundary in a CUDA graph pays no host time (A10: 1.28 vs 19.4 us eagerly)
+    assert 0 < peaks["launch_floor_graph_us"] < peaks["launch_floor_us"]
     print("peaks:", toolchain.format_peaks(peaks))
 
     capture = make_rmsnorm_capture(tmp_path / "rms.pt")
@@ -377,6 +425,11 @@ def test_measured_peaks_and_rmsnorm_sol(tmp_path):
             f"{case['sol_ms'] * 1000:.2f} us, {case['pct_of_sol']} % of SOL, {case['bound']}"
         )
     print("weighted pct_of_sol:", result["pct_of_sol"], "bound:", result["bound"])
+    assert result["launch_floor_ms"] == round(peaks["launch_floor_us"] / 1000, 5)
+    graphed = evaluate(capture, EXAMPLES_DIR / "triton_rmsnorm.py", context="graph")
+    assert graphed["status"] == "ok" and graphed["context"] == "graph", graphed
+    assert graphed["launch_floor_ms"] == round(peaks["launch_floor_graph_us"] / 1000, 5)
+    print("graph-timed bound:", graphed["bound"], "launch floor ms:", graphed["launch_floor_ms"])
 
     # attention over a static cache on the GPU: SDPA's mask-aware accounting holds there too
     cache = torch.zeros(2, 2, 1, 4, 1024, 64, device="cuda", dtype=torch.bfloat16)

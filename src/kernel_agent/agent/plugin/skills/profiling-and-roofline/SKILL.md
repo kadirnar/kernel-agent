@@ -46,8 +46,8 @@ statistics", "Host synchronisation in the profile"). What to do about each regim
   of every op of one run, with the GEMM / convolution / attention that could take them as
   an epilogue or prologue (*fuse*), across module boundaries (*crosses*), never across a
   host sync; layers deduplicated (*calls*). *saves* = the DRAM part of the intermediates'
-  round trips / DRAM bandwidth + launches saved × the launch floor (eager) or ~0.9 us per
-  CUDA-graph boundary. LRU-ish L2: of an intermediate, what exceeds L2 − the bytes other
+  round trips / DRAM bandwidth + launches saved × the launch floor (eager) or the measured
+  CUDA-graph launch floor per boundary (~0.9 us where the peaks have none). LRU-ish L2: of an intermediate, what exceeds L2 − the bytes other
   ops touch between its write and its last read counts (0 when it fits with that traffic;
   `fusions.md` says per intermediate: in L2, evicted by N MB of traffic, larger than the
   L2). The counted rows share no op and add up; a row marked ↳ is an alternative that
@@ -66,8 +66,11 @@ with its number.
 Every timed `evaluate_candidate` result reports per case `flops`, `min_bytes` (every byte
 range the reference reads once, outputs and changed state once), `sol_ms` = max(Σ flops /
 peak, min_bytes / bandwidth), `pct_of_sol` = 100 × sol_ms / new_ms and `bound`
-(`compute`, `memory`, or `launch` when `sol_ms` is below the launch floor), plus the
-weighted `pct_of_sol`, `sol_ms_weighted`, the dominant `bound` and `launch_floor_ms`.
+(`compute`, `memory`, or `launch` when `sol_ms` is below the launch floor of the result's
+`context`), plus the weighted `pct_of_sol`, `sol_ms_weighted`, the dominant `bound` and
+`launch_floor_ms`: eagerly a launch from Python, in a CUDA graph one kernel boundary, which
+pays no host time (measured on an NVIDIA A10, sm_86: 19.4 us vs 1.28 us). A graph-timed
+case below the eager floor is not launch bound there: its bytes or FLOPs set its bound.
 
 * `l2_resident`: the case's bytes fit in L2 and are compared with the L2 bandwidth (the
   benchmark reuses warm inputs; never with `l2: cold`).
@@ -94,7 +97,10 @@ the candidate cannot be captured in a CUDA graph (a host sync, a CPU tensor, a t
 inputs replaced instead of written in place) or computes something else when replayed: it
 would break a graphed stage, whatever its eager speedup. Measured: an FP8 GEMM of two Triton
 launches at M = 352 was 0.58x eagerly and 2.01x graph-timed with a cold L2 (RTX 5070 Ti),
-so compare candidates in the context the result names.
+so compare candidates in the context the result names. When a re-profile changes the
+target's context, earlier records compare at their `speedup_by_context` there (`measured_in`
+says where they were timed) or not at all (`context_stale`: an eager loser was never timed
+in a graph, so an idea refuted eagerly is untested there; evaluate it again).
 
 ## Deeper: `profile=true` and Nsight Compute
 

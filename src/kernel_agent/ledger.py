@@ -8,7 +8,9 @@ experiment:
               margin: ``speedup > best × (1 + max(1 %, 2 × timing_spread))``, the
               same rule as the budget advice (:func:`kernel_agent.budget.improves`);
               kernel targets start from the reference module (1.0×), ``e2e`` rows
-              from the baseline run
+              from the baseline run. A kernel's best is in the timing context the new
+              evaluation was timed in (:func:`bar`, #226): a row timed in another one
+              counts at its speedup there, or not at all without one
 * ``discard`` correct, but not better
 * ``incorrect``, ``incorrect_timed_output``, ``incorrect_perturbed``,
   ``integrity_violation``, ``fallback``, ``build_error``, ``runtime_error``,
@@ -85,6 +87,7 @@ from typing import Any
 
 from kernel_agent import diversity
 from kernel_agent.budget import MIN_GAIN, Standing, improves
+from kernel_agent.kernels import context as timing_context
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
 
 COLUMNS = (
@@ -256,6 +259,42 @@ def best_kept(rows: Iterable[dict[str, Any]]) -> float:
     return _standing(rows).best
 
 
+def in_context(
+    run: RunDir, target_id: str, rows: Iterable[dict[str, Any]], key: tuple[str, str]
+) -> list[dict[str, Any]]:
+    """A kernel target's ``rows`` with the ``speedup`` of each ``keep`` and ``re-evaluated``
+    one in the timing context ``key`` (``(context, l2)``, #226): its record's (``results.jsonl``,
+    by ``exp``; :func:`kernel_agent.kernels.context.comparable`), None when that record was
+    timed in another context and has no speedup in this one. A row whose record is not there
+    (being written by another session at this moment) keeps its own speedup."""
+    rows = list(rows)
+    if not any(r["status"] in (KEEP, REEVALUATED) for r in rows):
+        return rows
+    records = {r.get("exp"): r for r in read_jsonl(run.results_file(target_id))}
+    out = []
+    for row in rows:
+        rec = records.get(row["exp"]) if row["status"] in (KEEP, REEVALUATED) else None
+        if rec is not None and rec.get("speedup") is not None:
+            row = {**row, "speedup": timing_context.comparable(rec, key)[0]}
+        out.append(row)
+    return out
+
+
+def bar(
+    run: RunDir,
+    target_id: str,
+    key: tuple[str, str],
+    ledger_rows: Iterable[dict[str, Any]] | None = None,
+) -> float:
+    """The keep bar of a kernel target for an evaluation timed in ``key`` (``(context, l2)``):
+    :func:`best_kept` of its rows (of ``ledger_rows``, else of the ledger) at their speedups
+    in that context (:func:`in_context`): a row timed in another context counts at its
+    speedup in this one, and without one it sets no bar (#226)."""
+    found = rows(run) if ledger_rows is None else ledger_rows
+    mine = [r for r in found if r["target"] == target_id]
+    return best_kept(in_context(run, target_id, mine, key))
+
+
 def e2e_backend(transforms: list[Any], kernels: list[str]) -> str:
     return "+".join(k for k, v in (("transform", transforms), ("kernels", kernels)) if v) or "none"
 
@@ -321,12 +360,15 @@ def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     best), ``refuted`` (at least :data:`REFUTED_TRIES` correct tries, none a new best and
     none within the noise of the target's best: ``best × (1 + max(1 %, 2 × spread))`` below
     it; ``refuted`` holds the tries and that best) or ``buggy`` (never correct: untested,
-    not refuted).
+    not refuted). A correct try timed in another timing context than the target's current
+    one, without a speedup in it (``context_stale``: ``tools.idea_rows`` of records seen
+    from that context, #226), is a try but no evidence against the idea.
     """
     rows = list(rows)
     bar = best_kept(r for r in rows if r.get("status"))  # the target's best (the keep bar)
     out: dict[str, dict[str, Any]] = {}
     near: dict[str, bool] = {}  # a correct try within the noise of the bar
+    stale: dict[str, int] = {}  # correct tries not comparable with the bar (#226)
     for row in rows:
         idea = str(row.get("idea") or "")
         if not idea or row.get("status") in UNMEASURED:
@@ -355,6 +397,8 @@ def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             agg["kept"] += 1
         else:
             agg["slow"] += 1
+            if row.get("context_stale"):
+                stale[idea] = stale.get(idea, 0) + 1
         speedup = _num(row.get("speedup")) if row.get("correct") else None
         if speedup is not None and (agg["best"] is None or speedup > agg["best"]):
             agg["best"] = speedup
@@ -368,9 +412,10 @@ def ideas(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             agg["exps"].append(row["exp"])
     for idea, agg in out.items():
         agg["verdict"] = "kept" if agg["kept"] else "slow" if agg["slow"] else "buggy"
-        if agg["verdict"] == "slow" and agg["slow"] >= REFUTED_TRIES and not near.get(idea):
+        evidence = agg["slow"] - stale.get(idea, 0)
+        if agg["verdict"] == "slow" and evidence >= REFUTED_TRIES and not near.get(idea):
             agg["verdict"] = "refuted"
-            agg["refuted"] = {"tries": agg["slow"], "best": agg["best"], "target_best": bar}
+            agg["refuted"] = {"tries": evidence, "best": agg["best"], "target_best": bar}
     return list(out.values())
 
 
@@ -640,7 +685,8 @@ def record_kernel(
     review: str | None = None,
     title: str = "",
 ) -> dict[str, Any]:
-    """Classify a kernel evaluation against the target's running best and append it.
+    """Classify a kernel evaluation against the target's running best in the timing context
+    it was timed in (:func:`bar`) and append it.
 
     ``status``: a status of :data:`UNMEASURED` instead of the classification;
     ``worker``: the target's worker that ran it (:mod:`kernel_agent.workers`); ``queue_s``:
@@ -649,7 +695,8 @@ def record_kernel(
     ``title``: the agent's name of this version (:func:`clean_title`). Its ``evaluation``
     event lists the ``files`` it measured (:func:`kernel_files`)."""
     with _lock:
-        best = best_kept([r for r in rows(run) if r["target"] == target_id])
+        # the bar in the context it was timed in (an unmeasured status is not classified)
+        best = bar(run, target_id, timing_context.timed_in(result)) if not status else 1.0
         row = append(
             run,
             {

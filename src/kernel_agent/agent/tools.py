@@ -295,7 +295,8 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "pct_of_sol",
             "sol_ms_weighted",
             "bound",
-            "launch_floor_ms",
+            "launch_floor_ms",  # of the timing context (#226)
+            "launch_floor_note",  # a floor this GPU's peaks lack (roofline.launch_floor)
             "suspicious_faster_than_sol",
             "sol_unreliable",
             "sol_note",
@@ -307,6 +308,10 @@ def compact(result: dict[str, Any]) -> dict[str, Any]:
             "l2",
             "context_reason",
             "speedup_by_context",
+            # an earlier record seen from the target's current context (kernels/context.py)
+            "measured_in",
+            "context_note",
+            "context_stale",
         )
         if k in result
     }
@@ -552,29 +557,43 @@ def _expected(value: Any) -> float | None:
     return number if 0 < number < 1e6 else None
 
 
-def idea_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """``results.jsonl`` records as rows for :func:`kernel_agent.ledger.ideas`."""
-    return [
-        {
-            "idea": r.get("idea"),
-            "status": r.get("ledger_status") or r.get("status"),
-            "correct": bool(r.get("correct")),
-            "speedup": r.get("speedup"),
-            "expected_speedup": r.get("expected_speedup"),
-            "hypothesis": r.get("hypothesis"),
-            "exp": r.get("exp"),
-            "snapshot": r.get("snapshot"),  # a re-evaluation replaces its snapshot's record
-            "spread": ledger.kernel_spread(r),  # the noise of "within the noise of the best"
-        }
-        for r in records
-    ]
+def idea_rows(
+    records: list[dict[str, Any]], context: tuple[str, str] | None = None
+) -> list[dict[str, Any]]:
+    """``results.jsonl`` records as rows for :func:`kernel_agent.ledger.ideas`; ``context``:
+    the target's timing context (``TimingContext.key``), each speedup the record's there
+    (``timing_context.comparable``; none, and ``context_stale`` why, when it has none, #226)."""
+    rows = []
+    for r in records:
+        speedup, stale = (
+            (r.get("speedup"), None) if context is None else timing_context.comparable(r, context)
+        )
+        rows.append(
+            {
+                "idea": r.get("idea"),
+                "status": r.get("ledger_status") or r.get("status"),
+                "correct": bool(r.get("correct")),
+                "speedup": speedup,
+                "expected_speedup": r.get("expected_speedup"),
+                "hypothesis": r.get("hypothesis"),
+                "exp": r.get("exp"),
+                "snapshot": r.get("snapshot"),  # a re-evaluation replaces its snapshot's record
+                "spread": ledger.kernel_spread(r),  # the noise of "within the noise of the best"
+                **({"context_stale": stale} if stale else {}),
+            }
+        )
+    return rows
 
 
-def idea_stats(records: list[dict[str, Any]], idea: str) -> dict[str, Any] | None:
-    """``ledger.ideas`` of ``idea`` over a target's records (None: no try of it yet)."""
+def idea_stats(
+    records: list[dict[str, Any]], idea: str, context: tuple[str, str] | None = None
+) -> dict[str, Any] | None:
+    """``ledger.ideas`` of ``idea`` over a target's records (None: no try of it yet), seen
+    from the target's timing ``context`` (:func:`idea_rows`)."""
     if not idea:
         return None
-    return next((s for s in ledger.ideas(idea_rows(records)) if s["idea"] == idea), None)
+    rows = idea_rows(records, context)
+    return next((s for s in ledger.ideas(rows) if s["idea"] == idea), None)
 
 
 #: Session advice (docs/MULTIAGENT.md §3.12.5): this many build errors in a row on one idea
@@ -582,23 +601,29 @@ BUILD_ERRORS = 3
 
 
 def idea_feedback(
-    records: list[dict[str, Any]], idea: str, expected: float | None, row: dict[str, Any]
+    records: list[dict[str, Any]],
+    idea: str,
+    expected: float | None,
+    row: dict[str, Any],
+    context: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """``idea`` part of an ``evaluate_candidate`` result: expected vs measured, the idea so far
     (a refuted idea says so: stop its variations; :data:`BUILD_ERRORS` build errors in a row
-    on it advise compile triage or another idea)."""
+    on it advise compile triage or another idea), seen from the target's timing ``context``
+    (:func:`idea_rows`)."""
     out: dict[str, Any] = {"id": idea or None, "expected_speedup": expected}
     out["speedup"] = row["speedup"] if row["correct"] else None
     if row["correct"] and expected and row["speedup"]:
         out["vs_expected"] = f"{row['speedup']:.3f}x measured vs {expected:.3f}x expected"
-    stats = idea_stats(records, idea)
+    stats = idea_stats(records, idea, context)
     if stats:
         out |= {k: stats[k] for k in ("tries", "best", "kept", "slow", "bugs", "verdict")}
     if stats and stats["verdict"] == "refuted":
         out["note"] = (
-            f"refuted: stop variations of {idea!r}. {stats['slow']} correct tries, none a new "
-            f"best or within the noise of the best ({stats['refuted']['target_best']}x): take "
-            "the next open idea (a variant of this one needs force=true past the critic)"
+            f"refuted: stop variations of {idea!r}. {stats['refuted']['tries']} correct tries, "
+            "none a new best or within the noise of the best "
+            f"({stats['refuted']['target_best']}x): take the next open idea (a variant of this "
+            "one needs force=true past the critic)"
         )
     if not row["correct"] and idea:
         out["note"] = (
@@ -683,7 +708,10 @@ def current_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def ranked_for_target(
-    run: RunDir, target_id: str, keeper: Truth | None = None
+    run: RunDir,
+    target_id: str,
+    keeper: Truth | None = None,
+    context: tuple[str, str] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """The correct records of a target, fastest first, whose snapshot is still the
     evaluated file (checked lazily, as the caller asks for the next one).
@@ -691,27 +719,47 @@ def ranked_for_target(
     Only records kernel-agent wrote count (lines appended by anyone else are
     ignored); a target whose records were modified has none. Every worker of a
     target records here (``workers.py``), so this ranks across workers. A re-evaluated
-    snapshot ranks by its re-evaluation (:func:`current_records`)."""
+    snapshot ranks by its re-evaluation (:func:`current_records`).
+
+    Speedups are compared in the target's timing context (``context``, else its current one:
+    ``timing_context.current``, #226): a record timed in the other one ranks by its speedup
+    there, as its view from this one (``timing_context.in_context``: ``measured_in`` and
+    ``context_note`` say so). Those without a speedup there come after every one that has
+    it, by their own speedups, with ``context_stale`` saying why: the integration
+    re-evaluates such a record before it takes it (``evaluate.stale``)."""
     keeper = keeper or truth.of(run)
     try:
         records = current_records(keeper.records(run.results_file(target_id)))
     except TamperError:
         return
-    ranked = [r for r in records if r.get("correct") and r.get("speedup") is not None]
-    ranked.sort(key=lambda r: -float(r["speedup"]))  # stable: the first of equals wins
+    key = context or timing_context.current(run, target_id).key
+    ranked: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    for rec in records:
+        if not rec.get("correct") or rec.get("speedup") is None:
+            continue
+        if (view := timing_context.in_context(rec, key)) is not None:
+            ranked.append(view)
+        else:
+            stale.append({**rec, "context_stale": timing_context.comparable(rec, key)[1]})
+    for found in (ranked, stale):
+        found.sort(key=lambda r: -float(r["speedup"]))  # stable: the first of equals wins
     history = run.history_dir(target_id)
-    for rec in ranked:
+    for rec in [*ranked, *stale]:
         name = Path(str(rec.get("snapshot", ""))).name
         if keeper.snapshot_ok(history / name, rec.get("snapshot_sha256")):
             yield rec
 
 
 def best_for_target(
-    run: RunDir, target_id: str, keeper: Truth | None = None
+    run: RunDir,
+    target_id: str,
+    keeper: Truth | None = None,
+    context: tuple[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """The fastest correct record of a target (of all its workers) whose snapshot is still
-    the evaluated file (:func:`ranked_for_target`)."""
-    return next(ranked_for_target(run, target_id, keeper), None)
+    the evaluated file, in its timing context (:func:`ranked_for_target`)."""
+    return next(ranked_for_target(run, target_id, keeper, context), None)
 
 
 def _uncounted(budget: Budget, agent: str, evals_budget: int | None) -> dict[str, Any]:
@@ -823,23 +871,26 @@ def build_server(
         path = _path(base, str(parent)) if parent else None
         return path if path is not None and path.is_file() else None
 
+    def _key(target_id: str) -> tuple[str, str]:
+        """The target's timing context as ``(context, l2)``: what its records compare in."""
+        return timing_context.current(run, target_id).key
+
     def _best_so_far(target_id: str) -> dict[str, Any]:
         best = best_for_target(run, target_id, keeper)
-        return {
-            "best_so_far": {"snapshot": best["snapshot"], "speedup": best["speedup"]}
-            if best
-            else None
-        }
+        found = None
+        if best:  # in the target's timing context (#226), or why its speedup is not
+            keys = ("snapshot", "speedup", "measured_in", "context_stale")
+            found = {k: best[k] for k in keys if k in best}
+        return {"best_so_far": found}
 
     def _bar(target_id: str) -> dict[str, Any]:
         """``early_best`` for the evaluator: the speedup a new best of ``target_id`` must beat
-        (the ledger's keep bar, at least the reference's 1.0), so a correct candidate that
-        cannot reach it stops timing early (``kernels/early.py``, #190); {} when
-        ``--early-stop off``."""
+        (the ledger's keep bar in the target's timing context, at least the reference's 1.0),
+        so a correct candidate that cannot reach it stops timing early (``kernels/early.py``,
+        #190); {} when ``--early-stop off``."""
         if not budget.early_stop:
             return {}
-        rows = [r for r in ledger.rows(run) if r["target"] == target_id]
-        return {"early_best": ledger.best_kept(rows)}
+        return {"early_best": ledger.bar(run, target_id, _key(target_id))}
 
     def _context(target_id: str) -> dict[str, Any]:
         """The target's timing context for the evaluator: eager or CUDA graph, warm or cold
@@ -854,7 +905,7 @@ def build_server(
             records = keeper.records(run.results_file(target_id))
         except TamperError:
             return None
-        stats = idea_stats(records, idea)
+        stats = idea_stats(records, idea, _key(target_id))
         return stats.get("refuted") if stats else None
 
     async def _duplicate(
@@ -1025,6 +1076,7 @@ def build_server(
                 keeper,
                 mode=mode,
                 compile_check=bool(args.get("compile_check")),
+                context=_key(target_id),  # a result timed in another context is no answer
             )
             if cached is not None:
                 try:  # a duplicate skips the evaluator, which is where the capture is checked
@@ -1143,7 +1195,7 @@ def build_server(
                 records = keeper.records(run.results_file(target_id))
             except TamperError:
                 records = []
-            out["idea"] = idea_feedback(records, idea, expected, row)
+            out["idea"] = idea_feedback(records, idea, expected, row, _key(target_id))
         out |= _best_so_far(target_id)
         out |= budget.feedback(
             name,
@@ -1472,7 +1524,7 @@ def build_server(
                 records = keeper.records(run.results_file(target_id))
             except TamperError:
                 records = []
-            out["idea"] = idea_feedback(records, idea, expected, row)
+            out["idea"] = idea_feedback(records, idea, expected, row, _key(target_id))
         out |= _best_so_far(target_id)
         out |= budget.feedback(  # a sweep is one evaluation, however many configs it timed
             name,
@@ -1592,7 +1644,9 @@ def build_server(
             for k, item, src, source, hypothesis, slot in valid:
                 given = out[k]["candidate"]
                 check = bool(args.get("compile_check"))
-                cached = dedup.find(run, target_id, slot[2], keeper, compile_check=check)
+                cached = dedup.find(
+                    run, target_id, slot[2], keeper, compile_check=check, context=_key(target_id)
+                )
                 if cached is not None:  # evaluated before: that result, nothing runs
                     given_args = {"target_id": target_id, "parent": item.get("parent")}
                     given_args["title"] = item.get("title")
@@ -1694,7 +1748,9 @@ def build_server(
             except TamperError:
                 records = []
             for t, row in zip(todo, rows, strict=True):
-                out[t["k"]]["idea"] = idea_feedback(records, idea, t["expected"], row)
+                out[t["k"]]["idea"] = idea_feedback(
+                    records, idea, t["expected"], row, _key(target_id)
+                )
         report: dict[str, Any] = {"results": out} | _best_so_far(target_id)
         if todo:  # one evaluation per candidate that ran (budget honesty)
             signals = [s for t in todo if (s := sol_signal(t["result"])) is not None]
@@ -1737,7 +1793,7 @@ def build_server(
                     }
                     for r in records[-15:]
                 ],
-                "ideas": ledger.ideas(idea_rows(records)),
+                "ideas": ledger.ideas(idea_rows(records, _key(args["target_id"]))),
                 "untagged": sum(not r.get("idea") for r in records),
             }
         )

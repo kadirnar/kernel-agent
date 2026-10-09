@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 
 from kernel_agent import roles
 from kernel_agent.config import OptimizeConfig
+from kernel_agent.kernels import context as timing_context
 from kernel_agent.workspace import RunDir, append_jsonl, read_json, read_jsonl
 
 if TYPE_CHECKING:
@@ -154,6 +155,14 @@ class Standing:
         top = self.top
         return float(top["speedup"]) if top else self.start
 
+    def best_in(self, key: tuple[str, str]) -> float:
+        """:attr:`best` for an evaluation timed in ``key`` (``(context, l2)``, #226): each
+        result at its speedup in that timing context
+        (:func:`kernel_agent.kernels.context.comparable`); one without a speedup there sets
+        no bar."""
+        found = [timing_context.comparable(r, key)[0] for r in self.rows]
+        return max((s for s in found if s is not None and s > self.start), default=self.start)
+
 
 def non_improving_streak(
     records: Iterable[dict[str, Any]], *, ok_key: str = "correct", start: float = 1.0
@@ -165,13 +174,15 @@ def non_improving_streak(
     the library's prior winners and the library scout's candidates (:func:`not_agents`).
     The integration's re-evaluations of earlier snapshots (``reevaluates``) are not the
     agent's: they extend nothing, but replace the snapshot's earlier record in the best so far
-    (:class:`Standing`, like the ledger's keep bar).
+    (:class:`Standing`, like the ledger's keep bar). Each record is compared with the best in
+    the timing context it was timed in (:meth:`Standing.best_in`, #226), as the ledger
+    classifies it.
     """
     stand, streak = Standing(start), 0
     for rec in records:
         if rec.get("reevaluates"):
             stand.replace(rec)
-        elif improves(rec, stand.best, ok_key=ok_key):
+        elif improves(rec, stand.best_in(timing_context.timed_in(rec)), ok_key=ok_key):
             stand.keep(rec)
             streak = 0
         elif not not_agents(rec.get("hypothesis")):

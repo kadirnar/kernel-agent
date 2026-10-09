@@ -20,13 +20,28 @@ run's newest profile, never from names:
   between most of its calls), without attention's KV reads; else warm.
 
 No profile, timeline, work or L2 size: eager or warm, and the reason says which fact is
-missing. The roofline (``roofline.apply_sol(hot_l2=...)``) follows the L2 choice through the
-evaluator's ``l2_flush``.
+missing. The roofline (``roofline.apply_sol(hot_l2=..., context=...)``) follows the L2 choice
+through the evaluator's ``l2_flush`` and the launch floor through ``context``.
+
+**Records across contexts.** A target's context can change between improve rounds (a
+re-profile after the systems agent graphed a stage: eager -> graph), so its records may be
+timed in another context than its current one (an evaluation's ``context`` and ``l2``; one
+from before #226 has neither: eager, warm). :func:`comparable` gives a record's speedup in a
+context: its ``speedup`` when it was timed there, ``speedup_by_context[<context>]`` when it
+was timed with the same L2 in the other context and timed in this one too (a winner's), else
+none, and why (the context changed). Whatever compares an evaluation with older records of
+its target goes through it: the ledger's keep bar and the early-discard bar
+(``ledger.bar``), the budget's non-improving streak, an idea's ``refuted`` verdict, the
+duplicate cache (``dedup.find``), the integration's ``stale`` check (``evaluate.stale``) and
+the best-record ranking (``tools.ranked_for_target``, the scheduler's arms); a record with no
+speedup there sets no bar, is not served from the cache, ranks after those that have one
+and is re-evaluated before the integration takes it.
 """
 
 from __future__ import annotations
 
 import fnmatch
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +69,11 @@ class TimingContext:
             "l2_flush": self.l2 == "cold",
             "context_reason": self.reason,
         }
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """``(context, l2)``: what a record compares in (:func:`comparable`)."""
+        return self.context, self.l2
 
 
 def _qualname(spec: dict[str, Any]) -> str | None:
@@ -218,3 +238,148 @@ def for_target(run: RunDir, target_id: str) -> TimingContext:
         return select(profiles_of(run), spec, float(gpu.get("l2_cache_mb") or 0) or None)
     except Exception as exc:  # a broken profile must not stop an evaluation
         return TimingContext(reason=f"eager, warm L2: no context ({type(exc).__name__}: {exc})")
+
+
+_CURRENT: dict[tuple[str, str], tuple[tuple[Any, ...], TimingContext]] = {}
+
+
+def _stamp(run: RunDir, target_id: str) -> tuple[Any, ...]:
+    """``(path, inode, mtime, size)`` of every file :func:`for_target` reads."""
+    paths = [
+        run.target(target_id) / "spec.json",
+        run.toolchain_json,
+        run.profile_dir / "profile.json",
+        *sorted(run.root.glob("rounds/*/profile/profile.json")),
+    ]
+    out: list[tuple[Any, ...]] = []
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            out.append((str(path),))
+        else:
+            out.append((str(path), st.st_ino, st.st_mtime_ns, st.st_size))
+    return tuple(out)
+
+
+def current(run: RunDir, target_id: str) -> TimingContext:
+    """:func:`for_target`, read again only when a file it reads changed: the rankings of a
+    target's records ask for it on every call, and a profile is large."""
+    key, stamp = (str(run.root), target_id), _stamp(run, target_id)
+    found = _CURRENT.get(key)
+    if found is not None and found[0] == stamp:
+        return found[1]
+    context = for_target(run, target_id)
+    _CURRENT[key] = (stamp, context)
+    return context
+
+
+# ------------------------------------------------------------------ records across contexts
+
+
+#: A record's roofline fields that depend on the times and the launch floor of the context it
+#: was timed in: left out of its view from another context (:func:`in_context`).
+_TIMED_SOL = (
+    "pct_of_sol",
+    "bound",
+    "launch_floor_ms",
+    "launch_floor_note",
+    "suspicious_faster_than_sol",
+    "sol_unreliable",
+)
+
+
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def timed_in(record: Mapping[str, Any]) -> tuple[str, str]:
+    """``(context, l2)`` an evaluation result or record was timed in: eager calls with a warm
+    L2 for one from before #226 (no ``context``)."""
+    return str(record.get("context") or "eager"), str(record.get("l2") or "warm")
+
+
+def _how(key: tuple[str, str]) -> str:
+    return f"{'in a CUDA graph' if key[0] == 'graph' else 'eagerly'} with a {key[1]} L2"
+
+
+def comparable(record: Mapping[str, Any], key: tuple[str, str]) -> tuple[float | None, str | None]:
+    """``(speedup, why not)`` of an evaluation record in the timing context ``key``
+    (``(context, l2)``, :attr:`TimingContext.key`): its ``speedup`` when it was timed there,
+    its ``speedup_by_context[context]`` when it was timed with the same L2 in the other
+    context and timed in this one too (a winner, or a ``profile`` evaluation); else ``(None,
+    why)``: the context changed and the record has no speedup in this one. ``(None, None)``
+    for a record without a speedup (a failure, a quick check)."""
+    speedup = _number(record.get("speedup"))
+    if speedup is None:
+        return None, None
+    mine = timed_in(record)
+    if mine == key:
+        return speedup, None
+    other = (record.get("speedup_by_context") or {}).get(key[0])
+    if mine[1] == key[1] and (found := _number(other)) is not None:
+        return found, None
+    if mine[1] != key[1]:
+        detail = f"its speedup with a {key[1]} L2 was never measured"
+    elif isinstance(other, str):
+        detail = f"{key[0]}: {other}"
+    else:
+        detail = f"no {key[0]} timing in it: only a winner is timed in the other context too"
+    return None, (
+        f"the timing context changed: timed {_how(mine)}, the target is now timed "
+        f"{_how(key)} ({detail})"
+    )
+
+
+def in_context(record: dict[str, Any], key: tuple[str, str]) -> dict[str, Any] | None:
+    """``record`` seen from the timing context ``key``, or None when it has no speedup there
+    (:func:`comparable`). A record timed there, or without a speedup, is returned as is. One
+    timed in the other context becomes a copy with that context's ``speedup`` and
+    ``context``, per-case times from the cases' ``timing`` (``ref_ms``, ``new_ms``,
+    ``speedup``), weighted times and ``est_saved_ms_per_run``; ``measured_in`` says where it
+    was timed and at which speedup, ``context_note`` how to read it. Its roofline fields
+    (``pct_of_sol``, ``bound``, ...: the other context's times and launch floor) are left
+    out."""
+    speedup, why = comparable(record, key)
+    if why is not None:
+        return None
+    mine = timed_in(record)
+    if speedup is None or mine == key:
+        return record
+    view = {k: v for k, v in record.items() if k not in _TIMED_SOL}
+    cases: list[dict[str, Any]] = []
+    ref_total = new_total = saved = 0.0
+    weighted = True  # every timed case says how many calls of the target it stands for
+    for timed in record.get("cases") or []:
+        timing = (timed.get("timing") or {}).get(key[0])
+        case = {k: v for k, v in timed.items() if k not in _TIMED_SOL}
+        if isinstance(timing, Mapping) and "ref_ms" in timing and "new_ms" in timing:
+            ref, new = float(timing["ref_ms"]), float(timing["new_ms"])
+            case.update(ref_ms=ref, new_ms=new, speedup=timing.get("speedup"))
+            n = float(case.get("calls_per_run") or 0)
+            ref_total, new_total = ref_total + n * ref, new_total + n * new
+            if (calls := _number(case.get("target_calls"))) is None:
+                weighted = False
+            else:
+                saved += calls * (ref - new)
+        cases.append(case)
+    view.update(
+        cases=cases,
+        speedup=speedup,
+        context=key[0],
+        measured_in={"context": mine[0], "l2": mine[1], "speedup": record.get("speedup")},
+        context_note=f"timed {_how(mine)} at {record.get('speedup')}x; speedup and the "
+        f"per-case times are its timing {_how(key)} (speedup_by_context, fewer rounds); its "
+        "roofline (pct_of_sol, bound) was measured with the other context's times: evaluate "
+        "it again for this context's",
+    )
+    if new_total > 0:
+        view.update(ref_ms_weighted=round(ref_total, 4), new_ms_weighted=round(new_total, 4))
+    else:  # no case says its times there: none from the other context either
+        view.pop("ref_ms_weighted", None)
+        view.pop("new_ms_weighted", None)
+    if weighted and new_total > 0:
+        view["est_saved_ms_per_run"] = round(saved, 3)
+    else:
+        view.pop("est_saved_ms_per_run", None)
+    return view
