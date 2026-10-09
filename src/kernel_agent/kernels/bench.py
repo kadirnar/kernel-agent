@@ -44,6 +44,7 @@ _GraphBase: Any = getattr(torch._C, "_CUDAGraph", None)
 _CUDAGraph: Any = getattr(torch.cuda, "CUDAGraph", None)
 _replay: Callable[..., Any] | None = getattr(_GraphBase or _CUDAGraph, "replay", None)
 _graph_capture: Any = getattr(torch.cuda, "graph", None)
+_pool_handle: Any = getattr(torch.cuda, "graph_pool_handle", lambda: None)
 _Stream = torch.cuda.Stream
 _on_stream = torch.cuda.stream
 _set_stream = torch.cuda.set_stream
@@ -289,14 +290,50 @@ def _capture(body: Callable[[], Any], stream: Any) -> tuple[Any, Any]:
 
     graph = _CUDAGraph()
     current = _current_stream()
+    pool = _pool_handle()  # its private pool, named: a failed capture must leave it (below)
     try:
-        with _graph_capture(graph, stream=stream):
+        with _graph_capture(graph, pool=pool, stream=stream):
             out = guarded()
     except Exception as exc:
         # the capture's exit raised before it set the current stream back (torch 2.14)
         _set_stream(current)
+        _leave_pool(pool)
+        _leave_rng_capture()
         raise GraphUnavailable(first_line(failed[0] if failed else exc)) from exc
     return graph, out
+
+
+def _leave_pool(pool: Any) -> None:
+    """Stop the caching allocator routing allocations to ``pool``, the private pool of a
+    capture that failed: torch 2.10 leaves it routed there, and the next ``MemPool``
+    destructor of the process aborted it (``captures_underway.empty()``: a device loop's
+    after a candidate that could not be graph-timed, measured on an NVIDIA A10; graphloop
+    does the same for its own captures, #232). The pool is named before the capture because
+    ``CUDAGraph.pool()`` refuses after a failed one. An error where torch already did it is
+    ignored."""
+    end = getattr(torch._C, "_cuda_endAllocateToPool", None)
+    if end is None:
+        return
+    with contextlib.suppress(Exception):
+        end(torch.cuda.current_device(), pool)
+
+
+def _leave_rng_capture() -> None:
+    """End the capture mode a failed capture left the default CUDA generator in: torch's
+    capture end runs the generator's capture epilogue only when the capture ended cleanly, so
+    after a failed one every later random draw of the process raised "Offset increment outside
+    graph capture encountered unexpectedly" (torch 2.10 on an NVIDIA A10: a candidate that
+    cannot be graph-timed broke the evaluator's redrawn-input checks after it). The clean
+    capture of an empty-but-one-kernel graph on a fresh stream runs that epilogue. Never
+    raises: a process that cannot do it keeps the error it had."""
+    try:
+        graph = _CUDAGraph()
+        with _on_stream(_Stream()):
+            graph.capture_begin(capture_error_mode="relaxed")
+            _gpu_sleep(1)  # not an empty graph
+            graph.capture_end()
+    except Exception:  # the CUDA context itself is broken: nothing to reset here
+        return
 
 
 def _warm_up(
@@ -315,7 +352,7 @@ def _warm_up(
         for i in range(calls):
             if restore is not None:
                 restore()
-            a, k = copy.deepcopy(sets[0]) if mutable else sets[i % len(sets)]
+            a, k = _copy_like(sets[0]) if mutable else sets[i % len(sets)]
             fn(*a, **k)
     _current_stream().wait_stream(stream)
     _synchronize()
@@ -344,6 +381,18 @@ def _replaced(before: dict[str, torch.Tensor], value: Any) -> str | None:
                 "replays the tensors it captured"
             )
     return None
+
+
+def _copy_like(value: Any) -> Any:
+    """A deep copy of a call's ``(args, kwargs)`` whose tensors are inference tensors exactly
+    when its own are. The graph timing runs under ``inference_mode``, where a plain deep copy
+    of normal tensors gives inference tensors: a ``torch.compile`` candidate warmed up and
+    checked on the originals then fails Dynamo's guards on the copy and recompiles inside the
+    CUDA-graph capture (found by the library scout on an NVIDIA A10: a candidate packing its
+    weights at compile time failed there)."""
+    inference = any(t.is_inference() for t in _layout(value).values())
+    with torch.inference_mode(inference):
+        return copy.deepcopy(value)
 
 
 def _graph_copies(args: Any, kwargs: Any, calls: int) -> int:
@@ -652,11 +701,11 @@ def _measure_graph(
         _sleep_cycles_per_us()
         _warm_up(fn, restore, sets, mutable, max(warmup, 1), side)
         if mutable:  # made after the warm-up: as captured, never called
-            inputs = [copy.deepcopy((args0, kwargs0)) for _ in range(calls)]
+            inputs = [_copy_like((args0, kwargs0)) for _ in range(calls)]
         else:
             inputs = [sets[j % len(sets)] for j in range(calls)]
             if keep:
-                inputs[checked] = copy.deepcopy(sets[0])
+                inputs[checked] = _copy_like(sets[0])
         layout = [_layout(x) for x in inputs] if mutable else []
         reset = _restorer(sets[0], layout, side) if mutable else None
 

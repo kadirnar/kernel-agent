@@ -259,3 +259,89 @@ def test_evaluator_times_before_the_profiled_pass(tmp_path, monkeypatch):
     timed_twice = isinstance(result["speedup_by_context"].get("graph"), float)
     assert order == ["timing"] * (4 if timed_twice else 2) + ["profiler"], result
     assert all(case["clock"] >= bench.CLOCK_OK for case in result["cases"]), result["cases"]
+
+
+def test_graph_timing_copies_keep_the_inference_flag_of_the_inputs():
+    """The graph timing makes its copies under ``inference_mode``: a copy of normal tensors
+    stays normal (a compiled candidate's guards hold on it), one of inference tensors stays
+    an inference tensor."""
+    x = torch.randn(4)
+    with torch.inference_mode():
+        y = torch.randn(4)
+        (a,), _ = bench._copy_like(((x,), {}))
+        (b,), _ = bench._copy_like(((y,), {"n": 3}))
+    assert not x.is_inference() and not a.is_inference() and torch.equal(a, x)
+    assert y.is_inference() and b.is_inference() and torch.equal(b, y)
+    assert a.data_ptr() != x.data_ptr()
+
+
+@pytest.mark.gpu
+def test_a_compiled_candidate_is_not_recompiled_inside_the_graph_capture():
+    """A ``torch.compile`` candidate timed in a CUDA graph with a kept call (the timed-output
+    check) is compiled once, before the capture: the kept call's inputs are not inference
+    tensors when the case's are not (a recompile inside the capture: measured on an NVIDIA
+    A10, torch 2.10)."""
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    counters.clear()
+    fn = torch.compile(lambda t: t * 2 + 1, dynamic=False)
+    x = torch.randn(1024, device="cuda")
+    with torch.inference_mode():  # the correctness pass: the case's (normal) tensors
+        fn(x)
+    compiled = counters["stats"]["unique_graphs"]
+    result = bench.time_call(fn, (x,), {}, target_ms=5.0, keep=True, context=bench.GRAPH)
+    assert "kept" in result and result["median_ms"] > 0
+    assert counters["stats"]["unique_graphs"] == compiled, dict(counters["stats"])
+
+
+@pytest.mark.gpu
+def test_random_draws_work_after_a_failed_graph_capture():
+    """A capture that fails (a body that draws, then syncs) leaves the process able to draw
+    random numbers: on torch 2.10 the default generator stayed in capture mode and every
+    later draw raised (measured on an NVIDIA A10)."""
+
+    def body() -> None:
+        x = torch.rand(16, device="cuda")
+        float(x.sum())  # a host sync: not capturable
+
+    with torch.inference_mode(), pytest.raises(bench.GraphUnavailable):
+        bench._capture(body, torch.cuda.Stream())
+    assert torch.randn(8, device="cuda").shape == (8,)
+    assert torch.rand(8, device="cuda").max() < 1
+
+
+@pytest.mark.gpu
+def test_a_failed_graph_capture_leaves_the_allocator_usable(tmp_path):
+    """After a capture that fails (in its own process: the bug aborts it), a ``MemPool``
+    is used and destroyed: torch 2.10 left the allocator routed to the failed capture's pool
+    and that destructor aborted the process (``captures_underway.empty()``, measured on an
+    NVIDIA A10)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = tmp_path / "pool.py"
+    script.write_text(
+        "import torch\n"
+        "from kernel_agent.kernels import bench\n"
+        "def body():\n"
+        "    float(torch.rand(16, device='cuda').sum())  # a host sync: not capturable\n"
+        "try:\n"
+        "    bench._capture(body, torch.cuda.Stream())\n"
+        "except bench.GraphUnavailable:\n"
+        "    pass\n"
+        "pool = torch.cuda.MemPool()\n"
+        "with torch.cuda.use_mem_pool(pool):\n"
+        "    y = torch.empty(1 << 20, device='cuda')\n"
+        "del y, pool\n"
+        "torch.cuda.synchronize()\n"
+        "print('ok')\n"
+    )
+    src = str(Path(bench.__file__).parents[2])
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([src, os.environ.get("PYTHONPATH", "")])}
+    done = subprocess.run(
+        [sys.executable, str(script)], env=env, capture_output=True, text=True, timeout=300
+    )
+    assert done.returncode == 0 and "ok" in done.stdout, done.stderr[-2000:]
