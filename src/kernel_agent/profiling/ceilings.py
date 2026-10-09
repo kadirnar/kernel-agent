@@ -35,7 +35,9 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   - ``w4a4``: NVFP4 weights, all FLOPs at the NVFP4 tensor-core peak (target precision
     ``fp4_w4a4``, #233).
 
-  A precision whose peak was not measured is unknown: no ratio to bf16 is assumed.
+  A precision whose peak was not measured is unknown: no ratio to bf16 is assumed. A
+  sustained 16-bit peak at least 10 % below the burst one (a power-capped board: A10, T4,
+  L4; ``roofline.floor_tflops``, #253) replaces it: a model's run is sustained load.
   ``ceilings.json`` has every floor; the markdown shows the ``columns`` of the precisions
   the run allows (``--precisions``, :mod:`kernel_agent.precisions`: exact; near-lossless
   FP8 w, W8A8 and MXFP8; FP4 w with ``fp4_weights`` and W4A4 with ``fp4_w4a4``, each only
@@ -95,7 +97,7 @@ from typing import Any
 
 from kernel_agent import gpu_arch, projection
 from kernel_agent.kernels.mma_peaks import FP8_F32, FP8_SF
-from kernel_agent.kernels.roofline import FP4, FP8, INT8, MXFP8
+from kernel_agent.kernels.roofline import FP4, FP8, INT8, MXFP8, floor_tflops, sustained_drops
 
 
 @dataclass(frozen=True)
@@ -226,8 +228,9 @@ def floor(
     row: Mapping[str, Any], precision: Precision, peaks: Mapping[str, Any]
 ) -> dict[str, Any] | None:
     """``{"ms", "bound", "compute_ms", "memory_ms", "launch_ms"}`` of one row at one
-    precision; None when a peak it needs was not measured."""
-    tflops = {k: float(v) for k, v in (peaks.get("tflops") or {}).items() if v}
+    precision; None when a peak it needs was not measured. A power-capped board's sustained
+    16-bit peaks replace its burst ones (:func:`~kernel_agent.kernels.roofline.floor_tflops`)."""
+    tflops = floor_tflops(peaks)
     flops: dict[str, int] = row["flops"]
     if precision.peak is not None:
         peak = tflops.get(precision.peak)
@@ -366,6 +369,8 @@ def build(
                 "tflops",
                 "tflops_unavailable",
                 "mma_tflops",
+                "tflops_sustained",  # a power-capped board's floors use them (#253)
+                "sustained",
             )
             if peaks is not None and k in peaks
         },
@@ -543,7 +548,7 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
         ]
     else:
         dtype = _tensor_core_16bit(peaks)
-        ridge = float((peaks.get("tflops") or {}).get(dtype) or 0.0) * 1000
+        ridge = floor_tflops(peaks).get(dtype, 0.0) * 1000  # sustained on a capped board
         ridge /= float(peaks["dram_gbps"])
         legend = [_LEGEND[name] for name in cols if name in _LEGEND]
         for name in (c for c in cols if c not in _LEGEND):  # at a tensor-core peak of its own
@@ -583,6 +588,17 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             "already runs below its exact floor).",
             "",
         ]
+        if drops := sustained_drops(peaks):  # a power-capped board (#253)
+            rates = ", ".join(
+                f"{gpu_arch.SHORT_16BIT.get(d, d)} {rate:.0f} of the {burst:.0f} TFLOP/s burst"
+                for d, (burst, rate) in drops.items()
+            )
+            lines += [
+                f"*Sustained*: the compute floors use this GPU's sustained matmul peaks ({rates}, "
+                "measured after seconds of back-to-back GEMMs): it slows down under sustained "
+                "load (a power-capped board), and an end-to-end run is sustained load.",
+                "",
+            ]
         if fp8_col:
             lines += [
                 "*FP8 MMA*: the tensor-core instruction a W8A8 kernel needs to reach its floor. "

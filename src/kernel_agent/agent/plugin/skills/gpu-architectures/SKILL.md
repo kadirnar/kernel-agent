@@ -19,6 +19,8 @@ Every agent prompt already has the section of its own GPU (`# This GPU`, picked 
 
 On any GPU, the toolchain block's measured peaks and instruction rates come first; `kernel-agent doctor` probes `tl.dot_scaled`, TMA, PDL and green contexts.
 
+Boards of one architecture differ too: [skus.md](skus.md) has what tells them apart from measurements (datacenter vs GeForce fp32 accumulation, INT8 vs bf16, the sustained clock of a power-capped board), the NVIDIA A10 (sm_86) and the power-capped A10 / T4 / L4, datasheet numbers labelled.
+
 ## Examples and sources
 
 * Sources: the `documentation-sources` skill's `sources.md`, sections "CUDA C++ and PTX".

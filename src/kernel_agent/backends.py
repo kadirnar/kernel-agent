@@ -224,6 +224,12 @@ _INT8_NEVER = (
     "INT8 on activations with outlier channels (token crest > ~20): SmoothQuant, or keep "
     "those GEMMs in FP8 / bf16"
 )
+#: INT8 vs bf16 tensor-core rates of Ampere SKUs (#253): evidence from other GPUs, labelled;
+#: the GPU's own measured rates decide (:func:`_ampere_int8`).
+_AMPERE_INT8_SKUS = (
+    "datasheets, dense: A100 624 vs 312 TOPS and NVIDIA A10 250 vs 125, 2x; GeForce RTX "
+    "3090 284 vs 71, 4x, because its fp32-accumulating bf16 runs at half rate"
+)
 
 #: :data:`POLICY` rows that differ by architecture family (``gpu_arch.Family.key``): they
 #: replace the row of the same id on that family. :data:`POLICY`'s rows were measured on an
@@ -313,13 +319,24 @@ ARCH_POLICY: dict[str, dict[str, TargetClass]] = {
             "one-pass row kernel and the scales + bias in the epilogue "
             "(`examples/triton_int8_w8a8_gemm.py`); cuBLASLt int8 (`torch._int_mm`) as the "
             "baseline",
-            "Ampere has no FP8 tensor cores: IMMA is its 8-bit compute path, 2x the bf16 rate "
-            "(A100: 624 vs 312 TOPS; GeForce RTX 30xx, whose fp32-accumulating bf16 runs at "
-            "half rate: 4x)",
+            "Ampere has no FP8 tensor cores: IMMA is its 8-bit compute path, 2x to 4x the bf16 "
+            "rate by SKU: the toolchain block's measured `s8 IMMA.S32` and `bf16 HMMA.F32` "
+            "rates say which here (" + _AMPERE_INT8_SKUS + ")",
             "CUTLASS sm_80 int8 GEMMs from C++ when the epilogue fuses more; CUDA C++ "
             "`mma.sync` s8 inside a fused layer",
             ("triton", "cuda", "cute"),
             _INT8_NEVER,
+        ),
+        # The bundled CuTe DSL layer is sm_89+ (its e4m3 conversion does not compile for
+        # sm_80 / sm_86, NVVM "unsupported operation"): the fused layer is CUDA C++ here (#253).
+        "decoder_layer": TargetClass(
+            "decoder_layer",
+            _BY_ID["decoder_layer"].label,
+            _BY_ID["decoder_layer"].first,
+            _BY_ID["decoder_layer"].why,
+            "CUDA C++ fused layer with IMMA / bf16 `mma.sync` GEMMs behind one launcher "
+            "(`examples/cuda_int8_skinny_gemm.py`: IMMA m16n8k32 with the scales fused)",
+            ("cuda", "triton"),
         ),
     },
     "ada": {
@@ -588,6 +605,25 @@ def arch_rules(facts: Facts | None) -> tuple[str, ...]:
     return tuple(r for r in rules if not unrunnable(r, cap))
 
 
+def _ampere_int8(facts: Facts | None) -> TargetClass | None:
+    """Ampere's INT8 row with this GPU's measured s8 IMMA and bf16 HMMA rates (None: not
+    measured; the row with the SKUs' datasheet ratios stays). The ratio differs by SKU, not by
+    arch: 2x on the A100 and the A10, 4x on GeForce RTX 30xx (#253)."""
+    from kernel_agent.kernels.mma_peaks import BF16_F32, S8_S32
+
+    mma = facts.mma if facts is not None else {}
+    s8, bf16 = mma.get(S8_S32), mma.get(BF16_F32)
+    if not s8 or not bf16:
+        return None
+    row = ARCH_POLICY["ampere"]["int8_gemm"]
+    why = (
+        "Ampere has no FP8 tensor cores: IMMA is its 8-bit compute path; measured on this "
+        f"GPU: `s8 IMMA.S32` {s8:.0f} TOPS vs `bf16 HMMA.F32` {bf16:.0f} TFLOP/s "
+        f"({s8 / bf16:.1f}x; other SKUs, {_AMPERE_INT8_SKUS})"
+    )
+    return TargetClass(row.id, row.label, row.first, why, row.second, row.order, row.never)
+
+
 def policy(class_id: str, facts: Facts | None = None) -> TargetClass:
     """The policy row of ``class_id`` for the GPU of ``facts`` (None: :data:`POLICY`'s),
     naming only bundled examples whose ``ARCHS`` hold this GPU."""
@@ -595,6 +631,8 @@ def policy(class_id: str, facts: Facts | None = None) -> TargetClass:
     row = None
     if fam is not None and class_id == "fp8_gemm" and fam.key == "blackwell_geforce":
         row = _geforce_fp8(facts)  # this GPU's measured FP8 instruction rates
+    elif fam is not None and class_id == "int8_gemm" and fam.key == "ampere":
+        row = _ampere_int8(facts) or ARCH_POLICY["ampere"]["int8_gemm"]  # measured ratio
     elif fam is not None:
         row = ARCH_POLICY.get(fam.key, {}).get(class_id)
     row = row or _BY_ID.get(class_id, _BY_ID["other"])

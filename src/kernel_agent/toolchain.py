@@ -149,6 +149,8 @@ def format_peaks(peaks: dict[str, Any]) -> str:
         names = "/".join(short.get(k, k) for k in tflops)
         values = " / ".join(f"{v:.0f}" for v in tflops.values())
         parts.append(f"matmul {names} {values} TFLOP/s")
+    if sustained := peaks.get("tflops_sustained"):  # under sustained load (#253)
+        parts.append(_sustained(sustained, peaks.get("sustained") or {}, short))
     if peaks.get("tflops_unavailable"):  # low-precision matmuls torch has no kernel for here
         parts.append(
             "no " + "/".join(short.get(k, k) for k in peaks["tflops_unavailable"]) + " matmul"
@@ -160,6 +162,23 @@ def format_peaks(peaks: dict[str, Any]) -> str:
 
         parts.append(describe(peaks["mma_tflops"]))
     return ", ".join(parts)
+
+
+def _sustained(tflops: dict[str, Any], info: dict[str, Any], short: dict[str, str]) -> str:
+    """``sustained bf16/fp16 100 / 101 TFLOP/s (2 s; SM 1200 MHz, burst 1695; 149 W of a
+    150 W limit; sw_power_cap)``: the 16-bit peaks under sustained load and that load."""
+    names = "/".join(short.get(k, k) for k in tflops)
+    values = " / ".join(f"{float(v):.0f}" for v in tflops.values())
+    load = [f"{float(info['seconds']):.0f} s"] if info.get("seconds") else []
+    if info.get("sm_mhz"):
+        burst = f", burst {info['burst_sm_mhz']}" if info.get("burst_sm_mhz") else ""
+        load.append(f"SM {info['sm_mhz']} MHz{burst}")
+    if info.get("power_w"):
+        limit = f" of a {info['power_limit_w']:.0f} W limit" if info.get("power_limit_w") else ""
+        load.append(f"{info['power_w']:.0f} W{limit}")
+    if info.get("reasons"):
+        load.append(", ".join(info["reasons"]))
+    return f"sustained {names} {values} TFLOP/s" + (f" ({'; '.join(load)})" if load else "")
 
 
 def _pip_cuda_root() -> Path | None:
