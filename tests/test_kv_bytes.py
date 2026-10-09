@@ -79,6 +79,84 @@ def test_decode_calls_count_their_kv_cache_up_to_the_position():
     assert "| KV GB |" in md and "KV-cache reads are counted in decode rows" in md
 
 
+class _CacheLayer:
+    def __init__(self) -> None:
+        self.keys = torch.zeros(B, H, S, D)
+        self.values = torch.zeros(B, H, S, D)
+
+
+class LayeredCache:
+    """A cache object like transformers' ``Cache``: one entry per layer (``layers[i]``)."""
+
+    def __init__(self, layers: int) -> None:
+        self.layers = [_CacheLayer() for _ in range(layers)]
+
+
+class ListCache:
+    """The older layout: parallel ``key_cache`` / ``value_cache`` lists."""
+
+    def __init__(self, layers: int) -> None:
+        self.key_cache = [torch.zeros(B, H, S, D) for _ in range(layers)]
+        self.value_cache = [torch.zeros(B, H, S, D) for _ in range(layers)]
+
+
+class IndexedAttention(nn.Module):
+    """Reads its layer (``layer_idx``) of the cache object it is given; the position comes in
+    its ``**kwargs``."""
+
+    def __init__(self, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.o_proj = nn.Linear(16, 16, bias=False)
+
+    def forward(
+        self, x: torch.Tensor, past_key_values: object = None, **kwargs: object
+    ) -> torch.Tensor:
+        return self.o_proj(x)
+
+
+class IndexedLayer(nn.Module):
+    def __init__(self, layer_idx: int) -> None:
+        super().__init__()
+        self.self_attn = IndexedAttention(layer_idx)
+
+    def forward(
+        self, x: torch.Tensor, past_key_values: object = None, **kwargs: object
+    ) -> torch.Tensor:
+        return self.self_attn(x, past_key_values=past_key_values, **kwargs)
+
+
+class IndexedModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([IndexedLayer(0), IndexedLayer(1)])
+
+    def forward(
+        self, x: torch.Tensor, past_key_values: object = None, **kwargs: object
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, past_key_values=past_key_values, **kwargs)
+        return x
+
+
+def test_a_cache_object_counts_the_layer_of_each_call_once():
+    """A cache object (every layer's K / V) passed down the model (#226): each attention call
+    reads its own layer's (``layer_idx``) up to the position in its ``**kwargs``, not the
+    whole object; the layer and the model, which pass it on, count those reads once."""
+    for cache in (LayeredCache(2), ListCache(2)):
+        model = IndexedModel()
+        x = torch.randn(B, 1, 16)  # [batch, 1, ...]: a decode call
+        with torch.inference_mode(), ModuleTimer({"m": model}, cuda=False) as timer:
+            for position in (4, 9):
+                model(x, past_key_values=cache, cache_position=torch.tensor([position]))
+        stats = {c.cls: c for c in timer.class_stats()}
+        (attn,) = stats["IndexedAttention"].work
+        # 2 layers x (5 + 10 cached positions) x K and V of one layer
+        assert attn["kv_bytes"] == 2 * (5 + 10) * SLOT_BYTES, type(cache).__name__
+        assert stats["IndexedLayer"].work[0]["kv_bytes"] == attn["kv_bytes"]
+        assert stats["IndexedModel"].work[0]["kv_bytes"] == attn["kv_bytes"]
+
+
 def asdict_(stat: object) -> dict:
     from dataclasses import asdict
 

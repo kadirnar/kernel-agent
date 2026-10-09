@@ -1,0 +1,439 @@
+{
+ "_note": "Trimmed from an analyze profile of Qwen/Qwen3-0.6B (eager batch-1 decode, NVIDIA A10, sm_86) whose attention calls record their layer of the transformers cache object (kv_bytes): the fields kernels/context.py reads (#226)",
+ "entrypoints": [],
+ "module_gaps": {},
+ "classes": [
+  {
+   "cls": "Qwen3ForCausalLM",
+   "is_leaf": false,
+   "instances": 1,
+   "calls": 64,
+   "example_qualname": "model",
+   "work": [
+    {
+     "group": "model",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 64,
+     "weight_bytes": 76286001152,
+     "io_bytes": 19452408,
+     "kv_bytes": 3923361792
+    }
+   ]
+  },
+  {
+   "cls": "Qwen3Model",
+   "is_leaf": false,
+   "instances": 1,
+   "calls": 64,
+   "example_qualname": "model.model",
+   "work": [
+    {
+     "group": "model.model",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 64,
+     "weight_bytes": 56371445760,
+     "io_bytes": 1182200,
+     "kv_bytes": 3923361792
+    }
+   ]
+  },
+  {
+   "cls": "Qwen3DecoderLayer",
+   "is_leaf": false,
+   "instances": 28,
+   "calls": 1792,
+   "example_qualname": "model.model.layers.0",
+   "work": [
+    {
+     "group": "model.model.layers.*",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 55490641920,
+     "io_bytes": 7225344,
+     "kv_bytes": 3923361792
+    },
+    {
+     "group": "model.model.layers.*",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 880803840,
+     "io_bytes": 58720256
+    }
+   ]
+  },
+  {
+   "cls": "Qwen3Attention",
+   "is_leaf": false,
+   "instances": 28,
+   "calls": 1792,
+   "example_qualname": "model.model.layers.0.self_attn",
+   "work": [
+    {
+     "group": "model.model.layers.*.self_attn",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 22196256768,
+     "io_bytes": 7225344,
+     "kv_bytes": 3923361792
+    },
+    {
+     "group": "model.model.layers.*.self_attn",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 352321536,
+     "io_bytes": 58720256
+    }
+   ]
+  },
+  {
+   "cls": "Linear",
+   "is_leaf": true,
+   "instances": 197,
+   "calls": 12608,
+   "example_qualname": "model.model.layers.0.self_attn.q_proj",
+   "work": [
+    {
+     "group": "model.model.layers.*.mlp.up_proj",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 11098128384,
+     "io_bytes": 14450688
+    },
+    {
+     "group": "model.model.layers.*.self_attn.o_proj",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 7398752256,
+     "io_bytes": 10838016
+    },
+    {
+     "group": "model.model.layers.*.self_attn.q_proj",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 7398752256,
+     "io_bytes": 10838016
+    },
+    {
+     "group": "model.model.layers.*.self_attn.k_proj",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 3699376128,
+     "io_bytes": 7225344
+    },
+    {
+     "group": "model.model.layers.*.mlp.gate_proj",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 11098128384,
+     "io_bytes": 14450688
+    },
+    {
+     "group": "model.model.layers.*.self_attn.v_proj",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 3699376128,
+     "io_bytes": 7225344
+    },
+    {
+     "group": "model.model.layers.*.mlp.down_proj",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 11098128384,
+     "io_bytes": 14450688
+    },
+    {
+     "group": "model.lm_head",
+     "phase": "decode",
+     "instances": 1,
+     "calls": 64,
+     "weight_bytes": 19914555392,
+     "io_bytes": 19578880
+    },
+    {
+     "group": "model.model.layers.*.mlp.gate_proj",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 176160768,
+     "io_bytes": 117440512
+    },
+    {
+     "group": "model.model.layers.*.mlp.up_proj",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 176160768,
+     "io_bytes": 117440512
+    },
+    {
+     "group": "model.model.layers.*.mlp.down_proj",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 176160768,
+     "io_bytes": 117440512
+    },
+    {
+     "group": "model.model.layers.*.self_attn.q_proj",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 117440512,
+     "io_bytes": 88080384
+    },
+    {
+     "group": "model.model.layers.*.self_attn.o_proj",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 117440512,
+     "io_bytes": 88080384
+    },
+    {
+     "group": "model.model.layers.*.self_attn.k_proj",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 58720256,
+     "io_bytes": 58720256
+    },
+    {
+     "group": "model.model.layers.*.self_attn.v_proj",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 58720256,
+     "io_bytes": 58720256
+    }
+   ]
+  },
+  {
+   "cls": "Qwen3MLP",
+   "is_leaf": false,
+   "instances": 28,
+   "calls": 1792,
+   "example_qualname": "model.model.layers.0.mlp",
+   "work": [
+    {
+     "group": "model.model.layers.*.mlp",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 33294385152,
+     "io_bytes": 7225344
+    },
+    {
+     "group": "model.model.layers.*.mlp",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 528482304,
+     "io_bytes": 58720256
+    }
+   ]
+  },
+  {
+   "cls": "Qwen3RMSNorm",
+   "is_leaf": true,
+   "instances": 113,
+   "calls": 7232,
+   "example_qualname": "model.model.layers.0.input_layernorm",
+   "work": [
+    {
+     "group": "model.model.layers.*.input_layernorm",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 0,
+     "io_bytes": 7225344
+    },
+    {
+     "group": "model.model.layers.*.self_attn.q_norm",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 0,
+     "io_bytes": 14450688
+    },
+    {
+     "group": "model.model.layers.*.self_attn.k_norm",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 0,
+     "io_bytes": 7225344
+    },
+    {
+     "group": "model.model.layers.*.post_attention_layernorm",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 0,
+     "io_bytes": 7225344
+    },
+    {
+     "group": "model.model.norm",
+     "phase": "decode",
+     "instances": 1,
+     "calls": 63,
+     "weight_bytes": 0,
+     "io_bytes": 258048
+    },
+    {
+     "group": "model.model.layers.*.input_layernorm",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 0,
+     "io_bytes": 58720256
+    },
+    {
+     "group": "model.model.layers.*.self_attn.q_norm",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 0,
+     "io_bytes": 117440512
+    },
+    {
+     "group": "model.model.layers.*.post_attention_layernorm",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 0,
+     "io_bytes": 58720256
+    },
+    {
+     "group": "model.model.layers.*.self_attn.k_norm",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 0,
+     "io_bytes": 58720256
+    },
+    {
+     "group": "model.model.norm",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 1,
+     "weight_bytes": 0,
+     "io_bytes": 2097152
+    }
+   ]
+  },
+  {
+   "cls": "SiLUActivation",
+   "is_leaf": true,
+   "instances": 28,
+   "calls": 1792,
+   "example_qualname": "model.model.layers.0.mlp.act_fn",
+   "work": [
+    {
+     "group": "model.model.layers.*.mlp.act_fn",
+     "phase": "decode",
+     "instances": 28,
+     "calls": 1764,
+     "weight_bytes": 0,
+     "io_bytes": 21676032
+    },
+    {
+     "group": "model.model.layers.*.mlp.act_fn",
+     "phase": "prefill",
+     "instances": 28,
+     "calls": 28,
+     "weight_bytes": 0,
+     "io_bytes": 176160768
+    }
+   ]
+  },
+  {
+   "cls": "Qwen3RotaryEmbedding",
+   "is_leaf": true,
+   "instances": 1,
+   "calls": 64,
+   "example_qualname": "model.model.rotary_emb",
+   "work": [
+    {
+     "group": "model.model.rotary_emb",
+     "phase": "decode",
+     "instances": 1,
+     "calls": 63,
+     "weight_bytes": 0,
+     "io_bytes": 145152
+    },
+    {
+     "group": "model.model.rotary_emb",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 1,
+     "weight_bytes": 0,
+     "io_bytes": 1179648
+    }
+   ]
+  },
+  {
+   "cls": "Embedding",
+   "is_leaf": true,
+   "instances": 1,
+   "calls": 64,
+   "example_qualname": "model.model.embed_tokens",
+   "work": [
+    {
+     "group": "model.model.embed_tokens",
+     "phase": "prefill",
+     "instances": 1,
+     "calls": 64,
+     "weight_bytes": 0,
+     "io_bytes": 1182200
+    }
+   ]
+  }
+ ],
+ "kernel_view": {
+  "timeline": {
+   "stages": [
+    {
+     "stage": "model.model",
+     "calls": 64,
+     "events": 103352,
+     "kernels": 103268,
+     "graph_events": 0
+    },
+    {
+     "stage": "model.lm_head",
+     "calls": 64,
+     "events": 64,
+     "kernels": 64,
+     "graph_events": 0
+    },
+    {
+     "stage": "(no stage)",
+     "calls": 0,
+     "events": 2858,
+     "kernels": 2209,
+     "graph_events": 0
+    },
+    {
+     "stage": "model",
+     "calls": 64,
+     "events": 0,
+     "kernels": 0,
+     "graph_events": 0
+    }
+   ]
+  }
+ }
+}

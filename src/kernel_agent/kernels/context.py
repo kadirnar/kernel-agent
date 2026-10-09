@@ -12,12 +12,21 @@ run's newest profile, never from names:
   holds the target's instance are launched by CUDA-graph replays (``kernel_view.timeline``
   of the newest profile with a timeline, :mod:`kernel_agent.profiling.timeline`: the
   innermost stage whose qualname is the instance's or a prefix of it); else eager.
-* **cold** L2 when the bytes the rest of the model touches between two consecutive calls of
-  one instance exceed the GPU's L2 (``GPUInfo.l2_cache_mb`` in ``toolchain.json``): the work
-  bytes of the profile's leaf classes per run (``classes[].work``: the weights each call
-  reads, its first input and its output) less the instance's own, over the instance's calls
-  per run. An estimate: an average over the run (a module called in a tight loop is warm
-  between most of its calls), without attention's KV reads; else warm.
+* **cold** L2 when most calls of one instance of the target follow more bytes of other work
+  since its previous call than the GPU's L2 holds (``GPUInfo.l2_cache_mb`` in
+  ``toolchain.json``); its weights and KV cache are reused by its own calls only, so the
+  distance between two calls of one instance is what decides. The traffic is the profile's
+  per run (``classes[].work``): the weights each leaf call reads, its first input and output,
+  and the KV cache the decode calls read (``kv_bytes``, counted once at the innermost calls
+  that read it). Per call (:func:`per_call`): the target's calls are placed in the calls of
+  the modules around it (the work rows of its ancestors' groups, every phase). Where it is
+  called more often than the module around it, it runs in a loop there (a CFM solver's
+  estimator, ten calls per step): those calls follow only the other work inside one call of
+  that module, and the first call of each loop follows the gap between that module's calls,
+  found the same way; with no loop around it every call follows the rest of the run (a
+  decode step's layer: the whole model). Without the calls of the modules around it (a
+  partial profile): the average over the run, the run's other work over the instance's
+  calls, and the reason says so. Else warm.
 
 No profile, timeline, work or L2 size: eager or warm, and the reason says which fact is
 missing. The roofline (``roofline.apply_sol(hot_l2=..., context=...)``) follows the L2 choice
@@ -132,6 +141,137 @@ def _row_bytes(row: dict[str, Any]) -> float:
     return float(row.get("weight_bytes") or 0) + float(row.get("io_bytes") or 0)
 
 
+def _kv(row: dict[str, Any]) -> float:
+    return float(row.get("kv_bytes") or 0)
+
+
+def _inside(group: str, pattern: str) -> bool:
+    """``group`` (a qualname with layer indices folded) is ``pattern`` or lies inside it."""
+    return group == pattern or group.startswith(pattern + ".")
+
+
+@dataclass(frozen=True)
+class Traffic:
+    """The bytes a profile's calls touch per run (``classes[].work``) and where: per instance
+    group its calls and instances (every phase), the leaf rows' weights and activations and
+    the KV-cache reads of the innermost rows that record them (a decoder layer that passes
+    its cache on to its attention records the same bytes as the attention: counted once)."""
+
+    calls: dict[str, float]
+    instances: dict[str, float]
+    leaves: tuple[tuple[str, float], ...]
+    kv: tuple[tuple[str, float], ...]
+
+    @classmethod
+    def of(cls, classes: list[dict[str, Any]]) -> Traffic:
+        calls: dict[str, float] = {}
+        instances: dict[str, float] = {}
+        leaves: list[tuple[str, float]] = []
+        kv_rows: list[tuple[str, float]] = []
+        for c in classes:
+            mine: dict[str, list[float]] = {}  # group -> [calls, instances] of this class
+            for r in c.get("work") or []:
+                group = str(r.get("group") or "")
+                acc = mine.setdefault(group, [0.0, 0.0])
+                acc[0] += float(r.get("calls") or 0)
+                acc[1] = max(acc[1], float(r.get("instances") or 1))
+                if c.get("is_leaf"):
+                    leaves.append((group, _row_bytes(r)))
+                if _kv(r) > 0:
+                    kv_rows.append((group, _kv(r)))
+            for group, (n, inst) in mine.items():  # one pattern can hold two classes
+                calls[group] = calls.get(group, 0.0) + n
+                instances[group] = instances.get(group, 0.0) + inst
+        groups = {g for g, _ in kv_rows}
+        kv = [
+            (g, b)
+            for g, b in kv_rows
+            if not any(o != g and _inside(o, g) for o in groups)  # innermost readers only
+        ]
+        return cls(calls, instances, tuple(leaves), tuple(kv))
+
+    def inside(self, pattern: str | None = None) -> tuple[float, float]:
+        """``(bytes, of which KV-cache reads)`` per run of the calls in ``pattern``'s instances
+        (all of them; None: the whole run)."""
+        kv = sum(b for g, b in self.kv if pattern is None or _inside(g, pattern))
+        leaves = sum(b for g, b in self.leaves if pattern is None or _inside(g, pattern))
+        return leaves + kv, kv
+
+    def per_instance(self, group: str) -> float:
+        """Calls per run of one instance of ``group``."""
+        return self.calls.get(group, 0.0) / max(self.instances.get(group, 1.0), 1.0)
+
+    def around(self, group: str) -> list[str]:
+        """The groups with calls whose instances hold ``group``'s, innermost first."""
+        found = [g for g in self.calls if g != group and _inside(group, g)]
+        return sorted(found, key=len, reverse=True)
+
+
+@dataclass(frozen=True)
+class Gap:
+    """Other work between two calls of one instance: for ``share`` of its calls, ``bytes``
+    since its previous call (``kv`` of them KV-cache reads), and ``where`` they come from."""
+
+    share: float
+    bytes: float
+    kv: float
+    where: str
+
+
+def per_call(traffic: Traffic, group: str) -> list[Gap] | None:
+    """The other work before each call of one instance of ``group`` (see the module
+    docstring), or None: the profile has no calls of the modules around it, so a call in a
+    tight loop cannot be told from one the whole model separates."""
+    if "." in group and not traffic.around(group):
+        return None
+    n = max(traffic.instances.get(group, 1.0), 1.0)
+    own, own_kv = (x / n for x in traffic.inside(group))
+    return _gaps(traffic, group, own, own_kv, traffic.per_instance(group))
+
+
+def _gaps(traffic: Traffic, group: str, own: float, own_kv: float, calls: float) -> list[Gap]:
+    """:func:`per_call` of one instance of ``group`` whose calls touch ``own`` bytes per run
+    (``own_kv`` of them KV reads) in ``calls`` calls per run."""
+    if calls <= 0:
+        return []
+    for parent in traffic.around(group):
+        parent_calls = traffic.per_instance(parent)
+        if parent_calls <= 0 or calls <= parent_calls * (1.0 + 1e-9):
+            continue  # called once per call of ``parent``: its other work is in the gap below
+        per_parent = calls / parent_calls
+        # a loop in each call of ``parent``: its other work there, spread over the calls
+        n = max(traffic.instances.get(parent, 1.0), 1.0)
+        inside, inside_kv = (x / n for x in traffic.inside(parent))
+        step = max(inside - own, 0.0) / calls
+        step_kv = max(inside_kv - own_kv, 0.0) / calls
+        loop = f"inside one call of {parent}, which calls it {per_parent:,.3g} times"
+        out = [Gap(1.0 - 1.0 / per_parent, step, step_kv, loop)]
+        for gap in _gaps(traffic, parent, inside, inside_kv, parent_calls):
+            out.append(
+                Gap(
+                    gap.share / per_parent,
+                    gap.bytes + step,
+                    gap.kv + step_kv,
+                    f"the first in a call of {parent}, {gap.where}",
+                )
+            )
+        return out
+    total, total_kv = traffic.inside()
+    return [
+        Gap(
+            1.0,
+            max(total - own, 0.0) / calls,
+            max(total_kv - own_kv, 0.0) / calls,
+            "the rest of the run: no loop around it",
+        )
+    ]
+
+
+def _about(gap: Gap) -> str:
+    kv = f" ({gap.kv / _MB:,.0f} MB of it KV-cache reads)" if gap.kv >= _MB / 2 else ""
+    return f"about {gap.bytes / _MB:,.0f} MB of other work{kv}"
+
+
 def l2_choice(
     profile: dict[str, Any], spec: dict[str, Any], l2_mb: float | None, where: str
 ) -> tuple[str, str] | None:
@@ -145,8 +285,9 @@ def l2_choice(
         return None  # compiled or graph-replayed regions: their work is not in the classes
     classes = profile.get("classes") or []
     mine = [r for c in classes if c.get("cls") == cls for r in c.get("work") or []]
-    total = sum(_row_bytes(r) for c in classes if c.get("is_leaf") for r in c.get("work") or [])
-    if not mine or total <= 0:
+    traffic = Traffic.of(classes)
+    total, total_kv = traffic.inside()
+    if not mine or total - total_kv <= 0:
         return None
     # the rows of the target's instances: its capture's instance groups, else the group of
     # its captured instance, else (a target of every instance) the whole class
@@ -162,23 +303,43 @@ def l2_choice(
     rows = [r for r in rows if not phase or r.get("phase") == phase] or rows
     if not rows:
         return None
-    groups: dict[str, list[float]] = {}  # group -> [bytes, calls] of one of its instances
+    groups: dict[str, list[float]] = {}  # group -> [bytes, KV bytes, calls] of one instance
     for r in rows:
         n = max(int(r.get("instances") or 1), 1)
-        acc = groups.setdefault(str(r.get("group")), [0.0, 0.0])
-        acc[0] += _row_bytes(r) / n
-        acc[1] += float(r.get("calls") or 0) / n
-    group, (own, calls) = max(groups.items(), key=lambda kv: kv[1][1])
+        acc = groups.setdefault(str(r.get("group")), [0.0, 0.0, 0.0])
+        acc[0] += (_row_bytes(r) + _kv(r)) / n
+        acc[1] += _kv(r) / n
+        acc[2] += float(r.get("calls") or 0) / n
+    group, (own, own_kv, calls) = max(groups.items(), key=lambda kv: kv[1][2])
     if calls <= 0:
         return None
     if not l2_mb:
         return "warm", "warm L2: the GPU's L2 size is unknown (toolchain.json)"
-    between = max(total - own, 0.0) / calls
-    cold = between > l2_mb * _MB
+    l2_bytes = l2_mb * _MB
+    # a decode step's attention reads a KV cache the profile may not see (one held by the
+    # module, not passed to it): say so where it could tip the choice
+    unseen = "; the profile records no KV-cache reads" if phase == "decode" and not total_kv else ""
+    gaps = per_call(traffic, group)
+    if not gaps:  # the average over the run: its other work over the instance's calls
+        avg = Gap(1.0, max(total - own, 0.0) / calls, max(total_kv - own_kv, 0.0) / calls, "")
+        cold = avg.bytes > l2_bytes
+        return ("cold" if cold else "warm"), (
+            f"{'cold' if cold else 'warm'} L2: {_about(avg)} between two calls of one "
+            f"instance of {group} ({calls:,.0f} calls per run, {where}) "
+            f"{'exceeds' if cold else 'fits in'} the {l2_mb:g} MB L2 (an average over the "
+            f"run: the profile has no calls of the modules around {group}, so a call in a "
+            f"tight loop cannot be told from one the whole model separates{unseen})"
+        )
+    gaps.sort(key=lambda g: -g.share)
+    share = sum(g.share for g in gaps if g.bytes > l2_bytes)
+    cold = share > 0.5  # most calls
+    first, *rest = gaps
+    others = "".join(f"; {g.share:.0%} follow {_about(g)} ({g.where})" for g in rest)
     return ("cold" if cold else "warm"), (
-        f"{'cold' if cold else 'warm'} L2: about {between / _MB:,.0f} MB of other work between "
-        f"two calls of one instance of {group} ({calls:,.0f} calls per run, {where}) "
-        f"{'exceeds' if cold else 'fits in'} the {l2_mb:g} MB L2"
+        f"{'cold' if cold else 'warm'} L2, per call: {first.share:.0%} of the "
+        f"{traffic.per_instance(group):,.0f} calls per run of one instance of {group} follow "
+        f"{_about(first)} since its previous call ({first.where}){others}; {share:.0%} follow "
+        f"more than the {l2_mb:g} MB L2 ({where}{unseen})"
     )
 
 

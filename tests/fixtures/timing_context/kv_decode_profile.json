@@ -1,0 +1,91 @@
+{
+ "_note": "Synthetic (#226 follow-up 4): a decode LM whose KV-cache reads between two calls of one layer tip it past a 48 MB L2; the fields kernels/context.py reads",
+ "entrypoints": [
+  "LM.forward_step"
+ ],
+ "module_gaps": {},
+ "classes": [
+  {
+   "cls": "LM",
+   "is_leaf": false,
+   "example_qualname": "lm",
+   "work": [
+    {
+     "group": "lm",
+     "phase": "decode",
+     "instances": 1,
+     "calls": 64,
+     "weight_bytes": 3221225472,
+     "io_bytes": 20971,
+     "kv_bytes": 1610612736
+    }
+   ]
+  },
+  {
+   "cls": "Layer",
+   "is_leaf": false,
+   "example_qualname": "lm.layers.0",
+   "work": [
+    {
+     "group": "lm.layers.*",
+     "phase": "decode",
+     "instances": 4,
+     "calls": 256,
+     "weight_bytes": 3221225472,
+     "io_bytes": 20971,
+     "kv_bytes": 1610612736
+    }
+   ]
+  },
+  {
+   "cls": "Attn",
+   "is_leaf": false,
+   "example_qualname": "lm.layers.0.attn",
+   "work": [
+    {
+     "group": "lm.layers.*.attn",
+     "phase": "decode",
+     "instances": 4,
+     "calls": 256,
+     "weight_bytes": 1073741824,
+     "io_bytes": 20971,
+     "kv_bytes": 1610612736
+    }
+   ]
+  },
+  {
+   "cls": "Linear",
+   "is_leaf": true,
+   "example_qualname": "lm.layers.0.attn.qkv",
+   "work": [
+    {
+     "group": "lm.layers.*.attn.qkv",
+     "phase": "decode",
+     "instances": 4,
+     "calls": 256,
+     "weight_bytes": 1073741824,
+     "io_bytes": 20971
+    },
+    {
+     "group": "lm.layers.*.mlp",
+     "phase": "decode",
+     "instances": 4,
+     "calls": 256,
+     "weight_bytes": 2147483648,
+     "io_bytes": 20971
+    }
+   ]
+  }
+ ],
+ "kernel_view": {
+  "timeline": {
+   "stages": [
+    {
+     "stage": "lm.forward_step",
+     "events": 900,
+     "graph_events": 0
+    }
+   ]
+  }
+ }
+}
