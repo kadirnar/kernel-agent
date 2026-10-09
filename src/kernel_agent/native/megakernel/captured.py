@@ -264,7 +264,7 @@ def _make_recorder(module_of: Callable[[], str]) -> Any:
 
     class _Recorder(fusion.Recorder):
         def __init__(self) -> None:
-            super().__init__(lambda: -1)
+            super().__init__()  # no module stack: every op outside a module call
             self.recs: list[Rec] = []
             self.seen: dict[Key, Any] = {}
             self._funcs: list[Any] = []
@@ -282,7 +282,7 @@ def _make_recorder(module_of: Callable[[], str]) -> Any:
             finally:
                 self._funcs.pop()
 
-        def _record(self, info: Any, args: Any, kwargs: Any, out: Any) -> None:
+        def _record(self, info: Any, args: Any, kwargs: Any, out: Any, seq: int = -1) -> None:
             ins = fusion._tensors(args) + fusion._tensors(list(kwargs.values()))
             versions: dict[Key, int] = {}
             for t in ins:
@@ -290,7 +290,7 @@ def _make_recorder(module_of: Callable[[], str]) -> Any:
                 if key is not None:
                     versions[key] = self.writer.get(key, -1)
             index = len(self.ops)
-            super()._record(info, args, kwargs, out)
+            super()._record(info, args, kwargs, out, seq)
             if len(self.ops) == index:
                 return  # a view, an allocation or metadata: no kernel
             func = self._funcs[-1] if self._funcs else None
