@@ -85,6 +85,25 @@ def test_sdpa_flops_follow_the_mask():
     assert masked.read_bytes == kv + 2 * kv // 4 + 16 * F32  # q, valid k/v rows, mask
 
 
+def test_gqa_attention_flops_count_every_query_head():
+    """torch 2.10's SDPA FLOP formula refused fewer K / V heads than query heads (GQA), so
+    such targets got no speed of light: the formulas widen K / V to the query's heads (the
+    same math per query head) and leave MHA as torch counts it."""
+    from torch.utils.flop_counter import sdpa_flop_count
+
+    aten = torch.ops.aten
+    formulas = roofline.gqa_flop_formulas()
+    mha = sdpa_flop_count((2, 16, 3, 128), (2, 16, 512, 128), (2, 16, 512, 128))
+    q = torch.empty(2, 16, 3, 128, device="meta")
+    kv = torch.empty(2, 2, 512, 128, device="meta")  # [batch, heads, seq, dim]
+    sdpa = aten._scaled_dot_product_flash_attention
+    assert formulas[sdpa](q, kv, kv, out_val=None) == mha
+    full = torch.empty(2, 16, 512, 128, device="meta")
+    assert formulas[sdpa](q, full, full, out_val=None) == mha  # MHA: unchanged
+    efficient = aten._scaled_dot_product_efficient_attention
+    assert formulas[efficient](q, kv, kv, None, False, out_val=None) == mha
+
+
 class StaticCacheStep(nn.Module):
     """VoxCPM-style decode step: write one slot of a static cache, attend with a mask."""
 
@@ -446,3 +465,18 @@ class StaticCacheGPU(StaticCacheStep):
         v_cache[:, :, pos, :] = q[:, :, 0] * 2
         mask = (torch.arange(k_cache.size(2), device=q.device) <= pos).view(1, 1, 1, -1)
         return F.scaled_dot_product_attention(q, k_cache, v_cache, attn_mask=mask)
+
+
+@pytest.mark.gpu
+def test_gqa_attention_gets_a_speed_of_light_on_the_gpu():
+    """A GQA decode attention (16 query heads, 2 K / V heads) is counted on every torch:
+    torch 2.10's own formula raised for it (measured on an NVIDIA A10)."""
+    q = torch.randn(1, 16, 1, 128, device="cuda", dtype=torch.bfloat16)
+    k, v = (torch.randn(1, 2, 512, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+
+    class Gqa(nn.Module):
+        def forward(self, q, k, v):
+            return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+    cost = count_case(Gqa(), (q, k, v), {})
+    assert cost.total_flops == 2 * 16 * 1 * 512 * (128 + 128)
