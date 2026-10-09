@@ -53,7 +53,11 @@ statistics", "Host synchronisation in the profile"). What to do about each regim
   L2). The counted rows share no op and add up; a row marked ↳ is an alternative that
   shares a GEMM with the row above it (a prologue and an epilogue of one projection):
   plan one or the other. A row is a region target: `parent_class` = its parent class,
-  `region` = its ops, `fusion` = its id.
+  `region` = its ops, `fusion` = its id. On a GPU the launches are each op's own (the
+  kernel map: none for an op on host tensors, two for a split-K GEMM) and *launches* shows
+  its kernels' GPU time now. A round's re-profile mines the optimised model (what is left);
+  **not mined** names the regions its CUDA graphs, compiled code and custom kernels hide,
+  with their share of the run: their fusions are not in the table.
 * **Workload profile** of a target (`workload_profile.md`): every call of the target's
   instances during the capture run (signatures and shares, masks, strides, flags, integer
   ranges, KV-cache valid lengths): what may be specialised behind a run-time check.

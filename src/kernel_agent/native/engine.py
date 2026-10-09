@@ -375,11 +375,18 @@ def _evidence(chains: Sequence[Mapping[str, Any]], shown: int = 3) -> str:
 
 
 def fusion_candidates(run: RunDir) -> list[dict[str, Any]]:
-    """The candidates of the run's fusion table (``profile/fusions.json``: the analyze
-    profile of the unmodified model; [] without one)."""
-    table = read_json(run.profile_dir / "fusions.json", None)
-    found = table.get("candidates") if isinstance(table, dict) else None
-    return [c for c in found or [] if isinstance(c, dict)]
+    """The candidates of the fusion table next to the newest ceilings table
+    (:func:`newest_table_path`: a round's re-profile mines the optimised model, what is left,
+    #231), else the run's (``profile/fusions.json``, the unmodified model); [] without one."""
+    newest = newest_table_path(run)
+    for path in (
+        newest.parent / "fusions.json" if newest else None,
+        run.profile_dir / "fusions.json",
+    ):
+        table = read_json(path, None) if path is not None else None
+        if isinstance(table, dict):
+            return [c for c in table.get("candidates") or [] if isinstance(c, dict)]
+    return []
 
 
 def loop_targets(stages: Sequence[Stage]) -> list[Stage]:

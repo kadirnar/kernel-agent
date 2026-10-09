@@ -2630,7 +2630,8 @@ the import path; a candidate can subclass the region class with
 
 Which regions are worth it is measured, not left to the planner's reading of the
 source (`kernel_agent/profiling/fusion.py`, issue #231). `analyze` runs the
-unmodified model once more in the hooked work pass (module calls, no timing)
+model once more in the hooked work pass (module calls, no timing; the unmodified
+model, and in an improve round's re-profile the optimised one)
 under a `TorchDispatchMode` that records every aten op: its name, the storages
 it reads and writes (views resolved to their storage) with their bytes, and the
 module call around it (qualname, class, entrypoint, phase). A composite op is
@@ -2668,10 +2669,53 @@ says it per row (*Intermediates and the L2*). An approximation from bytes, not t
 hardware's replacement policy: the reads in between are not taken to refresh it,
 and work the recorder does not see (another process, a graph replay) is not
 traffic. The per-launch cost is the measured launch floor of an eager run, at
-most the run's own time per recorded op, or the measured CUDA-graph launch floor
-per kernel boundary when the kernel view shows the run mostly CUDA-graph launched
+most the run's own time per GPU launch (per recorded op without a kernel map), or
+the measured CUDA-graph launch floor per kernel boundary when the kernel view
+shows the run mostly CUDA-graph launched and no kernel map says which ops were
 (1.28 µs measured on an NVIDIA A10, sm_86; ~0.9 µs on an RTX 5070 Ti,
 docs/PARALLEL.md §4.6, for peaks without one).
+
+**Kernel map: exact launches and kernel times.** On a GPU the pass runs under
+the profiler (Kineto: the GPU's work, the launch calls and, on the host, only
+user-scope ranges, not every aten op), and every op the recorder dispatches runs
+in a range of its own (`ka.op/<n>`), every module call in another
+(`ka.call/<i>`). A GPU event (kernel, copy, memset) belongs to the op whose range
+was the innermost around the host call that launched it (its correlation id), so
+each recorded op carries its exact launches (none for an op on host tensors, two
+for a split-K GEMM and its reduction) and its kernels' GPU time in that pass. A placement's
+launches are the sum over its ops, and it becomes one kernel, or as many as its
+largest anchor launches; *launches* in the table reads `now → after; GPU ms`.
+An eager launch is priced at most at the run's time per GPU launch (window ÷
+launches, not ÷ recorded ops), and a placement's byte saving is capped at its
+kernels' measured time (fusing cannot save more GPU time than they take: it binds
+when the L2 is unknown or the LRU-ish rule over-counts). On the CPU, or when the
+profiler cannot start, every recorded op counts one launch and the table says so;
+`fusions.json` → `kernel_map` has the pass's GPU events, the launches of the
+recorded ops, the ops without a launch and those with several. GPU work launched
+between two recorded ops outside every op range (a graph replay, a Triton kernel)
+separates them as a host sync does: the recorder saw neither what it read nor what
+it wrote, so a chain across it could skip a dependency (`launch_cuts`; measured
+below, a residual add, a Triton RMSNorm and the next layer's add otherwise looked
+like one chain).
+
+**Rounds: what is left, and what is not mined.** An improve round's re-profile
+(`rounds/<n>/profile/`, the worker's `analyze --out-dir` with the accepted items)
+mines the optimised model, so its `fusions.json` / `fusions.md` and the
+re-planner's summary list what is left; the scheduler and the native stage graph
+take the newest table. Some of an optimised model's work dispatches nothing to
+the recorder: a CUDA-graph replay and a kernel launched outside the dispatcher
+(Triton, an extension) launch their kernels without an op, and compiled code does
+not run under a dispatch mode at all (Dynamo runs the compiled module's Python
+eagerly instead, so its ops are recorded but are not what the run executes: they
+become barriers, never in a chain). The kernel map gives the GPU work launched
+outside every op range to the innermost module call around its launch, and the
+table lists these regions as **not mined** (*CUDA-graph replays*, *compiled
+code*, *kernels launched outside the dispatcher*, by instance group) with their
+share of the run: their GPU time in the pass, a compiled module by the module
+view's inclusive time (its eager kernels are no measure of the compiled code);
+without a kernel map, the compiled modules and graph replays of the profile's
+`module_gaps` and its mostly graph-launched timeline stages. Their fusions are the
+graph's, the kernel's or the compiler's.
 
 Rows can share an op: q / k / v take the input norm as a prologue while `q_proj`
 takes `q_norm` + RoPE as its epilogue; `gate_proj` / `up_proj` take the
@@ -2689,15 +2733,16 @@ up, and the table states their total. Greedy and deterministic (ties: the
 innermost parent, the placement, the id), not the best combination in general.
 
 The candidates go to `profile/fusions.md` + `fusions.json`, the top 10 counted
-rows with their alternatives to `summary.md` (*Fusion candidates (measured)*); a
-re-profile of an optimised model shows the run's own table. The planner takes a
+rows with their alternatives to `summary.md` (*Fusion candidates (measured)*); an
+improve round's re-profile has its own (above). The planner takes a
 region from a row (`parent_class`, `region`, and `fusion` = its id); the improve
 scheduler expects that row's saving for the region arm (by parent class: the
 counted rows first; see "Scheduler"), and the native stage graph takes chains that
 span stages as evidence for a group, adding up only those that share no op. A
 `fusions.json` from before (version 1: no traffic, no overlaps) stays readable,
-every row counted. `python -m kernel_agent.profiling.fusion profile.json
---window-ms <ms>` ranks a profile's chains again.
+every row counted; one from before the kernel map (version 2) counts one launch
+per op. `python -m kernel_agent.profiling.fusion profile.json --window-ms <ms>`
+ranks a profile's chains again.
 
 Measured on an NVIDIA A10 (sm_86, 6 MB L2; eager, bf16): Qwen3-0.6B, a 512-token
 prompt + 64 tokens, 103,822 ops, 70 host syncs, 24 chains, an 8.8 s pass (8.6 s
@@ -2736,6 +2781,46 @@ the rows that share a projection (as on the A10 above) do not add up.
 | | LocDiT `q_proj` → RoPE | 5,940 | epilogue | `MiniCPMAttention` | 9 → 1 | 588 |
 | | LocDiT gate, up → SiLU · mul | 6,480 | epilogue | `MiniCPMMLP` | 4 → 1 | 240 |
 | | base LM residual add → `input_layernorm` → q / k / v (decode) | 1,620 | prologue | `MiniCPMModel` | 12 → 1 | 220 |
+
+**The recorder's cost and the kernel map**, measured on an NVIDIA A10, sm_86 (torch
+2.10, eager bf16, Qwen3-0.6B with a 512-token prompt + 64 tokens; the host's CPU was
+shared with other jobs, so the variants ran interleaved, 11 times over four sessions, the
+kernel map's final code 3 times; medians):
+
+| the miner's pass | s | over the hooked pass, per recorded op |
+|---|---|---|
+| the hooked work pass alone | 3.54 | |
+| + the recorder before (one launch per op) | 9.28 | 55 µs |
+| + the recorder after | 8.03 | 43 µs |
+| + the recorder after and the kernel map | 16.03 | 120 µs |
+
+The recorded ops are the same (103,822, compared); on a CPU toy decoder (11,340 ops)
+the recorder's own cost went from 125 to 89 µs per op with torch 2.10 and from 86 to 58
+µs with torch 2.14 (which also wraps `__torch_dispatch__` for Dynamo); a dispatch mode
+that only passes ops through costs ~25 µs per op there, the floor of a Python recorder.
+The kernel map found 106,272 GPU events for the 103,822 recorded ops: 61 launch none
+(ops on host tensors), 2,107 several. Its 8 s are the profiler during the pass, its stop
+and reading 0.4 million events (3.5 s); recording every aten op as well made the pass
+25.7 s, Kineto's external correlation (GPU spans of every range) 19 s. On this eager
+run the top rows' ops launch one kernel each, so their launches do not change (15 → 1, 14 → 1, 11 → 1, 10 → 1); the sampling glue after
+`lm_head` launches 38 kernels, not 28 (each `isin` launches four, `argmax` two), so it
+saves 31.7 ms, not 23.7; a launch is priced at the window ÷ 106,272 GPU launches, and
+*launches* shows each row's kernels' time now (the `k_proj` → `k_norm` → RoPE row: 66.7
+ms of GPU time per run over its 1,701 calls).
+
+An improve round's re-mining, by hand on the same A10 (the worker's re-profile path,
+`profile_workload(..., fusions=True)` on the optimised model, the kernel view stubbed):
+Qwen3-0.6B with two "accepted items", every `Qwen3MLP` `torch.compile`d and every
+`Qwen3RMSNorm` replaced by the bundled Triton RMSNorm example. The pass recorded 45,966
+ops (103,822 before) and its table reads what is left: RoPE + the KV `cat` as the prologue
+of SDPA (decode, 8 → 2 launches: the attention launches two kernels; 194 ms), the
+`o_proj` and `v_proj` epilogues, the sampling glue, instead of the norm and MLP chains
+the items took. **Not mined**: compiled code in `model.model.layers.*.mlp` (28
+instances, 12.2 % of the run by the module view; its 8,960 ops ran eagerly under the
+recorder and are barriers), kernels launched outside the dispatcher in the four norms
+of every layer (1.0-1.1 % of the pass's GPU time each, 1,792 launches each). Before the
+launch cuts this table listed chains of residual adds across 43-56 module boundaries:
+the Triton norm between two layers' adds had hidden their dependency.
 
 ### Speed of light
 

@@ -150,10 +150,11 @@ def cmd_analyze(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
 
     if not ns.no_profile:
         window_ms, what, per = objective.profile_window(baseline)  # metric=throughput: a run
-        unmodified = not (ns.kernel or ns.transform)  # fusion chains: of the model as loaded
+        # fusion chains of the model profiled: an improve round's re-profile mines the
+        # optimised model, so its table lists what is left (#231)
         with workload.metric_window():  # metric=ttfa: the run up to the first audio chunk
             profile = profile_workload(
-                workload, inputs, reference_ms=window_ms, work=work, fusions=unmodified
+                workload, inputs, reference_ms=window_ms, work=work, fusions=True
             )
         write_json(out.profile_dir / "profile.json", profile)
         # Floors per class at bf16 / FP8 / FP4 (profile/ceilings.json + .md; issue #90); the
@@ -211,15 +212,22 @@ def _fusion_section(
     run: RunDir, out: RunDir, profile: dict[str, Any], window_ms: float, per: str
 ) -> str:
     """``profile/fusions.json`` + ``.md`` of a profile that mined its chains (issue #231) and
-    their ``summary.md`` section; a re-profile of an optimised model (its kernels and
-    graphs hide the ops) shows the run's own table, from the unmodified model."""
+    their ``summary.md`` section: an improve round's re-profile mines the optimised model
+    (what is left; regions its graphs, kernels and compiled code hide are listed as not
+    mined). A profile without chains shows the run's own table, from the unmodified model."""
     from kernel_agent.kernels.roofline import current_peaks
     from kernel_agent.profiling import fusion
 
     if "fusions" in profile:
-        return fusion.markdown(
+        text = fusion.markdown(
             fusion.write(out.profile_dir, profile, current_peaks(), window_ms, per=per)
         )
+        if text and out.root != run.root:
+            text += (
+                "\nMined from the optimised model of this round (what is left); the unmodified "
+                "model's table: `profile/fusions.md` of the run.\n"
+            )
+        return text
     table = read_json(run.profile_dir / "fusions.json", None)
     if out.root == run.root or not isinstance(table, dict):
         return ""
