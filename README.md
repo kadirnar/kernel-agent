@@ -4609,9 +4609,18 @@ Claude session, once per target and library install (see *Scouting again* below)
 1. **Op families** from what the reference calls on its dominant captured case (a
    `TorchFunctionMode` trace with the data flow between calls, never module names):
    `sdpa` (q / k / v shapes, GQA, mask, causal), `rms_norm` (`F.rms_norm`, or
-   `rsqrt(mean(x²) + eps)` times `x` written out, casts allowed), `layer_norm`,
-   `softmax`, `linear` (M, N, K, bias), `matmul`, `sampling` (a draw: `multinomial`, or
-   `sort` + `cumsum`; `topk` alone is not), `rotary` (rotate-half), `gated_mlp`.
+   `rsqrt(mean(x²) + eps)` times `x` written out, casts allowed, `variance += eps` in
+   place too), `layer_norm`, `softmax`, `linear` (M, N, K, bias), `matmul`, `sampling` (a
+   draw: `multinomial`, or `sort` + `cumsum`; `topk` alone is not), `rotary` (rotate-half;
+   `paired` when two tensors, q and k, are rotated by one cos and sin), `gated_mlp`.
+   TorchScript runs in C++, where the trace sees nothing: during the trace every
+   TorchScript function the reference's code calls (`@torch.jit.script` or
+   `torch.jit.trace` of a Python function, found from the names its methods and the
+   functions they call read) runs as its Python original, or as its TorchScript code run
+   as Python when it has none (a function of a TorchScript archive), so an RMSNorm in a
+   scripted function is detected; candidates then let Dynamo trace into it too
+   (`fx_rewrites.inline_torchscript`; Dynamo breaks its graph at a TorchScript function
+   without a Python original). A scripted *module* stays opaque to both.
 2. **Adapters** (`libscout/adapters.py`), each with its families, architectures
    (`gpu_arch.supports` syntax), dtypes, target precisions, licence and an
    availability probe (installed, version, import, the library's own check: an
@@ -4629,7 +4638,9 @@ Claude session, once per target and library install (see *Scouting again* below)
    | `flashinfer-norm` | flashinfer-python | RMSNorm | sm_75+ | run on a GPU (A10, 0.6.17) |
    | `quack-rmsnorm`, `quack-softmax` | quack-kernels | RMSNorm; softmax over the last dimension | sm_90, sm_10x, sm_12x | from the docs (an A10 skips them: sm_86) |
    | `liger-rmsnorm`, `liger-swiglu` | liger-kernel | RMSNorm; `silu(gate) * up` | sm_80+ | run on a GPU (A10, 0.8.4) |
-   | `flashinfer-sampling`, `liger-rope`, `gemlite` | | listed and probed, skipped: a random draw cannot be compared with the reference's (*Sampling* below); no template yet | | follow-ups |
+   | `liger-rope` | liger-kernel | the rotate-half RoPE of q and k with one cos and sin (`x * cos + cat(-x2, x1) * sin` twice, about ten kernels) as one call of Liger's RoPE kernel; a q or k something else still reads is copied first (Liger writes into them) | sm_80+ | run on a GPU (A10, 0.8.4) |
+   | `gemlite` | gemlite | `F.linear` as a weight-only low-bit GEMV / GEMM, only on targets planned at `int8_weights` (INT8), `fp8_weights` (FP8) or the opt-in `fp4_weights` (MXFP4, NVFP4) | sm_80+; FP8 and NVFP4: sm_89+ | run on a GPU (A10, 0.6.0.post2) |
+   | `flashinfer-sampling` | | listed and probed, skipped: a random draw cannot be compared with the reference's (*Sampling* below) | | follow-up |
 
    An adapter is skipped with the reason when its library is missing or broken, the
    GPU is outside its architectures, no call site fits (dtype, head size, an explicit
@@ -4647,19 +4658,42 @@ Claude session, once per target and library install (see *Scouting again* below)
    `KA_LIBRARY = "<package>@<version>"`, `KA_LICENCE` and `ARCHS`, and passes the
    critic's static checks. The probe builds and calls each once on the dominant case: one
    that fails there, or whose rewrite finds nothing in Dynamo's graphs, is not swept.
+
+   **Guards.** Dynamo's compiled callable checks its guards on every call: host time a
+   launch-bound target pays at module level. `build(..., GUARDS=0)` is each candidate's
+   guard-free variant: per call signature (the tensors' shapes, strides, dtypes and
+   devices, the plain values, grad and inference mode: `fx_rewrites.call_key`) the
+   entrypoint is traced once by `torch._dynamo.export` (one graph, static shapes, the
+   reference's own parameters and buffers) with the adapter's rewrite applied, and that
+   graph is called directly. A call whose arguments hold another object (a cache) or that
+   Dynamo cannot trace as one graph (a graph break) runs the guarded graphs, and the
+   candidate's `guarded` says why. The probe builds the variant and calls it on the
+   dominant case too; every config is then swept with `GUARDS=1` and `GUARDS=0`, except
+   on a target timed in a CUDA graph (no guard on the timed path), on a module whose
+   capture tracks state between calls (what the guards would follow, a graph traced once
+   does not) and where the variant fails, runs guarded or computes something else on the
+   dominant case (the decision's `guard_free` and the digest say why).
 4. **Op bars** (`libscout/probe.py`): each recorded call an adapter replaces one for one
-   (SDPA, softmax) is called again on its recorded inputs with the reference's op and
-   the library's, checked in the capture's tolerance tier and timed interleaved, as
-   kernel time (replayed from a CUDA graph) and per eager call (host launch cost
-   included). A pattern an adapter folds has its op bar too: each written-out RMSNorm
-   (`rms_norm (written out)(...)`) is replayed from its recorded calls (the cast, `pow`,
-   `mean`, `add`, `rsqrt`, the multiplies: the reference's own kernels) against what the
-   adapter's rewrite puts in its place (`patterns()` of the candidate: `F.rms_norm` with
-   `FUSE=0` / `FUSE=1`, a library's RMSNorm) on the same x and weight. A config whose op
-   bars all lose by more than 10 %, or fail, is not swept.
+   (SDPA, softmax, `F.linear` for cuBLASLt and gemlite) is called again on its recorded
+   inputs with the reference's op and the library's, checked in the capture's tolerance
+   tier and timed interleaved, as kernel time (replayed from a CUDA graph) and per eager
+   call (host launch cost included). cuBLASLt's extension is built by the probe's dry run
+   (in the toolchain's build cache: the next probe only loads it), and its bars name the
+   algorithm it runs per GEMM shape (`algorithm`: the heuristic's i-th of `algorithms`;
+   with `ALGO=-1` all of them timed, the pick's `algorithm_us`). A pattern an adapter
+   folds has its op bar too: each written-out RMSNorm (`rms_norm (written out)(...)`) is
+   replayed from its recorded calls (the cast, `pow`, `mean`, `add`, `rsqrt`, the
+   multiplies: the reference's own kernels) against what the adapter's rewrite puts in
+   its place (`patterns()` of the candidate: `F.rms_norm` with `FUSE=0` / `FUSE=1`, a
+   library's RMSNorm) on the same x and weight. A config whose op bars all lose by more
+   than 10 %, or fail, is not swept, unless its op folds more than the bar times
+   (`folds`: cuBLASLt `FUSE=1` takes a residual add or a GELU into its epilogue, a kernel
+   the GEMM's bar does not count).
 5. **Sweeps**: every adapter that runs goes through `sweep_candidate`'s machinery
-   (its configs checked and timed with racing, the best through the full evaluator),
-   the probe and all sweeps under one GPU lock, and is recorded like an agent's sweep:
+   (its configs checked and timed with racing, the best through the full evaluator) in
+   the target's timing context, as an agent's candidates (`kernels/context.py`: in a
+   CUDA graph for a graph-launched stage; `libscout.json` → `timing_context`), the probe
+   and all sweeps under one GPU lock, and is recorded like an agent's sweep:
    snapshot, `results.jsonl`, a ledger row with `backend` `library:<package>@<version>`,
    `session` `libscout`, `idea` `library-<adapter>`, the title `library <adapter>:
    <config>` and the hypothesis `library scout: <what> (<package> <version>) [sweep: ...]`.
@@ -4683,8 +4717,10 @@ reference calls and the installed version of every distribution the adapters of 
 families use on that GPU (each adapter's package and the runtime wheels its kernels
 come from: torch, the cuBLAS wheel under cuBLASLt and `_scaled_mm`, cuDNN under SDPA's
 cuDNN backend, flash-attn, flashinfer-python, quack-kernels and the CUTLASS DSL,
-liger-kernel and Triton; the CUDA toolkit's `nvcc` when one of them builds an
-extension), read from the package metadata without importing anything. Every pass of the
+liger-kernel and Triton, gemlite at a low-bit weight precision; the CUDA toolkit's
+`nvcc` when one of them builds an extension) at the target's precision (kept in the key
+when reduced: gemlite's libraries key only targets at its precisions), read from the
+package metadata without importing anything. Every pass of the
 scout step (each `optimize` target, every `improve` loop pass) compares it with what is
 installed now: a library of the target's families installed, upgraded or removed, or
 another GPU, scouts the target again and logs why (`libscout: <target>: scouting again:
@@ -4757,9 +4793,9 @@ differs from torch's; without `CPATH` it builds either way. `flashinfer-jit-cach
 (flashinfer.ai/whl/cu128, 1.3 GB) has the kernels prebuilt. `--no-library-scout` turns
 the scout off; a simulated run skips it.
 
-`python -m kernel_agent.libscout CAPTURE [--precision P] [--no-sweep] [--json OUT]`
-scouts a capture outside a run (nothing recorded): families, decisions, op bars and
-every sweep's table.
+`python -m kernel_agent.libscout CAPTURE [--precision P] [--context eager|graph]
+[--no-sweep] [--json OUT]` scouts a capture outside a run (nothing recorded): families,
+decisions, op bars and every sweep's table.
 
 Measured on an RTX 5070 Ti (sm_120, torch 2.14.1), with `python -m kernel_agent.libscout`
 on copies of the runs' captures, on a machine shared with other jobs (load average about
@@ -4831,10 +4867,10 @@ than their kernels do:
 * "Achieved": the library kernel's K / V bytes (decode) or all of q / k / v / o (the
   11-token prefill) per op-bar time, or its FLOPs (causal prefill); the A10's measured peaks
   are 487.5 GB/s DRAM (600 GB/s on its datasheet: the batched decode reads above the
-  measured figure) and 80.6 TFLOP/s bf16. The evaluator's `pct_of_sol` is missing on every
-  GQA capture: its roofline counts FLOPs with torch's `FlopCounterMode`, whose
-  `sdpa_flop_count` (torch 2.10) asserts that q and k have the same number of heads
-  (`sol_error`).
+  measured figure) and 80.6 TFLOP/s bf16. The evaluator's `pct_of_sol` was missing on these
+  GQA captures when they were measured: torch 2.10's `sdpa_flop_count` asserts as many K / V
+  heads as query heads (`sol_error`); the roofline now counts GQA itself
+  (`roofline.gqa_flop_formulas`).
 * flash-attn: op bars 0.96 to 1.04x of the reference (torch's flash backend is
   FlashAttention 2's kernel), module 0.33 to 1.01x; cuDNN's SDPA 1.02 to 1.14x on the
   decodes. Every correct library candidate launches kernels the reference does not
@@ -4856,6 +4892,66 @@ than their kernels do:
 * A probe took 3.7 to 5.5 s (98 s when it builds cuBLASLt's extension), a capture's scout
   35 to 62 s (133 s). FlashInfer's first call of a kernel compiles its module (7 to 15 s
   each here: single / batched decode and prefill, bf16, head size 128; then cached).
+
+Measured on an NVIDIA A10 (sm_86, torch 2.10.0+cu128, transformers 5.19, liger-kernel
+0.8.4, gemlite 0.6.0.post2; the GPU shared with another tenant and other jobs) for the
+guard-free variant, cuBLASLt's op bars, Liger RoPE and gemlite: the probe (`python -m
+kernel_agent.libscout.probe`) and `run_sweep` on captures of Qwen3-0.6B's decoder layer 0
+(batch 1, 11 tokens, no KV cache: launch-bound, the reference 0.76 ms eager), of the toys
+and of skinny bf16 GEMMs:
+
+* **With and without Dynamo's guards**, module level, eager (the sweep's three
+  interleaved timing rounds; speedup over the reference):
+
+  | capture | candidate | `GUARDS=1` | `GUARDS=0` |
+  |---|---|---|---|
+  | Qwen3 decoder layer | `torch-rms-norm` `FUSE=1` | 1.585x | **1.686x** (full evaluation 1.689x, `custom_kernel_share` 0.073) |
+  | | `torch-rms-norm` `FUSE=0` | 1.475x | 1.557x |
+  | | `liger-rope` | 1.019x | **1.057x** (full evaluation 1.06x, `custom_kernel_share` 0.01) |
+  | | `torch-sdpa` flash / cuDNN | 0.979x / 0.952x | 1.007x / 0.981x (flash is torch's own kernel: a `fallback`) |
+  | written-out RMSNorm [64, 1024] (reference 83 us) | `FUSE=1` / `FUSE=0` | 1.841x / 1.473x | **1.964x** (full evaluation 1.944x) / 1.558x |
+  | SDPA core at 11 tokens (reference 37 us) | flash / cuDNN | 0.367x / 0.353x | 0.413x / 0.395x |
+
+  Dynamo's guard check is a part of the host cost, not all of it: per call in a host-bound
+  loop (the SDPA core) the reference took 20 us, `F.scaled_dot_product_attention` inside
+  `sdpa_kernel` 42 us (the pinning context manager itself) and either candidate about
+  70 us; a CPU microbenchmark (torch 2.14, a written-out RMSNorm) took 23 us eager, 37 us
+  through Dynamo's compiled callable and 25.5 us through the traced graph (plus 2.8 us for
+  its key). A launch-bound target gets a library's kernel-time gain whole only in a CUDA
+  graph: the scout times a graph-launched target's candidates there.
+* **Timed in a CUDA graph** (`--context graph`, as the scout of a graph-launched target;
+  the guard-free variant adds nothing there: the SDPA core's cuDNN candidate 1.805x
+  against 1.819x guarded): the SDPA core's cuDNN candidate **1.82x** (full evaluation
+  1.80x; eager 0.35x), the written-out RMSNorm `FUSE=1` **5.24x** (full evaluation 5.35x;
+  eager 1.84x), gemlite INT8 on the skinny GEMMs below **1.11x** (full evaluation 1.10x;
+  eager 0.21x). Every scout candidate was timed eagerly before, whatever the target's
+  context.
+* **cuBLASLt's op bars** (its extension built by the probe's dry run: that probe took 87 s
+  in all, the next one 5.9 s), kernel time, `ALGO=-1` (all of the heuristic's algorithms
+  timed per shape) against torch's `F.linear`:
+
+  | M x K → N | `F.linear` | cuBLASLt `ALGO=-1` | its pick | `ALGO=0` (the heuristic's first) |
+  |---|---|---|---|---|
+  | 1 x 1024 → 4096 | 21.8 us | 20.3 us (1.07x) | 2nd of 2 | 1.00x |
+  | 1 x 4096 → 1024 | 20.5 us | 20.5 us (1.00x) | 1st of 8 | 1.00x |
+  | 1 x 2048 → 2048 | 24.6 us | **21.1 us (1.16x)** | 3rd of 8 | 1.00x |
+  | 16 x 1024 → 4096 | 21.3 us | 24.2 us (0.88x) | 1st of 2 | 0.88x |
+  | 16 x 4096 → 1024 | 23.0 us | 22.6 us (1.02x) | 2nd of 2 | 1.00x |
+  | 16 x 2048 → 2048 | 21.0 us | 20.9 us (1.01x) | 1st of 1 | 1.00x |
+  | 352 x 1024 → 4096 | 55.1 us | 55.8 us (0.99x) | 2nd of 7 | 0.92x |
+  | 352 x 4096 → 1024 | 57.3 us | **48.9 us (1.17x)** | 5th of 8 | 1.00x |
+  | 352 x 2048 → 2048 | 55.6 us | 55.6 us (1.00x) | 1st of 1 | 1.00x |
+
+  Per eager call the extension's Python wrapper costs up to 15 us more than `F.linear`.
+* **gemlite** on the same GEMMs, kernel time against `F.linear`: at `int8_weights` (INT8
+  per output channel) 2.07-2.58x at M = 1, 1.57-2.17x at M = 16, 0.74-0.84x at M = 352; at
+  `fp4_weights` (MXFP4, within the relaxed-fp4 tier) 1.63-2.74x, 1.56-2.05x and
+  0.55-0.66x. Per eager call gemlite's dispatch costs 120-180 us (0.14-0.36x): its INT8
+  candidate measured 0.21x at module level, eager (full evaluation, `custom_kernel_share`
+  1.0). FP8 weights and NVFP4 fail on sm_86 (Triton has no e4m3 conversion below sm_89):
+  those formats declare sm_89+.
+* **Liger RoPE**: on the Qwen3 layer the probe found the two rotations paired and folded
+  them into one call of Liger's kernel (the sweep above).
 
 ### KernelBench regression suite
 

@@ -128,3 +128,89 @@ class Core(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+
+def _norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm written out (in fp32, cast back, the weight last): ``Fused`` scripts it."""
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    return weight * (x * torch.rsqrt(variance + eps)).to(dtype)
+
+
+norm_scripted = torch.jit.script(_norm)
+
+
+class Fused(nn.Module):
+    """An RMSNorm in a ``@torch.jit.script`` function (MiniCPM's ``rms_layernorm`` style):
+    TorchScript runs in C++, where a ``TorchFunctionMode`` sees no op of it."""
+
+    def __init__(self, hidden: int = 16, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return norm_scripted(x, self.weight, self.eps)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+class Rotary(nn.Module):
+    """GQA attention with the rotate-half RoPE of q and k by one cos and sin (as Llama's and
+    Qwen's ``apply_rotary_pos_emb``); ``keep``: the unrotated q is read again afterwards."""
+
+    def __init__(self, hidden: int = 32, heads: int = 4, kv_heads: int = 2, keep: bool = False):
+        super().__init__()
+        self.heads, self.kv_heads, self.dim, self.keep = heads, kv_heads, hidden // heads, keep
+        self.a = nn.Linear(hidden, heads * self.dim, bias=False)
+        self.b = nn.Linear(hidden, kv_heads * self.dim, bias=False)
+        self.c = nn.Linear(hidden, kv_heads * self.dim, bias=False)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+        q = self.a(x).view(b, s, self.heads, self.dim).transpose(1, 2)
+        k = self.b(x).view(b, s, self.kv_heads, self.dim).transpose(1, 2)
+        v = self.c(x).view(b, s, self.kv_heads, self.dim).transpose(1, 2)
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        q_rot = q * cos + rotate_half(q) * sin
+        k_rot = k * cos + rotate_half(k) * sin
+        o = F.scaled_dot_product_attention(q_rot, k_rot, v, enable_gqa=True)
+        out = o.transpose(1, 2).reshape(b, s, -1)
+        return out + q.transpose(1, 2).reshape(b, s, -1) if self.keep else out
+
+
+class Box:
+    """An object argument (a cache): what only Dynamo's guards follow."""
+
+    def __init__(self, scale: torch.Tensor) -> None:
+        self.scale = scale
+
+
+class Boxed(Scale):
+    """A written-out RMSNorm scaled by a tensor its argument object holds."""
+
+    def forward(self, x: torch.Tensor, box: Box) -> torch.Tensor:  # type: ignore[override]
+        return super().forward(x) * box.scale
+
+
+class Branchy(Scale):
+    """A written-out RMSNorm behind data-dependent control flow (a graph break)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x if bool(x.sum() > 0) else -x)
+
+
+class Counted(Scale):
+    """A written-out RMSNorm that counts its calls in a buffer (state between calls)."""
+
+    def __init__(self, hidden: int) -> None:
+        super().__init__(hidden)
+        self.register_buffer("calls", torch.zeros(()))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return super().forward(x)

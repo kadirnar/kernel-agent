@@ -202,8 +202,12 @@ class Adapter:
 
     def configs(self, found: Mapping[str, Site], gpu: Mapping[str, Any]) -> list[dict[str, Any]]:
         """The ``build`` keyword arguments the scout sweeps (``gpu``: ``capability``,
-        ``backends``)."""
+        ``backends`` and the target's ``precision``)."""
         return [{}]
+
+    def no_config(self, found: Mapping[str, Site], gpu: Mapping[str, Any]) -> str:
+        """Why :meth:`configs` has none for this target on this GPU."""
+        return "no config applies on this GPU"
 
     def code(self) -> str:
         """The op code of a candidate: imports, the replacement functions, ``ops(**config)``
@@ -318,7 +322,11 @@ def applicable(
         for name, fam in found.items()
         if isinstance(fam, Mapping)
     }
-    gpu = {"capability": capability, "backends": dict(backends or {})}
+    gpu = {
+        "capability": capability,
+        "backends": dict(backends or {}),
+        "precision": target_precision,
+    }
     for adapter in adapters:
         mine = [sites_of[f] for f in adapter.families if f in sites_of]
         if not mine:
@@ -344,7 +352,7 @@ def applicable(
             continue
         configs = adapter.configs(sites_of, gpu)
         if not configs:
-            decisions.append(Decision(adapter, "no config applies on this GPU"))
+            decisions.append(Decision(adapter, adapter.no_config(sites_of, gpu)))
             continue
         decisions.append(Decision(adapter, None, configs, taken))
     return decisions

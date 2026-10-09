@@ -1,8 +1,9 @@
 """The library scout's GPU step on one capture (issue #227), in a subprocess of its own.
 
 It loads the capture, restores the module state of its dominant case (the most calls per
-run) and runs that case once under :func:`kernel_agent.libscout.detect.trace`. Then, in the
-same process:
+run) and runs that case once under :func:`kernel_agent.libscout.detect.trace` (TorchScript
+functions the reference calls run as their Python there, ``detect.eager_torchscript``: an
+RMSNorm in a ``@torch.jit.script`` function is seen). Then, in the same process:
 
 * the op families of what the reference called (:func:`detect.families`);
 * every adapter's availability (:meth:`Adapter.probe`: the imports happen here, never in
@@ -10,9 +11,16 @@ same process:
   capability, the target's precision, the toolchain's backends);
 * the candidate file of every adapter that runs (:func:`template.render`), written to
   ``--out-dir`` as ``libscout_<adapter>.py``, built and called once on the dominant case
-  (:func:`_dry_run`): one that fails there, or whose rewrite finds nothing in TorchDynamo's
-  graphs (an RMSNorm inside a TorchScript function: the trace sees into it, Dynamo does
-  not), is not swept and says why;
+  (:func:`_dry_run`; a CUDA extension, cuBLASLt's, is built there, in the toolchain's build
+  cache): one that fails there, or whose rewrite finds nothing in TorchDynamo's graphs (an
+  RMSNorm inside a scripted TorchScript module), is not swept and says why;
+* its **guard-free variant** (``GUARDS=0``: one graph per call signature, called without
+  Dynamo's guards, :mod:`kernel_agent.libscout.template`) built and called once on the
+  dominant case too (:func:`guard_free`): every config is swept with and without guards,
+  unless the target is timed in a CUDA graph (``--context graph``: no guard on the timed
+  path), the capture tracks module state (a graph traced once does not follow it), or the
+  variant fails there, runs guarded or computes something else (``guard_free`` of the
+  decision says why);
 * **op bars**: each recorded call that an adapter's ``ops(reference, **config)`` maps (an
   SDPA call, a softmax), called again on its recorded inputs with the reference's own op
   and with the library's, checked against the reference op's output in the capture's
@@ -21,17 +29,20 @@ same process:
   launch cost included). A pattern an adapter folds (``patterns(reference, **config)``:
   the written-out RMSNorm, :func:`pattern_bars`) has its op bar too: its recorded calls
   replayed (the reference's own kernels, about six) against the library's fused kernel on
-  the same x and weight. Adapters that build a CUDA extension (``compiles``) have none
-  (their sweep builds it). The op bar is the library's speed on the op alone, apart from
-  what the module around it costs (cuDNN attention can be 2x faster on its call and slower
-  in an eager, launch-bound layer): what an engineer can count on when calling the library
-  inside a kernel or a CUDA graph.
+  the same x and weight. cuBLASLt's (its extension built by the dry run) carry the
+  algorithm it chose for each GEMM shape (``bar_details`` of a candidate: the heuristic's
+  i-th of n, the pick's time when all n were timed); a config whose op folds more than the
+  bar times (``folds``: a residual add or a GELU into cuBLASLt's epilogue) is never pruned
+  for speed. The op bar is the library's speed on the op alone, apart from what the module
+  around it costs (cuDNN attention can be 2x faster on its call and slower in an eager,
+  launch-bound layer): what an engineer can count on when calling the library inside a
+  kernel or a CUDA graph.
 
 The result arrives on stdout on a line tagged ``@@KA_LIBSCOUT@@`` (``run_probe`` runs it under
 the caller's GPU lock)::
 
     python -m kernel_agent.libscout.probe CAPTURE --out-dir DIR --target ID \\
-        [--precision P] [--backends cuda,triton] [--sha256 S] [--no-bars]
+        [--precision P] [--backends cuda,triton] [--sha256 S] [--no-bars] [--context C]
 """
 
 from __future__ import annotations
@@ -253,9 +264,17 @@ def op_bars(
                     "signature": _signature(name, args, kwargs),
                     "calls": group["calls"],
                 }
+                if folds := getattr(table[func], "folds", None):
+                    bar["folds"] = str(folds)  # the module gains what this bar leaves out
                 mine = functools.partial(func, *args, **kwargs)
                 theirs = functools.partial(table[func], *args, **kwargs)
                 bars.append(_measure(bar, mine, theirs, tier=tier, timer=timer))
+                details = getattr(module, "bar_details", None)
+                if callable(details) and bar.get("ok"):
+                    try:  # what the library chose for the call (cuBLASLt: its algorithm)
+                        bar.update(details(func, args, kwargs, **config) or {})
+                    except Exception as exc:
+                        bar["details_error"] = f"{type(exc).__name__}: {exc}"[:200]
     return bars
 
 
@@ -352,8 +371,11 @@ def prune(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """The configs worth a sweep and the others with why: a config whose op bar failed the
     tolerance, or whose op is slower than the reference's by more than :data:`PRUNE_BELOW`
-    both as kernel time and per eager call. A config without bars stays; when none would,
-    the fastest correct one does (its module-level verdict is still worth having)."""
+    both as kernel time and per eager call. A config without bars stays, and so does one
+    whose bars leave out what it folds around the op (``folds``: cuBLASLt's epilogue takes
+    a residual add or a GELU, a kernel the bar of the GEMM alone does not count) unless one
+    fails; when none would stay, the fastest correct one does (its module-level verdict is
+    still worth having)."""
     keep: list[dict[str, Any]] = []
     pruned: list[tuple[float, dict[str, Any]]] = []  # (best op speedup, -1: fails; entry)
     for config in configs:
@@ -365,6 +387,9 @@ def prune(
         if failed is not None:
             why = f"op bar fails: {str(failed.get('error') or '')[:160]}"
             pruned.append((-1.0, {"config": dict(config), "why": why}))
+            continue
+        if any(b.get("folds") for b in mine):
+            keep.append(dict(config))
             continue
         speeds = [s for b in mine for k in ("speedup", "eager_speedup") if (s := b.get(k))]
         if speeds and max(speeds) < PRUNE_BELOW:
@@ -393,17 +418,33 @@ def _import(path: Path) -> Any:
 #: Why a candidate whose rewrite changed nothing is not swept
 UNCHANGED = (
     "TorchDynamo's graphs of the reference show none of the calls it replaces (they run "
-    "inside an opaque call, such as a TorchScript function)"
+    "inside an opaque call, such as a scripted TorchScript module)"
+)
+#: Why the guard-free variant (``GUARDS=0``) of a graph-timed target's candidates is not swept
+GRAPH_TIMED = (
+    "the target is timed in a CUDA graph (its timing context): Dynamo's guards are host "
+    "time, off the timed path"
+)
+#: ... nor of a module that keeps state between calls
+STATEFUL = (
+    "the module keeps state between calls (the capture restores it per case): Dynamo's "
+    "guards follow it, a graph traced once does not"
 )
 
 
 def _dry_run(
-    path: Path, reference: Any, replay: Any, case: Mapping[str, Any], config: Mapping[str, Any]
+    path: Path,
+    reference: Any,
+    replay: Any,
+    case: Mapping[str, Any],
+    config: Mapping[str, Any],
+    output: list[Any] | None = None,
 ) -> tuple[Any, str | None]:
     """The candidate module at ``path`` built with ``config`` and called once on the
     dominant case: the module and why it is not worth a sweep (None: its rewrite changed
-    the reference's graphs). The trace saw inside every call, Dynamo does not: a TorchScript
-    function is one opaque node there, so its RMSNorm is not the scout's to replace."""
+    the reference's graphs); ``output`` receives the call's output. Dynamo traces into a
+    TorchScript function (its Python original, ``fx_rewrites.inline_torchscript``), not into
+    a scripted module: an RMSNorm there is not the scout's to replace."""
     import torch
 
     from kernel_agent.profiling.methods import entrypoint
@@ -414,15 +455,58 @@ def _dry_run(
         if replay:
             replay.restore(case, reference)
         with torch.inference_mode():
-            entrypoint(candidate, case.get("method", "forward"))(*case["args"], **case["kwargs"])
+            got = entrypoint(candidate, case.get("method", "forward"))(
+                *case["args"], **case["kwargs"]
+            )
     except Exception as exc:
         # what the rewrite raised, not Dynamo's BackendCompilerFailed around it
         inner = getattr(exc, "inner_exception", None) or exc
         why = f"{type(inner).__name__}: {inner}".splitlines()[0][:240]
         return None, f"its candidate failed on the dominant case in the probe: {why}"
+    if output is not None:
+        output.append(got)
     if not getattr(candidate, "rewritten", 0):
         return module, UNCHANGED
     return module, None
+
+
+def guard_free(
+    module: Any,
+    reference: Any,
+    case: Mapping[str, Any],
+    config: Mapping[str, Any],
+    expected: Any,
+    *,
+    tier: str | None = None,
+) -> str | None:
+    """Why the guard-free variant (``GUARDS=0``, :mod:`kernel_agent.libscout.template`) of
+    a candidate module is not worth a sweep (None: it is): built with ``config`` and called
+    on a copy of the dominant case's arguments, it fails, runs the guarded graphs (the
+    candidate's ``guarded`` says why: an argument that is not a tensor or a plain value, a
+    graph break), or its output differs from ``expected`` (the guarded variant's) in the
+    capture's tolerance tier."""
+    import copy
+
+    import torch
+
+    from kernel_agent.kernels.compare import compare_structures
+    from kernel_agent.profiling.methods import entrypoint
+
+    try:
+        candidate = module.build(reference, **{**config, "GUARDS": 0})
+        args, kwargs = copy.deepcopy((case["args"], case["kwargs"]))
+        with torch.inference_mode():
+            got = entrypoint(candidate, case.get("method", "forward"))(*args, **kwargs)
+            failed = [r for r in compare_structures(expected, got, tier=tier) if not r.get("ok")]
+    except Exception as exc:
+        why = f"{type(exc).__name__}: {exc}".strip().splitlines()[0][:200]
+        return f"its guard-free variant failed on the dominant case: {why}"
+    guarded = getattr(candidate, "guarded", None) or {}
+    if guarded:
+        return f"its guard-free variant runs guarded: {next(iter(guarded.values()))}"
+    if failed:
+        return f"its guard-free variant's output differs: {str(failed[0])[:160]}"
+    return None
 
 
 def probe(
@@ -434,8 +518,11 @@ def probe(
     backends: Mapping[str, bool] | None = None,
     sha256: str | None = None,
     bars: bool = True,
+    context: str | None = None,
 ) -> dict[str, Any]:
-    """Everything the scout needs from the GPU for one target (the module docstring)."""
+    """Everything the scout needs from the GPU for one target (the module docstring);
+    ``context``: the target's timing context (``eager`` / ``graph``, ``kernels/context.py``),
+    which decides whether a guard-free variant is worth a sweep."""
     import torch
 
     from kernel_agent import toolchain
@@ -459,12 +546,14 @@ def probe(
     if replay:
         replay.restore(case, reference)
     invocations: list[Any] = []
+    inlined: list[str] = []  # TorchScript functions the trace ran as Python
     calls = detect.trace(
         entrypoint(reference, case.get("method", "forward")),
         case["args"],
         case["kwargs"],
         module=reference,
         invocations=invocations,
+        inlined=inlined,
     )
     found = detect.summary(detect.families(calls))
     available = registry.availability(ADAPTERS)
@@ -480,54 +569,65 @@ def probe(
     out_dir.mkdir(parents=True, exist_ok=True)
     methods = list(capture.get("methods") or {"forward": 1})
     described = detect.describe(found)
+    tier = tier_of(capture)
+
+    def render(d: registry.Decision, configs: list[dict[str, Any]]) -> str:
+        return template.render(
+            d.adapter,
+            target=target,
+            version=available[d.adapter.name].version,
+            configs=configs,
+            families=described,
+            methods=methods,
+            torchscript=bool(inlined),
+        )
+
     written: dict[str, str] = {}
     timed: dict[str, tuple[Any, list[dict[str, Any]]]] = {}
+    unguarded: dict[str, str | None] = {}  # adapter -> why no guard-free variant (None: one)
     rows = [d.to_dict() for d in decisions]
     for d, row in zip(decisions, rows, strict=True):
         if not d.run:
             continue
-        version = available[d.adapter.name].version
         path = out_dir / candidate_name(d.adapter.name)
-        path.write_text(
-            template.render(
-                d.adapter,
-                target=target,
-                version=version,
-                configs=d.configs,
-                families=described,
-                methods=methods,
-            )
-        )
-        module, why = _dry_run(path, reference, replay, case, d.configs[0])
+        path.write_text(render(d, d.configs))
+        output: list[Any] = []
+        module, why = _dry_run(path, reference, replay, case, d.configs[0], output)
         if why is not None:  # no sweep: it would fail, or be the reference's graph unchanged
             row.update(run=False, reason=why)
             row.pop("configs", None)
             continue
         written[d.adapter.name] = str(path)
-        if bars and device == "cuda" and not d.adapter.compiles:
+        if context == "graph":
+            unguarded[d.adapter.name] = GRAPH_TIMED
+        elif replay:
+            unguarded[d.adapter.name] = STATEFUL
+        else:
+            unguarded[d.adapter.name] = guard_free(
+                module, reference, case, d.configs[0], output[0], tier=tier
+            )
+        if bars and device == "cuda":  # a CUDA extension (cuBLASLt) was built by its dry run
             timed[d.adapter.name] = (module, d.configs)
     measured = []
     if timed:  # one op for one op, and the written-out patterns the adapters fold
-        measured = op_bars(reference, invocations, timed, tier=tier_of(capture))
-        measured += pattern_bars(reference, invocations, calls, timed, tier=tier_of(capture))
-    for d, row in zip(decisions, rows, strict=True):  # the op bars spare the sweep its losers
-        if not row.get("run") or d.adapter.name not in timed:
+        measured = op_bars(reference, invocations, timed, tier=tier)
+        measured += pattern_bars(reference, invocations, calls, timed, tier=tier)
+    for d, row in zip(decisions, rows, strict=True):
+        if not row.get("run"):
             continue
-        keep, pruned = prune(
-            row["configs"], [b for b in measured if b["adapter"] == row["adapter"]]
-        )
-        if pruned:
-            row.update(configs=keep, pruned=pruned)
-            Path(written[d.adapter.name]).write_text(
-                template.render(
-                    d.adapter,
-                    target=target,
-                    version=available[d.adapter.name].version,
-                    configs=keep,
-                    families=described,
-                    methods=methods,
-                )
-            )
+        configs = row["configs"]
+        if d.adapter.name in timed:  # the op bars spare the sweep its losers
+            keep, pruned = prune(configs, [b for b in measured if b["adapter"] == row["adapter"]])
+            if pruned:
+                configs = keep
+                row["pruned"] = pruned
+        why = unguarded.get(d.adapter.name)
+        row["guard_free"] = True if why is None else why
+        if why is None:  # each config with Dynamo's guards and without (GUARDS=0)
+            configs = template.guard_free(configs)
+        if configs != row["configs"]:
+            row["configs"] = configs
+            Path(written[d.adapter.name]).write_text(render(d, configs))
     return {
         "target": target,
         "case": case.get("signature"),
@@ -535,6 +635,8 @@ def probe(
         "calls": len(calls),
         "families": found,
         "described": described,
+        "torchscript": inlined,
+        "context": context,
         "capability": list(capability) if capability else None,
         "available": {k: v.to_dict() for k, v in available.items()},
         "decisions": rows,
@@ -553,6 +655,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backends", default="", help="available backends, comma-separated")
     parser.add_argument("--sha256", default=None)
     parser.add_argument("--no-bars", action="store_true")
+    parser.add_argument("--context", choices=("eager", "graph"), default=None)
     ns = parser.parse_args(argv)
     backends = {b: True for b in ns.backends.split(",") if b} if ns.backends else None
     result = probe(
@@ -563,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
         backends=backends,
         sha256=ns.sha256,
         bars=not ns.no_bars,
+        context=ns.context,
     )
     print(MARKER + json.dumps(result, default=str), flush=True)
     return 0
@@ -581,6 +685,7 @@ def run_probe(
     sha256: str | None = None,
     bars: bool = True,
     timeout: float = 600.0,
+    context: str | None = None,
 ) -> dict[str, Any]:
     """:func:`probe` in a subprocess under the GPU lock (nested: the scout holds it for the
     whole target). ``{"error": ...}`` when it fails."""
@@ -604,6 +709,8 @@ def run_probe(
         cmd += ["--sha256", sha256]
     if not bars:
         cmd.append("--no-bars")
+    if context:
+        cmd += ["--context", context]
     with gpu_lock():
         try:
             proc = subprocess.run(

@@ -8,7 +8,10 @@ is ``F.rms_norm`` in one model and ``x.pow(2).mean(-1, keepdim=True)`` + ``rsqrt
 tensor method it reaches (outermost calls only: a mode is off inside its own handler), with
 the shapes and dtypes of the tensors and which earlier call produced each input (the data
 flow, by tensor identity; every output is kept alive for the trace so identities stay
-unique). :func:`families` classifies the record:
+unique; an in-place ``add_`` / ``mul_`` counts as its operation, its output being its
+input). TorchScript runs in C++, out of the mode's sight: the TorchScript functions the
+module's code calls run as their Python during the trace (:func:`eager_torchscript`).
+:func:`families` classifies the record:
 
 * ``sdpa``: ``F.scaled_dot_product_attention`` (q / k / v shapes, GQA, mask, causal);
 * ``rms_norm``: ``F.rms_norm``, or the manual pattern ``rsqrt(mean(x²) + eps)`` times ``x``
@@ -17,7 +20,8 @@ unique). :func:`families` classifies the record:
 * ``linear`` (``F.linear``: rows M, N, K, bias) and ``matmul`` (``matmul`` / ``bmm`` / ``@``
   outside attention);
 * ``sampling``: ``multinomial``, or ``topk`` / ``sort`` + ``cumsum`` (top-k / top-p);
-* ``rotary``: ``cat(-x2, x1)`` (rotate-half) multiplied and added back (RoPE);
+* ``rotary``: ``cat(-x2, x1)`` (rotate-half) multiplied and added back (RoPE), ``paired``
+  when two tensors (q and k) are rotated by one cos and sin;
 * ``gated_mlp``: ``act(gate) * up`` where gate and up are linears of one input (or halves
   of one merged linear), followed by a down projection.
 
@@ -27,7 +31,8 @@ Everything here runs on CPU tensors too (the tests' toy modules); the scout's pr
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+import contextlib
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -51,6 +56,15 @@ _ALIASES = {
     "__rmatmul__": "matmul",
     "__pow__": "pow",
     "__getitem__": "getitem",
+    # in-place arithmetic: ``variance += eps`` reaches the mode as ``Tensor.add_`` (its
+    # output is its input: the data flow follows it), ``x *= w`` as ``mul_``
+    "add_": "add",
+    "sub_": "sub",
+    "mul_": "mul",
+    "neg_": "neg",
+    "pow_": "pow",
+    "rsqrt_": "rsqrt",
+    "__isub__": "sub",
     "_softmax": "softmax",
     "special_softmax": "softmax",
     "concat": "cat",
@@ -188,16 +202,63 @@ def trace(
     *,
     module: Any = None,
     invocations: list[Any] | None = None,
+    inlined: list[str] | None = None,
 ) -> list[Call]:
     """The torch calls of ``fn(*args, **kwargs)`` (see the module docstring); ``module``: the
-    ``nn.Module`` whose parameters are named in :attr:`Call.params`; ``invocations``: a list
-    that receives ``(func, args, kwargs)`` of every recorded call (the scout's op bars run
-    them again)."""
+    ``nn.Module`` whose parameters are named in :attr:`Call.params`, and whose TorchScript
+    functions run as Python during the trace (:func:`eager_torchscript`: TorchScript runs
+    in C++, where the mode sees nothing); ``invocations``: a list that receives ``(func,
+    args, kwargs)`` of every recorded call (the scout's op bars run them again);
+    ``inlined``: a list that receives the names of the TorchScript functions run as
+    Python."""
     params = {id(p): n for n, p in module.named_parameters()} if module is not None else {}
     recorder = _Recorder(params, invocations)
-    with torch.inference_mode(), recorder:
+    with torch.inference_mode(), eager_torchscript(module) as names, recorder:
         fn(*args, **(kwargs or {}))
+    if inlined is not None:
+        inlined.extend(names)
     return recorder.calls
+
+
+@contextlib.contextmanager
+def eager_torchscript(module: Any) -> Iterator[list[str]]:
+    """While it is active, every TorchScript function ``module``'s code calls (a global its
+    submodules' methods read, or an attribute: ``fx_rewrites.torchscript_functions``) is its
+    Python equivalent (``fx_rewrites.torchscript_python``: the function it was made
+    from, or its TorchScript code as Python, which falls back to TorchScript on an error),
+    so a trace sees the ops inside it (an RMSNorm written in a ``@torch.jit.script``
+    function). Yields the names of those it replaced; everything is put back after."""
+    from kernel_agent.libscout.fx_rewrites import torchscript_functions, torchscript_python
+
+    found = torchscript_functions(module) if module is not None else []
+    patched: list[tuple[dict[str, Any], str, Any]] = []
+    names: list[str] = []
+    try:
+        for space, name, fn in found:
+            python = torchscript_python(fn)
+            if python is None:
+                continue
+            if python is not getattr(fn, "_torchdynamo_inline", None):  # translated code
+                python = _or_script(python, fn)
+            patched.append((space, name, fn))
+            space[name] = python
+            names.append(name)
+        yield sorted(set(names))
+    finally:
+        for space, name, fn in reversed(patched):
+            space[name] = fn
+
+
+def _or_script(python: Callable[..., Any], script: Any) -> Callable[..., Any]:
+    """``python``, or the TorchScript function where its translation fails."""
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return python(*args, **kwargs)
+        except Exception:
+            return script(*args, **kwargs)
+
+    return call
 
 
 # ------------------------------------------------------------------ classification
@@ -415,19 +476,57 @@ def _rows(shape: list[int]) -> int:
     return rows
 
 
+def _operand(
+    calls: list[Call], call: int, other: int, shape: list[int] | None = None
+) -> tuple[int, list[int]]:
+    """``(producer, shape)`` of the operand of a binary ``call`` besides ``other``'s output
+    (of ``shape``, when given: two outside tensors differ by it); ``(-2, [])``: none."""
+    c = calls[call]
+    pairs = list(zip(c.inputs, c.shapes, strict=False))
+    for k, (j, s) in enumerate(pairs):
+        if j == other and (shape is None or s == shape):
+            rest = pairs[:k] + pairs[k + 1 :]
+            return rest[0] if len(rest) == 1 else (-2, [])
+    return -2, []
+
+
 def _rotary(calls: list[Call], users: dict[int, list[int]]) -> list[dict[str, Any]]:
-    """``cat((-x2, x1), -1)`` multiplied by sin and added to ``x * cos``."""
-    sites = []
+    """``cat((-x2, x1), -1)`` multiplied by sin and added to ``x * cos`` (rotate-half RoPE):
+    one site per application with x's shape and dtype; ``paired`` when another application
+    multiplies by the same cos and sin (q and k: what a fused RoPE kernel takes together;
+    cos / sin compared by the call that produced them and their shapes)."""
+    apps = []
     for c in calls:
         if c.name != "cat" or len(c.inputs) != 2:
             continue
-        if not any(i >= 0 and calls[i].name == "neg" for i in c.inputs):
+        neg = next((i for i in c.inputs if i >= 0 and calls[i].name == "neg"), None)
+        if neg is None:
             continue
-        muls = [u for u in users.get(c.index, []) if calls[u].name == "mul"]
-        if any(calls[a].name == "add" for m in muls for a in users.get(m, [])):
+        half = calls[neg].inputs[0] if calls[neg].inputs else -1
+        x = calls[half].inputs[0] if half >= 0 and calls[half].inputs else -1
+        for m in (u for u in users.get(c.index, []) if calls[u].name == "mul"):
+            add = next((a for a in users.get(m, []) if calls[a].name == "add"), None)
+            if add is None:
+                continue
             shape = c.out_shapes[0] if c.out_shapes else []
-            sites.append({"shape": shape, "head_dim": shape[-1] if shape else None})
-    return sites
+            sin = _operand(calls, m, c.index)
+            scaled, _ = _operand(calls, add, m)
+            cos = _operand(calls, scaled, x, shape) if scaled >= 0 else (-2, [])
+            key = (cos[0], str(cos[1]), sin[0], str(sin[1]))
+            apps.append((key, shape, (c.out_dtypes or ["?"])[0]))
+            break
+    shared: dict[tuple[Any, ...], int] = {}
+    for key, _, _ in apps:
+        shared[key] = shared.get(key, 0) + 1
+    return [
+        {
+            "shape": shape,
+            "head_dim": shape[-1] if shape else None,
+            "dtype": dtype,
+            "paired": shared[key] > 1,
+        }
+        for key, shape, dtype in apps
+    ]
 
 
 def _gated(calls: list[Call], users: dict[int, list[int]]) -> list[dict[str, Any]]:

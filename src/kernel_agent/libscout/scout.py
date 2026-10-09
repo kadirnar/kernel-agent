@@ -8,7 +8,10 @@ each ``improve`` loop pass before slices, like the library priors):
    files (``candidates/libscout_<adapter>.py``) and the op bars;
 2. every adapter that runs goes through ``sweep_candidate``'s machinery
    (:func:`kernel_agent.kernels.sweep.run_sweep`: its configs checked and timed with
-   racing, the best one through the full evaluator with every anti-gaming guard) and is
+   racing, the best one through the full evaluator with every anti-gaming guard), in the
+   target's timing context as an agent's candidates (``kernels/context.py``: in a CUDA
+   graph for a graph-launched stage, where Dynamo's guards are off the timed path; eagerly
+   otherwise, where each config is also swept guard-free, ``GUARDS=0``), and is
    recorded like an agent's sweep (snapshot, ``results.jsonl``, a ledger row) with the
    hypothesis ``library scout: <what> (<package> <version>) [sweep: ...]``, the session
    ``libscout`` and the backend ``library:<package>@<version>``;
@@ -90,10 +93,11 @@ def gpu_label(gpu: Any) -> str | None:
     return None if gpu is None else f"{gpu.name} ({gpu.arch})"
 
 
-def _keyed(families: Iterable[str] | None, gpu: Any) -> list[Any]:
+def _keyed(families: Iterable[str] | None, gpu: Any, precision: str | None = None) -> list[Any]:
     """The adapters a target's scout depends on: those of its op ``families`` (None: a scout
-    that failed before it detected them, every adapter; []: none) that have a template and
-    run on ``gpu``."""
+    that failed before it detected them, every adapter; []: none) that have a template, run
+    on ``gpu`` and serve the target's ``precision`` (None: the reference's own; gemlite only
+    at low-bit weight precisions)."""
     from kernel_agent.libscout.adapters import ADAPTERS
 
     capability = tuple(gpu.capability) if gpu is not None else None
@@ -104,6 +108,7 @@ def _keyed(families: Iterable[str] | None, gpu: Any) -> list[Any]:
         if not a.no_template
         and (names is None or names & set(a.families))
         and a.arch_reason(capability) is None
+        and ("exact" in a.precisions or (precision or "exact") in a.precisions)
     ]
 
 
@@ -122,28 +127,33 @@ def key(
     *,
     nvcc: str | None = None,
     versions: Mapping[str, str] | None = None,
+    precision: str | None = None,
 ) -> dict[str, Any]:
     """What a target's scout measured besides its capture: ``{gpu, families, libraries}``,
     the GPU (:func:`gpu_label`), the op families its reference calls and the installed
-    version of every distribution the adapters of those families use on this GPU
-    (:attr:`~kernel_agent.libscout.registry.Adapter.distributions`: torch, the cuBLAS and
-    cuDNN wheels torch loads, flash-attn, flashinfer, QuACK, Liger, Triton, ...; read from
-    the metadata, nothing imported) and, when one of them builds a CUDA extension (cuBLASLt),
-    the CUDA toolkit's ``nvcc``. ``versions``: :func:`installed`, read once for many targets.
-    A target whose key changes is scouted again (:func:`stale`); the others keep their bar."""
+    version of every distribution the adapters of those families use on this GPU at the
+    target's ``precision`` (:attr:`~kernel_agent.libscout.registry.Adapter.distributions`:
+    torch, the cuBLAS and cuDNN wheels torch loads, flash-attn, flashinfer, QuACK, Liger,
+    gemlite, Triton, ...; read from the metadata, nothing imported) and, when one of them
+    builds a CUDA extension (cuBLASLt), the CUDA toolkit's ``nvcc``; a reduced ``precision``
+    is kept in the key too. ``versions``: :func:`installed`, read once for many targets. A
+    target whose key changes is scouted again (:func:`stale`); the others keep their bar."""
     from kernel_agent.libscout.registry import versions as read
 
-    adapters = _keyed(families, gpu)
+    adapters = _keyed(families, gpu, precision)
     found = read(adapters) if versions is None else versions
     wanted = {d for a in adapters for d in a.distributions}
     libraries = {d: found[d] for d in sorted(wanted) if d in found}
     if nvcc and any(a.compiles for a in adapters):
         libraries["nvcc (CUDA toolkit)"] = str(nvcc)
-    return {
+    out = {
         "gpu": gpu_label(gpu),
         "families": None if families is None else sorted(set(families)),
         "libraries": libraries,
     }
+    if precision and precision != "exact":
+        out["precision"] = precision
+    return out
 
 
 def changes(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
@@ -179,7 +189,9 @@ def stale(
     old = entry.get("key")
     if not isinstance(old, Mapping):
         return NO_KEY
-    now = key(old.get("families"), gpu, nvcc=nvcc, versions=versions)
+    now = key(
+        old.get("families"), gpu, nvcc=nvcc, versions=versions, precision=old.get("precision")
+    )
     return "; ".join(changes(old, now)) or None
 
 
@@ -209,6 +221,7 @@ def scout_target(
     ``sweeper``: :func:`probe.run_probe` / :func:`sweep.run_sweep` (fakes in tests)."""
     from kernel_agent import precisions
     from kernel_agent.gpulock import gpu_lock
+    from kernel_agent.kernels import context as timing_context
     from kernel_agent.libscout import probe
     from kernel_agent.truth import TamperError
 
@@ -225,16 +238,22 @@ def scout_target(
     except TamperError as exc:
         out["error"] = str(exc)
         return out
+    # timed as the agents' candidates are (#226): in a CUDA graph for a graph-launched
+    # stage, where Dynamo's per-call guards are host time off the timed path
+    timing = timing_context.for_target(run, target_id)
+    out["timing_context"] = {"context": timing.context, "l2": timing.l2, "why": timing.reason}
+    out["precision"] = precisions.of_spec(spec)  # its key's (gemlite: low-bit weights only)
     prober = prober or probe.run_probe
     with gpu_lock():  # one lease: the probe and every adapter's sweep
         info = prober(
             capture,
             out_dir=target_dir / "candidates",
             target=target_id,
-            precision=precisions.of_spec(spec),
+            precision=out["precision"],
             backends=backends,
             sha256=sha256,
             timeout=2 * timeout,
+            context=timing.context,
         )
         if "error" in info:
             out.update(error=str(info["error"])[-1500:], seconds=_since(start))
@@ -258,6 +277,7 @@ def scout_target(
                     timeout=timeout,
                     race=race,
                     sweeper=sweeper,
+                    timing=timing.kwargs(),
                 )
             )
     out.update(
@@ -303,9 +323,10 @@ def _sweep_adapter(
     timeout: float,
     race: bool,
     sweeper: Callable[..., dict[str, Any]] | None,
+    timing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One adapter's sweep, recorded like ``sweep_candidate``'s (snapshot, results.jsonl,
-    ledger row)."""
+    ledger row); ``timing``: the target's timing context (``TimingContext.kwargs``)."""
     from kernel_agent.agent.tools import record_candidate, snapshot
     from kernel_agent.kernels import sweep as sweep_mod
     from kernel_agent.libscout.adapters import BY_NAME
@@ -331,6 +352,7 @@ def _sweep_adapter(
         capture_sha256=sha256,
         prepare=prepare,
         race=race,
+        **dict(timing or {}),
     )
     result = data["evaluation"]
     snap, snap_sha256 = snaps[0]
@@ -380,6 +402,8 @@ def _sweep_adapter(
         "config": config,
         "configs": table,
         "pruned": decision.get("pruned") or [],  # configs its op bars spared the sweep
+        # True: each config swept with and without Dynamo's guards (GUARDS); else why not
+        "guard_free": decision.get("guard_free"),
         "error": _last_line(record.get("error")),
         "seconds": _since(start),
     }
@@ -510,7 +534,15 @@ def bar_lines(run: RunDir, target_id: str) -> list[str]:
         )
     results = found.get("adapters") or []
     if results:
-        lines.append("* Measured (module level, eager): " + "; ".join(map(_result_line, results)))
+        how = (found.get("timing_context") or {}).get("context") or "eager"
+        lines.append(f"* Measured (module level, {how}): " + "; ".join(map(_result_line, results)))
+        guarded = [
+            f"{r.get('adapter')} ({r['guard_free']})"
+            for r in results
+            if isinstance(r.get("guard_free"), str)
+        ]
+        if guarded:  # each other adapter's configs were swept with and without guards
+            lines.append("* Swept with Dynamo's guards only: " + "; ".join(guarded))
     elif found.get("described"):
         lines.append(f"* The reference calls {found['described']}; no library adapter applies.")
     groups = bar_groups(found.get("op_bars") or [])
@@ -857,6 +889,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=300.0, help="evaluation timeout (s)")
     parser.add_argument("--no-sweep", action="store_true", help="the probe and op bars only")
     parser.add_argument("--json", type=Path, default=None, help="write the result here")
+    parser.add_argument(
+        "--context",
+        choices=("eager", "graph"),
+        default="eager",
+        help="the target's timing context (graph: timed in a CUDA graph)",
+    )
     ns = parser.parse_args(argv)
     tc = toolchain.setup()
     out_dir = ns.out_dir or Path(tempfile.mkdtemp(prefix="ka-libscout-"))
@@ -871,6 +909,7 @@ def main(argv: list[str] | None = None) -> int:
                 precision=ns.precision,
                 backends=tc.backends,
                 timeout=2 * ns.timeout,
+                context=ns.context,
             )
             result["probe"] = info
             if "error" in info:
@@ -882,6 +921,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  skipped {d['adapter']}: {d['reason']}")
                 for p in d.get("pruned") or []:
                     print(f"  not swept: {d['adapter']} {_config(p['config'])}: {p['why']}")
+                if isinstance(d.get("guard_free"), str):
+                    print(f"  {d['adapter']}: no guard-free variant: {d['guard_free']}")
             for group in bar_groups(info.get("op_bars") or []):
                 print("  op bar " + _bar_line(group))
             sweeps = result["sweeps"] = {}
@@ -891,7 +932,12 @@ def main(argv: list[str] | None = None) -> int:
                 src = Path(info["candidates"][d["adapter"]])
                 t0 = time.monotonic()
                 data = sweep_mod.run_sweep(
-                    ns.capture, src, d["configs"], timeout=ns.timeout, race=True
+                    ns.capture,
+                    src,
+                    d["configs"],
+                    timeout=ns.timeout,
+                    race=True,
+                    context=ns.context,
                 )
                 data["seconds"] = round(time.monotonic() - t0, 1)
                 sweeps[d["adapter"]] = data
