@@ -181,7 +181,8 @@ def test_summary_carries_the_gpu_facts(arch):
     fam = gpu_arch.family(GPUS[arch][1])
     assert fam is not None
     assert f"arch: {fam.name} ({arch})" in text and "smem per block" in text
-    assert "bf16 ridge" in text and "full rate needs" in text
+    assert "16-bit ridge (bf16, the 16-bit tensor-core dtype here)" in text
+    assert "full rate needs" in text
     assert ("precisions this GPU cannot run" in text) is (arch not in ("sm_100", "sm_120"))
     assert ("software conversion" in text) is (arch in ("sm_80", "sm_86"))
     if arch != "sm_120":
@@ -189,6 +190,46 @@ def test_summary_carries_the_gpu_facts(arch):
     facts = gpu_arch.from_summary(text)
     assert facts.capability == GPUS[arch][1] and facts.name == GPUS[arch][0]
     assert facts == gpu_arch.from_toolchain(tc)  # the prompts read back what doctor shows
+
+
+def _summary(name: str, cap: tuple[int, int], peaks: dict) -> str:
+    gpu = toolchain.GPUInfo(name, cap, 16.0, 40, 4.0, 64.0, 64.0)
+    return toolchain.Toolchain(gpu, "2.14", "13.0", None, "13.0", {}, [], {}, peaks).summary()
+
+
+def test_the_16bit_ridge_is_the_tensor_core_dtypes():
+    """A T4 (datasheet: fp16 tensor cores 65 TFLOP/s, 320 GB/s; bf16 without tensor cores at
+    the fp32 rate) turns compute bound near M ≈ 203 on fp16, not 25 on bf16 (#257)."""
+    t4 = {
+        "arch": "sm_75",
+        "dram_gbps": 320.0,
+        "tflops": {"bfloat16": 8.1, "float16": 65.0, "float32": 8.1},
+        "mma_tflops": {"f16_f32_k8": 65.0, "f16_f16_k8": 65.0, "s8_s32_k16": 130.0},
+    }
+    text = _summary("Tesla T4", (7, 5), t4)
+    assert "16-bit ridge (fp16, the 16-bit tensor-core dtype here): a GEMM turns compute " in text
+    assert "M ≈ 203 rows per weight read (measured fp16 65 TFLOP/s / DRAM 320 GB/s)" in text
+    assert "bf16 matmuls run without tensor cores here (8 TFLOP/s: M ≈ 25)" in text
+    assert "fp32-accumulating HMMA at 100 % of fp16-accumulating here" in text
+    assert gpu_arch.from_summary(text).mma == t4["mma_tflops"]
+    assert gpu_arch.tensor_core_16bit((7, 5)) == "float16"
+    assert gpu_arch.tensor_core_16bit((8, 0)) == gpu_arch.tensor_core_16bit(None) == "bfloat16"
+
+
+@pytest.mark.parametrize(
+    ("name", "rates", "half"),
+    [("NVIDIA GeForce RTX 3090", (71.0, 142.0), True), ("NVIDIA A10", (125.0, 125.0), False)],
+)
+def test_the_summary_says_what_fp32_accumulation_costs(name, rates, half):
+    """GeForce Ampere runs fp32-accumulating HMMA at half rate, the A10 at full rate
+    (NVIDIA's whitepaper / datasheet numbers, dense): only the measured rates tell."""
+    peaks = {**peaks_of("sm_86"), "mma_tflops": {"f16_f32": rates[0], "f16_f16": rates[1]}}
+    text = _summary(name, (8, 6), peaks)
+    pct = 50 if half else 100
+    assert f"fp32-accumulating HMMA at {pct} % of fp16-accumulating here" in text
+    assert ("capped at the lower rate" in text) is half
+    assert ("costs no tensor-core rate" in text) is not half
+    assert "fp32-accumulating" not in _summary(name, (8, 6), peaks_of("sm_86"))
 
 
 def test_builds_target_the_arch_specific_isa_where_the_peak_mma_needs_it():

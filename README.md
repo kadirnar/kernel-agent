@@ -2526,9 +2526,18 @@ precision or another algorithm moves.
   `mma.sync` is not measured on sm_90 / sm_100, where it is emulated through fp16
   and `wgmma` / `tcgen05` reach the FP8 peak) (on the RTX 5070 Ti 104 / 208 / 416 / 416 TFLOP/s,
   docs/RESEARCH-TRITON.md §1.1: a hand-written kernel on `QMMA.F32` is capped at
-  208, below cuBLASLt's 333). `kernel-agent doctor` measures and prints them
-  (`--remeasure-peaks` measures again); a cache from before the FP8 / FP4 peaks
-  or the instruction rates is measured again once.
+  208, below cuBLASLt's 333). The 16-bit forms (#257): fp16 `HMMA.F32` and with
+  fp16 accumulation `HMMA.F16`, TF32 (`m16n8k8`), all sm_80+, and Turing's shapes
+  (sm_75+): fp16 `m16n8k8` (fp32 and fp16 accumulation) and s8 `m8n8k16`
+  (`IMMA.8816`), so a T4 gets instruction rates too. On the RTX 5070 Ti: fp16
+  `HMMA.F32` 104, `HMMA.F16` 208 (fp32 accumulation at half rate, as on every
+  GeForce part; datacenter parts run both at one rate), TF32 52 TFLOP/s; Turing's
+  shapes run padded there (`m16n8k8` 52 / 104, `m8n8k16` 99 TOPS vs `m16n8k32`'s
+  412). `mma_peaks.measure((7, 5))` runs an older GPU's rate kernels through its
+  `compute_75` PTX (driver JIT; the rates are this GPU's). `kernel-agent doctor`
+  measures and prints them (`--remeasure-peaks` measures again); a cache from
+  before the FP8 / FP4 peaks or the instruction rates (or the 16-bit forms) is
+  measured again once.
   `toolchain.json` and the agents' prompts include them. On the RTX 5070 Ti:
   copy DRAM 767 GB/s, L2 2970 GB/s, matmul bf16/fp16/fp32 99 / 94 / 34
   TFLOP/s, FP8 333 TFLOP/s, NVFP4 641 TFLOP/s, launch floor ~16 µs.
@@ -3363,9 +3372,9 @@ model and starts a new round (`kernel_agent/improve.py`,
   * `remaining_ms`: `now`, or the arm's best kernel per run when that is faster
     (not integrated yet: Σ its new ms per call × the calls each case stands for).
   * `headroom`: `1 − floor / remaining_ms`, the rows' floor at the arm's
-    precision: exact, FP8 w, W8A8 (`fp8_w8a8`), MXFP8 (`fp8_mx`), FP4 w, or bf16
-    math and weights (`reduced`). A precision pivot's arm takes the floor of its
-    new precision.
+    precision: exact, FP8 w, W8A8 (`fp8_w8a8`), MXFP8 (`fp8_mx`), FP4 w, or 16-bit
+    math and weights (`reduced`: bf16, fp16 on a GPU without bf16 tensor cores such
+    as Turing). A precision pivot's arm takes the floor of its new precision.
 
   A region target takes its expected gain from the fusion table instead (see
   "Fusion candidates (measured)"): the row of its `fusion` id, else the largest
@@ -4349,9 +4358,13 @@ measured on the GPU itself (`kernel_agent/gpu_arch.py`, issue #165):
   memory, L2 and shared memory per block / per SM; the peaks the copy bandwidth, matmul
   TFLOP/s per dtype, launch floor and `mma.sync` instruction rates. `kernel-agent
   doctor`, `toolchain.json` and every agent prompt carry them with the family, what
-  reaches the peak there, the precisions the GPU cannot run and the bf16 ridge
-  (`GPU ... smem per block`, `arch: ...`, `tensor cores: ...`, `precisions this GPU
-  cannot run: ...`, `bf16 ridge: ...`).
+  reaches the peak there, the precisions the GPU cannot run, the 16-bit ridge at
+  the GPU's 16-bit tensor-core dtype (bf16; fp16 on Turing, where bf16 runs
+  without tensor cores) and what fp32 accumulation costs there (`GPU ... smem per
+  block`, `arch: ...`, `tensor cores: ...`, `precisions this GPU cannot run:
+  ...`, `16-bit ridge (fp16, ...): ...`, `fp32-accumulating HMMA at 50 % of
+  fp16-accumulating here (...)`: half rate on GeForce Turing / Ampere / Ada /
+  Blackwell, full rate on datacenter parts such as the T4, A10 or L40S).
 * **Precisions by GPU.** `fp8_w8a8` needs FP8 tensor cores (sm_89+), `fp8_mx`
   block-scaled ones (sm_100+), `fp4_w4a4` block-scaled FP4 ones (sm_100+: "W4A4" above)
   and `int8_w8a8` INT8 ones (IMMA, sm_75+: on Turing and

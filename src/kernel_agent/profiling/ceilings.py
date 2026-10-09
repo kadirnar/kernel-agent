@@ -15,8 +15,9 @@ of a leaf class (``q_proj``, ``k_proj``, ... of one attention) share a row. Per 
   plus each call's first input and output (``io_bytes``) and, in decode rows, the KV
   cache the calls read (``kv_bytes``: the cache tensors passed to them up to their
   position, :func:`~kernel_agent.profiling.profiler._kv_cache`). ``M`` = FLOPs / (2 ×
-  weight elements), the rows per weight read: a bf16 GEMM turns compute bound near
-  ``M = peak FLOP/s / DRAM bandwidth``.
+  weight elements), the rows per weight read: a 16-bit GEMM turns compute bound near
+  ``M = peak FLOP/s / DRAM bandwidth`` (the peak of the GPU's 16-bit tensor-core dtype:
+  bf16, fp16 on Volta / Turing, :func:`kernel_agent.gpu_arch.tensor_core_16bit`).
 * **floor** per precision: ``max(FLOPs / peak, (weight + io + KV bytes) / DRAM bandwidth,
   calls × launch floor)``, peaks measured on this GPU (:mod:`kernel_agent.kernels.roofline`):
 
@@ -92,7 +93,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kernel_agent import projection
+from kernel_agent import gpu_arch, projection
 from kernel_agent.kernels.mma_peaks import FP8_F32, FP8_SF
 from kernel_agent.kernels.roofline import FP4, FP8, INT8, MXFP8
 
@@ -123,7 +124,7 @@ _LEGEND = {
     "fp4_weights": "FP4 w (NVFP4, 4.5 bits per weight, bf16 math)",
 }
 #: A target's ``precision`` (``kernels.compare.PRECISIONS``) → the column of its floor
-#: (``reduced``: none, bf16 math and weights: :data:`TARGET_PRECISIONS`).
+#: (``reduced``: none, 16-bit math and weights: :data:`TARGET_PRECISIONS`).
 TARGET_COLUMNS = {
     "exact": "exact",
     "fp8_weights": "fp8_weights",
@@ -359,6 +360,7 @@ def build(
             k: peaks[k]
             for k in (
                 "gpu",
+                "arch",  # the 16-bit tensor-core dtype of the ridge and of `reduced`
                 "dram_gbps",
                 "launch_floor_us",
                 "tflops",
@@ -411,7 +413,9 @@ def _e2e(rows: list[dict[str, Any]], precision: str, baseline_ms: float) -> dict
 # ------------------------------------------------------------------ targets (the scheduler)
 
 #: A target's ``precision`` (``spec.json``, ``kernels.compare.PRECISIONS``) → the precision
-#: of its floor. ``reduced`` (another numerics-changing kernel): bf16 math and weights.
+#: of its floor. ``reduced`` (another numerics-changing kernel): 16-bit math and weights at
+#: the GPU's tensor-core dtype, bf16 (:data:`REDUCED_FP16` on Volta / Turing:
+#: :func:`target_precision`).
 TARGET_PRECISIONS = {
     "exact": PRECISIONS["exact"],
     "fp8_weights": PRECISIONS["fp8_weights"],
@@ -423,12 +427,24 @@ TARGET_PRECISIONS = {
     "fp4_w4a4": PRECISIONS["w4a4"],
     "reduced": Precision("bf16", 2.0, "bfloat16"),
 }
+#: ``reduced`` on a GPU without bf16 tensor cores (Volta / Turing): fp16 math and weights.
+REDUCED_FP16 = Precision("fp16", 2.0, "float16")
 _SIBLINGS = re.compile(r"(.*)\.\{([^{}]*)\}")
 
 
-def target_precision(precision: str | None) -> Precision:
-    """The floor's precision of a target's ``precision`` (none or unknown: ``exact``)."""
+def target_precision(precision: str | None, peaks: Mapping[str, Any] | None = None) -> Precision:
+    """The floor's precision of a target's ``precision`` (none or unknown: ``exact``);
+    ``reduced`` at the 16-bit tensor-core dtype of the ``peaks``' GPU (their ``arch``: fp16
+    on Volta / Turing, whose bf16 runs without tensor cores; bf16 without an ``arch``)."""
+    if precision == "reduced" and _tensor_core_16bit(peaks) == "float16":
+        return REDUCED_FP16
     return TARGET_PRECISIONS.get(str(precision or "exact"), PRECISIONS["exact"])
+
+
+def _tensor_core_16bit(peaks: Mapping[str, Any] | None) -> str:
+    """``peaks["tflops"]`` key of the 16-bit tensor-core dtype of the ``peaks``' GPU."""
+    capability = gpu_arch.capability_of(str((peaks or {}).get("arch") or ""))
+    return gpu_arch.tensor_core_16bit(capability)
 
 
 def patterns(row: Mapping[str, Any]) -> list[str]:
@@ -526,11 +542,9 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             "",
         ]
     else:
-        ridge = (
-            float((peaks.get("tflops") or {}).get("bfloat16") or 0.0)
-            * 1000
-            / float(peaks["dram_gbps"])
-        )
+        dtype = _tensor_core_16bit(peaks)
+        ridge = float((peaks.get("tflops") or {}).get(dtype) or 0.0) * 1000
+        ridge /= float(peaks["dram_gbps"])
         legend = [_LEGEND[name] for name in cols if name in _LEGEND]
         for name in (c for c in cols if c not in _LEGEND):  # at a tensor-core peak of its own
             p = precisions[name]
@@ -557,7 +571,8 @@ def markdown(table: Mapping[str, Any], *, top: int = 30, min_share: float = 0.01
             "at the shapes and call counts of this profile (every row: `profile/ceilings.json`). "
             "Work = the FLOPs and weights of the `nn.Linear` / convolution calls inside each "
             "call, plus its first input and output; *M* = FLOPs / (2 × weight elements), the "
-            f"rows per weight read (a bf16 GEMM turns compute bound near M ≈ {ridge:.0f}). "
+            f"rows per weight read (at the {gpu_arch.SHORT_16BIT[dtype]} tensor-core peak a "
+            f"GEMM turns compute bound near M ≈ {ridge:.0f}). "
             f"Floor ({per}, ms) = max(FLOPs / peak, (weight + I/O{' + KV' if kv else ''} bytes) / "
             f"{float(peaks['dram_gbps']):.0f} GB/s, calls × "
             f"{float(peaks.get('launch_floor_us') or 0):.1f} us launch floor) per precision: "
