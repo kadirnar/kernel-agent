@@ -315,7 +315,7 @@ def _warm_up(
         for i in range(calls):
             if restore is not None:
                 restore()
-            a, k = copy.deepcopy(sets[0]) if mutable else sets[i % len(sets)]
+            a, k = _copy_like(sets[0]) if mutable else sets[i % len(sets)]
             fn(*a, **k)
     _current_stream().wait_stream(stream)
     _synchronize()
@@ -344,6 +344,18 @@ def _replaced(before: dict[str, torch.Tensor], value: Any) -> str | None:
                 "replays the tensors it captured"
             )
     return None
+
+
+def _copy_like(value: Any) -> Any:
+    """A deep copy of a call's ``(args, kwargs)`` whose tensors are inference tensors exactly
+    when its own are. The graph timing runs under ``inference_mode``, where a plain deep copy
+    of normal tensors gives inference tensors: a ``torch.compile`` candidate warmed up and
+    checked on the originals then fails Dynamo's guards on the copy and recompiles inside the
+    CUDA-graph capture (found by the library scout on an NVIDIA A10: a candidate packing its
+    weights at compile time failed there)."""
+    inference = any(t.is_inference() for t in _layout(value).values())
+    with torch.inference_mode(inference):
+        return copy.deepcopy(value)
 
 
 def _graph_copies(args: Any, kwargs: Any, calls: int) -> int:
@@ -652,11 +664,11 @@ def _measure_graph(
         _sleep_cycles_per_us()
         _warm_up(fn, restore, sets, mutable, max(warmup, 1), side)
         if mutable:  # made after the warm-up: as captured, never called
-            inputs = [copy.deepcopy((args0, kwargs0)) for _ in range(calls)]
+            inputs = [_copy_like((args0, kwargs0)) for _ in range(calls)]
         else:
             inputs = [sets[j % len(sets)] for j in range(calls)]
             if keep:
-                inputs[checked] = copy.deepcopy(sets[0])
+                inputs[checked] = _copy_like(sets[0])
         layout = [_layout(x) for x in inputs] if mutable else []
         reset = _restorer(sets[0], layout, side) if mutable else None
 

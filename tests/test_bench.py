@@ -259,3 +259,37 @@ def test_evaluator_times_before_the_profiled_pass(tmp_path, monkeypatch):
     timed_twice = isinstance(result["speedup_by_context"].get("graph"), float)
     assert order == ["timing"] * (4 if timed_twice else 2) + ["profiler"], result
     assert all(case["clock"] >= bench.CLOCK_OK for case in result["cases"]), result["cases"]
+
+
+def test_graph_timing_copies_keep_the_inference_flag_of_the_inputs():
+    """The graph timing makes its copies under ``inference_mode``: a copy of normal tensors
+    stays normal (a compiled candidate's guards hold on it), one of inference tensors stays
+    an inference tensor."""
+    x = torch.randn(4)
+    with torch.inference_mode():
+        y = torch.randn(4)
+        (a,), _ = bench._copy_like(((x,), {}))
+        (b,), _ = bench._copy_like(((y,), {"n": 3}))
+    assert not x.is_inference() and not a.is_inference() and torch.equal(a, x)
+    assert y.is_inference() and b.is_inference() and torch.equal(b, y)
+    assert a.data_ptr() != x.data_ptr()
+
+
+@pytest.mark.gpu
+def test_a_compiled_candidate_is_not_recompiled_inside_the_graph_capture():
+    """A ``torch.compile`` candidate timed in a CUDA graph with a kept call (the timed-output
+    check) is compiled once, before the capture: the kept call's inputs are not inference
+    tensors when the case's are not (a recompile inside the capture: measured on an NVIDIA
+    A10, torch 2.10)."""
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    counters.clear()
+    fn = torch.compile(lambda t: t * 2 + 1, dynamic=False)
+    x = torch.randn(1024, device="cuda")
+    with torch.inference_mode():  # the correctness pass: the case's (normal) tensors
+        fn(x)
+    compiled = counters["stats"]["unique_graphs"]
+    result = bench.time_call(fn, (x,), {}, target_ms=5.0, keep=True, context=bench.GRAPH)
+    assert "kept" in result and result["median_ms"] > 0
+    assert counters["stats"]["unique_graphs"] == compiled, dict(counters["stats"])
