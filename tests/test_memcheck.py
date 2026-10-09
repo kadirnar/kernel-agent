@@ -27,6 +27,8 @@ from kernel_agent.report import write_report
 from kernel_agent.scheduler import KERNEL, Arm, Policy
 from kernel_agent.workspace import read_json
 
+#: Sanitizer logs recorded on a GPU machine (tests/fixtures/sanitizer).
+SANITIZER_LOGS = Path(__file__).parent / "fixtures" / "sanitizer"
 #: A memcheck log of kernel 004 (issue #115) on an odd-size variant, shortened.
 LOG_004 = """========= COMPUTE-SANITIZER
 ========= Invalid __global__ read of size 16 bytes
@@ -285,6 +287,50 @@ def test_run_memcheck_with_a_stub_sanitizer(tmp_path, stub, monkeypatch):
         "reason": "not found",
         "seconds": 0.0,
     }
+
+
+def test_a_run_without_cuda_calls_passes_and_says_it_checked_nothing(tmp_path, stub, monkeypatch):
+    """compute-sanitizer 2025.2.1 logs a notice about child processes when the checked
+    process made no CUDA call (a CPU-only run; CUDA work in a child process only: measured
+    on an A10). It is no error report (it failed every clean CPU-only candidate, once a
+    sanitizer was cached), in memcheck, racecheck or synccheck; the result says that
+    nothing was checked instead of calling the kernel clean."""
+    log = (SANITIZER_LOGS / "memcheck_no_cuda_call.log").read_text()
+    assert "Tracking kernels launched by child processes" in log
+    assert memcheck.parse_log(log) == (0, "") and memcheck.unchecked(log)
+    assert memcheck.parse_race_log(log) == (0, 0, "")  # racecheck / synccheck log the same
+    assert memcheck.parse_log(log + "========= ERROR SUMMARY: 0 errors\n") == (0, "")
+    clean = "========= COMPUTE-SANITIZER\n========= ERROR SUMMARY: 0 errors\n"
+    assert not memcheck.unchecked(clean)
+    capture, candidate = tmp_path / "c.pt", tmp_path / "k.py"
+    torch.save({"module": torch.nn.Identity(), "cases": []}, capture)
+    candidate.write_text("# __shared__: racecheck and synccheck too\ndef build(r):\n    return r\n")
+    monkeypatch.setenv("STUB_CHILD", json.dumps({"status": "ok", "cases": 2}))
+    monkeypatch.setenv("STUB_LOG", log)
+    result = memcheck.run_memcheck(capture, candidate, tool=stub)
+    assert result["status"] == "ok" and not memcheck.failed(result)
+    assert result["unchecked"] == memcheck.UNCHECKED
+    tools = [result["tools"][name] for name in ("memcheck", *memcheck.EXTRA_TOOLS)]
+    assert [(t["status"], t.get("unchecked")) for t in tools] == [("ok", memcheck.UNCHECKED)] * 3
+    said = memcheck.describe(result)
+    assert said.startswith("memcheck checked nothing on 2 case(s); racecheck checked nothing")
+    assert "): the checked process made no CUDA call the sanitizer saw" in said
+    monkeypatch.setenv("STUB_LOG", clean)
+    assert "unchecked" not in memcheck.run_memcheck(capture, candidate, tool=stub)
+
+
+def test_the_real_sanitizer_on_a_process_without_cuda_calls(tmp_path):
+    """The installed compute-sanitizer (skipped without one) on a process that makes no
+    CUDA call: no error under any tool, and nothing checked."""
+    tool = toolchain.find_sanitizer()
+    if not tool.path:
+        pytest.skip(tool.reason or "no compute-sanitizer")
+    cmd = [sys.executable, "-c", "pass"]
+    for name in ("memcheck", *memcheck.EXTRA_TOOLS):
+        child, log, _ = memcheck._sanitize(cmd, 120, tmp_path, tool, name)
+        assert child is None
+        parse = memcheck.parse_race_log if name == "racecheck" else memcheck.parse_log
+        assert parse(log)[0] == 0 and memcheck.unchecked(log), (name, log)
 
 
 def test_the_self_test_wants_the_overrun_and_nothing_else(tmp_path, stub, monkeypatch):
