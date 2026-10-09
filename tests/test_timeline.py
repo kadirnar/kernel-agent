@@ -534,3 +534,19 @@ def test_stage_ranges_of_a_workload_without_roots_is_none():
     assert stages is not None and any(
         label == "model.lm.proj" for _, label in stages.modules.values()
     )
+
+
+def test_lost_launches_counts_kernel_launches_without_their_kernel_in_the_spans():
+    """A kernel launch whose kernel the profiler did not record, inside a measured span:
+    what timeline.start_warm should have absorbed (CUPTI lost a session's first kernels
+    after earlier profiling in the process, measured on an NVIDIA A10)."""
+    events = [
+        Event("cuda_runtime", "cudaLaunchKernel", 10, 11, 1, 1),  # its kernel lost
+        Event("cuda_runtime", "cuLaunchKernelEx", 20, 21, 2, 1),
+        Event("kernel", "k2", 30, 40, 2, 7),
+        Event("cuda_runtime", "cudaMemcpyAsync", 22, 23, 3, 1),  # not a kernel launch
+        Event("cuda_runtime", "cudaLaunchKernel", 500, 501, 4, 1),  # outside the spans
+    ]
+    assert timeline.lost_launches(events, [(0, 100)]) == 1
+    assert timeline.lost_launches(events, [(0, 100), (400, 600)]) == 2
+    assert timeline.lost_launches(events, []) == 0

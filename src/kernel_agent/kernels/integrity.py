@@ -56,7 +56,9 @@ from typing import Any
 import torch
 from torch import nn
 
+from kernel_agent.profiling.timeline import WARM_KERNELS, start_warm
 from kernel_agent.profiling.timeline import activity_type as _activity_type
+from kernel_agent.profiling.timeline import lost_launches as _lost_launches
 
 #: A reference entrypoint that runs on the main case with less than this share of
 #: the candidate's GPU time in kernels of its own is a fallback to the reference.
@@ -489,29 +491,49 @@ def activity_check(
     ref_args, ref_kwargs = copy.deepcopy(ref_args), copy.deepcopy(ref_kwargs)
     torch.cuda.synchronize()
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-    with profile(activities=activities) as prof, torch.inference_mode():
-        prepare(ref_restore)
-        with record_function("ka::reference"):
-            reference(*ref_args, **ref_kwargs)
-        torch.cuda.synchronize()
-        with count_calls(codes) as counts:
-            for i, (args, kwargs) in enumerate(inputs):
-                prepare(new_restore)
-                with record_function(f"ka::call{i}"):
-                    candidate(*args, **kwargs)
-                with record_function(f"ka::mark{i}"):
-                    torch.cuda._sleep(1)  # the timed stream moves on
+
+    def profiled(warm: int) -> tuple[list[_Event], dict[Any, int]]:
+        prof = profile(activities=activities)
+        start_warm(prof, warm)  # CUPTI may lose a session's first kernels (timeline.py)
+        try:
+            with torch.inference_mode():
+                prepare(ref_restore)
+                with record_function("ka::reference"):
+                    reference(*ref_args, **ref_kwargs)
                 torch.cuda.synchronize()
-            time.sleep(settle_s)  # late launches from other threads
-            torch.cuda.synchronize()
-            # the device is idle: no graph body runs under this marker's correlation id, so
-            # its stream is the timed one (e2e_activity.caller_stream)
-            with record_function(CALLER):
-                torch.cuda._sleep(1)
-            e2e_activity.mark_streams(record_function)  # declared streams' profiler ids
-            torch.cuda.synchronize()
-    out["reference_calls"] = {codes[c]: n for c, n in counts.items() if n}
-    return analyse_activity(_events(prof), len(inputs), out)
+                with count_calls(codes) as counts:
+                    for i, (args, kwargs) in enumerate(inputs):
+                        prepare(new_restore)
+                        with record_function(f"ka::call{i}"):
+                            candidate(*args, **kwargs)
+                        with record_function(f"ka::mark{i}"):
+                            torch.cuda._sleep(1)  # the timed stream moves on
+                        torch.cuda.synchronize()
+                    time.sleep(settle_s)  # late launches from other threads
+                    torch.cuda.synchronize()
+                    # the device is idle: no graph body runs under this marker's
+                    # correlation id, so its stream is the timed one (caller_stream)
+                    with record_function(CALLER):
+                        torch.cuda._sleep(1)
+                    e2e_activity.mark_streams(record_function)  # declared streams' ids
+                    torch.cuda.synchronize()
+        finally:
+            prof.stop()
+        return _events(prof), dict(counts)
+
+    # a pass whose reference or candidate kernels the profiler lost is profiled again, the
+    # warm-up longer (the kernel names and shares below come from those records)
+    for attempt in range(LOST_RETRIES + 1):
+        events, counts = profiled(WARM_KERNELS << (2 * attempt))
+        found = analyse_activity(events, len(inputs), out)
+        if not found.get("lost_kernels"):
+            break
+    found["reference_calls"] = {codes[c]: n for c, n in counts.items() if n}
+    return found
+
+
+#: Profiled passes of :func:`activity_check` after the first one that lost kernel records.
+LOST_RETRIES = 2
 
 
 #: The marker :func:`activity_check` launches on the timed stream once the device is idle.
@@ -545,6 +567,14 @@ def analyse_activity(
         span = ranges.get(name)
         return [] if span is None else [e for e in launches if span.start <= e.start <= span.end]
 
+    measured = [ranges.get(n) for n in ("ka::reference", *(f"ka::call{i}" for i in range(calls)))]
+    lost = _lost_launches(events, [(r.start, r.end) for r in measured if r is not None])
+    if lost:  # the kernel names and shares below miss them (timeline.start_warm)
+        out["lost_kernels"] = lost
+        out["note"] = (
+            f"the profiler lost {lost} kernel record(s) of the reference's and candidate's "
+            "calls: kernel names and custom_kernel_share are incomplete"
+        )
     marks = [within(f"ka::mark{i}") for i in range(calls)]
     if not all(marks) or not gpu:
         out["note"] = "the profiler recorded no GPU activity; activity checks skipped"

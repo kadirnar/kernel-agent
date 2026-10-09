@@ -48,7 +48,7 @@ import re
 import sys
 import time
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -153,6 +153,31 @@ class ClassStat:
     #: Per (folded qualname, phase): calls, inclusive_ms and the work of those calls, the
     #: input of :mod:`kernel_agent.profiling.ceilings` (:meth:`ModuleTimer.class_stats`).
     work: list[dict[str, Any]] = field(default_factory=list)
+
+
+@contextlib.contextmanager
+def _replays_seen(hook: Callable[[Any], None]) -> Iterator[None]:
+    """``hook(graph)`` before every ``torch.cuda.CUDAGraph.replay`` while active: what
+    ``torch.cuda.graphs.register_graph_replay_start_hook`` does on a torch that has it (2.14
+    does, 2.10 does not: there a graph replayed inside a module call went unseen, its work
+    counted as the module's own and ``module_gaps`` had no ``graph_replays``; measured on an
+    NVIDIA A10). The class's own ``replay`` is put back on exit."""
+    cls = torch.cuda.CUDAGraph
+    own = cls.__dict__.get("replay")
+    inherited = cls.replay
+
+    def replay(graph: Any, *args: Any, **kwargs: Any) -> Any:
+        hook(graph)
+        return inherited(graph, *args, **kwargs)
+
+    setattr(cls, "replay", replay)  # noqa: B010  (a method of torch's class, for a while)
+    try:
+        yield
+    finally:
+        if own is None:
+            delattr(cls, "replay")
+        else:
+            setattr(cls, "replay", own)  # noqa: B010
 
 
 def _capturing() -> bool:
@@ -425,6 +450,8 @@ class ModuleTimer:
             register = getattr(torch.cuda.graphs, "register_graph_replay_start_hook", None)
             if torch.cuda.is_available() and register is not None:  # untimed passes too
                 stack.callback(register(self._replay).remove)
+            elif torch.cuda.is_available():  # a torch without replay hooks (2.10): wrap it
+                stack.enter_context(_replays_seen(self._replay))
             stack.enter_context(instrument(modules, self.methods, self._pre, self._post))
             self._ctx = stack.pop_all()
         return self
@@ -1083,17 +1110,19 @@ def kernel_profile(
     synchronize()
     if stages is not None:
         stages.reset()
+    prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+    timeline.start_warm(prof)  # CUPTI may lose a session's first kernel records
     start = time.perf_counter()
-    with (
-        torch.inference_mode(),
-        profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof,
-    ):
-        with record_function(timeline.RUN):
-            workload.run(inputs)
-            synchronize()
-        wall_ms = (time.perf_counter() - start) * 1000
-        if after is not None:
-            after()
+    try:
+        with torch.inference_mode():
+            with record_function(timeline.RUN):
+                workload.run(inputs)
+                synchronize()
+            wall_ms = (time.perf_counter() - start) * 1000
+            if after is not None:
+                after()
+    finally:
+        prof.stop()
 
     kernels: list[dict[str, Any]] = []
     ops: list[dict[str, Any]] = []

@@ -841,6 +841,10 @@ def _kernel_profiler() -> Any:
                 _enable_profiler(config, self.kineto_activities)
             self.profiling_start_time_ns = time.perf_counter_ns()
 
+        def __enter__(self) -> Any:  # warmed up between preparing and starting the trace
+            timeline.start_warm(self)  # CUPTI may lose a session's first kernel records
+            return self
+
     try:
         experimental = _ExperimentalConfig(disable_external_correlation=True)
     except TypeError:

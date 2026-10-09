@@ -127,6 +127,9 @@ def test_blockscaled_gemm_selftest():
 @pytest.mark.gpu
 @pytest.mark.skipif(not HAS_CUTE, reason="no CuTe DSL")
 def test_decoder_block_selftest():
+    # its ARCHS (sm_89+: the e4m3 -> f16 conversion); an A10 (sm_86) failed in NVVM here
+    if (why := gpu_arch.example_skip(BLOCK, torch.cuda.get_device_capability())) is not None:
+        pytest.skip(why)
     errors = _load(BLOCK).selftest()
     assert max(errors.values()) < 1e-2
 
