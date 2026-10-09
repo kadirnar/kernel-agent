@@ -31,7 +31,18 @@
   a single token is redrawn without its outlier channels; the scaled checks too: a sign
   flip moves a massive activation to other channels).  The candidate
   always runs first and its output is copied right away, so it cannot return
-  memory that the reference's call just freed.
+  memory that the reference's call just freed. A draw that fails is judged again
+  with the reference's own rounding spread on it (:func:`against_rerounded`).
+
+* **Rounding spread** (:func:`rerounded_call`, #250): the reference called once more on
+  the same inputs under :class:`Rerounding`, a dispatch mode that redraws the rounding of
+  every aten op's floating-point results (one ulp at most, about a quarter of the
+  elements; views, copies and indexing exact): one more valid implementation of the
+  reference, whose distance from the plain call is how far rounding alone moves it on
+  those inputs. A deep bf16 chain drifts past the plain exact tolerance on some redrawn
+  inputs whatever rounds it (a fused kernel, ``torch.compile``, eager's own other kernels);
+  :data:`kernels.compare.ROUNDING_SPREAD_K` widens the tolerance by that spread for
+  noise-like errors only.
 
 What is redrawn: every floating-point tensor in the arguments (KV-cache contents
 too, every slot), each channel (one position of the last dimension) from its own
@@ -47,10 +58,12 @@ from __future__ import annotations
 import copy
 import itertools
 import math
+import random
 from collections.abc import Callable
 from typing import Any
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from kernel_agent.kernels.compare import (
     CHANNEL_MIN_ROWS,
@@ -58,6 +71,7 @@ from kernel_agent.kernels.compare import (
     compare_structures,
     flatten,
 )
+from kernel_agent.profiling.state import split as split_state
 
 MASKED = -1e4  # additive masks use values at or below this: never redrawn
 #: Rotary tables (:func:`rotary_tables`): ``cos² + sin²`` within this share of its mean.
@@ -282,6 +296,130 @@ def scale_(value: Any, factor: float) -> int:
     return done
 
 
+# ------------------------------------------------------------------ rounding spread
+
+#: The unit roundoff of the dtypes whose results :class:`Rerounding` redraws (#250).
+UNIT_ROUNDOFF: dict[torch.dtype, float] = {
+    torch.bfloat16: 2.0**-8,
+    torch.float16: 2.0**-11,
+    torch.float32: 2.0**-24,
+}
+#: aten ops whose floating-point results are not rounded (overload packets; in-place variants
+#: without their trailing ``_``): views, copies, indexing, selection, fills, sign and
+#: magnitude. ``_to_copy`` and ``copy`` round when they narrow the dtype (:func:`_rounds`).
+EXACT_OPS = frozenset(
+    {
+        "_reshape_alias", "_unsafe_view", "abs", "alias", "amax", "amin", "arange", "argmax",
+        "argmin", "as_strided", "cat", "ceil", "chunk", "clamp", "clamp_max", "clamp_min",
+        "clone", "constant_pad_nd", "contiguous", "detach", "diagonal", "embedding", "empty",
+        "empty_like", "empty_strided", "expand", "fill", "flatten", "flip", "floor", "full",
+        "full_like", "gather", "index", "index_copy", "index_put", "index_select", "lift",
+        "lift_fresh", "lift_fresh_copy", "masked_fill", "max", "maximum", "min", "minimum",
+        "narrow", "neg", "new_empty", "new_empty_strided", "new_full", "new_ones", "new_zeros",
+        "ones", "ones_like", "permute", "relu", "repeat", "repeat_interleave", "reshape",
+        "resize", "roll", "round", "scalar_tensor", "scatter", "select", "select_scatter",
+        "set", "sign", "slice", "slice_scatter", "sort", "split", "split_with_sizes", "squeeze",
+        "stack", "t", "topk", "transpose", "tril", "triu", "trunc", "unbind", "unflatten",
+        "unsqueeze", "view", "view_as", "where", "zero", "zeros", "zeros_like",
+    }
+)  # fmt: skip
+
+
+def _rounds(func: Any, args: tuple[Any, ...], out: torch.Tensor) -> bool:
+    """Whether aten op ``func`` called on ``args`` rounds its result ``out``: any op not in
+    :data:`EXACT_OPS` (by its overload packet's name), and a conversion or copy into a
+    floating-point dtype with fewer mantissa bits than its floating-point source's."""
+    name = func.overloadpacket.__name__.removesuffix("_")
+    if name in ("_to_copy", "copy"):
+        src = args[1] if name == "copy" and len(args) > 1 else args[0] if args else None
+        if not isinstance(src, torch.Tensor):
+            return True
+        wide = UNIT_ROUNDOFF.get(src.dtype, 0.0) if src.is_floating_point() else 1.0
+        return UNIT_ROUNDOFF.get(out.dtype, 0.0) > wide
+    return name not in EXACT_OPS
+
+
+def reround_(func: Any, args: tuple[Any, ...], out: Any, gen: Callable[[Any], Any]) -> None:
+    """Redraw the rounding of the floating-point results ``out`` of one aten op ``func``
+    called on ``args`` (in place; :class:`Rerounding`): each result an op allocates or
+    writes in place (not a view of its inputs) that it rounds (:func:`_rounds`) times
+    ``1 + u * xi`` (``u``: the dtype's unit roundoff, :data:`UNIT_ROUNDOFF`; ``xi`` uniform
+    in [-1, 1], from ``gen(device)``), rounded back to its dtype: about a quarter of the
+    elements move by one ulp, as when another implementation rounds that value differently
+    or not at all (a fused kernel keeping it in fp32, another accumulation order). Zeros,
+    infinities and NaN stay."""
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return
+    results = out if isinstance(out, tuple | list) else (out,)
+    for i, result in enumerate(results):
+        alias = schema.returns[i].alias_info if i < len(schema.returns) else None
+        if alias is not None and not alias.is_write:
+            continue  # a view: its values are its input's
+        for t in result if isinstance(result, list | tuple) else (result,):
+            if (
+                type(t) not in (torch.Tensor, torch.nn.Parameter)
+                or t.dtype not in UNIT_ROUNDOFF
+                or t.layout != torch.strided
+                or t.numel() == 0
+                or not _rounds(func, args, t)
+            ):
+                continue
+            wide = torch.float64 if t.dtype == torch.float32 else torch.float32
+            xi = torch.rand(t.shape, generator=gen(t.device), device=t.device, dtype=wide)
+            t.copy_(t.to(wide) * (1 + UNIT_ROUNDOFF[t.dtype] * (2 * xi - 1)))
+
+
+class Rerounding(TorchDispatchMode):
+    """A dispatch mode that redraws the rounding of every aten op's results
+    (:func:`reround_`): a reference called under it is one more valid implementation of
+    itself, whose distance from the plain call is the reference's own rounding spread on
+    those inputs (:func:`rerounded_call`)."""
+
+    def __init__(self, seed: int) -> None:
+        super().__init__()
+        self.seed = seed
+        self.gens: dict[str, torch.Generator] = {}
+
+    def gen(self, device: Any) -> torch.Generator:
+        key = str(device)
+        if key not in self.gens:
+            self.gens[key] = torch.Generator(device=device)
+            self.gens[key].manual_seed(self.seed)
+        return self.gens[key]
+
+    def __torch_dispatch__(
+        self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
+    ) -> Any:
+        out = func(*args, **(kwargs or {}))
+        reround_(func, args, out, self.gen)
+        return out
+
+
+def rerounded_call(
+    fn: Callable[..., Any], args: Any, kwargs: Any, *, seed: int | None = None
+) -> tuple[Any, Any, Any] | None:
+    """``fn`` (a reference entrypoint; a stateful case's state restored first, outside the
+    mode) called on copies of ``args`` / ``kwargs`` under :class:`Rerounding`: ``(output,
+    args, kwargs)`` after the call, or None when it cannot run so (an op the mode breaks, no
+    memory left for the copies); the comparison then has no rounding spread. ``seed``:
+    the redraws' (a random one by default)."""
+    call, restore = split_state(fn)
+    try:
+        a, k = copy.deepcopy((args, kwargs))
+        if restore is not None:
+            restore()
+        with torch.inference_mode(), Rerounding(seed if seed is not None else _seed()):
+            out = call(*a, **k)
+        return _snapshot(out), a, k
+    except Exception:
+        return None
+
+
+def _seed() -> int:
+    return random.SystemRandom().getrandbits(63)
+
+
 # ------------------------------------------------------------------ re-verification
 
 CHECKS = {
@@ -329,8 +467,8 @@ def _against_reference(
 ) -> list[dict[str, Any]] | None:
     """Call the candidate on ``args``/``kwargs`` (mutated in place, like the model
     would), then the reference on copies of the same pre-call inputs; compare (with
-    ``input_scale``, :func:`kernels.compare.compare_tensors`). ``finite``: None (skip)
-    when the reference's output or post-call state is not finite."""
+    ``input_scale``, :func:`kernels.compare.compare_tensors`; :func:`against_rerounded`).
+    ``finite``: None (skip) when the reference's output or post-call state is not finite."""
     pre_args, pre_kwargs = copy.deepcopy(args), copy.deepcopy(kwargs)
     out = _call(new_fn, args, kwargs, sync)
     ref_args, ref_kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
@@ -338,10 +476,37 @@ def _against_reference(
     if finite and not _finite((expected, ref_args, ref_kwargs)):
         return None
     kw: dict[str, Any] = {"perturbed": True, "input_scale": input_scale}
-    checks = compare_structures(expected, out, "output", inputs=(pre_args, pre_kwargs), **kw)
-    checks += compare_side_effects(pre_args, ref_args, args, "args", **kw)
-    checks += compare_side_effects(pre_kwargs, ref_kwargs, kwargs, "kwargs", **kw)
-    return checks
+
+    def compared(alt: tuple[Any, Any, Any]) -> list[dict[str, Any]]:
+        inputs = (pre_args, pre_kwargs)
+        checks = compare_structures(expected, out, "output", inputs=inputs, rerounded=alt[0], **kw)
+        checks += compare_side_effects(pre_args, ref_args, args, "args", rerounded=alt[1], **kw)
+        checks += compare_side_effects(
+            pre_kwargs, ref_kwargs, kwargs, "kwargs", rerounded=alt[2], **kw
+        )
+        return checks
+
+    return against_rerounded(compared, ref_fn, pre_args, pre_kwargs, sync)
+
+
+def against_rerounded(
+    compared: Callable[[tuple[Any, Any, Any]], list[dict[str, Any]]],
+    ref_fn: Callable[..., Any],
+    args: Any,
+    kwargs: Any,
+    sync: Callable[[], Any],
+) -> list[dict[str, Any]]:
+    """The checks ``compared((None, None, None))`` of a candidate against the reference on
+    redrawn inputs ``args`` / ``kwargs`` (before the call); when one fails, judged again with
+    the reference's own rounding spread on those inputs (:func:`rerounded_call`: ``compared``
+    gets its ``(output, args, kwargs)``; :data:`kernels.compare.ROUNDING_SPREAD_K`, #250). A
+    candidate that passes the plain checks costs no extra reference call."""
+    checks = compared((None, None, None))
+    if all(c.get("ok") for c in checks):
+        return checks
+    alt = rerounded_call(ref_fn, args, kwargs)
+    sync()
+    return checks if alt is None else compared(alt)
 
 
 def reverify_case(

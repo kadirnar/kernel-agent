@@ -185,6 +185,53 @@ same time.
   reference output turns non-finite where the captured one is finite (fp16
   overflow at × 3) is skipped. `redraws` in the result lists the checks that
   ran and were skipped.
+* **The reference's own rounding** (#250): a deep bf16 chain rounds at every
+  layer, and a candidate that rounds differently drifts from eager with depth.
+  Near zero, an element of a residual stream carries the rounding of summands
+  many times its size. So some redrawn inputs put a correct candidate past the
+  exact tolerance: at 8 layers of RMSNorm → GEMV → residual, 1.6–1.8 % of the draws
+  for the megakernel example and its graph + PDL and grid-barrier modes, and
+  every draw for `torch.compile` of the reference, which is closer to fp32 than
+  eager. Before this, 4 of 100 evaluations of the example were refused.
+  * **The re-judgement.** A check on redrawn inputs that fails (the timed output,
+    the perturbed and scaled inputs, the integration's re-check) is judged again.
+    The reference runs once more on the same inputs, with the rounding of every
+    aten op's results redrawn (`verify.Rerounding`: at most one ulp, views and
+    copies exact). That is one more valid implementation of the reference; its
+    distance from the plain call is the reference's rounding spread on those
+    inputs (`rounding_spread` in the check, relative to the output's RMS).
+  * **Noise-like errors only.** If the candidate's error is at most twice that
+    spread in RMS (`error_over_spread`, `ROUNDING_SPREAD_RMS`), each element's
+    tolerance grows by 4 × the spread (`ROUNDING_SPREAD_K`). The spread is
+    per channel where there are rows for it. The growth is at most 0.125 × the
+    output's RMS (`ROUNDING_SPREAD_CAP`), which bounds references with discrete
+    decisions. The 0.1 % budget, the 10× outlier rule, the whole-tensor checks
+    and the captured-input checks are unchanged.
+  * **Calibration.** On an RTX 5070 Ti (`docs/research-scripts/rounding-spread-250`)
+    the spread is 0.65–2.1 % of the RMS at 2–28 layers, about twice eager's own
+    error against fp32. Honest candidates stay within 0.77 × it in RMS, and every
+    element within the plain tolerance + 2.2 × it.
+
+  | 3,000 draws at 8 layers (1,000 at 16 / 28) | rejected before | after |
+  |---|---|---|
+  | megakernel / graph + PDL / grid barrier, 8 layers | 53 / 49 / 49 | 0 |
+  | the same, 16 layers | 84 / 87 / 87 | 0 |
+  | the same, 28 layers | 171 / 168 / 168 | 0 |
+  | `torch.compile` of the reference, 8 / 16 / 28 layers | all | 0 |
+  | the PDL example's GEMV chain, 28 layers | 342 | 0 |
+  | `torch.compile` of a 4-layer attention + MLP stack (KV cache), 200 draws | 200 | 0 |
+  | the previous call's output, a stale 16-row tile, the last layer skipped | all | all |
+  | evaluations of the 8-layer example (100) | 4 | 0 |
+
+  * **What it still rejects.** What the check is for stays far above the spread:
+    a previous call's output is 66–311 × it in RMS, a skipped last layer 8.9 × (28
+    layers) to 155 × (1 layer). Newly accepted are only systematic errors within
+    twice the spread. At 1 layer that is none. At 8 layers it is a bias up to ~2 %
+    of the RMS (eager's own error against fp32 there: 0.63 %).
+  * **Cost.** A candidate that passes the plain checks costs nothing. A failed
+    draw costs one more reference call; the re-check's reference process makes it
+    for every fresh input. Earlier results stay comparable: the change only accepts
+    more, so `EVALUATOR_SCHEMA` is unchanged.
 * **Peak memory** (a warning, not a failure): after timing, one call of the
   reference and of the candidate per timed case measures the GPU memory the
   allocator holds at the call's peak above what it held before

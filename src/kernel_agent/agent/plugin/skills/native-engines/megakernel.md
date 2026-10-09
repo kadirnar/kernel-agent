@@ -87,7 +87,9 @@ Not every rare failure is a race: the example's exact-tier check against eager (
 rounding) fails on 1.3 % of random inputs at 8 layers and on none at 4 (3,000 draws, issue
 #248), and the graph + PDL and grid-barrier baselines, which use no counters, fail at 1.0 %.
 Tell them apart with the stress check: a race differs from an isolated call on the same
-input, a rounding drift does not.
+input, a rounding drift does not. The evaluator judges a failed redrawn-input check again
+with the reference's own rounding spread (#250): at 8 layers none of 3,000 draws and none of
+100 evaluations are refused any more; the captured inputs keep the plain tolerance.
 
 ## Measured (RTX 5070 Ti, sm_120; the example, 28 layers)
 

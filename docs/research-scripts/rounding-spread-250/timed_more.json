@@ -1,0 +1,126 @@
+{
+ "norm4": {
+  "draws": 1000,
+  "seconds": 13,
+  "candidates": {
+   "megakernel": {
+    "before": 0,
+    "after": 0
+   },
+   "graph_pdl": {
+    "before": 0,
+    "after": 0
+   },
+   "coop_barrier": {
+    "before": 0,
+    "after": 0
+   },
+   "compiled": {
+    "before": 490,
+    "after": 0
+   }
+  },
+  "cheats_rejected": {
+   "cached": 99,
+   "stale_tile": 99,
+   "skip_last": 99,
+   "n": 99
+  }
+ },
+ "plain8": {
+  "draws": 1000,
+  "seconds": 3,
+  "candidates": {
+   "pdl": {
+    "before": 0,
+    "after": 0
+   },
+   "compiled": {
+    "before": 0,
+    "after": 0
+   }
+  },
+  "cheats_rejected": {
+   "cached": 99,
+   "stale_tile": 99,
+   "skip_last": 99,
+   "n": 99
+  }
+ },
+ "norm16": {
+  "draws": 1000,
+  "seconds": 37,
+  "candidates": {
+   "megakernel": {
+    "before": 84,
+    "after": 0
+   },
+   "graph_pdl": {
+    "before": 87,
+    "after": 0
+   },
+   "coop_barrier": {
+    "before": 87,
+    "after": 0
+   },
+   "compiled": {
+    "before": 1000,
+    "after": 0
+   }
+  },
+  "cheats_rejected": {
+   "cached": 99,
+   "stale_tile": 99,
+   "skip_last": 99,
+   "n": 99
+  }
+ },
+ "plain28": {
+  "draws": 1000,
+  "seconds": 9,
+  "candidates": {
+   "pdl": {
+    "before": 342,
+    "after": 0
+   },
+   "compiled": {
+    "before": 447,
+    "after": 0
+   }
+  },
+  "cheats_rejected": {
+   "cached": 99,
+   "stale_tile": 99,
+   "skip_last": 99,
+   "n": 99
+  }
+ },
+ "norm28": {
+  "draws": 1000,
+  "seconds": 65,
+  "candidates": {
+   "megakernel": {
+    "before": 171,
+    "after": 0
+   },
+   "graph_pdl": {
+    "before": 168,
+    "after": 0
+   },
+   "coop_barrier": {
+    "before": 168,
+    "after": 0
+   },
+   "compiled": {
+    "before": 1000,
+    "after": 0
+   }
+  },
+  "cheats_rejected": {
+   "cached": 99,
+   "stale_tile": 99,
+   "skip_last": 99,
+   "n": 99
+  }
+ }
+}

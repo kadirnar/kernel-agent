@@ -51,6 +51,10 @@ Stages and their failure statuses:
    scaled by 3, 0.01 and −1 (:mod:`kernels.verify`; ``redraws`` in the result: the
    scaled checks that ran and any skipped for a non-finite reference output).
 
+A check on redrawn inputs (stages 3 and 4) that fails is judged again with the reference's
+own rounding spread on those inputs (:func:`kernels.verify.against_rerounded`, issue #250):
+a deep bf16 chain that rounds differently from eager is not refused for it.
+
 Native candidates (projects, issue #225) also run every case twice from the same inputs and
 module state after stage 2: their outputs and in-place side effects must agree bit for bit
 (``incorrect`` at stage ``determinism``; ``determinism`` in the result), unless the entry
@@ -158,6 +162,9 @@ PEAK_MEMORY_WARN_MIB = 16.0
 #: 3: timed in the target's context (#226: ``context`` eager or CUDA graph, ``l2`` warm or
 #: cold; earlier records are eager with a warm L2, and an eager cold L2 no longer hides the
 #: call's host time behind the flush).
+#: Not a bump: #250 (a failed redrawn-input check judged again with the reference's own
+#: rounding spread) only accepts more, so every earlier verdict of correct and its timing
+#: stand; a bump would re-evaluate and re-check every kept kernel and re-run every A/B.
 EVALUATOR_SCHEMA = 3
 #: ``context_reason`` of an evaluation whose caller chose no context (eager, warm L2 unless
 #: ``l2_flush``); the tools choose one per target (:mod:`kernel_agent.kernels.context`).

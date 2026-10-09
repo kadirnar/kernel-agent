@@ -835,10 +835,12 @@ def peak_memory(
 def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> dict[str, Any]:
     """Compare a kept timed call of the candidate with a fresh reference call on the
     same inputs (outputs and in-place side effects; the inputs are redrawn, so a
-    reduced-precision tier applies its bounds for redrawn inputs).  The reference runs
-    after the candidate, on copies, so it cannot leave the expected output in freed
-    memory."""
+    reduced-precision tier applies its bounds for redrawn inputs, and a check that fails
+    is judged again with the reference's own rounding spread on them,
+    :func:`kernels.verify.against_rerounded`).  The reference runs after the candidate, on
+    copies, so it cannot leave the expected output in freed memory."""
     from kernel_agent.kernels.compare import compare_side_effects, compare_structures
+    from kernel_agent.kernels.verify import against_rerounded
 
     pre_args, pre_kwargs = kept["pre"]
     ref_args, ref_kwargs = copy.deepcopy(pre_args), copy.deepcopy(pre_kwargs)
@@ -846,11 +848,19 @@ def check_timed_output(reference: Callable[..., Any], kept: dict[str, Any]) -> d
         expected = reference(*ref_args, **ref_kwargs)
     torch.cuda.synchronize()
     new_args, new_kwargs = kept["post"]
-    checks = compare_structures(
-        expected, kept["output"], "output", inputs=kept["pre"], perturbed=True
-    )
-    checks += compare_side_effects(pre_args, ref_args, new_args, "args", perturbed=True)
-    checks += compare_side_effects(pre_kwargs, ref_kwargs, new_kwargs, "kwargs", perturbed=True)
+
+    def compared(alt: tuple[Any, Any, Any]) -> list[dict[str, Any]]:
+        kw: dict[str, Any] = {"perturbed": True}
+        checks = compare_structures(
+            expected, kept["output"], "output", inputs=kept["pre"], rerounded=alt[0], **kw
+        )
+        checks += compare_side_effects(pre_args, ref_args, new_args, "args", rerounded=alt[1], **kw)
+        checks += compare_side_effects(
+            pre_kwargs, ref_kwargs, new_kwargs, "kwargs", rerounded=alt[2], **kw
+        )
+        return checks
+
+    checks = against_rerounded(compared, reference, pre_args, pre_kwargs, torch.cuda.synchronize)
     return {"iteration": kept["iteration"], "failures": [c for c in checks if not c.get("ok")]}
 
 

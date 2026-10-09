@@ -4,6 +4,7 @@ example through the evaluator and under memcheck, racecheck and synccheck."""
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import random
 
@@ -352,6 +353,145 @@ def test_the_evaluator_stresses_the_example_back_to_back(tmp_path):
     assert result["correct"], result
     stress = result["determinism"]["stress"]
     assert (stress["calls"], stress["wrong"]) == (ev.STRESS_CALLS, 0), stress
+
+
+#: Redrawn inputs of the 8-layer chain in the timed-output test (#250; 1.6-1.8 % of them reach
+#: past the plain exact tolerance for each mode) and evaluations of the 8-layer example.
+DEEP_DRAWS = 1000
+DEEP_EVALUATIONS = 10
+
+
+def test_deep_chains_pass_the_timed_output_check_on_every_draw(mk):
+    """Issue #250: at 8 layers 1.6-1.8 % of redrawn inputs put the megakernel and its graph + PDL
+    and grid-barrier baselines past the exact tier's plain tolerance against eager (cuBLAS
+    rounding). The timed-output check judges such a draw again with the reference's own
+    rounding spread on it: none is rejected. What the check is for still fails on every draw
+    it is tried on: the previous draw's output (cached by shape or address), a stale 16-row
+    tile, the last layer skipped."""
+    from kernel_agent.kernels import bench, compare, verify
+
+    mod, _ = mk
+    ref = _chain(layers=8)
+    engines = {m: mod.build(ref, mode=m) for m in ("megakernel", "graph_pdl", "coop_barrier")}
+    gen = torch.Generator(device="cuda").manual_seed(250)
+    captured = torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16, generator=gen)
+    plain = dict.fromkeys(engines, 0)
+    tried = 0
+    previous = None
+    for i in range(DEEP_DRAWS):
+        args = (captured.clone(),)
+        verify.perturb_(args, gen, "normal")
+        pre = (copy.deepcopy(args), {})
+        with torch.inference_mode():
+            expected = ref(*args)
+            outs = {m: engine(*args) for m, engine in engines.items()}
+        for m, out in outs.items():
+            kept = {"iteration": i, "pre": pre, "post": pre, "output": out}
+            assert bench.check_timed_output(ref, kept)["failures"] == [], (m, i)
+            plain[m] += not compare.compare_tensors("output", expected, out, perturbed=True)["ok"]
+        if previous is not None and i % 20 == 0:
+            stale = outs["megakernel"].clone()
+            stale[:, 16:32] = previous[:, 16:32]
+            with torch.inference_mode():
+                skipped = args[0]
+                for norm, layer in zip(ref.norms[:-1], ref.layers[:-1], strict=True):
+                    skipped = skipped + layer(norm(skipped))
+            for what, out in (("previous", previous), ("stale", stale), ("skipped", skipped)):
+                kept = {"iteration": i, "pre": pre, "post": pre, "output": out}
+                assert bench.check_timed_output(ref, kept)["failures"], (what, i)
+            tried += 1
+        previous = outs["megakernel"]
+    assert tried == DEEP_DRAWS // 20 - 1
+    assert sum(plain.values()) > 0, plain  # the draws do reach past the plain tolerance
+    print(f"\n  past the plain tolerance (of {DEEP_DRAWS} draws): {plain}; rejected: none")
+
+
+def _deep_capture(tmp_path):
+    """The example's capture (``MEGAKERNEL_EXAMPLES``) at 8 layers."""
+    from kernel_agent.selftest import MEGAKERNEL_EXAMPLES, make_norm_chain_capture
+
+    hidden, _, calls = MEGAKERNEL_EXAMPLES["native_megakernel"]
+    return make_norm_chain_capture(tmp_path / "chain8.pt", hidden, 8, calls)
+
+
+def test_the_example_passes_the_evaluator_at_eight_layers_every_time(tmp_path):
+    """Issue #250: with the reference's own rounding spread the example passes every
+    evaluation of an 8-layer capture (before: 4 of 100 refused, 2 at the timed output, 2 at
+    the perturbed inputs)."""
+    from kernel_agent.kernels import evaluate as ev
+
+    capture = _deep_capture(tmp_path)
+    for i in range(DEEP_EVALUATIONS):
+        result = ev.run_evaluation(capture, EXAMPLE)
+        assert result["correct"], (i, result.get("status"), result.get("error"))
+
+
+#: The example's engine behind an output cache (#250: still rejected on the 8-layer chain).
+CHEATING_ENGINES = {
+    "memo": """
+from torch import nn
+
+from kernel_agent.agent.prompts import EXAMPLES_DIR
+from kernel_agent.native import project
+
+_EXAMPLE = project.import_project(EXAMPLES_DIR / "native_megakernel")
+
+
+class Memo(nn.Module):
+    '''The engine's output memoised by input shape.'''
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine, self.memo = engine, {}
+
+    def forward(self, x):
+        if x.shape not in self.memo:
+            self.memo[x.shape] = self.engine(x)
+        return self.memo[x.shape].clone()
+
+
+def build(reference):
+    return Memo(_EXAMPLE.build(reference))
+""",
+    "stale": """
+from torch import nn
+
+from kernel_agent.agent.prompts import EXAMPLES_DIR
+from kernel_agent.native import project
+
+_EXAMPLE = project.import_project(EXAMPLES_DIR / "native_megakernel")
+
+
+class Stale(nn.Module):
+    '''One call behind: the previous call's output of the same shape (the first its own).'''
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine, self.last = engine, {}
+
+    def forward(self, x):
+        out = self.engine(x)
+        last = self.last.get(x.shape)
+        self.last[x.shape] = out
+        return out if last is None else last
+
+
+def build(reference):
+    return Stale(_EXAMPLE.build(reference))
+""",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(CHEATING_ENGINES))
+def test_cached_and_stale_engines_are_still_rejected_at_eight_layers(tmp_path, kind):
+    from kernel_agent.kernels import evaluate as ev
+
+    capture = _deep_capture(tmp_path)
+    candidate = tmp_path / f"{kind}.py"
+    candidate.write_text(CHEATING_ENGINES[kind])
+    result = ev.run_evaluation(capture, candidate)
+    assert not result["correct"], result
+    assert result["status"] in ("incorrect_timed_output", "incorrect_perturbed"), result
 
 
 def _stress(launch, xs, golden, out, calls, seed=0):

@@ -1,0 +1,66 @@
+layers=1 rows=1 (100 draws): rejected before/after
+   bias 1%                 0    0   error/spread median 2.347
+   bias 2%               100  100   error/spread median 4.615
+   bias 4%               100  100   error/spread median 8.938
+   scale 1.01              0    0   error/spread median 2.208
+   scale 1.03            100  100   error/spread median 6.625
+   scale 1.05            100  100   error/spread median 11.071
+   noise 1%              100   99   error/spread median 2.245
+   noise 2%              100  100   error/spread median 4.406
+   last layer skipped    100  100   error/spread median 155.353
+   previous output        99   99   error/spread median 311.418
+layers=1 rows=64 (100 draws): rejected before/after
+   bias 1%                 0    0   error/spread median 2.347
+   bias 2%               100  100   error/spread median 4.577
+   bias 4%               100  100   error/spread median 8.806
+   scale 1.01              0    0   error/spread median 2.18
+   scale 1.03            100  100   error/spread median 6.562
+   scale 1.05            100  100   error/spread median 10.964
+   noise 1%              100  100   error/spread median 2.226
+   noise 2%              100  100   error/spread median 4.406
+   last layer skipped    100  100   error/spread median 155.794
+   previous output        99   99   error/spread median 307.913
+layers=8 rows=1 (100 draws): rejected before/after
+   bias 1%               100    0   error/spread median 0.84
+   bias 2%               100    0   error/spread median 1.676
+   bias 4%               100  100   error/spread median 3.328
+   scale 1.01              0    0   error/spread median 0.813
+   scale 1.03            100  100   error/spread median 2.45
+   scale 1.05            100  100   error/spread median 4.087
+   noise 1%              100    0   error/spread median 0.829
+   noise 2%              100   36   error/spread median 1.627
+   last layer skipped    100  100   error/spread median 27.246
+   previous output        99   99   error/spread median 115.302
+layers=8 rows=64 (100 draws): rejected before/after
+   bias 1%               100    0   error/spread median 0.841
+   bias 2%               100  100   error/spread median 1.682
+   bias 4%               100  100   error/spread median 3.328
+   scale 1.01              0    0   error/spread median 0.815
+   scale 1.03            100  100   error/spread median 2.456
+   scale 1.05            100  100   error/spread median 4.105
+   noise 1%              100    0   error/spread median 0.833
+   noise 2%              100   98   error/spread median 1.649
+   last layer skipped    100  100   error/spread median 27.394
+   previous output        99   99   error/spread median 115.327
+layers=28 rows=1 (100 draws): rejected before/after
+   bias 1%               100    0   error/spread median 0.506
+   bias 2%               100    0   error/spread median 0.959
+   bias 4%               100   11   error/spread median 1.9
+   scale 1.01              0    0   error/spread median 0.473
+   scale 1.03            100    0   error/spread median 1.415
+   scale 1.05            100  100   error/spread median 2.365
+   noise 1%              100    0   error/spread median 0.482
+   noise 2%              100    0   error/spread median 0.954
+   last layer skipped    100  100   error/spread median 8.892
+   previous output        99   99   error/spread median 66.485
+layers=28 rows=64 (100 draws): rejected before/after
+   bias 1%               100    0   error/spread median 0.498
+   bias 2%               100    0   error/spread median 0.943
+   bias 4%               100  100   error/spread median 1.891
+   scale 1.01              0    0   error/spread median 0.475
+   scale 1.03            100  100   error/spread median 1.426
+   scale 1.05            100  100   error/spread median 2.385
+   noise 1%              100    0   error/spread median 0.484
+   noise 2%              100   87   error/spread median 0.958
+   last layer skipped    100  100   error/spread median 8.9
+   previous output        99   99   error/spread median 66.971
