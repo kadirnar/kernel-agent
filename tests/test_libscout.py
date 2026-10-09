@@ -148,8 +148,8 @@ def _fake_libraries(monkeypatch, installed: dict[str, Any], broken: tuple[str, .
         monkeypatch.setitem(sys.modules, name, module)
         for sub, value in getattr(module, "_submodules", {}).items():
             monkeypatch.setitem(sys.modules, f"{name}.{sub}", value)
-    for name in broken:
-        monkeypatch.delitem(sys.modules, name, raising=False)
+    for name in broken:  # its import fails, installed or not (None in sys.modules)
+        monkeypatch.setitem(sys.modules, name, None)
     packages = {a.module.split(".")[0]: a.package for a in adapters.ADAPTERS}
     versions = {packages[m]: "9.9" for m in [*installed, *broken]}
     real_version = registry.package_version
@@ -556,6 +556,218 @@ def test_the_probe_sweeps_no_candidate_that_changes_nothing_or_fails(tmp_path):
     module, why = probe._dry_run(path, core, None, case, {"BACKEND": "fastest"})
     assert module is None
     assert why == "its candidate failed on the dominant case in the probe: KeyError: 'fastest'"
+
+
+# ------------------------------------------------------------------ FlashInfer attention
+
+
+def _attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool, scale: Any):
+    """One request's attention as FlashInfer computes it: q [Sq, Hq, D], k / v [Skv, Hkv,
+    D], each KV head serving Hq / Hkv consecutive query heads, the causal mask aligned to
+    the last key."""
+    sq, hq, d = q.shape
+    skv, hkv = k.shape[0], k.shape[1]
+    keys, values = (t.repeat_interleave(hq // hkv, dim=1).double() for t in (k, v))
+    scores = torch.einsum("qhd,khd->hqk", q.double(), keys) * (scale or d**-0.5)
+    if causal:
+        allowed = torch.ones(sq, skv, dtype=torch.bool).tril(skv - sq)
+        scores = scores.masked_fill(~allowed, float("-inf"))
+    return torch.einsum("hqk,khd->qhd", scores.softmax(-1), values).to(q.dtype)
+
+
+def _nhd(t: torch.Tensor, layout: str) -> torch.Tensor:
+    """Tokens first: [..., S, H, D] of a tensor in ``layout``."""
+    return t if layout == "NHD" else t.transpose(-3, -2)
+
+
+class _FakeFlashInfer:
+    """A ``flashinfer`` module that computes what FlashInfer's kernels compute (on the CPU,
+    in fp64) and records every call: which kernel, the KV layout, whether K / V were passed
+    in place (their storage) and each wrapper's plan (the page table it was given)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.plans: list[dict[str, Any]] = []
+        self.module = _module("flashinfer")
+        self.module.single_decode_with_kv_cache = self.single_decode
+        self.module.single_prefill_with_kv_cache = self.single_prefill
+        fake = self
+
+        class Wrapper:
+            kind = ""
+
+            def __init__(self, workspace: torch.Tensor, kv_layout: str = "NHD", **kw: Any):
+                assert workspace.dtype == torch.uint8 and workspace.numel() == 128 << 20
+                self.layout, self.options, self.plan_ = kv_layout, kw, None
+
+            def plan(self, *args: Any, **kwargs: Any) -> None:
+                names = ["indptr", "indices", "last", "hq", "hkv", "d", "page"]
+                if self.kind == "prefill":
+                    names = ["qo_indptr", *names]
+                self.plan_ = {"kind": self.kind, **dict(zip(names, args, strict=True)), **kwargs}
+                fake.plans.append(self.plan_)
+
+            def run(self, q: torch.Tensor, kv: tuple[torch.Tensor, torch.Tensor]) -> Any:
+                plan = self.plan_
+                assert plan is not None, "run() before plan()"
+                k_pages, v_pages = (_nhd(t, self.layout) for t in kv)
+                assert k_pages.shape[1] == plan["page"] and q.shape[-2:] == (plan["hq"], plan["d"])
+                fake.calls.append(
+                    (f"batch {self.kind}", self.layout, kv[0].data_ptr(), self.options)
+                )
+                outs = []
+                for i in range(len(plan["last"])):
+                    pages = plan["indices"][plan["indptr"][i] : plan["indptr"][i + 1]].long()
+                    k, v = (t[pages].flatten(0, 1) for t in (k_pages, v_pages))
+                    n = (len(pages) - 1) * plan["page"] + int(plan["last"][i])
+                    if self.kind == "decode":
+                        rows = q[i : i + 1]
+                    else:
+                        rows = q[plan["qo_indptr"][i] : plan["qo_indptr"][i + 1]]
+                    causal = bool(plan.get("causal"))
+                    outs.append(_attend(rows, k[:n], v[:n], causal, plan.get("sm_scale")))
+                return torch.cat(outs)
+
+        class Decode(Wrapper):
+            kind = "decode"
+
+        class Prefill(Wrapper):
+            kind = "prefill"
+
+        self.module.BatchDecodeWithPagedKVCacheWrapper = Decode
+        self.module.BatchPrefillWithPagedKVCacheWrapper = Prefill
+
+    def single_decode(self, q, k, v, kv_layout="NHD", use_tensor_cores=False, sm_scale=None):
+        self.calls.append(("single decode", kv_layout, k.data_ptr(), use_tensor_cores))
+        return _attend(q[None], _nhd(k, kv_layout), _nhd(v, kv_layout), False, sm_scale)[0]
+
+    def single_prefill(self, q, k, v, causal=False, kv_layout="NHD", sm_scale=None):
+        self.calls.append(("single prefill", kv_layout, k.data_ptr(), causal))
+        return _attend(q, _nhd(k, kv_layout), _nhd(v, kv_layout), causal, sm_scale)
+
+
+#: (batch, heads, kv heads, seq_q, seq_kv, causal, [B, S, H, D] projections viewed as heads)
+FLASHINFER_CALLS = [
+    (1, 4, 2, 1, 7, False, False),  # single decode, a KV cache (HND)
+    (1, 4, 2, 5, 5, True, True),  # single prefill, causal, projections (NHD)
+    (3, 4, 2, 1, 6, False, False),  # batched decode
+    (3, 4, 1, 1, 6, False, True),
+    (2, 4, 2, 3, 3, False, False),  # batched prefill
+    (2, 4, 2, 4, 4, True, True),
+]
+
+
+def test_flashinfer_attention_maps_single_and_batched_calls(tmp_path, monkeypatch):
+    """The FlashInfer template on the CPU with a fake library: one request through the
+    single-request kernels, a batch through the paged wrappers with one page per request
+    (page size = its KV length), K / V passed in place in their layout, each wrapper
+    planned once per call shape; outputs as SDPA's."""
+    fake = _FakeFlashInfer()
+    monkeypatch.setitem(sys.modules, "flashinfer", fake.module)
+    configs = [{"TENSOR_CORES": 0}, {"TENSOR_CORES": 1}]
+    module = _load(_render("flashinfer-attention", configs), tmp_path / "fi.py")
+    # the template takes CUDA half tensors only: the fake computes on the CPU in fp64
+    monkeypatch.setattr(module, "_takes", lambda q, k, v, mask, *rest: mask is None)
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    torch.manual_seed(0)
+    for cores in (0, 1):
+        attend = module.ops(None, TENSOR_CORES=cores)[sdpa]
+        for b, h, hkv, sq, skv, causal, projected in FLASHINFER_CALLS:
+
+            def heads(n: int, seq: int, b: int = b, projected: bool = projected) -> torch.Tensor:
+                if projected:
+                    return torch.randn(b, seq, n, 16, dtype=torch.float64).transpose(1, 2)
+                return torch.randn(b, n, seq, 16, dtype=torch.float64)
+
+            q, k, v = heads(h, sq), heads(hkv, skv), heads(hkv, skv)
+            want = sdpa(q, k, v, is_causal=causal, enable_gqa=True)
+            for _ in range(2):  # the second call reuses the first one's plan
+                got = attend(q, k, v, is_causal=causal, enable_gqa=True)
+                torch.testing.assert_close(got, want)
+            kind, layout, storage = fake.calls[-1][:3]
+            assert kind == adapters.flashinfer_path({"batch": b, "seq_q": sq})
+            assert layout == ("NHD" if projected else "HND")
+            assert storage == k.data_ptr()  # the pages are the K tensor itself: no copy
+    # one plan per call shape and decode form (TENSOR_CORES is the wrapper's)
+    assert [(p["kind"], len(p["last"]), p["page"]) for p in fake.plans] == [
+        ("decode", 3, 6),
+        ("decode", 3, 6),
+        ("prefill", 2, 3),
+        ("prefill", 2, 4),
+    ] * 2
+    first = fake.plans[0]
+    assert first["indptr"].tolist() == [0, 1, 2, 3] and first["indices"].tolist() == [0, 1, 2]
+    assert first["last"].tolist() == [6, 6, 6] and first["q_data_type"] == torch.float64
+    assert fake.plans[3]["causal"] and fake.plans[3]["qo_indptr"].tolist() == [0, 4, 8]
+    batched = [c for c in fake.calls if c[0] == "batch decode"]
+    assert {c[3]["use_tensor_cores"] for c in batched} == {False, True}
+    # a new shape first seen inside a CUDA graph capture: no plan there, torch's SDPA instead
+    monkeypatch.setattr(module, "_capturing", lambda t: True)
+    q, k = torch.randn(5, 4, 1, 16, dtype=torch.float64), torch.randn(5, 2, 9, 16).double()
+    plans, calls = len(fake.plans), len(fake.calls)
+    got = attend(q, k, k, enable_gqa=True)
+    torch.testing.assert_close(got, sdpa(q, k, k, enable_gqa=True))
+    assert (len(fake.plans), len(fake.calls)) == (plans, calls)
+
+
+def test_flashinfer_attention_takes_batches_from_the_call_shapes():
+    """Batched SDPA call sites go to FlashInfer's paged wrappers (they were refused while
+    the adapter had only the single-request kernels); decode sites sweep CUDA-core and
+    tensor-core decode."""
+    adapter = adapters.BY_NAME["flashinfer-attention"]
+    probes = {adapter.name: registry.Availability(adapter.name, adapter.package, "0.6.17")}
+
+    def site(batch: int, seq_q: int, seq_kv: int, dim: int = 128) -> dict[str, Any]:
+        return {
+            "dtype": "bfloat16",
+            "batch": batch,
+            "heads": 16,
+            "kv_heads": 2,
+            "seq_q": seq_q,
+            "seq_kv": seq_kv,
+            "head_dim": dim,
+            "mask": False,
+            "causal": False,
+        }
+
+    def decide(*sites: dict[str, Any]) -> registry.Decision:
+        (decision,) = registry.applicable(
+            [adapter],
+            {"sdpa": {"sites": list(sites)}},
+            capability=(8, 6),
+            precision=None,
+            available=probes,
+        )
+        return decision
+
+    prefill = decide(site(32, 11, 11))
+    assert prefill.run and prefill.configs == [{}] and prefill.sites == 1
+    decode = decide(site(16, 1, 1024), site(1, 1, 2048))
+    assert decode.configs == [{"TENSOR_CORES": 0}, {"TENSOR_CORES": 1}] and decode.sites == 2
+    assert decide(site(4, 1, 64, dim=96)).reason == (
+        "no call site it takes: head size 96 (FlashInfer: 64, 128, 256)"
+    )
+    paths = [adapters.flashinfer_path(s) for s in (site(1, 1, 9), site(1, 9, 9))]
+    paths += [adapters.flashinfer_path(s) for s in (site(8, 1, 9), site(8, 9, 9))]
+    assert paths == ["single decode", "single prefill", "batch decode", "batch prefill"]
+
+
+def test_a_library_check_imports_the_submodules_it_names(monkeypatch):
+    """A package does not import its submodules by itself: the probe imports them on the
+    way to the function (Liger's ``transformers.functional``, measured on Liger-Kernel
+    0.8.4: an attribute walk alone skipped it as missing)."""
+    package = _module("liger_kernel")
+    package.__path__ = []  # a package, its submodules not imported into it
+    functional = _module("liger_kernel.transformers.functional", liger_rms_norm=print)
+    transformers = _module("liger_kernel.transformers", functional=functional)
+    transformers.__path__ = []
+    monkeypatch.setitem(sys.modules, "liger_kernel.transformers", transformers)
+    monkeypatch.setitem(sys.modules, "liger_kernel.transformers.functional", functional)
+    norm = adapters.BY_NAME["liger-rmsnorm"]
+    assert norm.check(package) is None
+    assert adapters.BY_NAME["flashinfer-norm"].check(_module("flashinfer")) == (
+        "flashinfer has no norm.rmsnorm"
+    )
 
 
 # ------------------------------------------------------------------ the step in a run
@@ -1108,7 +1320,7 @@ def test_doctor_lists_libraries_and_where_their_adapters_run(monkeypatch):
     assert lines[0].startswith("library scout (#227)")
     text = "\n".join(lines)
     assert "  flash-attn 9.9 (BSD-3-Clause)" in text
-    assert "    flash-attn [sdpa, not verified on a GPU]: runs here" in text
+    assert "    flash-attn [sdpa]: runs here" in text  # run on an A10 (#227)
     assert "    flash-attn-3 [sdpa, not verified on a GPU]: skipped: needs sm_90" in text
     assert "  quack-kernels not installed (Apache-2.0)" in text
     assert "    torch-sdpa [sdpa]: runs here" in text
@@ -1118,7 +1330,7 @@ def test_doctor_lists_libraries_and_where_their_adapters_run(monkeypatch):
 # ------------------------------------------------------------------ on the GPU
 
 
-def _gpu_capture(path: Path) -> Path:
+def _gpu_capture(path: Path, dim: int = 64) -> Path:
     from kernel_agent.profiling.capture import capture_calls
 
     torch.manual_seed(0)
@@ -1126,7 +1338,7 @@ def _gpu_capture(path: Path) -> Path:
 
     def qkv(seq: int) -> tuple[torch.Tensor, ...]:
         def t(heads: int) -> torch.Tensor:
-            return torch.randn(16, heads, seq, 64, device="cuda", dtype=torch.bfloat16)
+            return torch.randn(16, heads, seq, dim, device="cuda", dtype=torch.bfloat16)
 
         return (t(16), t(2), t(2))
 
@@ -1146,8 +1358,15 @@ def test_probe_measures_sdpa_backends_and_the_scout_evaluates_them(tmp_path, mon
     info = probe.run_probe(capture, out_dir=tmp_path / "out", target="core", timeout=600)
     assert "error" not in info, info.get("error")
     assert info["described"] == "sdpa x1"
-    bars = {b["config"]["BACKEND"]: b for b in info["op_bars"]}
-    assert set(bars) >= {"efficient", "math"} and all(b["ok"] for b in bars.values())
+    # (FlashInfer's and flash-attn's bars too, where they are installed)
+    every = {b["config"]["BACKEND"]: b for b in info["op_bars"] if b["adapter"] == "torch-sdpa"}
+    assert set(every) >= {"efficient", "math"}
+    # a backend without a kernel for this call on this GPU fails its op bar (mem-efficient
+    # on an A10, sm_86: "No available kernel"); every other one is correct
+    bars = {name: b for name, b in every.items() if b["ok"]}
+    assert "math" in bars and all(
+        "No available kernel" in str(b.get("error")) for b in every.values() if not b["ok"]
+    )
     assert all(b["ref_us"] > 0 and b["us"] > 0 for b in bars.values())
     (decision,) = [d for d in info["decisions"] if d["adapter"] == "torch-sdpa"]
     fastest = min(bars.values(), key=lambda b: b["us"])["config"]
@@ -1176,6 +1395,79 @@ def test_probe_measures_the_written_out_rms_norm_against_the_fused_kernel(tmp_pa
     info = probe.run_probe(tmp_path / "norm.pt", out_dir=tmp_path / "out", target="norm")
     assert "error" not in info, info.get("error")
     bars = [b for b in info["op_bars"] if b.get("op") == probe.RMS_PATTERN]
-    assert sorted(b["config"]["FUSE"] for b in bars) == [0, 1]
+    mine = [b for b in bars if b["adapter"] == "torch-rms-norm"]  # libraries' too, installed
+    assert sorted(b["config"]["FUSE"] for b in mine) == [0, 1]
     assert all(b["ok"] and b["ref_us"] > 0 and b["us"] > 0 for b in bars), bars
     assert all(b["pattern_ops"] == 8 for b in bars)
+    # each installed library's RMSNorm: its op bar on the same pattern (FlashInfer, Liger)
+    for adapter in ("flashinfer-norm", "liger-rmsnorm"):
+        if info["available"][adapter]["reason"] is None:
+            assert [b["adapter"] for b in bars].count(adapter) == 1, adapter
+
+
+def _library(name: str) -> None:
+    """Skip unless the adapter's library is installed and usable here."""
+    found = adapters.BY_NAME[name].probe()
+    if not found.ok:
+        pytest.skip(str(found.reason))
+
+
+@pytest.mark.gpu
+def test_flashinfer_attention_on_the_gpu(tmp_path, monkeypatch):
+    """FlashInfer installed: the template's op on one request and on batches (decode and
+    prefill, K / V as a cache and as projections viewed as heads) against SDPA, then the
+    probe on a batched prefill capture (GQA, 11 tokens): the adapter runs, its op bar is
+    correct (measured on an NVIDIA A10, sm_86, FlashInfer 0.6.17: 21.6 vs 8.5 us at batch
+    32; README)."""
+    _library("flashinfer-attention")
+    toolchain.setup()  # FlashInfer's JIT builds with the toolchain's nvcc flags
+    configs = [{"TENSOR_CORES": 0}, {"TENSOR_CORES": 1}]
+    module = _load(_render("flashinfer-attention", configs), tmp_path / "fi.py")
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    torch.manual_seed(0)
+    for cores in (0, 1):
+        attend = module.ops(None, TENSOR_CORES=cores)[sdpa]
+        for b, h, hkv, sq, skv, causal, projected in (
+            (1, 16, 8, 1, 300, False, False),
+            (4, 16, 2, 1, 300, False, True),
+            (4, 16, 2, 11, 11, False, True),
+            (2, 8, 8, 64, 64, True, False),
+        ):
+
+            def heads(n: int, seq: int, b: int = b, projected: bool = projected) -> torch.Tensor:
+                shape = (b, seq, n, 128) if projected else (b, n, seq, 128)
+                t = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+                return t.transpose(1, 2) if projected else t
+
+            q, k, v = heads(h, sq), heads(hkv, skv), heads(hkv, skv)
+            with torch.inference_mode():
+                want = sdpa(q, k, v, is_causal=causal, enable_gqa=True)
+                got = attend(q, k, v, is_causal=causal, enable_gqa=True)
+            torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+    monkeypatch.setenv(gpulock.ENV, "1")  # conftest holds this process's GPU lock
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join([str(TESTS), os.environ.get("PYTHONPATH", "")])
+    )
+    capture = _gpu_capture(tmp_path / "core.pt", dim=128)
+    info = probe.run_probe(capture, out_dir=tmp_path / "out", target="core", timeout=1200)
+    assert "error" not in info, info.get("error")
+    (decision,) = [d for d in info["decisions"] if d["adapter"] == "flashinfer-attention"]
+    assert decision["run"], decision
+    bars = [b for b in info["op_bars"] if b["adapter"] == "flashinfer-attention"]
+    assert bars and all(b["ok"] and b["us"] > 0 for b in bars), bars
+
+
+@pytest.mark.gpu
+def test_liger_swiglu_on_the_gpu(tmp_path):
+    """Liger-Kernel installed: its SwiGLU folded into a gated MLP's Dynamo graph gives the
+    reference's output."""
+    _library("liger-swiglu")
+    torch.manual_seed(0)
+    feed = Feed(256, 512).cuda().bfloat16().eval()
+    x = torch.randn(2, 16, 256, device="cuda", dtype=torch.bfloat16)
+    module = _load(_render("liger-swiglu"), tmp_path / "swiglu.py")
+    candidate = module.build(feed)
+    with torch.inference_mode():
+        want, got = feed(x), candidate(x)
+    assert candidate.rewritten == 1
+    torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)

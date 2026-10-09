@@ -14,22 +14,30 @@ run on a GPU by the tests:
 * ``torch-scaled-mm``: ``F.linear`` as an FP8 W8A8 GEMM (``torch._scaled_mm``; e4m3 weights
   quantised once, activations per call), only on targets planned at ``fp8_w8a8``.
 
-Probed and used when installed (``kernel-agent[libs]``); written from each library's
-documentation (``verified`` False: their templates are checked statically until a GPU run
-with the library installed):
+Probed and used when installed (``kernel-agent[libs]``); run on a GPU by the tests when their
+library is installed (an NVIDIA A10, sm_86: flash-attn 2.8.1, FlashInfer 0.6.17,
+Liger-Kernel 0.8.4):
 
-* ``flash-attn`` (FlashAttention 2, sm_80+) and ``flash-attn-3`` (FlashAttention 3, sm_90);
-* ``flashinfer-attention`` (single-request decode / prefill), ``flashinfer-norm`` (RMSNorm);
-  FlashInfer sampling is listed and skipped: a random draw cannot be compared with the
-  reference's;
-* ``quack-rmsnorm``, ``quack-softmax`` (QuACK, CuTe DSL; H100, B200, RTX 50);
+* ``flash-attn`` (FlashAttention 2, sm_80+);
+* ``flashinfer-attention``: one request through FlashInfer's single decode / prefill
+  kernels, a batch through its paged wrappers with one page per request (K / V in place,
+  each wrapper planned once per call shape); ``flashinfer-norm`` (RMSNorm). FlashInfer
+  sampling is listed and skipped: a random draw cannot be compared with the reference's
+  (``kernels/distribution.py``: the comparison it needs);
 * ``liger-rmsnorm``, ``liger-swiglu`` (Liger-Kernel, Triton); Liger RoPE is listed without a
   template yet;
 * ``gemlite`` (low-bit weight GEMV): listed without a template yet.
+
+Written from each library's documentation (``verified`` False: their templates are checked
+statically until a GPU run with the library installed; their GPUs were not at hand):
+
+* ``flash-attn-3`` (FlashAttention 3, sm_90);
+* ``quack-rmsnorm``, ``quack-softmax`` (QuACK, CuTe DSL; H100, B200, RTX 50).
 """
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -47,6 +55,25 @@ _CUDNN = ("nvidia-cudnn-cu12", "nvidia-cudnn-cu13")
 def _cap(gpu: Mapping[str, Any]) -> tuple[int, ...] | None:
     cap = gpu.get("capability")
     return tuple(int(c) for c in cap) if cap else None
+
+
+def _resolve(module: Any, dotted: str) -> Any:
+    """``module.a.b.c`` with each submodule imported on the way (None: missing): a package
+    does not import its submodules by itself (``liger_kernel`` leaves ``transformers`` to
+    an import, measured: the attribute walk alone found no ``liger_rms_norm``)."""
+    obj = module
+    for part in dotted.split("."):
+        found = getattr(obj, part, None)
+        name = getattr(obj, "__name__", None)
+        if found is None and isinstance(name, str) and hasattr(obj, "__path__"):
+            try:
+                found = importlib.import_module(f"{name}.{part}")
+            except ImportError:
+                found = None
+        if found is None:
+            return None
+        obj = found
+    return obj
 
 
 # ------------------------------------------------------------------ attention
@@ -222,71 +249,173 @@ def rewrite(graph, reference=None, **config):
     )
 
 
+#: FlashInfer's attention kernels are instantiated for these head sizes
+FLASHINFER_HEAD_DIMS = (64, 128, 256)
+
+
+def flashinfer_path(site: Mapping[str, Any]) -> str:
+    """The FlashInfer kernel a detected SDPA call site maps onto, from its shapes: one
+    request (batch 1) takes the single-request kernels (``single decode``: one query;
+    ``single prefill``), a batch the paged wrappers with one page per request (``batch
+    decode``: ``BatchDecodeWithPagedKVCacheWrapper``, one query per request; ``batch
+    prefill``: ``BatchPrefillWithPagedKVCacheWrapper``), whose page table holds each
+    request's KV length (all ``seq_kv`` in a dense SDPA call)."""
+    one = int(site.get("batch") or 1) == 1
+    decode = int(site.get("seq_q") or 0) == 1
+    return f"{'single' if one else 'batch'} {'decode' if decode else 'prefill'}"
+
+
 class FlashInferAttention(Adapter):
-    """FlashInfer's single-request decode / prefill kernels (batch 1)."""
+    """FlashInfer's decode / prefill attention: one request through its single-request
+    kernels, a batch through the paged wrappers (one page per request: K / V used in place,
+    no copy into a page pool), each wrapper planned once per call shape."""
 
     def check(self, module: Any) -> str | None:
         missing = [
             f
-            for f in ("single_decode_with_kv_cache", "single_prefill_with_kv_cache")
+            for f in (
+                "single_decode_with_kv_cache",
+                "single_prefill_with_kv_cache",
+                "BatchDecodeWithPagedKVCacheWrapper",
+                "BatchPrefillWithPagedKVCacheWrapper",
+            )
             if not hasattr(module, f)
         ]
         return f"flashinfer has no {', '.join(missing)}" if missing else None
 
     def sites_ok(self, family: str, site: Mapping[str, Any]) -> str | None:
-        if site.get("batch") not in (1, None):
-            return (
-                f"batch {site.get('batch')} attention (the batched wrappers need page "
-                "tables: follow-up)"
-            )
-        if int(site.get("head_dim") or 0) not in (64, 128, 256):
-            return f"head size {site.get('head_dim')} (FlashInfer: 64, 128, 256)"
+        if int(site.get("head_dim") or 0) not in FLASHINFER_HEAD_DIMS:
+            dims = ", ".join(map(str, FLASHINFER_HEAD_DIMS))
+            return f"head size {site.get('head_dim')} (FlashInfer: {dims})"
         return super().sites_ok(family, site) or _attention_site(site)
+
+    def configs(self, found: Mapping[str, Site], gpu: Mapping[str, Any]) -> list[dict[str, Any]]:
+        # decode: CUDA-core kernels or tensor cores (the prefill kernels over the query heads
+        # of each KV head: a large GQA group fills an MMA tile); prefill has one form
+        sites = found["sdpa"].sites if "sdpa" in found else []
+        taken = [s for s in sites if self.sites_ok("sdpa", s) is None]
+        if any(flashinfer_path(s).endswith("decode") for s in taken):
+            return [{"TENSOR_CORES": 0}, {"TENSOR_CORES": 1}]
+        return [{}]
 
     CODE = r'''
 import flashinfer
 
 _SDPA = torch.nn.functional.scaled_dot_product_attention
+_WORKSPACE_MB = 128  # FlashInfer's recommended float workspace (split-KV partial outputs)
+#: per device: the float workspace every wrapper shares (they run one after another on the
+#: caller's stream) and the batched wrappers, planned once per call shape
+_STATE = {}
 
 
-def ops(reference=None):
-    """F.scaled_dot_product_attention of one request -> FlashInfer's decode (one query) or
-    prefill kernel; K / V [1, H_kv, S, D] are FlashInfer's HND layout already."""
+def _takes(q, k, v, attn_mask, dropout_p, is_causal, enable_gqa):
+    """What FlashInfer takes; every other call stays torch's SDPA."""
+    return (
+        q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and attn_mask is None
+        and not dropout_p
+        and q.dim() == k.dim() == v.dim() == 4
+        and q.shape[0] == k.shape[0] == v.shape[0]
+        and q.shape[-1] in (64, 128, 256)
+        and k.shape[-1] == v.shape[-1] == q.shape[-1]
+        and k.shape[1:3] == v.shape[1:3]
+        and q.shape[1] % k.shape[1] == 0
+        and (k.shape[1] == q.shape[1] or enable_gqa)
+        and (not is_causal or q.shape[2] == k.shape[2])
+        and q.shape[2] > 0
+        and k.shape[2] > 0
+    )
+
+
+def _pages(k, v):
+    """K and V [B, H_kv, S, D] as FlashInfer pages of one request each (page size S), in
+    place where the layout allows: ``NHD`` when they are [B, S, H_kv, D] tensors viewed as
+    heads (projections, the usual prefill), ``HND`` when contiguous (a KV cache); other
+    strides: contiguous copies, HND."""
+    kt, vt = k.transpose(1, 2), v.transpose(1, 2)
+    if kt.is_contiguous() and vt.is_contiguous():
+        return kt, vt, "NHD"
+    return k.contiguous(), v.contiguous(), "HND"
+
+
+def _rows(q):
+    """q [B, H, S, D] as FlashInfer's ragged queries [B * S, H, D] (a view when q is a
+    [B, S, H, D] projection viewed as heads)."""
+    return q.transpose(1, 2).reshape(-1, q.shape[1], q.shape[-1]).contiguous()
+
+
+def _capturing(t):
+    return t.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
+def _wrapper(kind, q, k, layout, causal, scale, tensor_cores):
+    """The batched wrapper of this call shape, planned on its first call: plan() reads the
+    page table on the host (a sync), so it runs once per shape (the evaluator's warm-up),
+    never in a timed call; None inside a CUDA graph capture before it was planned."""
+    b, hq, sq, d = q.shape
+    hkv, skv = (k.shape[2], k.shape[1]) if layout == "NHD" else (k.shape[1], k.shape[2])
+    state = _STATE.setdefault(q.device, {"plans": {}})
+    key = (kind, b, hq, hkv, sq, skv, d, q.dtype, layout, bool(causal), scale, tensor_cores)
+    found = state["plans"].get(key)
+    if found is not None or _capturing(q):
+        return found
+    if "workspace" not in state:
+        state["workspace"] = torch.empty(_WORKSPACE_MB << 20, dtype=torch.uint8, device=q.device)
+    # one page per request: page i is request i's whole KV (page size = its length)
+    indptr = torch.arange(b + 1, dtype=torch.int32)
+    last = torch.full((b,), skv, dtype=torch.int32)
+    types = {"q_data_type": q.dtype, "kv_data_type": q.dtype, "sm_scale": scale}
+    if kind == "decode":
+        found = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            state["workspace"], layout, use_tensor_cores=tensor_cores
+        )
+        found.plan(indptr, indptr[:-1], last, hq, hkv, d, skv, **types)
+    else:
+        found = flashinfer.BatchPrefillWithPagedKVCacheWrapper(state["workspace"], layout)
+        found.plan(indptr * sq, indptr, indptr[:-1], last, hq, hkv, d, skv, causal=causal, **types)
+    state["plans"][key] = found
+    return found
+
+
+def ops(reference=None, TENSOR_CORES=0):
+    """F.scaled_dot_product_attention -> FlashInfer: one request through its single decode
+    (one query) / prefill kernels, a batch through BatchDecode / BatchPrefill
+    WithPagedKVCacheWrapper (one page per request); TENSOR_CORES: decode on tensor cores."""
+    cores = bool(TENSOR_CORES)
 
     def sdpa_flashinfer(
         query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
         enable_gqa=False,
     ):
-        takes = (
-            query.is_cuda
-            and query.dtype in (torch.float16, torch.bfloat16)
-            and query.dtype == key.dtype == value.dtype
-            and attn_mask is None
-            and not dropout_p
-            and query.dim() == 4
-            and query.shape[0] == key.shape[0] == 1
-            and query.shape[-1] in (64, 128, 256)
-            and key.shape[-1] == value.shape[-1] == query.shape[-1]
-            and query.shape[1] % key.shape[1] == 0
-            and (key.shape[1] == query.shape[1] or enable_gqa)
-            and (not is_causal or query.shape[2] == key.shape[2])
-        )
-        if not takes:
+        if not _takes(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
             return _SDPA(
                 query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                 is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
             )
-        k, v = key[0].contiguous(), value[0].contiguous()
-        if query.shape[2] == 1:
+        b, hq, sq, d = query.shape
+        k, v, layout = _pages(key, value)
+        if b == 1 and sq == 1:
             out = flashinfer.single_decode_with_kv_cache(
-                query[0, :, 0].contiguous(), k, v, kv_layout="HND", sm_scale=scale
+                query[0, :, 0].contiguous(), k[0], v[0], kv_layout=layout,
+                use_tensor_cores=cores, sm_scale=scale,
             )
-            return out.reshape(1, query.shape[1], 1, query.shape[-1])
-        q = query[0].transpose(0, 1).contiguous()  # [S, H, D]
-        out = flashinfer.single_prefill_with_kv_cache(
-            q, k, v, causal=is_causal, kv_layout="HND", sm_scale=scale
-        )
-        return out.transpose(0, 1).unsqueeze(0)
+            return out.view(1, hq, 1, d)
+        if b == 1:
+            out = flashinfer.single_prefill_with_kv_cache(
+                _rows(query), k[0], v[0], causal=is_causal, kv_layout=layout, sm_scale=scale
+            )
+            return out.view(1, sq, hq, d).transpose(1, 2)
+        kind = "decode" if sq == 1 else "prefill"
+        wrapper = _wrapper(kind, query, k, layout, bool(is_causal), scale, cores)
+        if wrapper is None:  # first seen inside a CUDA graph capture: plan() cannot run
+            return _SDPA(
+                query, key, value, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa
+            )
+        if kind == "decode":
+            return wrapper.run(query[:, :, 0].contiguous(), (k, v)).unsqueeze(2)
+        return wrapper.run(_rows(query), (k, v)).view(b, sq, hq, d).transpose(1, 2)
 
     return {_SDPA: sdpa_flashinfer}
 
@@ -370,11 +499,8 @@ class LibraryRmsNorm(Adapter):
     ATTR = ""
 
     def check(self, module: Any) -> str | None:
-        obj: Any = module
-        for part in self.ATTR.split("."):
-            obj = getattr(obj, part, None)
-            if obj is None:
-                return f"{self.module} has no {self.ATTR}"
+        if _resolve(module, self.ATTR) is None:
+            return f"{self.module} has no {self.ATTR}"
         return None
 
     def sites_ok(self, family: str, site: Mapping[str, Any]) -> str | None:
@@ -970,7 +1096,6 @@ ADAPTERS: tuple[Adapter, ...] = (
         families=("sdpa",),
         archs="sm_80+",
         archs_why="FlashAttention 2: Ampere and newer",
-        verified=False,
         min_version="2.0",
     ),
     FlashAttn3(
@@ -986,14 +1111,14 @@ ADAPTERS: tuple[Adapter, ...] = (
     ),
     FlashInferAttention(
         name="flashinfer-attention",
-        title="SDPA as FlashInfer's single-request decode / prefill kernels",
+        title="SDPA as FlashInfer's decode / prefill kernels (one request, or a batch through "
+        "the paged wrappers)",
         package="flashinfer-python",
         module="flashinfer",
         licence="Apache-2.0",
         families=("sdpa",),
         archs="sm_75+",
         archs_why="FlashInfer: Turing and newer",
-        verified=False,
     ),
     FlashInferNorm(
         name="flashinfer-norm",
@@ -1004,7 +1129,6 @@ ADAPTERS: tuple[Adapter, ...] = (
         families=("rms_norm",),
         archs="sm_75+",
         archs_why="FlashInfer: Turing and newer",
-        verified=False,
         helpers=("fold_rms_norm",),
     ),
     Adapter(
@@ -1017,7 +1141,8 @@ ADAPTERS: tuple[Adapter, ...] = (
         verified=False,
         no_template=(
             "sampling draws random numbers: the evaluator compares outputs with the "
-            "reference's own draws (follow-up: a seeded or distributional comparison)"
+            "reference's own draws (kernels/distribution.py's distributional comparison is "
+            "not wired into it yet)"
         ),
     ),
     QuackRmsNorm(
@@ -1055,7 +1180,6 @@ ADAPTERS: tuple[Adapter, ...] = (
         families=("rms_norm",),
         archs="sm_80+",
         archs_why="Liger-Kernel's Triton kernels: Ampere and newer",
-        verified=False,
         helpers=("fold_rms_norm",),
         runtime=("triton",),
     ),
@@ -1069,7 +1193,6 @@ ADAPTERS: tuple[Adapter, ...] = (
         archs="sm_80+",
         archs_why="Liger-Kernel's Triton kernels: Ampere and newer",
         dtypes=_FLOAT,
-        verified=False,
         helpers=("fold_silu_mul",),
         runtime=("triton",),
     ),
