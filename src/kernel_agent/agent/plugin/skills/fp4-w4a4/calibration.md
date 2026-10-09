@@ -71,3 +71,27 @@ more Gaussian, which e2m1's grid fits worse); on the LocEnc and the Qwen3 layer 
 An unwritten output channel stays within W4A4's noise (as with FP4 weights), and a module
 that ends in a normalisation hides a scale error: the perceptual gate judges those end to
 end. The tiers are calibrated for single layers and blocks; a deep stack accumulates more.
+
+## The scale-rule guard (`kernels/scale_guard.py`)
+
+The hook `quantize_activations(x) -> (codes, scales, outer)`: codes packed two per byte
+`[rows, K / 2]` (not read by the guard: the tiers judge them), scales **unswizzled** `[rows,
+K / 16]` e4m3 (MXFP4: `[rows, K / 32]` e8m0; uint8 bits or values too; the swizzled 128 x 4
+layout is refused with that reason), outer fp32 `[rows]` or one per call (MXFP4 may return
+`(codes, scales)`). A quantiser that rotates first (`hadamard_rotate`) returns the rotated
+activations as a fourth element: its scales are checked against them.
+
+The evaluator runs it on the captured input and on a stress input of the same shape
+(`quant.fp4_stress_input`): every row's maximum is 64 (per token and per call give the same
+outer scale), the other blocks' scale before rounding sits at 1.1125 x 2^e (rounding to
+nearest gives 1.125 x 2^e, truncation 2^e) and at (k + 0.7) x 2^-9 in e4m3's subnormal
+range; MXFP4: block maxima at 1.9 x 2^e. It rejects the candidate (`stage: scale_rule`, with
+the reason) when a block maximum exceeds 6 x scale x outer beyond the rounding of an e4m3
+scale (`quant.fp4_scale_check`: 6.375 for a normal scale rounded to nearest; below 2^-6 the
+reference's own subnormal rounding), when a non-zero block gets scale 0 where rounding to
+nearest gives a subnormal one (a flush to zero), or when a scale is not finite. Caught (CPU
+tests): block scales rounded down (6.75 x step with a normal scale, more with a subnormal
+one), an outer scale 0.8x too small (block scales clamp at 448), subnormal scales flushed to
+zero (on Gaussian rows only the stress input shows it), MXFP4's OCP rule
+`2^(floor(log2 amax) - 2)` (up to 8 x scale). The reference's own saturation (up to 6.375 x
+step, more with subnormal scales: `fp4_w4a4_error`'s `activation_saturation`) passes.

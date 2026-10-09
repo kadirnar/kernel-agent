@@ -108,6 +108,20 @@ def _private_docs(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_sanitizer_in_cpu_tests(request, monkeypatch):
+    """CPU tests find no compute-sanitizer unless they bring one (a stub ``tool=``, or
+    ``find_sanitizer`` itself): one cached by ``doctor --fetch-sanitizer`` in
+    ~/.cache/kernel-agent, or a toolkit's, must not change a verdict. Once one was cached,
+    the integration's memcheck ran for real in the CPU end-to-end tests (#225)."""
+    if request.node.get_closest_marker("gpu") is not None:
+        return
+    from kernel_agent import toolchain
+
+    none = toolchain.Sanitizer(None, reason="no compute-sanitizer in CPU tests (tests/conftest.py)")
+    monkeypatch.setattr(toolchain, "sanitizer", lambda: none)
+
+
+@pytest.fixture(autouse=True)
 def _gpu_lock_for_gpu_tests(request):
     """`gpu` tests hold kernel-agent's GPU lock (of the GPU this process uses, see
     `pytest_configure`), so a plain `pytest` never benchmarks on top of a running

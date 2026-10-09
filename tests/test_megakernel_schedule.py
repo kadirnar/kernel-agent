@@ -310,6 +310,27 @@ def test_the_example_is_a_valid_project_that_packs_into_a_bundle(tmp_path):
     assert gpu_arch.example_requirement(EXAMPLE)[0] == "sm_80+"
 
 
+def test_the_examples_tiles_fit_the_page_pool_and_its_graph_mode_says_whether_pdl_ran(
+    tmp_path, monkeypatch
+):
+    """Issue #225, run on an A10 (sm_86): 16 rows of a 4096-wide layer (128 KB) do not fit the
+    page pool of a GPU with 99 KB of shared memory per block (11 pages of 8 KB; an RTX 5070 Ti
+    alike), so the default tile takes 8 there instead of failing to build; and the graph
+    baseline has no PDL edges before sm_90, which its label says."""
+    monkeypatch.setenv(proj.CACHE_ENV, str(tmp_path))
+    mod = proj.import_project(EXAMPLE)
+    pool = 11 * 8192
+    assert [mod.tile_rows(n, pool) for n in (256, 1024, 2048, 3072, 4096)] == [16, 16, 16, 12, 8]
+    assert mod.tile_rows(4096, 19 * 8192) == 16  # an A100's 163 KB
+    assert mod.tile_rows(4096, pool, want=4) == 4
+    assert mod.tile_rows(4096, 4096) == 0  # not one row fits
+    assert mod.graph_label((8, 6)) == (
+        "graph_pdl (plain graph, one kernel per layer: PDL needs sm_90+, this GPU is sm_86)"
+    )
+    for capability in ((9, 0), (10, 0), (12, 0)):
+        assert mod.graph_label(capability) == "graph_pdl (graph + PDL, one kernel per layer)"
+
+
 def test_every_project_build_has_the_kit_on_its_include_path():
     dirs = proj.toolkit_includes()
     assert (dirs[0] / "ka_launch.cuh").is_file() and (dirs[1] / megakernel.HEADER).is_file()

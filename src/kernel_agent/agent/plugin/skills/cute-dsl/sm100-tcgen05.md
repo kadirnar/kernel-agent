@@ -69,7 +69,10 @@ has completed.
 
 Triton's `tl.dot` lowers to `tcgen05.mma` on sm_100 (e4m3: `kind::f8f6f4`; FlashInfer-Bench
 §4.4): keep it first for GEMM-shaped glue and check its SASS (`UTCQMMA` / `UTCHMMA`, not
-`HMMA`). This template is for what Triton cannot express: warp roles, TMEM buffering, 2-CTA
+`HMMA`). Compiled on the CPU with Triton 3.8 (the FP8 W8A8 example's GEMM): 128-row tiles
+issue `UTCQMMA` for `tl.dot` and the block-scaled `UTCQMMA.SF` (the census's mark of the
+scale operand) for `tl.dot_scaled`; 64-row tiles of `tl.dot_scaled` fall back to 16-bit
+`UTCHMMA`, 32-row tiles to `mma.sync` (`HMMA`). This template is for what Triton cannot express: warp roles, TMEM buffering, 2-CTA
 pairs, epilogues over TMEM. MXFP8 (`fp8_mx`) is CUTLASS's `blockscaled_gemm/
 dense_blockscaled_gemm_persistent.py` (`make_blockscaled_trivial_tiled_mma`, scale factors
 copied into TMEM with `tcgen05.cp`): the next template to port.

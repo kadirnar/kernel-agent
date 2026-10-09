@@ -1091,10 +1091,11 @@ def _stages(
             rel_l2 = [c["rel_l2"] for c in checks if "rel_l2" in c]
             case_reports[-1]["max_rel_l2"] = max(rel_l2, default=0.0)
     result["cases"] = case_reports
-    if capture_precision(capture) == "fp8_mx":  # the MXFP8 scale rule (kernels/scale_guard.py)
+    # the scale rule of block-scaled activations, MXFP8 and W4A4 (kernels/scale_guard.py)
+    if (guarded := capture_precision(capture)) in ("fp8_mx", "fp4_w4a4"):
         from kernel_agent.kernels import scale_guard
 
-        rule = scale_guard.check(module, cases)
+        rule = scale_guard.check(module, cases, guarded)
         result["scale_rule"] = rule
         if not rule["ok"]:
             result.update(

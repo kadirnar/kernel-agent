@@ -20,6 +20,10 @@ issue #115 overruns only on a partial tile, which the captured shapes never have
 the sanitizer's first report in ``report``), ``skipped`` (no usable ``compute-sanitizer``:
 :func:`kernel_agent.toolchain.find_sanitizer`; no CUDA device), ``error`` (the sanitizer or
 the process failed without a memory error) or ``timeout``; ``seconds`` is its wall time.
+``unchecked`` (:data:`UNCHECKED`, with ``ok``): the checked process made no CUDA call the
+sanitizer saw (a CPU-only run; CUDA work in a child process, which ``--target-processes
+application-only`` does not track), so nothing was checked: the log's notice about child
+processes is no error (:func:`unchecked`).
 
 **racecheck and synccheck** (issue #225). A candidate that synchronises inside a kernel
 (:func:`extra_tools`: every native project; a source with shared memory, ``cp.async`` or
@@ -32,20 +36,25 @@ result has every tool's own record (status, errors, first report, seconds). Race
 shared memory only: ordering bugs of global memory are what the evaluator's determinism and
 perturbed checks are for.
 
-:func:`selftest` proves that the sanitizer works here (``kernel-agent doctor``): a deliberate
-one-block overrun of a Triton kernel (:mod:`kernel_agent.kernels.memcheck_probe`) must be
-reported, an in-bounds kernel must not.
+:func:`selftest` proves that each tool works here (``kernel-agent doctor``, :data:`SELFTESTS`):
+memcheck must report a deliberate one-block overrun of a Triton kernel
+(:mod:`kernel_agent.kernels.memcheck_probe`) and not an in-bounds kernel; racecheck a
+shared-memory read-after-write between two warps without the barrier, synccheck a
+``__syncthreads()`` half of a warp reaches (:mod:`kernel_agent.kernels.sanitizer_probe`,
+NVRTC), and neither the same kernels with their barrier in place.
 
 Subprocesses (under the sanitizer)::
 
     python -m kernel_agent.kernels.memcheck CAPTURE CANDIDATE [--capture-sha256 S]
     python -m kernel_agent.kernels.memcheck_probe
+    python -m kernel_agent.kernels.sanitizer_probe race|sync
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -117,6 +126,21 @@ _META = (
     "Target application returned an error",
     "Error: couldn't find exit code",
     "Error: Target application terminated before first instrumented API call",
+    # compute-sanitizer 2025.2 adds this notice after the line above: a hint, no error
+    "Tracking kernels launched by child processes requires",
+)
+#: What the log of a process that made no CUDA call under the sanitizer says (measured with
+#: compute-sanitizer 2025.2.1 on an NVIDIA A10: a CPU-only run, or CUDA work in a child
+#: process only; with CUDA in the process itself the log is a plain ERROR SUMMARY).
+_NO_CUDA_CALL = (
+    "terminated before first instrumented API call",
+    "Tracking kernels launched by child processes",
+)
+#: ``unchecked`` of such a run: it passes, and says so instead of claiming a clean kernel.
+UNCHECKED = (
+    "the checked process made no CUDA call the sanitizer saw, so nothing was checked: "
+    "kernels launched from a child process are not tracked (--target-processes "
+    "application-only), and a CPU-only run launches none"
 )
 REPORT_LINES = 25
 _dumps = json.dumps  # bound before any candidate is imported
@@ -277,6 +301,12 @@ def parse_log(text: str) -> tuple[int, str]:
     return errors, "\n".join(lines)
 
 
+def unchecked(text: str) -> bool:
+    """Whether a sanitizer log says its process made no CUDA call it saw (:data:`UNCHECKED`):
+    no error, and nothing checked either."""
+    return any(sign in text for sign in _NO_CUDA_CALL)
+
+
 def parse_race_log(text: str) -> tuple[int, int, str]:
     """``(errors, warnings, the first hazard report)`` of a racecheck log: its ``RACECHECK
     SUMMARY: N hazards displayed (E errors, W warnings)``, else one error per report."""
@@ -403,6 +433,8 @@ def run_memcheck(
             result["reason"] = child["reason"]
     else:
         result["reason"] = f"{child.get('status')}: {str(child.get('error') or '')[-1500:]}"
+    if not errors and unchecked(log):
+        result["unchecked"] = UNCHECKED
     tools, why = extra_tools(Path(candidate))
     if tools:
         result["tools"] = {"memcheck": _tool_record(result)}
@@ -422,9 +454,8 @@ def run_memcheck(
 
 
 def _tool_record(result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        k: result[k] for k in ("status", "errors", "report", "reason", "seconds") if k in result
-    }
+    keys = ("status", "errors", "report", "reason", "unchecked", "seconds")
+    return {k: result[k] for k in keys if k in result}
 
 
 def _run_tool(name: str, cmd: list[str], timeout: float, tool: Any) -> dict[str, Any]:
@@ -458,6 +489,8 @@ def _run_tool(name: str, cmd: list[str], timeout: float, tool: Any) -> dict[str,
     else:
         why = (log.strip().splitlines() or [""])[-1] if child is None else child.get("error")
         out["reason"] = f"the checked process gave no result: {str(why or tail)[-1500:]}"
+    if not errors and unchecked(log):
+        out["unchecked"] = UNCHECKED
     return out
 
 
@@ -465,8 +498,14 @@ def describe(result: dict[str, Any]) -> str:
     """One line on a memcheck result (and its racecheck and synccheck, when they ran)."""
     status, seconds = result.get("status"), result.get("seconds")
     took = f" ({seconds} s)" if seconds else ""
+
+    def verdict(rec: dict[str, Any]) -> str:
+        if rec.get("status") != "ok":
+            return str(rec.get("status"))
+        return "checked nothing" if rec.get("unchecked") else "clean"
+
     others = [
-        f"{name} {'clean' if rec.get('status') == 'ok' else rec.get('status')}"
+        f"{name} {verdict(rec)}"
         for name, rec in (result.get("tools") or {}).items()
         if name != "memcheck"
     ]
@@ -474,6 +513,8 @@ def describe(result: dict[str, Any]) -> str:
     if status == "ok":
         n = len(result.get("variants") or [])
         on = f"{result.get('cases')} case(s)" + (f" + {n} odd-size variant(s)" if n else "")
+        if result.get("unchecked"):
+            return f"memcheck checked nothing on {on}{also}{took}: {result['unchecked']}"
         return f"memcheck clean on {on}{also}{took}"
     if status in FAILED:
         return f"{status} FAILED{took}: {result.get('reason')}"
@@ -519,37 +560,95 @@ def pending(result: dict[str, Any]) -> bool:
 # ------------------------------------------------------------------ the self-test
 
 
-def selftest(tool: Any = None, timeout: float = 300.0) -> dict[str, Any]:
-    """``ok`` when the sanitizer reports the deliberate overrun of
-    :mod:`kernel_agent.kernels.memcheck_probe` and nothing else (``kernel-agent doctor``)."""
+@dataclasses.dataclass(frozen=True)
+class SelfTest:
+    """One tool's self-test: ``program`` (a module and its arguments) runs ``clean`` (a
+    kernel the tool must not report) and then ``hazard`` (one it must report as an error)."""
+
+    program: tuple[str, ...]
+    hazard: str
+    clean: str
+    hazard_is: str  # what the hazard is, for the verdict's reason
+    clean_is: str
+
+
+#: The self-test of every tool (``kernel-agent doctor``): memcheck's deliberate overrun of a
+#: Triton kernel (:mod:`kernel_agent.kernels.memcheck_probe`); racecheck's shared-memory race
+#: and synccheck's divergent ``__syncthreads()`` (:mod:`kernel_agent.kernels.sanitizer_probe`,
+#: issue #225).
+SELFTESTS = {
+    "memcheck": SelfTest(
+        ("kernel_agent.kernels.memcheck_probe",),
+        "_ka_memcheck_overrun",
+        "_ka_memcheck_inbounds",
+        "the deliberate out-of-bounds read",
+        "an in-bounds kernel",
+    ),
+    "racecheck": SelfTest(
+        ("kernel_agent.kernels.sanitizer_probe", "race"),
+        "ka_race",
+        "ka_ordered",
+        "the deliberate shared-memory race",
+        "a kernel ordered by its barrier",
+    ),
+    "synccheck": SelfTest(
+        ("kernel_agent.kernels.sanitizer_probe", "sync"),
+        "ka_divergent",
+        "ka_uniform",
+        "the deliberate divergent __syncthreads()",
+        "a barrier every thread reaches",
+    ),
+}
+
+
+def selftest(tool: Any = None, timeout: float = 300.0, name: str = "memcheck") -> dict[str, Any]:
+    """``ok`` when ``--tool name`` reports the deliberate hazard of its probe as an error and
+    nothing else (:data:`SELFTESTS`; ``kernel-agent doctor``). ``reason``: the first report
+    (or why not); ``errors`` / ``warnings`` / ``report`` as the tool's log has them."""
     from kernel_agent import toolchain
 
     tool = tool or toolchain.sanitizer()
     if not tool.path:
         return {"ok": False, "reason": tool.reason}
+    test = SELFTESTS[name]
     start = time.perf_counter()
-    workdir = Path(tempfile.mkdtemp(prefix="ka-memcheck-"))
-    cmd = [sys.executable, "-m", "kernel_agent.kernels.memcheck_probe"]
+    workdir = Path(tempfile.mkdtemp(prefix=f"ka-{name}-"))
+    cmd = [sys.executable, "-m", *test.program]
     try:
         with gpu_lock():
-            child, log, tail = _sanitize(cmd, timeout, workdir, tool)
+            child, log, tail = _sanitize(cmd, timeout, workdir, tool, name)
     except subprocess.TimeoutExpired:
         return {"ok": False, "reason": f"exceeded {timeout:.0f}s"}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-    errors, report = parse_log(log)
-    out: dict[str, Any] = {"seconds": round(time.perf_counter() - start, 1), "errors": errors}
-    out["report"] = report
+    out: dict[str, Any] = {"seconds": round(time.perf_counter() - start, 1)}
+    if name == "racecheck":
+        errors, out["warnings"], report = parse_race_log(log)
+    else:
+        errors, report = parse_log(log)
+    out.update(errors=errors, report=report)
     if child is None or child.get("status") != "ok":
         detail = (child or {}).get("error") or log.strip()[-500:] or tail.strip()[-500:]
         out.update(ok=False, reason=f"the probe did not run: {detail}")
-    elif "_ka_memcheck_inbounds" in log:
-        out.update(ok=False, reason=f"an in-bounds kernel was reported: {_first_lines(report)}")
-    elif not errors or "_ka_memcheck_overrun" not in report:
-        out.update(ok=False, reason="the deliberate out-of-bounds read was not reported")
+    elif test.clean in log:
+        out.update(ok=False, reason=f"{test.clean_is} was reported: {_first_lines(report)}")
+    elif child.get("clean") is False:  # the sanitizer changed a correct kernel's result
+        out.update(ok=False, reason=f"{test.clean_is} ({test.clean}) computed a wrong result")
+    elif not errors or test.hazard not in report:
+        warned = " (as a warning only)" if out.get("warnings") and test.hazard in report else ""
+        out.update(
+            ok=False,
+            reason=f"{test.hazard_is} was not reported{warned}: a clean {name} run is no "
+            "evidence on this GPU",
+        )
     else:
         out.update(ok=True, reason=_first_lines(report))
     return out
+
+
+def selftests(tool: Any = None, timeout: float = 300.0) -> dict[str, dict[str, Any]]:
+    """:func:`selftest` of every tool the integration runs (memcheck, racecheck, synccheck)."""
+    return {name: selftest(tool, timeout, name) for name in SELFTESTS}
 
 
 # ------------------------------------------------------------------ entry point

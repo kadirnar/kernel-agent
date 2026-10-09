@@ -1148,6 +1148,21 @@ class Orchestrator:
         stuck = {k for x in irreversible if (k := keys.arg(x)) is not None}
         everything = [*items, *(composite[0] if composite else []), *versions]
         irreversible.update(x for k, x in everything if stuck and keys.item((k, x)) in stuck)
+        tree, units = self._tree(), self._units()  # each step's estimated gain (#226)
+        kernel_saved: dict[str, float | None] = {}
+
+        def estimate(a: list[tuple[str, str]], b: list[tuple[str, str]]) -> float | None:
+            """The estimated gain of B over A (``pred_saved_ms`` of its ledger rows)."""
+            alone = _alone(base_ms, history)  # the transforms measured alone so far
+
+            def saving(item: tuple[str, str]) -> float | None:
+                if item[0] != "kernel":
+                    return alone.get(item[1])
+                if item[1] not in kernel_saved:
+                    kernel_saved[item[1]] = self._saving(item, alone, units)
+                return kernel_saved[item[1]]
+
+            return _step_gain(a, b, saving, tree, base_ms, owners.changes())
 
         def ab(
             a: list[tuple[str, str]], b: list[tuple[str, str]], note: str = "", **swap: Any
@@ -1165,7 +1180,11 @@ class Orchestrator:
             if hit is not None:
                 names = " + ".join(ledger.item_label(x) for _, x in b)
                 log(f"integrate: reused {names}{note}: measured before with the same content")
-            r = dict(hit) if hit is not None else self._paired(a, b, note, irreversible, crowded)
+            r = (
+                dict(hit)
+                if hit is not None
+                else self._paired(a, b, note, irreversible, crowded, estimate(a, b))
+            )
             owners.note(a, (r.get("ab") or {}).get("a_patches"))
             owners.note(b, r.get("patches"))
             record = {**(r.get("ab") or {}), "a_items": a_items}
@@ -1752,10 +1771,14 @@ class Orchestrator:
         cli: list[str],
         note: str,
         title: str = "",
+        est_gain: float | None = None,
+        a_ms: float | None = None,
     ) -> dict[str, Any]:
         """One integration measurement (``e2e`` / ``e2e_ab`` of ``combo``) and its ledger row
         (none when an A/B could not run in-process: nothing was measured); ``title``: the
-        row's (``ledger.integration_title``), its ``files`` the combination's items."""
+        row's (``ledger.integration_title``), its ``files`` the combination's items;
+        ``est_gain``: the estimated gain of B over A, its ``pred_saved_ms`` with A's median
+        (``a_ms``, else the result's A/B; ``ledger.predicted_saving``, #226)."""
         start = ledger.clock()  # simulated in a dry run, like the worker's measurements
         with self._gpu_job("integration") as job:  # one A/B step: one turn in the GPU queue
             r = self._worker(command, *cli, *self.truth.worker_args())
@@ -1775,6 +1798,8 @@ class Orchestrator:
             queue_s=job.queue_s,
             title=title,
             files=ledger.item_files(self.run, [a for _, a in combo]),
+            est_gain_ms=est_gain,
+            a_ms=a_ms,
         )
         gpu = r.get("gpu") or (r.get("ab") or {}).get("gpu")
         if message := telemetry.warning(gpu):
@@ -1788,6 +1813,7 @@ class Orchestrator:
         note: str,
         irreversible: set[str],
         crowded: list[set[str]] | None = None,
+        est_gain: float | None = None,
     ) -> dict[str, Any]:
         """B's result with an ``ab`` record of its timings against A: from one process
         (``e2e_ab``), or from two back to back when a state cannot be undone in-process
@@ -1795,7 +1821,8 @@ class Orchestrator:
         together (``oom``). After an ``oom`` each process runs with
         ``--expandable-segments``; ``crowded`` collects what both states of such a pair
         held (each state applies it afresh), and a later pair whose states both hold one of
-        those sets goes to two processes at once."""
+        those sets goes to two processes at once. ``est_gain``: the estimated gain of B over
+        A, for B's ledger row (:meth:`_integration_call`)."""
         why = "an item cannot be undone in-process"
         a_items, b_items = {x for _, x in a}, {x for _, x in b}
         title = ledger.integration_title([x for _, x in b], [x for _, x in a])
@@ -1814,7 +1841,7 @@ class Orchestrator:
             if self.cfg.early_stop:  # stop the rounds once the verdict is decided (#190)
                 cli += ["--sequential", "--ab-min-win-rate", str(self.cfg.ab_min_win_rate)]
                 cli += ["--ab-min-gain", str(self.cfg.ab_min_gain)]
-            r = self._integration_call("e2e_ab", b, cli, note, title)
+            r = self._integration_call("e2e_ab", b, cli, note, title, est_gain)
             if r.get("status") not in abtest.FALLBACK:
                 return r
             irreversible.update(r.get("irreversible") or [])
@@ -1833,7 +1860,9 @@ class Orchestrator:
             " (A of an A/B in separate processes)",
             ledger.integration_title([x for _, x in a], [x for _, x in a]),  # A again
         )
-        rb = self._integration_call("e2e", b, [*_cli(b, iters=iters), *flags], note, title)
+        rb = self._integration_call(
+            "e2e", b, [*_cli(b, iters=iters), *flags], note, title, est_gain, ra.get("median_ms")
+        )
         rb["ab"] = {
             "mode": "separate",
             "a_ms": ra.get("times_ms") or [],
@@ -1880,6 +1909,10 @@ class Orchestrator:
                 }
             )
         return projection.of_sets(tree, rows, base_ms, changes)  # in the metric's ms (#114)
+
+    def _tree(self) -> projection.Tree:
+        """The module tree of the run's targets (:func:`projection.tree`)."""
+        return projection.tree(self.run)
 
     def _units(self) -> projection.Units:
         """A kernel's est. saved ms per run → the metric's ms (#114), from the sealed
@@ -2456,7 +2489,9 @@ class Orchestrator:
             library.remember_seed(self.run, target_id, tried)
 
     async def scout_libraries(self, target_ids: list[str]) -> None:
-        """The library scout (``libscout/``, issue #227) on the targets not scouted yet:
+        """The library scout (``libscout/``, issue #227) on the targets not scouted yet, or
+        scouted under another key (``libscout.stale``: a library of the target's op families
+        installed, upgraded or removed since, another GPU, a scout from before the key):
         library kernels swept and fully evaluated with no agent, one GPU lease per target.
         Their rows are the bar the engineers start from (a floor, never a stop); a failure
         is logged and recorded, never fatal. Off with ``--no-library-scout``, in a simulated
@@ -2467,11 +2502,18 @@ class Orchestrator:
         if not self.cfg.library_scout or (self.scouter is None and not real):
             return
         done = False
+        nvcc = getattr(self.tc, "nvcc_version", None)
+        versions = libscout.installed()  # one metadata pass for every target (no import)
         for target_id in target_ids:
-            if libscout.scouted(self.run, target_id) is not None or self._refused(target_id):
+            if self._refused(target_id) or not self.run.capture_file(target_id).exists():
                 continue
-            if not self.run.capture_file(target_id).exists():
-                continue
+            before = libscout.scouted(self.run, target_id)
+            why = None
+            if before is not None:
+                why = libscout.stale(before, self.tc.gpu, nvcc=nvcc, versions=versions)
+                if why is None:
+                    continue  # the same libraries on the same GPU: its bar holds
+                log(f"libscout: {target_id}: scouting again: {why}")
             try:
                 with self._gpu_job("scout"):  # background work in the GPU queue
                     found = await asyncio.to_thread(
@@ -2488,6 +2530,11 @@ class Orchestrator:
                 found = {"error": repr(exc)[:300]}
             entry = {"seconds": found.get("seconds"), "error": found.get("error")}
             entry["adapters"] = [r.get("adapter") for r in found.get("adapters") or []]
+            families = found.get("families")  # its key: None (failed before detecting) = all
+            names = list(families) if isinstance(families, dict) else None
+            entry["key"] = libscout.key(names, self.tc.gpu, nvcc=nvcc, versions=versions)
+            if before is not None:
+                entry.update(scouts=int(before.get("scouts") or 1) + 1, rescouted=why)
             libscout.remember(self.run, target_id, entry)
             ledger.event(self.run, "library_scout", target=target_id, **entry)
             done = True
@@ -2547,11 +2594,14 @@ class Orchestrator:
 
     def _backend_record(self) -> str:
         """Planner-prompt section: which backend won which target class on this GPU in
-        earlier runs (kernel_agent/backends.py; "" without a library or a record)."""
+        earlier runs (kernel_agent/backends.py) and how far their estimates were off
+        (``library.prediction_note``, #226); "" without a library or a record."""
         from kernel_agent import backends
 
         try:
-            return backends.track_record_note(self._library_arch())
+            arch = self._library_arch()
+            notes = [backends.track_record_note(arch), library.prediction_note(arch)]
+            return "\n\n".join(n for n in notes if n)
         except Exception as exc:  # advice only: never fails the plan
             log(f"library: backend track record unreadable: {exc!r}")
             return ""
@@ -2566,6 +2616,10 @@ class Orchestrator:
             backends.record_run(self.run, arch)
         except Exception as exc:
             log(f"library: recording the backends of this run failed: {exc!r}")
+        try:  # predicted vs measured gain of every accepted item (prediction.py, #226)
+            library.store_predictions(self.run, arch, gpu=getattr(self.tc.gpu, "name", None))
+        except Exception as exc:
+            log(f"library: recording the prediction errors of this run failed: {exc!r}")
         try:
             stored = library.store_run(
                 self.run,
@@ -2727,6 +2781,39 @@ def _alone(base_ms: float, history: list[dict[str, Any]]) -> dict[str, float]:
         and h.get("passed")
         and (h.get("ab") or {}).get("gain") is not None
     }
+
+
+def _step_gain(
+    a: list[tuple[str, str]],
+    b: list[tuple[str, str]],
+    saving: Callable[[tuple[str, str]], float | None],
+    tree: projection.Tree,
+    base_ms: float,
+    changes: dict[str, list[str]],
+) -> float | None:
+    """The estimated gain of the integration step A → B in the metric's ms, as known when it
+    is measured (issue #226): the difference of the two sets projected from the baseline
+    (:func:`projection.of_set`: nested kernels and items that change the same modules counted
+    once), each item's saving from ``saving`` (:meth:`Orchestrator._saving`), rounded as in
+    ``integration.json``. The same as the ``est_gain_ms`` of an accepted step there, up to
+    what the patcher records of B's own modules. None when A is B (A measured again) or an
+    item B adds or A loses has no estimate (a transform not measured alone yet: its own probe
+    alone). Advice: it never fails the step."""
+    try:
+        saved = {x: saving((k, x)) for k, x in [*a, *b]}
+        moved = {x for _, x in a} ^ {x for _, x in b}
+        if not moved or any(saved[x] is None for x in moved):
+            return None
+        rounded = {x: None if v is None else round(v, 3) for x, v in saved.items()}
+
+        def summed(items: list[tuple[str, str]]) -> float:
+            mine = {x: rounded[x] for _, x in items}
+            return float(projection.of_set(tree, mine, base_ms, changes)["projected_ms"])
+
+        return round(summed(a) - summed(b), 3)
+    except Exception as exc:
+        log(f"integrate: no estimated gain for the step: {exc!r}")
+        return None
 
 
 #: Statuses of an integration measurement a re-integration measures again, not reuses

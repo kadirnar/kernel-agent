@@ -330,6 +330,10 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
     )
     if run.sealed():  # the agent's copy: module + inputs, no reference outputs
         truth.write_inputs_capture(capture, out / "capture_inputs.pt")
+    if info.get("precision") == "fp4_w4a4":  # which layers to keep at 8 bits (demotion.py)
+        from kernel_agent.kernels.mix_probe import probe_capture
+
+        info["w4a4_probe"] = probe_capture(capture)
     spec["parent_capture" if parent else "capture"] = info
     write_json(target_dir / "spec.json", spec)
     _write_reference_source(

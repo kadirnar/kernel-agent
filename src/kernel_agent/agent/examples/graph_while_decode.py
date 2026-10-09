@@ -18,15 +18,21 @@ The same greedy tokens, four ways:
   the stop read once per block; steps after the stop are masked
   (``graphloop.masked_copy_`` / ``masked_index_copy_``: no write past the stop).
 
+With ``--compile`` the step is also ``torch.compile``'d (the default mode: Inductor's
+kernels, no CUDA graphs of its own; :func:`compiled_request`) and run as a host loop, a
+graph per step and a WHILE loop, judged against the compiled host loop's tokens (Inductor's
+fusions change the numerics, so they may differ from the eager ones).
+
 ``python graph_while_decode.py`` prints, per way, the tokens' agreement with the host loop,
 the time per token (GPU-synchronised runs), the host time per token (how long the call
-held the host) and the host checks per run. Measured on an RTX 5070 Ti (sm_120): see
-``main``'s docstring.
+held the host) and the host checks per run. Measured on an RTX 5070 Ti (sm_120) and an A10
+(sm_86): see ``main``'s docstring.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import time
 from typing import Any
@@ -146,6 +152,15 @@ class Request:
             graphloop.masked_copy_(self.last, token, active)
 
 
+def compiled_request(req: Request) -> Request:
+    """``req`` (its buffers shared) with a ``torch.compile`` step in the default mode:
+    Inductor's kernels, no CUDA graphs of its own, so a graph or a device loop captures
+    them (``mode="reduce-overhead"`` would make graphs of its own)."""
+    compiled = copy.copy(req)
+    compiled.step = torch.compile(req.step)  # type: ignore[method-assign]
+    return compiled
+
+
 def generate_host(req: Request, prompt: list[int], eos: int) -> tuple[list[int], int]:
     """The plain loop: ``(tokens, host checks)``, one ``.item()`` per step."""
     req.prefill(prompt)
@@ -167,6 +182,9 @@ class GraphSteps:
         self.req = req
         with torch.inference_mode(False):
             self.index = torch.zeros((), dtype=torch.int64, device=req.last.device)
+        # warm-up on these buffers: a torch.compile step compiles for them here, not under the
+        # capture (where compiling fails); generate() prefills before it replays
+        req.step(self.index, None)
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             req.step(self.index, None)
@@ -224,13 +242,18 @@ def _time(fn: Any, runs: int) -> float:
 
 
 def compare(
-    max_new: int = 256, prompt_len: int = 16, runs: int = 10, **model_options: Any
+    max_new: int = 256,
+    prompt_len: int = 16,
+    runs: int = 10,
+    compile: bool = False,
+    **model_options: Any,
 ) -> dict[str, dict[str, Any]]:
     """Every way on one model and prompt: per way the tokens' agreement with the host loop,
     ms per token (prefill excluded), the host time per token of the loop call (a WHILE
     graph: its launch) and the host checks per run; ``eos`` is the first token the host
     loop generates for the first time from 3/4 of ``max_new`` on, so the loop stops on the
-    device's own decision there."""
+    device's own decision there. ``compile``: the ``torch.compile`` ways too, judged
+    against the compiled host loop."""
     model = ToyDecoder(**model_options)
     gen = torch.Generator().manual_seed(1)
     prompt = torch.randint(0, model.emb.shape[0], (prompt_len,), generator=gen).tolist()
@@ -239,27 +262,48 @@ def compare(
     late = range(3 * max_new // 4, max_new)
     eos = next((free[i] for i in late if free[i] not in free[:i]), -1)  # -1: max_new
     reference, _ = generate_host(req, prompt, eos)
-    n = len(reference)
     graphed = GraphSteps(req)
     loops = {
         "device loop (while)": DeviceGenerator(req, eos, mode="while", masked=False),
         "device loop (while, masked step)": DeviceGenerator(req, eos, mode="while"),
         "device loop (unrolled)": DeviceGenerator(req, eos, mode="unrolled"),
     }
-    ways: dict[str, Any] = {
-        "host loop": lambda: generate_host(req, prompt, eos),
-        "graph per step": lambda: graphed.generate(prompt, eos),
+    # per way: the call and the tokens it must give
+    ways: dict[str, tuple[Any, list[int]]] = {
+        "host loop": (lambda: generate_host(req, prompt, eos), reference),
+        "graph per step": (lambda: graphed.generate(prompt, eos), reference),
     }
-    ways |= {name: (lambda g=g: g.generate(prompt)) for name, g in loops.items()}
+    ways |= {name: (lambda g=g: g.generate(prompt), reference) for name, g in loops.items()}
+    if compile:
+        fast = compiled_request(req)
+        compiled, _ = generate_host(fast, prompt, eos)  # compiles the step before any capture
+        fast_graphed = GraphSteps(fast)
+        fast_loop = DeviceGenerator(fast, eos, mode="while", masked=False)
+        loops["device loop (while, torch.compile step)"] = fast_loop
+        ways |= {
+            "host loop (torch.compile step)": (
+                lambda: generate_host(fast, prompt, eos),
+                compiled,
+            ),
+            "graph per step (torch.compile step)": (
+                lambda: fast_graphed.generate(prompt, eos),
+                compiled,
+            ),
+            "device loop (while, torch.compile step)": (
+                lambda: fast_loop.generate(prompt),
+                compiled,
+            ),
+        }
     prefill_s = _time(lambda: req.prefill(prompt), runs)
     out: dict[str, dict[str, Any]] = {}
-    for name, call in ways.items():
+    for name, (call, want) in ways.items():
         call()  # warm-up (a device loop's first run is a host run, then it builds)
         tokens, checks = call()
         total_s = _time(call, runs)
+        n = len(tokens)
         row: dict[str, Any] = {
-            "same_tokens": tokens == reference,
-            "tokens": len(tokens),
+            "same_tokens": tokens == want,
+            "tokens": n,
             "ms_per_token": round((total_s - prefill_s) / n * 1e3, 4),
             "host_checks": checks,
         }
@@ -295,18 +339,47 @@ def main() -> None:
     ============================  ==========  =========  =================
 
     The WHILE loop held the host ~0.3 µs per token and checked nothing on the host; the
-    unrolled fallback chose K = 1 (GPU-bound steps) and pays for its masked writes."""
+    unrolled fallback chose K = 1 (GPU-bound steps) and pays for its masked writes.
+
+    Measured on an NVIDIA A10, sm_86 (150 W, shared with another tenant), driver 570.86
+    (CUDA 12.9), torch 2.10.0+cu128, cuda.core 1.2.1, bf16, the same model and stops, median
+    of 3 repetitions of 20 runs (``--compile``; the same tokens every way):
+
+    ===================================  ==========  =========  =================
+    way                                  4 x 512     1 x 256    1 x 128, vocab 512
+    ===================================  ==========  =========  =================
+    host loop                            1.861       0.650      0.617
+    graph per step                       0.377       0.120      0.099
+    device loop (while)                  0.369       0.095      0.092
+    device loop (while, masked)          0.409       0.108      0.102
+    device loop (unrolled, K=1)          0.428       0.113      0.111
+    graph per step (torch.compile)       0.270
+    device loop (while, torch.compile)   0.258
+    ===================================  ==========  =========  =================
+
+    The torch.compile ways ran 256 tokens (Inductor's numerics never generate the eager
+    stop token there) and match the compiled host loop (0.866 ms per token); on the 1-layer
+    models they stop after 78 and 24 tokens, too few for a stable number. The WHILE loop
+    held the host 0.25-0.35 µs per token."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--max-new", type=int, default=256)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--vocab", type=int, default=2048)
     parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--compile", action="store_true", help="the torch.compile ways too")
     ns = parser.parse_args()
     with torch.inference_mode():
-        rows = compare(ns.max_new, runs=ns.runs, layers=ns.layers, dim=ns.dim, vocab=ns.vocab)
+        rows = compare(
+            ns.max_new,
+            runs=ns.runs,
+            compile=ns.compile,
+            layers=ns.layers,
+            dim=ns.dim,
+            vocab=ns.vocab,
+        )
     for name, row in rows.items():
-        print(f"{name:34s} {row}")
+        print(f"{name:42s} {row}")
 
 
 if __name__ == "__main__":

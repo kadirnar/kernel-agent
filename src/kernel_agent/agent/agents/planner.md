@@ -31,7 +31,8 @@ share alone:
 * a `region` target (`parent_class` + `region`) fuses ops that sit between a parent's
   children (a residual add + norm) when no module target covers that round trip; the
   *Fusion candidates (measured)* table lists such chains with the bytes and launches they
-  save: take a row's parent class and ops and set `fusion` to its id;
+  save: take a row's parent class and ops and set `fusion` to its id (a row marked ↳
+  shares a GEMM with the row above it: their savings do not add up, plan one of them);
 * `why` names the bound with its number; `approach` the fusion / algorithm, the kernels it
   removes and the expected speedup; `backends` from those `kernel-agent doctor` reports,
   best suited first; 1-2 `alternatives` (a different algorithm or fusion boundary) for the

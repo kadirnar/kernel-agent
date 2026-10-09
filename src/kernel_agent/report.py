@@ -14,6 +14,7 @@ from kernel_agent import (
     library,
     objective,
     precisions,
+    prediction,
     projection,
     roles,
     sessions,
@@ -24,6 +25,7 @@ from kernel_agent.agent.tools import best_for_target
 from kernel_agent.dashboard import refresh
 from kernel_agent.improve import report_lines
 from kernel_agent.kernels import recheck, weights
+from kernel_agent.libscout import scout as libscout
 from kernel_agent.workloads import dtypes
 from kernel_agent.workspace import RunDir, read_json, read_jsonl
 
@@ -572,10 +574,12 @@ def write_report(run: RunDir) -> Path:
         if reference:
             items = ", ".join(f"`{ledger.item_label(i)}`" for i in reference.get("items", []))
             lines.append(f"* {items}: " + strong_baseline.combination_text(reference))
+        lines += prediction.report_lines(run, integration, baseline)  # #226
     lines += report_lines(run)  # `kernel-agent improve` slices, re-integrations, rounds
     lines += sessions.report_lines(run)  # agent time split and GPU use (issue #184)
     lines += backends.report_lines(run)  # evaluations per backend (by source) and target
     lines += library.report_lines(run)  # prior winners reused, entries stored, lessons
+    lines += libscout.report_lines(run)  # library kernels with no agent: the bar (#227)
     lines += web.report_lines(run.root)  # pages the agents fetched (issue #125)
     if costs:
         total = sum(c.get("usd", 0) for c in costs.values())

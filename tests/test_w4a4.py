@@ -21,7 +21,7 @@ import pytest
 import torch
 from torch import nn
 
-from kernel_agent import gpu_arch, precisions, selftest, skills
+from kernel_agent import backends, gpu_arch, precisions, selftest, skills, toolchain
 from kernel_agent.agent import prompts
 from kernel_agent.kernels import compare, quant, roofline
 from kernel_agent.profiling import ceilings
@@ -452,6 +452,68 @@ def test_the_engineer_gets_the_w4a4_contract():
     )
     assert "No 4-bit activations (W4A4)" in fp8
     assert skills.PRECISION_SKILLS[W4A4] == "fp4-w4a4"
+
+
+def _facts(name: str, cap: tuple[int, int]) -> gpu_arch.Facts:
+    """The facts of a fake GPU, read back from its toolchain summary (no GPU needed)."""
+    gpu = toolchain.GPUInfo(name, cap, 32.0, 100, 64.0, 99.0, 100.0)
+    found = {"cuda": True, "triton": True, "cute": True, "nvrtc": True, "tilelang": False}
+    tc = toolchain.Toolchain(gpu, "2.14", "13.0", None, "13.0", found, [], {}, None)
+    return gpu_arch.from_summary(tc.summary())
+
+
+_MLP = {
+    "module_class": "Qwen3MLP",
+    "precision": W4A4,
+    "capture": {"cases": [{"signature": "a0[2, 176, 1024]:bfloat16", "count": 10}]},
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "cap"),
+    [
+        ("NVIDIA B200", (10, 0)),
+        ("NVIDIA B300", (10, 3)),
+        ("NVIDIA GeForce RTX 5070 Ti", (12, 0)),
+        ("NVIDIA GB10", (12, 1)),
+    ],
+)
+def test_the_backend_policy_has_a_w4a4_row_on_fp4_tensor_cores(name, cap):
+    facts = _facts(name, cap)
+    assert facts.capability == cap and facts.has("fp4_tc")
+    assert backends.target_class(_MLP) == "fp4_gemm"
+    assert backends.target_class({**_MLP, "precision": "fp8_w8a8"}) == "fp8_gemm"
+    decode = {**_MLP, "capture": {"cases": [{"signature": "a0[1, 1, 1024]", "count": 9}]}}
+    assert backends.target_class(decode) == "small_m_gemm"  # memory bound: not W4A4's job
+    row = backends.policy("fp4_gemm", facts)
+    every = ["cuda", "triton", "cute"]
+    text = backends.policy_text(every, facts, (*precisions.default(NEAR), W4A4))
+    assert row.label in text and "* Compute-bound W4A4 GEMMs (`fp4_w4a4`, M ≳ 128)" in text
+    for off in (None, precisions.default(NEAR), (*precisions.default(NEAR), "fp4_weights")):
+        assert "W4A4" not in backends.policy_text(every, facts, off)  # opt-in
+    note = backends.engineer_note(_MLP, ["cute", "triton"], facts)
+    assert f"Target class: **{row.label}**" in note and row.first in note
+    layer = backends.engineer_note({**_MLP, "module_class": "LlamaDecoderLayer"}, every, facts)
+    assert f"The GEMMs inside (M = 352): {row.first}" in layer
+    if cap[0] == 10:  # datacenter Blackwell: tcgen05, the sm_12x CuTe example not named
+        assert "`tcgen05.mma kind::mxf4nvf4`" in row.first and row.order[0] == "triton"
+        assert "triton_nvfp4_w4a4_gemm.py" in row.first
+        assert "cute_sm100_gemm_tcgen05.py" in row.first
+        assert "cute_nvfp4_w4a4_gemm.py" not in text + note
+        assert "never a `mma.sync` kernel for a compute-bound W4A4 GEMM on sm_100" in text
+        assert "not measured by kernel-agent yet" in row.why
+    else:  # GeForce Blackwell: block-scaled FP4 mma.sync, the measured CuTe example first
+        assert "MmaMXF4NVF4Op" in row.first and "cute_nvfp4_w4a4_gemm.py" in row.first
+        assert row.order[0] == "cute" and "650 TFLOP/s" in row.why and "RTX 5070 Ti" in row.why
+        assert "triton_nvfp4_w4a4_gemm.py" in row.second
+    assert backends.unrunnable(text + note + layer, cap) == []
+
+
+@pytest.mark.parametrize("cap", [(7, 5), (8, 6), (8, 9), (9, 0)])
+def test_no_w4a4_backend_row_without_fp4_tensor_cores(cap):
+    facts = _facts("an older GPU", cap)
+    assert not facts.has("fp4_tc")
+    assert "W4A4" not in backends.policy_text(["cuda", "triton", "cute"], facts, ("exact", W4A4))
 
 
 class _Gemm(nn.Module):

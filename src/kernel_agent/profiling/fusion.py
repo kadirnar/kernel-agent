@@ -41,22 +41,48 @@ instance group and phase are one row (layers deduplicated): ``calls`` occurrence
 
 Estimate (:func:`build`, with the peaks measured on the GPU at hand)::
 
-    saves = Σ round trips of intermediates larger than L2 / DRAM bandwidth
+    saves = Σ DRAM bytes of the intermediates' round trips / DRAM bandwidth
             + calls × launches saved × per-launch cost
 
-An intermediate no larger than the L2 (the GPU's, :class:`kernel_agent.toolchain.GPUInfo`)
-stays there between its write and its read: it saves no DRAM bytes (L2 unknown: every one
-counts, an upper bound). The per-launch cost is the measured launch floor when the run
-launches eagerly, at most the run's own time per recorded op (window ÷ ops: the floor times
-a module call, whose Python a bare op does not pay), and the measured CUDA-graph launch floor
-(``launch_floor_graph_us``; :data:`GRAPH_BOUNDARY_US` for peaks without one) per kernel
-boundary when the kernel view shows most GPU work launched by CUDA graphs.
+The L2 rule (:func:`l2_round_trip`), LRU-ish: the L2 (the GPU's,
+:class:`kernel_agent.toolchain.GPUInfo`) is taken to hold the newest bytes touched. The ops
+between an intermediate's write and its last read inside the placement touch ``traffic``
+distinct bytes (what they read, weights included, and write, outside its storage; per
+storage the most bytes one op touches in it: :meth:`Miner._traffic`), so ``min(its bytes,
+L2 − traffic)`` of it is still in the L2 at that read and the rest counts, as that share of
+its round trip. An intermediate that fits with its traffic saves no DRAM bytes (``in``); a
+small one that the traffic evicts counts (``traffic``); a large one read at once counts the
+part beyond the L2 (``size``); with the L2 unknown every one counts (``unknown``, an upper
+bound). Per placement, ``intermediates`` records each one's bytes, traffic, DRAM bytes and
+why (``fusions.md`` says it). Not the hardware's replacement policy: the reads in between
+are not taken to refresh it, the L2 is one pool of its full size, and work the recorder
+does not see (another process, a graph replay) is not traffic.
 
-``analyze`` writes ``profile/fusions.json`` + ``fusions.md`` and the top :data:`TOP` into
-``summary.md`` (*Fusion candidates (measured)*); the improve scheduler takes a region arm's
-expected gain from its candidate (``fusion`` id in the plan, else its parent class), and the
-native stage graph takes chains that span stages as evidence for a group
-(``native/engine.py``). Candidates are evidence: the planner decides.
+The per-launch cost is the measured launch floor when the run launches eagerly, at most the
+run's own time per recorded op (window ÷ ops: the floor times a module call, whose Python a
+bare op does not pay), and the measured CUDA-graph launch floor (``launch_floor_graph_us``;
+:data:`GRAPH_BOUNDARY_US` for peaks without one) per kernel boundary when the kernel view
+shows most GPU work launched by CUDA graphs.
+
+Overlap-aware ranking (:func:`build`): rows can share an op, an anchor in one's prologue
+and another's epilogue (a norm before q / k / v and the q norm after q), and one GEMM
+cannot take in both, so their savings do not add up. :meth:`Miner.chains` records per
+placement the other rows whose placements take in one of its ops in some occurrence
+(``overlaps``); :func:`_disjoint` takes the placements of every row greedily by saving,
+each when its row has none yet and it shares no op with one taken (a row whose best
+placement is taken in elsewhere takes its next one: ``blocked``). The rows taken are
+``counted``: they share no op, their savings add up, ranked first by saving. A row with
+none taken is an alternative of the rows it overlaps (``overlaps``), ranked after them.
+Greedy and deterministic, not the best combination in general.
+
+``analyze`` writes ``profile/fusions.json`` + ``fusions.md`` and the top :data:`TOP` counted
+rows with their alternatives into ``summary.md`` (*Fusion candidates (measured)*); the
+improve scheduler takes a region arm's expected gain from its candidate (``fusion`` id in
+the plan, else the largest of its parent class, counted rows first: :func:`match`), and the
+native stage graph takes chains that span stages as evidence for a group, adding up only
+the savings of chains that share no op (:func:`additive`, ``native/engine.py``). Candidates
+are evidence: the planner decides. Tables from before the traffic and the overlaps were
+recorded (``fusions.json`` version 1) stay readable: every row counts.
 
 Approximate: each recorded op counts one launch; bytes are the logical bytes of each tensor
 (at most its storage's); an op of a CUDA-graph replay or a compiled region dispatches nothing
@@ -85,7 +111,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from kernel_agent.kernels.roofline import GRAPH_LAUNCH_FLOOR_US
 from kernel_agent.projection import fold
 
-VERSION = 1
+VERSION = 2  # 2: the L2 traffic of each intermediate, overlaps and counted rows
 #: Ops between a producer and its consumer beyond which they are not linked: a value a loop
 #: carries to its next step (a position counter) is not a fusion.
 MAX_GAP = 64
@@ -306,7 +332,9 @@ class _Op:
     dtype: Any
     anchor: str = ""  # gemm | conv | attention
     reads: list[tuple[int, Key, int]] = field(default_factory=list)  # producer, storage, bytes
-    reads_from: frozenset[Key] = frozenset()  # an anchor: every storage it reads
+    # every storage it reads (weights and inputs too, a written-only argument not) and the
+    # bytes: an anchor's inputs (which anchors share one), the L2 traffic of a window
+    loads: tuple[tuple[Key, int], ...] = ()
     writes: dict[Key, int] = field(default_factory=dict)  # storage -> bytes written
     consumers: list[tuple[int, Key, int]] = field(default_factory=list)  # op, storage, bytes
 
@@ -386,14 +414,15 @@ class Recorder(TorchDispatchMode):
             info.anchor or "",
         )
         overwrites = name in _OVERWRITE  # its written argument is not read
+        loads: dict[Key, int] = {}
         for t, (key, nbytes) in zip(ins, in_st, strict=True):
-            if key is None:
+            if key is None or (overwrites and any(t is w for w in written)):
                 continue
+            loads[key] = max(loads.get(key, 0), nbytes)
             producer = self.writer.get(key)
-            if producer is not None and not (overwrites and any(t is w for w in written)):
+            if producer is not None:
                 op.reads.append((producer, key, nbytes))
-        if kind == ANCHOR:  # which anchors share an input (one merged GEMM)
-            op.reads_from = frozenset(key for key, _ in in_st if key is not None)
+        op.loads = tuple(loads.items())
         mutated = {id(t) for t in written}
         carried = None
         if name in _PARTIAL:  # it writes the rows its other arguments carry, not the buffer
@@ -439,6 +468,30 @@ class _Groups:
         return {self.find(g) for g in groups}
 
 
+#: Why an intermediate's round trip counts (:func:`l2_round_trip`), from none to all of it.
+L2_WHY = ("in", "traffic", "size", "unknown")
+
+
+def l2_round_trip(written: int, trip: int, traffic: int, l2: int | None) -> tuple[int, str]:
+    """The DRAM bytes of an intermediate's round trip (``trip``: its write and its reads back,
+    ``written`` its bytes) and why (:data:`L2_WHY`), with ``traffic`` the distinct bytes
+    other ops touch between its write and its last read (:meth:`Miner._traffic`).
+
+    LRU-ish: the L2 is taken to hold the newest ``l2`` bytes touched, so at its last read
+    ``min(written, l2 − traffic)`` bytes of it are still there; the rest of it, as a share of
+    the round trip, goes through DRAM. ``in``: all of it is there (0 bytes); ``traffic``: it
+    fits the L2 alone, the traffic evicted all or part of it; ``size``: it is larger than
+    the L2 (the part the L2 holds still counts as there); ``unknown``: no L2 known, all of
+    it counts (an upper bound). Not the hardware's replacement policy: an approximation
+    from the bytes, with reads in between not counted as refreshing it."""
+    if l2 is None:
+        return trip, "unknown"
+    resident = min(written, max(l2 - traffic, 0))
+    if written <= 0 or resident >= written:
+        return 0, "in"
+    return -(-trip * (written - resident) // written), "size" if written > l2 else "traffic"
+
+
 class Miner:
     """Records a run's ops in the hooked work pass (:meth:`recording`) and finds its fusion
     chains (:meth:`chains`, :meth:`result`). ``l2_bytes``: the GPU's L2 (None: unknown,
@@ -454,6 +507,7 @@ class Miner:
         self.calls: list[Any] = []  # the timer's calls (qualname, cls, method, phase, parent)
         self._ancestry: dict[int, tuple[int, ...]] = {}
         self._folded: dict[int, str] = {}
+        self._windows: dict[tuple[int, int], tuple[int, dict[Key, int]]] = {}
 
     @contextlib.contextmanager
     def recording(self, timer: Any) -> Iterator[Recorder]:
@@ -569,27 +623,58 @@ class Miner:
             out["anchor"] = op.anchor
         return out
 
+    def _traffic(self, first: int, last: int, key: Key) -> int:
+        """The distinct bytes the ops strictly between ``first`` and ``last`` touch (read or
+        write; per storage the most bytes one of them touches in it) outside storage
+        ``key``: what passes through the L2 between an intermediate's write and its last
+        read. Windows are cached per chain (:meth:`chains` clears the cache)."""
+        window = self._windows.get((first, last))
+        if window is None:
+            touched: dict[Key, int] = {}
+            for op in self.ops[first + 1 : last]:
+                for k, n in itertools.chain(op.loads, op.writes.items()):
+                    if n > touched.get(k, 0):
+                        touched[k] = n
+            window = self._windows[(first, last)] = (sum(touched.values()), touched)
+        total, touched = window
+        return total - touched.get(key, 0)
+
     def _measure(self, members: Sequence[int]) -> dict[str, Any]:
         """Launches, intermediates and module boundaries of fusing ``members`` (the module
-        docstring), for one occurrence."""
+        docstring), for one occurrence; ``intermediates``: each one's bytes, round trip, the
+        traffic between its write and its last read inside, and its DRAM bytes and why
+        (:func:`l2_round_trip`), ``op`` its producer's position in ``members``."""
         inside = set(members)
         l2 = self.l2_bytes
         totals = {"intermediate": 0, "round_trip": 0, "dram": 0, "largest": 0, "tensors": 0}
-        for p in members:
+        found: list[dict[str, Any]] = []
+        for pos, p in enumerate(members):
             op = self.ops[p]
-            for key, written in op.writes.items():
+            for out, (key, written) in enumerate(op.writes.items()):
                 readers = [(c, b) for c, k, b in op.consumers if k == key]
-                mine = [b for c, b in readers if c in inside]
+                mine = [(c, b) for c, b in readers if c in inside]
                 if not mine:
                     continue
                 escapes = any(c not in inside for c, _ in readers)
-                trip = (0 if escapes else written) + sum(min(b, written) for b in mine)
+                trip = (0 if escapes else written) + sum(min(b, written) for _, b in mine)
+                traffic = self._traffic(p, max(c for c, _ in mine), key)
+                dram, why = l2_round_trip(written, trip, traffic, l2)
                 totals["intermediate"] += written
                 totals["round_trip"] += trip
                 totals["largest"] = max(totals["largest"], written)
                 totals["tensors"] += 1
-                if l2 is None or written > l2:
-                    totals["dram"] += trip
+                totals["dram"] += dram
+                found.append(
+                    {
+                        "op": pos,
+                        "out": out,
+                        "bytes": written,
+                        "round_trip_bytes": trip,
+                        "traffic_bytes": traffic,
+                        "dram_bytes": dram,
+                        "l2": why,
+                    }
+                )
         lca = self._lca(members)
         call = self.calls[lca] if lca >= 0 else None
         return {
@@ -603,6 +688,7 @@ class Miner:
             "dram_bytes": totals["dram"],
             "largest_bytes": totals["largest"],
             "tensors": totals["tensors"],
+            "intermediates": found,
         }
 
     def _placements(self, members: list[int]) -> dict[str, list[int]]:
@@ -628,7 +714,8 @@ class Miner:
         out = {"chain": list(members)}
         if producers:  # the newest, and those that read an input of it: one merged GEMM
             last = producers[-1]
-            shared = [p for p in producers if ops[p].reads_from & ops[last].reads_from]
+            inputs = {key for key, _ in ops[last].loads}
+            shared = [p for p in producers if any(key in inputs for key, _ in ops[p].loads)]
             out["epilogue"] = sorted({*members, *shared, last})
         if consumers:
             out["prologue"] = sorted({*members, *consumers})
@@ -639,9 +726,15 @@ class Miner:
     def chains(self) -> list[dict[str, Any]]:
         """Every chain that a fusion could save something on (a launch or an intermediate),
         occurrences with the same ops, modules and phase merged (layers deduplicated):
-        ``calls`` per run and the totals of every placement."""
+        ``calls`` per run and the totals of every placement, with its ``intermediates``
+        (summed over the occurrences: :func:`_merge_intermediates`) and its ``overlaps``
+        (``{id: [placements]}``: the other rows whose placements take in one of its ops in
+        some occurrence)."""
         found: dict[str, dict[str, Any]] = {}
+        # the rows (and placements) that would take each anchor op in: overlaps
+        owners: dict[int, set[tuple[str, str]]] = {}
         for members in self.groups():
+            self._windows.clear()
             sets = self._placements(members)
             measured = {name: self._measure(ms) for name, ms in sets.items()}
             if not any(
@@ -670,7 +763,9 @@ class Miner:
             row = found.get(key)
             if row is None:  # its first occurrence describes the row's ops
                 for name, ms in sets.items():
-                    measured[name] = {"ops": [self._describe(i) for i in ms], **measured[name]}
+                    m = measured[name]
+                    m["intermediates"] = _merge_intermediates({}, m["intermediates"])
+                    measured[name] = {"ops": [self._describe(i) for i in ms], **m}
                 row = found[key] = {
                     "id": "f" + hashlib.sha1(key.encode()).hexdigest()[:7],
                     "phase": phase,
@@ -685,10 +780,31 @@ class Miner:
                     for k in ("intermediate_bytes", "round_trip_bytes", "dram_bytes", "tensors"):
                         total[k] += m[k]
                     total["largest_bytes"] = max(total["largest_bytes"], m["largest_bytes"])
+                    _merge_intermediates(total["intermediates"], m["intermediates"])
             row["calls"] += 1
             row["instances"].add(call.qualname if call is not None else "")
+            for name, ms in sets.items():
+                for i in ms:
+                    if ops[i].kind == ANCHOR:
+                        owners.setdefault(i, set()).add((row["id"], name))
+        # two rows overlap when, in some occurrence, their placements take in the same op (an
+        # anchor: chains are disjoint): one GEMM cannot absorb both
+        shared: dict[tuple[str, str], dict[str, set[str]]] = {}
+        for owned in owners.values():
+            for (a, pa), (b, pb) in itertools.permutations(owned, 2):
+                if a != b:
+                    shared.setdefault((a, pa), {}).setdefault(b, set()).add(pb)
         rows = []
         for row in sorted(found.values(), key=lambda r: r["id"]):
+            for name, m in row["placements"].items():
+                m["intermediates"] = [
+                    {k: v for k, v in entry.items() if k != "out"}
+                    for _, entry in sorted(m["intermediates"].items())
+                ]
+                others = shared.get((row["id"], name), {})
+                m["overlaps"] = {
+                    b: sorted(ps, key=PLACEMENTS.index) for b, ps in sorted(others.items())
+                }
             modules = {
                 o["module"] for m in row["placements"].values() for o in m["ops"] if o["module"]
             }
@@ -714,6 +830,27 @@ class Miner:
         if error:
             out["error"] = error
         return out
+
+
+def _merge_intermediates(
+    into: dict[tuple[int, int], dict[str, Any]], found: list[dict[str, Any]]
+) -> dict[tuple[int, int], dict[str, Any]]:
+    """Add one occurrence's intermediates (:meth:`Miner._measure`) to a row's, by producer
+    position and output: bytes summed, the largest traffic, the strongest reason
+    (:data:`L2_WHY`), ``calls`` seen and ``dram_calls`` whose round trip counts DRAM bytes."""
+    for i in found:
+        dram = int(i["dram_bytes"] > 0)
+        entry = into.get((i["op"], i["out"]))
+        if entry is None:
+            into[(i["op"], i["out"])] = {**i, "calls": 1, "dram_calls": dram}
+            continue
+        for k in ("bytes", "round_trip_bytes", "dram_bytes"):
+            entry[k] += i[k]
+        entry["traffic_bytes"] = max(entry["traffic_bytes"], i["traffic_bytes"])
+        entry["l2"] = max(entry["l2"], i["l2"], key=L2_WHY.index)
+        entry["calls"] += 1
+        entry["dram_calls"] += dram
+    return into
 
 
 def gpu_l2() -> tuple[int | None, str]:
@@ -806,7 +943,7 @@ def build(
         notes.append("launch floor not measured (`kernel-agent doctor`): launches priced low")
     if dram <= 0:
         notes.append("DRAM bandwidth not measured (`kernel-agent doctor`): no byte saving")
-    candidates = []
+    priced: dict[str, dict[str, Any]] = {}  # id -> the chain and its options
     for chain in raw.get("chains") or []:
         options = []
         for order, name in enumerate(PLACEMENTS):
@@ -819,40 +956,59 @@ def build(
             depth = len(str(p["group"]).split(".")) if p["group"] else 0
             saving = round(byte_ms + launch_ms, 9)
             options.append((saving, depth, -order, name, byte_ms, launch_ms))
-        if not options:
-            continue
-        saving, _, _, name, byte_ms, launch_ms = max(options)
+        if options:
+            options.sort(reverse=True)  # the row's best first
+            priced[str(chain["id"])] = {"chain": chain, "options": options}
+    shown, blocked = _disjoint(priced)
+    candidates = []
+    for cid, entry in priced.items():
+        chain, options = entry["chain"], entry["options"]
+        name = shown[cid]
+        saving, _, _, _, byte_ms, launch_ms = next(o for o in options if o[3] == name)
         p = chain["placements"][name]
         kind = "glue" if not p["parent_class"] else "region" if p["boundaries"] > 0 else "module"
-        candidates.append(
-            {
-                "id": chain["id"],
-                "saving_ms": round(saving, 6),
-                "byte_ms": round(byte_ms, 6),
-                "launch_ms": round(launch_ms, 6),
-                "share": round(saving / window_ms, 6) if window_ms > 0 else None,
-                "placement": name,
-                "kind": kind,
-                "parent_class": p["parent_class"],
-                "group": p["group"],
-                "phase": chain.get("phase", ""),
-                "method": chain.get("method", ""),
-                "calls": chain["calls"],
-                "instances": chain.get("instances", 1),
-                "boundaries": p["boundaries"],
-                "launches": p["launches"],
-                "launches_saved": p["launches_saved"],
-                "intermediate_bytes": p["intermediate_bytes"],
-                "round_trip_bytes": p["round_trip_bytes"],
-                "dram_bytes": p["dram_bytes"],
-                "largest_bytes": p["largest_bytes"],
-                "ops": p["ops"],
-                "region": region_text(p["ops"], p["group"]),
-                "modules": chain.get("modules", []),
-                "placements": {o[3]: o[0] for o in sorted(options, key=lambda o: -o[2])},
-            }
-        )
-    candidates.sort(key=lambda c: (-c["saving_ms"], c["id"]))
+        # the other rows whose shown placement takes in an op of this one's
+        overlaps = sorted(o for o, ps in (p.get("overlaps") or {}).items() if shown.get(o) in ps)
+        candidate = {
+            "id": chain["id"],
+            "saving_ms": round(saving, 6),
+            "byte_ms": round(byte_ms, 6),
+            "launch_ms": round(launch_ms, 6),
+            "share": round(saving / window_ms, 6) if window_ms > 0 else None,
+            "placement": name,
+            "counted": cid in blocked,
+            "overlaps": overlaps,
+            "kind": kind,
+            "parent_class": p["parent_class"],
+            "group": p["group"],
+            "phase": chain.get("phase", ""),
+            "method": chain.get("method", ""),
+            "calls": chain["calls"],
+            "instances": chain.get("instances", 1),
+            "boundaries": p["boundaries"],
+            "launches": p["launches"],
+            "launches_saved": p["launches_saved"],
+            "intermediate_bytes": p["intermediate_bytes"],
+            "round_trip_bytes": p["round_trip_bytes"],
+            "dram_bytes": p["dram_bytes"],
+            "largest_bytes": p["largest_bytes"],
+            "intermediates": p.get("intermediates") or [],
+            "ops": p["ops"],
+            "region": region_text(p["ops"], p["group"]),
+            "modules": chain.get("modules", []),
+            "placements": {o[3]: o[0] for o in sorted(options, key=lambda o: -o[2])},
+        }
+        # a counted row's placements that would save more but take in a counted row's op
+        better = {
+            n: ids
+            for n, ids in (blocked.get(cid) or {}).items()
+            if candidate["placements"][n] > saving
+        }
+        if better:
+            candidate["blocked"] = better
+        candidates.append(candidate)
+    # the disjoint rows (their savings add up) by saving, then the rows that overlap them
+    candidates.sort(key=lambda c: (not c["counted"], -c["saving_ms"], c["id"]))
     for rank, c in enumerate(candidates, 1):
         c["rank"] = rank
     out: dict[str, Any] = {
@@ -877,6 +1033,62 @@ def build(
     return out
 
 
+def _disjoint(
+    priced: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, str], dict[str, dict[str, list[str]]]]:
+    """Overlap-aware ranking of the rows of :func:`build`: every placement of every row, by
+    saving (ties: the innermost parent, the placement order, the id), is taken when its row
+    has none yet and it shares no op with a placement taken (``overlaps``: an anchor two
+    rows' placements take in); a placement that saves nothing waits while a better one of
+    its row is blocked. Greedy, deterministic, not the best combination in general.
+
+    Returns the placement shown per row (the one taken; a row with none taken is an
+    alternative of the rows it overlaps, shown at its best) and, per taken row, its
+    placements that taken rows blocked (``{placement: [ids]}``): its keys are the rows
+    whose savings add up."""
+    order = sorted(
+        ((o[0], o[1], o[2], cid, o[3]) for cid, e in priced.items() for o in e["options"]),
+        key=lambda o: (-o[0], -o[1], -o[2], o[3]),
+    )
+    taken: dict[str, str] = {}
+    blocked: dict[str, dict[str, list[str]]] = {}
+    for saving, _, _, cid, name in order:
+        if cid in taken:
+            continue
+        if saving <= 0 and any(o[0] > 0 for o in priced[cid]["options"]):
+            continue  # nothing saved while a better placement of it overlaps: an alternative
+        place = priced[cid]["chain"]["placements"][name]
+        hits = sorted(o for o, ps in (place.get("overlaps") or {}).items() if taken.get(o) in ps)
+        if hits:
+            blocked.setdefault(cid, {})[name] = hits
+            continue
+        taken[cid] = name
+    shown = {cid: taken.get(cid, e["options"][0][3]) for cid, e in priced.items()}
+    return shown, {cid: blocked.get(cid, {}) for cid in taken}
+
+
+def additive(candidates: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The candidates whose savings add up, from any set of them (a stage group's chains,
+    the rows of a table): the counted ones, then by saving each alternative that overlaps
+    none kept so far (its ``overlaps``). A table from before overlaps were recorded counts
+    every row."""
+    kept: list[Mapping[str, Any]] = []
+    ids: set[str] = set()
+    ranked = sorted(
+        candidates,
+        key=lambda c: (
+            not c.get("counted", True),
+            -float(c.get("saving_ms") or 0.0),
+            str(c.get("id")),
+        ),
+    )
+    for c in ranked:
+        if not ids.intersection(c.get("overlaps") or ()):
+            kept.append(c)
+            ids.add(str(c.get("id")))
+    return kept
+
+
 def region_text(ops: Sequence[Mapping[str, Any]], group: str) -> str:
     """The ops of a placement for a region target's ``region``: runs of ops in one module,
     named relative to the parent (``group``): ```add` (the parent's own code) → `pow`, ...
@@ -898,13 +1110,14 @@ def region_text(ops: Sequence[Mapping[str, Any]], group: str) -> str:
 
 def match(table: Mapping[str, Any] | None, spec: Mapping[str, Any]) -> tuple[dict, str] | None:
     """The candidate a target stands for, and how it was found: its ``fusion`` id, else the
-    largest region candidate of its ``parent_class`` (in its ``phase``, if it has one)."""
+    largest region candidate of its ``parent_class`` (in its ``phase``, if it has one) among
+    the counted rows (:func:`build`: their savings add up), then among the alternatives."""
     candidates = (table or {}).get("candidates") or []
     fid = spec.get("fusion")
     if fid:
         hit = next((c for c in candidates if c.get("id") == fid), None)
         if hit is not None:
-            return hit, f"fusion {fid}"
+            return hit, f"fusion {fid}{overlap_note(hit)}"
     parent = spec.get("parent_class")
     phase = spec.get("phase") if spec.get("phase") not in (None, "", "all") else None
     same = [
@@ -917,8 +1130,24 @@ def match(table: Mapping[str, Any] | None, spec: Mapping[str, Any]) -> tuple[dic
     ]
     if not same:
         return None
-    best = max(same, key=lambda c: (float(c.get("saving_ms") or 0.0), c["id"]))
-    return best, f"fusion {best['id']}, the largest of parent class {parent}"
+    best = max(
+        same,
+        key=lambda c: (bool(c.get("counted", True)), float(c.get("saving_ms") or 0.0), c["id"]),
+    )
+    how = f"fusion {best['id']}, the largest of parent class {parent}{overlap_note(best)}"
+    return best, how
+
+
+def overlap_note(candidate: Mapping[str, Any]) -> str:
+    """`` (an alternative to f1, f2: …)`` / `` (alternatives f3 overlap it)``: the rows that
+    share an op with it ("" when none, or in a table from before overlaps)."""
+    ids = [f"`{i}`" for i in candidate.get("overlaps") or []]
+    if not ids:
+        return ""
+    names = ", ".join(ids[:3]) + (f" and {len(ids) - 3} more" if len(ids) > 3 else "")
+    if candidate.get("counted", True):
+        return f" (alternatives {names} overlap it)"
+    return f" (an alternative to {names}: they share an op, its saving does not add to theirs)"
 
 
 # ------------------------------------------------------------------ markdown
@@ -928,14 +1157,62 @@ def _mb(n: float) -> str:
     return f"{n / 1e6:,.3g} MB"
 
 
-def markdown(table: Mapping[str, Any], *, top: int = TOP, title: bool = True) -> str:
-    """``## Fusion candidates (measured)`` of ``summary.md`` ("" without chains)."""
+def l2_text(candidate: Mapping[str, Any]) -> str:
+    """Why its intermediates' bytes count, for the table: ``in L2``, ``1.2 MB DRAM: 2
+    evicted by ≤ 7.3 MB of traffic, 1 larger than the L2`` (a table from before the
+    traffic was recorded: its DRAM bytes only)."""
+    found = candidate.get("intermediates")
+    dram = int(candidate.get("dram_bytes") or 0)
+    if not found:
+        return f"{_mb(dram)} DRAM" if dram else "in L2"
+    if any(i.get("l2") == "unknown" for i in found):
+        return f"{_mb(dram)} DRAM: L2 unknown"
+    if not dram:
+        return "in L2"
+    parts = []
+    evicted = [i for i in found if i.get("l2") == "traffic"]
+    if evicted:
+        most = max(int(i.get("traffic_bytes") or 0) for i in evicted)
+        parts.append(f"{len(evicted)} evicted by ≤ {_mb(most)} of traffic")
+    larger = sum(1 for i in found if i.get("l2") == "size")
+    if larger:
+        parts.append(f"{larger} larger than the L2")
+    return f"{_mb(dram)} DRAM: " + ", ".join(parts)
+
+
+def _intermediate_text(i: Mapping[str, Any], ops: Sequence[Mapping[str, Any]]) -> str:
+    """```mul` (`m.norm`) 1.05 MB: evicted by ≤ 7.34 MB of traffic, 2.1 MB DRAM in 28 of 28
+    calls`` (bytes per call)."""
+    pos = int(i.get("op", -1))
+    op = ops[pos] if 0 <= pos < len(ops) else {}
+    calls = max(int(i.get("calls") or 1), 1)
+    where = f" (`{op.get('module')}`)" if op.get("module") else ""
+    traffic = _mb(int(i.get("traffic_bytes") or 0))
+    why = str(i.get("l2"))
+    text = {
+        "in": "in L2",
+        "traffic": f"evicted by ≤ {traffic} of traffic",
+        "size": f"larger than the L2 (≤ {traffic} of traffic too)",
+        "unknown": "L2 unknown",
+    }.get(why, why)
+    if why in ("traffic", "size"):
+        dram = _mb(int(i.get("dram_bytes") or 0))
+        text += f", {dram} DRAM in {i.get('dram_calls')} of {calls} calls"
+    return f"`{op.get('op', '?')}`{where} {_mb(int(i.get('bytes') or 0) / calls)}: {text}"
+
+
+def markdown(
+    table: Mapping[str, Any], *, top: int = TOP, title: bool = True, details: bool = False
+) -> str:
+    """``## Fusion candidates (measured)`` of ``summary.md`` ("" without chains): the top
+    counted rows (their savings add up), each followed by its alternatives (rows that share
+    an op with it); ``details``: why each intermediate of the rows shown counts or not."""
     candidates = table.get("candidates") or []
     if not candidates and not table.get("error"):
         return ""
     lines = ["", "## Fusion candidates (measured)", ""] if title else [""]
     l2 = table.get("l2_bytes")
-    l2_text = f"the {l2 / 2**20:.0f} MB L2" if l2 else "L2"
+    l2_size = f"the {l2 / 2**20:.3g} MB L2" if l2 else "the L2 (unknown here: all of it counts)"
     dram = table.get("dram_gbps")
     lines.append(
         f"Chains of memory-bound ops (element-wise, norms, reductions, casts, copies) with the "
@@ -943,10 +1220,12 @@ def markdown(table: Mapping[str, Any], *, top: int = TOP, title: bool = True) ->
         f"prologue, from the tensor storages of every op of one run "
         f"({table.get('ops', 0):,} kernel ops, {table.get('host_syncs', 0)} host syncs; no "
         "chain crosses one). *saves* (ms "
-        f"{table.get('per', 'per run')}) = the intermediates written and read back that "
-        f"exceed {l2_text} / "
+        f"{table.get('per', 'per run')}) = the DRAM round trips of the intermediates written "
+        f"and read back / "
         + (f"DRAM {dram:.0f} GB/s" if dram else "DRAM bandwidth (not measured)")
-        + " (smaller ones stay in L2: 0 bytes) + launches saved × "
+        + f" (LRU-ish: {l2_size} keeps the newest bytes touched, so an intermediate stays "
+        "there while it and the bytes other ops touch between its write and its last read "
+        "fit; the share of it evicted counts) + launches saved × "
         f"{table.get('launch_us', GRAPH_BOUNDARY_US):.3g} us ({table.get('launch_basis', '')}), "
         "× calls per run. One row per chain and instance group (layers deduplicated); *fuse* "
         "says where its ops go: one kernel of their own (*chain*), into the GEMM / attention "
@@ -959,38 +1238,111 @@ def markdown(table: Mapping[str, Any], *, top: int = TOP, title: bool = True) ->
         lines.append(f"* {note}")
     if not candidates:
         return "\n".join(lines) + "\n"
+    counted = [c for c in candidates if c.get("counted", True)]
+    rank = {c["id"]: n for n, c in enumerate(counted)}
+    alternatives: dict[str, list[Mapping[str, Any]]] = {}
+    for c in candidates:  # under the best-ranked counted row it overlaps
+        hosts = sorted((rank[i], i) for i in c.get("overlaps") or [] if i in rank)
+        if not c.get("counted", True) and hosts:
+            alternatives.setdefault(hosts[0][1], []).append(c)
     lines += [
         "",
         "| id | saves ms | bytes + launches ms | calls | fuse | parent class @ group | crosses "
-        "| launches | intermediates (largest) | ops |",
+        "| launches | intermediates (largest; L2) | ops |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for c in candidates[:top]:
-        where = f"`{c['parent_class']}` `{c['group']}`" if c["parent_class"] else "(no module)"
-        phase = f" ({c['phase']})" if c.get("phase") else ""
-        region = c["region"] if len(c["region"]) <= 400 else c["region"][:400] + " …"
-        dram_note = f", {_mb(c['dram_bytes'])} DRAM" if c["dram_bytes"] else ", in L2"
-        lines.append(
-            f"| `{c['id']}` | {c['saving_ms']:,.4g} | {c['byte_ms']:,.3g} + "
-            f"{c['launch_ms']:,.3g} | {c['calls']:,} | {c['placement']} | {where}{phase} | "
-            f"{c['boundaries']} | {c['launches']} → 1 | {_mb(c['intermediate_bytes'])} "
-            f"({_mb(c['largest_bytes'])}{dram_note}) | {region} |"
-        )
-    if len(candidates) > top:
-        rest = candidates[top:]
+    shown: list[Mapping[str, Any]] = []
+    for c in counted[:top]:
+        for row in (c, *alternatives.get(c["id"], [])):
+            lines.append(_table_row(row, c))
+            shown.append(row)
+    rest = counted[top:]
+    if rest:
         lines.append(
             f"| ... | {sum(c['saving_ms'] for c in rest):,.4g} | | | | {len(rest)} more | | | | |"
         )
+    total = sum(float(c["saving_ms"]) for c in counted)
+    others = len(candidates) - len(counted)
+    window = float(table.get("window_ms") or 0.0)
+    share = f" ({total / window:.1%} of the window)" if window > 0 else ""
     lines += [
         "",
-        "To plan one: a `region` target with `parent_class` = its parent class, `region` = its "
-        "ops and `fusion` = its id (the improve scheduler then expects its *saves*). *crosses* "
-        "0: inside one module call, a module target covers it. Rows that share an op (a GEMM "
-        "in one's prologue and another's epilogue) overlap: their savings do not add up. "
-        "Estimates from bytes and launches, not a fused kernel's measurement: the planner "
-        "still decides.",
+        (
+            f"The {len(counted)} counted rows share no op: together they save {total:,.4g} ms"
+            if len(counted) != 1
+            else f"The counted row saves {total:,.4g} ms"
+        )
+        + f"{share}. "
+        + (
+            f"{others} more {'is an alternative' if others == 1 else 'are alternatives'} (↳): "
+            "each shares an op (a GEMM in one's prologue and the other's epilogue) with the "
+            "row above it, so their savings do not add up; plan one or the other. "
+            if others
+            else ""
+        )
+        + "Ranked greedily by saving over rows that share no op (a row whose best placement "
+        "overlaps a row ranked before it takes its next one, *fuse* names what that would "
+        "cost). To plan one: a `region` target with `parent_class` = its parent class, "
+        "`region` = its ops and `fusion` = its id (the improve scheduler then expects its "
+        "*saves*). *crosses* 0: inside one module call, a module target covers it. Estimates "
+        "from bytes and launches, not a fused kernel's measurement: the planner still decides.",
     ]
+    if details:
+        lines += _details(shown)
     return "\n".join(lines) + "\n"
+
+
+def _table_row(c: Mapping[str, Any], host: Mapping[str, Any]) -> str:
+    where = f"`{c['parent_class']}` `{c['group']}`" if c["parent_class"] else "(no module)"
+    phase = f" ({c['phase']})" if c.get("phase") else ""
+    region = c["region"] if len(c["region"]) <= 400 else c["region"][:400] + " …"
+    fuse = str(c["placement"])
+    for name, ids in (c.get("blocked") or {}).items():  # a better placement it gave up
+        fuse += f" ({name} {c['placements'][name]:,.3g} ms: overlaps " + ", ".join(
+            f"`{i}`" for i in ids
+        )
+        fuse += ")"
+    ident = f"`{c['id']}`" if c is host else f"↳ `{c['id']}` (alt. of `{host['id']}`)"
+    return (
+        f"| {ident} | {c['saving_ms']:,.4g} | {c['byte_ms']:,.3g} + "
+        f"{c['launch_ms']:,.3g} | {c['calls']:,} | {fuse} | {where}{phase} | "
+        f"{c['boundaries']} | {c['launches']} → 1 | {_mb(c['intermediate_bytes'])} "
+        f"({_mb(c['largest_bytes'])}; {l2_text(c)}) | {region} |"
+    )
+
+
+def _details(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """``### Intermediates and the L2``: per row shown, the intermediates whose round trip
+    counts and why (:func:`l2_round_trip`), and how many stay in the L2."""
+    out = []
+    for c in rows:
+        found = c.get("intermediates") or []
+        if not found:
+            continue
+        counted = [i for i in found if i.get("l2") in ("traffic", "size")]
+        unknown = sum(1 for i in found if i.get("l2") == "unknown")
+        stay = [i for i in found if i.get("l2") == "in"]
+        items = [_intermediate_text(i, c.get("ops") or []) for i in counted]
+        if unknown:
+            items.append(f"{unknown} counted: L2 unknown")
+        if stay:
+            most = max(int(i.get("traffic_bytes") or 0) for i in stay)
+            traffic = f"≤ {_mb(most)} of traffic" if most else "no traffic in between"
+            items.append(f"{len(stay)} in L2 ({traffic})")
+        out.append(f"* `{c['id']}` ({c['placement']}): " + "; ".join(items))
+    if not out:
+        return []
+    return [
+        "",
+        "### Intermediates and the L2",
+        "",
+        "Per row shown, the intermediates whose round trip counts (by the op that writes "
+        "it, bytes per call) and why: *traffic* = the distinct bytes the ops between its "
+        "write and its last read touch, the most of any call; the L2 keeps the newest bytes "
+        "(LRU-ish), so the part of it beyond L2 − traffic counts.",
+        "",
+        *out,
+    ]
 
 
 def write(
@@ -1011,7 +1363,8 @@ def write(
         table = {"version": VERSION, "error": f"{type(exc).__name__}: {exc}"[:300]}
         table["candidates"] = []
     write_json(profile_dir / "fusions.json", table)
-    (profile_dir / "fusions.md").write_text(markdown(table, top=SHOWN).lstrip("\n"))
+    text = markdown(table, top=SHOWN, details=True)
+    (profile_dir / "fusions.md").write_text(text.lstrip("\n"))
     return table
 
 
