@@ -63,6 +63,7 @@ from typing import TYPE_CHECKING, Any
 
 from kernel_agent import (
     board,
+    demotion,
     governor,
     interrupt,
     ledger,
@@ -338,7 +339,9 @@ def kernel_digest(
         "target's time goes to the other arms for this round, so prefer a fundamentally "
         "different idea over small variations.",
     ]
-    lines += docs_section(run, read_json(run.target(arm.id) / "spec.json", {}) or {})
+    spec = read_json(run.target(arm.id) / "spec.json", {}) or {}
+    lines += demotion.digest_lines(spec)  # a W4A4 target's precision mix (#233)
+    lines += docs_section(run, spec)
     lines += board_section(run, arm, label)
     return "\n".join(lines + _footer("NOTES.md"))
 
@@ -586,7 +589,8 @@ def rounds_context(
     for arm in arms:
         if arm.kind == KERNEL:
             spec = read_json(run.target(arm.id) / "spec.json", {}) or {}
-            tier = f" [{pivot.label(spec)}]" if spec.get("precision") else ""
+            mix = demotion.label(spec)  # a W4A4 target's layers at 8 bits (#233)
+            tier = f" [{pivot.label(spec)}{mix}]" if spec.get("precision") else ""
             lines.append(
                 f"* `{arm.id}` (`{arm.module_class}`){tier}: best {arm.best:.2f}x after "
                 f"{arm.evals} evaluations; {arm.stop or 'still open'}"
@@ -1072,6 +1076,8 @@ class Improver:
         n, label = rec["n"], rec["label"]
         evaluations = self.icfg.slice
         try:
+            if arm.kind == KERNEL:  # a W4A4 target's mix moves on a failed gate (#233)
+                await self._w4a4_mix(arm.id)
             if arm.kind == NATIVE:
                 evaluations = self.orch.cfg.native_evaluations or evaluations
                 stand = await self._native_stage(arm)
@@ -1491,6 +1497,39 @@ class Improver:
             self.save()
         return rec
 
+    async def _w4a4_mix(self, target_id: str) -> dict[str, Any]:
+        """The per-layer demotion policy of a W4A4 target (``demotion.py``) on its records and
+        the last integration: a failed gate moves its next group of layers to 8 bits (the
+        slice's engineer reads the mix in ``spec.json``); with every group there, the pivot
+        to its 8-bit class it proposes is made (``Orchestrator.pivot``). What it did, or {}."""
+        from kernel_agent.truth import TamperError
+
+        spec = read_json(self.run.target(target_id) / "spec.json", {}) or {}
+        if not demotion.applies(spec):
+            return {}
+        try:
+            records = self.orch.truth.records(self.run.results_file(target_id))
+        except TamperError:
+            records = []
+        integration = self.orch.truth.load_json(self.run.root / "integration.json") or {}
+        try:
+            done = demotion.step(self.run, target_id, records=records, integration=integration)
+        except Exception as exc:  # bookkeeping: never a reason to fail the arm's slice
+            log(f"w4a4 mix: {target_id}: not updated: {exc!r}")
+            return {}
+        if done:
+            mix = done["mix"]
+            log(
+                f"w4a4 mix: {target_id}: {mix['demoted']} of {mix['groups']} groups in "
+                f"{mix['eight_bit']} ({done['trigger']}: {str(done['reason'])[:200]})"
+            )
+        if proposal := done.get("pivot"):
+            done["pivot_result"] = await self.orch.pivot(
+                target_id, proposal, source=demotion.SOURCE
+            )
+            demotion.record_pivot(self.run, target_id, done["pivot_result"])
+        return done
+
     def _open_research(self, arm: Arm, why: str) -> dict[str, Any]:
         """The record of a new research session of ``arm`` (``improve.json``)."""
         n = len(self.state["slices"])
@@ -1786,7 +1825,7 @@ def report_lines(run: RunDir) -> list[str]:
         mine = [s for s in slices if s["arm"] == arm]
         best = max(float(s.get("best_after") or s.get("best_before") or 1.0) for s in mine)
         spec = read_json(run.target(arm) / "spec.json", {}) or {}
-        tier = pivot.label(spec) if arm not in (SYSTEMS, NATIVE) else "—"
+        tier = pivot.label(spec) + demotion.label(spec) if arm not in (SYSTEMS, NATIVE) else "—"
         lines.append(
             f"| `{arm}` | {tier} | {len(mine)} | {sum(s.get('evals') or 0 for s in mine)} | "
             f"{sum(bool(s.get('improved')) for s in mine)} | {best:.3f}x |"

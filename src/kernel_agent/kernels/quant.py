@@ -76,7 +76,10 @@ token; MXFP4: e8m0 per 32), :func:`fp4_w4a4_linear` (``F.scaled_mm`` NVFP4 where
 the reference and fallback), :func:`swizzle_fp4_scales`, :func:`fp4_values`,
 :func:`fp4_saturation`, :func:`fp4_w4a4_error`, an optional block Hadamard rotation
 (:func:`hadamard_rotate`) and the per-layer sensitivity probe (:func:`fp4_w4a4_sensitivity`:
-which ``nn.Linear`` to keep in FP8).
+which ``nn.Linear`` to keep in FP8). :func:`fp4_scale_check`, :func:`fp4_scale_problem`: a
+quantiser's activation scales against the block maxima (the evaluator's scale-rule guard,
+:mod:`kernel_agent.kernels.scale_guard`); :func:`fp4_stress_input`: blocks whose maxima sit
+where a scale rounded down, flushed to zero or (MXFP4) the OCP floor rule saturates.
 """
 
 from __future__ import annotations
@@ -1215,6 +1218,231 @@ def fp4_saturation(
     }
 
 
+#: The largest ``block max / step`` an NVFP4 block reaches with its e4m3 scale rounded to
+#: nearest (step = scale x outer): 6 x (1 + 2^-4), e4m3's half step at the bottom of a binade
+#: (3 mantissa bits). A normal scale rounded down (truncated) reaches up to 6 x (1 + 2^-3);
+#: a subnormal one (below 2^-6, steps of 2^-9) more, so there the bound is what rounding to
+#: nearest gives that block (:func:`fp4_scale_check`).
+NVFP4_ROUNDING_RATIO = FP4_MAX * (1 + 2.0**-4)
+#: A block saturates beyond rounding when its ratio exceeds the bound by more than this share
+#: (the fp32 rounding of a kernel's scale and outer computation).
+FP4_SATURATION_SLACK = 2.0**-10
+#: e4m3's smallest normal value; below it the scales are subnormal, in steps of 2^-9.
+E4M3_MIN_NORMAL = 2.0**-6
+
+
+def fp4_format_of(k: int, scales: torch.Tensor) -> str:
+    """The FP4 format (:data:`FP4_FORMATS`) of activation ``scales`` for ``K`` = ``k``: from
+    their dtype (e4m3: ``nvfp4``, e8m0: ``mxfp4``), else from their width (``K / 16`` or
+    ``K / 32`` columns). ValueError: neither (a swizzled or flattened layout, say)."""
+    if scales.dtype == torch.float8_e4m3fn:
+        return "nvfp4"
+    if scales.dtype == torch.float8_e8m0fnu:
+        return "mxfp4"
+    width = scales.shape[-1] if scales.dim() == 2 else -1
+    for fmt, (block, _) in FP4_FORMATS.items():
+        if k % block == 0 and width == k // block:
+            return fmt
+    raise ValueError(
+        f"expected FP4 activation scales [rows, K / 16] (NVFP4, e4m3) or [rows, K / 32] (MXFP4, "
+        f"e8m0), unswizzled, for K = {k}; got {scales.dtype} {tuple(scales.shape)}"
+    )
+
+
+def fp4_scale_values(scales: torch.Tensor, fmt: str) -> torch.Tensor:
+    """fp32 values of FP4 block scales: e4m3 / e8m0, ``uint8`` bits of the format's scale
+    dtype, or floating-point values (as they are)."""
+    if scales.dtype == torch.uint8:
+        scales = scales.view(FP4_FORMATS[fmt][1])
+    return scales.float()
+
+
+def fp4_scale_check(
+    x: torch.Tensor,
+    scales: torch.Tensor,
+    outer: torch.Tensor | float | None = None,
+    fmt: str | None = None,
+) -> dict[str, Any]:
+    """How a W4A4 activation quantiser's block scales fit the block maxima of ``x [..., K]``
+    (the scale-rule guard of ``fp4_w4a4`` targets, :mod:`kernel_agent.kernels.scale_guard`).
+
+    ``scales``: ``[rows, K / block]`` for the rows of ``x.reshape(-1, K)``, unswizzled (e4m3
+    for NVFP4, e8m0 for MXFP4, their ``uint8`` bits or values; ``fmt`` None: from them,
+    :func:`fp4_format_of`); ``outer``: the NVFP4 second-level scale per row (``[rows]``, one
+    per call as a scalar / 1-element tensor, or None: 1). A block's step is ``scale x outer``
+    and its ratio ``bmax / step``; with the candidate's own outer scale:
+
+    * ``saturated``: blocks whose ratio exceeds the rule's bound by more than
+      :data:`FP4_SATURATION_SLACK` (their largest elements are clamped beyond rounding).
+      NVFP4: :data:`NVFP4_ROUNDING_RATIO` (6.375, a scale rounded to nearest; caught: scales
+      rounded down, block scales clamped at 448 by too small an outer scale), or for a block
+      whose round-to-nearest scale is subnormal the ratio that scale gives (also with the
+      ratio ``bmax / (outer x 6)`` one part in 2^20 lower: a tie decided the other way).
+      MXFP4: 6 (the rule ``2^ceil(log2(bmax / 6))`` never saturates; the OCP rule
+      ``2^(floor(log2 bmax) - 2)`` up to 8);
+    * ``underflow``: blocks with a non-zero maximum whose scale is 0 while e4m3 rounding to
+      nearest gives a non-zero (subnormal) one: all their codes are 0 (a flush to zero);
+    * ``nonfinite``: blocks whose scale or outer scale is not finite, or whose outer scale is
+      not positive; ``not_representable``: scales that are not e4m3 values (NVFP4) or not
+      powers of two (MXFP4);
+    * ``worst_ratio``, ``share`` (of saturated blocks), ``coarser`` (blocks whose scale is
+      above the reference rule's: nothing saturates, precision given away) and ``format``.
+
+    ValueError: ``scales`` or ``outer`` of another shape."""
+    k = x.shape[-1]
+    a = x.detach().reshape(-1, k).float()
+    rows = a.shape[0]
+    fmt = fmt or fp4_format_of(k, scales)
+    block = FP4_FORMATS[fmt][0]
+    nb = k // block if k % block == 0 else -1
+    if nb < 0 or tuple(scales.shape) != (rows, nb):
+        raise ValueError(
+            f"expected {fmt} scales [{rows}, {max(nb, 0)}] (rows of x, K / {block}, unswizzled) "
+            f"for x {tuple(x.shape)}, got {tuple(scales.shape)}"
+        )
+    s = fp4_scale_values(scales, fmt).to(a.device)
+    if outer is None:
+        o = torch.ones(rows, device=a.device)
+    else:
+        o = torch.as_tensor(outer).detach().float().to(a.device).reshape(-1)
+        if o.numel() == 1:
+            o = o.expand(rows)
+        elif o.numel() != rows:
+            raise ValueError(f"expected an outer scale per row ([{rows}]) or one, got {o.numel()}")
+    bmax = a.reshape(rows, nb, block).abs().amax(dim=-1)
+    o2 = o[:, None].expand(rows, nb)
+    finite = torch.isfinite(s) & torch.isfinite(o2) & (o2 > 0)
+    step = torch.where(finite, s * o2, torch.zeros_like(s))
+    live = finite & (bmax > 0)
+    ratio = torch.where(live & (step > 0), bmax / step.clamp_min(1e-38), torch.zeros_like(bmax))
+    zero = live & (step <= 0)
+    if fmt == "nvfp4":
+        safe = torch.where(finite, o2, torch.ones_like(o2))
+        r = bmax / (safe * FP4_MAX)  # the reference's ratio with this outer scale
+        rn = r.clamp(max=448.0).to(torch.float8_e4m3fn).float()
+        rn_low = (r * (1 - 2.0**-20)).clamp(max=448.0).to(torch.float8_e4m3fn).float()
+        bound = torch.full_like(bmax, NVFP4_ROUNDING_RATIO)
+        for ref in (rn, rn_low):  # a subnormal scale's own rounding error
+            ref_ratio = bmax / (ref * safe).clamp_min(1e-38)
+            sub = (ref > 0) & (ref < E4M3_MIN_NORMAL)
+            bound = torch.where(sub, torch.maximum(bound, ref_ratio), bound)
+        underflow = int((zero & (rn_low > 0)).sum())
+        representable = s.to(torch.float8_e4m3fn).float() == s
+        coarser = int((live & (s > rn)).sum())
+    else:
+        bound = torch.full_like(bmax, FP4_MAX)
+        underflow = int(zero.sum())
+        representable = (torch.frexp(s)[0] == 0.5) & (s > 0)
+        mantissa, exponent = torch.frexp(bmax)  # the ceil rule, as quantize_fp4_activations
+        ceil = exponent - 3 + (mantissa > 0.75).to(exponent.dtype)
+        coarser = int((live & (s > torch.pow(2.0, ceil.double()).float())).sum())
+    saturated = int((live & (ratio > bound * (1 + FP4_SATURATION_SLACK))).sum())
+    blocks = rows * nb
+    return {
+        "format": fmt,
+        "blocks": blocks,
+        "saturated": saturated,
+        "share": _sig(saturated / blocks) if blocks else 0.0,
+        "worst_ratio": _sig(float(ratio.max())) if blocks else 0.0,
+        "underflow": underflow,
+        "nonfinite": int((~finite).sum()),
+        "not_representable": int((finite & ~representable).sum()),
+        "coarser": coarser,
+    }
+
+
+def fp4_scale_problem(
+    x: torch.Tensor,
+    scales: torch.Tensor,
+    outer: torch.Tensor | float | None = None,
+    fmt: str | None = None,
+) -> str | None:
+    """Why ``(scales, outer)`` are not a valid W4A4 activation quantisation of ``x``
+    (:func:`fp4_scale_check`): non-finite scales, blocks saturated beyond rounding, non-zero
+    blocks flushed to a zero scale, or scales the format cannot hold; None when they are."""
+    found = fp4_scale_check(x, scales, outer, fmt)
+    blocks, fmt = found["blocks"], found["format"]
+    if found["nonfinite"]:
+        return (
+            f"{found['nonfinite']} of {blocks} {fmt} blocks have a scale or an outer scale that "
+            "is not finite, or an outer scale <= 0"
+        )
+    if found["saturated"] and fmt == "nvfp4":
+        return (
+            f"{found['saturated']} of {blocks} NVFP4 blocks ({found['share']:.1%}) saturate "
+            f"beyond the rounding of their e4m3 scale: block maximum up to "
+            f"{found['worst_ratio']:.4g} x step (scale x outer), above {NVFP4_ROUNDING_RATIO:g} "
+            "(6 x (1 + e4m3's half step)); round the block scale bmax / (outer x 6) to "
+            "nearest (or up), never down, and keep the outer scale at amax / (6 x 448) per "
+            "row or per call so that no block scale clamps at 448"
+        )
+    if found["saturated"]:
+        return (
+            f"{found['saturated']} of {blocks} MXFP4 blocks ({found['share']:.1%}) saturate: "
+            f"block maximum up to {found['worst_ratio']:.4g} x scale, above e2m1's 6 (their "
+            "largest elements are clamped). Use the scale 2^ceil(log2(amax / 6)); the OCP rule "
+            "2^(floor(log2 amax) - 2) saturates maxima in (6, 8) x scale"
+        )
+    if found["underflow"]:
+        return (
+            f"{found['underflow']} of {blocks} NVFP4 blocks with a non-zero maximum got block "
+            "scale 0 where e4m3 rounding to nearest gives a non-zero (subnormal, 2^-9 steps) "
+            "scale: all their codes are 0 (subnormal scales flushed to zero?)"
+        )
+    if found["not_representable"]:
+        what = "e4m3 values" if fmt == "nvfp4" else "powers of two (e8m0 holds an exponent only)"
+        return f"{found['not_representable']} of {blocks} {fmt} block scales are not {what}"
+    return None
+
+
+#: The ratios ``bmax / (outer x 6)`` (block scale before rounding) of :func:`fp4_stress_input`'s
+#: NVFP4 blocks: 1.1125 x 2^e for e from -6 to 7 (rounding to nearest gives 1.125 x 2^e,
+#: truncation 2^e: ratio 6.675) and (k + 0.7) x 2^-9 for k from 1 to 5 (subnormal: rounding
+#: to nearest gives (k + 1) x 2^-9; a flush to zero, or truncation, are caught).
+NVFP4_STRESS_RATIOS = (
+    *(1.1125 * 2.0**e for e in range(-6, 8)),
+    *((k + 0.7) * 2.0**-9 for k in range(1, 6)),
+)
+
+
+def fp4_stress_input(
+    shape: tuple[int, ...] | torch.Size,
+    fmt: str = "nvfp4",
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | str = "cpu",
+    seed: int = 0,
+) -> torch.Tensor:
+    """Activations of ``shape`` (``[..., K]``) on which saturating W4A4 scale rules show.
+
+    ``nvfp4`` (K a multiple of 16): Gaussian blocks of 16 whose maxima sit where a rounding
+    rule decides: the first block of every row holds the row's maximum, 64 (every row the
+    same, so a per-token and a per-call outer scale agree), the others ``64 x m / 448`` for
+    ``m`` of :data:`NVFP4_STRESS_RATIOS` across blocks and rows, so their block scale before
+    rounding is about ``m`` (bf16 and fp16 keep it within the same e4m3 interval).
+    ``mxfp4`` (K a multiple of 32): :func:`mxfp8_stress_input`'s blocks of 32 with maxima at
+    ±1.9 x 2^e, which the OCP floor rule maps to 7.6 x scale (saturated) and the ceil rule
+    to 3.8."""
+    if fmt == "mxfp4":
+        return mxfp8_stress_input(shape, dtype=dtype, device=device, seed=seed)
+    if fmt != "nvfp4":
+        raise ValueError(f"unknown FP4 format {fmt!r} (one of {', '.join(FP4_FORMATS)})")
+    block = FP4_FORMATS[fmt][0]
+    k = int(shape[-1])
+    if k % block:
+        raise ValueError(f"the last dimension {k} is not a multiple of the NVFP4 block (16)")
+    rows, nb = math.prod(int(n) for n in shape[:-1]), k // block
+    gen = torch.Generator().manual_seed(seed)
+    v = torch.randn(rows, nb, block, generator=gen)
+    peak = v.abs().argmax(dim=-1, keepdim=True)
+    v = v / v.abs().gather(-1, peak)  # block maximum ±1, at the largest Gaussian value
+    targets = torch.tensor(NVFP4_STRESS_RATIOS)
+    index = torch.arange(rows * nb).reshape(rows, nb) % len(NVFP4_STRESS_RATIOS)
+    bmax = 64.0 * targets[index] / 448.0
+    bmax[:, 0] = 64.0
+    return (v * bmax[..., None]).reshape(*shape).to(dtype=dtype, device=device)
+
+
 def fp4_w4a4_error(
     weight: torch.Tensor,
     codes: torch.Tensor,
@@ -1285,7 +1513,10 @@ def fp4_w4a4_sensitivity(
     ``name``, ``rows``, ``in_features``, ``out_features``, ``flop_share`` (of the layers'
     GEMM FLOPs over those calls), ``activation_crest``, ``w4a4_rel_l2``,
     ``w4a4_norm_change`` (``‖new‖ / ‖ref‖ - 1``: quantised activations can shrink a GEMM's
-    output by up to ~1 %, compounding through an MLP), ``fp8_rel_l2``. On the VoxCPM2 LocDiT
+    output by up to ~1 %, compounding through an MLP), ``fp8_rel_l2``, and ``input_group``:
+    the first layer (in module order) that read the same inputs (q / k / v, gate / up: one
+    quantised activation, often one merged GEMM; they move to FP8 together,
+    :mod:`kernel_agent.kernels.mix_probe`). On the VoxCPM2 LocDiT
     layer (M = 352) gate / up rank first (0.088 vs FP8's 0.019; 49 % of the FLOPs) and FP8 for
     them alone moves the layer's hidden output from relative L2 0.036 / norm -3.4 % to 0.014 /
     -0.9 %. Move layers to FP8 from the top until the evaluator and the perceptual gate pass;
@@ -1308,9 +1539,15 @@ def fp4_w4a4_sensitivity(
         for h in hooks:
             h.remove()
     found = []
-    for name, inputs in seen.items():
+    kept = {n: torch.cat(seen[n]) for n in layers if n in seen}  # module order
+    group: dict[str, str] = {}
+    for name, x in kept.items():  # the first layer that read the same inputs
+        group[name] = next(
+            (g for g, y in kept.items() if g in group and g == group[g] and _same(x, y)), name
+        )
+    for name, x in kept.items():
         w = layers[name].weight.detach()
-        x = torch.cat(inputs).to(w.device)
+        x = x.to(w.device)
         if w.shape[1] % (rotate or FP4_FORMATS[fmt][0]) or not x.numel():
             continue  # K not a multiple of the block (or the rotation): W4A4 does not apply
         wq = hadamard_rotate(w, rotate) if rotate else w
@@ -1329,9 +1566,15 @@ def fp4_w4a4_sensitivity(
                 "w4a4_rel_l2": e4["output_rel_l2"],
                 "w4a4_norm_change": _sig(e4["output_norm_ratio"] - 1.0),
                 "fp8_rel_l2": e8["output_rel_l2"],
+                "input_group": group[name],
             }
         )
     total = sum(r["flops"] for r in found) or 1
     for row in found:
         row["flop_share"] = _sig(row.pop("flops") / total)
     return sorted(found, key=lambda r: -r["w4a4_rel_l2"])
+
+
+def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two layers' kept inputs are the same values (one producer feeds both)."""
+    return a.shape == b.shape and a.dtype == b.dtype and a.device == b.device and torch.equal(a, b)

@@ -637,9 +637,10 @@ rate; its own looser tier, near-lossless-fp4a) only for compute-bound GEMMs whos
 floor in the *Ceilings* table is well below their *W8A8* / *MXFP8* one (many rows per
 weight read, past this GPU's FP8 ridge). It moves a GEMM's output about 1.4x as far as FP4
 weights and can shrink it by up to ~1 % per GEMM (measured on VoxCPM2's LocDiT layer at
-M = 352: relative L2 0.08, norm -3.4 %): give it the largest compute-bound targets first,
-keep their most sensitive `nn.Linear` layers in FP8 inside the target (the engineer's
-sensitivity probe ranks them), and let the perceptual gate decide. Not at a few rows per call
+M = 352: relative L2 0.08, norm -3.4 %): give it the largest compute-bound targets first;
+their most sensitive `nn.Linear` layers stay in FP8 inside the target (kernel-agent's
+per-layer probe picks them on the capture and moves the next group to FP8 when a gate
+fails), and the perceptual gate decides. Not at a few rows per call
 (memory bound: `fp4_weights` / `fp8_weights` there). Its `precision_why` names M and the
 *W4A4* and *W8A8* floors.""",
     "fp8_scales": """FP8 activation scales stay dynamic (computed from every call's data: per
@@ -813,7 +814,7 @@ model. Specialist agents will then write custom kernels for each target you pick
    row, `idea`); a systems-native agent rewrites them as native CUDA projects once the
    module targets have plateaued. Leave it out when module kernels can reach the floors.
 {precision_policy(quality, precisions, gpu.capability)}
-{backend_policy.policy_text(backends, gpu)}
+{backend_policy.policy_text(backends, gpu, precisions)}
 {backend_record}
 Return the plan as structured output.
 
@@ -1095,15 +1096,25 @@ def _precision_block(
   codes `e2m1(x / (scale * outer))` to nearest even with IEEE divisions, saturated at ±6),
   in the GEMM's prologue or fused into the op that produces them (RMSNorm, `silu(gate) *
   up`); never a static (calibrated) scale;
+* define a module-level `quantize_activations(x) -> (codes, scales, outer)` with the
+  quantiser your kernels use (codes packed two per byte [rows, K / 2]; scales unswizzled,
+  [rows, K / 16] e4m3, MXFP4 [rows, K / 32] e8m0; outer fp32 [rows] or one per call; a
+  quantiser that rotates first returns the rotated activations fourth): the
+  evaluator runs it on the captured input and on a stress input and rejects a candidate
+  whose block maxima exceed 6 x scale x outer beyond the rounding of an e4m3 scale (a block
+  scale rounded down, an outer scale so small that block scales clamp at 448; MXFP4: the
+  OCP rule `2^(floor(log2 amax) - 2)`) or whose non-zero blocks get scale 0 where rounding
+  to nearest gives a subnormal one (`stage: scale_rule`);
 * e2m1 x e2m1 products with both block scales applied by the tensor core (`F.scaled_mm`
   with `ScalingType.BlockWise1x16` and `swizzle_fp4_scales` scales; CuTe DSL
   `MmaMXF4NVF4Op` on sm_120a; `tcgen05.mma kind::mxf4nvf4` on sm_100), fp32 accumulation,
   then `acc * outer[m] * tensor_scale (+ bias[n])` once per output, one rounding to bf16
   (that is `fp4_w4a4_linear`); norms, softmax / attention math and residual adds as in eager;
 * sensitive layers: `fp4_w4a4_sensitivity(module, run)` ranks the target's `nn.Linear` by
-  their W4A4 output error on captured inputs (with FP8 W8A8's for comparison); when the
-  evaluator or the perceptual gate rejects W4A4 everywhere, keep the top ones in FP8 W8A8
-  inside the target. MXFP4 (`fmt="mxfp4"`) and a Hadamard rotation (`rotate=16`) measured no
+  their W4A4 output error on captured inputs (with FP8 W8A8's for comparison); the
+  precision mix below (when this target has one) names the layers kernel-agent keeps at 8
+  bits inside the target, and it moves the next group there when a gate rejects the
+  mix. MXFP4 (`fmt="mxfp4"`) and a Hadamard rotation (`rotate=16`) measured no
   better than plain NVFP4 on VoxCPM2 (MXFP4 fails near-lossless-fp4a on its LocDiT layer):
   measure before using them;
 * examples: `cute_nvfp4_w4a4_gemm.py` (CuTe DSL GEMM on `MmaMXF4NVF4Op`, sm_12x) and
@@ -1113,6 +1124,9 @@ def _precision_block(
   tensor_scale, x)` on captured activations and the evaluator's per-case `min_cosine` /
   `max_rel_l2`. W4A4 moves outputs further than any 8-bit class: the perceptual gate
   decides."""
+        from kernel_agent import demotion
+
+        contract += demotion.prompt_text(target)  # this target's mix of W4A4 / 8-bit layers
     elif precision == "int8_weights":
         contract = """INT8 weight-only:
 * quantise the weights once in `build()` (`from kernel_agent.kernels.quant import
