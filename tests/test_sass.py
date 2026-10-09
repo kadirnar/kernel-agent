@@ -5,8 +5,12 @@ cubins of a process are collected and disassembled without a GPU."""
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import struct
 import subprocess
+import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -165,9 +169,35 @@ def test_hopper_wgmma_and_tma():
 
 
 def test_datacenter_blackwell_tcgen05():
+    """Block-scaled tcgen05 MMAs (a tmem[] scale operand after idesc[]) count as .SF; the A
+    operand in tensor memory is no scale operand."""
     row = census_of("sm_100a.sass")["ka_tcgen05"]
-    assert row["tensor"] == {"UTCQMMA": 2, "UTCHMMA": 1, "UTCIMMA": 1, "UTCOMMA.4X": 1}
+    assert row["tensor"] == {
+        "UTCQMMA": 2,  # A from a shared-memory descriptor and from tensor memory
+        "UTCQMMA.SF": 2,  # kind::mxf8f6f4.block_scale, both A operands
+        "UTCHMMA": 1,
+        "UTCIMMA": 1,
+        "UTCOMMA.SF.4X": 1,  # kind::mxf4nvf4 scale_vec::4X
+        "UTCOMMA.SF": 1,  # kind::mxf4
+    }
     assert row["categories"]["tensor_memory"] >= 4  # LDTM, STTM, alloc / dealloc
+    scaled = [op for op in row["tensor"] if sass.block_scaled(op)]
+    assert sorted(scaled) == ["UTCOMMA.SF", "UTCOMMA.SF.4X", "UTCQMMA.SF"]
+    assert sass.block_scaled("QMMA.SF.16832.F32.E4M3.E4M3.E8")
+    assert not sass.block_scaled("QMMA.16832.F32.E4M3.E4M3") and not sass.block_scaled("UTCQMMA")
+
+
+def test_the_scale_operand_is_read_from_raw_cuobjdump_lines():
+    raw = """
+	code for sm_100a
+		Function : k
+        /*0460*/                   UTCQMMA.2CTA gdesc[UR8], gdesc[UR10], tmem[UR6], tmem[UR4], idesc[UR5], tmem[UR12], UPT ;  /* 0x00ff0c0a080075ea */
+                                                                                      /* 0x000fe2000ba00006 */
+        /*0470*/              @P0  UTCQMMA.WS tmem[UR7], gdesc[UR10], tmem[UR6], tmem[UR4], idesc[UR5], UPT ;  /* 0x00ff0c0a080075ea */
+        /*0480*/                   UTMALDG.2D [UR8], [UR4], desc[UR6] ;  /* 0x0000000608007db4 */
+"""  # noqa: E501
+    (kernel,) = sass.parse(raw)
+    assert kernel.ops == {"UTCQMMA.SF.2CTA": 1, "UTCQMMA.WS": 1, "UTMALDG.2D": 1}
 
 
 def test_geforce_blackwell_block_scaled_mma():
@@ -189,6 +219,19 @@ def test_triton_fp8_gemm_tl_dot_against_tl_dot_scaled_on_sm120():
         assert row["arch"] == "sm_120a" and row["categories"]["cp_async"] > 0
         assert "local" not in row["categories"]
     assert sass.line(scaled).startswith("_gemm_kernel (sm_120a): QMMA.SF.16832")
+
+
+def test_triton_fp8_gemm_tl_dot_against_tl_dot_scaled_on_sm100():
+    """The same GEMM for sm_100 (128-row tiles): tcgen05 both ways, tl.dot_scaled with the
+    block-scale operand (UTCQMMA.SF), which the opcode alone does not show."""
+    dot = census_of("triton_fp8_dot_sm100a.sass")["_gemm_kernel"]
+    scaled = census_of("triton_fp8_dot_scaled_sm100a.sass")["_gemm_kernel"]
+    assert dot["tensor"] == {"UTCQMMA": 2}
+    assert scaled["tensor"] == {"UTCQMMA.SF": 2}
+    for row in (dot, scaled):  # one stage: operands staged through registers, no TMA
+        assert row["arch"] == "sm_100a" and row["categories"]["shared_store"] > 0
+        assert row["categories"]["tensor_memory"] > 0 and "local" not in row["categories"]
+    assert sass.line(scaled).startswith("_gemm_kernel (sm_100a): UTCQMMA.SF x2")
 
 
 # ------------------------------------------------------------------ the cubins of a process
@@ -254,6 +297,116 @@ def test_binaries_come_from_the_collector_once_each(monkeypatch, tmp_path):
     assert keep  # alive until here: the collector tracks them
 
 
+class Kernel:
+    """``cuda.core``'s ``Kernel`` as the NVRTC registry sees it: weakly referable."""
+
+    __module__ = "cuda.core._module"
+
+
+def test_nvrtc_cubins_are_kept_while_their_kernels_live(monkeypatch):
+    """toolchain.nvrtc_kernels keeps each kernel's cubin (its ObjectCode is freed): the
+    census reads it as long as the kernel lives, and a dropped kernel drops it."""
+    monkeypatch.setattr(sass, "_extension_files", lambda: [])
+    cubin = b"\x7fELF-nvrtc-kept"
+    rms, tail = Kernel(), Kernel()
+    assert sass.keep(rms, "rmsnorm_bf16", cubin) and sass.keep(tail, "rms_tail", cubin)
+    assert not sass.keep(7, "x", b"\x7fELF-no-weakref")  # never kept, so never leaked
+    assert sorted(b.name for b in sass.kept() if b.data == cubin) == ["rms_tail", "rmsnorm_bf16"]
+    found = [b for b in sass.binaries() if b.data == cubin]
+    assert [(b.source, b.data) for b in found] == [("nvrtc", cubin)]  # one program: once
+    del rms
+    assert [b.name for b in sass.kept() if b.data == cubin] == ["rms_tail"]
+    del tail
+    assert not [b for b in sass.kept() if b.data == cubin]
+
+
+def _fake_cubin(tag: bytes) -> bytes:
+    """An ELF64 image of machine EM_CUDA: header, ``tag`` padded to 64 bytes, then its
+    section header table (one 64-byte entry), which ends it."""
+    head = bytearray(64)
+    head[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<H", head, 18, 190)
+    struct.pack_into("<QQ", head, 32, 0, 128)  # program / section header table offsets
+    struct.pack_into("<HHHH", head, 54, 0, 0, 64, 1)
+    return bytes(head) + tag.ljust(64, b"\0") + bytes(64)
+
+
+def _host_elf() -> bytes:
+    head = bytearray(64)
+    head[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<H", head, 18, 62)  # x86-64: the shared object itself
+    return bytes(head)
+
+
+def test_cubins_embedded_raw_in_a_file_are_found():
+    """TVM's module blob (TileLang's executable.so) holds cubins raw, length-prefixed."""
+    one, two = _fake_cubin(b"one"), _fake_cubin(b"two")
+    blob = b"".join(
+        (_host_elf(), b"\0" * 40, struct.pack("<Q", len(one)), one, b"cuda", two, b"tail")
+    )
+    assert sass.embedded_cubins(blob) == [one, two]
+    assert sass.embedded_cubins(blob, limit=1) == [one]
+    assert sass.embedded_cubins(_host_elf() + one[:150]) == []  # truncated: not a cubin
+    assert sass.embedded_cubins(b"no device code here") == []
+
+
+class JITKernel:
+    """TileLang's ``JITKernel`` as the census sees it."""
+
+    __module__ = "tilelang.jit.kernel"
+
+    def __init__(self, adapter: Any, cache_path: Path | None = None) -> None:
+        self.adapter = adapter
+        if cache_path is not None:
+            self._tilelang_cache_path = str(cache_path)
+
+
+class TvmModule:
+    """A TVM runtime module: a CUDA one returns its cubin from ``inspect_source("cubin")``
+    as a string, which does not decode (TVM-FFI 0.1)."""
+
+    def __init__(self, kind: str, cubin: bytes = b"", imports: tuple[Any, ...] = ()) -> None:
+        self.kind, self.cubin, self.imports = kind, cubin, list(imports)
+
+    def inspect_source(self, fmt: str = "") -> str:
+        if fmt == "cubin" and self.cubin:
+            raise UnicodeDecodeError("utf-8", self.cubin, 18, 19, "invalid start byte")
+        return 'extern "C" __global__ void main_kernel() {}'
+
+
+def test_tilelang_kernels_are_read_from_their_adapter(monkeypatch, tmp_path):
+    fresh, cached = _fake_cubin(b"fresh"), _fake_cubin(b"cached")
+    # a fresh tvm_ffi compile: the CUDA module its runtime module imports
+    host = TvmModule("library", imports=(TvmModule("cuda", fresh),))
+    compiled = types.SimpleNamespace(rt_mod=host)
+    (b,) = sass._tilelang(JITKernel(compiled))
+    assert (b.source, b.data, b.path, b.origin) == ("tilelang", fresh, None, None)
+    # loaded from TileLang's cache: TVM's executable.so, the cubin raw in its module blob
+    lib = tmp_path / "kernels" / "abc" / "executable.so"
+    lib.parent.mkdir(parents=True)
+    lib.write_bytes(_host_elf() + b"\0" * 32 + struct.pack("<Q", len(cached)) + cached)
+    loaded = types.SimpleNamespace(rt_mod=None, executable=TvmModule("library"), libpath=str(lib))
+    (b,) = sass._tilelang(JITKernel(loaded))
+    assert (b.data, b.origin) == (cached, lib)
+    entry = JITKernel(types.SimpleNamespace(), cache_path=lib.parent)  # TileLang's cache tag
+    assert sass._tilelang(entry)[0].data == cached
+    # the cython backend's nvcc-built library (its fat binary may be compressed): cuobjdump
+    so = tmp_path / "libkernel.so"
+    so.write_bytes(_host_elf() + b"\0" * 64)
+    (b,) = sass._tilelang(JITKernel(types.SimpleNamespace(libpath=str(so))))
+    assert (b.path, b.data) == (so, None)
+    assert sass._tilelang(JITKernel(None)) == []
+    # the collector: each once, the library a cubin came from not handed to cuobjdump again
+    monkeypatch.setattr(sass, "_extension_files", lambda: [lib, so])
+    nvcc_built = types.SimpleNamespace(libpath=str(so))
+    keep = [JITKernel(compiled), JITKernel(loaded), JITKernel(nvcc_built)]
+    found = [b for b in sass.binaries() if b.source == "tilelang" or b.path in (lib, so)]
+    assert sorted((b.source, b.data or b"", str(b.path)) for b in found) == sorted(
+        [("tilelang", fresh, "None"), ("tilelang", cached, "None"), ("tilelang", b"", str(so))]
+    )
+    assert keep  # alive until here: the collector tracks them
+
+
 def test_shared_objects_built_here_are_read_and_shipped_ones_are_not():
     import sys
 
@@ -311,6 +464,22 @@ def test_census_orders_kernels_that_ran_first_and_merges_variants(monkeypatch):
     assert out["missing"] == library[1:] and "library kernels" in out["note"]
 
 
+def test_a_cuobjdump_with_nvdisasm_beside_it_comes_first(tmp_path):
+    """-sass runs nvdisasm: a partial toolkit's cuobjdump without one disassembles nothing,
+    Triton bundles both."""
+    toolkit = tmp_path / "cuda" / "bin" / "cuobjdump"
+    bundled = tmp_path / "triton" / "backends" / "nvidia" / "bin" / "cuobjdump"
+    for tool in (toolkit, bundled):
+        tool.parent.mkdir(parents=True)
+        tool.write_text("")
+    assert sass.find_cuobjdump([toolkit, bundled]) == str(toolkit)  # no nvdisasm: the first
+    (bundled.parent / "nvdisasm").write_text("")
+    assert sass.find_cuobjdump([toolkit, bundled]) == str(bundled)
+    (toolkit.parent / "nvdisasm").write_text("")
+    assert sass.find_cuobjdump([toolkit, bundled]) == str(toolkit)
+    assert sass.find_cuobjdump([]) is None
+
+
 def test_census_without_cuobjdump_says_how_to_get_one(monkeypatch):
     monkeypatch.setattr(sass, "find_cuobjdump", lambda: None)
     out = sass.census(gpu={"arch": "sm_80"})
@@ -351,6 +520,57 @@ def test_census_of_a_triton_kernel_compiled_on_the_cpu():
     row = next(k for k in out["kernels"] if k["kernel"] == "ka_add_kernel")
     assert row["arch"].startswith("sm_120") and row["source"] == "triton"
     assert re.match(r"ka_add_kernel \(sm_120a?\): no tensor-core MMA; LDG", sass.line(row))
+
+
+TILELANG_CHILD = r"""
+import importlib.util, json, sys
+from kernel_agent import toolchain
+from kernel_agent.kernels import sass
+
+toolchain.setup()  # CUDA_HOME for TileLang's nvcc, before its import
+spec = importlib.util.spec_from_file_location("tilelang_rmsnorm", sys.argv[1])
+example = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(example)
+kernel = example._rmsnorm(16, 2048, 1e-5, "bfloat16")
+census = sass.census(gpu={"arch": "sm_86", "capability": [8, 6]})
+print(json.dumps({"census": census, "libpath": getattr(kernel.adapter, "libpath", None)}))
+"""
+
+
+def test_census_of_a_tilelang_kernel_compiled_on_the_cpu(tmp_path):
+    """The real path without a GPU: TileLang compiles its RMSNorm example for sm_86, then
+    loads it from its cache in a second process; the census reads both from the JITKernel
+    (its executable.so holds no device code cuobjdump reads)."""
+    pytest.importorskip("tilelang")
+    from kernel_agent import toolchain
+    from kernel_agent.agent.prompts import EXAMPLES_DIR
+
+    if sass.find_cuobjdump() is None or toolchain.setup(apply_env=False).nvcc_version is None:
+        pytest.skip("no cuobjdump or nvcc")
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env = os.environ | {
+        "CUDA_VISIBLE_DEVICES": "",  # compiles only
+        "TILELANG_CACHE_DIR": str(tmp_path / "tilelang"),
+        "TVM_FFI_CACHE_DIR": str(tmp_path / "tvm-ffi"),
+        "TILELANG_DEFAULT_TARGET": json.dumps({"kind": "cuda", "arch": "sm_86"}),
+        "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])),
+    }
+    example = str(EXAMPLES_DIR / "tilelang_rmsnorm.py")
+    for loaded in (False, True):  # compiled here, then from TileLang's cache
+        proc = subprocess.run(
+            [sys.executable, "-c", TILELANG_CHILD, example],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert (out["libpath"] is not None) == loaded
+        assert out["census"]["status"] == "ok", out["census"]
+        (row,) = [k for k in out["census"]["kernels"] if k["source"] == "tilelang"]
+        assert row["kernel"] == "main_kernel" and row["arch"] == "sm_86", row
+        assert row["categories"]["global_load"] > 0 and row["categories"]["shuffle"] > 0
 
 
 SPILLING_RMSNORM = """

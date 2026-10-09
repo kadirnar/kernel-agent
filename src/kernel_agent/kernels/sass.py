@@ -9,12 +9,15 @@ profiler runs. ``evaluate_candidate(profile=true)`` (and ``"ncu"``) adds :func:`
 
 * :func:`binaries` collects the candidate process's cubins: Triton's compiled kernels
   (``CompiledKernel.asm["cubin"]``, the candidate's own and those Inductor compiled for
-  it), NVRTC object code still alive (a ``cuda.core`` ``ObjectCode`` of code type
-  ``cubin``: ``Program(...).compile("cubin").get_kernel(...)`` frees it, so a candidate
-  keeps it in a global for the census, else its kernel is listed under ``missing``), the
-  shared objects built on this machine and mapped into the process (``load_inline``,
-  native projects, TileLang: ``cuobjdump`` reads the ``.so``), and CuTe DSL's compiled
-  functions (the fat binary their lowered IR module embeds).
+  it), NVRTC kernels (the cubins :func:`kernel_agent.toolchain.nvrtc_kernels` compiled,
+  :func:`kept` while their kernels live; a ``cuda.core`` ``ObjectCode`` of code type
+  ``cubin`` still alive: ``Program(...).compile("cubin").get_kernel(...)`` frees it, so a
+  candidate compiling without the helper keeps it in a global, else its kernel is listed
+  under ``missing``), TileLang's ``JITKernel`` objects (:func:`_tilelang`: the cubin of
+  their adapter's CUDA module or library file), the shared objects built on this machine
+  and mapped into the process (``load_inline``, native projects: ``cuobjdump`` reads the
+  ``.so``), and CuTe DSL's compiled functions (the fat binary their lowered IR module
+  embeds).
 * :func:`disassemble` runs ``cuobjdump -sass`` (the toolkit's or the one Triton bundles,
   :func:`find_cuobjdump`) on each; :func:`parse` reads its ``Function :`` blocks (and
   ``nvdisasm``'s ``.text.<kernel>:`` sections).
@@ -23,7 +26,13 @@ profiler runs. ``evaluate_candidate(profile=true)`` (and ``"ncu"``) adds :func:`
   atomics, fp32 / fp16 math), keeps every tensor-core opcode whole (shape and types:
   ``QMMA.SF.16832.F32.E4M3.E4M3.E8``), the widths of its global loads and the most frequent
   opcodes raw (an opcode in no category is reported under its own name, never guessed into
-  one). Counts are static (instructions in the binary), not executions.
+  one). Counts are static (instructions in the binary), not executions. A tcgen05 MMA
+  (sm_100) carries its block scaling as an operand, not as a modifier: a ``tmem[]`` scale
+  operand after its instruction descriptor (``kind::mxf8f6f4`` / ``mxf4`` / ``mxf4nvf4``
+  ``.block_scale``). The census marks such an MMA ``.SF`` like sm_120's own ``QMMA.SF`` /
+  ``OMMA.SF`` (``UTCQMMA.SF``, ``UTCOMMA.SF.4X``; the ``.SF`` is the census's, the SASS
+  shows the operand), so Triton's ``tl.dot_scaled`` (``UTCQMMA.SF``) and ``tl.dot``
+  (``UTCQMMA``) differ there as on sm_120.
 
 The tables name only opcodes found in cubins compiled on the CPU for sm_80, sm_89, sm_90a,
 sm_100a and sm_120a (``tests/fixtures/sass``: ``kernels.cu`` and ``make_fixtures.py``, which
@@ -40,10 +49,13 @@ import gc
 import hashlib
 import importlib
 import re
+import struct
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Mapping
+import threading
+import weakref
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,9 +71,11 @@ TENSOR_OPS: dict[str, str] = {
     "QGMMA": "wgmma FP8 (sm_90a)",
     "IGMMA": "wgmma int8 (sm_90a)",
     "UTCHMMA": "tcgen05.mma kind::f16 / tf32 (sm_100a)",
-    "UTCQMMA": "tcgen05.mma kind::f8f6f4 and its block-scaled form (sm_100a)",
+    "UTCQMMA": "tcgen05.mma kind::f8f6f4: FP8 / FP6 / FP4 operands (UTCQMMA.SF: "
+    "kind::mxf8f6f4.block_scale; sm_100a)",
     "UTCIMMA": "tcgen05.mma kind::i8 (sm_100a)",
-    "UTCOMMA": "tcgen05.mma kind::mxf4nvf4 (sm_100a)",
+    "UTCOMMA": "tcgen05.mma kind::mxf4 / mxf4nvf4, block-scaled FP4 (UTCOMMA.SF; .4X: "
+    "scale_vec::4X; sm_100a)",
 }
 #: Category of each base opcode the fixtures contain (everything else: its own name).
 CATEGORIES: dict[str, str] = {
@@ -107,11 +121,13 @@ MAX_BINARIES = 32  # cubins / files disassembled per evaluation
 MAX_KERNELS = 16  # kernels kept in the census
 MAX_MISSING = 5  # profiled kernels without SASS, named
 TIMEOUT_S = 60.0
+MAX_FILE_BYTES = 512 << 20  # a library file read for the cubins embedded in it
 #: Why a kernel that ran has no SASS in the census (``missing``).
 MISSING_NOTE = (
     "kernels that ran without SASS here (missing) are library kernels (torch, cuBLAS, "
-    "cuDNN), NVRTC kernels whose cuda.core ObjectCode was freed (keep it alive, e.g. in a "
-    "module global, to include them) or PTX-only code"
+    "cuDNN), NVRTC kernels compiled without kernel_agent.toolchain.nvrtc_kernels whose "
+    "cuda.core ObjectCode was freed (compile through the helper, or keep the ObjectCode "
+    "alive, e.g. in a module global, to include them) or PTX-only code"
 )
 
 _FUNCTION = re.compile(r"^\s*(?:Function\s*:\s*(?P<f>\S+)|\.text\.(?P<t>[^\s:]+):)")
@@ -120,6 +136,13 @@ _INSTRUCTION = re.compile(
     r"^\s*/\*[0-9a-f]{4,}\*/\s+\{?\s*(?:@!?U?P(?:T|\d+)\s+)?"
     r"(?P<op>[A-Z][A-Z0-9_]*(?:\.[A-Za-z0-9_]+)*)"
 )
+#: A tcgen05 MMA (``UTCHMMA``, ``UTCQMMA``, ``UTCIMMA``, ``UTCOMMA``, with modifiers).
+_TCGEN05_MMA = re.compile(r"UTC[A-Z]*MMA(?:\.|$)")
+#: Its block-scale operand: a ``tmem[]`` operand after the instruction descriptor
+#: (``UTCQMMA gdesc[UR12], gdesc[UR14], tmem[UR6], tmem[UR4], idesc[UR5], tmem[UR8], UPT``).
+#: Counting ``tmem[]`` operands would not do: the A operand can be in tensor memory too
+#: (``UTCQMMA tmem[UR7], gdesc[UR10], ...``), before the descriptor (tests/fixtures/sass).
+_SCALE_OPERAND = re.compile(r"\bidesc\[[^\]]*\]\s*,\s*tmem\[")
 
 
 # ------------------------------------------------------------------ parsing
@@ -137,7 +160,8 @@ class KernelSass:
 def parse(text: str) -> list[KernelSass]:
     """The kernels of ``cuobjdump -sass`` (``Function : <name>`` blocks under ``code for
     sm_XX``) or ``nvdisasm`` (``.text.<name>:`` sections) output, with every instruction's
-    full opcode (predicates dropped) counted."""
+    full opcode (predicates dropped) counted; a tcgen05 MMA with a block-scale operand is
+    counted ``.SF`` (module docstring)."""
     out: list[KernelSass] = []
     arch: str | None = None
     current: KernelSass | None = None
@@ -150,13 +174,23 @@ def parse(text: str) -> list[KernelSass]:
             out.append(current)
             continue
         if current is not None and (match := _INSTRUCTION.match(line)):
-            current.ops[match.group("op")] += 1
+            op = match.group("op")
+            if _TCGEN05_MMA.match(op) and _SCALE_OPERAND.search(line, match.end()):
+                name, _, mods = op.partition(".")
+                op = f"{name}.SF" + (f".{mods}" if mods else "")
+            current.ops[op] += 1
     return out
 
 
 def base(opcode: str) -> str:
     """``LDG`` for ``LDG.E.128``."""
     return opcode.split(".", 1)[0]
+
+
+def block_scaled(opcode: str) -> bool:
+    """Whether a tensor-core opcode is a block-scaled MMA: ``QMMA.SF`` / ``OMMA.SF``
+    (sm_12x ``mma.sync``) or a tcgen05 MMA :func:`parse` marked ``.SF`` (sm_100)."""
+    return "SF" in opcode.split(".")[1:]
 
 
 def load_bits(opcode: str) -> int:
@@ -249,10 +283,11 @@ def summarise(kernel: KernelSass) -> dict[str, Any]:
 class Binary:
     """A cubin (``data``) or a file holding cubins (``path``: an extension ``.so``)."""
 
-    source: str  # triton / nvrtc / cuda / cute
+    source: str  # triton / nvrtc / cuda / cute / tilelang
     name: str
     data: bytes | None = None
     path: Path | None = None
+    origin: Path | None = None  # the file a cubin of ``data`` was read from
 
     @property
     def key(self) -> str:
@@ -287,8 +322,124 @@ def _nvrtc(obj: Any) -> Binary | None:
     return None
 
 
+#: The cubins of NVRTC kernels compiled through :func:`kernel_agent.toolchain.nvrtc_kernels`,
+#: by kernel: ``cuda.core`` frees the ``ObjectCode`` once ``get_kernel`` returns, and a
+#: ``Kernel`` does not expose its cubin. Weak keys: an entry lives as long as its kernel, so
+#: a candidate that drops its kernels drops their cubins too (several kernels of one
+#: program share one ``bytes``).
+_KEPT: weakref.WeakKeyDictionary[Any, tuple[str, bytes]] = weakref.WeakKeyDictionary()
+_KEPT_LOCK = threading.Lock()
+
+
+def keep(owner: Any, name: str, cubin: bytes) -> bool:
+    """Keep ``cubin`` (holding kernel ``name``) for the census while ``owner`` (its
+    ``cuda.core`` ``Kernel``) lives. False when ``owner`` takes no weak reference: nothing
+    is kept then (never a leak; the census lists the kernel under ``missing``)."""
+    try:
+        with _KEPT_LOCK:
+            _KEPT[owner] = (str(name), bytes(cubin))
+    except TypeError:
+        return False
+    return True
+
+
+def kept() -> list[Binary]:
+    """The cubins :func:`keep` holds for kernels still alive."""
+    with _KEPT_LOCK:
+        entries = list(_KEPT.values())
+    return [Binary("nvrtc", name, cubin) for name, cubin in entries]
+
+
 #: The first bytes of a CUDA fat binary (0xBA55ED50) and of an ELF cubin.
 _DEVICE_CODE = (b"P\xedU\xba", b"\x7fELF")
+_EM_CUDA = 190  # the ELF machine of a cubin
+
+
+def embedded_cubins(data: bytes, limit: int = MAX_BINARIES) -> list[bytes]:
+    """The cubins stored raw in ``data`` (a file's bytes), at most ``limit``: TVM's module
+    blob in TileLang's ``executable.so`` holds its kernels' cubin, which ``cuobjdump`` does
+    not read ("does not contain device code"). A cubin is an ELF64 little-endian image of
+    machine ``EM_CUDA``; it ends with its section or program header table, whichever is
+    last (checked against the cubin TileLang caches beside the file)."""
+    out: list[bytes] = []
+    pos = data.find(b"\x7fELF")
+    while pos >= 0 and len(out) < limit:
+        head = data[pos : pos + 64]
+        if len(head) == 64 and head[4] == 2 and head[5] == 1:  # ELF64, little-endian
+            (machine,) = struct.unpack_from("<H", head, 18)
+            phoff, shoff = struct.unpack_from("<QQ", head, 32)
+            phentsize, phnum, shentsize, shnum = struct.unpack_from("<HHHH", head, 54)
+            end = max(shoff + shentsize * shnum, phoff + phentsize * phnum)
+            if machine == _EM_CUDA and 64 <= end <= len(data) - pos:
+                out.append(data[pos : pos + end])
+                pos = data.find(b"\x7fELF", pos + end)
+                continue
+        pos = data.find(b"\x7fELF", pos + 4)
+    return out
+
+
+def _tvm_modules(roots: Iterable[Any], depth: int = 3) -> Iterator[Any]:
+    """TVM runtime modules ``roots`` and their imports, ``depth`` levels down."""
+    for module in roots:
+        if module is None:
+            continue
+        yield module
+        if depth > 0:
+            with contextlib.suppress(Exception):
+                yield from _tvm_modules(list(module.imports), depth - 1)
+
+
+def _tvm_cubin(module: Any) -> bytes | None:
+    """The device code a TVM CUDA module holds: ``inspect_source("cubin")`` returns it as a
+    string, which does not decode as UTF-8 (the bytes are the decode error's)."""
+    for fmt in ("cubin", "fatbin"):
+        try:
+            data = str(module.inspect_source(fmt)).encode("utf-8", "surrogateescape")
+        except UnicodeDecodeError as exc:
+            data = bytes(exc.object)
+        except Exception:
+            continue
+        if data[:4] in _DEVICE_CODE:  # else the module's CUDA source: another format
+            return data
+    return None
+
+
+def _tilelang(obj: Any) -> list[Binary]:
+    """The device code of a TileLang ``JITKernel`` (TileLang 0.1 internals: any failure
+    leaves it out). Its kernels are in no ``.so`` cuobjdump reads: the tvm_ffi backend's
+    cubin is in the CUDA module its adapter's runtime module (a fresh compile) or loaded
+    library (TileLang's cache: ``libpath``) imports, and embedded raw in TVM's module blob
+    of that ``executable.so``. So: the CUDA modules first, then the cubins embedded in the
+    adapter's library file (``libpath``: also the nvrtc backend's ``.cubin``) or the cache
+    entry's; a file without (the cython backend's nvcc-built ``.so``) goes to cuobjdump."""
+    adapter = getattr(obj, "adapter", None)
+    files: list[Path] = []
+    with contextlib.suppress(Exception):
+        if libpath := getattr(adapter, "libpath", None):
+            files.append(Path(str(libpath)))
+        if cache := getattr(obj, "_tilelang_cache_path", None):
+            files += [Path(str(cache)) / n for n in ("executable.so", "kernel_lib.so")]
+    roots = [getattr(adapter, attr, None) for attr in ("rt_mod", "executable")]
+    found = [
+        data
+        for module in _tvm_modules(roots)
+        if getattr(module, "kind", None) == "cuda" and (data := _tvm_cubin(module)) is not None
+    ]
+    if found:  # the loaded library's (libpath) when it came from one: no cuobjdump run on it
+        origin = files[0] if files and getattr(adapter, "libpath", None) else None
+        return [Binary("tilelang", "tilelang", data, origin=origin) for data in found]
+    for path in files:
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if cubins := embedded_cubins(data):
+            return [Binary("tilelang", path.name, c, origin=path) for c in cubins]
+        if data[:4] in _DEVICE_CODE:
+            return [Binary("tilelang", path.name, path=path)]
+    return []
 
 
 def _is_cute(obj: Any) -> bool:
@@ -353,7 +504,8 @@ def binaries(namespace: Mapping[str, Any] | None = None) -> list[Binary]:
     """The cubins of this process's kernels (module docstring): the Triton kernels of
     ``namespace`` (a candidate module's globals) first, then those the garbage collector
     tracks (Triton ``CompiledKernel``, ``cuda.core`` ``ObjectCode``, CuTe DSL compiled
-    functions), then the extension files; each once."""
+    functions, TileLang ``JITKernel``), the NVRTC cubins :func:`kept`, then the extension
+    files (but those a TileLang library's cubins came from); each once."""
     from kernel_agent.kernels.ncu import _triton_kernels
 
     found: list[Binary] = []
@@ -370,7 +522,12 @@ def binaries(namespace: Mapping[str, Any] | None = None) -> list[Binary]:
                 found.append(b)
         elif _is_cute(obj):
             found += _cute(obj)
-    found += [Binary("cuda", p.name, path=p) for p in _extension_files()]
+        elif _type_is(obj, "JITKernel", "tilelang"):
+            found += _tilelang(obj)
+    found += kept()
+    read = {b.origin.resolve() for b in found if b.origin is not None}
+    files = [p for p in _extension_files() if p.resolve() not in read]
+    found += [Binary("cuda", p.name, path=p) for p in files]
     unique: dict[str, Binary] = {}
     for b in found:
         unique.setdefault(b.key, b)
@@ -380,11 +537,20 @@ def binaries(namespace: Mapping[str, Any] | None = None) -> list[Binary]:
 # ------------------------------------------------------------------ disassembling
 
 
-def find_cuobjdump() -> str | None:
-    """A ``cuobjdump`` (the CUDA toolkit's, else the one Triton bundles)."""
-    from kernel_agent.kernels.ncu import cuobjdump
+def find_cuobjdump(places: Iterable[Path] | None = None) -> str | None:
+    """A ``cuobjdump`` that can disassemble (``places``: :func:`kernel_agent.kernels.ncu.
+    cuobjdumps`, the toolkit's first, then Triton's). ``-sass`` runs ``nvdisasm`` from the
+    tool's directory or ``PATH``, and a partial toolkit ships ``cuobjdump`` without it (CUDA
+    12.9's on an A10 machine: "Could not find executable file 'nvdisasm'", and every kernel
+    went to ``missing``): one with an ``nvdisasm`` beside it comes first (Triton bundles
+    both), else the first (its ``nvdisasm`` from ``PATH``)."""
+    if places is None:
+        from kernel_agent.kernels.ncu import cuobjdumps
 
-    return cuobjdump()
+        places = cuobjdumps()
+    found = list(places)
+    paired = [p for p in found if (p.parent / "nvdisasm").is_file()]
+    return str((paired or found)[0]) if found else None
 
 
 def availability() -> dict[str, Any]:
@@ -462,8 +628,8 @@ def census(
                     continue
                 row = summarise(kernel)
                 row["source"] = binary.source
-                if binary.path is not None:
-                    row["file"] = binary.path.name
+                if (file := binary.path or binary.origin) is not None:
+                    row["file"] = file.name
                 key = (row["kernel"], str(row.get("arch")))
                 if key in rows:
                     _merge(rows[key], row)

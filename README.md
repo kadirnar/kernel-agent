@@ -2775,19 +2775,41 @@ it back: `--page details` gives Nsight's rules with their estimated speedup (`ru
 the 3 largest, global estimates first), `--page source --print-source cuda,sass` the
 warp-stall samples per source line (`lines`: the 5 lines with most samples, their share
 of the kernel's samples and dominant stall; `flagged`: lines with uncoalesced global
-accesses or shared-memory bank conflicts). Triton kernels carry line info; CUDA C++
-needs `-lineinfo` (`extra_cuda_cflags`, NVRTC `ProgramOptions(line_info=True)`), else
-the lines are SASS instructions. A failed details run leaves the metrics as they are
+accesses or shared-memory bank conflicts). Source lines need line info in the binary,
+else the lines are SASS instructions: Triton and TileLang kernels always carry it, and
+the `--ncu-mode` process (only it) builds the candidate's CUDA C++ with it
+(`toolchain.lineinfo_env`): `-lineinfo` in `NVCC_APPEND_FLAGS` for every nvcc
+(`load_inline`, native projects, whose build key includes the flags), `load_inline` builds
+in a `lineinfo/` directory of `TORCH_EXTENSIONS_DIR` (torch's build hash does not cover
+the flag: in the shared directory the cached build without it would load, and a rebuild
+would evict the build the evaluations load), NVRTC through `toolchain.nvrtc_kernels`
+with `lineinfo` and the program named by a file holding its source
+(`~/.cache/kernel-agent/nvrtc-src/`, where ncu reads the line text); a `Program`
+compiled directly needs `ProgramOptions(lineinfo=True)`. Measured on an NVIDIA A10
+(sm_86): `cuda_rmsnorm.py`'s extension and `nvrtc_rmsnorm.py`'s cubin built that way
+carry `.debug_line` / `.nv_debug_line_sass`, the evaluations' builds none (ncu itself is
+not installed there). A failed details run leaves the metrics as they are
 (`ncu.details.status: error`).
 
 **SASS opcode census and directives** (#230). Every `profile` evaluation also reads
 what each candidate kernel was compiled to (`kernel_agent/kernels/sass.py`, no GPU work,
 no ncu, no admin counters): the cubins of the candidate process (Triton
-`CompiledKernel.asm["cubin"]` including Inductor's, an NVRTC `ObjectCode` the candidate
-keeps alive, the `.so` files built on this machine and mapped into the process:
-`load_inline`, native projects, TileLang; CuTe DSL's compiled functions) through
-`cuobjdump -sass` (the toolkit's or Triton's bundled one); kernels that ran without SASS
-there (library kernels, a freed NVRTC `ObjectCode`) are listed under `missing`. Per kernel
+`CompiledKernel.asm["cubin"]` including Inductor's; NVRTC kernels compiled through
+`kernel_agent.toolchain.nvrtc_kernel` / `nvrtc_kernels`, which keep each kernel's cubin
+for as long as the kernel lives (weak references: `cuda.core` frees the `ObjectCode`
+once `get_kernel` returns, and a `Kernel` does not expose its cubin), or an `ObjectCode`
+the candidate keeps alive; TileLang's `JITKernel`s: the cubin of the CUDA module their
+adapter's runtime module or loaded library imports, else the cubins TVM embeds raw in
+the `executable.so` it loads, which cuobjdump does not read; the `.so` files built on
+this machine and mapped into the process: `load_inline`, native projects; CuTe DSL's
+compiled functions) through `cuobjdump -sass` (one with `nvdisasm` beside it first: a
+partial toolkit may lack it, Triton bundles both); kernels that ran without SASS there
+(library kernels, an NVRTC kernel compiled without the helper whose `ObjectCode` was
+freed) are listed under `missing`. Measured on an NVIDIA A10 (sm_86): `nvrtc_rmsnorm.py`
+through the helper gives `rmsnorm_bf16 (sm_86): no tensor-core MMA; LDG 3x16b` (main's
+version, `Program` directly, listed it under `missing`), the `load_inline` FP8 skinny GEMM
+`fp8_skinny_kernel (sm_86): HMMA.16816.F32.BF16 x64, HMMA.16816.F32 x64; LDL/STL 120`
+over its 80 template variants. Per kernel
 it counts opcodes by category (tensor-core MMA with its full opcode, e.g.
 `QMMA.SF.16832.F32.E4M3.E4M3.E8`; global loads by width; `LDGSTS`; TMA; `LDL` / `STL`;
 tensor memory; barriers; shuffles; atomics; fp32 / fp16 math) and keeps the most frequent
@@ -2797,6 +2819,11 @@ refreshes them after a CUDA or Triton upgrade; Turing's forms are `HMMA.1688` an
 `IMMA.8816`): `HMMA` / `IMMA` / `QMMA` / `OMMA` (`mma.sync`), `HGMMA` /
 `QGMMA` / `IGMMA` (wgmma), `UTCHMMA` / `UTCQMMA` / `UTCIMMA` / `UTCOMMA` (tcgen05), and
 e4m3 `mma.sync` on sm_90 / sm_100 shows as `F2FP.F16.E4M3.UNPACK_B` + `HMMA` (emulated).
+A tcgen05 MMA carries its block scaling as an operand (a `tmem[]` scale operand after its
+instruction descriptor), not a modifier: the census marks it `.SF` like sm_120's own
+`QMMA.SF` / `OMMA.SF` (`UTCQMMA.SF`, `UTCOMMA.SF.4X`), so the FP8 example's GEMM compiled
+on the CPU for sm_100a (128-row tiles) shows `UTCQMMA` for `tl.dot` and `UTCQMMA.SF` for
+`tl.dot_scaled`, as `QMMA.16832.F32` and `QMMA.SF` on sm_120a.
 Without `cuobjdump` the census says so (`sass.status: unavailable`); `kernel-agent doctor`
 prints which one it uses. `kernel_agent/kernels/directives.py` turns census, compiler
 stats, ncu (bounds, rules, stall lines), per-kernel GPU time, the evaluation's roofline
@@ -2804,7 +2831,8 @@ bound and the GPU's facts (capability, measured `mma.sync` rates) into at most 5
 directives by documented rules: local memory (spills), emulated FP8, a tensor-core
 instruction below this GPU's full-rate path for its operands (`mma.sync` where wgmma or
 tcgen05 runs faster; plain `QMMA.F32` where the measured `QMMA.SF` rate is higher, as
-on sm_12x), fp32 math in a compute-bound kernel without tensor cores, a tensor pipe under
+on sm_12x; on sm_100 plain and block-scaled `UTCQMMA` are both FP8's full rate, FP4's is
+`UTCOMMA.SF`), fp32 math in a compute-bound kernel without tensor cores, a tensor pipe under
 30 % active (ncu) in a kernel that issues MMAs, the line with most stall samples, uncoalesced or bank-conflicting lines, narrow global loads in a
 memory-bound kernel, Nsight's top rule, register-staged MMA operands without cp.async /
 TMA. Each carries its numbers ("_gemm_kernel: compute-bound at 21 % of SOL; issues
