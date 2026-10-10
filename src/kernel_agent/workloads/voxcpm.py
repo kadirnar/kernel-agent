@@ -40,6 +40,13 @@ teacher forcing, the held-out input and the natural-length run judge the full st
 output exactly as they judge the non-streaming one. A transform that breaks the
 streaming path (an ``_inference`` without its streaming branch, an AudioVAE decoder
 that ``streaming_decode()`` cannot drive) is rejected with a clear reason.
+
+``-o lora=<name>`` runs a fine-tuned model: VoxCPM's own LoRA (``lora_weights.safetensors``
++ ``lora_config.json``, the format its fine-tuning writes) applied on the checkpoint through
+``from_local(lora_config=...)`` and ``load_lora_weights``, unmerged (``LoRALinear``: the base
+GEMM plus the two low-rank GEMMs, as a server holding several adapters runs it). ``name`` is
+an adapter directory under the repo's ``adapters/`` (fetched alone; the base checkpoint's
+download skips ``adapters/``) or a local directory.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sys
 import tempfile
 import traceback
 from collections.abc import Callable, Iterator
@@ -98,6 +106,8 @@ PERCEPTUAL_TEXTS = (
 PERCEPTUAL_SEEDS = (0, 1)
 SPEAKER_WAV = "voxcpm_speaker.wav"
 ASSETS = Path(__file__).with_name("assets")
+#: ``-o lora=<name>``: the repo's adapter directories (``adapters/<name>/``).
+ADAPTERS_DIR = "adapters"
 
 
 class VoxCPMWorkload(Workload):
@@ -140,6 +150,8 @@ class VoxCPMWorkload(Workload):
         "natural_max_patches": 100,
         "stop_tolerance": 0,
         "stop_near_tie": 0.5,
+        # A LoRA adapter (`adapters/<name>` of the repo, or a directory); None: the base model.
+        "lora": None,
     }
     # A diverged (but correct) free run is another plausible sample: its audio
     # loudness varies more than its latents (different seeds: x0.52 .. x1.54).
@@ -160,17 +172,33 @@ class VoxCPMWorkload(Workload):
     def load(self) -> None:
         from huggingface_hub import snapshot_download
 
-        path = snapshot_download(self.spec.repo_id, revision=self.spec.revision)
+        # adapters are fetched one at a time (`lora`), never with the base checkpoint
+        path = snapshot_download(
+            self.spec.repo_id, revision=self.spec.revision, ignore_patterns=[f"{ADAPTERS_DIR}/*"]
+        )
         with open(os.path.join(path, "config.json")) as fh:
             arch = str(json.load(fh).get("architecture", "voxcpm")).lower()
         from voxcpm.model.voxcpm import VoxCPMModel
         from voxcpm.model.voxcpm2 import VoxCPM2Model
 
         model_cls: Any = VoxCPM2Model if arch == "voxcpm2" else VoxCPMModel
+        adapter = lora_directory(self.options.get("lora"), self.spec.repo_id, self.spec.revision)
+        extra = {"lora_config": lora_config(model_cls, adapter)} if adapter is not None else {}
         with _with_config_dtype(path, self.config_dtype) as checkpoint:
             self.model = model_cls.from_local(
-                checkpoint, optimize=bool(self.options["compile"]), device=self.spec.device
+                checkpoint,
+                optimize=bool(self.options["compile"]),
+                device=self.spec.device,
+                **extra,
             )
+        if adapter is not None:
+            loaded, skipped = self.model.load_lora_weights(str(adapter))
+            if skipped or not loaded:  # a partly loaded adapter would be another model
+                raise ValueError(
+                    f"lora={self.options['lora']}: {len(skipped)} of {len(loaded) + len(skipped)} "
+                    f"tensors match no LoRA module of the model (e.g. {(skipped or ['none'])[0]}); "
+                    "its lora_config.json must name the targets it was trained with"
+                )
         self.sampling_rate = int(getattr(self.model, "sample_rate", 0))
 
     def roots(self) -> dict[str, nn.Module]:
@@ -477,6 +505,42 @@ class VoxCPMWorkload(Workload):
             ),
             max_mos_drop=float(opt.get("max_mos_drop", p.MAX_MOS_DROP)),
         )
+
+
+def lora_directory(lora: Any, repo_id: str, revision: str | None) -> Path | None:
+    """``-o lora=``: a local directory, or the name of an adapter directory under the repo's
+    ``adapters/`` (only that adapter is downloaded); None without the option."""
+    if not lora:
+        return None
+    path = Path(str(lora)).expanduser()
+    if not path.is_dir():
+        from huggingface_hub import snapshot_download
+
+        root = snapshot_download(
+            repo_id, revision=revision, allow_patterns=[f"{ADAPTERS_DIR}/{lora}/*"]
+        )
+        path = Path(root) / ADAPTERS_DIR / str(lora)
+    if not any(
+        (path / name).is_file() for name in ("lora_weights.safetensors", "lora_weights.ckpt")
+    ):
+        raise ValueError(
+            f"lora={lora}: no lora_weights.safetensors in {path} (give a directory, or the name "
+            f"of an adapter under {ADAPTERS_DIR}/ of {repo_id})"
+        )
+    return path
+
+
+def lora_config(model_cls: type, directory: Path) -> Any:
+    """VoxCPM's ``LoRAConfig`` (of ``model_cls``'s module) from the adapter's
+    ``lora_config.json``: its ``lora_config`` object, as VoxCPM's fine-tuning writes it (keys
+    the installed VoxCPM does not know, e.g. ``base_model``, are left out)."""
+    config_cls = getattr(sys.modules[model_cls.__module__], "LoRAConfig", None)
+    if config_cls is None:
+        raise ValueError(f"lora: {model_cls.__name__}'s VoxCPM module has no LoRAConfig")
+    with open(directory / "lora_config.json") as fh:
+        raw = json.load(fh)
+    fields = raw.get("lora_config", raw)
+    return config_cls(**{k: v for k, v in fields.items() if k in config_cls.model_fields})
 
 
 @contextlib.contextmanager

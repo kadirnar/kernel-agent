@@ -3583,6 +3583,22 @@ stays at 0.970, just above `min_spec_cosine`. Baseline on the A10, eager, 128 re
 time to first audio 1,109 ms, steady state 580 ms per 160 ms patch (RTF 3.6, a 25 s
 playback stall over 60 patches), 8.7 GB.
 
+**A fine-tuned VoxCPM: LoRA adapters and another language** (`-o lora=<name>`,
+`-o texts=<file>`). A repo with the base checkpoint at its root and VoxCPM LoRA adapters
+in `adapters/<name>/` (`lora_weights.safetensors` + `lora_config.json`, the format
+VoxCPM's fine-tuning writes) loads with `-o lora=<name>`: the base download skips
+`adapters/`, the named adapter is fetched alone (a local directory works too), and the
+model is built with VoxCPM's `LoRAConfig` from that `lora_config.json` and
+`load_lora_weights`; an adapter whose tensors do not all land in `LoRALinear` modules is
+refused. The LoRA stays unmerged (the base GEMM plus two rank-r GEMMs per projection), as
+a server holding several adapters runs it. The model card counts the root's weights only
+when the root has a `config.json`, so adapters and helper models in subfolders do not
+inflate the size. `-o texts=<file>` (UTF-8, one request per line) replaces the built-in
+English sentences of a batch or burst; request 0 is the file's first line unless `-o
+text=` names it, and the held-out input rotates the file by one line. Measured on an A10
+with a synthetic r = 64 adapter of an Arabic dialect model's layout (q/k/v/o of both LMs
+and the LocDiT): 192 `LoRALinear` modules, every tensor loaded.
+
 ### Research support: documentation, dossier, citations
 
 Every agent session has `WebFetch` and `WebSearch` unless `--no-web`. In four

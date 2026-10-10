@@ -62,6 +62,7 @@ def test_routing_options_and_texts():
     assert texts[0] == TEXT and len(set(texts)) == 40
     with pytest.raises(ValueError, match="batch_size must be >= 1"):
         request_texts(TEXT, 0)
+    assert request_texts("a", 4, ["b", "c"]) == ["a", "b", "c", "b c"]  # another pool
     assert wl.variants()[1]["batch_size"] == 4  # capture: another batch size too
 
 
@@ -378,3 +379,29 @@ def test_voxcpm2_batch_4_is_batch_1():
         forced = wl.run_teacher_forced(inputs, out)
     cmp = wl.compare_teacher_forced(out, forced)
     assert not cmp.passed and cmp.reason.startswith("request "), cmp
+
+
+def test_request_texts_from_a_file(tmp_path):
+    """``-o texts=<file>``: one request per line (e.g. a fine-tuned model's language);
+    request 0 is the first line unless ``text`` is given; the held-out input rotates the file."""
+    path = tmp_path / "ar.txt"
+    path.write_text(
+        "هلا والله، كيف حالك؟\n\nودي أروح السوق بكرة.\nالجو اليوم حار مرة.\n", encoding="utf-8"
+    )
+    wl = create_workload(_spec(batch_size=4, texts=str(path)))
+    assert wl.make_inputs() == [
+        "هلا والله، كيف حالك؟",
+        "ودي أروح السوق بكرة.",
+        "الجو اليوم حار مرة.",
+        "ودي أروح السوق بكرة. الجو اليوم حار مرة.",
+    ]
+    held = wl.holdout_options(1)
+    assert "text" not in held and held["texts_offset"] == 1
+    held_wl = create_workload(_spec(batch_size=4, texts=str(path), **held))
+    assert held_wl.make_inputs()[0] == "ودي أروح السوق بكرة."
+    explicit = create_workload(_spec(batch_size=2, texts=str(path), text="مرحبا"))
+    assert explicit.make_inputs() == ["مرحبا", "هلا والله، كيف حالك؟"]
+    assert explicit.holdout_options(1)["text"]  # an explicit request 0: VoxCPM's held-out one
+    path.write_text("\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="no request texts"):
+        create_workload(_spec(batch_size=2, texts=str(path))).make_inputs()

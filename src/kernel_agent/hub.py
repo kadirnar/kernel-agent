@@ -148,7 +148,14 @@ def resolve(ref: str, *, token: str | None = None, modality: str | None = None) 
     files = [s.rfilename for s in siblings]
     # Repos often ship the same weights twice (.safetensors + .bin); count one format.
     weight_ext = ".safetensors" if any(f.endswith(".safetensors") for f in files) else ".bin"
-    size = sum((s.size or 0) for s in siblings if s.rfilename.endswith(weight_ext))
+    weights = [s for s in siblings if s.rfilename.endswith(weight_ext)]
+    # A model at the repo root with other files in subfolders (LoRA adapters, helper models of
+    # a fine-tuned VoxCPM): the model is the root's weights. Diffusers keep theirs in folders.
+    root = [s for s in weights if "/" not in s.rfilename]
+    narrowed = bool(root) and "config.json" in files and len(root) < len(weights)
+    if narrowed:
+        weights = root
+    size = sum((s.size or 0) for s in weights)
 
     def _json(name: str) -> dict[str, Any]:
         if name not in files:
@@ -173,7 +180,7 @@ def resolve(ref: str, *, token: str | None = None, modality: str | None = None) 
             pass
 
     params = None
-    if info.safetensors is not None:
+    if info.safetensors is not None and not narrowed:  # the Hub's count covers every file
         params = int(info.safetensors.total)
 
     detected = classify(

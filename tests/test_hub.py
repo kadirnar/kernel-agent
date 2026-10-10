@@ -69,3 +69,41 @@ def test_model_card_family_roundtrip():
     old = card.to_dict()
     old.pop("family")  # run.json written before the field existed
     assert ModelCard.from_dict(old).family is None
+
+
+def test_resolve_counts_the_model_at_the_root(monkeypatch, tmp_path):
+    """A fine-tuned VoxCPM repo: the model at the root, LoRA adapters and a helper model in
+    subfolders. The size is the root's weights; the Hub's parameter count (every file) is
+    left out."""
+    import json
+    from types import SimpleNamespace
+
+    import huggingface_hub
+
+    from kernel_agent import hub
+
+    gb = 1024**3
+    sib = [
+        ("config.json", 4000),
+        ("model.safetensors", 4 * gb),
+        ("audiovae.pth", gb // 3),
+        *((f"adapters/{d}/lora_weights.safetensors", gb // 7) for d in ("saudi", "najdi")),
+        ("adapters/saudi/lora_config.json", 500),
+    ]
+    info = SimpleNamespace(
+        siblings=[SimpleNamespace(rfilename=n, size=z) for n, z in sib],
+        safetensors=SimpleNamespace(total=2_700_000_000),
+        pipeline_tag="text-to-speech",
+        library_name="voxcpm",
+        tags=["text-to-speech"],
+    )
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"architecture": "voxcpm2"}))
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", lambda self, *a, **k: info)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, **k: str(config))
+    card = hub.resolve("org/voxcpm2-dialects")
+    assert card.size_gb == 4.0 and card.params is None and card.family == "voxcpm"
+
+    info.siblings = info.siblings[:3]  # only the root model: as before
+    card = hub.resolve("openbmb/VoxCPM2")
+    assert card.size_gb == 4.0 and card.params == 2_700_000_000

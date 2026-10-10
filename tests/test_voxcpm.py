@@ -558,3 +558,59 @@ def test_voxcpm2_time_to_first_audio(tmp_path):
     apply_transforms(wl, [STOP_TRANSFORMS / "vae_channels_last.py"], PatchReport())
     with pytest.raises(RuntimeError, match="the streaming AudioVAE decode failed"):
         wl.run(inputs)
+
+
+def test_lora_option_resolves_an_adapter(tmp_path, monkeypatch):
+    """``-o lora=``: a local directory, or an adapter under the repo's ``adapters/``,
+    downloaded alone; its ``lora_config.json`` becomes VoxCPM's ``LoRAConfig``."""
+    import json
+    import sys
+    import types
+
+    import huggingface_hub
+
+    from kernel_agent.workloads.voxcpm import lora_config, lora_directory
+
+    assert lora_directory(None, "a/b", None) is None
+    snapshot = tmp_path / "snapshot"
+    adapter = snapshot / "adapters" / "saudi"
+    adapter.mkdir(parents=True)
+    (adapter / "lora_weights.safetensors").write_bytes(b"x")
+    (adapter / "lora_config.json").write_text(
+        json.dumps(
+            {
+                "base_model": "model",
+                "lora_config": {"enable_lm": True, "enable_dit": True, "r": 64, "alpha": 128},
+            }
+        )
+    )
+    calls = []
+
+    def fake_snapshot(repo_id, revision=None, allow_patterns=None, **kw):
+        calls.append(allow_patterns)
+        return str(snapshot)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
+    assert lora_directory("saudi", "org/voxcpm2-dialects", None) == adapter
+    assert calls == [["adapters/saudi/*"]]
+    assert lora_directory(str(adapter), "org/voxcpm2-dialects", None) == adapter  # a directory
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match=r"lora=najdi: no lora_weights\.safetensors"):
+        lora_directory("najdi", "org/voxcpm2-dialects", None)
+
+    class LoRAConfig:  # VoxCPM's pydantic model: the fields it knows
+        model_fields = {"enable_lm": None, "enable_dit": None, "r": None, "alpha": None}
+
+        def __init__(self, **kw):
+            self.kw = kw
+
+    module = types.ModuleType("fake_voxcpm_model")
+    module.LoRAConfig = LoRAConfig  # type: ignore[attr-defined]
+    model_cls = type("FakeModel", (), {"__module__": "fake_voxcpm_model"})
+    monkeypatch.setitem(sys.modules, "fake_voxcpm_model", module)
+    assert lora_config(model_cls, adapter).kw == {
+        "enable_lm": True,
+        "enable_dit": True,
+        "r": 64,
+        "alpha": 128,
+    }

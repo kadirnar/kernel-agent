@@ -11,10 +11,13 @@ the stop flag of request 0 only); this workload is a faithful batched version of
 *different* texts:
 
 * request 0 says ``text``, requests 1.. the sentences of :data:`REQUEST_TEXTS` (pairs of
-  them past the end of the list). Request *b* draws its LocDiT noise from its own generator
-  seeded ``seed + b``, the noise VoxCPM's batch-1 ``generate`` draws after
-  ``torch.manual_seed(seed + b)``: the batched run intercepts the ``torch.randn`` call of
-  ``feat_decoder.forward`` (:meth:`VoxCPMBatchWorkload.request_noise`).
+  them past the end of the list). ``-o texts=<file>`` (UTF-8, one request per line, e.g. a
+  fine-tuned model's language) replaces that list; without an explicit ``-o text=`` request 0
+  is the file's first line. The held-out input rotates the file (``texts_offset``).
+  Request *b* draws its LocDiT noise from its own generator seeded ``seed + b``, the noise
+  VoxCPM's batch-1 ``generate`` draws after ``torch.manual_seed(seed + b)``: the batched run
+  intercepts the ``torch.randn`` call of ``feat_decoder.forward``
+  (:meth:`VoxCPMBatchWorkload.request_noise`).
 * The prompts are right-padded to the longest one and prefilled once for the batch through
   the model's own ``forward``s (base LM, residual LM, LocEnc over the prompt): causal
   attention keeps every real position from seeing the padding, the text / audio masks zero
@@ -72,7 +75,8 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -107,18 +111,30 @@ CACHE_ALIGN = 64
 SHOWN = 3
 
 
-def request_texts(first: str, n: int) -> list[str]:
-    """The ``n`` texts of a batch: ``first``, then :data:`REQUEST_TEXTS`, then pairs of
-    them (every text differs)."""
+def request_texts(first: str, n: int, pool: Sequence[str] = REQUEST_TEXTS) -> list[str]:
+    """The ``n`` texts of a batch: ``first``, then ``pool`` (:data:`REQUEST_TEXTS`), then
+    pairs of them (every text differs)."""
     if n < 1:
         raise ValueError(f"batch_size must be >= 1, got {n}")
-    pool = REQUEST_TEXTS
+    if not pool:
+        raise ValueError("the request texts are empty")
     texts = [first]
     for i in range(n - 1):
         k = i // len(pool)  # 0: one sentence; k: it and the sentence k further on
         sentence = pool[i % len(pool)]
         texts.append(sentence if k == 0 else f"{sentence} {pool[(i + k) % len(pool)]}")
     return texts
+
+
+def read_texts(path: str | Path) -> list[str]:
+    """``-o texts=``: the non-empty lines of a UTF-8 file, one request each."""
+    lines = [
+        line.strip() for line in Path(path).expanduser().read_text(encoding="utf-8").splitlines()
+    ]
+    lines = [line for line in lines if line]
+    if not lines:
+        raise ValueError(f"texts={path}: no request texts in the file")
+    return lines
 
 
 def per_request(results: list[Comparison], key: str) -> Comparison:
@@ -217,7 +233,25 @@ class VoxCPMBatchWorkload(VoxCPMWorkload):
         return int(self.options["batch_size"])
 
     def make_inputs(self) -> list[str]:  # type: ignore[override]
-        return request_texts(str(self.options["text"]), self.batch_size)
+        path = self.options.get("texts")
+        if not path:
+            return request_texts(str(self.options["text"]), self.batch_size)
+        lines = read_texts(path)
+        k = int(self.options.get("texts_offset") or 0) % len(lines)
+        lines = lines[k:] + lines[:k]
+        if "text" in self.spec.options:  # an explicit request 0
+            return request_texts(str(self.options["text"]), self.batch_size, lines)
+        return request_texts(lines[0], self.batch_size, lines[1:] or lines)
+
+    def holdout_options(self, variant: int = 1) -> dict[str, Any] | None:
+        """VoxCPM's held-out input (another request-0 sentence and seed); with ``texts``
+        the file rotated by ``variant`` lines, so every request says another text."""
+        out = super().holdout_options(variant)
+        if out is not None and self.options.get("texts"):
+            out["texts_offset"] = int(self.options.get("texts_offset") or 0) + variant
+            if "text" not in self.spec.options:
+                del out["text"]  # request 0 comes from the rotated file
+        return out
 
     def variants(self) -> list[dict[str, Any]]:
         """Another prefill length, and another batch size, few patches each."""
