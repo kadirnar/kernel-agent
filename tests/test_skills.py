@@ -326,7 +326,8 @@ def test_sessions_load_the_skills_and_their_helpers_isolated(tmp_path, monkeypat
     assert options.skills == [*skills.qualified_names(), *skills.BUNDLED]
     assert set(options.agents) == set(roles.HELPERS)
     assert options.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
-    append = options.system_prompt["append"]
+    assert options.system_prompt == {"type": "preset", "preset": "claude_code"}
+    append = Path(options.extra_args[runner.APPEND_PROMPT_FILE]).read_text()
     assert append.startswith("PROMPT") and "# Helpers (the Agent tool)" in append
 
     # a restricted session gets the Skill tool, and Agent only with helpers
@@ -337,7 +338,7 @@ def test_sessions_load_the_skills_and_their_helpers_isolated(tmp_path, monkeypat
     assert set(options.agents) == {"doc-lookup", "profile-analyst"}
     _, options = _session(tmp_path, monkeypatch, "refactor-x", tools=[*runner.READ_TOOLS])
     assert options.tools[-1] == "Skill" and options.agents is None
-    assert "# Helpers" not in options.system_prompt["append"]
+    assert "# Helpers" not in Path(options.extra_args[runner.APPEND_PROMPT_FILE]).read_text()
 
 
 def test_a_background_subagent_result_keeps_the_structured_output(tmp_path, monkeypatch):

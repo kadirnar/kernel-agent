@@ -153,7 +153,11 @@ same time.
   removed): the target is dropped with the reason in `spec.failed.json`
   (`capture_error`), and a native stage's digest says it has no
   teacher-forced target and why, so no agent is handed a target nothing can
-  pass.
+  pass. The worker's `capture` runs the self-check and writes the agent's copy
+  after it released the workload's model: both load the saved file again, its
+  module with its weights included (measured on VoxCPM2 with 6.9 GB free on
+  the GPU: next to the model, the copies of two LM stage targets ran out of
+  memory in the self-check, 24 MB short).
 * **Beyond the captured values**: during timing, inputs rotate between three
   copies, and one random timed call runs on redrawn input values; its output
   and side effects must match a fresh reference call
@@ -3555,6 +3559,30 @@ kernels (`mlp_fused` at M = N, `attn_fused` prefill) handle the batch or fall
 back. New candidates for the batched decode step (`lm_step`) are the next
 round's work.
 
+**A burst, streamed: time to first audio of N requests at once** (`-o batch_size=N
+-o metric=ttfa`). The same batched loop streams the batch as VoxCPM2's own
+`generate_streaming` streams one request: after every patch its newest latent goes
+through the stateful `audio_vae.streaming_decode()` for the whole batch in one
+`decode_chunk` call, the chunks go to the host, and the step is marked once for every
+request. The first mark is each request's time to first audio for a burst submitted
+at once (prefill of all N, the first patch, its decode); inside the metric window the
+loop stops there. The full streamed request of each measurement reports the steady
+state (`chunk_ms`: one patch for all N streams against its 160 ms of audio, `rtf`) and
+`stall_ms`, the total wait of a player that starts on the first chunk (also reported
+for batch-1 streaming). The streamed audio equals the one-shot decode request by request
+(CPU test on the tiny VoxCPM2), and the quality checks judge it. With `metric=ttfa`
+(batch 1 too) the teacher-forced audio is streamed from the reference latents, so it
+depends on the AudioVAE path alone, and its waveform cosine to the reference must reach
+`min_stream_waveform_cosine` (0.98; a correct fp32 decode gives 1.0000): an AudioVAE
+replacement that runs every convolution itself, which `streaming_decode()` cannot give
+its causal-convolution state, fails it while it passes one-shot decoding. Measured on an
+A10: such a fused decoder kernel, accepted by a latency run, clicked at every 160 ms
+chunk boundary (streamed vs one-shot correlation 0.91, UTMOS −1.1 on the streamed audio);
+its teacher-forced streamed audio reaches waveform cosine 0.931 while the spectral cosine
+stays at 0.970, just above `min_spec_cosine`. Baseline on the A10, eager, 128 requests:
+time to first audio 1,109 ms, steady state 580 ms per 160 ms patch (RTF 3.6, a 25 s
+playback stall over 60 patches), 8.7 GB.
+
 ### Research support: documentation, dossier, citations
 
 Every agent session has `WebFetch` and `WebSearch` unless `--no-web`. In four
@@ -6754,6 +6782,16 @@ same on every machine (`kernel_agent/agent/runner.py`):
   `$CLAUDE_CONFIG_DIR`). With auto memory off, a session asked to remember
   something wrote the repository's `CLAUDE.md` instead, which your own
   sessions would load. The agents' Bash tool is not covered.
+* The system prompt goes to Claude Code as a file
+  (`--append-system-prompt-file <log_dir>/agent-<name>.system.md`), not on its
+  command line, and a PreToolUse hook on Bash (`runner.kill_guard`) denies
+  killing processes found by an unanchored pattern of their whole command line
+  (`pkill -f`, `pgrep -f` or `ps | grep` into `kill`); an anchored pattern
+  (`pgrep -f '^/path/to/python -m module'`) passes. Measured on a VoxCPM2 run:
+  a native session stopped its build with `pkill -9 -f "native.project build"`
+  and `ps aux | grep "project build" | ... | xargs kill -9`; both matched its own
+  Claude Code process, whose command line held that prompt, and the sessions
+  died with exit -9 (two slices, about two hours of work, lost).
 
 Claude Code still keeps each session's transcript under
 `~/.claude/projects/` (the usage-limit resume needs it), and it reads

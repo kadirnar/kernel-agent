@@ -585,7 +585,7 @@ def capture_module(
         },
         path,
     )
-    checked = _refuse_unverifiable(path, tracked) if self_check else None
+    checked = refuse_unverifiable(path, tracked) if self_check else None
     return {
         "qualname": full,
         # calls per run of this instance, per entrypoint (captured or not)
@@ -696,7 +696,7 @@ def capture_calls(
         path,
     )
     if self_check:
-        _refuse_unverifiable(path, tracked)
+        refuse_unverifiable(path, tracked)
 
 
 class UnverifiableCapture(RuntimeError):
@@ -742,7 +742,7 @@ def self_check(path: Path, device: str | None = None) -> dict[str, Any]:
     return {"ok": not failures, "cases": cases, "failures": failures, "seconds": seconds}
 
 
-def _refuse_unverifiable(path: Path, tracked: dict[str, Any]) -> dict[str, Any]:
+def refuse_unverifiable(path: Path, tracked: dict[str, Any]) -> dict[str, Any]:
     """:func:`self_check` of a capture just saved; removes the file and raises
     :class:`UnverifiableCapture` with the reason when the reference fails it."""
     result = self_check(path)

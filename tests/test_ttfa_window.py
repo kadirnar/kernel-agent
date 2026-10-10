@@ -148,3 +148,17 @@ def test_the_diverse_set_times_short_requests_and_judges_a_whole_one(tmp_path, c
     assert output["states"].shape[0] == STEPS  # what the quality check judges
     value = 1000 * FIRST_S if metric == "ttfa" else WHOLE_MS
     assert timing["times_ms"] == [pytest.approx(value)] * 3
+
+
+def test_the_playback_stall_of_a_stream():
+    from kernel_agent.workloads.base import playback_stall_ms
+
+    # chunks of 160 ms: a stream that keeps up never stalls the player
+    assert playback_stall_ms([(0.0, 160.0), (0.1, 160.0), (0.25, 160.0)]) == 0.0
+    # chunk 2 arrives 90 ms after it was due (0.16 + 0.16 = 0.32 s): the player waits, and
+    # chunk 3 is then due at 0.41 + 0.16 = 0.57 s, so arriving at 0.6 s adds 30 ms
+    assert playback_stall_ms([(0.0, 160.0), (0.1, 160.0), (0.41, 160.0), (0.6, 160.0)]) == (
+        pytest.approx(120.0)
+    )
+    assert playback_stall_ms([(0.0, None), (0.1, 160.0)]) is None
+    assert playback_stall_ms([]) is None

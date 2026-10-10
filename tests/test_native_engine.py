@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel_agent import cli, dryrun, improve, ledger, orchestrator, program
+from kernel_agent import cli, dryrun, improve, ledger, orchestrator, program, scheduler
 from kernel_agent.agent import prompts
 from kernel_agent.agent.tools import record_e2e_result, snapshot
 from kernel_agent.budget import Budget
@@ -19,7 +19,7 @@ from kernel_agent.config import OptimizeConfig
 from kernel_agent.improve import ImproveConfig, Improver, native_digest
 from kernel_agent.native import engine
 from kernel_agent.native import project as proj
-from kernel_agent.scheduler import KERNEL, NATIVE, Policy, build_arms, systems_rows
+from kernel_agent.scheduler import KERNEL, NATIVE, SYSTEMS, Policy, build_arms, systems_rows
 from kernel_agent.workspace import RunDir, read_json, write_json
 
 BASE = dryrun.BASELINE_MS
@@ -306,7 +306,7 @@ def make(tmp_path, **cfg):
     return orch, dryrun.World(orch)
 
 
-def native_run(run: RunDir, name: str, speedup: float, kernels=()):
+def native_run(run: RunDir, name: str, speedup: float, kernels=(), session=None):
     root = engine.native_dir(run) / name
     (root / "csrc").mkdir(parents=True, exist_ok=True)
     (root / proj.MANIFEST).write_text(
@@ -316,7 +316,9 @@ def native_run(run: RunDir, name: str, speedup: float, kernels=()):
     (root / "csrc" / "e.cu").write_text(f"// {speedup}\n")
     snap = snapshot(run, root)
     result = dryrun._e2e_result(BASE / speedup)
-    record_e2e_result(run, result, [snap], list(kernels), hypothesis=f"native {speedup}")
+    record_e2e_result(
+        run, result, [snap], list(kernels), hypothesis=f"native {speedup}", session=session
+    )
     return snap
 
 
@@ -347,6 +349,44 @@ def test_native_arm_waits_for_the_module_arms_and_tracks_its_runs(tmp_path):
     assert "over the best module-level result" in arm.why()
     stopped = build_arms(run, Policy(native=True, native_patience=1), [], targets=[])
     assert "plateau" in next(a for a in stopped if a.id == NATIVE).stop
+
+
+def test_a_systems_stack_on_native_projects_is_the_systems_arms(tmp_path):
+    """A row is the arm's whose session made it. Measured on a VoxCPM2 run: a systems
+    session's stack on the native projects (exp 146, ledger backend ``native+kernels``) went
+    to the native arm by its backend, so its slice counted 0 evaluations and the systems
+    best stayed at its last run without a native project (7.37x for 9.51x)."""
+    orch, _ = make(tmp_path)
+    run = orch.run
+    integration = dryrun._e2e_result(BASE / 2.0)
+    ledger.record_e2e(run, integration, backend="integrate", snapshot="x", hypothesis="all")
+    loop = native_run(run, "loop", 2.4, session="native#1")
+    graph = run.transforms_dir / "graph_prefill.py"
+    graph.write_text("def apply(workload): pass\n")
+    snap = snapshot(run, graph)
+    alone = dryrun._e2e_result(BASE / 2.2)
+    record_e2e_result(run, alone, [snap], [], hypothesis="graphs", session="systems#2")
+    stacked = dryrun._e2e_result(BASE / 2.6)
+    record_e2e_result(run, stacked, [loop, snap], [], hypothesis="on the loop", session="systems#3")
+    rows = ledger.rows(run)
+    stack = rows[-1]
+    assert stack["backend"] == "native" and engine.is_native(stack)  # what it ran
+    assert not scheduler.native_run(stack) and stack in systems_rows(rows)  # whose it is
+    assert scheduler.native_run(rows[1]) and scheduler.made_by(rows[1]) == NATIVE
+
+    arms = {a.id: a for a in build_arms(run, Policy(native=True), [], targets=[])}
+    systems, native = arms[SYSTEMS], arms[NATIVE]
+    assert systems.evals == 2 and systems.best == pytest.approx(2.6, rel=1e-3)
+    assert systems.best_snapshot == stack["snapshot"] and systems.streak == 0
+    # the stack had to beat the native arm's 2.4x run too: only that gain is the agent's
+    gain = (1.0 - 1.0 / 2.2) + (1.0 / 2.4 - 1.0 / 2.6)
+    assert systems.gain_ms == pytest.approx(systems.ref_ms * gain, rel=1e-3)
+    assert native.evals == 1 and native.best == pytest.approx(2.4 / 2.2, rel=1e-3)
+
+    improver = Improver(orch, ImproveConfig(agents=2), require_capture=False, live_charts=False)
+    arm, new, improved = improver._own({"arm": SYSTEMS, "sessions": ["systems#3"]})
+    assert arm is not None and arm.id == SYSTEMS
+    assert [r["exp"] for r in new] == [stack["exp"]] and improved  # its slice's own row
 
 
 def test_stage_targets_belong_to_the_native_arm(tmp_path):

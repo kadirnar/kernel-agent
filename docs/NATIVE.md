@@ -247,6 +247,14 @@ A `native` session (role `native` in `program.md`):
   to end: integrations, the systems agent's runs), `best` its fastest native run over the
   bar, `estimate` `Policy.native_estimate` (1.3), and its runs are recorded with the ledger
   backend `native` (no longer the systems agent's).
+* A row is the arm's whose session made it (`scheduler.native_run`, the row's `session`
+  label `<agent>#<slice>`): a systems session's stack on top of native projects has the
+  backend `native+kernels` but is the systems agent's evaluation, and it is a new systems
+  best only when it also beats the native arm's fastest run so far. A row without a session
+  label goes by its backend. (Measured on a VoxCPM2 run: grouping by backend alone credited
+  such a stack, the run's best at 9.51x, to the native arm; the systems slices counted 0
+  evaluations and the systems best stayed at 7.37x.) The bar still excludes every run with
+  a native project.
 * Before a native slice the loop captures the current stage's target once.
 * An integration measurement that includes one of the arm's own items (its projects and
   stage targets, `engine.own_items`) is the arm's result, not a module-level one: an

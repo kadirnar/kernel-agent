@@ -171,6 +171,10 @@ version is saved as `logs/program-<sha12>.md`.
   winners, the library) instead of rewriting their math from scratch.
 * Compile with `python -m kernel_agent.native.project build <dir>` until it
   builds cleanly; an evaluation is for a hypothesis, not for a compiler error.
+  A build can take minutes: bound it with `timeout -k 10 <seconds>`, and stop
+  a build you started in the background by the PID you recorded (`$!`). Never
+  `pkill -f`, nor `pgrep -f` / `ps | grep` into `kill`: such a pattern also
+  matches your own session's process (it is denied).
 
 ## harness
 

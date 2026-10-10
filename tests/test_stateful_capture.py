@@ -12,7 +12,9 @@ holding the variant's cache while the decode cases were recorded with the main r
 from __future__ import annotations
 
 import argparse
+import gc
 import math
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ from kernel_agent.kernels.evaluate import evaluate
 from kernel_agent.kernels.sweep import sweep
 from kernel_agent.native import engine
 from kernel_agent.native import project as proj
+from kernel_agent.profiling import capture as capture_mod
 from kernel_agent.profiling import state
 from kernel_agent.profiling.capture import (
     UnverifiableCapture,
@@ -507,6 +510,50 @@ def test_native_stage_target_of_a_stateful_module(tmp_path, monkeypatch):
     assert sum("state" in c for c in agent_copy["cases"]) == info["state"]["cases"]
     same = _candidate(tmp_path, "same", SAME)
     assert evaluate(run.capture_file(spec["id"]), same, device="cpu")["correct"]
+
+
+def test_the_capture_self_check_runs_without_the_workloads_model(tmp_path, monkeypatch):
+    """The self-check and the agent's copy load the saved capture again (its module with
+    its weights, every case): the worker releases the workload's model first. Measured on
+    VoxCPM2 with 6.9 GB free on the GPU: next to the model, that copy of two LM stage
+    targets ran out of memory in the self-check (24 MB short)."""
+    run = RunDir.create(tmp_path, "toy/stateful")
+    write_json(run.run_json, {"truth": truth.new_section()})  # sealed: + the agent's copy
+    stage = engine.Stage(id="decoder", scope="stage", group="model", module_class="Decoder")
+    spec = engine.target_spec(stage)
+    assert spec is not None
+    write_json(run.target(spec["id"]) / "spec.json", spec)
+    loaded: list[weakref.ref[DecoderWorkload]] = []
+
+    def load(run):
+        wl = _workload()
+        loaded.append(weakref.ref(wl))
+        return wl
+
+    seen: list[bool] = []  # whether the workload was alive at each reload
+    real_check, real_copy = capture_mod.refuse_unverifiable, worker.truth.write_inputs_capture
+
+    def alive() -> bool:
+        gc.collect()
+        return loaded[0]() is not None
+
+    def self_check(path, tracked):
+        seen.append(alive())
+        return real_check(path, tracked)
+
+    def inputs_copy(full, dst):
+        seen.append(alive())
+        return real_copy(full, dst)
+
+    monkeypatch.setattr(worker, "_workload", load)
+    monkeypatch.setattr(capture_mod, "refuse_unverifiable", self_check)
+    monkeypatch.setattr(worker.truth, "write_inputs_capture", inputs_copy)
+    info = worker.cmd_capture(run, argparse.Namespace(target=spec["id"], max_cases=4))
+    assert seen == [False, False]  # both after the model was released
+    assert info["self_check"]["cases"] == 5  # still checked, and recorded
+    source = (run.target(spec["id"]) / "reference_source.py").read_text()
+    assert source.startswith("# Reference implementation of ") and "class Decoder" in source
+    assert (run.target(spec["id"]) / "capture_inputs.pt").is_file()
 
 
 def test_refused_stage_capture_reaches_the_native_digest(tmp_path, monkeypatch):

@@ -128,6 +128,12 @@ class VoxCPMWorkload(Workload):
         # Audio decoded from the teacher-forced (reference) latents; also reported,
         # informationally, for the free-running audio.
         "min_spec_cosine": 0.97,
+        # metric=ttfa: the teacher-forced audio is streamed from the reference latents, so it
+        # depends on the AudioVAE path only and a correct decode matches the reference (fp32,
+        # waveform cosine ~1.0). A decode that loses its causal-convolution state between
+        # 160 ms chunks clicks at every boundary: on VoxCPM2, waveform cosine 0.93 while the
+        # spectral cosine stays at 0.970.
+        "min_stream_waveform_cosine": 0.98,
         # Natural-length run (stop condition): the candidate stops at the baseline's patch;
         # `stop_tolerance=1` accepts ±1 patch at a near-tie of the baseline's stop logits.
         "natural_text": NATURAL_TEXT,
@@ -389,7 +395,14 @@ class VoxCPMWorkload(Workload):
         reasons = [steps.reason] if not steps.passed else []
         if not decoded.passed:
             reasons.append(f"audio decoded from the reference latents: {decoded.reason}")
-        return Comparison(steps.passed and decoded.passed, metrics, "; ".join(reasons))
+        wave = decoded.metrics.get("waveform_cosine")
+        floor = float(self.options["min_stream_waveform_cosine"])
+        if self.metric == objective.TTFA and isinstance(wave, float) and wave < floor:
+            reasons.append(
+                f"audio streamed from the reference latents: waveform cosine {wave:.4f} < "
+                f"{floor} (does the AudioVAE decode keep its state between chunks?)"
+            )
+        return Comparison(not reasons, metrics, "; ".join(reasons))
 
     # ------------------------------------------------- perceptual gate (near-lossless)
 

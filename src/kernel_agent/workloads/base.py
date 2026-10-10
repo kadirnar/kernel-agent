@@ -472,6 +472,7 @@ class Workload(ABC):
             "steady_chunks": len(gaps),
             "chunk_ms": chunk_ms,
             "rtf": rtf,
+            "stall_ms": playback_stall_ms(marks),
         }
 
     def output_seconds(self) -> float:
@@ -544,6 +545,24 @@ class Workload(ABC):
 def synchronize() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def playback_stall_ms(marks: list[tuple[float, float | None]]) -> float | None:
+    """Total playback interruption of a streamed run for a player that starts playing on its
+    first chunk (``marks``: ``(arrival time in s, audio ms)`` per chunk): chunk *k* is due
+    when the audio before it has played; when it arrives later the player waits, and the
+    rest of the stream shifts by that wait. ``0`` for a stream that keeps up; ``None``
+    without every chunk's audio duration."""
+    if not marks or any(a is None for _, a in marks):
+        return None
+    clock, stall = marks[0][0] * 1000, 0.0
+    for (_, audio_ms), (arrival, _) in itertools.pairwise(marks):
+        clock += float(audio_ms or 0.0)  # the previous chunk has played
+        wait = arrival * 1000 - clock
+        if wait > 0:
+            stall += wait
+            clock += wait
+    return stall
 
 
 def timed_run(

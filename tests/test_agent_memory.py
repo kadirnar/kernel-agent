@@ -29,13 +29,14 @@ def test_every_session_runs_without_auto_memory_and_connectors(tmp_path, monkeyp
     assert options.env["X"] == "1"  # the caller's environment is kept
     assert options.setting_sources == []  # no user/project settings, hooks or CLAUDE.md
     web_guard = "WebFetch|WebSearch"  # the WebFetch allowlist of the web tools (#125)
-    assert [m.matcher for m in options.hooks["PreToolUse"]] == [runner.WRITE_TOOLS, web_guard]
+    matchers = [m.matcher for m in options.hooks["PreToolUse"]]
+    assert matchers == [runner.WRITE_TOOLS, "Bash", web_guard]  # + the kill guard
 
     # a restricted session keeps its write guard, and gets the Claude files guard too
     _, seen = run_stream(
         tmp_path, monkeypatch, [_init(), _result()], writable=[tmp_path / "plan.json"]
     )
-    assert len(seen["options"].hooks["PreToolUse"]) == 3  # + the write guard
+    assert len(seen["options"].hooks["PreToolUse"]) == 4  # + the write guard
 
 
 def _decision(matcher, cwd: Path, path: str, tool: str = "Write") -> str | None:
@@ -62,6 +63,52 @@ def test_claude_files_guard(tmp_path, monkeypatch):
     assert _decision(guard, cwd, str(config / "CLAUDE.md"), tool="Edit") == "deny"
     for path in ("NOTES.md", "candidates/v1.py", str(tmp_path / "runs" / "r" / "plan.json")):
         assert _decision(guard, cwd, path) is None, path
+    assert asyncio.run(guard.hooks[0]({"tool_input": {}}, None, None)) == {}
+
+
+# Bash commands of a native session that killed its own Claude Code process (measured on a
+# VoxCPM2 run, exit -9): its command line held the pattern, then in its system prompt.
+SELF_KILLS = (
+    'cd /r/transforms/native; pkill -9 -f "project build lm_pf" ; cat > scripts/build.sh'
+    " <<'EOF'\n#!/bin/bash\nsetsid -w python -m kernel_agent.native.project build \"$1\"\nEOF",
+    'cd /r/transforms/native; kill -9 %1 2>/dev/null; ps aux | grep "project build" | grep '
+    "-v grep | awk '{print $2}' | xargs -r kill -9; nohup setsid python -m kernel_agent.native."
+    "project build lm_pf > build_lm_pf.log 2>&1 < /dev/null & disown; echo started",
+    'pkill -9 -f "native.project build"',
+    "pkill --full worker",
+    'kill -9 $(pgrep -f "kernel_agent.worker")',
+    'pgrep -f "project build" | xargs -r kill -9',
+    "kill $(ps aux | grep build | awk '{print $2}')",
+    "sudo pkill -u root -f build",
+)
+SAFE = (
+    "kill -9 $(pgrep -f '^/venv/bin/python3 -m kernel_agent.native.project build')",
+    "pkill -f '^/venv/bin/python3 -m kernel_agent.native.project build'",
+    'pgrep -af "native.project build"',  # listing only
+    'ps aux | grep "project build" | grep -v grep',
+    "ps aux | grep build; kill 1234",  # a PID, in another command
+    "kill -9 %1",
+    "kill -CONT %1 2>/dev/null; wait %1",
+    "timeout -k 10 900 scripts/build.sh lm_pf",
+    "pkill -9 ninja",  # by process name
+    'grep -rn "pkill -f" src/',
+    "echo kill",
+)
+
+
+def test_kill_guard_denies_killing_by_an_unanchored_command_line_pattern():
+    for command in SELF_KILLS:
+        assert runner.self_kill(command), command
+    for command in SAFE:
+        assert runner.self_kill(command) is None, command
+    guard = runner.kill_guard()
+    assert guard.matcher == "Bash"
+    out = asyncio.run(guard.hooks[0]({"tool_input": {"command": SELF_KILLS[0]}}, "tu1", None))
+    decision = out["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    assert "`pkill -f project build lm_pf`" in decision["permissionDecisionReason"]
+    assert "timeout -k 10" in decision["permissionDecisionReason"]
+    assert asyncio.run(guard.hooks[0]({"tool_input": {"command": SAFE[0]}}, None, None)) == {}
     assert asyncio.run(guard.hooks[0]({"tool_input": {}}, None, None)) == {}
 
 
@@ -109,7 +156,7 @@ def test_claude_code_gets_the_switches_through_the_real_sdk(tmp_path, monkeypatc
         runner.run_agent(
             "k",
             prompt="remember this",
-            system_append="",
+            system_append="build with python -m kernel_agent.native.project build <dir>",
             cwd=tmp_path,
             cfg=OptimizeConfig(model_ref="org/m", auth="subscription"),
             mcp_server=tools_mod.build_server(RunDir.create(tmp_path, "org/m")),
@@ -123,7 +170,13 @@ def test_claude_code_gets_the_switches_through_the_real_sdk(tmp_path, monkeypatc
     assert seen["env"] == runner.SESSION_ENV
     assert "--setting-sources=" in seen["argv"]
     matchers = seen["hooks"]["PreToolUse"]
-    assert [m["matcher"] for m in matchers] == [runner.WRITE_TOOLS, "WebFetch|WebSearch"]
+    assert [m["matcher"] for m in matchers] == [runner.WRITE_TOOLS, "Bash", "WebFetch|WebSearch"]
+    # the system prompt is a file the CLI appends, not in its command line (pkill -f)
+    assert not any("native.project" in arg for arg in seen["argv"])
+    path = Path(seen["argv"][seen["argv"].index("--" + runner.APPEND_PROMPT_FILE) + 1])
+    assert path == tmp_path / "logs" / "agent-k.system.md"
+    assert path.read_text().startswith("build with python -m kernel_agent.native.project")
+    assert "--append-system-prompt" not in seen["argv"]
 
 
 # ------------------------------------------------------------------ import-memory

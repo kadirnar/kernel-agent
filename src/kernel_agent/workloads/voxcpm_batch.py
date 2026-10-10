@@ -32,6 +32,20 @@ the stop flag of request 0 only); this workload is a faithful batched version of
   with the stop head live (natural-length run, perceptual samples) each request stops on
   its own and the loop ends when all have.
 
+``-o metric=ttfa`` (with ``-o batch_size=N``) times a *burst*: N different requests
+submitted at once and streamed together, as VoxCPM2's own streaming path streams one
+(``generate_streaming``: every patch's newest latent through the stateful
+``audio_vae.streaming_decode()``, one chunk per patch on the host). Each patch is decoded
+for the whole batch in one ``decode_chunk`` call and marked once
+(:meth:`~kernel_agent.workloads.base.Workload.mark_chunk`): the first mark is every
+request's time to first audio (prefill, the first patch, its decode), the next ones give
+the steady state (a patch's latency for all N streams against its 160 ms of audio) and
+the playback stall. Inside :meth:`~kernel_agent.workloads.base.Workload.metric_window` the
+loop stops at the first chunk. The quality checks judge the streamed audio, so an
+AudioVAE replacement that breaks the stateful decode (its chunks decoded without the
+previous chunk's causal-convolution state) fails the audio decoded from the reference
+latents.
+
 The metric's value (:mod:`kernel_agent.objective`) is the wall-clock time per second of
 generated audio, ``1000 / throughput`` ms (``batch_size x patches`` patches of 160 ms in
 the benchmark): lower stays better everywhere and every speedup is the throughput ratio.
@@ -131,9 +145,10 @@ def per_request(results: list[Comparison], key: str) -> Comparison:
 
 
 class VoxCPMBatchWorkload(VoxCPMWorkload):
-    """``batch_size`` different requests, decoded as one batch (``metric=throughput``)."""
+    """``batch_size`` different requests, decoded as one batch (``metric=throughput``), or
+    streamed as one burst (``metric=ttfa``)."""
 
-    metrics = (objective.THROUGHPUT,)  # type: ignore[assignment]  # (the base: a pair)
+    metrics = (objective.THROUGHPUT, objective.TTFA)
     # outlier_steps: the worst teacher-forced steps of each request excused from the step
     # thresholds (reported). Calibrated on VoxCPM2 (60 patches, batches of 4 / 8 / 16):
     # some trajectories have an ill-conditioned LocDiT step that any bf16-level change
@@ -312,51 +327,73 @@ class VoxCPMBatchWorkload(VoxCPMWorkload):
         margins: list[torch.Tensor] = []
         pred_feat_seq = []
         flags = self.async_flags()
-        for i in range(n):
-            # every request's own stop flag (it depends on lm_hidden only), sent to the host
-            # now and read once the LocDiT and LocEnc are queued: one host sync per patch, as
-            # VoxCPM's loop, but on the flags' copy, not on the whole patch (bit-identical)
-            logits = model.stop_head(model.stop_actn(model.stop_proj(lm_hidden)))
-            ticket = flags.send(logits.argmax(dim=-1))
-            dit_hidden = torch.cat(
-                (model.lm_to_dit_proj(lm_hidden), model.res_to_dit_proj(residual_hidden)), dim=-1
-            )
-            with self.request_noise(generators):
-                pred_feat = model.feat_decoder(
-                    mu=dit_hidden,
-                    patch_size=model.patch_size,
-                    cond=prefix_feat_cond.transpose(1, 2).contiguous(),
-                    n_timesteps=int(self.options["timesteps"]),
-                    cfg_value=float(self.options["cfg"]),
-                ).transpose(1, 2)  # [b, p, d]
-            curr_embed = model.enc_to_lm_proj(model.feat_encoder(pred_feat.unsqueeze(1)))
-            pred_feat_seq.append(pred_feat.unsqueeze(1))
-            prefix_feat_cond = pred_feat
+        chunks: list[torch.Tensor] = []  # metric=ttfa: the streamed audio, a patch per chunk
+        stream = contextlib.ExitStack()
+        decoder = None
+        if self.metric == objective.TTFA:
+            decoder = stream.enter_context(model.audio_vae.streaming_decode())
+        with stream:
+            for i in range(n):
+                # every request's own stop flag (it depends on lm_hidden only), sent to the host
+                # now and read once the LocDiT and LocEnc are queued: one host sync per patch, as
+                # VoxCPM's loop, but on the flags' copy, not on the whole patch (bit-identical)
+                logits = model.stop_head(model.stop_actn(model.stop_proj(lm_hidden)))
+                ticket = flags.send(logits.argmax(dim=-1))
+                dit_hidden = torch.cat(
+                    (model.lm_to_dit_proj(lm_hidden), model.res_to_dit_proj(residual_hidden)),
+                    dim=-1,
+                )
+                with self.request_noise(generators):
+                    pred_feat = model.feat_decoder(
+                        mu=dit_hidden,
+                        patch_size=model.patch_size,
+                        cond=prefix_feat_cond.transpose(1, 2).contiguous(),
+                        n_timesteps=int(self.options["timesteps"]),
+                        cfg_value=float(self.options["cfg"]),
+                    ).transpose(1, 2)  # [b, p, d]
+                curr_embed = model.enc_to_lm_proj(model.feat_encoder(pred_feat.unsqueeze(1)))
+                pred_feat_seq.append(pred_feat.unsqueeze(1))
+                prefix_feat_cond = pred_feat
+                if decoder is not None:  # metric=ttfa: VoxCPM2's streaming path, batched
+                    # the newest patch's latent [b, d, p] through the stateful decode: one
+                    # chunk per request, on the host, marked once for the burst
+                    wav = decoder.decode_chunk(pred_feat.transpose(1, 2).to(torch.float32))
+                    chunks.append(wav.squeeze(1).float().cpu())
+                    self.mark_chunk(audio_ms=1000.0 * chunks[-1].shape[-1] / self.sampling_rate)
+                    if self.in_window:  # the time to first audio is known: stop here
+                        steps = [i + 1] * batch
+                        break
 
-            stop = flags.read(ticket)
-            if min_len < n:
-                margins.append(logits.detach().float())
-            if i > min_len:
-                for b in (stop.eq(1) & ~finished).nonzero().flatten().tolist():
-                    steps[b] = i + 1
-                finished |= stop.eq(1)
-                if bool(finished.all()):
-                    break
+                stop = flags.read(ticket)
+                if min_len < n:
+                    margins.append(logits.detach().float())
+                if i > min_len:
+                    for b in (stop.eq(1) & ~finished).nonzero().flatten().tolist():
+                        steps[b] = i + 1
+                    finished |= stop.eq(1)
+                    if bool(finished.all()):
+                        break
 
-            position = positions + i
-            lm_hidden = model.fsq_layer(
-                self.lm_step(model.base_lm, base_cache, curr_embed[:, 0, :], position)
-            )
-            residual_input = model.fusion_concat_proj(
-                torch.cat((lm_hidden, curr_embed[:, 0, :]), dim=-1)
-            )
-            residual_hidden = self.lm_step(
-                model.residual_lm, residual_cache, residual_input, position
-            )
+                position = positions + i
+                lm_hidden = model.fsq_layer(
+                    self.lm_step(model.base_lm, base_cache, curr_embed[:, 0, :], position)
+                )
+                residual_input = model.fusion_concat_proj(
+                    torch.cat((lm_hidden, curr_embed[:, 0, :]), dim=-1)
+                )
+                residual_hidden = self.lm_step(
+                    model.residual_lm, residual_cache, residual_input, position
+                )
 
-        seq = torch.cat(pred_feat_seq, dim=1)  # [b, t, p, d]
-        latent = seq.permute(0, 3, 1, 2).reshape(batch, seq.shape[-1], -1)  # [b, d, t * p]
-        audio = self._decode(latent, steps)
+        if chunks:  # streamed: request b's audio, zero past its own end
+            audio = torch.cat(chunks, dim=-1)
+            per_patch = self._patch_samples()
+            for b, length in enumerate(steps):
+                audio[b, length * per_patch :] = 0
+        else:
+            seq = torch.cat(pred_feat_seq, dim=1)  # [b, t, p, d]
+            latent = seq.permute(0, 3, 1, 2).reshape(batch, seq.shape[-1], -1)  # [b, d, t * p]
+            audio = self._decode(latent, steps)
         stop_margins = None
         if margins:
             stacked = torch.stack(margins).cpu()  # [steps, batch, 2]

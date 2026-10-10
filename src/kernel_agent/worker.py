@@ -296,9 +296,18 @@ def _apply_patches(run: RunDir, workload: Any, kernels: list[str], transforms: l
 
 
 def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
+    """Capture a target's module and calls. The capture's self-check and the agent's copy
+    load the saved file again (its module with its weights, and every case), so they run
+    after the workload's model is released: next to it, a stage target's copy doubled its
+    weights (measured on VoxCPM2 on a GPU with 6.9 GB free: the captures of two LM stages
+    ran out of memory in the self-check, 24 MB short)."""
+    import gc
+
+    import torch
+
     from kernel_agent import region
     from kernel_agent.kernels.compare import EXACT_TIER, tier_for
-    from kernel_agent.profiling.capture import capture_module
+    from kernel_agent.profiling.capture import capture_module, refuse_unverifiable
 
     target_dir = run.target(ns.target)
     spec = read_json(target_dir / "spec.json")
@@ -335,7 +344,15 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         variants=workload.variants(),  # extra settings: correctness-only cases
         tier=None if tier == EXACT_TIER else tier,
         precision=None if tier == EXACT_TIER else spec.get("precision"),  # roofline bytes
+        self_check=False,  # below, without the model
     )
+    source = _reference_source(workload, {"module_class": cls, "capture": info})
+    del workload, inputs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if checked := refuse_unverifiable(capture, info.get("state") or {}):
+        info["self_check"] = checked
     if run.sealed():  # the agent's copy: module + inputs, no reference outputs
         truth.write_inputs_capture(capture, out / "capture_inputs.pt")
     if info.get("precision") == "fp4_w4a4":  # which layers to keep at 8 bits (demotion.py)
@@ -344,14 +361,12 @@ def cmd_capture(run: RunDir, ns: argparse.Namespace) -> dict[str, Any]:
         info["w4a4_probe"] = probe_capture(capture)
     spec["parent_capture" if parent else "capture"] = info
     write_json(target_dir / "spec.json", spec)
-    _write_reference_source(
-        workload, {"module_class": cls, "capture": info}, out / "reference_source.py"
-    )
+    (out / "reference_source.py").write_text(source)
     return info
 
 
-def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> None:
-    """Dump the target class source (plus its file path) for the kernel engineer."""
+def _reference_source(workload: Any, spec: dict[str, Any]) -> str:
+    """The target class source (plus its file path) for the kernel engineer."""
     import inspect
 
     from kernel_agent.profiling.capture import find_instance
@@ -367,7 +382,7 @@ def _write_reference_source(workload: Any, spec: dict[str, Any], path: Path) -> 
     children = "\n".join(
         f"#   {name}: {type(child).__name__}" for name, child in module.named_children()
     )
-    path.write_text(
+    return (
         f"# Reference implementation of {cls.__module__}.{cls.__qualname__}\n"
         f"# defined in: {file}\n# instance repr:\n"
         + "\n".join(f"#   {line}" for line in repr(module).splitlines()[:40])

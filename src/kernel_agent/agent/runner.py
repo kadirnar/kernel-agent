@@ -6,6 +6,8 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
+import shlex
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -213,6 +215,109 @@ def claude_files_guard(cwd: Path) -> HookMatcher:
     return HookMatcher(matcher=WRITE_TOOLS, hooks=[guard])
 
 
+#: The Claude Code flag that appends a file to the ``claude_code`` system prompt: the
+#: prompt stays out of the CLI's command line, where ``pkill -f`` patterns match it.
+APPEND_PROMPT_FILE = "append-system-prompt-file"
+
+_STATEMENTS = re.compile(r";|&&|\|\||\n")  # the commands of one Bash call
+_SEGMENTS = re.compile(r"\||\$\(|`|\(|\)")  # the commands of a pipeline or substitution
+_PREFIXES = frozenset({"sudo", "nohup", "exec", "command", "env", "nice", "setsid"})
+# the options of pkill / pgrep that take a value (procps-ng)
+_VALUED = frozenset("dgGPstuUFn") | {"--signal", "--delimiter", "--pgroup", "--group",
+                                     "--parent", "--session", "--terminal", "--euid",
+                                     "--uid", "--pidfile", "--ns", "--nslist"}  # fmt: skip
+
+
+def _words(segment: str) -> list[str]:
+    try:
+        words = shlex.split(segment)
+    except ValueError:  # an open quote: the segment ends inside a larger construct
+        words = segment.split()
+    while words and (words[0] in _PREFIXES or "=" in words[0].split("/")[0]):
+        words = words[1:]  # VAR=value, sudo, nohup ...: the command comes after them
+    return words
+
+
+def _full_pattern(words: list[str]) -> str | None:
+    """The pattern of a ``pkill`` / ``pgrep`` that matches whole command lines (``-f``,
+    ``--full``), or None."""
+    full, pattern, skip = False, None, False
+    for word in words[1:]:
+        if skip:
+            skip = False
+        elif word in ("-f", "--full") or (
+            re.fullmatch(r"-[a-zA-Z]+", word) and "f" in word and word[1:] not in SIGNALS
+        ):
+            full = True
+        elif word.startswith("--"):
+            skip = word in _VALUED
+        elif word.startswith("-") and len(word) > 1:
+            skip = word[-1] in _VALUED and len(word) == 2
+        elif pattern is None:
+            pattern = word
+    return pattern if full and pattern is not None else None
+
+
+#: Signal names a ``-<name>`` option of pkill means (``-KILL``), not option letters.
+SIGNALS = frozenset({"KILL", "TERM", "INT", "HUP", "QUIT", "STOP", "CONT", "USR1", "USR2"})
+
+
+def self_kill(command: str) -> str | None:
+    """Why a Bash ``command`` would kill processes found by a pattern of their whole command
+    line (``pkill -f``; ``pgrep -f`` or ``ps | grep`` feeding ``kill``), which also matches
+    the session's own Claude Code process (its paths, options and once its system prompt
+    are in its command line), or None. A pattern anchored at the start (``^/path/python
+    -m ...``) cannot match the CLI and passes. Measured on a VoxCPM2 run: a native session
+    stopping its build with ``pkill -9 -f "native.project build"`` SIGKILLed itself."""
+    for statement in _STATEMENTS.split(command):
+        kills = full = ps = grep = None
+        for segment in _SEGMENTS.split(statement):
+            words = _words(segment)
+            if not words:
+                continue
+            name = Path(words[0]).name
+            if name == "kill" or (name == "xargs" and "kill" in words[1:]):
+                kills = True
+            elif name in ("pkill", "pgrep"):
+                pattern = _full_pattern(words)
+                if pattern is not None and not pattern.startswith("^"):
+                    if name == "pkill":
+                        return f"`pkill -f {pattern}`"
+                    full = f"`pgrep -f {pattern}` feeding `kill`"
+            elif name == "ps":
+                ps = True
+            elif name == "grep" and ps:
+                grep = "`ps | grep` feeding `kill`"
+        if kills and (full or grep):
+            return full or grep
+    return None
+
+
+def kill_guard() -> HookMatcher:
+    """PreToolUse hook of every session: deny Bash commands that kill by an unanchored
+    command-line pattern (:func:`self_kill`), with the safe ways to stop a process."""
+
+    async def guard(data: Any, tool_use_id: str | None, context: Any) -> HookJSONOutput:
+        why = self_kill(str((data.get("tool_input") or {}).get("command") or ""))
+        if why is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": f"{why} finds processes by a pattern of their "
+                "whole command line, and this session's own Claude Code process has its paths "
+                "and options in its command line: it would kill this session. Bound a long "
+                "command with `timeout -k 10 <seconds> <command>`; record `$!` when you start "
+                "a background job and kill that PID; or find processes with a pattern "
+                "anchored at the start of the command line (`pgrep -f '^/path/to/python -m "
+                "module'`), check them with `ps -o pid,args -p <pids>` and kill those PIDs.",
+            }
+        }
+
+    return HookMatcher(matcher="Bash", hooks=[guard])
+
+
 def _resolve(cwd: Path, path: str) -> Path:
     p = Path(path).expanduser()
     return (p if p.is_absolute() else cwd / p).resolve()
@@ -317,12 +422,14 @@ async def run_agent(
     # clean timing (hygiene.py): the CLI, found by this mark, moves off the timing cores
     mark = {hygiene.SESSION_ENV: f"{os.getpid()}-{name}"} if hygiene.current() else {}
     cli: list[int] = []  # its pid, once moved
+    log_dir.mkdir(parents=True, exist_ok=True)
+    system_file = log_dir / f"agent-{name}.system.md"  # the CLI reads it once, at its start
+    tmp = system_file.with_name(f".{system_file.name}.{os.getpid()}.tmp")
+    tmp.write_text(system_append + roles.delegation_note(helpers))
+    tmp.replace(system_file)
     options = ClaudeAgentOptions(
-        system_prompt={
-            "type": "preset",
-            "preset": "claude_code",
-            "append": system_append + roles.delegation_note(helpers),
-        },
+        system_prompt={"type": "preset", "preset": "claude_code"},
+        extra_args={APPEND_PROMPT_FILE: str(system_file)},  # not in its argv: pkill -f
         cwd=str(cwd),
         add_dirs=[str(d) for d in (add_dirs or [])],
         mcp_servers={"ka": mcp_server},
@@ -335,6 +442,7 @@ async def run_agent(
     guarded = writable is not None or roots is not None
     hooks = write_guard(writable or [], cwd, roots=roots, excluded=excluded) if guarded else {}
     hooks.setdefault("PreToolUse", []).append(claude_files_guard(cwd))
+    hooks["PreToolUse"].append(kill_guard())
     options.hooks = hooks
     tracker = sessions.current()  # the session's states (sessions.py, #184): its tool spans
     if tracker is not None:
@@ -350,7 +458,6 @@ async def run_agent(
     usd, turns_before, seconds = result.cost_usd, result.turns, result.seconds  # resumed: > 0
     usage, by_model = dict(result.usage), dict(result.model_usage)  # resumed: a first run's
     watch = auth.LimitWatch()
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"agent-{name}.jsonl"
     start = time.perf_counter()
     _log(f"agent {name}: started (cwd={cwd})")

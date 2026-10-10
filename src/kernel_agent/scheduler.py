@@ -649,15 +649,33 @@ def gpu_busy(run: RunDir) -> float | None:
     return busy if busy and 0.0 < busy <= 1.0 else None
 
 
+def made_by(row: Mapping[str, Any]) -> str:
+    """The agent whose session made a ledger row: its ``session`` label is
+    ``<agent>#<slice>`` (``improve.Improver._open_slice``); "" for a row without one."""
+    return str(row.get("session") or "").partition("#")[0]
+
+
+def native_run(row: Mapping[str, Any]) -> bool:
+    """An end-to-end evaluation of the native arm: one a native session made, or, for a row
+    without a session label, one that ran a native project (``native_engine.is_native``).
+    A systems session's stack that runs native projects is the systems arm's evaluation:
+    grouping rows by their backend alone credited it to the native arm, so the systems arm's
+    slices counted none of their rows and its best and headroom went stale."""
+    if row.get("target") != ledger.E2E or row.get("backend") == "integrate":
+        return False
+    maker = made_by(row)
+    if maker in (SYSTEMS, NATIVE):
+        return maker == NATIVE
+    return native_engine.is_native(row)
+
+
 def systems_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """End-to-end rows of the systems agent (integration steps and the native arm's runs are
     not its evaluations)."""
     return [
         r
         for r in rows
-        if r["target"] == ledger.E2E
-        and r["backend"] != "integrate"
-        and not native_engine.is_native(r)
+        if r["target"] == ledger.E2E and r["backend"] != "integrate" and not native_run(r)
     ]
 
 
@@ -771,21 +789,28 @@ def _systems_history(arm: Arm, rows: list[tuple[dict[str, Any], frozenset[str]]]
     run is a new best when it beats the best transform-only run so far (1.0: the
     baseline); transforms on top of kernels when they beat the best run measured
     with the same kernels: an integration or a kernels-only run, or the agent's
-    previous new best with them (its first run with them sets the bar). ``gain_ms``
-    adds the ms per run saved over that reference, ``best`` is the fastest new
-    best end to end (its kernels included).
+    previous new best with them (its first run with them sets the bar). Its run on
+    top of native projects (:func:`native_run`) must also beat the native arm's fastest
+    run so far: their gain is not the systems agent's either. ``gain_ms`` adds the ms
+    per run saved over that reference, ``best`` is the fastest new best end to end
+    (its kernels included).
     """
     refs: dict[frozenset[str], float] = {frozenset(): 1.0}  # kernels → speedup to beat
+    native_best = 0.0  # the native arm's fastest run so far
     for row, kernels in rows:
-        if native_engine.is_native(row):  # the native arm's (native_arm)
-            continue
         measured = float(row["speedup"]) if row["correct"] and row["speedup"] else None
+        if native_run(row):  # the native arm's (native_arm)
+            native_best = max(native_best, measured or 0.0)
+            continue
         ref = refs.get(kernels)
+        if native_engine.is_native(row) and native_best:
+            ref = max(ref or 0.0, native_best)
         if row["backend"] == "integrate":  # not an evaluation of the systems agent
             if kernels and measured:
                 refs[kernels] = max(ref or 0.0, measured)
             continue
-        transforms = "transform" in row["backend"]
+        # a native project in a systems stack is one of its transforms (native_run)
+        transforms = "transform" in row["backend"] or native_engine.is_native(row)
         if transforms and ref is not None and measured and _improves(row, ref):
             arm.gain_ms += arm.ref_ms * (1.0 / ref - 1.0 / measured)
             refs[kernels], arm.streak = measured, 0
@@ -947,8 +972,8 @@ def native_arm(
     stage_targets: set[str],
     since: int | None = None,
 ) -> Arm:
-    """The native arm: its evaluations are its end-to-end runs (``native.engine.is_native``)
-    and those of its stage targets; ``best`` is its fastest run over the module-level bar
+    """The native arm: its evaluations are its end-to-end runs (:func:`native_run`) and
+    those of its stage targets; ``best`` is its fastest run over the module-level bar
     (``native.engine.bar``, 1.0 = at the bar), a new best when it beats the previous one
     beyond the noise; ``ref_ms`` is the run at the bar. Its streak counts the runs of the
     current round (``since``: its start, issue #166)."""
@@ -956,7 +981,7 @@ def native_arm(
     base = float((read_json(run.baseline_json, {}) or {}).get("median_ms") or 0.0)
     arm = Arm(NATIVE, NATIVE, base / level, estimate=policy.native_estimate)
     arm.basis = ": the native estimate (--native)"
-    runs = [r for r in rows if native_engine.is_native(r)]
+    runs = [r for r in rows if native_run(r)]
     stage_rows = ledger.measured(r for r in rows if r["target"] in stage_targets)
     arm.rows = sorted([*runs, *stage_rows], key=lambda r: r["exp"] or 0)
     best = level

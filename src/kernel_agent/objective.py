@@ -7,7 +7,11 @@
   ``metric_detail`` also reports the steady state: the median latency of the next
   ``steady_chunks`` chunks (default :data:`STEADY_CHUNKS`) and their real-time factor
   (chunk latency / chunk audio duration; below 1 the stream keeps up with playback),
-  and the full streamed run. Quality is judged on the full streamed output. The timed
+  the playback stall of the whole stream (``stall_ms``: the total wait of a player that
+  starts on the first chunk) and the full streamed run. A batch of requests streamed
+  together (VoxCPM: ``-o batch_size=N -o metric=ttfa``, a burst of N requests submitted
+  at once) marks one chunk per step for all of them: the value is every request's time to
+  first audio. Quality is judged on the full streamed output. The timed
   requests stop at the first chunk (``Workload.metric_window``) but for one whole request
   per measurement, which gives the judged output and those details: a check costs
   requests up to their first chunk, not streamed runs.
@@ -133,6 +137,8 @@ def detail_text(detail: dict[str, Any] | None) -> str:
             f"steady state {detail['chunk_ms']:,.1f} ms per chunk{rtf} "
             f"(next {detail.get('steady_chunks') or 0:.0f} chunks)"
         )
+    if detail.get("stall_ms") is not None:
+        parts.append(f"playback stall {detail['stall_ms']:,.0f} ms")
     if detail.get("run_ms") is not None:
         chunks = f", {detail['chunks']:.0f} chunks" if detail.get("chunks") else ""
         parts.append(f"full streamed run {detail['run_ms']:,.1f} ms{chunks}")

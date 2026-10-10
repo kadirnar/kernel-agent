@@ -24,6 +24,9 @@ python -m kernel_agent.native.project check <dir>
 python -m kernel_agent.native.project build <dir>
 ```
 
+Bound a long build with `timeout -k 10 <seconds>` and stop a background one by the PID you
+recorded; a `pkill -f` / `ps | grep | kill` pattern also matches your own session (denied).
+
 A stage with a kernel target is evaluated like a kernel (`kernel-agent eval
 <run_dir>/.truth/captures/native_<id>.pt <dir>`); a group or the loop end to end
 (`python -m kernel_agent.worker e2e --run-dir <run_dir> --transform <dir>`, under the GPU

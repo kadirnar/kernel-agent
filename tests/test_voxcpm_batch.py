@@ -1,7 +1,8 @@
 """Batched VoxCPM2 throughput workload (``-o batch_size=N -o metric=throughput``): the
 batched loop on a tiny random VoxCPM2 (voxcpm's own modules, CPU) against VoxCPM's own
 batch-1 generate, per-request quality checks, per-request stop flags and the throughput
-metric; batch 4 against batch 1 on the real VoxCPM2 (GPU)."""
+metric; a burst streamed together (``-o metric=ttfa``); batch 4 against batch 1 on the
+real VoxCPM2 (GPU)."""
 
 from typing import Any
 
@@ -53,6 +54,10 @@ def test_routing_options_and_texts():
         create_workload(_spec(batch_size=4, metric="latency"))
     assert type(create_workload(_spec())) is VoxCPMWorkload  # batch 1, latency: unchanged
 
+    burst = create_workload(_spec(batch_size=4, metric="ttfa"))  # streamed together
+    assert isinstance(burst, VoxCPMBatchWorkload) and burst.metric == "ttfa" and burst.windowed
+    validate_metric(_spec(metric="ttfa", batch_size=128))
+
     texts = request_texts(TEXT, 40)
     assert texts[0] == TEXT and len(set(texts)) == 40
     with pytest.raises(ValueError, match="batch_size must be >= 1"):
@@ -82,6 +87,60 @@ def test_batched_run_and_the_throughput_metric(batch):
     # a fixed-length run: the audio is fixed by the options, not by what a run reports
     batch.chunk_marks[:] = [(0.0, 1e6)]
     assert batch.output_seconds() == pytest.approx(audio_s)
+
+
+def test_a_burst_streams_every_request_and_times_its_first_chunk(batch):
+    inputs = batch.make_inputs()
+    oneshot = batch.run(inputs)  # metric=throughput: every request decoded once at the end
+    batch.options["metric"] = "ttfa"
+    out, ms, detail = timed_run(batch, inputs)
+    marks = list(batch.chunk_marks)
+    # VoxCPM2's streaming path for the batch: the stateful decode of each newest patch is the
+    # one-shot decode, request by request, one mark (for every request) per patch
+    torch.testing.assert_close(out["latents"], oneshot["latents"])
+    torch.testing.assert_close(out["audio"], oneshot["audio"], atol=1e-5, rtol=1e-4)
+    assert out["steps"].tolist() == [PATCHES] * 4
+    assert len(marks) == PATCHES
+    assert all(a == pytest.approx(1000 * SAMPLES_PER_PATCH / 16000) for _, a in marks)
+    assert detail["chunks"] == PATCHES and 0 < ms <= detail["run_ms"]
+    assert detail["chunk_ms"] > 0 and detail["rtf"] > 0 and detail["stall_ms"] >= 0
+    assert "streaming_decode" not in str(vars(batch.model.audio_vae.decoder).get("forward"))
+
+    # inside the metric window the burst stops at its first chunk: the time to first audio
+    out, ms, detail = timed_run(batch, inputs, window=True)
+    assert len(batch.chunk_marks) == 1 and detail == {} and ms > 0
+    assert out["latents"].shape[0] == 1 and out["steps"].tolist() == [1] * 4
+    assert out["audio"].shape == (4, SAMPLES_PER_PATCH)
+
+    timing = measure(batch, inputs, warmup=0, iters=2)
+    assert timing["metric"] == "ttfa" and timing["metric_detail"]["chunks"] == PATCHES
+
+
+class Stateless(nn.Module):
+    """An AudioVAE decoder replacement that runs every convolution itself (as a fused kernel
+    does): ``streaming_decode()`` cannot carry its causal-convolution state between chunks."""
+
+    def __init__(self, ref: nn.Module) -> None:
+        super().__init__()
+        object.__setattr__(self, "_ref", ref)  # not a submodule: streaming_decode() misses it
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return self._ref(*args, **kwargs)  # type: ignore[no-any-return]
+
+
+def test_a_decoder_that_breaks_the_streaming_decode_fails_the_burst(batch):
+    inputs = batch.make_inputs()
+    batch.options["metric"] = "ttfa"
+    ref = batch.run(inputs)
+    vae = batch.model.audio_vae
+    vae.decoder = Stateless(vae.decoder)
+    forced = batch.run_teacher_forced(inputs, ref)
+    cmp = batch.compare_teacher_forced(ref, forced)
+    assert not cmp.passed and "audio streamed from the reference latents" in cmp.reason, cmp
+    assert cmp.metrics["decoded_waveform_cosine"] < 0.98
+    batch.options["metric"] = "throughput"  # one-shot decoding: the same decoder is right
+    ref = batch.run(inputs)
+    assert batch.compare_teacher_forced(ref, batch.run_teacher_forced(inputs, ref)).passed
 
 
 def test_every_request_is_voxcpms_batch_1_run(batch):
